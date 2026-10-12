@@ -33,8 +33,9 @@ impl Native {
     }
 }
 
-/// Whether guest code should run on the translator (ARM32_ENGINE=jit, or the
-/// Android property debug.arm32bridge.engine=jit; the checker turns it on too).
+/// Whether guest code should run on the translator: the default on ARM64.
+/// ARM32_ENGINE=unicorn (or the Android property debug.arm32bridge.engine=unicorn)
+/// runs everything in Unicorn instead; the checker always uses the translator.
 pub fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -44,10 +45,8 @@ pub fn enabled() -> bool {
         if super::check::enabled() {
             return true;
         }
-        if let Ok(value) = std::env::var("ARM32_ENGINE") {
-            return value == "jit";
-        }
-        property("debug.arm32bridge.engine").as_deref() == Some("jit")
+        let setting = std::env::var("ARM32_ENGINE").ok().or_else(|| property("debug.arm32bridge.engine"));
+        setting.as_deref() != Some("unicorn")
     })
 }
 

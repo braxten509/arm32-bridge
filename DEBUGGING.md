@@ -122,3 +122,6 @@ engine.rs run(): an address at stub+4 (the `bx lr` half) just returns to LR. Tem
 - Check 2 in play: checker=1, start-up + resumed level + 4 matches: 2,097,152 checks, 0 differences, 50 ran past.
   User saw stutters during this checker run (checker replays sampled blocks in Unicorn). Translator restarted for
   the user to judge without the checker.
+- User: smooth without the checker; loading freeze on first village load does not count. Translator is now the
+  default (ARM32_ENGINE / debug.arm32bridge.engine=unicorn opts out). Self-test passes on all engines; game start-up
+  124 ms with no property set (Unicorn: 2722 ms).
