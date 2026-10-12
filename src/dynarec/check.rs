@@ -52,6 +52,10 @@ static CHECKS: AtomicU64 = AtomicU64::new(0);
 static DIFFERENCES: AtomicU64 = AtomicU64::new(0);
 /// Reference runs that stopped with an error (not compared).
 static FAILED: AtomicU64 = AtomicU64::new(0);
+/// Reference runs where Unicorn ran instructions outside the block (not compared).
+/// Unicorn treats a Thumb IT block as one instruction and can miss a stop request
+/// for a few instructions after one, so it sometimes runs past where the block ends.
+static RAN_PAST: AtomicU64 = AtomicU64::new(0);
 static REPORTED: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
 
 thread_local! {
@@ -170,12 +174,19 @@ pub fn reference(uc: &mut Uc, pc: u32, end: u32, stop_at: u32) -> Option<Referen
     if failed {
         return None;
     }
+    let block = (pc & !1)..end;
+    if executed.iter().any(|(address, _, _)| !block.contains(address)) {
+        RAN_PAST.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
     Some(Reference { start, end_state, exit_pc, steps, writes, executed })
 }
 
 /// Compares the translated block's result with Unicorn's.
 pub fn compare(uc: &mut Uc, pc: u32, end: u32, reference: &Reference) {
-    CHECKS.fetch_add(1, Ordering::Relaxed);
+    if (CHECKS.fetch_add(1, Ordering::Relaxed) + 1) % (1 << 18) == 0 {
+        print_summary(); // a running app never reaches the end-of-run print
+    }
     let state = &uc.get_data().native.as_ref().unwrap().state;
     let expected = &reference.end_state;
     let mut differences = Vec::new();
@@ -247,9 +258,10 @@ pub fn compare(uc: &mut Uc, pc: u32, end: u32, reference: &Reference) {
 
 pub fn print_summary() {
     crate::log::line(&format!(
-        "[check] {} blocks checked, {} differences, {} not compared (Unicorn stopped)",
+        "[check] {} blocks checked, {} differences, not compared: {} (Unicorn stopped), {} (Unicorn ran past the block)",
         CHECKS.load(Ordering::Relaxed),
         DIFFERENCES.load(Ordering::Relaxed),
-        FAILED.load(Ordering::Relaxed)
+        FAILED.load(Ordering::Relaxed),
+        RAN_PAST.load(Ordering::Relaxed)
     ));
 }

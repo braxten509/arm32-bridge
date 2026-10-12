@@ -72,3 +72,7 @@ engine.rs run(): an address at stub+4 (the `bx lr` half) just returns to LR. Tem
 - Result attempt 3: no change; Unicorn ran caller instructions even after emu_stop from our own hook. Reverted.
 - Status: 3 attempts on this check, stopped and reported to the user (2026-10-12). In all 30 cases the JIT
   result is the correct one; Unicorn (the reference) runs past an IT block that ends in a branch.
+- Decision (user, 2026-10-12): label these runs. A reference run where Unicorn ran any instruction outside the
+  block is counted as "not compared (Unicorn ran past the block)" instead of a difference.
+- Result (2026-10-12): game, ARM32_CHECK=1, 75 s: 786,432 checks, 0 differences, 22 not compared (ran past the block).
+  Self-test ARM32_CHECK=all: 35,363 checks, 0 differences, 0 ran past. Pass check 2 met.

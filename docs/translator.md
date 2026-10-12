@@ -55,7 +55,11 @@ exit point and the recorded memory must match; the first difference per block
 is logged with the start registers and the block's code. `1` checks each
 block's first 32 runs and then every 1024th (fast enough to play); `all`
 checks every run. The summary line counts checks, differences and reference
-runs that could not finish in Unicorn.
+runs that were not compared: ones that could not finish in Unicorn, and ones
+where Unicorn ran an instruction outside the block. The second happens after a
+Thumb IT block that ends in a branch: Unicorn misses the stop request for a
+few instructions (a known Unicorn quirk, see DEBUGGING.md), so its result is
+not a fair answer key for that run.
 
 ## Pass checks (approved)
 
