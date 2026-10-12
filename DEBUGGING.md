@@ -106,3 +106,12 @@ engine.rs run(): an address at stub+4 (the `bx lr` half) just returns to LR. Tem
   Fixed: gaps outside MAPPED_REGIONS are PROT_NONE. Throwaway /tmp fault.so: Unicorn "READ_UNMAPPED at 0x10",
   translator "[fault] ... at 0x00000010 ... guest block 0x01000328", then SIGSEGV. Self-test, bench, game (jit and
   checker: 1,048,576 checks, 0 differences) all still pass.
+
+# Stage 7b: level measurements (2026-10-12)
+- Level (idle on the board, no moves), engine=jit, 31 s: game counter min 95.2 / median 119.9 / max 122.5 fps;
+  own code avg 1.08 ms/frame; SurfaceFlinger timestats 3729 frames, 0 dropped, 0 janky. One 148 ms frame (own 119 ms)
+  in the first measured second, ~7 s after tapping Continue.
+- Level entry: one ~1 s frame (own 856 ms). simpleperf of the render thread over entry: translated code 39%, bridge
+  .so 16% (call_stub 10.5% self, incl. inlined handlers), kernel 16%, libc 13% (allocations are in gralloc/EGL during
+  eglSwapBuffers/glClear, not the bridge), translate() 0.03%, Unicorn ~0. So: the game's own level-loading work, not
+  translation or fallbacks.
