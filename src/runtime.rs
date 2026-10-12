@@ -25,6 +25,94 @@ use crate::mem::{self, Bump, GuestHeap, GuestMem};
 
 pub type Uc = Unicorn<'static, Thread>;
 
+/// Register access for handlers, whichever engine is running the guest.
+/// Registers 0-15 are r0-r15 (13 = sp, 14 = lr, 15 = pc).
+pub trait GuestCpu {
+    fn reg(&self, index: usize) -> u32;
+    fn set_reg(&mut self, index: usize, value: u32);
+    /// VFP/NEON register d0-d31.
+    fn dreg(&self, index: usize) -> u64;
+    fn set_dreg(&mut self, index: usize, value: u64);
+    /// Ends the current guest run (after a fault or exit()).
+    fn stop(&mut self);
+}
+
+const CORE_REGISTERS: [RegisterARM; 16] = [
+    RegisterARM::R0,
+    RegisterARM::R1,
+    RegisterARM::R2,
+    RegisterARM::R3,
+    RegisterARM::R4,
+    RegisterARM::R5,
+    RegisterARM::R6,
+    RegisterARM::R7,
+    RegisterARM::R8,
+    RegisterARM::R9,
+    RegisterARM::R10,
+    RegisterARM::R11,
+    RegisterARM::R12,
+    RegisterARM::SP,
+    RegisterARM::LR,
+    RegisterARM::PC,
+];
+
+const DOUBLE_REGISTERS: [RegisterARM; 32] = [
+    RegisterARM::D0,
+    RegisterARM::D1,
+    RegisterARM::D2,
+    RegisterARM::D3,
+    RegisterARM::D4,
+    RegisterARM::D5,
+    RegisterARM::D6,
+    RegisterARM::D7,
+    RegisterARM::D8,
+    RegisterARM::D9,
+    RegisterARM::D10,
+    RegisterARM::D11,
+    RegisterARM::D12,
+    RegisterARM::D13,
+    RegisterARM::D14,
+    RegisterARM::D15,
+    RegisterARM::D16,
+    RegisterARM::D17,
+    RegisterARM::D18,
+    RegisterARM::D19,
+    RegisterARM::D20,
+    RegisterARM::D21,
+    RegisterARM::D22,
+    RegisterARM::D23,
+    RegisterARM::D24,
+    RegisterARM::D25,
+    RegisterARM::D26,
+    RegisterARM::D27,
+    RegisterARM::D28,
+    RegisterARM::D29,
+    RegisterARM::D30,
+    RegisterARM::D31,
+];
+
+impl GuestCpu for Uc {
+    fn reg(&self, index: usize) -> u32 {
+        self.reg_read(CORE_REGISTERS[index]).unwrap() as u32
+    }
+    fn set_reg(&mut self, index: usize, value: u32) {
+        self.reg_write(CORE_REGISTERS[index], value as u64).unwrap();
+    }
+    fn dreg(&self, index: usize) -> u64 {
+        self.reg_read(DOUBLE_REGISTERS[index]).unwrap()
+    }
+    fn set_dreg(&mut self, index: usize, value: u64) {
+        self.reg_write(DOUBLE_REGISTERS[index], value).unwrap();
+    }
+    fn stop(&mut self) {
+        self.emu_stop().unwrap();
+    }
+}
+
+pub const SP: usize = 13;
+pub const LR: usize = 14;
+pub const PC: usize = 15;
+
 /// What a handler hands back to the guest.
 pub enum Ret {
     Void,
@@ -395,22 +483,27 @@ fn on_interrupt(uc: &mut Unicorn<'_, Thread>, interrupt: u32) {
             Ret::U32(0)
         }
     };
+    write_result(uc, result);
+    if uc.get_data().fault.is_some() || uc.get_data().exit_code.is_some() {
+        uc.stop();
+    }
+}
+
+/// Puts a handler's result where a softfp caller expects it (r0, or r0:r1).
+pub fn write_result(cpu: &mut impl GuestCpu, result: Ret) {
     match result {
         Ret::Void | Ret::Jumped => {}
-        Ret::U32(value) => uc.reg_write(RegisterARM::R0, value as u64).unwrap(),
+        Ret::U32(value) => cpu.set_reg(0, value),
+        Ret::F32(value) => cpu.set_reg(0, value.to_bits()),
         Ret::U64(value) => {
-            uc.reg_write(RegisterARM::R0, value & 0xFFFF_FFFF).unwrap();
-            uc.reg_write(RegisterARM::R1, value >> 32).unwrap();
+            cpu.set_reg(0, value as u32);
+            cpu.set_reg(1, (value >> 32) as u32);
         }
-        Ret::F32(value) => uc.reg_write(RegisterARM::R0, value.to_bits() as u64).unwrap(),
         Ret::F64(value) => {
             let bits = value.to_bits();
-            uc.reg_write(RegisterARM::R0, bits & 0xFFFF_FFFF).unwrap();
-            uc.reg_write(RegisterARM::R1, bits >> 32).unwrap();
+            cpu.set_reg(0, bits as u32);
+            cpu.set_reg(1, (bits >> 32) as u32);
         }
-    }
-    if uc.get_data().fault.is_some() || uc.get_data().exit_code.is_some() {
-        uc.emu_stop().unwrap();
     }
 }
 
@@ -429,7 +522,7 @@ pub fn stop_with_fault(uc: &mut Uc, message: String) {
     if uc.get_data().fault.is_none() {
         uc.get_data_mut().fault = Some(message);
     }
-    uc.emu_stop().unwrap();
+    uc.stop();
 }
 
 /// Reads arguments the way an ARM32 softfp caller passes them.
@@ -440,13 +533,8 @@ pub struct Args {
 }
 
 impl Args {
-    pub fn from_registers(uc: &Uc) -> Args {
-        let r = |reg| uc.reg_read(reg).unwrap() as u32;
-        Args {
-            registers: [r(RegisterARM::R0), r(RegisterARM::R1), r(RegisterARM::R2), r(RegisterARM::R3)],
-            next_register: 0,
-            stack: r(RegisterARM::SP),
-        }
+    pub fn from_registers(cpu: &impl GuestCpu) -> Args {
+        Args { registers: [cpu.reg(0), cpu.reg(1), cpu.reg(2), cpu.reg(3)], next_register: 0, stack: cpu.reg(SP) }
     }
 }
 

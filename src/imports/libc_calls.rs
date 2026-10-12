@@ -6,9 +6,8 @@
 use crate::handler;
 use crate::imports::{printf, scanf, HostFile};
 use crate::mem::GuestMem;
-use crate::runtime::{call_guest, mem, shared, stop_with_fault, stub_for, ArgSource, Args, Handler, Ret, Uc, VaList};
+use crate::runtime::{call_guest, mem, shared, stop_with_fault, stub_for, ArgSource, Args, GuestCpu, Handler, Ret, Uc, VaList, LR, SP};
 
-use unicorn_engine::RegisterARM;
 
 fn host_c(guest: u32) -> *mut libc::c_char {
     mem().host_or_null(guest) as *mut libc::c_char
@@ -223,69 +222,28 @@ fn strtol_32(uc: &Uc, a: &mut Args, signed: bool) -> Ret {
     Ret::U32(value)
 }
 
-fn save_jump_buffer(uc: &mut Uc, buffer: u32) {
+/// jmp_buf layout (ours): r4-r11, sp, lr, then d8-d15.
+const SAVED_CORE: [usize; 10] = [4, 5, 6, 7, 8, 9, 10, 11, SP, LR];
+
+fn save_jump_buffer(cpu: &mut Uc, buffer: u32) {
     let memory = mem();
-    let registers = [
-        RegisterARM::R4,
-        RegisterARM::R5,
-        RegisterARM::R6,
-        RegisterARM::R7,
-        RegisterARM::R8,
-        RegisterARM::R9,
-        RegisterARM::R10,
-        RegisterARM::R11,
-        RegisterARM::SP,
-        RegisterARM::LR,
-    ];
-    for (i, register) in registers.iter().enumerate() {
-        memory.write_u32(buffer + i as u32 * 4, uc.reg_read(*register).unwrap() as u32);
+    for (i, &register) in SAVED_CORE.iter().enumerate() {
+        memory.write_u32(buffer + i as u32 * 4, cpu.reg(register));
     }
-    let doubles = [
-        RegisterARM::D8,
-        RegisterARM::D9,
-        RegisterARM::D10,
-        RegisterARM::D11,
-        RegisterARM::D12,
-        RegisterARM::D13,
-        RegisterARM::D14,
-        RegisterARM::D15,
-    ];
-    for (i, register) in doubles.iter().enumerate() {
-        memory.write_u64(buffer + 40 + i as u32 * 8, uc.reg_read(*register).unwrap());
+    for i in 0..8 {
+        memory.write_u64(buffer + 40 + i as u32 * 8, cpu.dreg(8 + i));
     }
 }
 
-fn restore_jump_buffer(uc: &mut Uc, buffer: u32, value: u32) -> Ret {
+fn restore_jump_buffer(cpu: &mut Uc, buffer: u32, value: u32) -> Ret {
     let memory = mem();
-    let registers = [
-        RegisterARM::R4,
-        RegisterARM::R5,
-        RegisterARM::R6,
-        RegisterARM::R7,
-        RegisterARM::R8,
-        RegisterARM::R9,
-        RegisterARM::R10,
-        RegisterARM::R11,
-        RegisterARM::SP,
-        RegisterARM::LR,
-    ];
-    for (i, register) in registers.iter().enumerate() {
-        uc.reg_write(*register, memory.read_u32(buffer + i as u32 * 4) as u64).unwrap();
+    for (i, &register) in SAVED_CORE.iter().enumerate() {
+        cpu.set_reg(register, memory.read_u32(buffer + i as u32 * 4));
     }
-    let doubles = [
-        RegisterARM::D8,
-        RegisterARM::D9,
-        RegisterARM::D10,
-        RegisterARM::D11,
-        RegisterARM::D12,
-        RegisterARM::D13,
-        RegisterARM::D14,
-        RegisterARM::D15,
-    ];
-    for (i, register) in doubles.iter().enumerate() {
-        uc.reg_write(*register, memory.read_u64(buffer + 40 + i as u32 * 8)).unwrap();
+    for i in 0..8 {
+        cpu.set_dreg(8 + i, memory.read_u64(buffer + 40 + i as u32 * 8));
     }
-    uc.reg_write(RegisterARM::R0, if value == 0 { 1 } else { value } as u64).unwrap();
+    cpu.set_reg(0, if value == 0 { 1 } else { value });
     Ret::Jumped
 }
 
@@ -1120,7 +1078,7 @@ pub fn handler(name: &str) -> Option<Handler> {
         }),
         "exit" | "_exit" => handler!(|uc, a| {
             uc.get_data_mut().exit_code = Some(a.i32());
-            uc.emu_stop().unwrap();
+            uc.stop();
             Ret::Void
         }),
         "__errno" => handler!(|uc, a| Ret::U32(uc.get_data().errno_slot)),
