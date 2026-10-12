@@ -1,0 +1,13 @@
+[package]
+name = "arm32-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "Proof of concept: run 32-bit ARM Android game code inside a 64-bit process"
+
+[dependencies]
+dlmalloc = "0.2.14"
+libc = "0.2.190"
+unicorn-engine = { version = "2.1.5", default-features = false, features = ["arch_arm"] }
+
+[profile.release]
+debug = 1

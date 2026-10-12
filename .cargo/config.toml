@@ -1,0 +1,12 @@
+[target.aarch64-linux-android]
+# Android has no libpthread; Unicorn asks for it, so an empty stand-in is on the path.
+# Unicorn's code generator also needs __clear_cache from clang's builtins library.
+rustflags = ["-C", "link-arg=/home/braxtenchenay/Android/Sdk/ndk/30.0.16248370/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/lib/linux/libclang_rt.builtins-aarch64-android.a", "-L", "/home/braxtenchenay/dev/arm32-bridge/android-link-stubs"]
+linker = "/home/braxtenchenay/Android/Sdk/ndk/30.0.16248370/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang"
+
+[env]
+CC_aarch64_linux_android = "/home/braxtenchenay/Android/Sdk/ndk/30.0.16248370/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang"
+CXX_aarch64_linux_android = "/home/braxtenchenay/Android/Sdk/ndk/30.0.16248370/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang++"
+AR_aarch64_linux_android = "/home/braxtenchenay/Android/Sdk/ndk/30.0.16248370/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+ANDROID_NDK = "/home/braxtenchenay/Android/Sdk/ndk/30.0.16248370"
+BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android = "--target=aarch64-linux-android30 --sysroot=/home/braxtenchenay/Android/Sdk/ndk/30.0.16248370/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
