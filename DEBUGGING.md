@@ -88,3 +88,9 @@ engine.rs run(): an address at stub+4 (the `bx lr` half) just returns to LR. Tem
 - NEON (neon.rs): VLD1/VST1 1-4 regs and 32-bit lane, 3-same float/int/logic, VMUL/VMLA/VMLS.F32 by scalar; host FPCR
   switched to the ARMv7 standard FPSCR value around NEON float. Game with checker: 1,310,720 checks, 0 differences,
   90-107 fps under the checker; fewer than 4M fallbacks in 75 s (no stats print).
+
+# Stage 6 start: own code per frame (2026-10-12)
+- Frame timer now splits own code / phone functions. Menu, engine=jit: 110-122 fps (median ~117); own code 3.9-5.1 ms
+  per frame (goal <=3 ms); phone functions 2.9-4.2 ms (glClear screen wait ~5 ms on most frames, excluded).
+- Spikes: own code 45-59 ms every few seconds (unknown yet); glDrawElements 16-31 ms inside the GPU driver.
+- Next: simpleperf profile of the game process before choosing what to change.

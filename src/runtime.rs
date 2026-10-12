@@ -315,6 +315,15 @@ static WAKE: Condvar = Condvar::new();
 thread_local! {
     static GIL_GUARD: RefCell<Option<MutexGuard<'static, ()>>> = const { RefCell::new(None) };
     static ENGINE: Cell<*mut Uc> = const { Cell::new(std::ptr::null_mut()) };
+    /// Time this thread spent inside phone functions (outermost calls only), in `ticks`.
+    static PHONE_TICKS: Cell<u64> = const { Cell::new(0) };
+    static PHONE_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Total time this thread has spent inside phone functions (a phone function
+/// that calls back into game code counts that game code too).
+pub fn phone_time() -> std::time::Duration {
+    std::time::Duration::from_nanos(PHONE_TICKS.with(|t| t.get()) * 1_000_000 / ticks_per_ms())
 }
 
 pub fn gil_held() -> bool {
@@ -509,9 +518,16 @@ pub fn call_stub(uc: &mut Uc, index: u32) {
     let started = ticks();
     let result = match handler {
         Some(handler) => {
+            PHONE_DEPTH.with(|depth| depth.set(depth.get() + 1));
             let result = handler(uc, &mut args);
             // Calls this slow show up as stutters at 120 Hz (8.3 ms per frame).
             let spent = ticks().wrapping_sub(started);
+            if PHONE_DEPTH.with(|depth| {
+                depth.set(depth.get() - 1);
+                depth.get() == 0
+            }) {
+                PHONE_TICKS.with(|total| total.set(total.get() + spent));
+            }
             if spent >= SLOW_CALL_MS * ticks_per_ms() {
                 let java = if name.starts_with("jni:Call") { crate::imports::jni_host::last_method() } else { String::new() };
                 crate::log::line(&format!(

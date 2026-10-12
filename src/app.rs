@@ -113,31 +113,51 @@ struct FrameCounter {
     window_start: Instant,
     frames: u32,
     guest_time: Duration,
+    /// Part of `guest_time` spent in phone functions (GL calls, which include waiting for the screen).
+    phone_time: Duration,
     slowest: Duration,
+    /// Slowest frame not counting phone-function time.
+    slowest_own: Duration,
 }
 
 static FRAMES: Mutex<Option<FrameCounter>> = Mutex::new(None);
 
-fn count_frame(spent: Duration) {
+fn count_frame(spent: Duration, phone: Duration) {
     let mut counter = FRAMES.lock().unwrap_or_else(|e| e.into_inner());
     let counter = counter.get_or_insert_with(|| FrameCounter {
         window_start: Instant::now(),
         frames: 0,
         guest_time: Duration::ZERO,
+        phone_time: Duration::ZERO,
         slowest: Duration::ZERO,
+        slowest_own: Duration::ZERO,
     });
     counter.frames += 1;
     counter.guest_time += spent;
+    counter.phone_time += phone;
     counter.slowest = counter.slowest.max(spent);
+    counter.slowest_own = counter.slowest_own.max(spent.saturating_sub(phone));
     let elapsed = counter.window_start.elapsed();
     if elapsed >= Duration::from_secs(1) {
         let fps = counter.frames as f64 / elapsed.as_secs_f64();
-        let average = counter.guest_time.as_secs_f64() * 1000.0 / counter.frames as f64;
+        let per_frame = |time: Duration| time.as_secs_f64() * 1000.0 / counter.frames as f64;
+        let ms = |time: Duration| time.as_secs_f64() * 1000.0;
         crate::log::line(&format!(
-            "[fps] {fps:.1} fps, game code {average:.2} ms/frame (slowest {:.2} ms)",
-            counter.slowest.as_secs_f64() * 1000.0
+            "[fps] {fps:.1} fps, game code {:.2} ms/frame (own code {:.2} ms, phone functions {:.2} ms; slowest {:.2} ms, own {:.2} ms)",
+            per_frame(counter.guest_time),
+            per_frame(counter.guest_time.saturating_sub(counter.phone_time)),
+            per_frame(counter.phone_time),
+            ms(counter.slowest),
+            ms(counter.slowest_own)
         ));
-        *counter = FrameCounter { window_start: Instant::now(), frames: 0, guest_time: Duration::ZERO, slowest: Duration::ZERO };
+        *counter = FrameCounter {
+            window_start: Instant::now(),
+            frames: 0,
+            guest_time: Duration::ZERO,
+            phone_time: Duration::ZERO,
+            slowest: Duration::ZERO,
+            slowest_own: Duration::ZERO,
+        };
     }
 }
 
@@ -198,6 +218,7 @@ pub fn forward(env: *mut JNIEnv, symbol: &str, address: &AtomicU32, args: &[Host
         crate::sound_preload::on_frame(env, library_directory());
     }
     let started = Instant::now();
+    let phone_before = crate::runtime::phone_time();
     let _lock = hold_gil();
     let _entry = jni_host::enter(env);
     let uc = engine();
@@ -238,7 +259,7 @@ pub fn forward(env: *mut JNIEnv, symbol: &str, address: &AtomicU32, args: &[Host
         _ => result & 0xFFFF_FFFF,
     };
     if is_frame {
-        count_frame(started.elapsed());
+        count_frame(started.elapsed(), crate::runtime::phone_time() - phone_before);
     }
     HostValue(value)
 }
