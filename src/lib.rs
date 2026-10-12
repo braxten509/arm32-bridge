@@ -10,3 +10,5 @@ pub mod runtime;
 
 #[cfg(target_os = "android")]
 pub mod app;
+#[cfg(target_os = "android")]
+pub mod sound_preload;

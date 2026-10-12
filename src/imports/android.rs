@@ -2,8 +2,8 @@
 //! Host AAssetManager / AAsset / AAssetDir pointers are 64-bit, so the guest
 //! gets small handles; data is read straight into guest memory.
 
-use crate::handler;
-use crate::runtime::{ArgSource, Handler, Ret};
+#[cfg(not(target_os = "android"))]
+use crate::runtime::Handler;
 
 #[cfg(target_os = "android")]
 mod host {
@@ -160,7 +160,5 @@ pub struct Assets;
 
 #[cfg(not(target_os = "android"))]
 pub fn handler(_name: &str) -> Option<Handler> {
-    // Keeps the shared imports used on non-Android builds.
-    let _: Option<Handler> = handler!(|uc, a| Ret::U32(a.u32()));
     None
 }

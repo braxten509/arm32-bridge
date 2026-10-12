@@ -281,8 +281,19 @@ fn host_c(pointer: u32) -> *const std::ffi::c_char {
     mem().host_or_null(pointer) as *const std::ffi::c_char
 }
 
+thread_local! {
+    /// The Java method handle this thread called last (for the "[slow]" log).
+    static LAST_METHOD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// "name signature" of the Java method this thread called last.
+pub fn last_method() -> String {
+    member(LAST_METHOD.with(|m| m.get())).map(|m| format!("{}{}", m.name, m.signature)).unwrap_or_default()
+}
+
 /// Calls a Java method with the guest's arguments and converts the result.
 fn call_method(name: &str, target: u32, class: u32, method: u32, a: &mut Args) -> Ret {
+    LAST_METHOD.with(|m| m.set(method));
     let Some(member) = member(method) else {
         crate::log::line(&format!("[bridge] {name} with unknown method id {method:#x}"));
         return Ret::U32(0);
@@ -297,6 +308,8 @@ fn call_method(name: &str, target: u32, class: u32, method: u32, a: &mut Args) -
     };
     let values = host_arguments(&parameters, source);
     let env = env();
+    #[cfg(target_os = "android")]
+    crate::sound_preload::observe_java_call(env, &member.name, &member.signature, &values);
     let id = member.host as jmethodID;
     let target_object = to_host(target);
     let class_object = to_host(class);

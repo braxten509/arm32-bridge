@@ -57,7 +57,12 @@ fn fail(message: &str) -> ! {
 }
 
 /// Directory this library was loaded from (the app's native library dir).
-fn library_directory() -> PathBuf {
+fn library_directory() -> &'static PathBuf {
+    static DIRECTORY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIRECTORY.get_or_init(find_library_directory)
+}
+
+fn find_library_directory() -> PathBuf {
     let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
     unsafe { libc::dladdr(JNI_OnLoad as *const c_void, &mut info) };
     let path = unsafe { CStr::from_ptr(info.dli_fname) }.to_string_lossy().into_owned();
@@ -77,7 +82,7 @@ pub extern "system" fn JNI_OnLoad(vm: *mut JavaVM, _reserved: *mut c_void) -> ji
     let uc = engine();
     let (guest_vm, _guest_env) = jni::create_vm(uc);
 
-    let directory = library_directory();
+    let directory = library_directory().clone();
     let path = directory.join(GUEST_LIBRARY);
     crate::log::line(&format!("[bridge] loading {}", path.display()));
     let mut loader = crate::elf::Loader::new(vec![directory]);
@@ -188,6 +193,9 @@ pub fn forward(env: *mut JNIEnv, symbol: &str, address: &AtomicU32, args: &[Host
     let is_frame = symbol.ends_with("_nativeRender");
     if symbol.ends_with("_nativeOnSurfaceChanged") || symbol.ends_with("_nativeInit") {
         request_refresh_rate(env);
+    }
+    if is_frame {
+        crate::sound_preload::on_frame(env, library_directory());
     }
     let started = Instant::now();
     let _lock = hold_gil();

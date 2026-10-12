@@ -55,6 +55,35 @@ const UDF: u32 = 0xE7F0_00F0;
 
 const MAIN_STACK_SIZE: u32 = 8 << 20;
 pub const THREAD_STACK_SIZE: u32 = 1 << 20;
+/// Phone-function calls at least this slow (in ms) are logged as "[slow]".
+const SLOW_CALL_MS: u64 = 5;
+
+/// A cheap timestamp: the CPU's own counter on ARM64 (a clock call costs far
+/// more, and every phone-function call is timed).
+#[cfg(target_arch = "aarch64")]
+fn ticks() -> u64 {
+    let value: u64;
+    unsafe { std::arch::asm!("mrs {}, cntvct_el0", out(reg) value, options(nomem, nostack)) };
+    value
+}
+
+#[cfg(target_arch = "aarch64")]
+fn ticks_per_ms() -> u64 {
+    let frequency: u64;
+    unsafe { std::arch::asm!("mrs {}, cntfrq_el0", out(reg) frequency, options(nomem, nostack)) };
+    (frequency / 1000).max(1)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn ticks() -> u64 {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn ticks_per_ms() -> u64 {
+    1_000_000
+}
 
 /// State shared by every guest thread (guarded by the guest lock).
 pub struct Shared {
@@ -341,8 +370,22 @@ fn on_interrupt(uc: &mut Unicorn<'_, Thread>, interrupt: u32) {
         let r = args.registers;
         eprintln!("[call t{}] {name}({:#x}, {:#x}, {:#x}, {:#x})", uc.get_data().id, r[0], r[1], r[2], r[3]);
     }
+    let started = ticks();
     let result = match handler {
-        Some(handler) => handler(uc, &mut args),
+        Some(handler) => {
+            let result = handler(uc, &mut args);
+            // Calls this slow show up as stutters at 120 Hz (8.3 ms per frame).
+            let spent = ticks().wrapping_sub(started);
+            if spent >= SLOW_CALL_MS * ticks_per_ms() {
+                let java = if name.starts_with("jni:Call") { crate::imports::jni_host::last_method() } else { String::new() };
+                crate::log::line(&format!(
+                    "[slow] {name} {java} took {:.1} ms (thread {})",
+                    spent as f64 / ticks_per_ms() as f64,
+                    uc.get_data().id
+                ));
+            }
+            result
+        }
         None => {
             let mut shared = shared();
             if !shared.missing.iter().any(|missing| missing == name) {
