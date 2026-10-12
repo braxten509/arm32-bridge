@@ -12,6 +12,8 @@ use crate::mem::GuestMem;
 
 #[path = "arm.rs"]
 mod arm;
+#[path = "neon.rs"]
+mod neon;
 #[path = "vfp.rs"]
 mod vfp;
 pub use arm::translate as translate_arm;
@@ -67,12 +69,14 @@ struct Translator {
     in_it: bool,
     /// Thumb (true) or ARM (false) code.
     thumb: bool,
+    /// Host FPCR is in NEON's standard mode (see neon.rs); blocks start in the guest's FPSCR mode.
+    neon_fp: bool,
 }
 
 /// Translates the block starting at `start` (a Thumb address without bit 0).
 /// Returns the code and the guest address just past the last translated instruction.
 pub fn translate(mem: GuestMem, start: u32) -> (Vec<u32>, u32) {
-    let mut t = Translator { a: Asm::new(), mem, pc: start, size: 2, count: 0, in_it: false, thumb: true };
+    let mut t = Translator { a: Asm::new(), mem, pc: start, size: 2, count: 0, in_it: false, thumb: true, neon_fp: false };
     let end;
     loop {
         if t.count >= MAX_INSTRUCTIONS {
@@ -617,6 +621,7 @@ impl Translator {
             if condition != cond::AL {
                 self.a.b_cond_to(cond::invert(condition), skip);
             }
+            let fp_mode = self.neon_fp;
             match self.instruction(cond::AL) {
                 Ok(Flow::Next) => {}
                 Ok(Flow::End) => {
@@ -636,6 +641,11 @@ impl Translator {
                 }
             }
             self.a.bind(skip);
+            if self.neon_fp != fp_mode {
+                // The mode changed only if the instruction ran.
+                let neon = self.neon_fp;
+                self.set_fp_mode(neon);
+            }
             self.pc += self.size;
             self.count += 1;
         }
@@ -1046,6 +1056,9 @@ impl Translator {
                     self.multiply(h1, h2)
                 } else if op2 & 0b1111000 == 0b0111000 {
                     self.long_multiply(h1, h2)
+                } else if op2 & 0b1110001 == 0b0010000 {
+                    // Advanced SIMD loads and stores: 1111 1001 is ARM's 1111 0100
+                    self.neon_load_store(0xF400_0000 | ((h1 & 0xFF) << 16) | h2)
                 } else if op2 & 0b1000000 == 0b1000000 {
                     self.coprocessor(h1, h2)
                 } else {
@@ -1572,6 +1585,10 @@ impl Translator {
             }
             self.a.ldr_w_off(rt, host::STATE, offsets::TLS);
             return Ok(Flow::Next);
+        }
+        if h1 & 0xEF00 == 0xEF00 {
+            // Advanced SIMD data processing: 111U 1111 is ARM's 1111 001U
+            return self.neon_data(0xF200_0000 | (((h1 >> 12) & 1) << 24) | ((h1 & 0xFF) << 16) | h2);
         }
         if h1 & 0xFC00 == 0xEC00 {
             // VFP: the ARM encoding with condition 1110

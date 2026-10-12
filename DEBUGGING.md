@@ -82,3 +82,9 @@ engine.rs run(): an address at stub+4 (the `bx lr` half) just returns to LR. Tem
   ARM register-shifted MOV/MVN fix. Game with ARM32_CHECK=1: 1,077,554 checks, 0 differences, 30 ran past;
   55-75 fps under the checker (was ~3). Fallback sites 5345 -> 75; the rest are Thumb NEON (by-scalar float multiply,
   VLD1/VST1).
+- Without checker (engine=jit): 91-108 fps, game code 9-10 ms/frame; ~600k fallbacks/s, all Thumb NEON matrix code.
+- Sub-agent review (Sol 6.1 high): VMSR kept exception-enable bits (fixed: mask 0xFFF7009F); FPSCR LEN/STRIDE not
+  checked (fixed: dispatcher sends blocks to Unicorn while LEN/STRIDE != 0, and VMSR ends the block).
+- NEON (neon.rs): VLD1/VST1 1-4 regs and 32-bit lane, 3-same float/int/logic, VMUL/VMLA/VMLS.F32 by scalar; host FPCR
+  switched to the ARMv7 standard FPSCR value around NEON float. Game with checker: 1,310,720 checks, 0 differences,
+  90-107 fps under the checker; fewer than 4M fallbacks in 75 s (no stats print).

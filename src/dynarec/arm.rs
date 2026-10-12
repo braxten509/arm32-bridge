@@ -8,7 +8,7 @@ use super::{LR, MAX_INSTRUCTIONS, PC, SP, T0, T1, T2, T3, T4, T5, T6};
 /// Translates the ARM block starting at `start` (4-byte aligned).
 /// Returns the code and the guest address just past the last translated instruction.
 pub fn translate(mem: GuestMem, start: u32) -> (Vec<u32>, u32) {
-    let mut t = Translator { a: Asm::new(), mem, pc: start, size: 4, count: 0, in_it: false, thumb: false };
+    let mut t = Translator { a: Asm::new(), mem, pc: start, size: 4, count: 0, in_it: false, thumb: false, neon_fp: false };
     let end;
     loop {
         if t.count >= MAX_INSTRUCTIONS {
@@ -78,8 +78,14 @@ impl Translator {
         }
         let skip = self.a.label();
         self.a.b_cond_to(cond::invert(condition), skip);
+        let fp_mode = self.neon_fp;
         let flow = self.arm_body(word)?;
         self.a.bind(skip);
+        if flow == Flow::Next && self.neon_fp != fp_mode {
+            // The mode changed only if the instruction ran.
+            let neon = self.neon_fp;
+            self.set_fp_mode(neon);
+        }
         if flow == Flow::End {
             // The body branched when the condition held; otherwise continue after it.
             let next = self.next_pc();
@@ -96,6 +102,12 @@ impl Translator {
         if word & 0xFFFF_FF00 == 0xF57F_F000 && matches!((word >> 4) & 0xF, 4..=6) {
             // DSB / DMB / ISB: one guest thread runs at a time
             return Ok(Flow::Next);
+        }
+        if word >> 25 == 0b1111_001 {
+            return self.neon_data(word);
+        }
+        if word & 0xFF10_0000 == 0xF400_0000 {
+            return self.neon_load_store(word);
         }
         if (word >> 25) & 7 == 0b101 {
             // BLX <imm>: call Thumb code

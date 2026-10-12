@@ -13,9 +13,9 @@
 //! exit glue moves them); the compare flags (NZCV) stay in `CpuState::fpscr`.
 
 use crate::dynarec::emit::{fp, shift, Reg};
-use super::{host, offsets, Flow, Result, Translator};
+use super::{emit_exit, exit, host, offsets, Flow, Result, Translator};
 use super::{PC, T0, T1, T2};
-use crate::dynarec::{FPSCR_CONTROL, FPSCR_CUMULATIVE};
+use crate::dynarec::{FPSCR_CONTROL, FPSCR_CUMULATIVE, FPSCR_WRITABLE};
 
 // Scratch vector registers (never guest registers).
 const V0: Reg = 16;
@@ -93,6 +93,7 @@ impl Translator {
         if opc1 == 0b111 {
             return self.vfp_other(word, double, d, m);
         }
+        self.fp_mode(false);
         let vn = self.fp_read(n, V0);
         let vm = self.fp_read(m, V1);
         match opc1 {
@@ -139,6 +140,9 @@ impl Translator {
             self.a.fmov_imm(double, V0, imm8);
             self.fp_write(d, V0);
             return Ok(Flow::Next);
+        }
+        if (opc2, op7) != (0b0000, false) {
+            self.fp_mode(false);
         }
         match (opc2, op7) {
             (0b0000, false) => {
@@ -219,15 +223,21 @@ impl Translator {
                     if to_core {
                         self.vmrs(rt);
                     } else {
-                        // VMSR FPSCR, Rt
+                        // VMSR FPSCR, Rt. Bits without a function (exception enables) read as zero.
+                        // The block ends so the dispatcher sees a new LEN/STRIDE.
                         if rt == PC {
                             return Err(());
                         }
-                        self.a.str_w_off(rt, host::STATE, offsets::FPSCR);
-                        self.a.and_w_imm(T0, rt, FPSCR_CUMULATIVE, T1);
+                        self.a.and_w_imm(T2, rt, FPSCR_WRITABLE, T1);
+                        self.a.str_w_off(T2, host::STATE, offsets::FPSCR);
+                        self.a.and_w_imm(T0, T2, FPSCR_CUMULATIVE, T1);
                         self.a.msr_fpsr(T0);
-                        self.a.and_w_imm(T0, rt, FPSCR_CONTROL, T1);
+                        self.a.and_w_imm(T0, T2, FPSCR_CONTROL, T1);
                         self.a.msr_fpcr(T0);
+                        self.neon_fp = false;
+                        let next = self.next_pc() | self.mode_bit();
+                        emit_exit(&mut self.a, next, exit::JUMP);
+                        return Ok(Flow::End);
                     }
                     Ok(Flow::Next)
                 }

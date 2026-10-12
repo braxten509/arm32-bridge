@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 use unicorn_engine::RegisterARM;
 
 use super::emit::{cond, shift, Asm, SP};
-use super::{check, exit, host, offsets, thumb, CpuState, FPSCR_CONTROL, FPSCR_CUMULATIVE};
+use super::{check, exit, host, offsets, thumb, CpuState, FPSCR_CONTROL, FPSCR_CUMULATIVE, FPSCR_VECTOR};
 use crate::mem;
 use crate::runtime::{self, mem as guest_mem, GuestCpu, Uc, LR};
 
@@ -275,6 +275,11 @@ pub fn run(uc: &mut Uc, pc: u32, stop_at: u32) -> Result<(), String> {
                 return Err(format!("guest called exit({code})"));
             }
             pc = uc.reg(LR);
+            continue;
+        }
+        if uc.get_data().native.as_ref().unwrap().state.fpscr & FPSCR_VECTOR != 0 {
+            // VFP short vectors (never used on Android): leave the code to Unicorn.
+            pc = fallback(uc, pc, 1, stop_at)?;
             continue;
         }
         let (code, end, enter, exit_stub) = block_for(pc);

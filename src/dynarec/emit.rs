@@ -57,6 +57,20 @@ pub mod fp {
     pub const FCVT_TO_DOUBLE: u32 = 0x1E22_C000;
 }
 
+/// Three-register vector opcodes for `simd3` (element size in bits 22-23 for ADD/SUB).
+pub mod simd {
+    pub const ADD: u32 = 0x0E20_8400;
+    pub const SUB: u32 = 0x2E20_8400;
+    pub const AND: u32 = 0x0E20_1C00;
+    pub const BIC: u32 = 0x0E60_1C00;
+    pub const ORR: u32 = 0x0EA0_1C00;
+    pub const ORN: u32 = 0x0EE0_1C00;
+    pub const EOR: u32 = 0x2E20_1C00;
+    pub const FADD: u32 = 0x0E20_D400;
+    pub const FSUB: u32 = 0x0EA0_D400;
+    pub const FMUL: u32 = 0x2E20_DC00;
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Label(usize);
 
@@ -648,6 +662,18 @@ impl Asm {
         let op = if signed { 0x1E38_0000 } else { 0x1E39_0000 };
         self.emit(op | Self::fp_type(double) | (rn << 5) | rd);
     }
+    /// Three-register vector operation (`simd::ADD` and so on); `q` = 128 bits, `size` = element size code.
+    pub fn simd3(&mut self, op: u32, q: bool, size: u32, rd: Reg, rn: Reg, rm: Reg) {
+        self.emit(op | ((q as u32) << 30) | (size << 22) | (rm << 16) | (rn << 5) | rd);
+    }
+    /// fmul vd.4s/2s, vn.4s/2s, vm.s[index]
+    pub fn fmul_element(&mut self, q: bool, rd: Reg, rn: Reg, rm: Reg, index: u32) {
+        self.emit(0x0F80_9000 | ((q as u32) << 30) | ((index & 1) << 21) | ((index >> 1) << 11) | (rm << 16) | (rn << 5) | rd);
+    }
+    /// mov vd.16b, vn.16b
+    pub fn mov_vector(&mut self, rd: Reg, rn: Reg) {
+        self.simd3(simd::ORR, true, 0, rd, rn, rn);
+    }
     /// ld1 {vt.s/d}[lane], [xn] (with `post`: [xn], #4/#8)
     pub fn ld1_lane(&mut self, double: bool, rt: Reg, lane: u32, rn: Reg, post: bool) {
         self.lane_access(0x0040_0000, double, rt, lane, rn, post);
@@ -851,6 +877,33 @@ mod tests {
                 0x1E31_8830, 0x1F11_4830, 0x1F51_C830, 0x1F31_4830, 0x1F71_C830, 0x1E20_C230, 0x1E61_4230, 0x1E21_C230,
                 0x1E62_4230, 0x1E22_C230, 0x1E31_2200, 0x1E60_2208, 0x1E31_2210, 0x1E60_2218, 0x1E2E_1010, 0x1E7C_1010,
                 0x1E22_0210, 0x1E63_0210, 0x1E38_0230, 0x1E79_0230, 0x4D40_9223, 0x4DDF_8623, 0x4D9F_8223, 0x0D00_8623,
+            ]
+        );
+    }
+
+    /// Vector encodings checked against the NDK assembler.
+    #[test]
+    fn vector_encodings() {
+        let mut a = Asm::new();
+        a.simd3(simd::ADD, true, 2, 16, 1, 17); // add v16.4s
+        a.simd3(simd::SUB, false, 0, 16, 1, 17); // sub v16.8b
+        a.simd3(simd::ADD, true, 3, 16, 1, 17); // add v16.2d
+        a.simd3(simd::AND, true, 0, 16, 1, 17);
+        a.simd3(simd::BIC, false, 0, 16, 1, 17);
+        a.simd3(simd::ORR, true, 0, 16, 1, 17);
+        a.simd3(simd::ORN, false, 0, 16, 1, 17);
+        a.simd3(simd::EOR, true, 0, 16, 1, 17);
+        a.simd3(simd::FADD, true, 0, 16, 1, 17);
+        a.simd3(simd::FSUB, false, 0, 16, 1, 17);
+        a.simd3(simd::FMUL, true, 0, 16, 1, 17);
+        a.fmul_element(true, 16, 1, 7, 3);
+        a.fmul_element(false, 16, 1, 7, 1);
+        a.fmul_element(true, 16, 1, 7, 2);
+        assert_eq!(
+            a.code,
+            vec![
+                0x4EB1_8430, 0x2E31_8430, 0x4EF1_8430, 0x4E31_1C30, 0x0E71_1C30, 0x4EB1_1C30, 0x0EF1_1C30, 0x6E31_1C30,
+                0x4E31_D430, 0x0EB1_D430, 0x6E31_DC30, 0x4FA7_9830, 0x0FA7_9030, 0x4F87_9830,
             ]
         );
     }

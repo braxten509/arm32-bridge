@@ -80,6 +80,12 @@ pub const FPSCR_CONTROL: u32 = 0x07C0_0000;
 /// FPSCR cumulative exception flags (QC, IDC, IXC, UFC, OFC, DZC, IOC), kept in
 /// host FPSR (same positions).
 pub const FPSCR_CUMULATIVE: u32 = 0x0800_009F;
+/// FPSCR bits a VMSR can set (no exception enables, no FZ16), as on Cortex-A15 and in Unicorn.
+pub const FPSCR_WRITABLE: u32 = 0xFFF7_009F;
+/// The "standard FPSCR value" ARMv7 NEON floating point uses: flush-to-zero, default NaN, round to nearest.
+pub const FPSCR_STANDARD: u32 = 0x0300_0000;
+/// FPSCR LEN and STRIDE: VFP short vectors, which the translator does not do.
+pub const FPSCR_VECTOR: u32 = 0x0037_0000;
 
 /// Exit reasons (low 8 bits of `exit_reason`).
 pub mod exit {
