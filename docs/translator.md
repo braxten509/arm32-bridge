@@ -45,11 +45,17 @@ native (bench 20000: ~1370 ms on the PC vs ~145 ms native).
 
 ## Checker
 
-`ARM32_CHECK=1` runs every translated block twice from the same start state:
-first in Unicorn with a write hook that records (address, old value, new
-value) and then undoes the writes, then in the translator. Registers, flags
-and the recorded memory must match; the first difference is logged with
-both states and the block's disassembly.
+`ARM32_CHECK=1` (or the Android property `debug.arm32bridge.check=1`) turns the
+translator on and checks translated Thumb blocks: before a block runs, Unicorn
+runs the same instructions one at a time from the same registers, stopping
+where the block stops (the first step that does not move forward inside the
+block). A write hook records Unicorn's memory writes, which are then undone.
+After the translated block runs, registers, flags, Q/GE, d0-d31, FPSCR, the
+exit point and the recorded memory must match; the first difference per block
+is logged with the start registers and the block's code. `1` checks each
+block's first 32 runs and then every 1024th (fast enough to play); `all`
+checks every run. The summary line counts checks, differences and reference
+runs that could not finish in Unicorn.
 
 ## Pass checks (approved)
 

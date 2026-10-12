@@ -213,7 +213,7 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     };
-    if arm32_bridge::dynarec::enabled() && runtime::stats_enabled() {
+    if arm32_bridge::dynarec::enabled() && (runtime::stats_enabled() || arm32_bridge::dynarec::check::enabled()) {
         arm32_bridge::dynarec::print_stats();
     }
     code

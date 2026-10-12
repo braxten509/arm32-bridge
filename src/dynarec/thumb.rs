@@ -62,11 +62,14 @@ struct Translator {
 }
 
 /// Translates the block starting at `start` (a Thumb address without bit 0).
-pub fn translate(mem: GuestMem, start: u32) -> Vec<u32> {
+/// Returns the code and the guest address just past the last translated instruction.
+pub fn translate(mem: GuestMem, start: u32) -> (Vec<u32>, u32) {
     let mut t = Translator { a: Asm::new(), mem, pc: start, size: 2, count: 0, in_it: false };
+    let end;
     loop {
         if t.count >= MAX_INSTRUCTIONS {
             emit_exit(&mut t.a, t.pc | 1, exit::JUMP);
+            end = t.pc;
             break;
         }
         let checkpoint = t.a.checkpoint();
@@ -75,10 +78,14 @@ pub fn translate(mem: GuestMem, start: u32) -> Vec<u32> {
             // IT: translate the whole block or fall back for all of it.
             match t.it_block(first) {
                 Ok(Flow::Next) => continue,
-                Ok(Flow::End) => break,
+                Ok(Flow::End) => {
+                    end = t.pc;
+                    break;
+                }
                 Err(instructions) => {
                     t.a.rollback(checkpoint);
                     emit_exit(&mut t.a, t.pc | 1, exit::FALLBACK | ((instructions + 1) << 8));
+                    end = t.pc;
                     break;
                 }
             }
@@ -88,16 +95,20 @@ pub fn translate(mem: GuestMem, start: u32) -> Vec<u32> {
                 t.pc += t.size;
                 t.count += 1;
             }
-            Ok(Flow::End) => break,
+            Ok(Flow::End) => {
+                end = t.pc + t.size;
+                break;
+            }
             Err(()) => {
                 t.a.rollback(checkpoint);
                 emit_exit(&mut t.a, t.pc | 1, exit::FALLBACK | (1 << 8));
+                end = t.pc;
                 break;
             }
         }
     }
     t.a.finish();
-    t.a.code
+    (t.a.code, end)
 }
 
 /// Decodes a modified immediate (ThumbExpandImm): the value and, for

@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 use unicorn_engine::RegisterARM;
 
 use super::emit::{Asm, SP};
-use super::{exit, host, offsets, thumb, CpuState};
+use super::{check, exit, host, offsets, thumb, CpuState};
 use crate::mem;
 use crate::runtime::{self, mem as guest_mem, GuestCpu, Uc, LR};
 
@@ -19,23 +19,28 @@ pub struct Native {
     /// True while `state` holds the live registers (translated code or a
     /// handler it called); false while Unicorn holds them.
     pub active: bool,
+    /// The checker's Unicorn write hook is installed.
+    pub check_hook: bool,
 }
 
 impl Native {
     pub fn new(tls: u32) -> Native {
         let mut state = CpuState::default();
         state.tls = tls;
-        Native { state, active: false }
+        Native { state, active: false, check_hook: false }
     }
 }
 
 /// Whether guest code should run on the translator (ARM32_ENGINE=jit, or the
-/// Android property debug.arm32bridge.engine=jit).
+/// Android property debug.arm32bridge.engine=jit; the checker turns it on too).
 pub fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         if !cfg!(target_arch = "aarch64") {
             return false; // translated code is ARM64
+        }
+        if super::check::enabled() {
+            return true;
         }
         if let Ok(value) = std::env::var("ARM32_ENGINE") {
             return value == "jit";
@@ -45,7 +50,7 @@ pub fn enabled() -> bool {
 }
 
 #[cfg(target_os = "android")]
-fn property(name: &str) -> Option<String> {
+pub(super) fn property(name: &str) -> Option<String> {
     extern "C" {
         fn __system_property_get(name: *const libc::c_char, value: *mut libc::c_char) -> libc::c_int;
     }
@@ -56,7 +61,7 @@ fn property(name: &str) -> Option<String> {
 }
 
 #[cfg(not(target_os = "android"))]
-fn property(_name: &str) -> Option<String> {
+pub(super) fn property(_name: &str) -> Option<String> {
     None
 }
 
@@ -176,7 +181,8 @@ fn exit_code() -> Vec<u32> {
 
 struct Cache {
     memory: CodeMemory,
-    blocks: HashMap<u32, usize>,
+    /// Guest pc → (code address, guest address just past the block).
+    blocks: HashMap<u32, (usize, u32)>,
     /// Fallback sites: guest pc → times run in Unicorn (ARM32_STATS=1 prints them).
     fallbacks: HashMap<u32, u64>,
 }
@@ -192,24 +198,25 @@ fn with_cache<R>(work: impl FnOnce(&mut Cache) -> R) -> R {
     work(cache)
 }
 
-/// The translated block for a guest pc (bit 0 = Thumb), translating it on first use.
-fn block_for(pc: u32) -> (usize, usize, usize) {
+/// The translated block for a guest pc (bit 0 = Thumb), translating it on
+/// first use: (code, block end, enter glue, exit stub).
+fn block_for(pc: u32) -> (usize, u32, usize, usize) {
     with_cache(|cache| {
         let (enter, exit_stub) = (cache.memory.enter, cache.memory.exit_stub);
-        if let Some(&code) = cache.blocks.get(&pc) {
-            return (code, enter, exit_stub);
+        if let Some(&(code, end)) = cache.blocks.get(&pc) {
+            return (code, end, enter, exit_stub);
         }
-        let code = if pc & 1 == 1 {
+        let (code, end) = if pc & 1 == 1 {
             thumb::translate(guest_mem(), pc & !1)
         } else {
             // ARM-mode code runs in Unicorn for now.
             let mut a = Asm::new();
             thumb::emit_exit(&mut a, pc, exit::FALLBACK | (16 << 8));
-            a.code
+            (a.code, pc)
         };
         let address = cache.memory.place(&code);
-        cache.blocks.insert(pc, address);
-        (address, enter, exit_stub)
+        cache.blocks.insert(pc, (address, end));
+        (address, end, enter, exit_stub)
     })
 }
 
@@ -226,6 +233,12 @@ pub fn run(uc: &mut Uc, pc: u32, stop_at: u32) -> Result<(), String> {
         let address = pc & !1;
         if address >= mem::STUB_BASE && address < mem::STUB_BASE + mem::STUB_SIZE {
             // A phone function: `svc #index; bx lr`.
+            if address % 8 == 4 {
+                // The `bx lr` half: a Unicorn fallback stopped right after the
+                // `svc`, so the function already ran. Just return.
+                pc = uc.reg(LR);
+                continue;
+            }
             let index = (address - mem::STUB_BASE) / 8;
             if index < runtime::FIRST_STUB {
                 return Err(format!("guest returned to a stale return trap at {address:#010x}"));
@@ -241,10 +254,14 @@ pub fn run(uc: &mut Uc, pc: u32, stop_at: u32) -> Result<(), String> {
             pc = uc.reg(LR);
             continue;
         }
-        let (code, enter, exit_stub) = block_for(pc);
+        let (code, end, enter, exit_stub) = block_for(pc);
+        let reference = if check::enabled() { check::reference(uc, pc, end, stop_at) } else { None };
         let state = &mut uc.get_data_mut().native.as_mut().expect("translator state").state as *mut CpuState;
         let enter: EnterFn = unsafe { std::mem::transmute(enter) };
         let reason = unsafe { enter(state, memory_base, code, exit_stub) };
+        if let Some(reference) = reference {
+            check::compare(uc, pc, end, &reference);
+        }
         let state = unsafe { &mut *state };
         pc = state.exit_pc;
         match reason & 0xFF {
@@ -278,17 +295,12 @@ const CORE: [RegisterARM; 15] = [
 /// CPSR Q (bit 27) and GE (bits 16-19).
 const CPSR_Q_GE: u32 = 0x080F_0000;
 
-/// Runs `count` instructions at `pc` in Unicorn and returns where it stopped.
-fn fallback(uc: &mut Uc, pc: u32, count: u32, stop_at: u32) -> Result<u32, String> {
-    if crate::runtime::stats_enabled() {
-        with_cache(|cache| *cache.fallbacks.entry(pc).or_default() += 1);
-    }
-    let state = uc.get_data().native.as_ref().unwrap().state;
+/// Copies guest state into Unicorn. Only NZCV, Q and GE move between engines;
+/// Unicorn keeps its mode bits, and the Thumb bit comes from the start address.
+pub(super) fn write_unicorn(uc: &mut Uc, state: &CpuState) {
     for (i, register) in CORE.iter().enumerate() {
         uc.reg_write(*register, state.r[i] as u64).unwrap();
     }
-    // Only NZCV, Q and GE move between engines; Unicorn keeps its mode bits, and
-    // the Thumb bit comes from bit 0 of the start address.
     let current = uc.reg_read(RegisterARM::CPSR).unwrap() as u32;
     let cpsr = (current & !(0xF000_0000 | CPSR_Q_GE)) | (state.nzcv as u32 & 0xF000_0000) | (state.cpsr_other & CPSR_Q_GE);
     uc.reg_write(RegisterARM::CPSR, cpsr as u64).unwrap();
@@ -297,12 +309,10 @@ fn fallback(uc: &mut Uc, pc: u32, count: u32, stop_at: u32) -> Result<u32, Strin
     }
     uc.reg_write(RegisterARM::FPSCR, state.fpscr as u64).unwrap();
     uc.reg_write(RegisterARM::C13_C0_3, state.tls as u64).unwrap();
+}
 
-    uc.get_data_mut().native.as_mut().unwrap().active = false;
-    let result = uc.emu_start(pc as u64, stop_at as u64, 0, count as usize);
-    uc.get_data_mut().native.as_mut().unwrap().active = true;
-
-    let mut state = uc.get_data().native.as_ref().unwrap().state;
+/// Copies Unicorn's registers into `state` and returns its pc (bit 0 = Thumb).
+pub(super) fn read_unicorn(uc: &mut Uc, state: &mut CpuState) -> u32 {
     for (i, register) in CORE.iter().enumerate() {
         state.r[i] = uc.reg_read(*register).unwrap() as u32;
     }
@@ -313,9 +323,24 @@ fn fallback(uc: &mut Uc, pc: u32, count: u32, stop_at: u32) -> Result<u32, Strin
         state.set_dreg(i, uc.reg_read(runtime::double_register(i)).unwrap());
     }
     state.fpscr = uc.reg_read(RegisterARM::FPSCR).unwrap() as u32;
-    let new_pc = uc.reg_read(RegisterARM::PC).unwrap() as u32 | ((cpsr >> 5) & 1);
-    state.r[15] = new_pc & !1;
-    uc.get_data_mut().native.as_mut().unwrap().state = state;
+    let pc = uc.reg_read(RegisterARM::PC).unwrap() as u32 | ((cpsr >> 5) & 1);
+    state.r[15] = pc & !1;
+    pc
+}
+
+/// Runs `count` instructions at `pc` in Unicorn and returns where it stopped.
+fn fallback(uc: &mut Uc, pc: u32, count: u32, stop_at: u32) -> Result<u32, String> {
+    if crate::runtime::stats_enabled() {
+        with_cache(|cache| *cache.fallbacks.entry(pc).or_default() += 1);
+    }
+    let mut state = uc.get_data().native.as_ref().unwrap().state;
+    write_unicorn(uc, &state);
+    uc.get_data_mut().native.as_mut().unwrap().active = false;
+    let result = uc.emu_start(pc as u64, stop_at as u64, 0, count as usize);
+    let new_pc = read_unicorn(uc, &mut state);
+    let native = uc.get_data_mut().native.as_mut().unwrap();
+    native.active = true;
+    native.state = state;
 
     let thread = uc.get_data();
     if let Some(fault) = &thread.fault {
@@ -347,4 +372,7 @@ pub fn print_stats() {
             crate::log::line(&format!("[jit]   {count:8} x {address:#010x} {} {text}", if thumb { "T" } else { "A" }));
         }
     });
+    if check::enabled() {
+        check::print_summary();
+    }
 }

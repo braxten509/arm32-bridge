@@ -5,6 +5,7 @@
 //! q0-q15 → v0-v15). Anything not translated yet runs in this thread's
 //! Unicorn engine for a few instructions ("fallback").
 
+pub mod check;
 pub mod emit;
 pub mod thumb;
 
