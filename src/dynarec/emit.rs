@@ -88,6 +88,10 @@ pub struct Asm {
     pub code: Vec<u32>,
     labels: Vec<Option<usize>>,
     fixups: Vec<(usize, Label, Fixup)>,
+    /// Exits to a fixed guest pc: (word index of a `nop` to patch into `b <block>`, guest pc).
+    pub links: Vec<(usize, u32)>,
+    /// Exits may not link to other blocks or use the jump table (host FPCR is not in the guest's mode).
+    pub no_link: bool,
 }
 
 impl Asm {
@@ -112,6 +116,7 @@ impl Asm {
         self.code.truncate(checkpoint.0);
         self.labels.truncate(checkpoint.1);
         self.fixups.truncate(checkpoint.2);
+        self.links.retain(|&(at, _)| at < checkpoint.0);
     }
 
     pub fn label(&mut self) -> Label {
@@ -290,6 +295,10 @@ impl Asm {
     /// xd = xn + zero-extended wm (host address of a guest address).
     pub fn add_x_uxtw(&mut self, rd: Reg, rn: Reg, rm: Reg) {
         self.emit(0x8B20_0000 | (rm << 16) | (0b010 << 13) | (rn << 5) | rd);
+    }
+    /// add xd, xn, xm, lsl #amount
+    pub fn add_x_lsl(&mut self, rd: Reg, rn: Reg, rm: Reg, amount: u32) {
+        self.emit(0x8B00_0000 | (rm << 16) | (amount << 10) | (rn << 5) | rd);
     }
     pub fn add_x(&mut self, rd: Reg, rn: Reg, rm: Reg) {
         self.emit(0x8B00_0000 | (rm << 16) | (rn << 5) | rd);

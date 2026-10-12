@@ -94,3 +94,10 @@ engine.rs run(): an address at stub+4 (the `bx lr` half) just returns to LR. Tem
   per frame (goal <=3 ms); phone functions 2.9-4.2 ms (glClear screen wait ~5 ms on most frames, excluded).
 - Spikes: own code 45-59 ms every few seconds (unknown yet); glDrawElements 16-31 ms inside the GPU driver.
 - Next: simpleperf profile of the game process before choosing what to change.
+- Sub-agent review (Gemini 3.8 high): enter glue compared masked guest control bits with the unmasked host FPCR
+  (would rewrite FPCR every block if the host had other bits set). Fixed: mask both. Everything else confirmed.
+- Profile (simpleperf, 8 s, menu): engine::run 34%, call_stub 12%, SipHash block lookup 7%, malloc/free 4%,
+  translated code incl. glue ~20%. Dispatcher overhead dominates -> stage 6 (block links + jump table).
+- Stage 6 (block links + 4096-entry jump table + cheap pc hash): self-test 0 failures (all engines); bench 141-144 ms
+  vs native 106-147 ms (~1.0-1.3x); menu 119.8-120.1 fps, own code 2.2-2.4 ms/frame, own-code spikes up to 8.4 ms,
+  slowest frame 25.6 ms (phone functions).

@@ -2,6 +2,8 @@
 //! block cache and the dispatch loop with its Unicorn fallback.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 use unicorn_engine::RegisterARM;
@@ -134,7 +136,8 @@ fn enter_code() -> Vec<u32> {
     a.str_w_off(16, host::STATE, offsets::HOST_FPCR);
     a.ldr_w_off(24, host::STATE, offsets::FPSCR);
     a.and_w_imm(25, 24, FPSCR_CONTROL, 26);
-    a.cmp_w(25, 16);
+    a.and_w_imm(27, 16, FPSCR_CONTROL, 26);
+    a.cmp_w(25, 27);
     let same = a.label();
     a.b_cond_to(cond::EQ, same);
     a.msr_fpcr(25);
@@ -208,10 +211,63 @@ fn exit_code() -> Vec<u32> {
 
 // ---- block cache (shared by all threads; only used under the guest lock) ----
 
+/// A cheap hash for guest addresses (the default SipHash showed up in profiles).
+#[derive(Default)]
+struct PcHasher(u64);
+
+impl Hasher for PcHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.write_u32(byte as u32);
+        }
+    }
+    fn write_u32(&mut self, value: u32) {
+        let mixed = (self.0 ^ value as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.0 = mixed ^ (mixed >> 32);
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type PcMap<V> = HashMap<u32, V, BuildHasherDefault<PcHasher>>;
+
+/// Jump table for computed jumps in translated code (`emit_exit_to`):
+/// 2^JUMP_TABLE_BITS entries indexed by guest pc bits 1 and up.
+pub(super) const JUMP_TABLE_BITS: u32 = 12;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct JumpEntry {
+    guest_pc: u32,
+    _pad: u32,
+    code: usize,
+}
+
+/// Address of the jump table, or 0 when blocks are not linked.
+static JUMP_TABLE: AtomicUsize = AtomicUsize::new(0);
+
+pub(super) fn jump_table() -> usize {
+    JUMP_TABLE.load(Ordering::Relaxed)
+}
+
+/// Whether translated blocks jump straight to each other (off under the
+/// checker, which compares one block at a time, or with debug.arm32bridge.link=0).
+fn linking() -> bool {
+    static LINKING: OnceLock<bool> = OnceLock::new();
+    *LINKING.get_or_init(|| {
+        let setting = std::env::var("ARM32_LINK").ok().or_else(|| property("debug.arm32bridge.link"));
+        !check::enabled() && setting.as_deref() != Some("0")
+    })
+}
+
 struct Cache {
     memory: CodeMemory,
     /// Guest pc → (code address, guest address just past the block).
-    blocks: HashMap<u32, (usize, u32)>,
+    blocks: PcMap<(usize, u32)>,
+    /// Guest pc not translated yet → exits waiting to be linked to it.
+    pending: PcMap<Vec<usize>>,
+    table: Box<[JumpEntry]>,
     /// Fallback sites: guest pc → times run in Unicorn (ARM32_STATS=1 prints them).
     fallbacks: HashMap<u32, u64>,
     fallback_total: u64,
@@ -224,8 +280,31 @@ static CACHE: GuardedCache = GuardedCache(std::cell::RefCell::new(None));
 fn with_cache<R>(work: impl FnOnce(&mut Cache) -> R) -> R {
     debug_assert!(runtime::gil_held());
     let mut cache = CACHE.0.borrow_mut();
-    let cache = cache.get_or_insert_with(|| Cache { memory: CodeMemory::new(), blocks: HashMap::new(), fallbacks: HashMap::new(), fallback_total: 0 });
+    let cache = cache.get_or_insert_with(|| {
+        let table = vec![JumpEntry { guest_pc: u32::MAX, _pad: 0, code: 0 }; 1 << JUMP_TABLE_BITS].into_boxed_slice();
+        if linking() {
+            JUMP_TABLE.store(table.as_ptr() as usize, Ordering::Relaxed);
+        }
+        Cache {
+            memory: CodeMemory::new(),
+            blocks: PcMap::default(),
+            pending: PcMap::default(),
+            table,
+            fallbacks: HashMap::new(),
+            fallback_total: 0,
+        }
+    });
     work(cache)
+}
+
+/// Turns the `nop` at `site` into `b target`.
+fn patch_link(site: usize, target: usize) {
+    let offset = (target as i64 - site as i64) / 4;
+    let word = 0x1400_0000 | (offset as u32 & 0x03FF_FFFF);
+    unsafe {
+        std::ptr::write_volatile(site as *mut u32, word);
+        __clear_cache(site as *mut libc::c_char, (site + 4) as *mut libc::c_char);
+    }
 }
 
 /// The translated block for a guest pc (bit 0 = Thumb), translating it on
@@ -234,12 +313,31 @@ fn block_for(pc: u32) -> (usize, u32, usize, usize) {
     with_cache(|cache| {
         let (enter, exit_stub) = (cache.memory.enter, cache.memory.exit_stub);
         if let Some(&(code, end)) = cache.blocks.get(&pc) {
+            if linking() {
+                // A jump-table miss: the entry may belong to another pc with the same index.
+                cache.table[((pc >> 1) & ((1 << JUMP_TABLE_BITS) - 1)) as usize] = JumpEntry { guest_pc: pc, _pad: 0, code };
+            }
             return (code, end, enter, exit_stub);
         }
-        let (code, end) = if pc & 1 == 1 { thumb::translate(guest_mem(), pc & !1) } else { thumb::translate_arm(guest_mem(), pc) };
-        let address = cache.memory.place(&code);
-        cache.blocks.insert(pc, (address, end));
-        (address, end, enter, exit_stub)
+        let block = if pc & 1 == 1 { thumb::translate(guest_mem(), pc & !1) } else { thumb::translate_arm(guest_mem(), pc) };
+        let address = cache.memory.place(&block.code);
+        cache.blocks.insert(pc, (address, block.end));
+        if linking() {
+            for &(at, target) in &block.links {
+                let site = address + at * 4;
+                if let Some(&(code, _)) = cache.blocks.get(&target) {
+                    patch_link(site, code);
+                } else if !(mem::STUB_BASE..mem::STUB_BASE + mem::STUB_SIZE).contains(&(target & !1)) {
+                    cache.pending.entry(target).or_default().push(site);
+                }
+            }
+            for site in cache.pending.remove(&pc).unwrap_or_default() {
+                patch_link(site, address);
+            }
+            let entry = &mut cache.table[((pc >> 1) & ((1 << JUMP_TABLE_BITS) - 1)) as usize];
+            *entry = JumpEntry { guest_pc: pc, _pad: 0, code: address };
+        }
+        (address, block.end, enter, exit_stub)
     })
 }
 

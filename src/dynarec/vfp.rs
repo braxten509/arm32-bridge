@@ -236,7 +236,10 @@ impl Translator {
                         self.a.msr_fpcr(T0);
                         self.neon_fp = false;
                         let next = self.next_pc() | self.mode_bit();
+                        // Unlinked: the dispatcher checks the new LEN/STRIDE.
+                        self.a.no_link = true;
                         emit_exit(&mut self.a, next, exit::JUMP);
+                        self.a.no_link = false;
                         return Ok(Flow::End);
                     }
                     Ok(Flow::Next)

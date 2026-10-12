@@ -40,6 +40,7 @@ impl Translator {
         }
         self.a.msr_fpcr(T0);
         self.neon_fp = neon;
+        self.a.no_link = neon;
     }
 
     /// A host register holding guest d(n) in its low half, or guest q(n/2).

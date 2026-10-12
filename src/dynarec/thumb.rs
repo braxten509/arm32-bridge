@@ -35,13 +35,33 @@ const SP: u32 = 13;
 
 /// Ends a block: continue at `pc` (bit 0 = Thumb) for `reason`.
 pub fn emit_exit(a: &mut Asm, pc: u32, reason: u32) {
+    if reason == exit::JUMP && !a.no_link {
+        // Becomes `b <block>` once the block at `pc` is translated (engine.rs).
+        a.links.push((a.len(), pc));
+        a.nop();
+    }
     a.mov_w_imm(host::EXIT_PC, pc);
     a.mov_w_imm(host::EXIT_REASON, reason);
     a.br(host::EXIT_STUB);
 }
 
-/// Ends a block: continue at the address in `target` (bit 0 = Thumb).
+/// Ends a block: continue at the address in `target` (bit 0 = Thumb). With
+/// linking on, the jump table (engine.rs) is tried first; a miss goes to the
+/// dispatcher, which fills the table.
 fn emit_exit_to(a: &mut Asm, target: Reg) {
+    let table = super::engine::jump_table();
+    if table != 0 && !a.no_link {
+        let miss = a.label();
+        a.mov_x_imm(T0, table as u64);
+        a.ubfx_w(T1, target, 1, super::engine::JUMP_TABLE_BITS);
+        a.add_x_lsl(T0, T0, T1, 4);
+        a.ldr_w_off(T1, T0, 0);
+        a.eor_w(T1, T1, target, shift::LSL, 0); // no compare: the guest flags live in NZCV
+        a.cbnz_w_to(T1, miss);
+        a.ldr_x_off(T0, T0, 8);
+        a.br(T0);
+        a.bind(miss);
+    }
     a.mov_w(host::EXIT_PC, target);
     a.mov_w_imm(host::EXIT_REASON, exit::JUMP);
     a.br(host::EXIT_STUB);
@@ -73,9 +93,16 @@ struct Translator {
     neon_fp: bool,
 }
 
+/// A translated block: code, the guest address just past its last
+/// instruction, and its exits to fixed guest addresses (see `Asm::links`).
+pub struct Block {
+    pub code: Vec<u32>,
+    pub end: u32,
+    pub links: Vec<(usize, u32)>,
+}
+
 /// Translates the block starting at `start` (a Thumb address without bit 0).
-/// Returns the code and the guest address just past the last translated instruction.
-pub fn translate(mem: GuestMem, start: u32) -> (Vec<u32>, u32) {
+pub fn translate(mem: GuestMem, start: u32) -> Block {
     let mut t = Translator { a: Asm::new(), mem, pc: start, size: 2, count: 0, in_it: false, thumb: true, neon_fp: false };
     let end;
     loop {
@@ -120,7 +147,7 @@ pub fn translate(mem: GuestMem, start: u32) -> (Vec<u32>, u32) {
         }
     }
     t.a.finish();
-    (t.a.code, end)
+    Block { code: t.a.code, end, links: t.a.links }
 }
 
 /// Decodes a modified immediate (ThumbExpandImm): the value and, for

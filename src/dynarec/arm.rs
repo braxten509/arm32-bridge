@@ -2,12 +2,11 @@
 //! Every ARM instruction has a condition; a conditional one is wrapped in a
 //! branch over it, like an instruction in a Thumb IT block.
 
-use super::{cond, emit_exit, emit_exit_to, exit, host, offsets, shift, sign_extend, Asm, Flow, GuestMem, Reg, Result, Translator};
+use super::{cond, emit_exit, emit_exit_to, exit, host, offsets, shift, sign_extend, Asm, Block, Flow, GuestMem, Reg, Result, Translator};
 use super::{LR, MAX_INSTRUCTIONS, PC, SP, T0, T1, T2, T3, T4, T5, T6};
 
 /// Translates the ARM block starting at `start` (4-byte aligned).
-/// Returns the code and the guest address just past the last translated instruction.
-pub fn translate(mem: GuestMem, start: u32) -> (Vec<u32>, u32) {
+pub fn translate(mem: GuestMem, start: u32) -> Block {
     let mut t = Translator { a: Asm::new(), mem, pc: start, size: 4, count: 0, in_it: false, thumb: false, neon_fp: false };
     let end;
     loop {
@@ -36,7 +35,7 @@ pub fn translate(mem: GuestMem, start: u32) -> (Vec<u32>, u32) {
         }
     }
     t.a.finish();
-    (t.a.code, end)
+    Block { code: t.a.code, end, links: t.a.links }
 }
 
 /// The ARM data-processing opcodes in the Thumb-2 numbering `data_processing` uses.
