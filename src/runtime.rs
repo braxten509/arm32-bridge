@@ -39,7 +39,8 @@ pub enum Ret {
 pub type Handler = fn(&mut Uc, &mut Args) -> Ret;
 
 pub struct Stub {
-    pub name: String,
+    /// Made once per stub and never freed, so it can be passed around for free.
+    pub name: &'static str,
     pub handler: Option<Handler>,
     pub calls: u64,
 }
@@ -68,7 +69,7 @@ pub struct Shared {
     pub first_use: Vec<u32>,
     /// Names called that have no handler yet (they return 0).
     pub missing: Vec<String>,
-    pub recent: VecDeque<String>,
+    pub recent: VecDeque<&'static str>,
     pub next_thread_id: u32,
     next_stack_top: u32,
     pub state: crate::imports::State,
@@ -102,7 +103,7 @@ pub struct Thread {
     pub tls_block: u32,
     pub stack_top: u32,
     /// Name of the phone function being handled right now.
-    pub current_call: String,
+    pub current_call: &'static str,
 }
 
 struct GuardedShared(RefCell<Option<Shared>>);
@@ -258,13 +259,14 @@ fn new_engine(stack_size: u32) -> Uc {
         errno_slot,
         tls_block,
         stack_top,
-        current_call: String::new(),
+        current_call: "",
     };
     let mut uc = Unicorn::new_with_data(Arch::ARM, Mode::ARM, thread).expect("start Unicorn");
     uc.ctl_set_cpu_model(ArmCpuModel::CORTEX_A15 as i32).expect("pick Cortex-A15 (ARMv7 + NEON)");
-    for (start, end) in mem::MAPPED_REGIONS {
+    for (start, end, code) in mem::MAPPED_REGIONS {
+        let protection = if code { Prot::ALL } else { Prot::READ | Prot::WRITE };
         unsafe {
-            uc.mem_map_ptr(start as u64, (end - start) as u64, Prot::ALL, memory.host(start).cast())
+            uc.mem_map_ptr(start as u64, (end - start) as u64, protection, memory.host(start).cast())
                 .expect("map guest region");
         }
     }
@@ -290,7 +292,8 @@ pub fn stub_for(name: &str) -> u32 {
     }
     let index = FIRST_STUB + shared.stubs.len() as u32;
     assert!(index * 8 < mem::STUB_SIZE, "too many stubs");
-    shared.stubs.push(Stub { name: name.to_string(), handler: crate::imports::handler_for(name), calls: 0 });
+    let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
+    shared.stubs.push(Stub { name: leaked, handler: crate::imports::handler_for(name), calls: 0 });
     shared.stub_by_name.insert(name.to_string(), index);
     let address = mem::STUB_BASE + index * 8;
     mem().write_u32(address, SVC | index);
@@ -320,7 +323,7 @@ fn on_interrupt(uc: &mut Unicorn<'_, Thread>, interrupt: u32) {
         let stub = &mut shared.stubs[(index - FIRST_STUB) as usize];
         stub.calls += 1;
         let first = stub.calls == 1;
-        let name = stub.name.clone();
+        let name = stub.name;
         let handler = stub.handler;
         if first {
             shared.first_use.push(index);
@@ -328,10 +331,10 @@ fn on_interrupt(uc: &mut Unicorn<'_, Thread>, interrupt: u32) {
         if shared.recent.len() == 32 {
             shared.recent.pop_front();
         }
-        shared.recent.push_back(name.clone());
+        shared.recent.push_back(name);
         (handler, name, shared.trace)
     };
-    uc.get_data_mut().current_call = name.clone();
+    uc.get_data_mut().current_call = name;
 
     let mut args = Args::from_registers(uc);
     if trace {
@@ -342,8 +345,8 @@ fn on_interrupt(uc: &mut Unicorn<'_, Thread>, interrupt: u32) {
         Some(handler) => handler(uc, &mut args),
         None => {
             let mut shared = shared();
-            if !shared.missing.contains(&name) {
-                shared.missing.push(name.clone());
+            if !shared.missing.iter().any(|missing| missing == name) {
+                shared.missing.push(name.to_string());
                 crate::log::line(&format!("[bridge] no handler yet for {name}; returning 0"));
             }
             Ret::U32(0)

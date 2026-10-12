@@ -23,13 +23,15 @@ pub const MISC_END: u32 = 0xD000_0000;
 pub const STACK_BASE: u32 = 0xE000_0000;
 pub const STACK_TOP: u32 = 0xF000_0000;
 
-/// Regions handed to Unicorn. Everything else faults when touched.
-pub const MAPPED_REGIONS: [(u32, u32); 5] = [
-    (STUB_BASE, STUB_BASE + STUB_SIZE),
-    (LIB_BASE, LIB_END),
-    (HEAP_BASE, HEAP_END),
-    (MISC_BASE, MISC_END),
-    (STACK_BASE, STACK_TOP),
+/// Regions handed to Unicorn as (start, end, may hold code). Everything else
+/// faults when touched. Writes to code regions pay for a self-modifying-code
+/// check (see vendor/unicorn-engine-sys), so only stubs and libraries get it.
+pub const MAPPED_REGIONS: [(u32, u32, bool); 5] = [
+    (STUB_BASE, STUB_BASE + STUB_SIZE, true),
+    (LIB_BASE, LIB_END, true),
+    (HEAP_BASE, HEAP_END, false),
+    (MISC_BASE, MISC_END, false),
+    (STACK_BASE, STACK_TOP, false),
 ];
 
 #[derive(Clone, Copy)]

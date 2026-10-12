@@ -212,8 +212,8 @@ fn element_size(name: &str) -> u32 {
 
 /// One handler for every JNI entry; it switches on the stub being called.
 fn dispatch(uc: &mut Uc, a: &mut Args) -> Ret {
-    let full_name = uc.get_data().current_call.clone();
-    let name = full_name.strip_prefix("jni:").unwrap_or(&full_name);
+    let full_name = uc.get_data().current_call;
+    let name = full_name.strip_prefix("jni:").unwrap_or(full_name);
     if super::jni_host::active() {
         return super::jni_host::dispatch(uc, name, a);
     }

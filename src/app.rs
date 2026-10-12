@@ -51,7 +51,7 @@ impl HostValue {
 
 fn fail(message: &str) -> ! {
     crate::log::write(6, "arm32bridge", message.as_bytes());
-    let recent: Vec<String> = shared().recent.iter().cloned().collect();
+    let recent: Vec<&str> = shared().recent.iter().copied().collect();
     crate::log::write(6, "arm32bridge", format!("last phone functions: {}", recent.join(", ")).as_bytes());
     std::process::abort();
 }

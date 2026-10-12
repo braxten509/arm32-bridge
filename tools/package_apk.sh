@@ -4,6 +4,7 @@
 # - lib<main>.so (the game's 32-bit code) is packed as lib/arm64-v8a/libgame32.so
 #   and replaced by the bridge, built with entry points for this game.
 # - Other 32-bit libraries get 64-bit stand-ins (tools/gen_stub_lib.py).
+# - Known Java-side bugs are fixed in the dex files (tools/patch_dex.py).
 # - The APK is re-signed with the debug key (the original signature can't survive).
 #
 # usage: tools/package_apk.sh <original.apk> <main library name, e.g. cocos2dcpp> <output.apk>
@@ -43,6 +44,17 @@ echo "== APK"
 cp "$APK" "$WORK/unsigned.apk"
 zip -q -d "$WORK/unsigned.apk" 'lib/*' 'META-INF/MANIFEST.MF' 'META-INF/*.SF' 'META-INF/*.RSA' 'META-INF/*.DSA' >/dev/null || true
 (cd "$WORK/stage" && zip -q -r "$WORK/unsigned.apk" lib)
+
+echo "== Java fixes"
+mkdir -p "$WORK/dex"
+cp "$WORK"/unpacked/classes*.dex "$WORK/dex/"
+python3 -I "$ROOT/tools/patch_dex.py" "$BUILD_TOOLS/dexdump" "$WORK"/dex/classes*.dex
+for dex in "$WORK"/dex/classes*.dex; do
+    if ! cmp -s "$dex" "$WORK/unpacked/$(basename "$dex")"; then
+        zip -q -d "$WORK/unsigned.apk" "$(basename "$dex")"
+        (cd "$WORK/dex" && zip -q "$WORK/unsigned.apk" "$(basename "$dex")")
+    fi
+done
 "$BUILD_TOOLS/zipalign" -f -p 4 "$WORK/unsigned.apk" "$WORK/aligned.apk"
 "$BUILD_TOOLS/apksigner" sign --ks "$HOME/.android/debug.keystore" --ks-pass pass:android --key-pass pass:android \
     --ks-key-alias androiddebugkey --out "$OUT" "$WORK/aligned.apk"

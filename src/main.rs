@@ -97,7 +97,7 @@ fn print_report(uc: &Uc) {
 fn print_fault(uc: &Uc, error: &str) {
     println!("\nFAILED: {error}");
     let _ = uc;
-    let recent: Vec<String> = runtime::shared().recent.iter().cloned().collect();
+    let recent: Vec<&str> = runtime::shared().recent.iter().copied().collect();
     println!("Last phone functions called: {}", recent.join(", "));
 }
 

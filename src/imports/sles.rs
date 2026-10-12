@@ -364,7 +364,7 @@ fn create_object(a: &mut Args, host: usize, index: usize, with_source: bool, wit
 }
 
 fn dispatch(uc: &mut Uc, a: &mut Args) -> Ret {
-    let name = uc.get_data().current_call.clone();
+    let name = uc.get_data().current_call;
     let Some((kind, method)) = name.trim_start_matches("sl:").split_once('.') else { return Ret::U32(0) };
     let this = a.u32();
     let host = unwrap(this);
