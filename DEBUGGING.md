@@ -115,3 +115,10 @@ engine.rs run(): an address at stub+4 (the `bx lr` half) just returns to LR. Tem
   .so 16% (call_stub 10.5% self, incl. inlined handlers), kernel 16%, libc 13% (allocations are in gralloc/EGL during
   eglSwapBuffers/glClear, not the bridge), translate() 0.03%, Unicorn ~0. So: the game's own level-loading work, not
   translation or fallbacks.
+- Play test (user approved moves), engine=jit, 8 matches over ~106 s: every second >=115 fps (median 120), slowest
+  play frame 32 ms; opening the level 74 ms; SurfaceFlinger timestats 15,573 frames, 0 dropped, 0 janky. Repeating
+  22-32 ms frame (own code) about every 5 s. The ~1 s freeze is the first load of the village map after Continue on
+  the title screen (999 ms, own 838 ms), not opening a level.
+- Check 2 in play: checker=1, start-up + resumed level + 4 matches: 2,097,152 checks, 0 differences, 50 ran past.
+  User saw stutters during this checker run (checker replays sampled blocks in Unicorn). Translator restarted for
+  the user to judge without the checker.
