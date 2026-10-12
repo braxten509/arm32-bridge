@@ -91,22 +91,56 @@ const DOUBLE_REGISTERS: [RegisterARM; 32] = [
     RegisterARM::D31,
 ];
 
+/// The translator's registers, when they are the live ones.
+fn live_native(uc: &Uc) -> Option<&crate::dynarec::CpuState> {
+    uc.get_data().native.as_ref().filter(|native| native.active).map(|native| &native.state)
+}
+
+fn live_native_mut(uc: &mut Uc) -> Option<&mut crate::dynarec::CpuState> {
+    uc.get_data_mut().native.as_mut().filter(|native| native.active).map(|native| &mut native.state)
+}
+
 impl GuestCpu for Uc {
     fn reg(&self, index: usize) -> u32 {
-        self.reg_read(CORE_REGISTERS[index]).unwrap() as u32
+        match live_native(self) {
+            Some(state) => state.r[index],
+            None => self.reg_read(CORE_REGISTERS[index]).unwrap() as u32,
+        }
     }
     fn set_reg(&mut self, index: usize, value: u32) {
-        self.reg_write(CORE_REGISTERS[index], value as u64).unwrap();
+        match live_native_mut(self) {
+            Some(state) => state.r[index] = value,
+            None => self.reg_write(CORE_REGISTERS[index], value as u64).unwrap(),
+        }
     }
     fn dreg(&self, index: usize) -> u64 {
-        self.reg_read(DOUBLE_REGISTERS[index]).unwrap()
+        match live_native(self) {
+            Some(state) => state.dreg(index),
+            None => self.reg_read(DOUBLE_REGISTERS[index]).unwrap(),
+        }
     }
     fn set_dreg(&mut self, index: usize, value: u64) {
-        self.reg_write(DOUBLE_REGISTERS[index], value).unwrap();
+        match live_native_mut(self) {
+            Some(state) => state.set_dreg(index, value),
+            None => self.reg_write(DOUBLE_REGISTERS[index], value).unwrap(),
+        }
     }
     fn stop(&mut self) {
-        self.emu_stop().unwrap();
+        // The translator checks `fault` / `exit_code` after every phone function.
+        if live_native(self).is_none() {
+            self.emu_stop().unwrap();
+        }
     }
+}
+
+pub fn double_register(index: usize) -> RegisterARM {
+    DOUBLE_REGISTERS[index]
+}
+
+/// ARM32_STATS=1: count translator fallbacks and print them at the end.
+pub fn stats_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ARM32_STATS").is_ok_and(|v| v == "1"))
 }
 
 pub const SP: usize = 13;
@@ -221,6 +255,8 @@ pub struct Thread {
     pub stack_top: u32,
     /// Name of the phone function being handled right now.
     pub current_call: &'static str,
+    /// Translator state, once this thread has run translated code.
+    pub native: Option<Box<crate::dynarec::Native>>,
 }
 
 struct GuardedShared(RefCell<Option<Shared>>);
@@ -377,6 +413,7 @@ fn new_engine(stack_size: u32) -> Uc {
         tls_block,
         stack_top,
         current_call: "",
+        native: None,
     };
     let mut uc = Unicorn::new_with_data(Arch::ARM, Mode::ARM, thread).expect("start Unicorn");
     uc.ctl_set_cpu_model(ArmCpuModel::CORTEX_A15 as i32).expect("pick Cortex-A15 (ARMv7 + NEON)");
@@ -435,6 +472,14 @@ fn on_interrupt(uc: &mut Unicorn<'_, Thread>, interrupt: u32) {
         return;
     }
     let index = mem().read_u32(svc_address) & 0x00FF_FFFF;
+    call_stub(uc, index);
+    if uc.get_data().fault.is_some() || uc.get_data().exit_code.is_some() {
+        uc.stop();
+    }
+}
+
+/// Runs the handler for phone function `index` with the current registers.
+pub fn call_stub(uc: &mut Uc, index: u32) {
     let (handler, name, trace) = {
         let mut shared = shared();
         let stub = &mut shared.stubs[(index - FIRST_STUB) as usize];
@@ -484,9 +529,6 @@ fn on_interrupt(uc: &mut Unicorn<'_, Thread>, interrupt: u32) {
         }
     };
     write_result(uc, result);
-    if uc.get_data().fault.is_some() || uc.get_data().exit_code.is_some() {
-        uc.stop();
-    }
 }
 
 /// Puts a handler's result where a softfp caller expects it (r0, or r0:r1).
@@ -629,6 +671,11 @@ pub fn call_guest_with(uc: &mut Uc, address: u32, args: &[Arg]) -> Result<u64, S
     if depth >= MAX_DEPTH {
         return Err("guest calls nested too deeply".into());
     }
+    // The translator runs top-level calls and calls made from its own
+    // handlers; calls made while Unicorn is running stay in Unicorn.
+    if crate::dynarec::enabled() && (depth == 0 || live_native(uc).is_some()) {
+        return call_guest_native(uc, address, args, depth);
+    }
     let saved = if depth > 0 {
         let mut context = uc.context_alloc().map_err(|e| format!("{e:?}"))?;
         uc.context_save(&mut context).map_err(|e| format!("{e:?}"))?;
@@ -637,38 +684,7 @@ pub fn call_guest_with(uc: &mut Uc, address: u32, args: &[Arg]) -> Result<u64, S
         None
     };
 
-    // Lay the arguments out: registers r0-r3, then the stack.
-    let mut registers = [0u32; 4];
-    let mut next_register = 0usize;
-    let mut stack_words: Vec<u32> = Vec::new();
-    for arg in args {
-        match *arg {
-            Arg::Word(value) => {
-                if next_register < 4 {
-                    registers[next_register] = value;
-                    next_register += 1;
-                } else {
-                    stack_words.push(value);
-                }
-            }
-            Arg::Pair(value) => {
-                next_register = (next_register + 1) & !1;
-                if next_register < 4 {
-                    registers[next_register] = value as u32;
-                    registers[next_register + 1] = (value >> 32) as u32;
-                    next_register += 2;
-                } else {
-                    next_register = 4;
-                    if stack_words.len() % 2 == 1 {
-                        stack_words.push(0);
-                    }
-                    stack_words.push(value as u32);
-                    stack_words.push((value >> 32) as u32);
-                }
-            }
-        }
-    }
-
+    let (registers, stack_words) = lay_out_arguments(args);
     let mut sp = if depth > 0 {
         (uc.reg_read(RegisterARM::SP).unwrap() as u32 - 256) & !7
     } else {
@@ -712,4 +728,83 @@ pub fn call_guest_with(uc: &mut Uc, address: u32, args: &[Arg]) -> Result<u64, S
         return Err(format!("guest stopped at {pc:#010x} instead of returning"));
     }
     Ok(r0 | (r1 << 32))
+}
+
+/// The same call on the translator: state lives in the thread's `CpuState`.
+fn call_guest_native(uc: &mut Uc, address: u32, args: &[Arg], depth: u32) -> Result<u64, String> {
+    if uc.get_data().native.is_none() {
+        let tls = uc.get_data().tls_block;
+        uc.get_data_mut().native = Some(Box::new(crate::dynarec::Native::new(tls)));
+    }
+    let (registers, stack_words) = lay_out_arguments(args);
+    let stack_top = uc.get_data().stack_top;
+    let native = uc.get_data_mut().native.as_mut().unwrap();
+    let was_active = native.active;
+    let saved = native.state;
+    let mut sp = if was_active { (native.state.r[SP] - 256) & !7 } else { stack_top - 64 };
+    sp = (sp - stack_words.len() as u32 * 4) & !7;
+    let memory = mem();
+    for (i, value) in stack_words.iter().enumerate() {
+        memory.write_u32(sp + i as u32 * 4, *value);
+    }
+    let trap = trap_address(depth);
+    native.state.r[..4].copy_from_slice(&registers);
+    native.state.r[SP] = sp;
+    native.state.r[LR] = trap;
+    native.active = true;
+
+    uc.get_data_mut().depth = depth + 1;
+    let result = crate::dynarec::run(uc, address, trap);
+    uc.get_data_mut().depth = depth;
+
+    let native = uc.get_data_mut().native.as_mut().unwrap();
+    let (r0, r1) = (native.state.r[0] as u64, native.state.r[1] as u64);
+    if was_active {
+        native.state = saved;
+    } else {
+        native.active = false;
+    }
+    if let Err(error) = result {
+        if uc.get_data().fault.is_none() {
+            uc.get_data_mut().fault = Some(error.clone());
+        }
+        return Err(error);
+    }
+    Ok(r0 | (r1 << 32))
+}
+
+/// Registers r0-r3 and stack words for a softfp call.
+fn lay_out_arguments(args: &[Arg]) -> ([u32; 4], Vec<u32>) {
+    let mut registers = [0u32; 4];
+    let mut next_register = 0usize;
+    let mut stack_words: Vec<u32> = Vec::new();
+    for arg in args {
+        match *arg {
+            Arg::Word(value) => {
+                if next_register < 4 {
+                    registers[next_register] = value;
+                    next_register += 1;
+                } else {
+                    stack_words.push(value);
+                }
+            }
+            Arg::Pair(value) => {
+                next_register = (next_register + 1) & !1;
+                if next_register < 4 {
+                    registers[next_register] = value as u32;
+                    registers[next_register + 1] = (value >> 32) as u32;
+                    next_register += 2;
+                } else {
+                    next_register = 4;
+                    if stack_words.len() % 2 == 1 {
+                        stack_words.push(0);
+                    }
+                    stack_words.push(value as u32);
+                    stack_words.push((value >> 32) as u32);
+                }
+            }
+        }
+    }
+
+    (registers, stack_words)
 }

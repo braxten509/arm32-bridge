@@ -204,7 +204,7 @@ fn main() -> ExitCode {
     let _lock = runtime::hold_gil();
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     let options = parse(&arguments);
-    match options.positional.first().map(String::as_str) {
+    let code = match options.positional.first().map(String::as_str) {
         Some("load") => command_load(&options),
         Some("call") => command_call(&options, false),
         Some("bench") => command_call(&options, true),
@@ -212,5 +212,9 @@ fn main() -> ExitCode {
             eprintln!("usage: arm32-bridge load|call|bench ... (see src/main.rs)");
             ExitCode::from(2)
         }
+    };
+    if arm32_bridge::dynarec::enabled() && runtime::stats_enabled() {
+        arm32_bridge::dynarec::print_stats();
     }
+    code
 }

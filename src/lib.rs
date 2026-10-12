@@ -2,6 +2,7 @@
 //! process. Built as a command-line tool (src/main.rs) for testing, and as a
 //! drop-in replacement for a game's native library inside its APK (app.rs).
 
+pub mod dynarec;
 pub mod elf;
 pub mod imports;
 pub mod log;
