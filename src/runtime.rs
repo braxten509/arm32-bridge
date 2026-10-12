@@ -137,10 +137,13 @@ pub fn double_register(index: usize) -> RegisterARM {
     DOUBLE_REGISTERS[index]
 }
 
-/// ARM32_STATS=1: count translator fallbacks and print them at the end.
+/// ARM32_STATS=1 (or the Android property debug.arm32bridge.stats=1): count
+/// translator fallbacks and print them at the end (and every so often in an app).
 pub fn stats_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("ARM32_STATS").is_ok_and(|v| v == "1"))
+    *ENABLED.get_or_init(|| {
+        std::env::var("ARM32_STATS").ok().or_else(|| crate::dynarec::property("debug.arm32bridge.stats")).as_deref() == Some("1")
+    })
 }
 
 pub const SP: usize = 13;

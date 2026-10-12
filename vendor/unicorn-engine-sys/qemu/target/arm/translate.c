@@ -10943,6 +10943,11 @@ static void disas_arm_insn(DisasContext *s, unsigned int insn)
         return;
     }
 
+    // arm32-bridge: only the Thumb translator sets no_exit_request (inside IT
+    // blocks); clear it so a value left over from Thumb code cannot remove the
+    // exit checks from ARM code.
+    s->uc->no_exit_request = false;
+
     // Unicorn: trace this instruction on request
     if (HOOK_EXISTS_BOUNDED(s->uc, UC_HOOK_CODE, s->pc_curr)) {
 

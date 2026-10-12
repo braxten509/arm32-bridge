@@ -1213,6 +1213,9 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
             uc->nested_level--;
             return err;
         }
+        // arm32-bridge: blocks translated while counting was off have no
+        // counter call; drop them so the count is exact.
+        uc->tb_flush(uc);
     }
 
     // If UC_CTL_UC_USE_EXITS is set, then the @until param won't have any

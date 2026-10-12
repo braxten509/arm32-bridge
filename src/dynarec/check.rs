@@ -59,6 +59,8 @@ thread_local! {
     /// Unicorn's writes during a reference run: address and the bytes before.
     static WRITES: RefCell<Vec<(u32, Vec<u8>)>> = const { RefCell::new(Vec::new()) };
     static RUNS: RefCell<HashMap<u32, u64>> = RefCell::new(HashMap::new());
+    /// Every instruction Unicorn ran during a reference run (address, size), for the report.
+    static EXECUTED: RefCell<Vec<(u32, u32)>> = const { RefCell::new(Vec::new()) };
 }
 
 /// What Unicorn did with the block.
@@ -69,6 +71,8 @@ pub struct Reference {
     steps: u32,
     /// Address and the bytes Unicorn left there.
     writes: Vec<(u32, Vec<u8>)>,
+    /// Instructions Unicorn ran, with the step each began (address, size, step).
+    executed: Vec<(u32, u32, u32)>,
 }
 
 fn should_check(pc: u32) -> bool {
@@ -100,14 +104,21 @@ fn install_hook(uc: &mut Uc) {
         true
     })
     .expect("add checker write hook");
+    uc.add_code_hook(1, 0, |_uc, address, size| {
+        if RECORDING.with(|recording| recording.get()) {
+            EXECUTED.with(|executed| executed.borrow_mut().push((address as u32, size)));
+        }
+    })
+    .expect("add checker code hook");
     // Code Unicorn translated before the hook existed would not report its writes.
     uc.ctl_flush_tb().expect("flush Unicorn's translated code");
 }
 
-/// Runs the Thumb block at `pc` (instructions up to `end`) in Unicorn and
-/// undoes its memory writes. None when the block cannot be checked.
+/// Runs the block at `pc` (bit 0 = Thumb; instructions up to `end`) in Unicorn
+/// and undoes its memory writes. None when the block cannot be checked.
 pub fn reference(uc: &mut Uc, pc: u32, end: u32, stop_at: u32) -> Option<Reference> {
-    if pc & 1 == 0 || end <= pc & !1 || !should_check(pc) {
+    let thumb = pc & 1;
+    if end <= pc & !1 || !should_check(pc) {
         return None;
     }
     install_hook(uc);
@@ -116,6 +127,8 @@ pub fn reference(uc: &mut Uc, pc: u32, end: u32, stop_at: u32) -> Option<Referen
     let fault_before = uc.get_data_mut().fault.take();
     uc.get_data_mut().native.as_mut().unwrap().active = false;
     WRITES.with(|writes| writes.borrow_mut().clear());
+    EXECUTED.with(|executed| executed.borrow_mut().clear());
+    let mut executed = Vec::new();
     RECORDING.with(|recording| recording.set(true));
 
     let mut current = pc & !1;
@@ -123,8 +136,9 @@ pub fn reference(uc: &mut Uc, pc: u32, end: u32, stop_at: u32) -> Option<Referen
     let mut end_state = start;
     let mut failed = false;
     let exit_pc = loop {
-        let result = uc.emu_start((current | 1) as u64, stop_at as u64, 0, 1);
+        let result = uc.emu_start((current | thumb) as u64, stop_at as u64, 0, 1);
         steps += 1;
+        EXECUTED.with(|ran| executed.extend(ran.borrow_mut().drain(..).map(|(address, size)| (address, size, steps))));
         let next = read_unicorn(uc, &mut end_state);
         if result.is_err() || uc.get_data().fault.is_some() {
             if FAILED.fetch_add(1, Ordering::Relaxed) < 5 {
@@ -138,7 +152,7 @@ pub fn reference(uc: &mut Uc, pc: u32, end: u32, stop_at: u32) -> Option<Referen
             break next;
         }
         let address = next & !1;
-        if next & 1 == 0 || address <= current || address >= end || steps >= MAX_STEPS {
+        if next & 1 != thumb || address <= current || address >= end || steps >= MAX_STEPS {
             break next;
         }
         current = address;
@@ -156,7 +170,7 @@ pub fn reference(uc: &mut Uc, pc: u32, end: u32, stop_at: u32) -> Option<Referen
     if failed {
         return None;
     }
-    Some(Reference { start, end_state, exit_pc, steps, writes })
+    Some(Reference { start, end_state, exit_pc, steps, writes, executed })
 }
 
 /// Compares the translated block's result with Unicorn's.
@@ -204,7 +218,12 @@ pub fn compare(uc: &mut Uc, pc: u32, end: u32, reference: &Reference) {
         return;
     }
     let start = &reference.start;
-    let mut text = format!("[check] difference in block {:#010x}..{end:#010x} ({} Unicorn steps):", pc & !1, reference.steps);
+    let mut text = format!(
+        "[check] difference in block {:#010x}..{end:#010x} ({} Unicorn steps, call depth {}):",
+        pc & !1,
+        reference.steps,
+        uc.get_data().depth
+    );
     for difference in &differences {
         text.push_str(&format!("\n[check]   {difference}"));
     }
@@ -213,6 +232,10 @@ pub fn compare(uc: &mut Uc, pc: u32, end: u32, reference: &Reference) {
         text.push_str(&format!(" r{i}={:x}", start.r[i]));
     }
     text.push_str(&format!(" NZCV={:x}", flags(start.nzcv) >> 28));
+    text.push_str("\n[check]   Unicorn ran (step: address/size):");
+    for (address, size, step) in reference.executed.iter().take(48) {
+        text.push_str(&format!(" {step}:{address:x}/{size}"));
+    }
     text.push_str("\n[check]   code:");
     let mut address = pc & !1;
     while address < end {

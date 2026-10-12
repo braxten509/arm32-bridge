@@ -10,6 +10,10 @@ use super::emit::{cond, shift, Asm, Reg, ZR};
 use super::{exit, host, offsets};
 use crate::mem::GuestMem;
 
+#[path = "arm.rs"]
+mod arm;
+pub use arm::translate as translate_arm;
+
 const MAX_INSTRUCTIONS: u32 = 64;
 
 // Scratch registers (never guest registers).
@@ -59,12 +63,14 @@ struct Translator {
     count: u32,
     /// Inside an IT block (16-bit instructions do not set flags there).
     in_it: bool,
+    /// Thumb (true) or ARM (false) code.
+    thumb: bool,
 }
 
 /// Translates the block starting at `start` (a Thumb address without bit 0).
 /// Returns the code and the guest address just past the last translated instruction.
 pub fn translate(mem: GuestMem, start: u32) -> (Vec<u32>, u32) {
-    let mut t = Translator { a: Asm::new(), mem, pc: start, size: 2, count: 0, in_it: false };
+    let mut t = Translator { a: Asm::new(), mem, pc: start, size: 2, count: 0, in_it: false, thumb: true };
     let end;
     loop {
         if t.count >= MAX_INSTRUCTIONS {
@@ -139,9 +145,14 @@ impl Translator {
         self.pc + self.size
     }
 
-    /// The value r15 reads as: this instruction + 4.
+    /// The value r15 reads as: this instruction + 4 (Thumb) or + 8 (ARM).
     fn pc_value(&self) -> u32 {
-        self.pc + 4
+        self.pc + if self.thumb { 4 } else { 8 }
+    }
+
+    /// Bit 0 of an address in this instruction set.
+    fn mode_bit(&self) -> u32 {
+        self.thumb as u32
     }
 
     /// A host register holding guest register `r` (r15 is materialised in `scratch`).
@@ -422,7 +433,12 @@ impl Translator {
             _ => return Err(()),
         }
         if rd == PC {
-            return Err(()); // computed jumps with data ops: rare, leave to Unicorn
+            if self.thumb {
+                return Err(()); // computed jumps with Thumb-2 data ops: rare, leave to Unicorn
+            }
+            // ARM: the result went to T6; writing the PC interworks like BX.
+            emit_exit_to(&mut self.a, T6);
+            return Ok(Flow::End);
         }
         Ok(Flow::Next)
     }
@@ -559,8 +575,8 @@ impl Translator {
             emit_exit(&mut self.a, destination, exit::JUMP);
             self.a.bind(skip);
             // Not taken: the block ends here too, continuing after the branch.
-            let next = self.next_pc();
-            emit_exit(&mut self.a, next | 1, exit::JUMP);
+            let next = self.next_pc() | self.mode_bit();
+            emit_exit(&mut self.a, next, exit::JUMP);
             Flow::End
         }
     }
@@ -1507,27 +1523,30 @@ impl Translator {
                 if rd_lo == PC || rd_lo == rd_hi {
                     return Err(());
                 }
-                let signed = op1 == 0b000 || op1 == 0b100;
-                let accumulate = op1 >= 0b100;
-                if accumulate {
-                    // x26 = rd_hi:rd_lo
-                    self.a.mov_w(T4, rd_lo);
-                    self.a.orr_x(T4, T4, rd_hi, shift::LSL, 32);
-                } else {
-                    self.a.mov_w_imm(T4, 0);
-                }
-                if signed {
-                    self.a.smaddl(T4, rn, rm, T4);
-                } else {
-                    self.a.umaddl(T4, rn, rm, T4);
-                }
-                self.a.mov_w(rd_lo, T4);
-                self.a.lsr_x_imm(T4, T4, 32);
-                self.a.mov_w(rd_hi, T4);
+                self.multiply_long(op1 == 0b000 || op1 == 0b100, op1 >= 0b100, rd_lo, rd_hi, rn, rm);
                 Ok(Flow::Next)
             }
             _ => Err(()),
         }
+    }
+
+    /// rd_hi:rd_lo = rn * rm (+ rd_hi:rd_lo when accumulating), 64-bit.
+    fn multiply_long(&mut self, signed: bool, accumulate: bool, rd_lo: u32, rd_hi: u32, rn: u32, rm: u32) {
+        if accumulate {
+            // T4 = rd_hi:rd_lo
+            self.a.mov_w(T4, rd_lo);
+            self.a.orr_x(T4, T4, rd_hi, shift::LSL, 32);
+        } else {
+            self.a.mov_w_imm(T4, 0);
+        }
+        if signed {
+            self.a.smaddl(T4, rn, rm, T4);
+        } else {
+            self.a.umaddl(T4, rn, rm, T4);
+        }
+        self.a.mov_w(rd_lo, T4);
+        self.a.lsr_x_imm(T4, T4, 32);
+        self.a.mov_w(rd_hi, T4);
     }
 
     fn coprocessor(&mut self, h1: u32, h2: u32) -> Result<Flow> {

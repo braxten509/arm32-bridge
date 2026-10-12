@@ -50,7 +50,7 @@ pub fn enabled() -> bool {
 }
 
 #[cfg(target_os = "android")]
-pub(super) fn property(name: &str) -> Option<String> {
+pub fn property(name: &str) -> Option<String> {
     extern "C" {
         fn __system_property_get(name: *const libc::c_char, value: *mut libc::c_char) -> libc::c_int;
     }
@@ -61,7 +61,7 @@ pub(super) fn property(name: &str) -> Option<String> {
 }
 
 #[cfg(not(target_os = "android"))]
-pub(super) fn property(_name: &str) -> Option<String> {
+pub fn property(_name: &str) -> Option<String> {
     None
 }
 
@@ -185,6 +185,7 @@ struct Cache {
     blocks: HashMap<u32, (usize, u32)>,
     /// Fallback sites: guest pc → times run in Unicorn (ARM32_STATS=1 prints them).
     fallbacks: HashMap<u32, u64>,
+    fallback_total: u64,
 }
 
 struct GuardedCache(std::cell::RefCell<Option<Cache>>);
@@ -194,7 +195,7 @@ static CACHE: GuardedCache = GuardedCache(std::cell::RefCell::new(None));
 fn with_cache<R>(work: impl FnOnce(&mut Cache) -> R) -> R {
     debug_assert!(runtime::gil_held());
     let mut cache = CACHE.0.borrow_mut();
-    let cache = cache.get_or_insert_with(|| Cache { memory: CodeMemory::new(), blocks: HashMap::new(), fallbacks: HashMap::new() });
+    let cache = cache.get_or_insert_with(|| Cache { memory: CodeMemory::new(), blocks: HashMap::new(), fallbacks: HashMap::new(), fallback_total: 0 });
     work(cache)
 }
 
@@ -206,14 +207,7 @@ fn block_for(pc: u32) -> (usize, u32, usize, usize) {
         if let Some(&(code, end)) = cache.blocks.get(&pc) {
             return (code, end, enter, exit_stub);
         }
-        let (code, end) = if pc & 1 == 1 {
-            thumb::translate(guest_mem(), pc & !1)
-        } else {
-            // ARM-mode code runs in Unicorn for now.
-            let mut a = Asm::new();
-            thumb::emit_exit(&mut a, pc, exit::FALLBACK | (16 << 8));
-            (a.code, pc)
-        };
+        let (code, end) = if pc & 1 == 1 { thumb::translate(guest_mem(), pc & !1) } else { thumb::translate_arm(guest_mem(), pc) };
         let address = cache.memory.place(&code);
         cache.blocks.insert(pc, (address, end));
         (address, end, enter, exit_stub)
@@ -294,15 +288,25 @@ const CORE: [RegisterARM; 15] = [
 
 /// CPSR Q (bit 27) and GE (bits 16-19).
 const CPSR_Q_GE: u32 = 0x080F_0000;
+/// CPSR IT state (bits 10-15 and 25-26).
+const CPSR_IT: u32 = 0x0600_FC00;
+
+/// Times Unicorn still had IT state when guest state was copied in (ARM32_STATS / checker summary).
+pub(super) static STALE_IT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Copies guest state into Unicorn. Only NZCV, Q and GE move between engines;
 /// Unicorn keeps its mode bits, and the Thumb bit comes from the start address.
+/// The IT state is cleared: the guest is never inside an IT block here, since
+/// translated code exits between instructions and Unicorn cannot stop inside one.
 pub(super) fn write_unicorn(uc: &mut Uc, state: &CpuState) {
     for (i, register) in CORE.iter().enumerate() {
         uc.reg_write(*register, state.r[i] as u64).unwrap();
     }
     let current = uc.reg_read(RegisterARM::CPSR).unwrap() as u32;
-    let cpsr = (current & !(0xF000_0000 | CPSR_Q_GE)) | (state.nzcv as u32 & 0xF000_0000) | (state.cpsr_other & CPSR_Q_GE);
+    if current & CPSR_IT != 0 {
+        STALE_IT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let cpsr = (current & !(0xF000_0000 | CPSR_Q_GE | CPSR_IT)) | (state.nzcv as u32 & 0xF000_0000) | (state.cpsr_other & CPSR_Q_GE);
     uc.reg_write(RegisterARM::CPSR, cpsr as u64).unwrap();
     for i in 0..32 {
         uc.reg_write(runtime::double_register(i), state.dreg(i)).unwrap();
@@ -331,7 +335,14 @@ pub(super) fn read_unicorn(uc: &mut Uc, state: &mut CpuState) -> u32 {
 /// Runs `count` instructions at `pc` in Unicorn and returns where it stopped.
 fn fallback(uc: &mut Uc, pc: u32, count: u32, stop_at: u32) -> Result<u32, String> {
     if crate::runtime::stats_enabled() {
-        with_cache(|cache| *cache.fallbacks.entry(pc).or_default() += 1);
+        let total = with_cache(|cache| {
+            *cache.fallbacks.entry(pc).or_default() += 1;
+            cache.fallback_total += 1;
+            cache.fallback_total
+        });
+        if total % (1 << 22) == 0 {
+            print_stats(); // a running app never reaches the end-of-run print
+        }
     }
     let mut state = uc.get_data().native.as_ref().unwrap().state;
     write_unicorn(uc, &state);
@@ -361,7 +372,13 @@ pub fn print_stats() {
         let mut sites: Vec<(&u32, &u64)> = cache.fallbacks.iter().collect();
         sites.sort_by(|a, b| b.1.cmp(a.1));
         let total: u64 = cache.fallbacks.values().sum();
-        crate::log::line(&format!("[jit] {} blocks, {} fallbacks at {} sites", cache.blocks.len(), total, sites.len()));
+        crate::log::line(&format!(
+            "[jit] {} blocks, {} fallbacks at {} sites, {} starts with leftover IT state",
+            cache.blocks.len(),
+            total,
+            sites.len(),
+            STALE_IT.load(std::sync::atomic::Ordering::Relaxed)
+        ));
         for (pc, count) in sites.iter().take(40) {
             let pc = **pc;
             let thumb = pc & 1 == 1;
