@@ -76,3 +76,9 @@ engine.rs run(): an address at stub+4 (the `bx lr` half) just returns to LR. Tem
   block is counted as "not compared (Unicorn ran past the block)" instead of a difference.
 - Result (2026-10-12): game, ARM32_CHECK=1, 75 s: 786,432 checks, 0 differences, 22 not compared (ran past the block).
   Self-test ARM32_CHECK=all: 35,363 checks, 0 differences, 0 ran past. Pass check 2 met.
+
+# Stage 5 progress (2026-10-12)
+- VFP translated (src/dynarec/vfp.rs), FPSCR control/flags moved through enter/exit glue, LDM IB/DA, Thumb BX PC,
+  ARM register-shifted MOV/MVN fix. Game with ARM32_CHECK=1: 1,077,554 checks, 0 differences, 30 ran past;
+  55-75 fps under the checker (was ~3). Fallback sites 5345 -> 75; the rest are Thumb NEON (by-scalar float multiply,
+  VLD1/VST1).

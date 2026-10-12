@@ -12,6 +12,8 @@ use crate::mem::GuestMem;
 
 #[path = "arm.rs"]
 mod arm;
+#[path = "vfp.rs"]
+mod vfp;
 pub use arm::translate as translate_arm;
 
 const MAX_INSTRUCTIONS: u32 = 64;
@@ -520,16 +522,22 @@ impl Translator {
 
     /// LDM/STM: `list` of registers, increment-after (true) or decrement-before.
     fn load_store_multiple(&mut self, load: bool, rn: u32, list: u32, increment: bool, writeback: bool) -> Result<Flow> {
+        self.load_store_multiple_at(load, rn, list, increment, !increment, writeback)
+    }
+
+    /// LDM/STM in any of the four modes: `up` = increment, `before` = adjust before each access.
+    fn load_store_multiple_at(&mut self, load: bool, rn: u32, list: u32, up: bool, before: bool, writeback: bool) -> Result<Flow> {
         let count = list.count_ones();
         if count == 0 || rn == PC || (!load && list & (1 << PC) != 0) || (list & (1 << SP) != 0 && rn != SP && load) {
             return Err(());
         }
         let a = &mut self.a;
         // T0 = lowest address; T1 = host address of it.
-        if increment {
-            a.mov_w(T0, rn);
-        } else {
-            a.sub_w_imm(T0, rn, count * 4);
+        match (up, before) {
+            (true, false) => a.mov_w(T0, rn),
+            (true, true) => a.add_w_imm(T0, rn, 4),
+            (false, true) => a.sub_w_imm(T0, rn, count * 4),
+            (false, false) => a.sub_w_imm(T0, rn, count * 4 - 4),
         }
         a.add_x_uxtw(T1, host::MEMORY, T0);
         let mut offset = 0;
@@ -546,10 +554,10 @@ impl Translator {
             offset += 4;
         }
         if writeback && !(load && list & (1 << rn) != 0) {
-            if increment {
+            if up {
                 a.add_w_imm(rn, rn, count * 4);
             } else {
-                a.mov_w(rn, T0);
+                a.sub_w_imm(rn, rn, count * 4);
             }
         }
         if load && list & (1 << rn) != 0 {
@@ -909,7 +917,13 @@ impl Translator {
                 // BX / BLX Rm
                 let link = (h >> 7) & 1 == 1;
                 if rm == PC {
-                    return Err(());
+                    if link {
+                        return Err(()); // unpredictable
+                    }
+                    // BX PC: switch to the ARM code right after this word-aligned pair
+                    let target = self.pc_value() & !3;
+                    emit_exit(&mut self.a, target, exit::JUMP);
+                    return Ok(Flow::End);
                 }
                 self.a.mov_w(T6, rm);
                 if link {
@@ -1558,6 +1572,10 @@ impl Translator {
             }
             self.a.ldr_w_off(rt, host::STATE, offsets::TLS);
             return Ok(Flow::Next);
+        }
+        if h1 & 0xFC00 == 0xEC00 {
+            // VFP: the ARM encoding with condition 1110
+            return self.vfp((h1 << 16) | h2);
         }
         Err(())
     }

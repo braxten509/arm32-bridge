@@ -31,7 +31,9 @@ pub struct CpuState {
     pub cpsr_other: u32,
     /// TPIDRURO (bionic's thread pointer).
     pub tls: u32,
-    pub _pad: [u32; 7],
+    /// The host's FPCR while translated code runs (restored on exit).
+    pub host_fpcr: u32,
+    pub _pad: [u32; 6],
     /// q0-q15 = d0-d31 (d(2n) is the low half of q(n)).
     pub q: [[u64; 2]; 16],
 }
@@ -45,6 +47,7 @@ pub mod offsets {
     pub const FPSCR: u32 = 88;
     pub const CPSR_OTHER: u32 = 92;
     pub const TLS: u32 = 96;
+    pub const HOST_FPCR: u32 = 100;
     pub const Q: u32 = 128;
 }
 
@@ -58,6 +61,7 @@ const _: () = {
     assert!(offset_of!(CpuState, fpscr) == offsets::FPSCR as usize);
     assert!(offset_of!(CpuState, cpsr_other) == offsets::CPSR_OTHER as usize);
     assert!(offset_of!(CpuState, tls) == offsets::TLS as usize);
+    assert!(offset_of!(CpuState, host_fpcr) == offsets::HOST_FPCR as usize);
     assert!(offset_of!(CpuState, q) == offsets::Q as usize);
 };
 
@@ -69,6 +73,13 @@ impl CpuState {
         self.q[index / 2][index % 2] = value;
     }
 }
+
+/// FPSCR bits kept in host FPCR (AHP, DN, FZ, RMode) while translated code
+/// runs; ARM64 FPCR has them at the same positions.
+pub const FPSCR_CONTROL: u32 = 0x07C0_0000;
+/// FPSCR cumulative exception flags (QC, IDC, IXC, UFC, OFC, DZC, IOC), kept in
+/// host FPSR (same positions).
+pub const FPSCR_CUMULATIVE: u32 = 0x0800_009F;
 
 /// Exit reasons (low 8 bits of `exit_reason`).
 pub mod exit {

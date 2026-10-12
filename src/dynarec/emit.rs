@@ -37,6 +37,26 @@ pub mod shift {
     pub const ROR: u32 = 3;
 }
 
+/// Scalar floating-point opcodes for `fp1`, `fp2` and `fp3` (single; `double` sets the type).
+pub mod fp {
+    pub const FMUL: u32 = 0x1E20_0800;
+    pub const FDIV: u32 = 0x1E20_1800;
+    pub const FADD: u32 = 0x1E20_2800;
+    pub const FSUB: u32 = 0x1E20_3800;
+    pub const FNMUL: u32 = 0x1E20_8800;
+    pub const FMADD: u32 = 0x1F00_0000;
+    pub const FMSUB: u32 = 0x1F00_8000;
+    pub const FNMADD: u32 = 0x1F20_0000;
+    pub const FNMSUB: u32 = 0x1F20_8000;
+    pub const FABS: u32 = 0x1E20_C000;
+    pub const FNEG: u32 = 0x1E21_4000;
+    pub const FSQRT: u32 = 0x1E21_C000;
+    /// fcvt sd, dn (source type double)
+    pub const FCVT_TO_SINGLE: u32 = 0x1E22_4000;
+    /// fcvt dd, sn (source type single)
+    pub const FCVT_TO_DOUBLE: u32 = 0x1E22_C000;
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Label(usize);
 
@@ -554,6 +574,94 @@ impl Asm {
         self.emit(0xD51B_4200 | rt);
     }
 
+    /// mrs xt, fpcr / msr fpcr, xt / mrs xt, fpsr / msr fpsr, xt
+    pub fn mrs_fpcr(&mut self, rt: Reg) {
+        self.emit(0xD53B_4400 | rt);
+    }
+    pub fn msr_fpcr(&mut self, rt: Reg) {
+        self.emit(0xD51B_4400 | rt);
+    }
+    pub fn mrs_fpsr(&mut self, rt: Reg) {
+        self.emit(0xD53B_4420 | rt);
+    }
+    pub fn msr_fpsr(&mut self, rt: Reg) {
+        self.emit(0xD51B_4420 | rt);
+    }
+
+    // ---- floating point (v registers; `double` picks .d/double or .s/single) ----
+
+    fn element(double: bool, lane: u32) -> u32 {
+        if double {
+            (lane << 4) | 0b1000
+        } else {
+            (lane << 3) | 0b100
+        }
+    }
+    fn fp_type(double: bool) -> u32 {
+        (double as u32) << 22
+    }
+    /// dup sd/dd, vn.s/d[lane]: an element to lane 0 of a scalar.
+    pub fn dup_element(&mut self, double: bool, rd: Reg, rn: Reg, lane: u32) {
+        self.emit(0x5E00_0400 | (Self::element(double, lane) << 16) | (rn << 5) | rd);
+    }
+    /// ins vd.s/d[lane], vn.s/d[from]
+    pub fn ins_element(&mut self, double: bool, rd: Reg, lane: u32, rn: Reg, from: u32) {
+        let imm4 = if double { from << 3 } else { from << 2 };
+        self.emit(0x6E00_0400 | (Self::element(double, lane) << 16) | (imm4 << 11) | (rn << 5) | rd);
+    }
+    /// ins vd.s[lane], wn / ins vd.d[lane], xn
+    pub fn ins_general(&mut self, double: bool, rd: Reg, lane: u32, rn: Reg) {
+        self.emit(0x4E00_1C00 | (Self::element(double, lane) << 16) | (rn << 5) | rd);
+    }
+    /// umov wd, vn.s[lane] / umov xd, vn.d[lane]
+    pub fn umov(&mut self, double: bool, rd: Reg, rn: Reg, lane: u32) {
+        self.emit(0x0E00_3C00 | ((double as u32) << 30) | (Self::element(double, lane) << 16) | (rn << 5) | rd);
+    }
+    /// Two-source scalar operation (`fp::FMUL` and so on).
+    pub fn fp2(&mut self, op: u32, double: bool, rd: Reg, rn: Reg, rm: Reg) {
+        self.emit(op | Self::fp_type(double) | (rm << 16) | (rn << 5) | rd);
+    }
+    /// Three-source scalar operation (`fp::FMADD` and so on): rd = ra ± rn*rm.
+    pub fn fp3(&mut self, op: u32, double: bool, rd: Reg, rn: Reg, rm: Reg, ra: Reg) {
+        self.emit(op | Self::fp_type(double) | (rm << 16) | (ra << 10) | (rn << 5) | rd);
+    }
+    /// One-source scalar operation (`fp::FABS` and so on); `double` is the source type.
+    pub fn fp1(&mut self, op: u32, double: bool, rd: Reg, rn: Reg) {
+        self.emit(op | Self::fp_type(double) | (rn << 5) | rd);
+    }
+    /// fcmp / fcmpe with a register or zero.
+    pub fn fcmp(&mut self, double: bool, rn: Reg, rm: Reg, zero: bool, signaling: bool) {
+        let opc = ((signaling as u32) << 4) | ((zero as u32) << 3);
+        self.emit(0x1E20_2000 | Self::fp_type(double) | (rm << 16) | (rn << 5) | opc);
+    }
+    /// fmov sd/dd, #imm8 (VFPExpandImm encoding)
+    pub fn fmov_imm(&mut self, double: bool, rd: Reg, imm8: u32) {
+        self.emit(0x1E20_1000 | Self::fp_type(double) | (imm8 << 13) | rd);
+    }
+    /// scvtf / ucvtf sd/dd, wn
+    pub fn int_to_float(&mut self, signed: bool, double: bool, rd: Reg, rn: Reg) {
+        let op = if signed { 0x1E22_0000 } else { 0x1E23_0000 };
+        self.emit(op | Self::fp_type(double) | (rn << 5) | rd);
+    }
+    /// fcvtzs / fcvtzu wd, sn/dn
+    pub fn float_to_int(&mut self, signed: bool, double: bool, rd: Reg, rn: Reg) {
+        let op = if signed { 0x1E38_0000 } else { 0x1E39_0000 };
+        self.emit(op | Self::fp_type(double) | (rn << 5) | rd);
+    }
+    /// ld1 {vt.s/d}[lane], [xn] (with `post`: [xn], #4/#8)
+    pub fn ld1_lane(&mut self, double: bool, rt: Reg, lane: u32, rn: Reg, post: bool) {
+        self.lane_access(0x0040_0000, double, rt, lane, rn, post);
+    }
+    /// st1 {vt.s/d}[lane], [xn] (with `post`: [xn], #4/#8)
+    pub fn st1_lane(&mut self, double: bool, rt: Reg, lane: u32, rn: Reg, post: bool) {
+        self.lane_access(0, double, rt, lane, rn, post);
+    }
+    fn lane_access(&mut self, load: u32, double: bool, rt: Reg, lane: u32, rn: Reg, post: bool) {
+        let base = if post { 0x0D9F_8000 } else { 0x0D00_8000 };
+        let (q, s, size) = if double { (lane, 0, 0b01) } else { (lane >> 1, lane & 1, 0b00) };
+        self.emit(base | load | (q << 30) | (s << 12) | (size << 10) | (rn << 5) | rt);
+    }
+
     // ---- memory: guest accesses are [x20 (memory base), w(address), uxtw] ----
 
     fn mem_reg(&mut self, base: u32, rt: Reg, rn: Reg, rm: Reg) {
@@ -687,6 +795,62 @@ mod tests {
                 0x3200_CCA4,
                 0x5201_00E6,
                 0x8B30_4291,
+            ]
+        );
+    }
+
+    /// Float encodings checked against the NDK assembler.
+    #[test]
+    fn float_encodings() {
+        let mut a = Asm::new();
+        a.mrs_fpcr(16);
+        a.msr_fpcr(16);
+        a.mrs_fpsr(17);
+        a.msr_fpsr(17);
+        a.dup_element(false, 16, 3, 2); // mov s16, v3.s[2]
+        a.dup_element(true, 16, 3, 1); // mov d16, v3.d[1]
+        a.ins_element(false, 5, 3, 16, 0); // mov v5.s[3], v16.s[0]
+        a.ins_element(true, 5, 1, 17, 1); // mov v5.d[1], v17.d[1]
+        a.ins_general(false, 5, 1, 7); // mov v5.s[1], w7
+        a.ins_general(true, 5, 1, 16); // mov v5.d[1], x16
+        a.umov(false, 3, 5, 3); // mov w3, v5.s[3]
+        a.umov(true, 16, 5, 1); // mov x16, v5.d[1]
+        a.fp2(fp::FMUL, false, 16, 1, 17);
+        a.fp2(fp::FDIV, true, 16, 1, 17);
+        a.fp2(fp::FADD, false, 16, 1, 17);
+        a.fp2(fp::FSUB, true, 16, 1, 17);
+        a.fp2(fp::FNMUL, false, 16, 1, 17);
+        a.fp3(fp::FMADD, false, 16, 1, 17, 18);
+        a.fp3(fp::FMSUB, true, 16, 1, 17, 18);
+        a.fp3(fp::FNMADD, false, 16, 1, 17, 18);
+        a.fp3(fp::FNMSUB, true, 16, 1, 17, 18);
+        a.fp1(fp::FABS, false, 16, 17);
+        a.fp1(fp::FNEG, true, 16, 17);
+        a.fp1(fp::FSQRT, false, 16, 17);
+        a.fp1(fp::FCVT_TO_SINGLE, true, 16, 17); // fcvt s16, d17
+        a.fp1(fp::FCVT_TO_DOUBLE, false, 16, 17); // fcvt d16, s17
+        a.fcmp(false, 16, 17, false, false);
+        a.fcmp(true, 16, 0, true, false);
+        a.fcmp(false, 16, 17, false, true);
+        a.fcmp(true, 16, 0, true, true);
+        a.fmov_imm(false, 16, 0x70); // fmov s16, #1.0
+        a.fmov_imm(true, 16, 0xE0); // fmov d16, #-0.5
+        a.int_to_float(true, false, 16, 16); // scvtf s16, w16
+        a.int_to_float(false, true, 16, 16); // ucvtf d16, w16
+        a.float_to_int(true, false, 16, 17); // fcvtzs w16, s17
+        a.float_to_int(false, true, 16, 17); // fcvtzu w16, d17
+        a.ld1_lane(false, 3, 3, 17, false); // ld1 {v3.s}[3], [x17]
+        a.ld1_lane(true, 3, 1, 17, true); // ld1 {v3.d}[1], [x17], #8
+        a.st1_lane(false, 3, 2, 17, true); // st1 {v3.s}[2], [x17], #4
+        a.st1_lane(true, 3, 0, 17, false); // st1 {v3.d}[0], [x17]
+        assert_eq!(
+            a.code,
+            vec![
+                0xD53B_4410, 0xD51B_4410, 0xD53B_4431, 0xD51B_4431, 0x5E14_0470, 0x5E18_0470, 0x6E1C_0605, 0x6E18_4625,
+                0x4E0C_1CE5, 0x4E18_1E05, 0x0E1C_3CA3, 0x4E18_3CB0, 0x1E31_0830, 0x1E71_1830, 0x1E31_2830, 0x1E71_3830,
+                0x1E31_8830, 0x1F11_4830, 0x1F51_C830, 0x1F31_4830, 0x1F71_C830, 0x1E20_C230, 0x1E61_4230, 0x1E21_C230,
+                0x1E62_4230, 0x1E22_C230, 0x1E31_2200, 0x1E60_2208, 0x1E31_2210, 0x1E60_2218, 0x1E2E_1010, 0x1E7C_1010,
+                0x1E22_0210, 0x1E63_0210, 0x1E38_0230, 0x1E79_0230, 0x4D40_9223, 0x4DDF_8623, 0x4D9F_8223, 0x0D00_8623,
             ]
         );
     }

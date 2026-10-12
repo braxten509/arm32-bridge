@@ -157,6 +157,11 @@ impl Translator {
         let set_flags = (word >> 20) & 1 == 1;
         let (rn, rd) = ((word >> 16) & 0xF, (word >> 12) & 0xF);
         let compare = (0b1000..=0b1011).contains(&op);
+        let register_shift = !immediate && (word >> 4) & 1 == 1;
+        let uses_rn = op != 0b1101 && op != 0b1111;
+        if register_shift && ((uses_rn && rn == PC) || (!compare && rd == PC)) {
+            return Err(()); // unpredictable
+        }
         if rd == PC && set_flags && !compare {
             return Err(()); // exception return forms
         }
@@ -184,7 +189,7 @@ impl Translator {
             }
         } else {
             let (rm, rs) = (word & 0xF, (word >> 8) & 0xF);
-            if rm == PC || rs == PC || rn == PC || rd == PC {
+            if rm == PC || rs == PC {
                 return Err(());
             }
             self.shift_register(T2, rm, rs, (word >> 5) & 3, want_carry);
@@ -548,21 +553,20 @@ impl Translator {
         Ok(Flow::Next)
     }
 
-    /// LDM/STM (increment-after and decrement-before; push and pop are these).
+    /// LDM/STM (all four modes; push and pop are these).
     fn arm_multiple(&mut self, word: u32) -> Result<Flow> {
         let (before, up, user, writeback, load) = ((word >> 24) & 1 == 1, (word >> 23) & 1 == 1, (word >> 22) & 1 == 1, (word >> 21) & 1 == 1, (word >> 20) & 1 == 1);
         let (rn, list) = ((word >> 16) & 0xF, word & 0xFFFF);
         if user || (rn == SP && list & (1 << SP) != 0) {
             return Err(());
         }
-        match (before, up) {
-            (false, true) => self.load_store_multiple(load, rn, list, true, writeback),
-            (true, false) => self.load_store_multiple(load, rn, list, false, writeback),
-            _ => Err(()), // IB / DA: rare
-        }
+        self.load_store_multiple_at(load, rn, list, up, before, writeback)
     }
 
     fn arm_coprocessor(&mut self, word: u32) -> Result<Flow> {
+        if (word >> 9) & 7 == 0b101 && (word >> 24) & 0xF != 0xF {
+            return self.vfp(word);
+        }
         if word & 0x0FFF_0FFF == 0x0E1D_0F70 {
             // MRC p15, 0, Rt, c13, c0, 3: TPIDRURO (bionic's thread pointer)
             let rt = (word >> 12) & 0xF;
@@ -572,6 +576,6 @@ impl Translator {
             self.a.ldr_w_off(rt, host::STATE, offsets::TLS);
             return Ok(Flow::Next);
         }
-        Err(()) // VFP, NEON, SVC: Unicorn for now
+        Err(()) // SVC, other coprocessors: Unicorn
     }
 }

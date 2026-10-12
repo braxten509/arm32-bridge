@@ -6,8 +6,8 @@ use std::sync::OnceLock;
 
 use unicorn_engine::RegisterARM;
 
-use super::emit::{Asm, SP};
-use super::{check, exit, host, offsets, thumb, CpuState};
+use super::emit::{cond, shift, Asm, SP};
+use super::{check, exit, host, offsets, thumb, CpuState, FPSCR_CONTROL, FPSCR_CUMULATIVE};
 use crate::mem;
 use crate::runtime::{self, mem as guest_mem, GuestCpu, Uc, LR};
 
@@ -128,6 +128,19 @@ fn enter_code() -> Vec<u32> {
     a.push_pair_d(14, 15);
     a.mov_x(host::STATE, 0);
     a.mov_x(host::MEMORY, 1);
+    // Guest FPSCR: control bits into FPCR (only written when they differ from
+    // the host's, which is slow), cumulative flags into FPSR.
+    a.mrs_fpcr(16);
+    a.str_w_off(16, host::STATE, offsets::HOST_FPCR);
+    a.ldr_w_off(24, host::STATE, offsets::FPSCR);
+    a.and_w_imm(25, 24, FPSCR_CONTROL, 26);
+    a.cmp_w(25, 16);
+    let same = a.label();
+    a.b_cond_to(cond::EQ, same);
+    a.msr_fpcr(25);
+    a.bind(same);
+    a.and_w_imm(25, 24, FPSCR_CUMULATIVE, 26);
+    a.msr_fpsr(25);
     a.mov_x(17, 2);
     a.mov_x(host::EXIT_STUB, 3);
     a.mov_x_from_sp(16);
@@ -142,6 +155,7 @@ fn enter_code() -> Vec<u32> {
     }
     a.ldr_w_off(14, host::STATE, offsets::R + 14 * 4);
     a.br(17);
+    a.finish();
     a.code
 }
 
@@ -154,6 +168,20 @@ fn exit_code() -> Vec<u32> {
     a.str_w_off(14, host::STATE, offsets::R + 14 * 4);
     a.mrs_nzcv(16);
     a.str_x_off(16, host::STATE, offsets::NZCV);
+    // FPSCR flags back from FPSR; the host's FPCR back if the guest's differed.
+    a.mrs_fpsr(16);
+    a.and_w_imm(16, 16, FPSCR_CUMULATIVE, 24);
+    a.ldr_w_off(17, host::STATE, offsets::FPSCR);
+    a.and_w_imm(17, 17, !FPSCR_CUMULATIVE, 24);
+    a.orr_w(17, 17, 16, shift::LSL, 0);
+    a.str_w_off(17, host::STATE, offsets::FPSCR);
+    a.ldr_w_off(16, host::STATE, offsets::HOST_FPCR);
+    a.mrs_fpcr(17);
+    a.cmp_w(16, 17);
+    let same = a.label();
+    a.b_cond_to(cond::EQ, same);
+    a.msr_fpcr(16);
+    a.bind(same);
     for pair in 0..8 {
         a.stp_q_off(pair * 2, pair * 2 + 1, host::STATE, offsets::Q + pair * 32);
     }
@@ -173,6 +201,7 @@ fn exit_code() -> Vec<u32> {
     a.pop_pair_x(19, 20);
     a.pop_pair_x(29, 30);
     a.ret();
+    a.finish();
     let _ = SP;
     a.code
 }
