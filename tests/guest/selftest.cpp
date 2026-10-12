@@ -4,7 +4,10 @@
 #include <android/log.h>
 #include <jni.h>
 #include <math.h>
+#include <errno.h>
 #include <pthread.h>
+#include <sched.h>
+#include <time.h>
 #include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,6 +33,19 @@ static int once_count = 0;
 static void once_function() { once_count++; }
 static jmp_buf jump;
 static void jump_back() { longjmp(jump, 7); }
+static pthread_mutex_t counter_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t counter_changed = PTHREAD_COND_INITIALIZER;
+static int counter = 0;
+static void *add_to_counter(void *amount) {
+    for (int i = 0; i < 1000; i++) {
+        pthread_mutex_lock(&counter_lock);
+        counter += (int)(long)amount;
+        pthread_cond_broadcast(&counter_changed);
+        pthread_mutex_unlock(&counter_lock);
+        if (i % 100 == 0) sched_yield();
+    }
+    return (void *)(long)((int)(long)amount * 10);
+}
 static double take_mixed(int a, double b, int c, long long d, float e) { return a + b + c + (double)d + e; }
 
 extern "C" int run_all() {
@@ -48,6 +64,21 @@ extern "C" int run_all() {
     snprintf(buffer, sizeof buffer, "%d|%5s|%.2f|%lld|%x|%c|%u", -12, "ab", 3.14159, 1234567890123LL, 255, 'Z', 4000000000u);
     check(strcmp(buffer, "-12|   ab|3.14|1234567890123|ff|Z|4000000000") == 0, "snprintf with 32-bit argument sizes");
 
+    {
+        float x = 0, y = 0;
+        int r[4] = {0};
+        long long big = 0;
+        double d = 0;
+        char word[16] = "", rest[16] = "";
+        unsigned char small = 0;
+        int got = sscanf("12.5,-3.25", "%f,%f", &x, &y);
+        got += sscanf("{1, 2, 30, 400}", "{%d,%d,%d,%d}", &r[0], &r[1], &r[2], &r[3]);
+        got += sscanf("big=12345678901 0x1f 2.5e3 hello [a-b]", "big=%lld %hhx %lf %s %[^]]", &big, &small, &d, word, rest);
+        check(got == 11 && x == 12.5f && y == -3.25f && r[0] == 1 && r[3] == 400 && big == 12345678901LL &&
+                  small == 0x1f && d == 2500.0 && strcmp(word, "hello") == 0 && strcmp(rest, "[a-b") == 0 &&
+                  sscanf("", "%d", &r[0]) == EOF && sscanf("abc", "%d", &r[0]) == 0,
+              "sscanf with 32-bit sizes");
+    }
     check(fabs(sin(1.0) - 0.8414709848) < 1e-9 && fabs(pow(2.0, 10.0) - 1024.0) < 1e-12, "double math (softfp pairs)");
     check(fabsf(sqrtf(2.0f) - 1.4142135f) < 1e-6f && fabsf(atan2f(1.0f, 1.0f) - 0.7853982f) < 1e-6f, "float math");
     volatile double (*mixed)(int, double, int, long long, float) = (volatile double (*)(int, double, int, long long, float))take_mixed;
@@ -87,6 +118,39 @@ extern "C" int run_all() {
 
     errno = 0;
     check(strtol("99999999999", nullptr, 10) == 2147483647L && errno == ERANGE, "strtol clamps to 32-bit long + errno");
+
+    pthread_t threads[4];
+    for (long i = 0; i < 4; i++) pthread_create(&threads[i], nullptr, add_to_counter, (void *)(i + 1));
+    pthread_mutex_lock(&counter_lock);
+    while (counter < 10000) pthread_cond_wait(&counter_changed, &counter_lock);
+    pthread_mutex_unlock(&counter_lock);
+    long results = 0;
+    for (int i = 0; i < 4; i++) {
+        void *result = nullptr;
+        pthread_join(threads[i], &result);
+        results += (long)result;
+    }
+    check(counter == 10000 && results == 100, "4 threads + mutex + condition variable + join");
+
+    pthread_mutexattr_t attributes;
+    pthread_mutexattr_init(&attributes);
+    pthread_mutexattr_settype(&attributes, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_t recursive;
+    pthread_mutex_init(&recursive, &attributes);
+    bool nested = pthread_mutex_lock(&recursive) == 0 && pthread_mutex_lock(&recursive) == 0 &&
+                  pthread_mutex_unlock(&recursive) == 0 && pthread_mutex_unlock(&recursive) == 0 &&
+                  pthread_mutex_trylock(&recursive) == 0;
+    pthread_mutex_unlock(&recursive);
+    check(nested, "recursive mutex");
+
+    pthread_mutex_lock(&counter_lock);
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_nsec += 20 * 1000 * 1000;
+    if (deadline.tv_nsec >= 1000000000) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000; }
+    int waited = pthread_cond_timedwait(&counter_changed, &counter_lock, &deadline);
+    pthread_mutex_unlock(&counter_lock);
+    check(waited == ETIMEDOUT, "condition wait times out");
 
     __android_log_print(ANDROID_LOG_INFO, TAG, "%d failures", failures);
     return failures;

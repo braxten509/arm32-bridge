@@ -37,6 +37,10 @@ pub struct GuestMem {
     base: *mut u8,
 }
 
+// The reservation lives for the whole process and is only a base address.
+unsafe impl Send for GuestMem {}
+unsafe impl Sync for GuestMem {}
+
 impl GuestMem {
     pub fn reserve() -> GuestMem {
         let size = 1usize << 32;

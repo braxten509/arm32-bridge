@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::mem;
-use crate::runtime::{call_guest, stub_for, Uc};
+use crate::runtime::{call_guest, shared, stub_for, Uc};
 
 const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
@@ -48,8 +48,8 @@ pub struct Symbol {
 }
 
 impl Library {
-    pub fn symbol(&self, uc: &Uc, index: u32) -> Symbol {
-        let memory = uc.get_data().mem;
+    pub fn symbol(&self, _uc: &Uc, index: u32) -> Symbol {
+        let memory = crate::runtime::mem();
         let entry = self.symbol_table + index * 16;
         let name_offset = memory.read_u32(entry);
         let value = memory.read_u32(entry + 4);
@@ -137,7 +137,7 @@ impl Loader {
         }
         self.next_base = base + size + mem::PAGE;
 
-        let memory = uc.get_data().mem;
+        let memory = crate::runtime::mem();
         for segment in segments.iter().filter(|s| s.kind == PT_LOAD) {
             let bytes = &file[segment.offset as usize..(segment.offset + segment.file_size) as usize];
             memory.write_bytes(base + segment.address, bytes);
@@ -145,7 +145,7 @@ impl Loader {
         if let Some(exidx) = segments.iter().find(|s| s.kind == PT_ARM_EXIDX) {
             // C++ exception unwinding asks for this via dl_unwind_find_exidx.
             let entry = (base, base + size, base + exidx.address, exidx.memory_size / 8);
-            uc.get_data_mut().state.unwind_tables.push(entry);
+            shared().state.unwind_tables.push(entry);
         }
         let dynamic = segments.iter().find(|s| s.kind == PT_DYNAMIC).ok_or("no dynamic section")?;
 
@@ -170,7 +170,7 @@ impl Loader {
             if let Some(found) = self.find_guest_library(&needed) {
                 let index = self.load(uc, &found)?;
                 for (name, address) in self.libraries[index].exports(uc) {
-                    uc.get_data_mut().guest_exports.entry(name).or_insert(address);
+                    shared().guest_exports.entry(name).or_insert(address);
                 }
             }
         }
@@ -225,7 +225,7 @@ impl Loader {
             }
         }
         for (export, address) in library.exports(uc) {
-            uc.get_data_mut().guest_exports.entry(export).or_insert(address);
+            shared().guest_exports.entry(export).or_insert(address);
         }
         self.libraries.push(library);
         Ok(self.libraries.len() - 1)
@@ -266,18 +266,18 @@ fn check_header(file: &[u8]) -> Result<(), String> {
 
 /// Address for a symbol a relocation refers to: the library's own
 /// definition, another loaded game library's export, or a bridge stand-in.
-fn resolve(uc: &mut Uc, library: &Library, symbol: &crate::elf::Symbol) -> u32 {
+fn resolve(_uc: &mut Uc, library: &Library, symbol: &crate::elf::Symbol) -> u32 {
     if symbol.defined {
         return library.base + symbol.value;
     }
     if symbol.name.is_empty() {
         return 0;
     }
-    if let Some(&address) = uc.get_data().guest_exports.get(&symbol.name) {
+    if let Some(&address) = shared().guest_exports.get(&symbol.name) {
         return address;
     }
     if symbol.kind == STT_OBJECT {
-        return crate::imports::data_import(uc, &symbol.name);
+        return crate::imports::data_import(&symbol.name);
     }
-    stub_for(uc, &symbol.name)
+    stub_for(&symbol.name)
 }

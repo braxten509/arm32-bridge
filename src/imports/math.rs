@@ -3,7 +3,7 @@
 //! arrives in one register and returns in r0.
 
 use crate::handler;
-use crate::runtime::{ArgSource, Handler, Ret};
+use crate::runtime::{mem, ArgSource, Handler, Ret};
 
 #[allow(non_upper_case_globals)]
 mod c {
@@ -159,7 +159,7 @@ pub fn handler(name: &str) -> Option<Handler> {
             let integer_out = a.u32();
             let mut integer = 0.0;
             let fraction = unsafe { c::modf(x, &mut integer) };
-            uc.get_data().mem.write_u64(integer_out, integer.to_bits());
+            mem().write_u64(integer_out, integer.to_bits());
             Ret::F64(fraction)
         }),
         "remquo" => handler!(|uc, a| {
@@ -168,7 +168,7 @@ pub fn handler(name: &str) -> Option<Handler> {
             let quotient_out = a.u32();
             let mut quotient = 0;
             let result = unsafe { c::remquo(x, y, &mut quotient) };
-            uc.get_data().mem.write_u32(quotient_out, quotient as u32);
+            mem().write_u32(quotient_out, quotient as u32);
             Ret::F64(result)
         }),
         // long is 32 bits on ARM32.

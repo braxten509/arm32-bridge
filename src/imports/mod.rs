@@ -2,13 +2,20 @@
 //! imports from the phone (libc, libm, liblog, libdl, JNI, ...).
 
 pub mod jni;
+pub mod jni_host;
+pub mod threads;
 pub mod libc_calls;
 pub mod math;
 pub mod printf;
+pub mod scanf;
+pub mod sles;
+pub mod gles;
+mod gles_generated;
+pub mod android;
 
 use std::collections::HashMap;
 
-use crate::runtime::{Handler, Uc};
+use crate::runtime::{mem, shared, Handler};
 
 /// A guest FILE* maps to one of these.
 #[derive(Clone, Copy)]
@@ -22,7 +29,7 @@ pub enum HostFile {
 pub struct State {
     pub files: HashMap<u32, HostFile>,
     pub directories: HashMap<u32, (usize, u32)>,
-    pub thread_keys: Vec<Option<u32>>,
+    pub threads: threads::Threads,
     pub at_exit: Vec<(u32, u32)>,
     pub strtok_next: usize,
     pub static_tm: u32,
@@ -31,6 +38,9 @@ pub struct State {
     /// (start, end, exidx address, exidx entry count) per loaded library.
     pub unwind_tables: Vec<(u32, u32, u32, u32)>,
     pub jni: jni::Jni,
+    pub jni_refs: jni_host::Refs,
+    pub assets: android::Assets,
+    pub sound: sles::Sound,
 }
 
 /// Wraps a closure body as a `Handler` with the right parameter types.
@@ -48,20 +58,28 @@ pub fn handler_for(name: &str) -> Option<Handler> {
     if let Some(jni_name) = name.strip_prefix("jni:") {
         return jni::handler(jni_name);
     }
-    libc_calls::handler(name).or_else(|| math::handler(name))
+    threads::handler(name)
+        .or_else(|| libc_calls::handler(name))
+        .or_else(|| math::handler(name))
+        .or_else(|| gles::handler(name))
+        .or_else(|| android::handler(name))
+        .or_else(|| sles::handler(name))
 }
-
-pub fn install_data(_uc: &mut Uc) {}
 
 const BIONIC_FILE_SIZE: u32 = 84;
 
 /// Guest address for a data object the game imports (stdio, ctype tables...).
-pub fn data_import(uc: &mut Uc, name: &str) -> u32 {
-    if let Some(&address) = uc.get_data().state.data_imports.get(name) {
+pub fn data_import(name: &str) -> u32 {
+    if let Some(&address) = shared().state.data_imports.get(name) {
         return address;
     }
-    let runtime = uc.get_data_mut();
-    let memory = runtime.mem;
+    if name.starts_with("SL_IID_") {
+        let address = sles::interface_id_import(name);
+        shared().state.data_imports.insert(name.to_string(), address);
+        return address;
+    }
+    let mut runtime = shared();
+    let memory = mem();
     let address = match name {
         "__sF" => {
             let base = runtime.misc_alloc(BIONIC_FILE_SIZE * 3, 8);
@@ -98,20 +116,12 @@ pub fn data_import(uc: &mut Uc, name: &str) -> u32 {
             memory.write_u32(pointer, table);
             pointer
         }
-        _ if name.starts_with("SL_IID_") => {
-            // OpenSL ES interface IDs: a pointer to a 16-byte ID.
-            let id = runtime.misc_alloc(16, 4);
-            memory.write_bytes(id, &name.as_bytes()[..16.min(name.len())]);
-            let pointer = runtime.misc_alloc(4, 4);
-            memory.write_u32(pointer, id);
-            pointer
-        }
         _ => {
-            eprintln!("[bridge] unknown data import {name}; giving it 64 zero bytes");
+            crate::log::line(&format!("[bridge] unknown data import {name}; giving it 64 zero bytes"));
             runtime.misc_alloc(64, 8)
         }
     };
-    uc.get_data_mut().state.data_imports.insert(name.to_string(), address);
+    runtime.state.data_imports.insert(name.to_string(), address);
     address
 }
 

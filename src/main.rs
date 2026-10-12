@@ -11,10 +11,7 @@
 //!   bench <lib.so> <function> <number>
 //!       Time one exported function through the bridge.
 
-mod elf;
-mod imports;
-mod mem;
-mod runtime;
+use arm32_bridge::{elf, imports, runtime};
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -52,22 +49,24 @@ fn parse_number(text: &str) -> u32 {
 
 /// Creates the CPU, loads the library (and game libraries next to it) and
 /// runs every library's start-up code, dependencies first.
-fn boot(path: &Path, options: &Options) -> Result<(Uc, elf::Loader, usize), String> {
-    let mut uc = runtime::new_cpu(options.trace);
-    imports::jni::create_vm(&mut uc);
+fn boot(path: &Path, options: &Options) -> Result<(&'static mut Uc, elf::Loader, usize), String> {
+    runtime::init(options.trace);
+    let uc = runtime::engine();
+    imports::jni::create_vm(uc);
     let directory = path.parent().map(PathBuf::from).unwrap_or_default();
     let mut loader = elf::Loader::new(vec![directory]);
-    let index = loader.load(&mut uc, path)?;
+    let index = loader.load(uc, path)?;
     let mut total = 0;
     for i in 0..loader.libraries.len() {
-        total += loader.run_init(&mut uc, i, options.verbose)?;
+        total += loader.run_init(uc, i, options.verbose)?;
     }
     eprintln!("[bridge] start-up code finished: {total} functions ran");
     Ok((uc, loader, index))
 }
 
 fn print_report(uc: &Uc) {
-    let runtime = uc.get_data();
+    let _ = uc;
+    let runtime = runtime::shared();
     let used: Vec<&runtime::Stub> = runtime
         .first_use
         .iter()
@@ -97,8 +96,9 @@ fn print_report(uc: &Uc) {
 
 fn print_fault(uc: &Uc, error: &str) {
     println!("\nFAILED: {error}");
-    let recent: Vec<&String> = uc.get_data().recent.iter().collect();
-    println!("Last phone functions called: {}", recent.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
+    let _ = uc;
+    let recent: Vec<String> = runtime::shared().recent.iter().cloned().collect();
+    println!("Last phone functions called: {}", recent.join(", "));
 }
 
 fn command_load(options: &Options) -> ExitCode {
@@ -107,7 +107,7 @@ fn command_load(options: &Options) -> ExitCode {
         return ExitCode::from(2);
     };
     let started = Instant::now();
-    let (mut uc, loader, index) = match boot(Path::new(path), options) {
+    let (uc, loader, index) = match boot(Path::new(path), options) {
         Ok(booted) => booted,
         Err(error) => {
             eprintln!("[bridge] {error}");
@@ -123,12 +123,12 @@ fn command_load(options: &Options) -> ExitCode {
 
     let mut passed = true;
     if options.jni_onload {
-        let Some(onload) = library.export(&uc, "JNI_OnLoad") else {
+        let Some(onload) = library.export(uc, "JNI_OnLoad") else {
             println!("{} has no JNI_OnLoad", library.name);
             return ExitCode::FAILURE;
         };
-        let vm = uc.get_data().state.jni.vm;
-        match call_guest(&mut uc, onload, &[vm, 0]) {
+        let vm = runtime::shared().state.jni.vm;
+        match call_guest(uc, onload, &[vm, 0]) {
             Ok(result) => {
                 let version = result as u32;
                 let valid = matches!(version, 0x0001_0001 | 0x0001_0002 | 0x0001_0004 | 0x0001_0006 | 0x0001_0008);
@@ -139,14 +139,14 @@ fn command_load(options: &Options) -> ExitCode {
                 passed &= valid;
             }
             Err(error) => {
-                print_fault(&uc, &error);
+                print_fault(uc, &error);
                 passed = false;
             }
         }
     }
-    print_report(&uc);
+    print_report(uc);
     println!("\nTime: {:.2} s", started.elapsed().as_secs_f64());
-    let has_missing = !uc.get_data().missing.is_empty();
+    let has_missing = !runtime::shared().missing.is_empty();
     println!(
         "Result: {}",
         if passed && !has_missing {
@@ -170,19 +170,19 @@ fn command_call(options: &Options, timed: bool) -> ExitCode {
         return ExitCode::from(2);
     };
     let arguments: Vec<u32> = options.positional[3..].iter().map(|s| parse_number(s)).collect();
-    let (mut uc, loader, index) = match boot(Path::new(path), options) {
+    let (uc, loader, index) = match boot(Path::new(path), options) {
         Ok(booted) => booted,
         Err(error) => {
             eprintln!("[bridge] {error}");
             return ExitCode::FAILURE;
         }
     };
-    let Some(address) = loader.libraries[index].export(&uc, function) else {
+    let Some(address) = loader.libraries[index].export(uc, function) else {
         eprintln!("[bridge] {function} is not exported");
         return ExitCode::FAILURE;
     };
     let started = Instant::now();
-    let result = call_guest(&mut uc, address, &arguments);
+    let result = call_guest(uc, address, &arguments);
     let elapsed = started.elapsed();
     match result {
         Ok(value) => {
@@ -193,13 +193,15 @@ fn command_call(options: &Options, timed: bool) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(error) => {
-            print_fault(&uc, &error);
+            print_fault(uc, &error);
             ExitCode::FAILURE
         }
     }
 }
 
 fn main() -> ExitCode {
+    // The command-line tool runs everything on this one thread.
+    let _lock = runtime::hold_gil();
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     let options = parse(&arguments);
     match options.positional.first().map(String::as_str) {
