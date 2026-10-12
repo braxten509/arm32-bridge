@@ -101,3 +101,8 @@ engine.rs run(): an address at stub+4 (the `bx lr` half) just returns to LR. Tem
 - Stage 6 (block links + 4096-entry jump table + cheap pc hash): self-test 0 failures (all engines); bench 141-144 ms
   vs native 106-147 ms (~1.0-1.3x); menu 119.8-120.1 fps, own code 2.2-2.4 ms/frame, own-code spikes up to 8.4 ms,
   slowest frame 25.6 ms (phone functions).
+- Stage 7a: fault handler for translated code (logs guest address, block, r0-r14, then chains to Android's handler).
+  Found: the host reservation was RW everywhere, so a NULL read in translated code returned 0 where Unicorn faults.
+  Fixed: gaps outside MAPPED_REGIONS are PROT_NONE. Throwaway /tmp fault.so: Unicorn "READ_UNMAPPED at 0x10",
+  translator "[fault] ... at 0x00000010 ... guest block 0x01000328", then SIGSEGV. Self-test, bench, game (jit and
+  checker: 1,048,576 checks, 0 differences) all still pass.

@@ -96,6 +96,9 @@ impl CodeMemory {
             )
         };
         assert!(base != libc::MAP_FAILED, "could not map memory for translated code");
+        CODE_BASE.store(base as usize, Ordering::Relaxed);
+        #[cfg(all(target_arch = "aarch64", target_os = "android"))]
+        fault::install();
         let mut memory = CodeMemory { base: base as *mut u32, used: 0, enter: 0, exit_stub: 0 };
         memory.enter = memory.place(&enter_code());
         memory.exit_stub = memory.place(&exit_code());
@@ -265,6 +268,9 @@ struct Cache {
     memory: CodeMemory,
     /// Guest pc → (code address, guest address just past the block).
     blocks: PcMap<(usize, u32)>,
+    /// (code address, guest pc) of every block in placement order (rising
+    /// addresses), so the fault handler can name the block a host pc is in.
+    starts: Vec<(usize, u32)>,
     /// Guest pc not translated yet → exits waiting to be linked to it.
     pending: PcMap<Vec<usize>>,
     table: Box<[JumpEntry]>,
@@ -289,12 +295,81 @@ fn with_cache<R>(work: impl FnOnce(&mut Cache) -> R) -> R {
             memory: CodeMemory::new(),
             blocks: PcMap::default(),
             pending: PcMap::default(),
+            starts: Vec::new(),
             table,
             fallbacks: HashMap::new(),
             fallback_total: 0,
         }
     });
     work(cache)
+}
+
+/// Start of translated code memory (for the fault handler).
+static CODE_BASE: AtomicUsize = AtomicUsize::new(0);
+
+/// Faults inside translated code (a bad guest memory access) are logged as a
+/// guest fault with the guest block and registers; then the crash goes on to
+/// the previous handler (Android's), as before.
+#[cfg(all(target_arch = "aarch64", target_os = "android"))]
+mod fault {
+    use super::{Ordering, CACHE, CODE_BASE, CODE_SIZE};
+    use std::sync::atomic::AtomicBool;
+
+    /// The handlers that were there before, for SIGSEGV and SIGBUS.
+    static mut PREVIOUS: [std::mem::MaybeUninit<libc::sigaction>; 2] = [std::mem::MaybeUninit::uninit(); 2];
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+
+    pub fn install() {
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = on_fault as *const () as usize;
+            action.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+            libc::sigemptyset(&mut action.sa_mask);
+            for (i, signal) in [libc::SIGSEGV, libc::SIGBUS].into_iter().enumerate() {
+                let previous = (std::ptr::addr_of_mut!(PREVIOUS) as *mut libc::sigaction).add(i);
+                libc::sigaction(signal, &action, previous);
+            }
+        }
+    }
+
+    extern "C" fn on_fault(signal: libc::c_int, info: *mut libc::siginfo_t, context: *mut libc::c_void) {
+        let base = CODE_BASE.load(Ordering::Relaxed);
+        let context = unsafe { &*(context as *const libc::ucontext_t) };
+        let pc = context.uc_mcontext.pc as usize;
+        if pc >= base && pc < base + CODE_SIZE && !REPORTED.swap(true, Ordering::Relaxed) {
+            let registers = &context.uc_mcontext.regs;
+            let host_address = unsafe { (*info).si_addr() } as usize;
+            let guest_address = host_address.wrapping_sub(registers[20] as usize);
+            let block = CACHE.0.try_borrow().ok().and_then(|cache| {
+                let cache = cache.as_ref()?;
+                let index = cache.starts.partition_point(|&(start, _)| start <= pc);
+                index.checked_sub(1).map(|i| cache.starts[i].1)
+            });
+            let mut text = format!(
+                "[fault] bad guest memory access at {guest_address:#010x} in translated code (guest block {}, host pc {pc:#x}); registers:",
+                block.map_or("unknown".to_string(), |pc| format!("{pc:#010x}"))
+            );
+            for (i, value) in registers.iter().take(15).enumerate() {
+                text.push_str(&format!(" r{i}={:x}", *value as u32));
+            }
+            crate::log::line(&text);
+        }
+        // Hand the signal to the handler that was there before.
+        unsafe {
+            let slot = if signal == libc::SIGBUS { 1 } else { 0 };
+            let previous = &*(std::ptr::addr_of!(PREVIOUS) as *const libc::sigaction).add(slot);
+            if previous.sa_flags & libc::SA_SIGINFO != 0 && previous.sa_sigaction > 1 {
+                let handler: extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void) = std::mem::transmute(previous.sa_sigaction);
+                handler(signal, info, context as *const _ as *mut libc::c_void);
+            } else if previous.sa_sigaction > 1 {
+                let handler: extern "C" fn(libc::c_int) = std::mem::transmute(previous.sa_sigaction);
+                handler(signal);
+            } else {
+                libc::signal(signal, libc::SIG_DFL);
+                libc::raise(signal);
+            }
+        }
+    }
 }
 
 /// Turns the `nop` at `site` into `b target`.
@@ -322,6 +397,7 @@ fn block_for(pc: u32) -> (usize, u32, usize, usize) {
         let block = if pc & 1 == 1 { thumb::translate(guest_mem(), pc & !1) } else { thumb::translate_arm(guest_mem(), pc) };
         let address = cache.memory.place(&block.code);
         cache.blocks.insert(pc, (address, block.end));
+        cache.starts.push((address, pc));
         if linking() {
             for &(at, target) in &block.links {
                 let site = address + at * 4;

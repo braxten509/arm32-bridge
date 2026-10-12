@@ -57,6 +57,16 @@ impl GuestMem {
             )
         };
         assert!(base != libc::MAP_FAILED, "could not reserve 4 GiB for guest memory");
+        // Addresses outside the mapped regions fault on the host too, as they
+        // do in Unicorn (a NULL dereference in translated code must not read 0).
+        let mut start = 0usize;
+        for (region_start, region_end, _) in MAPPED_REGIONS {
+            if (region_start as usize) > start {
+                unsafe { libc::mprotect((base as *mut u8).add(start).cast(), region_start as usize - start, libc::PROT_NONE) };
+            }
+            start = region_end as usize;
+        }
+        unsafe { libc::mprotect((base as *mut u8).add(start).cast(), size - start, libc::PROT_NONE) };
         GuestMem { base: base as *mut u8 }
     }
 
