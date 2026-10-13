@@ -125,3 +125,18 @@ engine.rs run(): an address at stub+4 (the `bx lr` half) just returns to LR. Tem
 - User: smooth without the checker; loading freeze on first village load does not count. Translator is now the
   default (ARM32_ENGINE / debug.arm32bridge.engine=unicorn opts out). Self-test passes on all engines; game start-up
   124 ms with no property set (Unicorn: 2722 ms).
+
+# Packaging part A: one bridge build for every game (2026-10-12)
+- Java natives are now connected at start-up (src/natives.rs): every `Java_*` export of the 32-bit library is
+  demangled, its Java method's signature read through reflection, and RegisterNatives points it at a generated
+  32-byte stub (movz x16,#index; ldr/br to one shared entry that saves x0-x7/d0-d7 and decodes by signature). The
+  game's own RegisterNatives goes the same way. build.rs exports, tools/gen_exports.py and the per-game rebuild are gone.
+- Helper libraries: one prebuilt stand-in (tools/standin/standin.c) reads class names from its original
+  (lib<name>-arm32.so next to it), registers do-nothing natives for the app's own classes only (class loader != null),
+  and skips methods the bridge reports as connected (arm32_bridge_connected). The main original is
+  lib<main>-arm32.so; the loader prefers <name>-arm32.so for NEEDED libraries and only loads 32-bit ARM ELF files.
+- The PC tool's pretend package name now comes from ARM32_PACKAGE (no game names left in src/ or tools/).
+- Result, Puzzle Craft 2 repacked the new way: "[bridge] connected 47 native methods; 0 exports without a matching
+  Java method", stand-in "1 do-nothing native methods in 1 classes" (same as the old generator), menu 119.8-120.1 fps,
+  own code ~2 ms/frame; checker 1,048,576 blocks, 0 differences (30 ran past); self-test 0 failures on PC, and on the
+  phone with jit, unicorn and ARM32_CHECK=all (35,328 checks, 0 differences).

@@ -5,11 +5,14 @@
 pub mod dynarec;
 pub mod elf;
 pub mod imports;
+pub mod jni_names;
 pub mod log;
 pub mod mem;
 pub mod runtime;
 
 #[cfg(target_os = "android")]
 pub mod app;
+#[cfg(target_os = "android")]
+pub mod natives;
 #[cfg(target_os = "android")]
 pub mod sound_preload;

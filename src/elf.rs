@@ -30,6 +30,9 @@ const R_ARM_RELATIVE: u32 = 23;
 
 const STT_OBJECT: u8 = 1;
 
+/// File name ending of a 32-bit library packed next to its 64-bit replacement.
+pub const ORIGINAL_SUFFIX: &str = "-arm32.so";
+
 pub struct Library {
     pub name: String,
     pub base: u32,
@@ -231,8 +234,20 @@ impl Loader {
         Ok(self.libraries.len() - 1)
     }
 
+    /// A needed library's 32-bit file. In a converted APK the original of
+    /// lib<name>.so sits next to its 64-bit stand-in as lib<name>-arm32.so.
     fn find_guest_library(&self, name: &str) -> Option<PathBuf> {
-        self.search_dirs.iter().map(|d| d.join(name)).find(|p| p.is_file())
+        let original = format!("{}{ORIGINAL_SUFFIX}", name.strip_suffix(".so").unwrap_or(name));
+        let is_arm32 = |path: &PathBuf| {
+            let mut header = [0u8; 20];
+            std::fs::File::open(path).and_then(|mut file| std::io::Read::read_exact(&mut file, &mut header)).is_ok()
+                && header[..5] == *b"\x7fELF\x01"
+                && u16::from_le_bytes([header[18], header[19]]) == 40 // EM_ARM
+        };
+        self.search_dirs
+            .iter()
+            .flat_map(|d| [d.join(&original), d.join(name)])
+            .find(|p| p.is_file() && is_arm32(p))
     }
 
     /// Runs DT_INIT and every DT_INIT_ARRAY entry (C++ static constructors).

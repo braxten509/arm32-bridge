@@ -1,7 +1,7 @@
 //! A pretend Java side. The game gets a JavaVM and a JNIEnv whose function
 //! tables point at bridge stand-ins; every class lookup and Java call is
 //! logged and answered with a harmless value (or a known answer from
-//! `PRETEND_ANSWERS`). References are opaque handles in an unmapped range,
+//! `pretend_answer`). References are opaque handles in an unmapped range,
 //! so a game that dereferences one faults loudly instead of reading junk.
 
 use crate::handler;
@@ -10,15 +10,19 @@ use crate::runtime::{mem, shared, stop_with_fault, stub_for, ArgSource, Args, Ha
 const HANDLE_BASE: u32 = 0xD000_0000;
 const JNI_VERSION_1_6: u32 = 0x0001_0006;
 
-/// Answers for Java methods the game asks about at start-up.
-const PRETEND_ANSWERS: &[(&str, &str)] = &[
-    ("getCocos2dxPackageName", "com.chillingo.puzzlecraft2.android.gplay"),
-    ("getCocos2dxWritablePath", "/data/data/com.chillingo.puzzlecraft2.android.gplay/files"),
-    ("getCurrentLanguage", "en"),
-    ("getCurrentLanguageCode", "en"),
-    ("getDeviceModel", "Pixel 10"),
-    ("getVersion", "1.0"),
-];
+/// Answers for Java methods the game asks about at start-up. The package name
+/// comes from ARM32_PACKAGE (the PC tool has no real app to ask).
+fn pretend_answer(method: &str) -> Option<String> {
+    let package = std::env::var("ARM32_PACKAGE").unwrap_or_else(|_| "app".into());
+    Some(match method {
+        "getCocos2dxPackageName" => package,
+        "getCocos2dxWritablePath" => format!("/data/data/{package}/files"),
+        "getCurrentLanguage" | "getCurrentLanguageCode" => "en".into(),
+        "getDeviceModel" => "Pixel 10".into(),
+        "getVersion" => "1.0".into(),
+        _ => return None,
+    })
+}
 
 #[derive(Clone, Debug)]
 pub enum JavaObject {
@@ -174,13 +178,13 @@ fn java_answer(method: u32, how: &str) -> Ret {
         _ => (String::from("?"), format!("<method {method:#x}>"), String::from("()V")),
     };
     let return_type = signature.rsplit(')').next().unwrap_or("V").to_string();
-    let answer = PRETEND_ANSWERS.iter().find(|(method_name, _)| *method_name == name).map(|(_, value)| *value);
+    let answer = pretend_answer(&name);
     let result = match return_type.as_bytes().first() {
         Some(b'V') => Ret::Void,
         Some(b'J') => Ret::U64(0),
         Some(b'F') => Ret::F32(0.0),
         Some(b'D') => Ret::F64(0.0),
-        Some(b'L') if return_type == "Ljava/lang/String;" => Ret::U32(shared().state.jni.text(answer.unwrap_or(""))),
+        Some(b'L') if return_type == "Ljava/lang/String;" => Ret::U32(shared().state.jni.text(answer.as_deref().unwrap_or(""))),
         Some(b'L') | Some(b'[') => {
             let type_name = return_type.trim_start_matches('L').trim_end_matches(';').to_string();
             Ret::U32(shared().state.jni.add(JavaObject::Instance(type_name)))

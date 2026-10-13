@@ -784,8 +784,20 @@ pub fn dispatch(uc: &mut Uc, name: &str, a: &mut Args) -> Ret {
             Ret::Void
         }
         "RegisterNatives" => {
-            crate::log::line("[bridge] the game called RegisterNatives; not supported yet");
-            Ret::U32(0)
+            // JNINativeMethod in 32-bit code: name, signature, function (3 words each).
+            let (class, methods, count) = (a.u32(), a.u32(), a.u32());
+            let methods: Vec<(String, String, u32)> = (0..count)
+                .map(|i| {
+                    let at = methods + i * 12;
+                    let text = |pointer: u32| mem().c_str(mem().read_u32(pointer)).to_string_lossy().into_owned();
+                    (text(at), text(at + 4), mem().read_u32(at + 8))
+                })
+                .collect();
+            #[cfg(target_os = "android")]
+            let ok = crate::natives::register_from_guest(env, to_host(class), &methods);
+            #[cfg(not(target_os = "android"))]
+            let ok = { let _ = (class, &methods); false };
+            Ret::U32(if ok { 0 } else { u32::MAX })
         }
         "UnregisterNatives" => Ret::U32(0),
         "MonitorEnter" => {
