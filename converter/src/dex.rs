@@ -1,0 +1,253 @@
+//! Fixes known Java-side problems of old games directly in their dex files.
+//!
+//! Fix 1 - AudioAttributes FLAG_HW_AV_SYNC (0x10): cocos2d-x 3.x builds its
+//! SoundPool with setFlags(16), which asks for a hardware A/V sync output.
+//! Phones without one refuse every sound effect. The bit is cleared from a
+//! constant passed straight to AudioAttributes.Builder.setFlags.
+//!
+//! Fix 2 - cocos2d-x Cocos2dxSound.LOAD_TIME_OUT (5000 ms): the game thread
+//! waits until Android has decoded a new effect, which froze the game for
+//! 76-500 ms per effect. The wait becomes 1 ms; the effect still plays as soon
+//! as its load-complete listener fires.
+//!
+//! Fix 3 - frame limiters: a Thread.sleep inside a GLSurfaceView renderer's
+//! onDrawFrame only ever holds the game below the screen's rate. The call
+//! becomes nops, so the game draws at the screen's rate.
+
+const FLAG_HW_AV_SYNC: i32 = 0x10;
+const SHORT_LOAD_WAIT: i32 = 1;
+
+/// One change made to a dex file.
+pub struct Fix {
+    pub offset: usize,
+    pub reason: &'static str,
+    pub old: String,
+    pub new: String,
+}
+
+struct Dex<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> Dex<'a> {
+    fn u16(&self, at: usize) -> u16 {
+        u16::from_le_bytes([self.data[at], self.data[at + 1]])
+    }
+    fn u32(&self, at: usize) -> u32 {
+        u32::from_le_bytes(self.data[at..at + 4].try_into().unwrap())
+    }
+    fn uleb(&self, at: &mut usize) -> u32 {
+        let mut value = 0u32;
+        for shift in (0..35).step_by(7) {
+            let byte = self.data[*at];
+            *at += 1;
+            value |= u32::from(byte & 0x7F) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+        }
+        value
+    }
+    fn string(&self, index: u32) -> String {
+        let mut at = self.u32(self.u32(0x3C) as usize + index as usize * 4) as usize;
+        self.uleb(&mut at);
+        let end = self.data[at..].iter().position(|&b| b == 0).map_or(self.data.len(), |n| at + n);
+        String::from_utf8_lossy(&self.data[at..end]).into_owned()
+    }
+    fn type_name(&self, index: u32) -> String {
+        self.string(self.u32(self.u32(0x44) as usize + index as usize * 4))
+    }
+    /// `Lclass;.name:type` like dexdump prints a field reference.
+    fn field(&self, index: u32) -> String {
+        let at = self.u32(0x54) as usize + index as usize * 8;
+        let (class, kind, name) = (self.u16(at), self.u16(at + 2), self.u32(at + 4));
+        format!("{}.{}:{}", self.type_name(class.into()), self.string(name), self.type_name(kind.into()))
+    }
+    /// (`Lclass;.name:(params)return`, name, signature) of a method reference.
+    fn method(&self, index: u32) -> (String, String, String) {
+        let at = self.u32(0x5C) as usize + index as usize * 8;
+        let (class, proto, name) = (self.u16(at), self.u16(at + 2), self.u32(at + 4));
+        let proto_at = self.u32(0x4C) as usize + proto as usize * 12;
+        let (returns, parameters) = (self.u32(proto_at + 4), self.u32(proto_at + 8) as usize);
+        let mut signature = String::from("(");
+        if parameters != 0 {
+            for i in 0..self.u32(parameters) as usize {
+                signature.push_str(&self.type_name(self.u16(parameters + 4 + i * 2).into()));
+            }
+        }
+        signature.push(')');
+        signature.push_str(&self.type_name(returns));
+        let name = self.string(name);
+        (format!("{}.{}:{}", self.type_name(class.into()), name, signature), name, signature)
+    }
+}
+
+/// Length in 16-bit units of the instruction at `units[0]` (payloads included).
+fn instruction_length(units: &[u16]) -> usize {
+    let opcode = units[0] & 0xFF;
+    match units[0] {
+        0x0100 => return 4 + units[1] as usize * 2,
+        0x0200 => return 2 + units[1] as usize * 4,
+        0x0300 => {
+            let width = units[1] as usize;
+            let count = units[2] as usize | (units[3] as usize) << 16;
+            return 4 + (count * width + 1) / 2;
+        }
+        _ => {}
+    }
+    match opcode {
+        0x02 | 0x05 | 0x08 | 0x13 | 0x15 | 0x16 | 0x19 | 0x1A | 0x1C | 0x1F | 0x20 | 0x22 | 0x23 | 0x29 => 2,
+        0x2D..=0x3D | 0x44..=0x6D | 0x90..=0xAF | 0xD0..=0xE2 | 0xFE | 0xFF => 2,
+        0x03 | 0x06 | 0x09 | 0x14 | 0x17 | 0x1B | 0x24..=0x26 | 0x2A..=0x2C | 0x6E..=0x72 | 0x74..=0x78 | 0xFC | 0xFD => 3,
+        0xFA | 0xFB => 4,
+        0x18 => 5,
+        _ => 1,
+    }
+}
+
+/// Finds every fix to make in a dex file.
+pub fn find_fixes(data: &[u8]) -> Vec<Fix> {
+    let dex = Dex { data };
+    let mut fixes = Vec::new();
+    let mut seen_code = std::collections::HashSet::new();
+    let (class_count, class_defs) = (dex.u32(0x60) as usize, dex.u32(0x64) as usize);
+    for class in 0..class_count {
+        let class_data = dex.u32(class_defs + class * 32 + 24) as usize;
+        if class_data == 0 {
+            continue;
+        }
+        let mut at = class_data;
+        let counts: Vec<u32> = (0..4).map(|_| dex.uleb(&mut at)).collect();
+        for _ in 0..counts[0] + counts[1] {
+            dex.uleb(&mut at);
+            dex.uleb(&mut at);
+        }
+        for list in [counts[2], counts[3]] {
+            let mut method_index = 0;
+            for _ in 0..list {
+                method_index += dex.uleb(&mut at);
+                dex.uleb(&mut at);
+                let code = dex.uleb(&mut at) as usize;
+                if code != 0 && seen_code.insert(code) {
+                    let (_, name, signature) = dex.method(method_index);
+                    scan_code(&dex, code, &name, &signature, &mut fixes);
+                }
+            }
+        }
+    }
+    fixes
+}
+
+fn scan_code(dex: &Dex, code: usize, method_name: &str, method_signature: &str, fixes: &mut Vec<Fix>) {
+    let in_on_draw_frame =
+        method_name == "onDrawFrame" && method_signature == "(Ljavax/microedition/khronos/opengles/GL10;)V";
+    let size = dex.u32(code + 12) as usize;
+    let start = code + 16;
+    let units: Vec<u16> = (0..size).map(|i| dex.u16(start + i * 2)).collect();
+    // The previous instruction, if it was `const/16` or `const`: (offset, register, value).
+    let mut previous: Option<(usize, u32, i32)> = None;
+    let mut pc = 0;
+    while pc < size {
+        let unit = units[pc];
+        let length = instruction_length(&units[pc..]).max(1);
+        let offset = start + pc * 2;
+        let opcode = unit & 0xFF;
+        let a = u32::from(unit >> 8);
+        match opcode {
+            // invoke-static(/range) Thread.sleep(J) inside onDrawFrame
+            0x71 | 0x77 if in_on_draw_frame && dex.method(units[pc + 1].into()).0 == "Ljava/lang/Thread;.sleep:(J)V" => {
+                fixes.push(Fix { offset, reason: "frame limiter in onDrawFrame removed", old: "Thread.sleep".into(), new: "nop".into() });
+            }
+            // invoke-virtual {vC, vD}, AudioAttributes$Builder.setFlags(I)
+            0x6E if a >> 4 == 2 => {
+                let second = u32::from(units[pc + 2] >> 4) & 0xF;
+                if let Some((const_offset, register, value)) = previous {
+                    if register == second
+                        && value & FLAG_HW_AV_SYNC != 0
+                        && dex.method(units[pc + 1].into()).0.starts_with("Landroid/media/AudioAttributes$Builder;.setFlags:(I)")
+                    {
+                        fixes.push(Fix {
+                            offset: const_offset,
+                            reason: "AudioAttributes flags (no hardware A/V sync)",
+                            old: value.to_string(),
+                            new: (value & !FLAG_HW_AV_SYNC).to_string(),
+                        });
+                    }
+                }
+            }
+            // sput vAA, Cocos2dxSound.LOAD_TIME_OUT
+            0x67 => {
+                if let Some((const_offset, register, value)) = previous {
+                    if register == a
+                        && value > SHORT_LOAD_WAIT
+                        && dex.field(units[pc + 1].into()) == "Lorg/cocos2dx/lib/Cocos2dxSound;.LOAD_TIME_OUT:I"
+                    {
+                        fixes.push(Fix {
+                            offset: const_offset,
+                            reason: "cocos2d-x sound load wait in ms",
+                            old: value.to_string(),
+                            new: SHORT_LOAD_WAIT.to_string(),
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+        previous = match opcode {
+            0x13 => Some((offset, a, units[pc + 1] as i16 as i32)),
+            0x14 => Some((offset, a, (units[pc + 1] as u32 | (units[pc + 2] as u32) << 16) as i32)),
+            _ => None,
+        };
+        pc += length;
+    }
+}
+
+/// Applies the fixes and updates the header checksums. Returns what changed.
+pub fn patch(data: &mut [u8]) -> Vec<Fix> {
+    let fixes = find_fixes(data);
+    for fix in &fixes {
+        let at = fix.offset;
+        match data[at] {
+            0x71 | 0x77 => data[at..at + 6].fill(0),
+            0x13 => {
+                let value: i32 = fix.new.parse().unwrap();
+                data[at + 2..at + 4].copy_from_slice(&(value as u16).to_le_bytes());
+            }
+            0x14 => {
+                let value: i32 = fix.new.parse().unwrap();
+                data[at + 2..at + 6].copy_from_slice(&(value as u32).to_le_bytes());
+            }
+            other => panic!("unexpected opcode {other:#x} at {at:#x}"),
+        }
+    }
+    if !fixes.is_empty() {
+        // Header: magic[8], adler32 of [12..], SHA-1 of [32..].
+        use sha1::Digest;
+        let digest = sha1::Sha1::digest(&data[32..]);
+        data[12..32].copy_from_slice(&digest);
+        let checksum = adler32(&data[12..]);
+        data[8..12].copy_from_slice(&checksum.to_le_bytes());
+    }
+    fixes
+}
+
+fn adler32(data: &[u8]) -> u32 {
+    let (mut a, mut b) = (1u32, 0u32);
+    for chunk in data.chunks(5552) {
+        for &byte in chunk {
+            a += u32::from(byte);
+            b += a;
+        }
+        a %= 65521;
+        b %= 65521;
+    }
+    b << 16 | a
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn adler32_known_value() {
+        assert_eq!(super::adler32(b"Wikipedia"), 0x11E6_0398);
+    }
+}

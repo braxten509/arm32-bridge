@@ -172,29 +172,19 @@ fn command_imports(options: &Options) -> ExitCode {
         eprintln!("usage: arm32-bridge imports <lib.so>");
         return ExitCode::from(2);
     };
-    runtime::init(false);
-    let uc = runtime::engine();
-    imports::jni::create_vm(uc);
-    let path = Path::new(path);
-    let mut loader = elf::Loader::new(vec![path.parent().map(PathBuf::from).unwrap_or_default()]);
-    if let Err(error) = loader.load(uc, path) {
-        eprintln!("[bridge] {error}");
-        return ExitCode::FAILURE;
+    match imports::missing_imports(Path::new(path)) {
+        Ok(missing) => {
+            for name in &missing {
+                println!("{name}");
+            }
+            eprintln!("[bridge] {} imports without a handler", missing.len());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("[bridge] {error}");
+            ExitCode::FAILURE
+        }
     }
-    let runtime = runtime::shared();
-    let mut missing: Vec<&str> = runtime
-        .stubs
-        .iter()
-        .filter(|stub| !stub.name.starts_with("jni:") && !imports::phone_handles(stub.name))
-        .map(|stub| stub.name)
-        .collect();
-    missing.extend(runtime.state.unknown_data.iter().map(String::as_str));
-    missing.sort_unstable();
-    for name in &missing {
-        println!("{name}");
-    }
-    eprintln!("[bridge] {} imports without a handler", missing.len());
-    ExitCode::SUCCESS
 }
 
 fn command_call(options: &Options, timed: bool) -> ExitCode {

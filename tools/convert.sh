@@ -7,7 +7,9 @@
 #   lib<main>-arm32.so.
 # - Other 32-bit libraries are replaced by the shared stand-in (tools/standin),
 #   with their originals kept next to them the same way.
-# - Known Java-side bugs are fixed in the dex files (tools/patch_dex.py).
+# - Known Java-side problems are fixed in the dex files.
+# The conversion itself is done by apk-convert (converter/), the same program
+# the phone app uses; this script builds it, signs the result and installs it.
 # - The APK is re-signed with the debug key (the original signature can't survive).
 # - Phone functions the game imports that the bridge has no handler for yet are listed.
 #
@@ -33,71 +35,37 @@ done
 APK=$(realpath "$APK")
 OUT=$(realpath -m "${OUT:-$(dirname "$APK")/$(basename "$APK" .apk)-arm64.apk}")
 
-ENTRIES=$(unzip -Z1 "$APK")
-if grep -q '^lib/arm64-v8a/.*\.so$' <<<"$ENTRIES"; then
-    echo "This game already has 64-bit code, so it doesn't need converting. Install it as it is."
-    exit 0
-fi
-ABI=""
-for candidate in armeabi-v7a armeabi; do
-    if grep -q "^lib/$candidate/.*\.so$" <<<"$ENTRIES"; then ABI=$candidate; break; fi
-done
-[ -n "$ABI" ] || { echo "This APK has no 32-bit ARM code, so there is nothing to convert." >&2; exit 1; }
-
 WORK=$ROOT/target/apk/$(basename "$APK" .apk)
 rm -rf "$WORK"
-mkdir -p "$WORK/stage/lib/arm64-v8a"
-unzip -q -o "$APK" "lib/$ABI/*" 'classes*.dex' -d "$WORK/unpacked"
-LIB32=$WORK/unpacked/lib/$ABI
-if [ -z "$MAIN" ]; then
-    MAIN=$(basename "$(ls -S "$LIB32"/*.so | head -1)" .so)
-    MAIN=${MAIN#lib}
-fi
-[ -f "$LIB32/lib$MAIN.so" ] || { echo "No lib$MAIN.so in lib/$ABI." >&2; exit 1; }
-echo "== game code: lib$MAIN.so ($ABI)"
+mkdir -p "$WORK"
 
-echo "== bridge"
+echo "== building the bridge"
 systemd-run --user --wait --pipe -q -p AllowedCPUs=6-11,18-23 -d bash -c \
-    "cd '$ROOT' && ./build-phone.sh --lib -q && cargo build --release -q" >&2
-cp "$ROOT/target/aarch64-linux-android/release/libarm32_bridge.so" "$WORK/stage/lib/arm64-v8a/lib$MAIN.so"
+    "cd '$ROOT' && ./build-phone.sh --lib -q && cargo build --release -q -p apk-convert" >&2
+"$CLANG" -O2 -shared -fPIC -Wl,--build-id=none -o "$WORK/libstandin.so" "$ROOT/tools/standin/standin.c" -llog -ldl
 
-echo "== phone functions the bridge doesn't have yet"
-"$ROOT/target/release/arm32-bridge" imports "$LIB32/lib$MAIN.so" > "$WORK/missing.txt" 2>/dev/null || true
-if [ -s "$WORK/missing.txt" ]; then
-    echo "$(wc -l < "$WORK/missing.txt") missing (the game may fail when it uses them):"
-    column -c 110 "$WORK/missing.txt" | sed 's/^/  /'
-else
-    echo "none"
+echo "== converting"
+set +e
+"$ROOT/target/release/apk-convert" "$APK" "$WORK/unsigned.apk" \
+    --bridge "$ROOT/target/aarch64-linux-android/release/libarm32_bridge.so" --standin "$WORK/libstandin.so" \
+    --work "$WORK" ${MAIN:+--main "$MAIN"} > "$WORK/convert.log"
+STATUS=$?
+set -e
+grep -v '^missing ' "$WORK/convert.log" | sed -e 's/^step /  /' -e 's/^error /  /'
+case $STATUS in
+    0) ;;
+    3) exit 0 ;;
+    *) exit 1 ;;
+esac
+MISSING=$(grep '^missing ' "$WORK/convert.log" | cut -d' ' -f2- || true)
+if [ -n "$MISSING" ]; then
+    echo "== $(wc -l <<<"$MISSING") phone functions the bridge doesn't have yet (the game may fail if it uses them):"
+    column -c 110 <<<"$MISSING" | sed 's/^/  /'
 fi
 
-echo "== stand-ins for other 32-bit libraries"
-"$CLANG" -O2 -shared -fPIC -Wl,--build-id=none -o "$WORK/libstandin.so" "$ROOT/tools/standin/standin.c" -llog -ldl
-for library in "$LIB32"/*.so; do
-    name=$(basename "$library" .so)
-    cp "$library" "$WORK/stage/lib/arm64-v8a/$name-arm32.so"
-    [ "$name" = "lib$MAIN" ] && continue
-    cp "$WORK/libstandin.so" "$WORK/stage/lib/arm64-v8a/$name.so"
-    echo "$name.so"
-done
-
-echo "== APK"
-cp "$APK" "$WORK/unsigned.apk"
-zip -q -d "$WORK/unsigned.apk" 'lib/*' 'META-INF/MANIFEST.MF' 'META-INF/*.SF' 'META-INF/*.RSA' 'META-INF/*.DSA' >/dev/null || true
-(cd "$WORK/stage" && zip -q -r "$WORK/unsigned.apk" lib)
-
-echo "== Java fixes"
-mkdir -p "$WORK/dex"
-cp "$WORK"/unpacked/classes*.dex "$WORK/dex/"
-python3 -I "$ROOT/tools/patch_dex.py" "$BUILD_TOOLS/dexdump" "$WORK"/dex/classes*.dex
-for dex in "$WORK"/dex/classes*.dex; do
-    if ! cmp -s "$dex" "$WORK/unpacked/$(basename "$dex")"; then
-        zip -q -d "$WORK/unsigned.apk" "$(basename "$dex")"
-        (cd "$WORK/dex" && zip -q "$WORK/unsigned.apk" "$(basename "$dex")")
-    fi
-done
-"$BUILD_TOOLS/zipalign" -f -p 4 "$WORK/unsigned.apk" "$WORK/aligned.apk"
+echo "== signing"
 "$BUILD_TOOLS/apksigner" sign --ks "$HOME/.android/debug.keystore" --ks-pass pass:android --key-pass pass:android \
-    --ks-key-alias androiddebugkey --out "$OUT" "$WORK/aligned.apk" 2>/dev/null
+    --ks-key-alias androiddebugkey --out "$OUT" "$WORK/unsigned.apk" 2>/dev/null
 echo "converted: $OUT"
 
 [ "$INSTALL" = 1 ] || exit 0

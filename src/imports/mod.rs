@@ -68,6 +68,28 @@ pub fn handler_for(name: &str) -> Option<Handler> {
         .or_else(|| sles::handler(name))
 }
 
+/// Loads a 32-bit library (and the game libraries next to it) without running
+/// it, and returns the phone functions and data it imports that the bridge
+/// has no handler for, sorted.
+pub fn missing_imports(path: &std::path::Path) -> Result<Vec<String>, String> {
+    crate::runtime::init(false);
+    let _lock = crate::runtime::hold_gil();
+    let uc = crate::runtime::engine();
+    jni::create_vm(uc);
+    let directory = path.parent().map(std::path::PathBuf::from).unwrap_or_default();
+    crate::elf::Loader::new(vec![directory]).load(uc, path)?;
+    let runtime = shared();
+    let mut missing: Vec<String> = runtime
+        .stubs
+        .iter()
+        .filter(|stub| !stub.name.starts_with("jni:") && !phone_handles(stub.name))
+        .map(|stub| stub.name.to_string())
+        .collect();
+    missing.extend(runtime.state.unknown_data.iter().cloned());
+    missing.sort_unstable();
+    Ok(missing)
+}
+
 /// Whether the phone build of the bridge handles `name` (the PC build lacks
 /// the phone-only parts).
 pub fn phone_handles(name: &str) -> bool {

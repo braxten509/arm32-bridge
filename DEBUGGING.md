@@ -166,3 +166,11 @@ engine.rs run(): an address at stub+4 (the `bx lr` half) just returns to LR. Tem
   game's own frame cap, set from native code). PC2 (cocos2d-x 3.x) has no such cap below 1/60 s. Put to the user.
 - User chose to lift frame limits for all games. patch_dex.py fix 3: Thread.sleep inside any
   onDrawFrame(GL10) becomes nops. PC1: 116-120 fps (own code ~0.7 ms/frame); PC2 unchanged at 118-120.
+
+# Packaging part C step 1: shared converter (2026-10-12)
+- converter/ (apk-convert, Rust): picks the 32-bit ABI and main library, writes the APK with aligned stored entries
+  (libraries 4096, others 4), Java fixes ported from patch_dex.py to Rust (own dex walker), missing-function report
+  via arm32_bridge::imports::missing_imports. tools/convert.sh now builds + runs it, then signs and installs.
+- Check: dex output byte-identical to patch_dex.py for both games (PC1 classes.dex + classes2.dex, PC2 both),
+  zipalign -c -p 4 passes, missing counts 0 / 32 as before; PC2 converted this way runs at 119.9-120.2 fps.
+- User: the phone app installs with root for now; may move to a non-root install later (keep that step separate).

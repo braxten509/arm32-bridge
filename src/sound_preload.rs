@@ -3,7 +3,7 @@
 //! cocos2d-x plays effects through Java's SoundPool and, the first time an
 //! effect plays, decodes it on the spot. On current Android each decode goes
 //! through the media service and they queue up, so first plays come out late
-//! (tools/patch_dex.py removes the freeze that used to come with them).
+//! (the converter's Java fix 2, converter/src/dex.rs, removes the freeze that used to come with them).
 //!
 //! Nothing here is specific to one game. The bridge watches the game's Java
 //! sound calls to learn which files are effects ("...Effect" methods) and which
