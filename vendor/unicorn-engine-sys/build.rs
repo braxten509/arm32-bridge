@@ -169,6 +169,11 @@ fn watch_source_files() {
         "cargo:rerun-if-changed={}",
         project_root.join("list.c").display()
     );
+    // arm32-bridge: the configure script decides features (see ARM32-BRIDGE.md, 9).
+    println!(
+        "cargo:rerun-if-changed={}",
+        project_root.join("qemu/configure").display()
+    );
 
     // Directories to watch for changes
     let watch_dirs = vec!["qemu", "include", "bindings", "glib_compat"];

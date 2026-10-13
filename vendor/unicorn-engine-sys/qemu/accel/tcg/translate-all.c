@@ -1158,7 +1158,7 @@ static uc_err uc_gen_tb(struct uc_struct *uc, uint64_t addr, uc_tb *out_tb)
     uint32_t cflags = cpu->cflags_next_tb;
 
     if (cflags == -1) {
-        cflags = curr_cflags();
+        cflags = curr_cflags(cpu);
     }
 
     cpu_get_tb_cpu_state(env, &pc, &cs_base, &flags);
@@ -1946,7 +1946,7 @@ tb_invalidate_phys_page_range__locked(struct uc_struct *uc, struct page_collecti
     if (current_tb_modified) {
         page_collection_unlock(pages);
         /* Force execution of one insn next time.  */
-        cpu->cflags_next_tb = 1 | curr_cflags();
+        cpu->cflags_next_tb = 1 | curr_cflags(cpu);
         mmap_unlock();
         cpu_loop_exit_noexc(cpu);
     }
@@ -2124,7 +2124,7 @@ void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr)
 #endif
 
     /* Generate a new TB executing the I/O insn.  */
-    cpu->cflags_next_tb = curr_cflags() | CF_LAST_IO | n;
+    cpu->cflags_next_tb = curr_cflags(cpu) | CF_LAST_IO | n;
 
     if (tb_cflags(tb) & CF_NOCACHE) {
         if (tb->orig_tb) {

@@ -50,12 +50,18 @@ macro_rules! jcall {
     };
 }
 
+/// Runs `work` under PRELOADER (a leaf lock: no file or Java work inside).
 fn with<R>(work: impl FnOnce(&mut Preloader) -> R) -> R {
+    // The learned list is read once, before the lock is taken.
+    static MEMORY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let memory = MEMORY.get_or_init(|| std::fs::read_to_string(memory_file()?).ok());
     let mut guard = PRELOADER.lock().unwrap_or_else(|e| e.into_inner());
     let preloader = guard.get_or_insert_with(Preloader::default);
     if !preloader.loaded_memory {
         preloader.loaded_memory = true;
-        load_memory(preloader);
+        if let Some(text) = memory {
+            load_memory(preloader, text);
+        }
     }
     work(preloader)
 }
@@ -68,9 +74,7 @@ fn memory_file() -> Option<PathBuf> {
     Some(PathBuf::from(format!("/data/data/{package}/files/arm32bridge-sounds.txt")))
 }
 
-fn load_memory(preloader: &mut Preloader) {
-    let Some(path) = memory_file() else { return };
-    let Ok(text) = std::fs::read_to_string(path) else { return };
+fn load_memory(preloader: &mut Preloader, text: &str) {
     for line in text.lines() {
         match line.split_once('\t') {
             Some(("effect", sound)) => {
@@ -125,13 +129,14 @@ pub fn observe_java_call(env: *mut JNIEnv, method: &str, signature: &str, argume
     if !is_audio(&sound) {
         return;
     }
-    with(|preloader| {
+    let new = with(|preloader| {
         preloader.requested.insert(sound.clone());
-        let (set, kind) = if is_effect { (&mut preloader.effects, "effect") } else { (&mut preloader.music, "music") };
-        if set.insert(sound.clone()) {
-            remember(kind, &sound);
-        }
+        let set = if is_effect { &mut preloader.effects } else { &mut preloader.music };
+        set.insert(sound.clone())
     });
+    if new {
+        remember(if is_effect { "effect" } else { "music" }, &sound);
+    }
 }
 
 /// Every audio file in the APK's assets as (path inside assets/, size). Reads only the zip's file list.
@@ -181,28 +186,37 @@ fn installed_apk(library_directory: &Path) -> PathBuf {
     library_directory.parent().and_then(Path::parent).map(|app| app.join("base.apk")).unwrap_or_default()
 }
 
-/// Adds every audio asset that isn't known music, smallest first, written the way the game writes effect paths.
-fn sweep(preloader: &mut Preloader, library_directory: &Path) {
-    preloader.swept = true;
-    let Some(example) = preloader.effects.iter().next() else { return };
-    let with_prefix = example.starts_with("assets/");
-    let music: HashSet<&str> = preloader.music.iter().map(|m| without_assets_prefix(m)).collect();
+/// Adds every audio asset that isn't known music, smallest first, written the
+/// way the game writes effect paths. The APK is read without holding PRELOADER.
+fn sweep(library_directory: &Path) {
+    let claimed = with(|preloader| {
+        if preloader.swept || preloader.disabled || preloader.frames < START_AFTER_FRAMES {
+            return None;
+        }
+        let example = preloader.effects.iter().next()?;
+        preloader.swept = true;
+        let music: HashSet<String> = preloader.music.iter().map(|m| without_assets_prefix(m).to_string()).collect();
+        Some((example.starts_with("assets/"), music))
+    });
+    let Some((with_prefix, music)) = claimed else { return };
     let mut assets = apk_audio_assets(&installed_apk(library_directory));
     assets.sort_by_key(|(_, size)| *size);
     let count = assets.len();
-    for (inside, _) in assets {
-        if music.contains(inside.as_str()) {
-            continue;
+    let queued = with(|preloader| {
+        for (inside, _) in assets {
+            if music.contains(&inside) {
+                continue;
+            }
+            preloader.queue.push_back(if with_prefix { format!("assets/{inside}") } else { inside });
         }
-        preloader.queue.push_back(if with_prefix { format!("assets/{inside}") } else { inside });
-    }
-    crate::log::line(&format!("[sound] preloading up to {} of {count} audio files in the background", preloader.queue.len()));
+        preloader.queue.len()
+    });
+    crate::log::line(&format!("[sound] preloading up to {queued} of {count} audio files in the background"));
 }
 
-fn preload_method(env: *mut JNIEnv, preloader: &mut Preloader) -> Option<(jclass, jmethodID)> {
-    if let Some(found) = preloader.preload_method {
-        return Some(found);
-    }
+/// Looks up cocos2d-x's preload method. Called without holding PRELOADER:
+/// loading a Java class can run native code that reports sounds back here.
+fn find_preload_method(env: *mut JNIEnv) -> Option<(jclass, jmethodID)> {
     let class = jcall!(env, FindClass, HELPER_CLASS.as_ptr());
     if class.is_null() {
         jcall!(env, ExceptionClear);
@@ -216,12 +230,12 @@ fn preload_method(env: *mut JNIEnv, preloader: &mut Preloader) -> Option<(jclass
     }
     let global = jcall!(env, NewGlobalRef, class) as jclass;
     jcall!(env, DeleteLocalRef, class);
-    preloader.preload_method = Some((global, method));
-    preloader.preload_method
+    Some((global, method))
 }
 
 /// Called on the game's render thread before each frame; preloads at most one effect.
 pub fn on_frame(env: *mut JNIEnv, library_directory: &Path) {
+    sweep(library_directory);
     let next = with(|preloader| {
         if preloader.disabled {
             return None;
@@ -230,21 +244,31 @@ pub fn on_frame(env: *mut JNIEnv, library_directory: &Path) {
         if preloader.frames < START_AFTER_FRAMES {
             return None;
         }
-        if !preloader.swept && !preloader.effects.is_empty() {
-            sweep(preloader, library_directory);
-        }
         while let Some(sound) = preloader.queue.pop_front() {
             if preloader.requested.insert(sound.clone()) {
-                let Some(method) = preload_method(env, preloader) else {
-                    preloader.disabled = true;
-                    return None;
-                };
-                return Some((sound, method));
+                return Some((sound, preloader.preload_method));
             }
         }
         None
     });
-    let Some((sound, (class, method))) = next else { return };
+    let Some((sound, known)) = next else { return };
+    let Some((class, method)) = known.or_else(|| {
+        let found = find_preload_method(env);
+        with(|preloader| match (found, preloader.preload_method) {
+            // Another thread found it first: keep that one.
+            (Some((class, _)), Some(existing)) => {
+                jcall!(env, DeleteGlobalRef, class);
+                Some(existing)
+            }
+            (Some(found), None) => Some(*preloader.preload_method.insert(found)),
+            (None, _) => {
+                preloader.disabled = true;
+                None
+            }
+        })
+    }) else {
+        return;
+    };
     let Ok(text) = CString::new(sound) else { return };
     let string = jcall!(env, NewStringUTF, text.as_ptr());
     let arguments = [jvalue { l: string }];

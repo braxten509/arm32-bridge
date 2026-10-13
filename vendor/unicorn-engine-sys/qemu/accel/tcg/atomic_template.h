@@ -117,8 +117,12 @@ ABI_TYPE ATOMIC_NAME(xchg)(CPUArchState *env, target_ulong addr,
     DATA_TYPE *haddr = ATOMIC_MMU_LOOKUP;
     DATA_TYPE ret;
 
+#ifdef _MSC_VER
     ret = *haddr;
     *haddr = val;
+#else
+    ret = atomic_xchg__nocheck(haddr, val); /* arm32-bridge: was a plain read then write */
+#endif
     ATOMIC_MMU_CLEANUP;
 
     return ret;
@@ -175,12 +179,10 @@ ABI_TYPE ATOMIC_NAME(X)(CPUArchState *env, target_ulong addr,       \
     ATOMIC_MMU_DECLS;                                               \
     XDATA_TYPE *haddr = ATOMIC_MMU_LOOKUP;                          \
     XDATA_TYPE cmp, old, new, val = xval;                           \
-    cmp = *haddr;                                                   \
+    cmp = atomic_read__nocheck(haddr);                              \
     do {                                                            \
         old = cmp; new = FN(old, val);                              \
-        cmp = *haddr;                                               \
-        if (cmp == old)                                          \
-            *haddr = new;                                           \
+        cmp = atomic_cmpxchg__nocheck(haddr, old, new);             \
     } while (cmp != old);                                           \
     ATOMIC_MMU_CLEANUP;                                             \
     return RET;                                                     \
@@ -260,8 +262,12 @@ ABI_TYPE ATOMIC_NAME(xchg)(CPUArchState *env, target_ulong addr,
     ATOMIC_MMU_DECLS;
     DATA_TYPE *haddr = ATOMIC_MMU_LOOKUP;
     ABI_TYPE ret;
+#ifdef _MSC_VER
     ret = *haddr;
     *haddr = BSWAP(val);
+#else
+    ret = atomic_xchg__nocheck(haddr, BSWAP(val)); /* arm32-bridge: was a plain read then write */
+#endif
     ATOMIC_MMU_CLEANUP;
     return BSWAP(ret);
 }
@@ -315,12 +321,10 @@ ABI_TYPE ATOMIC_NAME(X)(CPUArchState *env, target_ulong addr,       \
     ATOMIC_MMU_DECLS;                                               \
     XDATA_TYPE *haddr = ATOMIC_MMU_LOOKUP;                          \
     XDATA_TYPE ldo, ldn, old, new, val = xval;                      \
-    ldn = *haddr;                                                   \
+    ldn = atomic_read__nocheck(haddr);                              \
     do {                                                            \
         ldo = ldn; old = BSWAP(ldo); new = FN(old, val);            \
-        ldn = *haddr;                                               \
-        if (ldn == ldo)                                             \
-            *haddr = BSWAP(new);                                    \
+        ldn = atomic_cmpxchg__nocheck(haddr, ldo, BSWAP(new));      \
     } while (ldo != ldn);                                           \
     ATOMIC_MMU_CLEANUP;                                             \
     return RET;                                                     \

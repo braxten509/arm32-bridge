@@ -55,7 +55,7 @@ impl HostValue {
 
 fn fail(message: &str) -> ! {
     crate::log::write(6, "arm32bridge", message.as_bytes());
-    let recent: Vec<&str> = shared().recent.iter().copied().collect();
+    let recent = crate::runtime::recent_calls();
     crate::log::write(6, "arm32bridge", format!("last phone functions: {}", recent.join(", ")).as_bytes());
     std::process::abort();
 }
@@ -170,8 +170,17 @@ fn count_frame(spent: Duration, phone: Duration, waiting: Duration) {
         let fps = counter.frames as f64 / elapsed.as_secs_f64();
         let per_frame = |time: Duration| time.as_secs_f64() * 1000.0 / counter.frames as f64;
         let ms = |time: Duration| time.as_secs_f64() * 1000.0;
+        let parallel = if crate::runtime::parallel() {
+            format!(
+                "; parallel: {} stops of every thread, {} signal helpers",
+                crate::runtime::STOPS.load(std::sync::atomic::Ordering::Relaxed),
+                crate::imports::signals::borrows()
+            )
+        } else {
+            String::new()
+        };
         crate::log::line(&format!(
-            "[fps] {fps:.1} fps, game code {:.2} ms/frame (own code {:.2} ms, phone functions {:.2} ms, waiting for the guest lock {:.2} ms; slowest {:.2} ms, own {:.2} ms)",
+            "[fps] {fps:.1} fps, game code {:.2} ms/frame (own code {:.2} ms, phone functions {:.2} ms, waiting for the guest lock {:.2} ms; slowest {:.2} ms, own {:.2} ms){parallel}",
             per_frame(counter.guest_time),
             per_frame(counter.guest_time.saturating_sub(counter.phone_time)),
             per_frame(counter.phone_time),

@@ -90,14 +90,12 @@ pub fn missing_imports(paths: &[std::path::PathBuf]) -> Result<Vec<String>, Stri
     for path in paths {
         loader.load(uc, path)?;
     }
-    let runtime = shared();
-    let mut missing: Vec<String> = runtime
-        .stubs
+    let mut missing: Vec<String> = crate::runtime::stubs()
         .iter()
         .filter(|stub| !stub.name.starts_with("jni:") && !phone_handles(stub.name))
         .map(|stub| stub.name.to_string())
         .collect();
-    missing.extend(runtime.state.unknown_data.iter().cloned());
+    missing.extend(shared().state.unknown_data.iter().cloned());
     missing.sort_unstable();
     missing.dedup();
     Ok(missing)
@@ -118,10 +116,13 @@ pub fn data_import(name: &str) -> u32 {
     }
     if name.starts_with("SL_IID_") {
         let address = sles::interface_id_import(name);
-        shared().state.data_imports.insert(name.to_string(), address);
-        return address;
+        // Another thread may have made it meanwhile: everyone uses the first.
+        return *shared().state.data_imports.entry(name.to_string()).or_insert(address);
     }
     let mut runtime = shared();
+    if let Some(&address) = runtime.state.data_imports.get(name) {
+        return address; // another thread made it meanwhile
+    }
     let memory = mem();
     let address = match name {
         "__sF" => {

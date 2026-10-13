@@ -249,7 +249,7 @@ fn dispatch(uc: &mut Uc, a: &mut Args) -> Ret {
     if let Some(rest) = name.strip_prefix("New").filter(|r| r.ends_with("Array") && *r != "ObjectArray") {
         let length = a.u32();
         let size = element_size(rest);
-        let data = shared().heap.calloc(length.max(1), size);
+        let data = crate::runtime::heap().calloc(length.max(1), size);
         return Ret::U32(shared().state.jni.add(JavaObject::Array { element_size: size, length, data }));
     }
     if name.starts_with("Get") && name.ends_with("ArrayElements") {
@@ -367,10 +367,10 @@ fn dispatch(uc: &mut Uc, a: &mut Args) -> Ret {
                 memory.write_u8(is_copy, 1);
             }
             if name == "GetStringUTFChars" {
-                Ret::U32(shared().heap.strdup(text.as_bytes()))
+                Ret::U32(crate::runtime::heap().strdup(text.as_bytes()))
             } else {
                 let units: Vec<u16> = text.encode_utf16().chain([0]).collect();
-                let buffer = shared().heap.malloc(units.len() as u32 * 2);
+                let buffer = crate::runtime::heap().malloc(units.len() as u32 * 2);
                 for (i, unit) in units.iter().enumerate() {
                     memory.write_u16(buffer + i as u32 * 2, *unit);
                 }
@@ -379,7 +379,7 @@ fn dispatch(uc: &mut Uc, a: &mut Args) -> Ret {
         }
         "ReleaseStringUTFChars" | "ReleaseStringChars" | "ReleaseStringCritical" => {
             let (_string, characters) = (a.u32(), a.u32());
-            shared().heap.free(characters);
+            crate::runtime::heap().free(characters);
             Ret::Void
         }
         "GetStringUTFLength" | "GetStringLength" => {
@@ -408,7 +408,7 @@ fn dispatch(uc: &mut Uc, a: &mut Args) -> Ret {
         }
         "NewObjectArray" => {
             let (length, _class, initial) = (a.u32(), a.u32(), a.u32());
-            let data = shared().heap.calloc(length.max(1), 4);
+            let data = crate::runtime::heap().calloc(length.max(1), 4);
             for i in 0..length {
                 memory.write_u32(data + i * 4, initial);
             }

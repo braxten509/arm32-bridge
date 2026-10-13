@@ -1,5 +1,5 @@
 use crate::handler;
-use crate::runtime::{mem, shared, without_gil, ArgSource, Handler, Ret, Uc};
+use crate::runtime::{mem, without_gil, ArgSource, Handler, Ret, Uc};
 
 const SOL_SOCKET: i32 = 1;
 const SO_RCVTIMEO: i32 = 20;
@@ -53,7 +53,7 @@ fn guest_addrinfo_chain(mut host: *const libc::addrinfo) -> u32 {
     while !host.is_null() {
         let entry = unsafe { &*host };
         let address_length = entry.ai_addrlen as u32;
-        let node = shared().heap.calloc(1, ADDRINFO_SIZE + address_length);
+        let node = crate::runtime::heap().calloc(1, ADDRINFO_SIZE + address_length);
         let memory = mem();
         memory.write_u32(node, entry.ai_flags as u32);
         memory.write_u32(node + 4, entry.ai_family as u32);
@@ -62,7 +62,7 @@ fn guest_addrinfo_chain(mut host: *const libc::addrinfo) -> u32 {
         memory.write_u32(node + 16, address_length);
         if !entry.ai_canonname.is_null() {
             let name = unsafe { std::ffi::CStr::from_ptr(entry.ai_canonname) }.to_bytes().to_vec();
-            let copy = shared().heap.strdup(&name);
+            let copy = crate::runtime::heap().strdup(&name);
             memory.write_u32(node + 20, copy);
         }
         if !entry.ai_addr.is_null() && address_length > 0 {
@@ -298,16 +298,16 @@ pub fn handler(name: &str) -> Option<Handler> {
                 let next = mem().read_u32(node + 28);
                 let name = mem().read_u32(node + 20);
                 if name != 0 {
-                    shared().heap.free(name);
+                    crate::runtime::heap().free(name);
                 }
-                shared().heap.free(node);
+                crate::runtime::heap().free(node);
                 node = next;
             }
             Ret::Void
         }),
         "gai_strerror" => handler!(|uc, a| {
             let text = unsafe { std::ffi::CStr::from_ptr(libc::gai_strerror(a.i32())) }.to_bytes().to_vec();
-            Ret::U32(shared().heap.strdup(&text))
+            Ret::U32(crate::runtime::heap().strdup(&text))
         }),
         _ => None,
     }

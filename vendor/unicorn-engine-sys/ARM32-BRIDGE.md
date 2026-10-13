@@ -25,3 +25,32 @@ Copied from crates.io; speed patches and one fix for arm32-bridge:
    (which Unicorn reported as INSN_INVALID, so Unity's job worker threads
    stopped in their spin-wait loop). arm32-bridge hands the guest lock to
    another thread there, so a spinning thread can't starve the one it waits on.
+7. `include/unicorn/arm.h` + `qemu/target/arm/unicorn_arm.c` (reg_read /
+   reg_write): two new registers, UC_ARM_REG_EXCLUSIVE_ADDR and
+   UC_ARM_REG_EXCLUSIVE_VAL, give access to the exclusive monitor
+   (`env->exclusive_addr`, -1 = none, and `env->exclusive_val`). The
+   translator keeps its own monitor and moves it in and out of Unicorn around
+   fallbacks and checker runs, so an LDREX on one engine and its STREX on the
+   other still pair up (with guest threads running at the same time).
+8. `qemu/include/exec/exec-all.h` (curr_cflags), its callers in
+   `qemu/accel/tcg/{cpu-exec,tcg-runtime,translate-all}.c`,
+   `qemu/include/hw/core/cpu.h` and `qemu/target/arm/unicorn_arm.c`: a
+   per-engine `parallel` flag (pseudo-register UC_ARM_REG_PARALLEL). When set,
+   code is translated with CF_PARALLEL: STREX/SWP become real host atomics and
+   DMB/DSB real barriers, as guest threads then run at the same time. Engines
+   used one thread at a time (and the translator's checker, whose write-undo
+   hook does not see atomic stores) leave it off. `arm_stop_interrupt` stops
+   on EXCP_ATOMIC instead of retrying the instruction forever.
+9. `qemu/configure` (64-bit atomics probe): the probe used the size-suffixed
+   library names (`__atomic_load_8` ...), which newer clang rejects as
+   undeclared, so CONFIG_ATOMIC64 was never set and every 64-bit atomic in
+   CF_PARALLEL code (LDREXD/STREXD, the kernel's cmpxchg64 helper) left with
+   EXCP_ATOMIC. It now uses the generic builtins (`__atomic_load_n` ...), as
+   later QEMU does.
+10. `qemu/accel/tcg/atomic_template.h`: Unicorn had replaced QEMU's atomic
+    exchange with a plain read then write (`ret = *haddr; *haddr = val;`) and
+    the min/max helpers' compare-and-swap with a plain compare then write, on
+    every compiler, not just MSVC. With guest threads running at the same time a
+    store from another thread could land in between and be lost (a SWP spinlock
+    stayed locked for good). xchg now uses `atomic_xchg__nocheck` and the min/max
+    loops `atomic_cmpxchg__nocheck`, as upstream QEMU; MSVC keeps the old code.

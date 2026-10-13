@@ -13,12 +13,11 @@
 //! Guest layouts (bionic ARM32): sigset_t is one word (bit n-1 = signal n);
 //! struct sigaction is { handler, mask, flags, restorer }.
 
-use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::Ordering;
 
 use crate::handler;
-use crate::imports::threads::current_handle;
+use crate::imports::threads::{current_handle, current_identity, Identity};
 use crate::runtime::{engine, gil_held, mem, shared, wait_on, ArgSource, GuestCpu, Handler, Ret, Uc};
 
 const SIG_DFL: u32 = 0;
@@ -55,29 +54,16 @@ struct Action {
     flags: u32,
 }
 
-#[derive(Default)]
-struct ThreadSignals {
-    pending: u64,
-    blocked: u64,
-}
-
+/// Signal actions (the pending and blocked sets live with each thread, `Identity`).
 #[derive(Default)]
 pub struct Signals {
     actions: HashMap<u32, Action>,
-    /// By pthread_t.
-    threads: HashMap<u32, ThreadSignals>,
 }
 
-/// Signals sent and not yet delivered, over all threads (a quick check).
-static PENDING: AtomicU32 = AtomicU32::new(0);
-
+/// Whether this thread has a signal it could run a handler for now.
 pub fn any_pending() -> bool {
-    PENDING.load(Ordering::Relaxed) != 0
-}
-
-thread_local! {
-    /// Handlers this thread has run (sigsuspend waits for this to change).
-    static DELIVERED: Cell<u64> = const { Cell::new(0) };
+    let me = current_identity();
+    me.pending.load(Ordering::Acquire) & !me.blocked.load(Ordering::Acquire) != 0
 }
 
 fn bit(signal: u32) -> u64 {
@@ -89,21 +75,8 @@ fn blockable(mask: u64) -> u64 {
     mask & !(bit(SIGKILL) | bit(SIGSTOP))
 }
 
-fn blocked_now() -> u64 {
-    let me = current_handle();
-    shared().state.signals.threads.get(&me).map(|t| t.blocked).unwrap_or(0)
-}
-
-fn set_blocked(mask: u64) {
-    let me = current_handle();
-    shared().state.signals.threads.entry(me).or_default().blocked = blockable(mask);
-}
-
-/// A thread finished: drop what it had pending.
-pub fn forget_thread(handle: u32) {
-    if let Some(gone) = shared().state.signals.threads.remove(&handle) {
-        PENDING.fetch_sub(gone.pending.count_ones(), Ordering::Relaxed);
-    }
+fn set_blocked(me: &Identity, mask: u64) {
+    me.blocked.store(blockable(mask), Ordering::SeqCst);
 }
 
 /// Sends `signal` to guest thread `target`; returns an errno value (0 = sent).
@@ -111,78 +84,235 @@ fn send(target: u32, signal: u32) -> u32 {
     if signal > LAST_SIGNAL {
         return EINVAL;
     }
-    if !crate::imports::threads::is_live(target) {
-        return ESRCH;
-    }
+    let Some(identity) = crate::imports::threads::identity(target) else { return ESRCH };
     if signal == 0 {
         return 0;
     }
-    {
-        let mut shared = shared();
-        let signals = &mut shared.state.signals;
-        let action = signals.actions.get(&signal).copied().unwrap_or_default();
-        match action.handler {
-            SIG_IGN => return 0,
-            SIG_DFL => {
-                drop(shared);
-                crate::log::line(&format!("[bridge] signal {signal} sent with no handler set; ignored"));
-                return 0;
-            }
-            _ => {}
+    let action = shared().state.signals.actions.get(&signal).copied().unwrap_or_default();
+    match action.handler {
+        SIG_IGN => return 0,
+        SIG_DFL => {
+            crate::log::line(&format!("[bridge] signal {signal} sent with no handler set; ignored"));
+            return 0;
         }
-        let thread = signals.threads.entry(target).or_default();
-        if thread.pending & bit(signal) == 0 {
-            thread.pending |= bit(signal);
-            PENDING.fetch_add(1, Ordering::Relaxed);
-        }
+        _ => {}
     }
-    crate::runtime::wake_thread(target);
+    identity.pending.fetch_or(bit(signal), Ordering::SeqCst);
+    // A thread busy in translated code stops at its next block exit (so does
+    // a helper standing in for it).
+    let runner = identity.runner.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    for runner in [runner.as_ref(), identity.helper_runner.lock().unwrap_or_else(|e| e.into_inner()).as_ref()].into_iter().flatten() {
+        runner.attention.store(1, Ordering::SeqCst);
+    }
+    if bit(signal) & !identity.blocked.load(Ordering::SeqCst) != 0 {
+        crate::runtime::wake_thread(target);
+    }
+    // One sitting in a phone function that does not wake for signals
+    // (a blocked read, Java, the network) gets a helper if it stays there.
+    if crate::runtime::parallel() && target != current_handle() {
+        helpers::request(target);
+    }
     if target == current_handle() {
         deliver_pending();
     }
     0
 }
 
+/// Signals for threads stuck in phone functions (parallel mode). A service
+/// thread checks 1 ms after a send: if the thread is still outside guest code
+/// with the signal undelivered, a helper host thread takes its place (same
+/// identity, slots and parked registers, its own engine) and runs the
+/// handlers, as if they came during the call; the thread itself keeps
+/// running its host call and waits on its way back into guest code until
+/// the helper is done. Limitation: the call is not interrupted (no EINTR).
+mod helpers {
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use std::sync::mpsc::{channel, Receiver, Sender};
+    use std::sync::{Arc, Condvar, Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    use crate::imports::threads::{identity, Identity};
+    use crate::runtime::{self, Runner, OUTSIDE};
+
+    struct Job {
+        identity: Arc<Identity>,
+        target: Arc<Runner>,
+    }
+
+    /// Threads to look at again, with when.
+    static REQUESTS: (Mutex<Vec<(u32, Instant)>>, Condvar) = (Mutex::new(Vec::new()), Condvar::new());
+    /// Helpers waiting for work: (number, where to send it).
+    static IDLE: Mutex<Vec<(u32, Sender<Job>)>> = Mutex::new(Vec::new());
+    static NEXT_HELPER: AtomicU32 = AtomicU32::new(1);
+    /// Borrows started (shown with the stats).
+    pub static BORROWS: AtomicU64 = AtomicU64::new(0);
+
+    const GRACE: Duration = Duration::from_millis(1);
+
+    pub fn request(handle: u32) {
+        static SERVICE: OnceLock<()> = OnceLock::new();
+        SERVICE.get_or_init(|| {
+            std::thread::Builder::new().name("arm32-signals".into()).spawn(service).expect("start the signal service");
+        });
+        let (requests, ready) = &REQUESTS;
+        let mut requests = requests.lock().unwrap_or_else(|e| e.into_inner());
+        if !requests.iter().any(|&(waiting, _)| waiting == handle) {
+            requests.push((handle, Instant::now() + GRACE));
+            ready.notify_one();
+        }
+    }
+
+    fn service() {
+        let (requests, ready) = &REQUESTS;
+        loop {
+            let due: Vec<u32> = {
+                let mut requests = requests.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    let now = Instant::now();
+                    match requests.iter().map(|&(_, at)| at).min() {
+                        None => requests = ready.wait(requests).unwrap_or_else(|e| e.into_inner()),
+                        Some(at) if at > now => {
+                            requests = ready.wait_timeout(requests, at - now).unwrap_or_else(|e| e.into_inner()).0
+                        }
+                        Some(_) => break,
+                    }
+                }
+                let now = Instant::now();
+                let due = requests.iter().filter(|&&(_, at)| at <= now).map(|&(handle, _)| handle).collect();
+                requests.retain(|&(_, at)| at > now);
+                due
+            };
+            for handle in due {
+                borrow(handle);
+            }
+        }
+    }
+
+    fn deliverable(identity: &Identity) -> bool {
+        identity.pending.load(Ordering::Acquire) & !identity.blocked.load(Ordering::Acquire) != 0
+    }
+
+    /// Starts a helper for `handle` if it is still stuck outside guest code
+    /// with a deliverable signal.
+    fn borrow(handle: u32) {
+        let Some(identity) = identity(handle) else { return };
+        let Some(target) = identity.runner.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return };
+        if !deliverable(&identity) || target.state.load(Ordering::SeqCst) != OUTSIDE {
+            return;
+        }
+        let (number, sender) = take_helper();
+        if identity.borrower.compare_exchange(0, number, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+            IDLE.lock().unwrap_or_else(|e| e.into_inner()).push((number, sender));
+            return;
+        }
+        // Pairs with the thread's entry: it stores IN_GUEST, then loads borrower.
+        if target.state.load(Ordering::SeqCst) != OUTSIDE || !target.parked_valid.load(Ordering::Relaxed)
+            || identity.exiting.load(Ordering::SeqCst)
+        {
+            runtime::clear_borrower(&identity); // it delivers them itself
+            IDLE.lock().unwrap_or_else(|e| e.into_inner()).push((number, sender));
+            return;
+        }
+        BORROWS.fetch_add(1, Ordering::Relaxed);
+        if let Err(failed) = sender.send(Job { identity, target }) {
+            runtime::clear_borrower(&failed.0.identity);
+        }
+    }
+
+    /// An idle helper, or a new one (each keeps its engine for later borrows).
+    fn take_helper() -> (u32, Sender<Job>) {
+        if let Some(idle) = IDLE.lock().unwrap_or_else(|e| e.into_inner()).pop() {
+            return idle;
+        }
+        let number = NEXT_HELPER.fetch_add(1, Ordering::Relaxed);
+        let (sender, jobs) = channel::<Job>();
+        let own = sender.clone();
+        std::thread::Builder::new()
+            .name(format!("arm32-signal-helper-{number}"))
+            .spawn(move || helper(number, jobs, own))
+            .expect("start a signal helper");
+        (number, sender)
+    }
+
+    fn helper(number: u32, jobs: Receiver<Job>, own: Sender<Job>) {
+        runtime::become_helper(number);
+        for Job { identity, target } in jobs {
+            runtime::deliver_for(&identity, &target);
+            identity.helper_runner.lock().unwrap_or_else(|e| e.into_inner()).take();
+            runtime::clear_borrower(&identity);
+            // A signal that came after the last delivery check: the thread
+            // delivers it on its way back in, or a new borrow does.
+            if deliverable(&identity) {
+                target.attention.store(1, Ordering::SeqCst);
+                request(identity.handle);
+            }
+            IDLE.lock().unwrap_or_else(|e| e.into_inner()).push((number, own.clone()));
+        }
+    }
+}
+
+pub fn borrows() -> u64 {
+    helpers::BORROWS.load(Ordering::Relaxed)
+}
+
 /// Runs handlers for this thread's pending, unblocked signals. Only while the
 /// thread is inside guest code (parked in a phone function); otherwise they
 /// wait until it is. Returns whether any handler ran.
 pub fn deliver_pending() -> bool {
-    if PENDING.load(Ordering::Relaxed) == 0 || !gil_held() {
+    if !gil_held() {
         return false;
     }
-    let uc = engine();
-    if uc.get_data().depth == 0 {
+    deliver_pending_on(engine())
+}
+
+/// `deliver_pending` for the thread running `uc` (cheap when nothing is pending).
+pub fn deliver_pending_on(uc: &mut Uc) -> bool {
+    if uc.get_data().identity.pending.load(Ordering::SeqCst) == 0 || uc.get_data().depth == 0 {
         return false;
     }
-    let me = current_handle();
+    let me = std::sync::Arc::clone(&uc.get_data().identity);
+    if me.pending.load(Ordering::SeqCst) & !me.blocked.load(Ordering::SeqCst) == 0 {
+        return false;
+    }
+    let runner = std::sync::Arc::clone(&uc.get_data().runner);
+    let was = runner.state.load(Ordering::SeqCst);
+    let entered = crate::runtime::parallel() && was != crate::runtime::IN_GUEST;
+    if entered {
+        crate::runtime::enter_guest(uc);
+    }
     let mut delivered = false;
     loop {
-        let next = {
+        let blocked = me.blocked.load(Ordering::SeqCst);
+        let ready = me.pending.load(Ordering::SeqCst) & !blocked;
+        if ready == 0 {
+            break;
+        }
+        let signal = ready.trailing_zeros() + 1;
+        // Taken by exactly one delivery, even if a sender sets it again meanwhile.
+        if me.pending.fetch_and(!bit(signal), Ordering::AcqRel) & bit(signal) == 0 {
+            continue;
+        }
+        let action = {
             let mut shared = shared();
-            let signals = &mut shared.state.signals;
-            let Some(thread) = signals.threads.get_mut(&me) else { return delivered };
-            let ready = thread.pending & !thread.blocked;
-            if ready == 0 {
-                return delivered;
-            }
-            let signal = ready.trailing_zeros() + 1;
-            thread.pending &= !bit(signal);
-            PENDING.fetch_sub(1, Ordering::Relaxed);
-            let blocked = thread.blocked;
-            let action = signals.actions.get(&signal).copied().unwrap_or_default();
+            let actions = &mut shared.state.signals.actions;
+            let action = actions.get(&signal).copied().unwrap_or_default();
             if action.flags & SA_RESETHAND != 0 {
-                signals.actions.remove(&signal);
+                actions.remove(&signal);
             }
-            (signal, action, blocked)
+            action
         };
-        run_handler(uc, next.0, next.1, next.2);
+        run_handler(uc, &me, signal, action, blocked);
         delivered = true;
     }
+    if entered {
+        runner.state.store(was, Ordering::SeqCst);
+    }
+    delivered
 }
 
 /// Calls the guest handler with a siginfo_t and a ucontext_t describing where
 /// the thread is parked (the phone function's return address).
-fn run_handler(uc: &mut Uc, signal: u32, action: Action, blocked: u64) {
+fn run_handler(uc: &mut Uc, me: &Identity, signal: u32, action: Action, blocked: u64) {
     if action.handler <= SIG_IGN {
         return;
     }
@@ -190,9 +320,9 @@ fn run_handler(uc: &mut Uc, signal: u32, action: Action, blocked: u64) {
     if action.flags & SA_NODEFER == 0 {
         during |= bit(signal);
     }
-    set_blocked(during);
+    set_blocked(me, during);
 
-    let frame = shared().heap.malloc(SIGINFO_SIZE + UCONTEXT_SIZE);
+    let frame = crate::runtime::heap().malloc(SIGINFO_SIZE + UCONTEXT_SIZE);
     let memory = mem();
     unsafe { std::ptr::write_bytes(memory.host(frame), 0, (SIGINFO_SIZE + UCONTEXT_SIZE) as usize) };
     let info = frame;
@@ -234,14 +364,15 @@ fn run_handler(uc: &mut Uc, signal: u32, action: Action, blocked: u64) {
     }
     // Returning from a handler restores the mask saved in the context.
     let restored = memory.read_u32(context + SIGMASK) as u64 | (memory.read_u32(context + SIGMASK + 4) as u64) << 32;
-    set_blocked(restored);
-    shared().heap.free(frame);
-    DELIVERED.with(|d| d.set(d.get() + 1));
+    set_blocked(me, restored);
+    crate::runtime::heap().free(frame);
+    me.delivered.fetch_add(1, Ordering::AcqRel);
 }
 
 /// Changes this thread's blocked set (pthread_sigmask / sigprocmask).
 fn change_mask(how: u32, set: u32, old: u32) -> u32 {
-    let current = blocked_now();
+    let me = current_identity();
+    let current = me.blocked.load(Ordering::Acquire);
     if old != 0 {
         mem().write_u32(old, current as u32);
     }
@@ -253,7 +384,7 @@ fn change_mask(how: u32, set: u32, old: u32) -> u32 {
             SIG_SETMASK => (current & !0xFFFF_FFFF) | given,
             _ => return EINVAL,
         };
-        set_blocked(next);
+        set_blocked(&me, next);
         deliver_pending();
     }
     0
@@ -327,14 +458,15 @@ pub fn handler(name: &str) -> Option<Handler> {
         // Waits with `mask` blocked until a handler has run; always fails with EINTR.
         "sigsuspend" => handler!(|uc, a| {
             let mask = mem().read_u32(a.u32()) as u64;
-            let saved = blocked_now();
-            set_blocked((saved & !0xFFFF_FFFF) | mask);
-            let before = DELIVERED.with(|d| d.get());
+            let me = std::sync::Arc::clone(&uc.get_data().identity);
+            let saved = me.blocked.load(Ordering::Acquire);
+            set_blocked(&me, (saved & !0xFFFF_FFFF) | mask);
+            let before = me.delivered.load(Ordering::Acquire);
             deliver_pending();
-            while DELIVERED.with(|d| d.get()) == before {
-                wait_on(2 << 32 | current_handle() as u64, None);
+            while me.delivered.load(Ordering::Acquire) == before {
+                wait_on(2 << 32 | me.handle as u64, None);
             }
-            set_blocked(saved);
+            set_blocked(&me, saved);
             fail(uc, EINTR)
         }),
         "pthread_kill" => handler!(|uc, a| {

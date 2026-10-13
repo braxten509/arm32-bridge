@@ -83,23 +83,26 @@ impl GuestMem {
         GuestMem { base: base as *mut u8 }
     }
 
-    /// Writes the kuser helpers at the addresses Linux uses. Only one guest
-    /// thread runs at a time, so plain loads and stores are atomic. Results
-    /// match the kernel's: 0 and carry set on success.
+    /// Writes the kuser helpers at the addresses Linux uses, as the kernel
+    /// writes them for multi-core ARMv7 (guest threads run at the same time):
+    /// ldrex/strex loops with barriers. Results match the kernel's: 0 and
+    /// carry set on success.
     pub fn write_kernel_helpers(&self) {
         const HELPERS: [(u32, &[u32]); 4] = [
             // __kuser_cmpxchg64(const u64 *old, const u64 *new, u64 *ptr)
             (0xFFFF_0F60, &[
                 0xE92D_00F0, // push {r4-r7}
                 0xE1C0_40D0, // ldrd r4, r5, [r0]
-                0xE1C2_60D0, // ldrd r6, r7, [r2]
-                0xE156_0004, // cmp r6, r4
-                0x0157_0005, // cmpeq r7, r5
-                0x01C1_40D0, // ldrdeq r4, r5, [r1]
-                0x01C2_40F0, // strdeq r4, r5, [r2]
-                0x03A0_0000, // moveq r0, #0
-                0x13A0_0001, // movne r0, #1
-                0xE270_0000, // rsbs r0, r0, #0
+                0xE1C1_60D0, // ldrd r6, r7, [r1]
+                0xF57F_F05B, // dmb ish
+                0xE1B2_0F9F, // 1: ldrexd r0, r1, [r2]
+                0xE030_3004, // eors r3, r0, r4
+                0x0031_3005, // eorseq r3, r1, r5
+                0x01A2_3F96, // strexdeq r3, r6, r7, [r2]
+                0x0333_0001, // teqeq r3, #1
+                0x0AFF_FFF9, // beq 1b
+                0xF57F_F05B, // dmb ish
+                0xE273_0000, // rsbs r0, r3, #0
                 0xE8BD_00F0, // pop {r4-r7}
                 0xE12F_FF1E, // bx lr
             ]),
@@ -107,11 +110,14 @@ impl GuestMem {
             (0xFFFF_0FA0, &[0xF57F_F05B, 0xE12F_FF1E]), // dmb ish; bx lr
             // __kuser_cmpxchg(u32 old, u32 new, u32 *ptr)
             (0xFFFF_0FC0, &[
-                0xE592_3000, // ldr r3, [r2]
+                0xF57F_F05B, // dmb ish
+                0xE192_3F9F, // 1: ldrex r3, [r2]
                 0xE053_3000, // subs r3, r3, r0
-                0x0582_1000, // streq r1, [r2]
+                0x0182_3F91, // strexeq r3, r1, [r2]
+                0x0333_0001, // teqeq r3, #1
+                0x0AFF_FFFA, // beq 1b
                 0xE273_0000, // rsbs r0, r3, #0
-                0xE12F_FF1E, // bx lr
+                0xEAFF_FFEF, // b __kuser_memory_barrier
             ]),
             // __kuser_get_tls
             (0xFFFF_0FE0, &[0xEE1D_0F70, 0xE12F_FF1E]), // mrc p15, 0, r0, c13, c0, 3; bx lr
@@ -123,6 +129,13 @@ impl GuestMem {
         }
         // __kuser_helper_version: the number of 32-byte helper slots.
         self.write_u32(0xFFFF_0FFC, 5);
+    }
+
+    /// The guest word at `guest` (4-byte aligned) as an atomic, for words several
+    /// threads change at once (mutexes, semaphores, futexes).
+    pub fn atomic_u32(&self, guest: u32) -> &'static std::sync::atomic::AtomicU32 {
+        assert!(guest % 4 == 0, "unaligned guest synchronization word at {guest:#x}");
+        unsafe { &*(self.host(guest) as *const std::sync::atomic::AtomicU32) }
     }
 
     pub fn host(&self, guest: u32) -> *mut u8 {

@@ -215,6 +215,11 @@ typedef enum uc_arm_reg {
 	// A pseudo-register for fetching the exception syndrome
 	// from the CPU state. This is not a real register.
     UC_ARM_REG_ESR,
+    // arm32-bridge: the exclusive monitor (LDREX address, -1 = none, and value).
+    UC_ARM_REG_EXCLUSIVE_ADDR,
+    UC_ARM_REG_EXCLUSIVE_VAL,
+    // arm32-bridge: write 1 when other threads run guest code at the same time.
+    UC_ARM_REG_PARALLEL,
     UC_ARM_REG_ENDING, // <-- mark the end of the list or registers
 
     //> alias registers

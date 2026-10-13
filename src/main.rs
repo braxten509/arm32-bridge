@@ -54,6 +54,7 @@ fn parse_number(text: &str) -> u32 {
 /// runs every library's start-up code, dependencies first.
 fn boot(path: &Path, options: &Options) -> Result<(&'static mut Uc, usize), String> {
     runtime::init(options.trace);
+    runtime::count_calls();
     let uc = runtime::engine();
     imports::jni::create_vm(uc);
     let directory = path.parent().map(PathBuf::from).unwrap_or_default();
@@ -66,25 +67,20 @@ fn boot(path: &Path, options: &Options) -> Result<(&'static mut Uc, usize), Stri
 
 fn print_report(uc: &Uc) {
     let _ = uc;
-    let runtime = runtime::shared();
-    let used: Vec<&runtime::Stub> = runtime
-        .first_use
-        .iter()
-        .map(|&index| &runtime.stubs[(index - 64) as usize])
-        .filter(|stub| !stub.name.starts_with("jni:"))
-        .collect();
+    let first_use: Vec<&runtime::Stub> = runtime::first_use().into_iter().filter_map(runtime::stub).collect();
+    let calls = |stub: &runtime::Stub| stub.calls.load(std::sync::atomic::Ordering::Relaxed);
+    let used: Vec<&runtime::Stub> = first_use.iter().copied().filter(|stub| !stub.name.starts_with("jni:")).collect();
     println!("\nPhone functions the game used ({}), in order of first use:", used.len());
     for stub in &used {
         let mark = if stub.handler.is_some() { "" } else { "  <- no handler yet, returned 0" };
-        println!("  {:<28} x{}{mark}", stub.name, stub.calls);
+        println!("  {:<28} x{}{mark}", stub.name, calls(stub));
     }
-    let jni_used: Vec<String> = runtime
-        .first_use
+    let jni_used: Vec<String> = first_use
         .iter()
-        .map(|&index| &runtime.stubs[(index - 64) as usize])
         .filter(|stub| stub.name.starts_with("jni:"))
-        .map(|stub| format!("{} x{}", &stub.name[4..], stub.calls))
+        .map(|stub| format!("{} x{}", &stub.name[4..], calls(stub)))
         .collect();
+    let runtime = runtime::shared();
     println!("\nJava (JNI) functions used ({}): {}", jni_used.len(), jni_used.join(", "));
     println!("Java requests: {}", runtime.state.jni.java_calls.len());
     if runtime.missing.is_empty() {
@@ -97,7 +93,7 @@ fn print_report(uc: &Uc) {
 fn print_fault(uc: &Uc, error: &str) {
     println!("\nFAILED: {error}");
     let _ = uc;
-    let recent: Vec<&str> = runtime::shared().recent.iter().copied().collect();
+    let recent = runtime::recent_calls();
     println!("Last phone functions called: {}", recent.join(", "));
 }
 

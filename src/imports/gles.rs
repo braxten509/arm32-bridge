@@ -2,7 +2,8 @@
 //! the NDK headers (gles_generated.rs); the ones here need special care:
 //! - vertex, index, pixel and indirect pointers are either a guest pointer or
 //!   an offset into a bound buffer, depending on GL state, so buffer bindings
-//!   are tracked per thread (GL contexts are too).
+//!   are tracked per GL context (and mapped buffers per share group: a
+//!   buffer mapped in one context can be unmapped in another).
 //! - glMapBufferOES / glMapBufferRange return driver memory outside the guest's
 //!   4 GiB, so the guest writes into a guest copy that is uploaded on unmap.
 //! - glShaderSource and friends take arrays of pointers; glGetString(i) returns one.
@@ -11,8 +12,8 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::handler;
 use crate::runtime::{mem, shared, ArgSource, Handler, Ret};
@@ -92,9 +93,91 @@ struct Bindings {
     vertex_array: u32,
     /// Element buffer binding per vertex array object (0 = the default one).
     element_buffers: HashMap<u32, u32>,
+}
+
+/// What contexts sharing objects share.
+#[derive(Default)]
+struct ShareGroup {
     /// Mapped buffers by buffer name. GL keeps a buffer mapped after another
     /// buffer is bound to the same target, so the target can't be the key.
     mapped: HashMap<u32, Mapped>,
+}
+
+#[derive(Clone)]
+struct Context {
+    bindings: Arc<Mutex<Bindings>>,
+    group: Arc<Mutex<ShareGroup>>,
+}
+
+/// Every host EGL context seen, by its pointer. Contexts the game did not
+/// make (Java's GLSurfaceView makes them) get their own group on first sight.
+static CONTEXTS: Mutex<Option<HashMap<usize, Context>>> = Mutex::new(None);
+/// Bumped when a context is made (it may reuse a destroyed one's pointer).
+static CONTEXT_CHANGES: AtomicU64 = AtomicU64::new(0);
+
+pub fn context_created(context: usize, share: usize) {
+    let mut contexts = CONTEXTS.lock().unwrap_or_else(|e| e.into_inner());
+    let contexts = contexts.get_or_insert_with(HashMap::new);
+    let group = match share {
+        0 => None,
+        share => Some(Arc::clone(&contexts.entry(share).or_insert_with(new_context).group)),
+    };
+    let entry = Context { bindings: Arc::default(), group: group.unwrap_or_default() };
+    contexts.insert(context, entry);
+    CONTEXT_CHANGES.fetch_add(1, Ordering::Release);
+}
+
+/// A thread that still has it current keeps its state until it moves on
+/// (EGL deletes a current context only once released): its cached lookup
+/// stays valid, as only a new context made at the same address bumps
+/// CONTEXT_CHANGES.
+pub fn context_destroyed(context: usize) {
+    if let Some(contexts) = CONTEXTS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        contexts.remove(&context);
+    }
+}
+
+fn new_context() -> Context {
+    Context { bindings: Arc::default(), group: Arc::default() }
+}
+
+thread_local! {
+    /// The context current on this thread, as last looked up: (host context,
+    /// CONTEXT_CHANGES then, its state).
+    static CURRENT: RefCell<Option<(usize, u64, Context)>> = const { RefCell::new(None) };
+}
+
+/// The state of the context current on this thread (checked against EGL each
+/// time, so a MakeCurrent from Java is seen too).
+fn current() -> Context {
+    let host = crate::imports::egl::current_context();
+    let changes = CONTEXT_CHANGES.load(Ordering::Acquire);
+    CURRENT.with(|current| {
+        let mut current = current.borrow_mut();
+        if let Some((context, seen, state)) = current.as_ref() {
+            if *context == host && *seen == changes {
+                return state.clone();
+            }
+        }
+        let state = {
+            let mut contexts = CONTEXTS.lock().unwrap_or_else(|e| e.into_inner());
+            contexts.get_or_insert_with(HashMap::new).entry(host).or_insert_with(new_context).clone()
+        };
+        *current = Some((host, changes, state.clone()));
+        state
+    })
+}
+
+fn with_bindings<R>(work: impl FnOnce(&mut Bindings) -> R) -> R {
+    let context = current();
+    let mut bindings = context.bindings.lock().unwrap_or_else(|e| e.into_inner());
+    work(&mut bindings)
+}
+
+fn with_group<R>(work: impl FnOnce(&mut ShareGroup) -> R) -> R {
+    let context = current();
+    let mut group = context.group.lock().unwrap_or_else(|e| e.into_inner());
+    work(&mut group)
 }
 
 /// A guest copy standing in for mapped buffer memory.
@@ -107,12 +190,8 @@ struct Mapped {
     upload_on_unmap: bool,
 }
 
-thread_local! {
-    static BINDINGS: RefCell<Bindings> = RefCell::new(Bindings::default());
-}
-
 fn bound(target: u32) -> u32 {
-    BINDINGS.with(|b| b.borrow().buffers.get(&target).copied().unwrap_or(0))
+    with_bindings(|b| b.buffers.get(&target).copied().unwrap_or(0))
 }
 
 /// The buffer the context has bound to `target` right now (asked from GL, as
@@ -171,19 +250,15 @@ pub fn pack_pointer(pointer: u32) -> *mut c_void {
 }
 
 fn element_buffer() -> u32 {
-    BINDINGS.with(|b| {
-        let b = b.borrow();
-        b.element_buffers.get(&b.vertex_array).copied().unwrap_or(0)
-    })
+    with_bindings(|b| b.element_buffers.get(&b.vertex_array).copied().unwrap_or(0))
 }
 
 fn bind_vertex_array(array: u32) {
-    BINDINGS.with(|b| b.borrow_mut().vertex_array = array);
+    with_bindings(|b| b.vertex_array = array);
 }
 
 fn forget_vertex_arrays(count: i32, arrays: u32) {
-    BINDINGS.with(|b| {
-        let mut b = b.borrow_mut();
+    with_bindings(|b| {
         for i in 0..count.max(0) as u32 {
             let array = mem().read_u32(arrays + i * 4);
             b.element_buffers.remove(&array);
@@ -217,7 +292,7 @@ fn string_array(strings: u32, count: i32) -> Vec<*mut c_void> {
 /// said it will overwrite the range, the copy starts with the current contents,
 /// because the copy is uploaded whole.
 fn map_into_copy(target: u32, offset: u32, length: u32, access: u32) -> u32 {
-    let copy = shared().heap.malloc(length.max(1));
+    let copy = crate::runtime::heap().malloc(length.max(1));
     if access & (GL_MAP_INVALIDATE_RANGE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT) == 0 {
         let current = unsafe {
             host!("glMapBufferRange", fn(u32, isize, isize, u32) -> *mut c_void)(
@@ -247,8 +322,7 @@ fn map_into_copy(target: u32, offset: u32, length: u32, access: u32) -> u32 {
 fn remember_mapping(mapped: Mapped) {
     static OVERLAPS_REPORTED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let buffer = buffer_bound_to(mapped.target);
-    BINDINGS.with(|b| {
-        let mut b = b.borrow_mut();
+    with_group(|b| {
         let others = b.mapped.iter().filter(|(&other, m)| other != buffer && m.target == mapped.target).count();
         if others > 0 && OVERLAPS_REPORTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 10 {
             crate::log::line(&format!(
@@ -275,13 +349,13 @@ fn upload(target: u32, offset: u32, length: u32, data: u32) {
 
 fn unmap(target: u32) -> u32 {
     let buffer = buffer_bound_to(target);
-    let Some(mapped) = BINDINGS.with(|b| b.borrow_mut().mapped.remove(&buffer)) else {
+    let Some(mapped) = with_group(|b| b.mapped.remove(&buffer)) else {
         return 0;
     };
     if mapped.upload_on_unmap {
         upload(target, mapped.offset, mapped.length, mapped.copy);
     }
-    shared().heap.free(mapped.copy);
+    crate::runtime::heap().free(mapped.copy);
     1
 }
 
@@ -296,8 +370,7 @@ fn special(name: &str) -> Option<Handler> {
     match name {
         "glBindBuffer" => handler!(|uc, a| {
             let (target, buffer) = (a.u32(), a.u32());
-            BINDINGS.with(|b| {
-                let mut b = b.borrow_mut();
+            with_bindings(|b| {
                 if target == GL_ELEMENT_ARRAY_BUFFER {
                     let vertex_array = b.vertex_array;
                     b.element_buffers.insert(vertex_array, buffer);
@@ -310,15 +383,17 @@ fn special(name: &str) -> Option<Handler> {
         }),
         "glDeleteBuffers" => handler!(|uc, a| {
             let (count, buffers) = (a.i32(), a.u32());
-            BINDINGS.with(|b| {
-                let mut b = b.borrow_mut();
-                for i in 0..count.max(0) as u32 {
-                    let buffer = mem().read_u32(buffers + i * 4);
+            let names: Vec<u32> = (0..count.max(0) as u32).map(|i| mem().read_u32(buffers + i * 4)).collect();
+            with_group(|group| {
+                for buffer in &names {
                     // Deleting a mapped buffer unmaps it; its copy is no longer valid.
-                    if let Some(mapped) = b.mapped.remove(&buffer) {
-                        shared().heap.free(mapped.copy);
+                    if let Some(mapped) = group.mapped.remove(buffer) {
+                        crate::runtime::heap().free(mapped.copy);
                     }
-                    let b = &mut *b;
+                }
+            });
+            with_bindings(|b| {
+                for &buffer in &names {
                     for bound in b.buffers.values_mut().chain(b.element_buffers.values_mut()) {
                         if *bound == buffer {
                             *bound = 0;
@@ -435,9 +510,7 @@ fn special(name: &str) -> Option<Handler> {
                 return Ret::U32(0);
             }
             let text = unsafe { std::ffi::CStr::from_ptr(text) }.to_string_lossy().into_owned();
-            let address = shared().misc_cstr(&text);
-            shared().state.data_imports.insert(key, address);
-            Ret::U32(address)
+            Ret::U32(shared().cached_cstr(key, &text))
         }),
         "glMapBufferOES" => handler!(|uc, a| {
             let (target, _access) = (a.u32(), a.u32());
@@ -469,7 +542,7 @@ fn special(name: &str) -> Option<Handler> {
         "glFlushMappedBufferRange" => handler!(|uc, a| {
             let (target, offset, length) = (a.u32(), a.u32(), a.u32());
             let buffer = buffer_bound_to(target);
-            let found = BINDINGS.with(|b| b.borrow().mapped.get(&buffer).map(|m| (m.copy, m.offset)));
+            let found = with_group(|b| b.mapped.get(&buffer).map(|m| (m.copy, m.offset)));
             if let Some((copy, start)) = found {
                 upload(target, start + offset, length, copy + offset);
             }
@@ -488,9 +561,7 @@ fn special(name: &str) -> Option<Handler> {
                 return Ret::U32(0);
             }
             let text = unsafe { std::ffi::CStr::from_ptr(text) }.to_string_lossy().into_owned();
-            let address = shared().misc_cstr(&text);
-            shared().state.data_imports.insert(key, address);
-            Ret::U32(address)
+            Ret::U32(shared().cached_cstr(key, &text))
         }),
         "glTransformFeedbackVaryings" => handler!(|uc, a| {
             let (program, count, varyings, mode) = (a.u32(), a.i32(), a.u32(), a.u32());

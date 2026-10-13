@@ -241,6 +241,10 @@ mod host {
         result
     }
 
+    pub fn current_context() -> usize {
+        unsafe { eglGetCurrentContext() as usize }
+    }
+
     pub fn handler(name: &str) -> Option<Handler> {
         match name {
             "eglGetDisplay" => handler!(|uc, a| {
@@ -309,11 +313,19 @@ mod host {
             }),
             "eglCreateContext" => handler!(|uc, a| {
                 let (display, config, share, attributes) = (host(a.u32()), host(a.u32()), host(a.u32()), a.u32());
-                Ret::U32(guest(unsafe { eglCreateContext(display, config, share, int_pointer(attributes)) }))
+                let context = unsafe { eglCreateContext(display, config, share, int_pointer(attributes)) };
+                if !context.is_null() {
+                    crate::imports::gles::context_created(context as usize, share as usize);
+                }
+                Ret::U32(guest(context))
             }),
             "eglDestroyContext" => handler!(|uc, a| {
                 let (display, context) = (host(a.u32()), host(a.u32()));
-                Ret::U32(unsafe { eglDestroyContext(display, context) })
+                let done = unsafe { eglDestroyContext(display, context) };
+                if done != 0 {
+                    crate::imports::gles::context_destroyed(context as usize);
+                }
+                Ret::U32(done)
             }),
             "eglQueryContext" => handler!(|uc, a| {
                 let (display, context, attribute, value) = (host(a.u32()), host(a.u32()), a.i32(), a.u32());
@@ -345,9 +357,7 @@ mod host {
                     return Ret::U32(0);
                 }
                 let text = unsafe { std::ffi::CStr::from_ptr(text) }.to_string_lossy().into_owned();
-                let address = shared().misc_cstr(&text);
-                shared().state.data_imports.insert(key, address);
-                Ret::U32(address)
+                Ret::U32(shared().cached_cstr(key, &text))
             }),
             "eglGetError" => handler!(|uc, a| Ret::U32(unsafe { eglGetError() } as u32)),
             "eglCreateSyncKHR" => handler!(|uc, a| {
@@ -471,7 +481,13 @@ mod host {
 }
 
 #[cfg(target_os = "android")]
-pub use host::handler;
+pub use host::{current_context, handler};
+
+/// The host EGL context current on this thread (0 = none).
+#[cfg(not(target_os = "android"))]
+pub fn current_context() -> usize {
+    0
+}
 
 #[cfg(not(target_os = "android"))]
 pub fn handler(_name: &str) -> Option<Handler> {

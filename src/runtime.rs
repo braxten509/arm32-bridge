@@ -14,9 +14,9 @@
 //! into Java). Switching only ever happens inside a handler, never between
 //! two guest instructions, so the guest's ldrex/strex atomics stay atomic.
 
-use std::cell::{Cell, RefCell, RefMut};
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -168,8 +168,43 @@ pub struct Stub {
     /// Made once per stub and never freed, so it can be passed around for free.
     pub name: &'static str,
     pub handler: Option<Handler>,
-    pub calls: u64,
+    /// Times called; only counted while `counting_calls()` (a shared counter
+    /// would make every thread calling the same function wait on one cache line).
+    pub calls: AtomicU64,
+    used: AtomicBool,
 }
+
+/// Phone function stand-ins by stub slot (`index - FIRST_STUB`); made once, never freed.
+fn stub_table() -> &'static [AtomicPtr<Stub>] {
+    static TABLE: OnceLock<Box<[AtomicPtr<Stub>]>> = OnceLock::new();
+    TABLE.get_or_init(|| (0..mem::STUB_SIZE / 8).map(|_| AtomicPtr::new(std::ptr::null_mut())).collect())
+}
+
+/// The stand-in in stub slot `index`.
+pub fn stub(index: u32) -> Option<&'static Stub> {
+    let pointer = stub_table().get(index.checked_sub(FIRST_STUB)? as usize)?.load(Ordering::Acquire);
+    unsafe { pointer.as_ref() }
+}
+
+/// Stub slots in the order the game first called them.
+static FIRST_USE: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+pub fn first_use() -> Vec<u32> {
+    FIRST_USE.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+static COUNT_CALLS: AtomicBool = AtomicBool::new(false);
+
+/// Counts calls per phone function (for the stats and the command-line report).
+pub fn count_calls() {
+    COUNT_CALLS.store(true, Ordering::Relaxed);
+}
+
+fn counting_calls() -> bool {
+    COUNT_CALLS.load(Ordering::Relaxed) || stats_enabled()
+}
+
+static TRACE: AtomicBool = AtomicBool::new(false);
 
 /// Return traps: one per nesting depth, so a host→guest call made from
 /// inside a handler stops at its own return address.
@@ -211,22 +246,20 @@ fn ticks_per_ms() -> u64 {
     1_000_000
 }
 
-/// State shared by every guest thread (guarded by the guest lock).
+/// State shared by every guest thread (`shared()`; the guest heap has its own lock, `heap()`).
 pub struct Shared {
-    pub heap: GuestHeap,
     pub misc: Bump,
-    pub stubs: Vec<Stub>,
-    pub stub_by_name: HashMap<String, u32>,
+    /// Stub slot of each phone function made so far.
+    stub_by_name: HashMap<String, u32>,
     /// Exported symbols of loaded guest libraries (name → guest address).
     pub guest_exports: HashMap<String, u32>,
-    pub trace: bool,
-    /// Order in which phone functions were first used.
-    pub first_use: Vec<u32>,
     /// Names called that have no handler yet (they return 0).
     pub missing: Vec<String>,
-    pub recent: VecDeque<&'static str>,
     pub next_thread_id: u32,
     next_stack_top: u32,
+    /// Finished threads' id, stack top, errno slot and TLS block, for reuse
+    /// (ids stay small: locks keep the owner's id in 16 bits).
+    free_threads: Vec<(u32, u32, u32, u32)>,
     pub state: crate::imports::State,
 }
 
@@ -234,6 +267,17 @@ impl Shared {
     pub fn misc_alloc(&mut self, size: u32, align: u32) -> u32 {
         self.misc.alloc(size, align)
     }
+    /// The guest copy of `text` stored as data import `key`, made on first
+    /// use (one lookup and insert, so two threads get the same copy).
+    pub fn cached_cstr(&mut self, key: String, text: &str) -> u32 {
+        if let Some(&address) = self.state.data_imports.get(&key) {
+            return address;
+        }
+        let address = self.misc_cstr(text);
+        self.state.data_imports.insert(key, address);
+        address
+    }
+
     pub fn misc_cstr(&mut self, text: &str) -> u32 {
         let guest = self.misc.alloc(text.len() as u32 + 1, 1);
         mem().write_bytes(guest, text.as_bytes());
@@ -250,6 +294,8 @@ impl Shared {
 
 /// Per-thread state: the data attached to each Unicorn engine.
 pub struct Thread {
+    /// Which guest thread (pthread_t) this is.
+    pub identity: Arc<crate::imports::threads::Identity>,
     pub id: u32,
     pub depth: u32,
     pub fault: Option<String>,
@@ -261,30 +307,128 @@ pub struct Thread {
     pub current_call: &'static str,
     /// Translator state, once this thread has run translated code.
     pub native: Option<Box<crate::dynarec::Native>>,
+    /// The last phone functions this thread called (for crash reports).
+    pub recent: VecDeque<&'static str>,
+    /// This host thread's place in stopping the world (parallel mode).
+    pub runner: Arc<Runner>,
+    /// The last code change (`note_code_change`) this thread's Unicorn has dropped.
+    pub code_generation: u64,
+    pub clean: Option<unicorn_engine::Context>,
 }
 
-struct GuardedShared(RefCell<Option<Shared>>);
-// Only touched while holding the guest lock.
-unsafe impl Sync for GuardedShared {}
-
-static SHARED: GuardedShared = GuardedShared(RefCell::new(None));
+static SHARED: Mutex<Option<Shared>> = Mutex::new(None);
+/// `thread_number()` of the thread holding SHARED (0 = none), to report a
+/// thread locking it twice instead of hanging.
+static SHARED_OWNER: AtomicU64 = AtomicU64::new(0);
+static HEAP: Mutex<Option<GuestHeap>> = Mutex::new(None);
 static MEMORY: OnceLock<GuestMem> = OnceLock::new();
 
 pub fn mem() -> GuestMem {
     *MEMORY.get().expect("runtime::init not called")
 }
 
-/// The shared state. Never hold the result across a call into guest code.
-pub fn shared() -> RefMut<'static, Shared> {
-    debug_assert!(gil_held(), "shared state used without the guest lock");
-    RefMut::map(SHARED.0.borrow_mut(), |s| s.as_mut().expect("runtime::init not called"))
+/// A number for this host thread, never 0 (cheaper to compare than a ThreadId).
+fn thread_number() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    thread_local! {
+        static NUMBER: u64 = NEXT.fetch_add(1, Ordering::Relaxed);
+    }
+    NUMBER.with(|n| *n)
 }
 
-/// Sets up guest memory and the shared state. Safe to call more than once.
-pub fn init(trace: bool) {
-    if MEMORY.get().is_some() {
-        return;
+/// The shared state, locked until the result is dropped. Never hold it
+/// across a call into guest code, Java, or anything else that may wait.
+pub struct SharedGuard(MutexGuard<'static, Option<Shared>>);
+
+impl std::ops::Deref for SharedGuard {
+    type Target = Shared;
+    fn deref(&self) -> &Shared {
+        self.0.as_ref().expect("runtime::init not called")
     }
+}
+
+impl std::ops::DerefMut for SharedGuard {
+    fn deref_mut(&mut self) -> &mut Shared {
+        self.0.as_mut().expect("runtime::init not called")
+    }
+}
+
+impl Drop for SharedGuard {
+    fn drop(&mut self) {
+        SHARED_OWNER.store(0, Ordering::Relaxed);
+        LOCKS_HELD.with(|held| held.set(held.get() - 1));
+    }
+}
+
+thread_local! {
+    /// Bridge locks (shared state, heap) this thread holds right now.
+    static LOCKS_HELD: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Debug builds and ARM32_LOCKCHECK=1: code that may block for long (or
+/// stop every thread) must hold no bridge lock, or other threads hang behind it.
+pub fn assert_no_bridge_locks(place: &str) {
+    static CHECKING: OnceLock<bool> = OnceLock::new();
+    let checking = *CHECKING.get_or_init(|| cfg!(debug_assertions) || std::env::var("ARM32_LOCKCHECK").as_deref() == Ok("1"));
+    if checking && LOCKS_HELD.with(|held| held.get()) != 0 {
+        crate::log::line(&format!("[bridge] lock check: {place} runs while this thread holds a bridge lock"));
+        debug_assert!(false, "{place} runs while holding a bridge lock");
+    }
+}
+
+pub fn shared() -> SharedGuard {
+    let me = thread_number();
+    let guard = match SHARED.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            assert!(SHARED_OWNER.load(Ordering::Relaxed) != me, "the shared state was locked twice by one thread");
+            SHARED.lock().unwrap_or_else(|e| e.into_inner())
+        }
+    };
+    SHARED_OWNER.store(me, Ordering::Relaxed);
+    LOCKS_HELD.with(|held| held.set(held.get() + 1));
+    SharedGuard(guard)
+}
+
+/// The guest heap (malloc and friends), locked until the result is dropped.
+/// May be taken while holding `shared()`, never the other way round.
+pub struct HeapGuard(MutexGuard<'static, Option<GuestHeap>>);
+
+impl std::ops::Deref for HeapGuard {
+    type Target = GuestHeap;
+    fn deref(&self) -> &GuestHeap {
+        self.0.as_ref().expect("runtime::init not called")
+    }
+}
+
+impl std::ops::DerefMut for HeapGuard {
+    fn deref_mut(&mut self) -> &mut GuestHeap {
+        self.0.as_mut().expect("runtime::init not called")
+    }
+}
+
+pub fn heap() -> HeapGuard {
+    let guard = HEAP.lock().unwrap_or_else(|e| e.into_inner());
+    LOCKS_HELD.with(|held| held.set(held.get() + 1));
+    HeapGuard(guard)
+}
+
+impl Drop for HeapGuard {
+    fn drop(&mut self) {
+        LOCKS_HELD.with(|held| held.set(held.get() - 1));
+    }
+}
+
+/// Sets up guest memory and the shared state. Safe to call more than once,
+/// also from several threads at once: the first does the work, the others
+/// wait for it to finish.
+pub fn init(trace: bool) {
+    static DONE: OnceLock<()> = OnceLock::new();
+    DONE.get_or_init(|| set_up(trace));
+}
+
+fn set_up(trace: bool) {
     let memory = GuestMem::reserve();
     memory.write_kernel_helpers();
     MEMORY.set(memory).ok();
@@ -292,24 +436,300 @@ pub fn init(trace: bool) {
         memory.write_u32(trap_address(depth), UDF);
         memory.write_u32(trap_address(depth) + 4, UDF);
     }
-    let _lock = hold_gil();
-    *SHARED.0.borrow_mut() = Some(Shared {
-        heap: GuestHeap::new(memory),
+    TRACE.store(trace, Ordering::Relaxed);
+    *HEAP.lock().unwrap_or_else(|e| e.into_inner()) = Some(GuestHeap::new(memory));
+    *SHARED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Shared {
         misc: Bump::new(mem::MISC_BASE, mem::MISC_END),
-        stubs: Vec::new(),
         stub_by_name: HashMap::new(),
         guest_exports: HashMap::new(),
-        trace,
-        first_use: Vec::new(),
         missing: Vec::new(),
-        recent: Default::default(),
         next_thread_id: 1,
         next_stack_top: mem::STACK_TOP,
+        free_threads: Vec::new(),
         state: Default::default(),
     });
+    start_engine_builder();
 }
 
-// ---- the guest lock ----
+// ---- running guest threads at the same time ----
+
+/// Whether guest threads run at the same time (translator mode). Unicorn-only
+/// mode and the checker keep one thread at a time with the guest lock (GIL).
+/// ARM32_PARALLEL=0 / debug.arm32bridge.parallel=0 turns it off for testing.
+pub fn parallel() -> bool {
+    static PARALLEL: OnceLock<bool> = OnceLock::new();
+    *PARALLEL.get_or_init(|| {
+        let setting = std::env::var("ARM32_PARALLEL").ok().or_else(|| crate::dynarec::property("debug.arm32bridge.parallel"));
+        crate::dynarec::enabled() && !crate::dynarec::check::enabled() && setting.as_deref() != Some("0")
+    })
+}
+
+/// Where a host thread that runs guest code is right now.
+pub const IN_GUEST: u32 = 0;
+/// In a phone function or other host code (or not running guest code at all).
+pub const OUTSIDE: u32 = 1;
+/// Asleep in a bridge wait (it wakes for signals itself).
+pub const WAITING: u32 = 2;
+/// Stopped at a safe point because the world is stopped.
+pub const PARKED: u32 = 3;
+
+/// One host thread that runs guest code (one per engine).
+pub struct Runner {
+    pub state: AtomicU32,
+    /// Non-zero asks translated code to leave to the dispatcher at its next
+    /// block exit (a signal came, or the world is being stopped).
+    pub attention: AtomicU32,
+    /// For a helper standing in for a stuck thread (signals.rs): its number, else 0.
+    pub helper: u32,
+    /// Where the thread stopped for its current phone function (parallel
+    /// mode): r0-r14, then the address it goes on at. Written before the
+    /// OUTSIDE store, so a helper that sees OUTSIDE sees them.
+    pub parked: [AtomicU32; 16],
+    pub parked_valid: AtomicBool,
+    /// The thread's fixed slots, for a helper standing in for it.
+    pub thread_id: u32,
+    pub errno_slot: u32,
+    pub tls_block: u32,
+}
+
+/// Every runner, for stopping the world.
+static RUNNERS: Mutex<Vec<Arc<Runner>>> = Mutex::new(Vec::new());
+/// Set while one thread has stopped every other one (`stop_world`).
+static STOP: AtomicBool = AtomicBool::new(false);
+static STOPPER: Mutex<()> = Mutex::new(());
+/// Threads wait here for the world to start again.
+static RELEASED: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
+
+fn new_runner(thread_id: u32, errno_slot: u32, tls_block: u32) -> Arc<Runner> {
+    let runner = make_runner(thread_id, errno_slot, tls_block);
+    RUNNERS.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::clone(&runner));
+    runner
+}
+
+fn make_runner(thread_id: u32, errno_slot: u32, tls_block: u32) -> Arc<Runner> {
+    Arc::new(Runner {
+        state: AtomicU32::new(OUTSIDE),
+        attention: AtomicU32::new(0),
+        helper: HELPER.with(|helper| helper.get()),
+        parked: std::array::from_fn(|_| AtomicU32::new(0)),
+        parked_valid: AtomicBool::new(false),
+        thread_id,
+        errno_slot,
+        tls_block,
+    })
+}
+
+fn forget_runner(runner: &Arc<Runner>) {
+    RUNNERS.lock().unwrap_or_else(|e| e.into_inner()).retain(|other| !Arc::ptr_eq(other, runner));
+}
+
+/// This thread leaves guest code (into a phone function or host code).
+pub fn leave_guest(uc: &Uc) {
+    if parallel() {
+        uc.get_data().runner.state.store(OUTSIDE, Ordering::SeqCst);
+    }
+}
+
+/// Records where this thread stops for a phone function (it goes on at
+/// `resume`), so a helper can run signal handlers for it meanwhile.
+fn park_registers(uc: &Uc, resume: u32) {
+    if !parallel() {
+        return;
+    }
+    let runner = &uc.get_data().runner;
+    for register in 0..15 {
+        runner.parked[register].store(uc.reg(register), Ordering::Relaxed);
+    }
+    runner.parked[15].store(resume, Ordering::Relaxed);
+    runner.parked_valid.store(true, Ordering::Relaxed);
+}
+
+/// Whether another runner stands in for this thread's identity right now
+/// (a helper treats its own borrow as clear).
+fn borrowed_from(runner: &Runner, identity: &crate::imports::threads::Identity) -> bool {
+    let borrower = identity.borrower.load(Ordering::SeqCst);
+    borrower != 0 && borrower != runner.helper
+}
+
+/// This thread goes (back) into guest code, waiting first while the world is
+/// stopped or a helper runs signal handlers for it. The state store and the
+/// STOP / borrower loads pair with `stop_world`'s STOP store and the helper
+/// service's borrower store, each followed by a state load (all SeqCst), so
+/// one side always sees the other.
+pub fn enter_guest(uc: &Uc) {
+    if !parallel() {
+        return;
+    }
+    let (runner, identity) = (&uc.get_data().runner, &uc.get_data().identity);
+    loop {
+        runner.state.store(IN_GUEST, Ordering::SeqCst);
+        let stop = STOP.load(Ordering::SeqCst);
+        if !stop && !borrowed_from(runner, identity) {
+            return;
+        }
+        runner.state.store(if stop { PARKED } else { OUTSIDE }, Ordering::SeqCst);
+        let (lock, released) = &RELEASED;
+        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while STOP.load(Ordering::SeqCst) || borrowed_from(runner, identity) {
+            guard = released.wait(guard).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+/// Ends (or undoes) a helper's borrow of `identity` and wakes its thread if
+/// it waits to go back into guest code.
+pub fn clear_borrower(identity: &crate::imports::threads::Identity) {
+    let (lock, released) = &RELEASED;
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    identity.borrower.store(0, Ordering::SeqCst);
+    released.notify_all();
+}
+
+/// Waits until no helper stands in for `identity` (a finishing thread).
+pub fn wait_for_borrow_end(identity: &crate::imports::threads::Identity) {
+    let started = Instant::now();
+    let mut warned = false;
+    let (lock, released) = &RELEASED;
+    let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while identity.borrower.load(Ordering::SeqCst) != 0 {
+        guard = released.wait_timeout(guard, Duration::from_millis(100)).unwrap_or_else(|e| e.into_inner()).0;
+        if !warned && started.elapsed() > Duration::from_secs(5) {
+            warned = true;
+            crate::log::line(&format!(
+                "[bridge] thread {:#x} is finishing but a signal handler still runs for it after 5 s",
+                identity.handle
+            ));
+        }
+    }
+}
+
+/// A helper (signals.rs) runs this thread's pending signal handlers as if
+/// they came while `target` sat in its phone function: on the target's
+/// identity and slots, with its parked registers, below its parked stack.
+pub fn deliver_for(identity: &Arc<crate::imports::threads::Identity>, target: &Runner) {
+    crate::imports::threads::adopt_identity(Some(Arc::clone(identity)));
+    let uc = engine();
+    {
+        let flag = attention_flag_address(uc);
+        let thread = uc.get_data_mut();
+        thread.identity = Arc::clone(identity);
+        thread.id = target.thread_id;
+        thread.errno_slot = target.errno_slot;
+        thread.tls_block = target.tls_block;
+        thread.depth = 1;
+        let native = thread.native.get_or_insert_with(|| Box::new(crate::dynarec::Native::new(target.tls_block, flag)));
+        native.state.tls = target.tls_block;
+        for register in 0..15 {
+            native.state.r[register] = target.parked[register].load(Ordering::Relaxed);
+        }
+        native.state.clear_exclusive();
+        native.active = true;
+    }
+    let _ = uc.reg_write(RegisterARM::C13_C0_3, target.tls_block as u64);
+    // Signals sent meanwhile poke this helper too.
+    *identity.helper_runner.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&uc.get_data().runner));
+    let resume_before = RESUME_AT.with(|r| r.replace(Some(target.parked[15].load(Ordering::Relaxed))));
+    enter_guest(uc);
+    crate::imports::signals::deliver_pending_on(uc);
+    leave_guest(uc);
+    RESUME_AT.with(|r| r.set(resume_before));
+    let thread = uc.get_data_mut();
+    thread.depth = 0;
+    thread.fault = None;
+    thread.exit_code = None;
+    if let Some(native) = thread.native.as_mut() {
+        native.active = false;
+    }
+    crate::imports::threads::adopt_identity(None);
+}
+
+/// Stops every other thread that runs guest code at a safe point (a block
+/// exit or outside guest code), runs `work`, and lets them go again. For rare
+/// changes no guest code may see half done (dropping translated code). The
+/// caller holds no bridge lock; another thread stopping the world first is
+/// waited for (this thread counts as stopped meanwhile).
+pub fn stop_world<R>(uc: &Uc, work: impl FnOnce() -> R) -> R {
+    if !parallel() {
+        return work();
+    }
+    assert_no_bridge_locks("stopping every thread");
+    let me = &uc.get_data().runner;
+    let was = me.state.swap(PARKED, Ordering::SeqCst);
+    let stopper = STOPPER.lock().unwrap_or_else(|e| e.into_inner());
+    STOP.store(true, Ordering::SeqCst);
+    let runners: Vec<Arc<Runner>> = RUNNERS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    for runner in &runners {
+        runner.attention.store(1, Ordering::SeqCst);
+    }
+    let started = Instant::now();
+    let mut warned = false;
+    for runner in runners.iter().filter(|runner| !Arc::ptr_eq(runner, me)) {
+        while runner.state.load(Ordering::SeqCst) == IN_GUEST {
+            std::thread::yield_now();
+            if !warned && started.elapsed() > Duration::from_secs(2) {
+                warned = true;
+                crate::log::line("[bridge] stopping the world: a thread has not reached a safe point after 2 s");
+            }
+        }
+    }
+    STOPS.fetch_add(1, Ordering::Relaxed);
+    let result = work();
+    {
+        let (lock, released) = &RELEASED;
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        STOP.store(false, Ordering::SeqCst);
+        released.notify_all();
+    }
+    drop(stopper);
+    me.state.store(was, Ordering::SeqCst);
+    if was == IN_GUEST {
+        enter_guest(uc);
+    }
+    result
+}
+
+/// Times the world was stopped (shown with the stats).
+pub static STOPS: AtomicU64 = AtomicU64::new(0);
+
+/// The flag translated code checks at every linked exit: this thread's
+/// attention flag in parallel mode, else the shared time-slice flag.
+pub fn attention_flag_address(uc: &Uc) -> u64 {
+    if parallel() {
+        uc.get_data().runner.attention.as_ptr() as u64
+    } else {
+        preempt_flag_address()
+    }
+}
+
+/// The dispatcher between blocks (game code goes on at `resume`): stop for a
+/// stopped world or a signal (parallel mode), or let a waiting thread have
+/// the guest lock after a full time slice.
+pub fn check_in(uc: &mut Uc, resume: u32) {
+    if parallel() {
+        if uc.get_data().runner.attention.load(Ordering::Relaxed) != 0 {
+            safe_point(uc, resume);
+        }
+    } else if preempt_requested() {
+        share_gil(resume);
+    }
+}
+
+/// The dispatcher found its attention flag set: clear it, wait out a stopped
+/// world, and run handlers for signals that came (resuming at `resume`).
+pub fn safe_point(uc: &mut Uc, resume: u32) {
+    let runner = Arc::clone(&uc.get_data().runner);
+    runner.attention.store(0, Ordering::SeqCst);
+    std::sync::atomic::fence(Ordering::SeqCst);
+    if STOP.load(Ordering::SeqCst) {
+        runner.state.store(PARKED, Ordering::SeqCst);
+        enter_guest(uc);
+    }
+    let resume_before = RESUME_AT.with(|r| r.replace(Some(resume)));
+    crate::imports::signals::deliver_pending_on(uc);
+    RESUME_AT.with(|r| r.set(resume_before));
+}
+
+// ---- the guest lock (one thread at a time; not used in parallel mode) ----
 
 static GIL: Mutex<()> = Mutex::new(());
 
@@ -320,6 +740,10 @@ thread_local! {
     static PHONE_TICKS: Cell<u64> = const { Cell::new(0) };
     static PHONE_DEPTH: Cell<u32> = const { Cell::new(0) };
     static RESUME_AT: Cell<Option<u32>> = const { Cell::new(None) };
+    /// This host thread's helper number (signals.rs), set before its engine is made.
+    static HELPER: Cell<u32> = const { Cell::new(0) };
+    /// This host thread's runner, once it has an engine.
+    static CURRENT_RUNNER: RefCell<Option<Arc<Runner>>> = const { RefCell::new(None) };
     static HELD_SINCE: Cell<u64> = const { Cell::new(0) };
     static LOCK_WAIT_TICKS: Cell<u64> = const { Cell::new(0) };
 }
@@ -366,6 +790,9 @@ fn start_preempt_ticker() {
 }
 
 fn take_gil() {
+    if parallel() {
+        return;
+    }
     let guard = match GIL.try_lock() {
         Ok(guard) => guard,
         Err(_) => {
@@ -384,6 +811,11 @@ fn take_gil() {
     HELD_SINCE_ANY.store(now, Ordering::Relaxed);
     PREEMPT.store(0, Ordering::Relaxed);
     GIL_GUARD.with(|g| *g.borrow_mut() = Some(guard));
+}
+
+/// Marks this host thread as signal helper `number` (before its engine is made).
+pub fn become_helper(number: u32) {
+    HELPER.with(|helper| helper.set(number));
 }
 
 pub fn resume_point() -> Option<u32> {
@@ -407,15 +839,18 @@ fn hand_over_gil() -> bool {
 }
 
 pub fn share_gil(resume: u32) {
+    if parallel() {
+        return;
+    }
     if hand_over_gil() {
-        RESUME_AT.with(|r| r.set(Some(resume)));
+        let resume_before = RESUME_AT.with(|r| r.replace(Some(resume)));
         crate::imports::signals::deliver_pending();
-        RESUME_AT.with(|r| r.set(None));
+        RESUME_AT.with(|r| r.set(resume_before));
     }
 }
 
 fn share_gil_after_time_slice() {
-    if WANTING.load(Ordering::Relaxed) != 0
+    if !parallel() && WANTING.load(Ordering::Relaxed) != 0
         && ticks().wrapping_sub(HELD_SINCE.with(|since| since.get())) >= TIME_SLICE_MS * ticks_per_ms()
     {
         hand_over_gil();
@@ -428,8 +863,10 @@ pub fn phone_time() -> std::time::Duration {
     std::time::Duration::from_nanos(PHONE_TICKS.with(|t| t.get()) * 1_000_000 / ticks_per_ms())
 }
 
+/// Whether this thread may touch guest state: always in parallel mode,
+/// else while it holds the guest lock.
 pub fn gil_held() -> bool {
-    GIL_GUARD.with(|g| g.borrow().is_some())
+    parallel() || GIL_GUARD.with(|g| g.borrow().is_some())
 }
 
 /// Holds the guest lock until dropped (does nothing if already held).
@@ -444,7 +881,7 @@ impl Drop for GilToken {
 }
 
 pub fn hold_gil() -> GilToken {
-    if gil_held() {
+    if parallel() || gil_held() {
         return GilToken(false);
     }
     take_gil();
@@ -453,6 +890,12 @@ pub fn hold_gil() -> GilToken {
 
 /// Runs `work` with the guest lock released (for anything that may block).
 pub fn without_gil<R>(work: impl FnOnce() -> R) -> R {
+    assert_no_bridge_locks("a blocking phone call");
+    if parallel() {
+        let result = work();
+        crate::imports::signals::deliver_pending();
+        return result;
+    }
     let guard = GIL_GUARD.with(|g| g.borrow_mut().take());
     if guard.is_none() {
         return work();
@@ -469,79 +912,164 @@ struct Parker {
     ready: Condvar,
 }
 
+impl Parker {
+    fn wake(&self) {
+        *self.woken.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.ready.notify_one();
+    }
+}
+
+/// How a wait ended.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Wait {
+    /// `wake_on` / `wake_on_count` picked this waiter.
+    Woken,
+    TimedOut,
+    /// The condition no longer held when checked, so it never slept.
+    NotWaiting,
+    /// A signal came for this thread (its handler has run when this returns).
+    Interrupted,
+}
+
+const UNCLAIMED: u8 = 0;
+const WOKEN: u8 = 1;
+const TIMED_OUT: u8 = 2;
+const INTERRUPTED: u8 = 3;
+
 struct Waiter {
     thread: u32,
     key: u64,
     parker: Arc<Parker>,
+    /// Claimed exactly once (a waker, the timeout or a signal), under WAITERS.
+    outcome: Arc<std::sync::atomic::AtomicU8>,
 }
 
+/// Threads asleep in a bridge wait, oldest first.
 static WAITERS: Mutex<Vec<Waiter>> = Mutex::new(Vec::new());
 
 thread_local! {
     static PARKER: Arc<Parker> = Arc::new(Parker { woken: Mutex::new(false), ready: Condvar::new() });
 }
 
-/// Wait key for waits that any `wake_guests` ends.
-pub const ANY_EVENT: u64 = u64::MAX;
-
-/// Gives up the guest lock until another thread calls `wake_guests` (or the
-/// timeout passes). Callers re-check their condition in a loop.
-pub fn wait_for_guests(timeout: Option<Duration>) {
-    wait_on(ANY_EVENT, timeout);
+fn waiters() -> MutexGuard<'static, Vec<Waiter>> {
+    WAITERS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Gives up the guest lock until `wake_on(key)`, `wake_guests`, a signal for
-/// this thread, or the timeout. Callers re-check their condition in a loop.
-pub fn wait_on(key: u64, timeout: Option<Duration>) {
-    // A signal sent before this thread started waiting runs instead of the wait.
-    if crate::imports::signals::deliver_pending() {
-        return;
+/// Whether this thread is inside guest code with a signal it could take now.
+fn signal_ready() -> bool {
+    if !gil_held() {
+        return false;
     }
+    let uc = engine();
+    let me = &uc.get_data().identity;
+    uc.get_data().depth > 0 && me.pending.load(Ordering::SeqCst) & !me.blocked.load(Ordering::SeqCst) != 0
+}
+
+/// Sleeps until `wake_on(key)` picks this thread, the deadline passes or a
+/// signal arrives, as long as `still_waiting()` holds. It is checked under
+/// the waiters' lock and wakers change the guest's memory before taking that
+/// lock, so a wake-up between the check and the sleep is never lost (the
+/// futex rule). Signals that arrived are delivered before this returns.
+pub fn wait_until(key: u64, deadline: Option<Instant>, still_waiting: impl FnOnce() -> bool) -> Wait {
+    assert_no_bridge_locks("a wait");
     let parker = PARKER.with(Arc::clone);
     *parker.woken.lock().unwrap_or_else(|e| e.into_inner()) = false;
-    let thread = crate::imports::threads::current_handle();
-    WAITERS.lock().unwrap_or_else(|e| e.into_inner()).push(Waiter { thread, key, parker: Arc::clone(&parker) });
-    let guard = GIL_GUARD.with(|g| g.borrow_mut().take()).expect("waiting without the guest lock");
-    drop(guard);
-    let deadline = timeout.map(|timeout| Instant::now() + timeout);
-    let mut woken = parker.woken.lock().unwrap_or_else(|e| e.into_inner());
-    while !*woken {
-        woken = match deadline {
-            Some(deadline) => {
-                let now = Instant::now();
-                if now >= deadline {
-                    break;
+    let outcome = Arc::new(std::sync::atomic::AtomicU8::new(UNCLAIMED));
+    {
+        let mut list = waiters();
+        if signal_ready() {
+            drop(list);
+            crate::imports::signals::deliver_pending();
+            return Wait::Interrupted;
+        }
+        if !still_waiting() {
+            return Wait::NotWaiting;
+        }
+        let thread = crate::imports::threads::current_handle();
+        list.push(Waiter { thread, key, parker: Arc::clone(&parker), outcome: Arc::clone(&outcome) });
+    }
+    // Asleep without the guest lock (GIL mode), so the thread that wakes this one can run.
+    let held = GIL_GUARD.with(|g| g.borrow_mut().take()).is_some();
+    // A signal wakes this wait and is delivered by this thread (no helper needed).
+    let runner = CURRENT_RUNNER.with(|current| current.borrow().clone());
+    let before = runner.as_ref().map(|runner| runner.state.swap(WAITING, Ordering::SeqCst));
+    {
+        let mut woken = parker.woken.lock().unwrap_or_else(|e| e.into_inner());
+        while !*woken {
+            woken = match deadline {
+                Some(deadline) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    parker.ready.wait_timeout(woken, deadline - now).unwrap_or_else(|e| e.into_inner()).0
                 }
-                parker.ready.wait_timeout(woken, deadline - now).unwrap_or_else(|e| e.into_inner()).0
-            }
-            None => parker.ready.wait(woken).unwrap_or_else(|e| e.into_inner()),
-        };
+                None => parker.ready.wait(woken).unwrap_or_else(|e| e.into_inner()),
+            };
+        }
     }
-    drop(woken);
-    WAITERS.lock().unwrap_or_else(|e| e.into_inner()).retain(|waiter| !Arc::ptr_eq(&waiter.parker, &parker));
-    take_gil();
-    // Signals sent to this thread while it waited run now.
+    if outcome.load(Ordering::Acquire) == UNCLAIMED {
+        // Timed out, unless a waker claims it first (then the wake counts).
+        let mut list = waiters();
+        if outcome.compare_exchange(UNCLAIMED, TIMED_OUT, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            list.retain(|waiter| !Arc::ptr_eq(&waiter.outcome, &outcome));
+        }
+    }
+    if let (Some(runner), Some(before)) = (runner, before) {
+        runner.state.store(before, Ordering::SeqCst);
+    }
+    if held {
+        take_gil();
+    }
     crate::imports::signals::deliver_pending();
-}
-
-fn wake_where(matches: impl Fn(&Waiter) -> bool) {
-    let waiters = WAITERS.lock().unwrap_or_else(|e| e.into_inner());
-    for waiter in waiters.iter().filter(|waiter| matches(waiter)) {
-        *waiter.parker.woken.lock().unwrap_or_else(|e| e.into_inner()) = true;
-        waiter.parker.ready.notify_one();
+    match outcome.load(Ordering::Acquire) {
+        WOKEN => Wait::Woken,
+        INTERRUPTED => Wait::Interrupted,
+        _ => Wait::TimedOut,
     }
 }
 
-pub fn wake_guests() {
-    wake_where(|_| true);
+/// Wakes up to `count` threads waiting on `key`, oldest first; returns how many.
+pub fn wake_on_count(key: u64, count: u32) -> u32 {
+    let mut woken = 0;
+    let mut list = waiters();
+    list.retain(|waiter| {
+        if woken >= count || waiter.key != key {
+            return true;
+        }
+        if waiter.outcome.compare_exchange(UNCLAIMED, WOKEN, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            return false;
+        }
+        waiter.parker.wake();
+        woken += 1;
+        false
+    });
+    woken
 }
 
+/// Wakes every thread waiting on `key`.
 pub fn wake_on(key: u64) {
-    wake_where(|waiter| waiter.key == key || waiter.key == ANY_EVENT);
+    wake_on_count(key, u32::MAX);
 }
 
+/// Wakes guest thread `thread` from any bridge wait (a signal came for it).
 pub fn wake_thread(thread: u32) {
-    wake_where(|waiter| waiter.thread == thread);
+    let mut list = waiters();
+    list.retain(|waiter| {
+        if waiter.thread != thread {
+            return true;
+        }
+        if waiter.outcome.compare_exchange(UNCLAIMED, INTERRUPTED, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            waiter.parker.wake();
+        }
+        false
+    });
+}
+
+/// Waits on `key` until woken, a signal or the timeout (callers re-check
+/// their own condition in a loop).
+pub fn wait_on(key: u64, timeout: Option<Duration>) {
+    wait_until(key, timeout.map(|timeout| Instant::now() + timeout), || true);
 }
 
 // ---- engines ----
@@ -557,8 +1085,9 @@ pub fn engine() -> &'static mut Uc {
     if !existing.is_null() {
         return unsafe { &mut *existing };
     }
-    let size = if shared().next_thread_id == 1 { MAIN_STACK_SIZE } else { THREAD_STACK_SIZE };
-    let engine = Box::into_raw(Box::new(new_engine(size)));
+    let mut uc = take_engine();
+    adopt_engine(&mut uc);
+    let engine = Box::into_raw(uc);
     ENGINE.with(|e| e.set(engine));
     unsafe { &mut *engine }
 }
@@ -566,34 +1095,93 @@ pub fn engine() -> &'static mut Uc {
 /// Frees this thread's engine (guest threads call this when they finish).
 pub fn drop_engine() {
     let existing = ENGINE.with(|e| e.replace(std::ptr::null_mut()));
-    if !existing.is_null() {
-        drop(unsafe { Box::from_raw(existing) });
+    if existing.is_null() {
+        return;
+    }
+    let mut engine = unsafe { Box::from_raw(existing) };
+    CURRENT_RUNNER.with(|current| current.borrow_mut().take());
+    // The thread has finished: nothing runs on its stack any more (a helper
+    // standing in for it is done before this). Thread 1 has the main stack.
+    let thread = engine.get_data();
+    if thread.id != 1 && thread.stack_top != 0 {
+        shared().free_threads.push((thread.id, thread.stack_top, thread.errno_slot, thread.tls_block));
+    }
+    {
+        let thread = engine.get_data();
+        forget_runner(&thread.runner);
+        let mut runner = thread.identity.runner.lock().unwrap_or_else(|e| e.into_inner());
+        if runner.as_ref().is_some_and(|runner| Arc::ptr_eq(runner, &thread.runner)) {
+            *runner = None;
+        }
+    }
+    let (pool, _) = &ENGINE_POOL;
+    let mut engines = pool.lock().unwrap_or_else(|e| e.into_inner());
+    if engines.len() < KEPT_ENGINES {
+        let thread = engine.get_data_mut();
+        let (code_generation, clean) = (thread.code_generation, thread.clean.take());
+        *thread = idle_thread(code_generation, clean);
+        engines.push(PooledEngine(Box::into_raw(engine)));
     }
 }
 
-fn new_engine(stack_size: u32) -> Uc {
-    let memory = mem();
-    let (id, stack_top, errno_slot, tls_block) = {
-        let mut shared = shared();
-        let id = shared.next_thread_id;
-        shared.next_thread_id += 1;
-        let stack_top = shared.alloc_stack(stack_size);
-        let errno_slot = shared.misc_alloc(4, 4);
-        let tls_block = shared.misc_alloc(0x100, 8);
-        (id, stack_top, errno_slot, tls_block)
-    };
-    let thread = Thread {
-        id,
+/// An engine sits in the pool or in one thread's ENGINE slot, never both, so
+/// only one host thread uses it at a time.
+struct PooledEngine(*mut Uc);
+unsafe impl Send for PooledEngine {}
+
+static ENGINE_POOL: (Mutex<Vec<PooledEngine>>, Condvar) = (Mutex::new(Vec::new()), Condvar::new());
+const SPARE_ENGINES: usize = 2;
+const KEPT_ENGINES: usize = 4;
+
+fn start_engine_builder() {
+    let _ = std::thread::Builder::new().name("arm32-engines".into()).spawn(|| {
+        let (pool, wanted) = &ENGINE_POOL;
+        loop {
+            {
+                let mut engines = pool.lock().unwrap_or_else(|e| e.into_inner());
+                while engines.len() >= SPARE_ENGINES {
+                    engines = wanted.wait(engines).unwrap_or_else(|e| e.into_inner());
+                }
+            }
+            let engine = Box::into_raw(Box::new(build_engine()));
+            pool.lock().unwrap_or_else(|e| e.into_inner()).push(PooledEngine(engine));
+        }
+    });
+}
+
+fn take_engine() -> Box<Uc> {
+    let (pool, wanted) = &ENGINE_POOL;
+    let taken = pool.lock().unwrap_or_else(|e| e.into_inner()).pop();
+    wanted.notify_one();
+    match taken {
+        Some(PooledEngine(engine)) => unsafe { Box::from_raw(engine) },
+        None => Box::new(build_engine()),
+    }
+}
+
+fn idle_thread(code_generation: u64, clean: Option<unicorn_engine::Context>) -> Thread {
+    Thread {
+        identity: Arc::new(crate::imports::threads::Identity::new(0)),
+        id: 0,
         depth: 0,
         fault: None,
         exit_code: None,
-        errno_slot,
-        tls_block,
-        stack_top,
+        errno_slot: 0,
+        tls_block: 0,
+        stack_top: 0,
         current_call: "",
         native: None,
-    };
-    let mut uc = Unicorn::new_with_data(Arch::ARM, Mode::ARM, thread).expect("start Unicorn");
+        recent: VecDeque::new(),
+        runner: make_runner(0, 0, 0),
+        code_generation,
+        clean,
+    }
+}
+
+fn build_engine() -> Uc {
+    let memory = mem();
+    let code_generation = CODE_GENERATION.load(Ordering::Acquire);
+    let mut uc = Unicorn::new_with_data(Arch::ARM, Mode::ARM, idle_thread(code_generation, None)).expect("start Unicorn");
     uc.ctl_set_cpu_model(ArmCpuModel::CORTEX_A15 as i32).expect("pick Cortex-A15 (ARMv7 + NEON)");
     for (start, end, code) in mem::MAPPED_REGIONS {
         let protection = if code { Prot::ALL } else { Prot::READ | Prot::WRITE };
@@ -605,11 +1193,73 @@ fn new_engine(stack_size: u32) -> Uc {
     // Turn on the floating point / NEON unit: CPACR full access to cp10+cp11, FPEXC.EN.
     uc.reg_write(RegisterARM::C1_C0_2, 0x00F0_0000).unwrap();
     uc.reg_write(RegisterARM::FPEXC, 0x4000_0000).unwrap();
-    // bionic reads the thread pointer from TPIDRURO.
-    uc.reg_write(RegisterARM::C13_C0_3, tls_block as u64).unwrap();
+    if parallel() {
+        // Atomic STREX/SWP and real barriers in Unicorn too (local patch,
+        // see vendor/unicorn-engine-sys/ARM32-BRIDGE.md).
+        uc.reg_write(UC_ARM_REG_PARALLEL, 1).expect("Unicorn parallel mode");
+    }
     uc.add_intr_hook(on_interrupt).expect("add stub hook");
     uc.add_mem_hook(HookType::MEM_INVALID, 0, u64::MAX, on_bad_memory).expect("add fault hook");
+    let mut clean = uc.context_alloc().expect("Unicorn context");
+    uc.context_save(&mut clean).expect("save Unicorn context");
+    uc.get_data_mut().clean = Some(clean);
     uc
+}
+
+fn adopt_engine(uc: &mut Uc) {
+    let (id, stack_top, errno_slot, tls_block) = {
+        // The id and its stack are handed out together: thread 1 (the first
+        // to run guest code) gets the big main-thread stack.
+        let mut shared = shared();
+        if let Some((id, stack_top, errno_slot, tls_block)) = shared.free_threads.pop() {
+            unsafe { std::ptr::write_bytes(mem().host(tls_block), 0, 0x100) };
+            mem().write_u32(errno_slot, 0);
+            (id, stack_top, errno_slot, tls_block)
+        } else {
+            let id = shared.next_thread_id;
+            shared.next_thread_id += 1;
+            let stack_size = if id == 1 { MAIN_STACK_SIZE } else { THREAD_STACK_SIZE };
+            let stack_top = shared.alloc_stack(stack_size);
+            let errno_slot = shared.misc_alloc(4, 4);
+            let tls_block = shared.misc_alloc(0x100, 8);
+            (id, stack_top, errno_slot, tls_block)
+        }
+    };
+    let (code_generation, clean) = {
+        let old = uc.get_data_mut();
+        (old.code_generation, old.clean.take())
+    };
+    if let Some(clean) = &clean {
+        uc.context_restore(clean).expect("restore Unicorn context");
+    }
+    let thread = Thread {
+        identity: crate::imports::threads::current_identity(),
+        id,
+        depth: 0,
+        fault: None,
+        exit_code: None,
+        errno_slot,
+        tls_block,
+        stack_top,
+        current_call: "",
+        native: None,
+        recent: VecDeque::with_capacity(32),
+        runner: new_runner(id, errno_slot, tls_block),
+        code_generation,
+        clean,
+    };
+    // A helper's engine is made while it stands in for a thread: that
+    // thread keeps its own runner.
+    thread.identity.runner.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(|| Arc::clone(&thread.runner));
+    let identity = &thread.identity;
+    if identity.pending.load(Ordering::SeqCst) & !identity.blocked.load(Ordering::SeqCst) != 0 {
+        thread.runner.attention.store(1, Ordering::SeqCst);
+    }
+    CURRENT_RUNNER.with(|current| *current.borrow_mut() = Some(Arc::clone(&thread.runner)));
+    *uc.get_data_mut() = thread;
+    // bionic reads the thread pointer from TPIDRURO.
+    uc.reg_write(RegisterARM::C13_C0_3, tls_block as u64).unwrap();
+    let _ = uc.reg_write(UC_ARM_REG_EXCLUSIVE_ADDR, u64::MAX);
 }
 
 fn trap_address(depth: u32) -> u32 {
@@ -622,15 +1272,32 @@ pub fn stub_for(name: &str) -> u32 {
     if let Some(&index) = shared.stub_by_name.get(name) {
         return mem::STUB_BASE + index * 8;
     }
-    let index = FIRST_STUB + shared.stubs.len() as u32;
+    let index = FIRST_STUB + shared.stub_by_name.len() as u32;
     assert!(index * 8 < mem::STUB_SIZE, "too many stubs");
     let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
-    shared.stubs.push(Stub { name: leaked, handler: crate::imports::handler_for(name), calls: 0 });
+    let stub = Stub { name: leaked, handler: crate::imports::handler_for(name), calls: AtomicU64::new(0), used: AtomicBool::new(false) };
+    // Published before its code is written, so a thread calling the code finds it.
+    stub_table()[(index - FIRST_STUB) as usize].store(Box::into_raw(Box::new(stub)), Ordering::Release);
     shared.stub_by_name.insert(name.to_string(), index);
     let address = mem::STUB_BASE + index * 8;
     mem().write_u32(address, SVC | index);
     mem().write_u32(address + 4, BX_LR);
     address
+}
+
+/// Every phone function stand-in made so far, in slot order.
+pub fn stubs() -> Vec<&'static Stub> {
+    let count = shared().stub_by_name.len() as u32;
+    (FIRST_STUB..FIRST_STUB + count).filter_map(stub).collect()
+}
+
+/// The last phone functions this thread called (for crash reports).
+pub fn recent_calls() -> Vec<&'static str> {
+    let engine = ENGINE.with(|e| e.get());
+    if engine.is_null() {
+        return Vec::new();
+    }
+    unsafe { &*engine }.get_data().recent.iter().copied().collect()
 }
 
 /// Hooks get the engine with a borrowed lifetime; ours is always `'static`.
@@ -657,7 +1324,15 @@ fn on_interrupt(uc: &mut Unicorn<'_, Thread>, interrupt: u32) {
         let number = uc.reg_read(RegisterARM::R7).unwrap() as u32;
         let registers = [RegisterARM::R0, RegisterARM::R1, RegisterARM::R2, RegisterARM::R3, RegisterARM::R4, RegisterARM::R5];
         let arguments = registers.map(|register| uc.reg_read(register).unwrap() as u32);
+        // As for a phone function: it may block (futex), so it waits outside guest code.
+        clear_exclusive(uc);
+        let thumb = (uc.reg_read(RegisterARM::CPSR).unwrap() as u32 >> 5) & 1;
+        let resume_before = RESUME_AT.with(|r| r.replace(Some(pc | thumb)));
+        park_registers(uc, pc | thumb);
+        leave_guest(uc);
         let result = crate::imports::threads::linux_syscall(uc, number, arguments);
+        enter_guest(uc);
+        RESUME_AT.with(|r| r.set(resume_before));
         uc.reg_write(RegisterARM::R0, result as u32 as u64).unwrap();
         if uc.get_data().fault.is_some() || uc.get_data().exit_code.is_some() {
             uc.stop();
@@ -679,12 +1354,68 @@ fn on_interrupt(uc: &mut Unicorn<'_, Thread>, interrupt: u32) {
 /// A Linux system call from translated game code: number in r7, arguments in
 /// r0-r5, result (negative errno) back in r0; game code goes on at `resume`.
 pub fn native_syscall(uc: &mut Uc, resume: u32) {
+    clear_exclusive(uc);
     let number = uc.reg(7);
     let arguments = [0, 1, 2, 3, 4, 5].map(|index| uc.reg(index));
-    RESUME_AT.with(|r| r.set(Some(resume)));
+    let resume_before = RESUME_AT.with(|r| r.replace(Some(resume)));
+    park_registers(uc, resume);
+    leave_guest(uc);
     let result = crate::imports::threads::linux_syscall(uc, number, arguments);
-    RESUME_AT.with(|r| r.set(None));
+    enter_guest(uc);
+    RESUME_AT.with(|r| r.set(resume_before));
     uc.set_reg(0, result as u32);
+}
+
+/// Forgets an outstanding LDREX, as the kernel does on every return from an
+/// exception (system call, phone function, signal handler): a STREX after it fails.
+pub fn clear_exclusive(uc: &mut Uc) {
+    match uc.get_data_mut().native.as_mut() {
+        Some(native) if native.active => native.state.clear_exclusive(),
+        _ => {
+            let _ = uc.reg_write(UC_ARM_REG_EXCLUSIVE_ADDR, u64::MAX);
+        }
+    }
+}
+
+/// Unicorn's exclusive monitor address (local patch, see vendor/unicorn-engine-sys/ARM32-BRIDGE.md).
+const UC_ARM_REG_EXCLUSIVE_ADDR: i32 = 141;
+/// Unicorn translates for several CPUs at once (CF_PARALLEL; local patch).
+const UC_ARM_REG_PARALLEL: i32 = 143;
+
+/// Code changes (cacheflush), numbered, so every thread's Unicorn drops its
+/// stale translations before it runs again.
+static CODE_GENERATION: AtomicU64 = AtomicU64::new(0);
+static CODE_CHANGES: Mutex<VecDeque<(u64, u32, u32)>> = Mutex::new(VecDeque::new());
+const KEPT_CODE_CHANGES: usize = 64;
+
+pub fn note_code_change(start: u32, end: u32) {
+    let mut changes = CODE_CHANGES.lock().unwrap_or_else(|e| e.into_inner());
+    let generation = CODE_GENERATION.load(Ordering::Relaxed) + 1;
+    if changes.len() == KEPT_CODE_CHANGES {
+        changes.pop_front();
+    }
+    changes.push_back((generation, start, end));
+    CODE_GENERATION.store(generation, Ordering::Release);
+}
+
+/// Drops Unicorn translations of code changed since this thread last looked
+/// (everything, if it fell more than KEPT_CODE_CHANGES behind).
+pub fn sync_unicorn_code(uc: &mut Uc) {
+    let seen = uc.get_data().code_generation;
+    if CODE_GENERATION.load(Ordering::Acquire) == seen {
+        return;
+    }
+    let changes = CODE_CHANGES.lock().unwrap_or_else(|e| e.into_inner());
+    let latest = CODE_GENERATION.load(Ordering::Relaxed);
+    if changes.front().is_none_or(|&(oldest, _, _)| oldest > seen + 1) {
+        let _ = uc.ctl_flush_tb();
+    } else {
+        for &(_, start, end) in changes.iter().filter(|&&(generation, _, _)| generation > seen) {
+            let _ = uc.ctl_remove_cache(start as u64, end as u64);
+        }
+    }
+    drop(changes);
+    uc.get_data_mut().code_generation = latest;
 }
 
 /// Runs the handler for phone function `index` with the current registers.
@@ -740,32 +1471,34 @@ fn sample_caller(uc: &mut Uc, name: &str) {
 
 /// Logs the most-called phone functions so far (with the translator stats).
 pub fn log_top_calls(count: usize) {
-    let mut calls: Vec<(u64, &'static str)> = shared().stubs.iter().map(|stub| (stub.calls, stub.name)).filter(|c| c.0 > 0).collect();
+    let mut calls: Vec<(u64, &'static str)> =
+        stubs().iter().map(|stub| (stub.calls.load(Ordering::Relaxed), stub.name)).filter(|c| c.0 > 0).collect();
     calls.sort_unstable_by(|a, b| b.0.cmp(&a.0));
     let text: Vec<String> = calls.iter().take(count).map(|(calls, name)| format!("{name} {calls}")).collect();
     crate::log::line(&format!("[calls] {}", text.join(", ")));
 }
 
 pub fn call_stub(uc: &mut Uc, index: u32) {
-    let (handler, name, trace) = {
-        let mut shared = shared();
-        let stub = &mut shared.stubs[(index - FIRST_STUB) as usize];
-        stub.calls += 1;
-        let first = stub.calls == 1;
-        let name = stub.name;
-        let handler = stub.handler;
-        if first {
-            shared.first_use.push(index);
-        }
-        if shared.recent.len() == 32 {
-            shared.recent.pop_front();
-        }
-        shared.recent.push_back(name);
-        (handler, name, shared.trace)
+    let Some(stub) = stub(index) else {
+        stop_with_fault(uc, format!("called phone function slot {index}, which was never made"));
+        return;
     };
+    if counting_calls() {
+        stub.calls.fetch_add(1, Ordering::Relaxed);
+    }
+    if !stub.used.load(Ordering::Relaxed) && !stub.used.swap(true, Ordering::Relaxed) {
+        FIRST_USE.lock().unwrap_or_else(|e| e.into_inner()).push(index);
+    }
+    let (handler, name, trace) = (stub.handler, stub.name, TRACE.load(Ordering::Relaxed));
+    let recent = &mut uc.get_data_mut().recent;
+    if recent.len() == 32 {
+        recent.pop_front();
+    }
+    recent.push_back(name);
     if sampling() {
         sample_caller(uc, name);
     }
+    clear_exclusive(uc);
     share_gil_after_time_slice();
     uc.get_data_mut().current_call = name;
 
@@ -775,6 +1508,11 @@ pub fn call_stub(uc: &mut Uc, index: u32) {
         crate::log::line(&format!("[call t{}] {name}({:#x}, {:#x}, {:#x}, {:#x})", uc.get_data().id, r[0], r[1], r[2], r[3]));
     }
     let started = ticks();
+    let resume = uc.reg(LR);
+    // Signals taken during or right after this call resume at its return address.
+    let resume_before = RESUME_AT.with(|r| r.replace(Some(resume)));
+    park_registers(uc, resume);
+    leave_guest(uc);
     let result = match handler {
         Some(handler) => {
             PHONE_DEPTH.with(|depth| depth.set(depth.get() + 1));
@@ -806,11 +1544,13 @@ pub fn call_stub(uc: &mut Uc, index: u32) {
             Ret::U32(0)
         }
     };
+    enter_guest(uc);
     let jumped = matches!(result, Ret::Jumped);
     write_result(uc, result);
-    if !jumped {
-        crate::imports::signals::deliver_pending();
+    if !jumped && gil_held() {
+        crate::imports::signals::deliver_pending_on(uc);
     }
+    RESUME_AT.with(|r| r.set(resume_before));
 }
 
 /// Puts a handler's result where a softfp caller expects it (r0, or r0:r1).
@@ -955,7 +1695,9 @@ pub fn call_guest_with(uc: &mut Uc, address: u32, args: &[Arg]) -> Result<u64, S
     }
     // The translator runs top-level calls and calls made from its own
     // handlers; calls made while Unicorn is running stay in Unicorn.
-    if crate::dynarec::enabled() && (depth == 0 || live_native(uc).is_some()) {
+    // In parallel mode every call runs there (G4): a Unicorn run could not
+    // stop for a stopped world.
+    if crate::dynarec::enabled() && (depth == 0 || live_native(uc).is_some() || parallel()) {
         return call_guest_native(uc, address, args, depth);
     }
     let saved = if depth > 0 {
@@ -986,6 +1728,7 @@ pub fn call_guest_with(uc: &mut Uc, address: u32, args: &[Arg]) -> Result<u64, S
     uc.reg_write(RegisterARM::LR, trap as u64).unwrap();
 
     uc.get_data_mut().depth = depth + 1;
+    sync_unicorn_code(uc);
     let result = uc.emu_start(address as u64, trap as u64, 0, 0);
     uc.get_data_mut().depth = depth;
 
@@ -994,6 +1737,7 @@ pub fn call_guest_with(uc: &mut Uc, address: u32, args: &[Arg]) -> Result<u64, S
     let r1 = uc.reg_read(RegisterARM::R1).unwrap();
     if let Some(context) = saved {
         uc.context_restore(&context).map_err(|e| format!("{e:?}"))?;
+        clear_exclusive(uc);
     }
     if let Some(fault) = &uc.get_data().fault {
         return Err(fault.clone());
@@ -1016,14 +1760,41 @@ pub fn call_guest_with(uc: &mut Uc, address: u32, args: &[Arg]) -> Result<u64, S
 fn call_guest_native(uc: &mut Uc, address: u32, args: &[Arg], depth: u32) -> Result<u64, String> {
     if uc.get_data().native.is_none() {
         let tls = uc.get_data().tls_block;
-        uc.get_data_mut().native = Some(Box::new(crate::dynarec::Native::new(tls)));
+        let flag = attention_flag_address(uc);
+        uc.get_data_mut().native = Some(Box::new(crate::dynarec::Native::new(tls, flag)));
+    }
+    // Wait out a stopped world (or a helper's borrow) before touching the guest stack.
+    let was_in_guest = parallel() && uc.get_data().runner.state.load(Ordering::SeqCst) == IN_GUEST;
+    enter_guest(uc);
+    // The phone function that made this call stays parked where it was.
+    let outer_parked: Option<[u32; 16]> = (parallel() && depth > 0)
+        .then(|| std::array::from_fn(|i| uc.get_data().runner.parked[i].load(Ordering::Relaxed)));
+    // Called from a phone function that Unicorn ran (a fallback): keep
+    // Unicorn's state for when this returns, and start from its registers.
+    let unicorn_live = depth > 0 && !uc.get_data().native.as_ref().unwrap().active;
+    let unicorn_saved = if unicorn_live {
+        let saved = uc.context_alloc().and_then(|mut context| uc.context_save(&mut context).map(|_| context));
+        match saved {
+            Ok(context) => Some(context),
+            Err(error) => {
+                if !was_in_guest {
+                    leave_guest(uc);
+                }
+                return Err(format!("{error:?}"));
+            }
+        }
+    } else {
+        None
+    };
+    if unicorn_live {
+        crate::dynarec::seed_from_unicorn(uc);
     }
     let (registers, stack_words) = lay_out_arguments(args);
     let stack_top = uc.get_data().stack_top;
     let native = uc.get_data_mut().native.as_mut().unwrap();
     let was_active = native.active;
     let saved = native.state;
-    let mut sp = if was_active { (native.state.r[SP] - 256) & !7 } else { stack_top - 64 };
+    let mut sp = if was_active || unicorn_live { (native.state.r[SP] - 256) & !7 } else { stack_top - 64 };
     sp = (sp - stack_words.len() as u32 * 4) & !7;
     let memory = mem();
     for (i, value) in stack_words.iter().enumerate() {
@@ -1043,8 +1814,29 @@ fn call_guest_native(uc: &mut Uc, address: u32, args: &[Arg], depth: u32) -> Res
     let (r0, r1) = (native.state.r[0] as u64, native.state.r[1] as u64);
     if was_active {
         native.state = saved;
+        native.state.clear_exclusive();
     } else {
         native.active = false;
+    }
+    if let Some(context) = unicorn_saved {
+        let _ = uc.context_restore(&context);
+        clear_exclusive(uc);
+    }
+    if parallel() {
+        let runner = &uc.get_data().runner;
+        match outer_parked {
+            Some(parked) => {
+                for (slot, value) in runner.parked.iter().zip(parked) {
+                    slot.store(value, Ordering::Relaxed);
+                }
+            }
+            None => runner.parked_valid.store(false, Ordering::Relaxed),
+        }
+    }
+    if was_in_guest {
+        enter_guest(uc);
+    } else {
+        leave_guest(uc);
     }
     if let Err(error) = result {
         if uc.get_data().fault.is_none() {

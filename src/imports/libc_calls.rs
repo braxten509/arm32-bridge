@@ -53,7 +53,7 @@ fn back(host: *const libc::c_char) -> Ret {
 }
 
 fn guest_string_in_heap(text: &[u8]) -> u32 {
-    shared().heap.strdup(text)
+    crate::runtime::heap().strdup(text)
 }
 
 /// A shared 1 KiB scratch copy for host results like strerror().
@@ -182,15 +182,7 @@ fn write_tm32(guest: u32, tm: &libc::tm) {
     } else {
         let text = unsafe { std::ffi::CStr::from_ptr(tm.tm_zone) }.to_bytes().to_vec();
         let key = format!("tz:{}", String::from_utf8_lossy(&text));
-        let cached = shared().state.data_imports.get(&key).copied();
-        match cached {
-            Some(address) => address,
-            None => {
-                let address = shared().misc_cstr(&String::from_utf8_lossy(&text));
-                shared().state.data_imports.insert(key, address);
-                address
-            }
-        }
+        shared().cached_cstr(key, &String::from_utf8_lossy(&text))
     };
     mem().write_u32(guest + 40, zone);
 }
@@ -238,7 +230,7 @@ fn register_file(uc: &mut Uc, stream: *mut libc::FILE) -> u32 {
         sync_errno(uc);
         return 0;
     }
-    let handle = shared().heap.calloc(1, 84);
+    let handle = crate::runtime::heap().calloc(1, 84);
     shared().state.files.insert(handle, HostFile::Stream(stream as usize));
     handle
 }
@@ -303,14 +295,8 @@ fn restore_jump_buffer(cpu: &mut Uc, buffer: u32, value: u32) -> Ret {
 
 /// The guest's one locale handle (a small zeroed block; bionic never looks inside).
 fn locale_handle() -> u32 {
-    static HANDLE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let existing = HANDLE.load(std::sync::atomic::Ordering::Relaxed);
-    if existing != 0 {
-        return existing;
-    }
-    let handle = shared().misc_alloc(16, 4);
-    HANDLE.store(handle, std::sync::atomic::Ordering::Relaxed);
-    handle
+    static HANDLE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *HANDLE.get_or_init(|| shared().misc_alloc(16, 4))
 }
 
 fn page_round(length: u32) -> u32 {
@@ -318,9 +304,10 @@ fn page_round(length: u32) -> u32 {
 }
 
 /// Whether [address, address + length) lies inside one block mmap handed out.
-fn inside_mapping(address: u32, length: u32) -> bool {
-    let mappings = &shared().state.mappings;
-    mappings
+fn inside_mapping(shared: &crate::runtime::Shared, address: u32, length: u32) -> bool {
+    shared
+        .state
+        .mappings
         .range(..=address)
         .next_back()
         .is_some_and(|(&start, &size)| address as u64 + length as u64 <= start as u64 + size as u64)
@@ -342,7 +329,10 @@ fn map_memory(uc: &mut Uc, address: u32, length: u32, _protection: u32, flags: u
     let anonymous = flags & libc::MAP_ANONYMOUS as u32 != 0;
     let start = if flags & libc::MAP_FIXED as u32 != 0 {
         // Only inside a block already handed out (allocators trim and reuse those).
-        if !inside_mapping(address, size) {
+        // Checked and cleared in one go, so the block can't be unmapped in between.
+        let shared = shared();
+        if !inside_mapping(&shared, address, size) {
+            drop(shared);
             crate::log::line(&format!("[bridge] mmap at fixed address {address:#x} ({length} bytes) outside its blocks"));
             set_errno(uc, libc::ENOMEM);
             return Ret::U32(MAP_FAILED);
@@ -350,7 +340,7 @@ fn map_memory(uc: &mut Uc, address: u32, length: u32, _protection: u32, flags: u
         unsafe { std::ptr::write_bytes(mem().host(address), 0, size as usize) };
         address
     } else {
-        let block = shared().heap.memalign(crate::mem::PAGE, size);
+        let block = crate::runtime::heap().memalign(crate::mem::PAGE, size);
         if block == 0 {
             set_errno(uc, libc::ENOMEM);
             return Ret::U32(MAP_FAILED);
@@ -364,8 +354,9 @@ fn map_memory(uc: &mut Uc, address: u32, length: u32, _protection: u32, flags: u
         if read < 0 {
             sync_errno(uc);
             if start != address {
-                shared().state.mappings.remove(&start);
-                shared().heap.free(start);
+                let mut shared = shared();
+                shared.state.mappings.remove(&start);
+                crate::runtime::heap().free(start);
             }
             return Ret::U32(MAP_FAILED);
         }
@@ -431,7 +422,7 @@ extern "C" {
 /// the heap; log who did it (first few times) and leave the heap alone.
 fn refuse_bad_block(uc: &mut Uc, call: &str, pointer: u32) -> bool {
     static REPORTED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let Some(reason) = shared().heap.not_owned(pointer) else { return false };
+    let Some(reason) = crate::runtime::heap().not_owned(pointer) else { return false };
     if REPORTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 30 {
         crate::log::line(&format!(
             "[heap] refused {call}({pointer:#x}): {reason}; called from lr {:#x}",
@@ -446,12 +437,12 @@ pub fn handler(name: &str) -> Option<Handler> {
         // ---- memory ----
         "malloc" => handler!(|uc, a| {
             let size = a.u32();
-            Ret::U32(shared().heap.malloc(size))
+            Ret::U32(crate::runtime::heap().malloc(size))
         }),
         "calloc" => handler!(|uc, a| {
             let count = a.u32();
             let size = a.u32();
-            Ret::U32(shared().heap.calloc(count, size))
+            Ret::U32(crate::runtime::heap().calloc(count, size))
         }),
         "realloc" => handler!(|uc, a| {
             let pointer = a.u32();
@@ -459,26 +450,26 @@ pub fn handler(name: &str) -> Option<Handler> {
             if pointer != 0 && refuse_bad_block(uc, "realloc", pointer) {
                 return Ret::U32(0);
             }
-            Ret::U32(shared().heap.realloc(pointer, size))
+            Ret::U32(crate::runtime::heap().realloc(pointer, size))
         }),
         "free" => handler!(|uc, a| {
             let pointer = a.u32();
             if pointer != 0 && refuse_bad_block(uc, "free", pointer) {
                 return Ret::Void;
             }
-            shared().heap.free(pointer);
+            crate::runtime::heap().free(pointer);
             Ret::Void
         }),
         "memalign" => handler!(|uc, a| {
             let align = a.u32();
             let size = a.u32();
-            Ret::U32(shared().heap.memalign(align, size))
+            Ret::U32(crate::runtime::heap().memalign(align, size))
         }),
         "posix_memalign" => handler!(|uc, a| {
             let out = a.u32();
             let align = a.u32();
             let size = a.u32();
-            let pointer = shared().heap.memalign(align, size);
+            let pointer = crate::runtime::heap().memalign(align, size);
             mem().write_u32(out, pointer);
             Ret::U32(if pointer == 0 { libc::ENOMEM as u32 } else { 0 })
         }),
@@ -924,7 +915,7 @@ pub fn handler(name: &str) -> Option<Handler> {
             match removed {
                 Some(HostFile::Stream(stream)) => {
                     let result = unsafe { libc::fclose(stream as *mut libc::FILE) };
-                    shared().heap.free(file);
+                    crate::runtime::heap().free(file);
                     Ret::U32(result as u32)
                 }
                 Some(other) => {
@@ -1249,7 +1240,7 @@ pub fn handler(name: &str) -> Option<Handler> {
                 return Ret::U32(0);
             }
             // The guest handle doubles as the buffer readdir() fills.
-            let handle = shared().heap.calloc(1, 280);
+            let handle = crate::runtime::heap().calloc(1, 280);
             shared().state.directories.insert(handle, (directory as usize, handle));
             Ret::U32(handle)
         }),
@@ -1279,7 +1270,7 @@ pub fn handler(name: &str) -> Option<Handler> {
             match removed {
                 Some((directory, _)) => {
                     unsafe { libc::closedir(directory as *mut libc::DIR) };
-                    shared().heap.free(handle);
+                    crate::runtime::heap().free(handle);
                     Ret::U32(0)
                 }
                 None => Ret::U32(u32::MAX),
@@ -1410,13 +1401,7 @@ pub fn handler(name: &str) -> Option<Handler> {
             Ret::U32(guest_string_in_heap(&text))
         }),
         "setlocale" => handler!(|uc, a| {
-            let key = "locale:C".to_string();
-            if let Some(&address) = shared().state.data_imports.get(&key) {
-                return Ret::U32(address);
-            }
-            let address = shared().misc_cstr("C");
-            shared().state.data_imports.insert(key, address);
-            Ret::U32(address)
+            Ret::U32(shared().cached_cstr("locale:C".to_string(), "C"))
         }),
         "sysconf" => handler!(|uc, a| {
             // bionic uses the same _SC_ numbers on every architecture.
@@ -1451,6 +1436,10 @@ pub fn handler(name: &str) -> Option<Handler> {
         "getpwuid" => handler!(|uc, a| Ret::U32(0)),
         // For the self-test: tests that need the translator (time slicing inside game code).
         "arm32_bridge_uses_translator" => handler!(|uc, a| Ret::U32(crate::dynarec::enabled() as u32)),
+        // The checker runs every block twice (and one thread at a time): long tests shrink.
+        "arm32_bridge_is_checking" => handler!(|uc, a| Ret::U32(crate::dynarec::check::enabled() as u32)),
+        "arm32_bridge_runs_in_parallel" => handler!(|uc, a| Ret::U32(crate::runtime::parallel() as u32)),
+        "arm32_bridge_forces_fallbacks" => handler!(|uc, a| Ret::U32(crate::dynarec::thumb::force_sync_fallback() as u32)),
         "fork" | "execl" | "system" | "setsid" => handler!(|uc, a| {
             set_errno(uc, libc::ENOSYS);
             Ret::U32(u32::MAX)
@@ -1505,8 +1494,8 @@ pub fn handler(name: &str) -> Option<Handler> {
             }
             let m = mem();
             let items: Vec<Vec<u8>> = (0..count).map(|i| m.bytes(base + i * size, size as usize).to_vec()).collect();
-            let left = shared().heap.malloc(size);
-            let right = shared().heap.malloc(size);
+            let left = crate::runtime::heap().malloc(size);
+            let right = crate::runtime::heap().malloc(size);
             let mut order: Vec<usize> = (0..items.len()).collect();
             order.sort_by(|&x, &y| {
                 m.write_bytes(left, &items[x]);
@@ -1519,8 +1508,8 @@ pub fn handler(name: &str) -> Option<Handler> {
             for (slot, &item) in order.iter().enumerate() {
                 m.write_bytes(base + slot as u32 * size, &items[item]);
             }
-            shared().heap.free(left);
-            shared().heap.free(right);
+            crate::runtime::heap().free(left);
+            crate::runtime::heap().free(right);
             Ret::Void
         }),
         "bsearch" => handler!(|uc, a| {
@@ -1568,6 +1557,8 @@ pub fn handler(name: &str) -> Option<Handler> {
         "dlsym" => handler!(|uc, a| {
             let (handle, name) = (a.u32(), a.u32());
             let name = mem().string(name);
+            // Waits while another thread is loading a library (or running its start-up code).
+            let _dl = crate::elf::lock_dl();
             // A game library's own symbol first (each part has its own JNI_OnLoad).
             let own = handle
                 .checked_sub(FIRST_LIBRARY_HANDLE)
@@ -1627,11 +1618,11 @@ pub fn handler(name: &str) -> Option<Handler> {
                 return Ret::U32(u32::MAX);
             }
             let length = line.iter().position(|&b| b == 0).unwrap_or(line.len() - 1);
-            let input = shared().heap.malloc(length as u32 + 1);
+            let input = crate::runtime::heap().malloc(length as u32 + 1);
             mem().write_bytes(input, &line[..=length.min(line.len() - 1)]);
             mem().write_u8(input + length as u32, 0);
             let result = scanf::scan(mem(), input, format, a);
-            shared().heap.free(input);
+            crate::runtime::heap().free(input);
             Ret::U32(result as u32)
         }),
         // Memory blocks come from the guest heap, page aligned. File mappings are
@@ -1646,10 +1637,11 @@ pub fn handler(name: &str) -> Option<Handler> {
         }),
         "munmap" => handler!(|uc, a| {
             let (address, length) = (a.u32(), a.u32());
-            let whole = shared().state.mappings.get(&address).copied() == Some(page_round(length));
-            if whole {
-                shared().state.mappings.remove(&address);
-                shared().heap.free(address);
+            // Checked and removed in one go: of two threads unmapping the same block, only one frees it.
+            let mut shared = shared();
+            if shared.state.mappings.get(&address).copied() == Some(page_round(length)) {
+                shared.state.mappings.remove(&address);
+                crate::runtime::heap().free(address);
             }
             // Part of a block: it stays in use until the whole block goes.
             Ret::U32(0)
@@ -1666,7 +1658,8 @@ pub fn handler(name: &str) -> Option<Handler> {
         // MADV_DONTNEED empties anonymous memory; other advice changes nothing.
         "madvise" => handler!(|uc, a| {
             let (address, length, advice) = (a.u32(), a.u32(), a.u32());
-            if advice == libc::MADV_DONTNEED as u32 && inside_mapping(address, length) {
+            let shared = shared();
+            if advice == libc::MADV_DONTNEED as u32 && inside_mapping(&shared, address, length) {
                 unsafe { std::ptr::write_bytes(mem().host(address), 0, length as usize) };
             }
             Ret::U32(0)
@@ -1715,7 +1708,7 @@ pub fn handler(name: &str) -> Option<Handler> {
                         return Ret::U32(0);
                     }
                     // getcwd(NULL, size) allocates the buffer (freed by the game with free).
-                    let buffer = if buffer == 0 { shared().heap.malloc(size.max(needed)) } else { buffer };
+                    let buffer = if buffer == 0 { crate::runtime::heap().malloc(size.max(needed)) } else { buffer };
                     mem().write_bytes(buffer, text.as_bytes());
                     mem().write_u8(buffer + text.len() as u32, 0);
                     Ret::U32(buffer)

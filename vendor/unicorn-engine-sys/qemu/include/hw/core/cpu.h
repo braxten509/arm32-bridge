@@ -266,6 +266,9 @@ struct CPUState {
     bool exit_request;
     bool in_exclusive_context;
     uint32_t cflags_next_tb;
+    /* arm32-bridge: other host threads run guest code at the same time, so
+       atomics must really be atomic (CF_PARALLEL). */
+    bool parallel;
     /* updates protected by BQL */
     uint32_t interrupt_request;
     int singlestep_enabled;

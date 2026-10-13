@@ -3,6 +3,9 @@
 // exceptions, the pretend Java side). run_all() returns the failure count.
 #include <android/log.h>
 #include <jni.h>
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <GLES3/gl3.h>
 #include <math.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -11,6 +14,9 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <linux/futex.h>
 #include <pthread.h>
 #include <sched.h>
 #include <time.h>
@@ -72,8 +78,9 @@ static void on_pause(int signal, siginfo_t *info, void *context) {
     sigset_t wait_mask;
     sigfillset(&wait_mask);
     sigdelset(&wait_mask, SIGXCPU);
-    sem_post(&paused_answer);
+    // Clear before answering: once answered, the resume signal can come at any moment.
     resumed_flag = 0;
+    sem_post(&paused_answer);
     while (!resumed_flag) sigsuspend(&wait_mask);
     sem_post(&paused_answer);
 }
@@ -127,6 +134,30 @@ static void *exits_from_nested_call(void *) {
     ran_after_exit = 1;
     return (void *)1;
 }
+// Many short threads one after another: each finished thread's stack must be
+// reused (the guest stack area only fits about 250 at once).
+static void *note_ran(void *ran) {
+    ++*(int *)ran;
+    return __builtin_frame_address(0); // where this thread's stack is
+}
+static bool many_threads_reuse_stacks() {
+    int ran = 0, places = 0;
+    static uintptr_t seen[300];
+    for (int i = 0; i < 300; i++) {
+        pthread_t thread;
+        void *stack;
+        if (pthread_create(&thread, nullptr, note_ran, &ran) != 0 || pthread_join(thread, &stack) != 0 || !stack)
+            return false;
+        uintptr_t where = (uintptr_t)stack >> 20; // the thread's 1 MiB stack
+        bool known = false;
+        for (int j = 0; j < places; j++) known = known || seen[j] == where;
+        if (!known) seen[places++] = where;
+    }
+    __android_log_print(ANDROID_LOG_INFO, TAG, "many threads: %d of 300 ran, on %d stacks", ran, places);
+    // Without reuse every thread has its own stack; with it a few do (a joiner can
+    // start the next thread just before the last one's stack is handed back).
+    return ran == 300 && places < 150;
+}
 static bool thread_exits_with_value(void) {
     ran_after_exit = exit_destructor_value = 0;
     pthread_key_create(&exit_key, on_exit_key);
@@ -164,6 +195,610 @@ static bool signal_reaches_sleeping_thread(void) {
     bool quick = sleeper_signalled && seconds_now() - sent < 0.2;
     pthread_detach(thread);
     return quick;
+}
+
+// ---- guest threads running at the same time ----
+static bool bridge_flag(const char *name) {
+    int (*flag)(void) = (int (*)(void))dlsym(RTLD_DEFAULT, name);
+    return flag && flag();
+}
+static const int kRaceThreads = 4;
+static int kRaceAdds = 100000;
+static volatile int race_gate;
+static volatile unsigned race32;
+static volatile unsigned long long race64;
+static volatile int race_swp_lock;
+static int race_swp;
+static volatile int race_kuser;
+static volatile long long race_kuser64;
+static int race_locked;
+static pthread_mutex_t race_lock = PTHREAD_MUTEX_INITIALIZER;
+typedef int (*kuser_cmpxchg_fn)(int old_value, int new_value, volatile int *pointer);
+typedef int (*kuser_cmpxchg64_fn)(const long long *old_value, const long long *new_value, volatile long long *pointer);
+// A spinlock built on SWP (ARMv5 code still uses it; ARM mode only).
+__attribute__((target("arm"), noinline)) static void swp_lock_add(void) {
+    int old_value;
+    do {
+        __asm__ volatile(".arch armv6\n\tswp %0, %1, [%2]\n\t.arch armv7-a"
+                         : "=&r"(old_value)
+                         : "r"(1), "r"(&race_swp_lock)
+                         : "memory");
+    } while (old_value != 0);
+    __asm__ volatile("dmb ish" ::: "memory");
+    race_swp++;
+    __asm__ volatile("dmb ish" ::: "memory");
+    race_swp_lock = 0;
+}
+#define RACE_ADDER(mode)                                                                               \
+    __attribute__((target(#mode), noinline)) static void *race_adder_##mode(void *) {                  \
+        kuser_cmpxchg_fn cmpxchg = (kuser_cmpxchg_fn)0xffff0fc0;                                       \
+        kuser_cmpxchg64_fn cmpxchg64 = (kuser_cmpxchg64_fn)0xffff0f60;                                 \
+        while (!race_gate) {                                                                           \
+        }                                                                                              \
+        for (int i = 0; i < kRaceAdds; i++) {                                                          \
+            __atomic_fetch_add(&race32, 1, __ATOMIC_RELAXED);                                          \
+            __atomic_fetch_add(&race64, 1, __ATOMIC_RELAXED);                                          \
+            int old_value;                                                                             \
+            do old_value = race_kuser;                                                                 \
+            while (cmpxchg(old_value, old_value + 1, &race_kuser) != 0);                               \
+            long long old_wide, new_wide;                                                              \
+            do {                                                                                       \
+                old_wide = race_kuser64;                                                               \
+                new_wide = old_wide + 1;                                                               \
+            } while (cmpxchg64(&old_wide, &new_wide, &race_kuser64) != 0);                             \
+            pthread_mutex_lock(&race_lock);                                                            \
+            race_locked++;                                                                             \
+            pthread_mutex_unlock(&race_lock);                                                          \
+            swp_lock_add();                                                                            \
+        }                                                                                              \
+        return nullptr;                                                                                \
+    }
+RACE_ADDER(arm)
+RACE_ADDER(thumb)
+// Four threads (two ARM, two Thumb) add to shared counters at once; every total must be exact.
+static bool shared_counters_exact(void) {
+    race_gate = 0;
+    race32 = 0;
+    race64 = 0;
+    race_swp_lock = race_swp = 0;
+    race_kuser = 0;
+    race_kuser64 = 0;
+    race_locked = 0;
+    pthread_t threads[kRaceThreads];
+    for (int i = 0; i < kRaceThreads; i++)
+        if (pthread_create(&threads[i], nullptr, i % 2 ? race_adder_thumb : race_adder_arm, nullptr) != 0) return false;
+    race_gate = 1;
+    for (int i = 0; i < kRaceThreads; i++) pthread_join(threads[i], nullptr);
+    const unsigned total = kRaceThreads * kRaceAdds;
+    __android_log_print(ANDROID_LOG_INFO, TAG, "counters: %u %llu kuser %d %lld mutex %d swp %d (want %u)", race32,
+                        race64, race_kuser, race_kuser64, race_locked, race_swp, total);
+    return race32 == total && race64 == total && race_kuser == (int)total && race_kuser64 == (long long)total &&
+           race_locked == (int)total && race_swp == (int)total;
+}
+
+// 8- and 16-bit atomics: a total that wraps could hide lost adds, so each round
+// stays below 256 and is checked exactly, with untouched bytes on both sides.
+static int kSmallRounds = 1000;
+static const int kSmallAdds = 60;
+static struct alignas(8) {
+    unsigned char canary_a, value8, canary_b, canary_c;
+    unsigned short value16, canary_d;
+} small;
+static volatile int small_round, small_done;
+#define SMALL_ADDER(mode)                                                                              \
+    __attribute__((target(#mode), noinline)) static void *small_adder_##mode(void *) {                 \
+        for (int round = 1; round <= kSmallRounds; round++) {                                          \
+            while (__atomic_load_n(&small_round, __ATOMIC_ACQUIRE) != round) sched_yield();            \
+            for (int i = 0; i < kSmallAdds; i++) {                                                     \
+                __atomic_fetch_add(&small.value8, 1, __ATOMIC_RELAXED);                                \
+                __atomic_fetch_add(&small.value16, 1, __ATOMIC_RELAXED);                               \
+            }                                                                                          \
+            __atomic_fetch_add(&small_done, 1, __ATOMIC_RELEASE);                                      \
+        }                                                                                              \
+        return nullptr;                                                                                \
+    }
+SMALL_ADDER(arm)
+SMALL_ADDER(thumb)
+static bool small_counters_exact(void) {
+    small_round = small_done = 0;
+    pthread_t threads[kRaceThreads];
+    for (int i = 0; i < kRaceThreads; i++)
+        if (pthread_create(&threads[i], nullptr, i % 2 ? small_adder_thumb : small_adder_arm, nullptr) != 0) return false;
+    int bad_rounds = 0;
+    for (int round = 1; round <= kSmallRounds; round++) {
+        small.canary_a = small.canary_b = small.canary_c = 0xA5;
+        small.canary_d = 0x5AA5;
+        small.value8 = 0;
+        small.value16 = 0;
+        __atomic_store_n(&small_done, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&small_round, round, __ATOMIC_RELEASE);
+        while (__atomic_load_n(&small_done, __ATOMIC_ACQUIRE) != kRaceThreads) sched_yield();
+        bool ok = small.value8 == kRaceThreads * kSmallAdds && small.value16 == kRaceThreads * kSmallAdds &&
+                  small.canary_a == 0xA5 && small.canary_b == 0xA5 && small.canary_c == 0xA5 && small.canary_d == 0x5AA5;
+        if (!ok && bad_rounds++ < 3)
+            __android_log_print(ANDROID_LOG_INFO, TAG, "small counters round %d: %d %d canaries %x %x %x %x", round,
+                                small.value8, small.value16, small.canary_a, small.canary_b, small.canary_c, small.canary_d);
+    }
+    for (int i = 0; i < kRaceThreads; i++) pthread_join(threads[i], nullptr);
+    return bad_rounds == 0;
+}
+
+static volatile unsigned busy_sink;
+static void *busy_work(void *) {
+    unsigned x = 1;
+    for (int i = 0; i < 60000000; i++) x = x * 1103515245u + 12345u;
+    busy_sink = x;
+    return nullptr;
+}
+static double run_busy_threads(int count) {
+    pthread_t threads[4];
+    double started = seconds_now();
+    for (int i = 0; i < count; i++) pthread_create(&threads[i], nullptr, busy_work, nullptr);
+    for (int i = 0; i < count; i++) pthread_join(threads[i], nullptr);
+    return seconds_now() - started;
+}
+// Four busy threads finish in well under four times what one takes alone
+// (best of three runs each; the phone's cores differ in speed, and the
+// guest cannot pick them).
+static bool busy_threads_overlap(void) {
+    double one = 1e9, four = 1e9;
+    for (int run = 0; run < 3; run++) {
+        double took = run_busy_threads(1);
+        if (took < one) one = took;
+        took = run_busy_threads(4);
+        if (took < four) four = took;
+    }
+    __android_log_print(ANDROID_LOG_INFO, TAG, "busy threads: one %.0f ms, four %.0f ms", one * 1000, four * 1000);
+    return four < 0.75 * 4 * one;
+}
+
+// Two threads open a library whose start-up code takes 200 ms; both must get
+// it only once that code has finished (and the code may reopen its own library).
+static int opened_ready[2];
+static void *open_slow_library(void *slot) {
+    void *library = dlopen("libslowinit.so", RTLD_NOW);
+    int (*ready)(void) = library ? (int (*)(void))dlsym(library, "slowinit_ready") : nullptr;
+    opened_ready[(long)slot] = ready ? ready() : -1;
+    return nullptr;
+}
+static bool dlopen_waits_for_start_up(void) {
+    pthread_t threads[2];
+    for (long i = 0; i < 2; i++) pthread_create(&threads[i], nullptr, open_slow_library, (void *)i);
+    for (int i = 0; i < 2; i++) pthread_join(threads[i], nullptr);
+    __android_log_print(ANDROID_LOG_INFO, TAG, "slow start-up library: %d %d (want 2 2)", opened_ready[0], opened_ready[1]);
+    return opened_ready[0] == 2 && opened_ready[1] == 2;
+}
+
+// Ping-pong between two threads; a lost wake-up shows up as a 5 s timeout.
+static const int kPingRounds = 20000;
+static pthread_mutex_t ping_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t ping_changed = PTHREAD_COND_INITIALIZER;
+static int ping_turn;
+static volatile int ping_timeouts;
+static sem_t ping_a, ping_b;
+static void deadline_in(struct timespec *deadline, int seconds) {
+    clock_gettime(CLOCK_REALTIME, deadline);
+    deadline->tv_sec += seconds;
+}
+static void *ping_partner(void *) {
+    for (int i = 0; i < kPingRounds && !ping_timeouts; i++) {
+        pthread_mutex_lock(&ping_lock);
+        while (ping_turn != 1 && !ping_timeouts) {
+            struct timespec deadline;
+            deadline_in(&deadline, 5);
+            if (pthread_cond_timedwait(&ping_changed, &ping_lock, &deadline) == ETIMEDOUT) ping_timeouts++;
+        }
+        ping_turn = 0;
+        pthread_cond_signal(&ping_changed);
+        pthread_mutex_unlock(&ping_lock);
+    }
+    for (int i = 0; i < kPingRounds && !ping_timeouts; i++) {
+        struct timespec deadline;
+        deadline_in(&deadline, 5);
+        if (sem_timedwait(&ping_a, &deadline) != 0) ping_timeouts++;
+        sem_post(&ping_b);
+    }
+    return nullptr;
+}
+static bool ping_pong_without_lost_wakeups(void) {
+    ping_turn = 0;
+    ping_timeouts = 0;
+    sem_init(&ping_a, 0, 0);
+    sem_init(&ping_b, 0, 0);
+    pthread_t partner;
+    if (pthread_create(&partner, nullptr, ping_partner, nullptr) != 0) return false;
+    for (int i = 0; i < kPingRounds && !ping_timeouts; i++) {
+        pthread_mutex_lock(&ping_lock);
+        while (ping_turn != 0 && !ping_timeouts) {
+            struct timespec deadline;
+            deadline_in(&deadline, 5);
+            if (pthread_cond_timedwait(&ping_changed, &ping_lock, &deadline) == ETIMEDOUT) ping_timeouts++;
+        }
+        ping_turn = 1;
+        pthread_cond_signal(&ping_changed);
+        pthread_mutex_unlock(&ping_lock);
+    }
+    for (int i = 0; i < kPingRounds && !ping_timeouts; i++) {
+        sem_post(&ping_a);
+        struct timespec deadline;
+        deadline_in(&deadline, 5);
+        if (sem_timedwait(&ping_b, &deadline) != 0) ping_timeouts++;
+    }
+    pthread_join(partner, nullptr);
+    return ping_timeouts == 0;
+}
+
+static pthread_once_t race_once = PTHREAD_ONCE_INIT;
+static volatile int race_once_runs, race_once_finished, race_once_early;
+static void race_once_init(void) {
+    __atomic_fetch_add(&race_once_runs, 1, __ATOMIC_SEQ_CST);
+    usleep(20000);
+    __atomic_store_n(&race_once_finished, 1, __ATOMIC_SEQ_CST);
+}
+static void *race_once_caller(void *) {
+    while (!race_gate) {
+    }
+    pthread_once(&race_once, race_once_init);
+    if (race_once_runs != 1 || !__atomic_load_n(&race_once_finished, __ATOMIC_SEQ_CST)) race_once_early = 1;
+    return nullptr;
+}
+// pthread_once called by four threads at once runs the function once; nobody returns before it ends.
+static bool once_from_four_threads(void) {
+    race_gate = 0;
+    race_once_runs = race_once_finished = race_once_early = 0;
+    pthread_t threads[kRaceThreads];
+    for (int i = 0; i < kRaceThreads; i++)
+        if (pthread_create(&threads[i], nullptr, race_once_caller, nullptr) != 0) return false;
+    race_gate = 1;
+    for (int i = 0; i < kRaceThreads; i++) pthread_join(threads[i], nullptr);
+    return race_once_runs == 1 && !race_once_early;
+}
+
+static volatile int spinner_running, spinner_signalled;
+static void on_spinner_signal(int) { spinner_signalled = 1; }
+static void *busy_spinner(void *) {
+    spinner_running = 1;
+    for (long spins = 0; spins < 2000000000 && !spinner_signalled; spins++) {
+    }
+    return nullptr;
+}
+// A signal reaches a thread busy in a loop that makes no calls.
+static bool signal_reaches_spinning_thread(void) {
+    struct sigaction action = {};
+    action.sa_handler = on_spinner_signal;
+    sigaction(SIGUSR2, &action, nullptr);
+    spinner_running = spinner_signalled = 0;
+    pthread_t thread;
+    if (pthread_create(&thread, nullptr, busy_spinner, nullptr) != 0) return false;
+    while (!spinner_running) usleep(1000);
+    usleep(20000);
+    double sent = seconds_now();
+    pthread_kill(thread, SIGUSR2);
+    pthread_join(thread, nullptr);
+    return spinner_signalled && seconds_now() - sent < 0.5;
+}
+
+// ---- threads running at the same time: waits, code changes, signals ----
+
+static long futex_call(volatile int *word, int op, int value, const struct timespec *timeout) {
+    return syscall(SYS_futex, word, op, value, timeout, nullptr, 0);
+}
+static volatile int futex_word, futex_waiters_in;
+static void *futex_waiter(void *) {
+    __sync_fetch_and_add(&futex_waiters_in, 1);
+    while (futex_word == 0) futex_call(&futex_word, FUTEX_WAIT, 0, nullptr);
+    return nullptr;
+}
+static volatile int race_word, race_waits_done, race_woken;
+static void *timed_futex_waiter(void *) {
+    struct timespec brief = {0, 1000000};
+    for (int i = 0; i < 1000; i++)
+        if (futex_call(&race_word, FUTEX_WAIT, 0, &brief) == 0) race_woken++;
+    race_waits_done = 1;
+    return nullptr;
+}
+// Three sleepers: WAKE 2 reports 2, the next WAKE 2 reports 1. Then 1000
+// timed waits race wakes: every wake that reports a sleeper woke one wait.
+static bool futex_wake_counts(void) {
+    futex_word = futex_waiters_in = 0;
+    pthread_t threads[3];
+    for (int i = 0; i < 3; i++)
+        if (pthread_create(&threads[i], nullptr, futex_waiter, nullptr) != 0) return false;
+    while (futex_waiters_in < 3) usleep(1000);
+    usleep(50000); // all three asleep
+    futex_word = 1;
+    long first = futex_call(&futex_word, FUTEX_WAKE, 2, nullptr);
+    usleep(20000);
+    long second = futex_call(&futex_word, FUTEX_WAKE, 2, nullptr);
+    for (int i = 0; i < 3; i++) pthread_join(threads[i], nullptr);
+
+    race_word = race_waits_done = race_woken = 0;
+    pthread_t waiter;
+    if (pthread_create(&waiter, nullptr, timed_futex_waiter, nullptr) != 0) return false;
+    long wakes = 0;
+    while (!race_waits_done) wakes += futex_call(&race_word, FUTEX_WAKE, 1, nullptr);
+    pthread_join(waiter, nullptr);
+    __android_log_print(ANDROID_LOG_INFO, TAG, "futex wakes: %ld then %ld (want 2 then 1); raced: %ld wakes, %d woken",
+                        first, second, wakes, race_woken);
+    return first == 2 && second == 1 && wakes == race_woken;
+}
+
+// Code in writable + executable memory, rewritten while other threads run it
+// (two call it in a loop, one spins on a flag without calls, then calls it once).
+typedef int (*made_function)(void);
+static made_function made_code;
+static volatile int made_stop, made_release, made_seen_new[2], made_spinner_got;
+static void *call_made_code(void *slot) {
+    while (!made_stop)
+        if (made_code() == 2) made_seen_new[(long)slot] = 1;
+    return nullptr;
+}
+static void *spin_then_call_made_code(void *) {
+    while (!made_release) {
+    }
+    made_spinner_got = made_code();
+    return nullptr;
+}
+static void write_made_code(unsigned *code, unsigned value) {
+    code[0] = 0xE3A00000u | value; // mov r0, #value
+    code[1] = 0xE12FFF1Eu;          // bx lr
+    __builtin___clear_cache((char *)code, (char *)(code + 2));
+}
+static bool code_rewrite_across_threads(void) {
+    unsigned *code = (unsigned *)mmap(nullptr, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (code == MAP_FAILED) return false;
+    write_made_code(code, 1);
+    made_code = (made_function)code;
+    made_stop = made_release = made_spinner_got = 0;
+    made_seen_new[0] = made_seen_new[1] = 0;
+    bool first = made_code() == 1;
+    pthread_t threads[3];
+    for (long i = 0; i < 2; i++)
+        if (pthread_create(&threads[i], nullptr, call_made_code, (void *)i) != 0) return false;
+    if (pthread_create(&threads[2], nullptr, spin_then_call_made_code, nullptr) != 0) return false;
+    usleep(30000);
+    write_made_code(code, 2);
+    double started = seconds_now();
+    while (!(made_seen_new[0] && made_seen_new[1]) && seconds_now() - started < 2.0) usleep(1000);
+    made_release = 1;
+    made_stop = 1;
+    for (int i = 0; i < 3; i++) pthread_join(threads[i], nullptr);
+    bool seen = made_seen_new[0] && made_seen_new[1] && made_spinner_got == 2 && made_code() == 2;
+    munmap(code, 4096);
+    return first && seen;
+}
+
+// A signal reaches a thread spinning inside a qsort comparator (game code
+// called back from a phone function).
+static volatile int comparator_spinning, comparator_signalled;
+static void on_comparator_signal(int) { comparator_signalled = 1; }
+static int spinning_comparator(const void *a, const void *b) {
+    comparator_spinning = 1;
+    for (long spins = 0; spins < 2000000000 && !comparator_signalled; spins++) {
+    }
+    return *(const int *)a - *(const int *)b;
+}
+static void *sort_with_spinning_comparator(void *) {
+    int values[2] = {2, 1};
+    qsort(values, 2, sizeof(int), spinning_comparator);
+    return nullptr;
+}
+static bool signal_reaches_callback(void) {
+    struct sigaction action = {};
+    action.sa_handler = on_comparator_signal;
+    sigaction(SIGUSR2, &action, nullptr);
+    comparator_spinning = comparator_signalled = 0;
+    pthread_t thread;
+    if (pthread_create(&thread, nullptr, sort_with_spinning_comparator, nullptr) != 0) return false;
+    while (!comparator_spinning) usleep(1000);
+    usleep(20000);
+    double sent = seconds_now();
+    pthread_kill(thread, SIGUSR2);
+    pthread_join(thread, nullptr);
+    return comparator_signalled && seconds_now() - sent < 0.5;
+}
+
+// A handler reading thread-specific data while its thread keeps changing it.
+static pthread_key_t tsd_key;
+static volatile int tsd_stop, tsd_bad, tsd_handled, tsd_running;
+static void on_tsd_signal(int) {
+    long value = (long)pthread_getspecific(tsd_key);
+    if ((value & 1) != 1) tsd_bad++;
+    tsd_handled++;
+}
+static void *tsd_looper(void *) {
+    pthread_setspecific(tsd_key, (void *)1); // valid before the first signal can come
+    tsd_running = 1;
+    for (long i = 0; !tsd_stop; i++) {
+        long value = (i << 1) | 1;
+        pthread_setspecific(tsd_key, (void *)value);
+        if ((long)pthread_getspecific(tsd_key) != value) tsd_bad++;
+    }
+    return nullptr;
+}
+static bool handler_reads_thread_data(void) {
+    struct sigaction action = {};
+    action.sa_handler = on_tsd_signal;
+    sigaction(SIGUSR2, &action, nullptr);
+    if (pthread_key_create(&tsd_key, nullptr) != 0) return false;
+    tsd_stop = tsd_bad = tsd_handled = tsd_running = 0;
+    pthread_t thread;
+    if (pthread_create(&thread, nullptr, tsd_looper, nullptr) != 0) return false;
+    while (!tsd_running) usleep(1000);
+    for (int i = 0; i < 200; i++) {
+        pthread_kill(thread, SIGUSR2);
+        usleep(500);
+    }
+    usleep(20000);
+    tsd_stop = 1;
+    pthread_join(thread, nullptr);
+    pthread_key_delete(tsd_key);
+    return tsd_bad == 0 && tsd_handled > 0;
+}
+
+// One thread makes short phone calls in a loop; 1000 signals sent one at a
+// time each run their handler exactly once.
+static volatile int calls_stop, calls_running, calls_handled;
+static void on_calls_signal(int) { calls_handled++; }
+static void *phone_call_looper(void *) {
+    calls_running = 1;
+    struct timespec now;
+    while (!calls_stop) clock_gettime(CLOCK_MONOTONIC, &now);
+    return nullptr;
+}
+static bool signals_during_phone_calls(void) {
+    struct sigaction action = {};
+    action.sa_handler = on_calls_signal;
+    sigaction(SIGUSR2, &action, nullptr);
+    calls_stop = calls_running = calls_handled = 0;
+    pthread_t thread;
+    if (pthread_create(&thread, nullptr, phone_call_looper, nullptr) != 0) return false;
+    while (!calls_running) usleep(1000);
+    bool in_time = true;
+    for (int i = 0; i < 1000 && in_time; i++) {
+        pthread_kill(thread, SIGUSR2);
+        double sent = seconds_now();
+        while (calls_handled < i + 1 && (in_time = seconds_now() - sent < 1.0)) {
+        }
+    }
+    usleep(20000);
+    calls_stop = 1;
+    pthread_join(thread, nullptr);
+    __android_log_print(ANDROID_LOG_INFO, TAG, "signals during phone calls: %d handled (want 1000)", calls_handled);
+    return in_time && calls_handled == 1000;
+}
+
+// Signals reach a thread blocked in a phone function (read() on an empty
+// pipe) while the read stays blocked, and the read finishes normally later.
+static int blocked_pipe[2];
+static volatile int blocked_reading, blocked_read_done, blocked_first, blocked_second;
+static volatile long blocked_read_result;
+static void on_blocked_first(int) { blocked_first++; }
+static void on_blocked_second(int) { blocked_second++; }
+static void *blocked_reader(void *) {
+    char got[4] = {0};
+    blocked_reading = 1;
+    long result;
+    do result = read(blocked_pipe[0], got, sizeof got);
+    while (result < 0 && errno == EINTR);
+    blocked_read_result = result == 4 && memcmp(got, "data", 4) == 0 ? 4 : -1;
+    blocked_read_done = 1;
+    return nullptr;
+}
+static bool signals_reach_blocked_read(void) {
+    struct sigaction first = {}, second = {};
+    first.sa_handler = on_blocked_first;
+    second.sa_handler = on_blocked_second;
+    sigaction(SIGUSR1, &first, nullptr);
+    sigaction(SIGUSR2, &second, nullptr);
+    if (pipe(blocked_pipe) != 0) return false;
+    blocked_reading = blocked_read_done = blocked_first = blocked_second = 0;
+    blocked_read_result = 0;
+    pthread_t thread;
+    if (pthread_create(&thread, nullptr, blocked_reader, nullptr) != 0) return false;
+    while (!blocked_reading) usleep(1000);
+    usleep(50000);
+    double sent = seconds_now();
+    pthread_kill(thread, SIGUSR1);
+    pthread_kill(thread, SIGUSR2);
+    while (!(blocked_first && blocked_second) && seconds_now() - sent < 1.0) usleep(1000);
+    double took = seconds_now() - sent;
+    bool still_blocked = !blocked_read_done;
+    usleep(50000);
+    bool once_each = blocked_first == 1 && blocked_second == 1;
+    write(blocked_pipe[1], "data", 4);
+    pthread_join(thread, nullptr);
+    close(blocked_pipe[0]);
+    close(blocked_pipe[1]);
+    __android_log_print(ANDROID_LOG_INFO, TAG, "blocked read: handlers %d %d after %.0f ms, read still blocked %d, read %ld",
+                        blocked_first, blocked_second, took * 1000, still_blocked, blocked_read_result);
+    return once_each && took < 0.1 && still_blocked && blocked_read_result == 4;
+}
+
+// ---- GL state follows the GL context, not the thread ----
+
+static EGLDisplay gl_display;
+static EGLSurface gl_surface;
+static EGLContext gl_first, gl_shared;
+static GLuint gl_pack_buffer, gl_mapped_buffer;
+static volatile int gl_pack_ok, gl_unmap_ok;
+
+// Thread 2, first context: the pack buffer bound on thread 1 still counts,
+// so the pointer is an offset in it.
+static void *read_pixel_into_bound_buffer(void *) {
+    eglMakeCurrent(gl_display, gl_surface, gl_surface, gl_first);
+    // Offset 4, not 0: taken as a guest address instead, it would become a
+    // large host address (no pixel), where offset 0 would become null.
+    glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, (void *)4);
+    const unsigned char *pixel = (const unsigned char *)glMapBufferRange(GL_PIXEL_PACK_BUFFER, 4, 4, GL_MAP_READ_BIT);
+    gl_pack_ok = pixel && pixel[0] == 255 && pixel[1] == 0 && pixel[2] == 0 && pixel[3] == 255;
+    if (pixel) glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+    eglMakeCurrent(gl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    return nullptr;
+}
+
+// Thread 2, the sharing context: unmapping uploads what thread 1 wrote.
+static void *unmap_from_shared_context(void *) {
+    eglMakeCurrent(gl_display, gl_surface, gl_surface, gl_shared);
+    glBindBuffer(GL_ARRAY_BUFFER, gl_mapped_buffer);
+    bool unmapped = glUnmapBuffer(GL_ARRAY_BUFFER) == GL_TRUE;
+    const unsigned char *data = (const unsigned char *)glMapBufferRange(GL_ARRAY_BUFFER, 0, 4, GL_MAP_READ_BIT);
+    gl_unmap_ok = unmapped && data && data[0] == 0x11 && data[1] == 0x22 && data[2] == 0x33 && data[3] == 0x44;
+    if (data) glUnmapBuffer(GL_ARRAY_BUFFER);
+    eglMakeCurrent(gl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    return nullptr;
+}
+
+// 1 = passed, 0 = failed, -1 = no GL context can be made here (not runnable).
+static int gl_state_follows_context(void) {
+    gl_display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    if (gl_display == EGL_NO_DISPLAY || !eglInitialize(gl_display, nullptr, nullptr)) return -1;
+    const EGLint config_wanted[] = {EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT_KHR,
+                                    EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8, EGL_NONE};
+    EGLConfig config;
+    EGLint found = 0;
+    if (!eglChooseConfig(gl_display, config_wanted, &config, 1, &found) || found != 1) return -1;
+    const EGLint surface_size[] = {EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE};
+    const EGLint version[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
+    gl_surface = eglCreatePbufferSurface(gl_display, config, surface_size);
+    gl_first = eglCreateContext(gl_display, config, EGL_NO_CONTEXT, version);
+    gl_shared = eglCreateContext(gl_display, config, gl_first, version);
+    if (gl_surface == EGL_NO_SURFACE || gl_first == EGL_NO_CONTEXT || gl_shared == EGL_NO_CONTEXT) return -1;
+
+    // Thread 1 (this one): red pixel, a pack buffer bound, and a buffer left mapped with data written.
+    eglMakeCurrent(gl_display, gl_surface, gl_surface, gl_first);
+    glClearColor(1, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glGenBuffers(1, &gl_pack_buffer);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, gl_pack_buffer);
+    glBufferData(GL_PIXEL_PACK_BUFFER, 64, nullptr, GL_STREAM_READ);
+    glGenBuffers(1, &gl_mapped_buffer);
+    glBindBuffer(GL_ARRAY_BUFFER, gl_mapped_buffer);
+    glBufferData(GL_ARRAY_BUFFER, 16, nullptr, GL_DYNAMIC_DRAW);
+    unsigned char *mapped = (unsigned char *)glMapBufferRange(GL_ARRAY_BUFFER, 0, 4, GL_MAP_WRITE_BIT);
+    if (mapped) {
+        mapped[0] = 0x11; mapped[1] = 0x22; mapped[2] = 0x33; mapped[3] = 0x44;
+    }
+    glFinish();
+    eglMakeCurrent(gl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+
+    gl_pack_ok = gl_unmap_ok = 0;
+    pthread_t thread;
+    if (pthread_create(&thread, nullptr, read_pixel_into_bound_buffer, nullptr) != 0) return 0;
+    pthread_join(thread, nullptr);
+    if (pthread_create(&thread, nullptr, unmap_from_shared_context, nullptr) != 0) return 0;
+    pthread_join(thread, nullptr);
+
+    eglMakeCurrent(gl_display, gl_surface, gl_surface, gl_first);
+    glDeleteBuffers(1, &gl_pack_buffer);
+    glDeleteBuffers(1, &gl_mapped_buffer);
+    eglMakeCurrent(gl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    eglDestroyContext(gl_display, gl_shared);
+    eglDestroyContext(gl_display, gl_first);
+    eglDestroySurface(gl_display, gl_surface);
+    __android_log_print(ANDROID_LOG_INFO, TAG, "gl state: pack binding on another thread %d, unmap from shared context %d",
+                        gl_pack_ok, gl_unmap_ok);
+    return mapped && gl_pack_ok && gl_unmap_ok ? 1 : 0;
 }
 
 #define MULTIPLY_TESTS(mode)                                                                         \
@@ -861,6 +1496,7 @@ extern "C" int run_all() {
     }
     check(counter == 10000 && results == 100, "4 threads + mutex + condition variable + join");
     check(thread_exits_with_value(), "pthread_exit from a nested call returns its value to join");
+    check(many_threads_reuse_stacks(), "300 threads one after another (finished threads' stacks are reused)");
 
     pthread_mutexattr_t attributes;
     pthread_mutexattr_init(&attributes);
@@ -912,6 +1548,9 @@ extern "C" int run_all() {
         struct sigaction action = {};
         action.sa_sigaction = on_pause;
         action.sa_flags = SA_SIGINFO | SA_RESTART;
+        // As Mono does: everything blocked in the handler, so a resume that comes
+        // before its sigsuspend waits for it (else the resume can be missed).
+        sigfillset(&action.sa_mask);
         sigaction(SIGPWR, &action, nullptr);
         action.sa_sigaction = on_resume;
         sigaction(SIGXCPU, &action, nullptr);
@@ -1038,6 +1677,40 @@ extern "C" int run_all() {
         check(neon_then_vfp_arm() == 0x3EAAAAAA && neon_then_vfp_thumb() == 0x3EAAAAAA,
               "VFP rounding mode after a NEON block loops back (ARM and Thumb)");
         check(reverse_subtract_with_carry() && push_stack_pointer(), "RSC and STM {sp, lr} with sp! (ARM)");
+    }
+
+    {
+        check(dlopen_waits_for_start_up(), "two threads opening a library both wait for its start-up code");
+        check(ping_pong_without_lost_wakeups(), "mutex + condition and semaphore ping-pong without lost wake-ups");
+        check(futex_wake_counts(), "futex wake counts: 3 sleepers, wake 2 then 2; timed waits racing wakes");
+        check(handler_reads_thread_data(), "a signal handler reads thread-specific data its thread keeps changing");
+        if (bridge_flag("arm32_bridge_runs_in_parallel"))
+            check(signals_reach_blocked_read(), "two signals reach a thread blocked in read() while it stays blocked");
+        int gl = gl_state_follows_context();
+        if (gl < 0)
+            __android_log_print(ANDROID_LOG_INFO, TAG, "not runnable: GL state follows the context (no GL context here)");
+        else
+            check(gl == 1, "GL state follows the context: binding seen on another thread, unmap from a sharing context");
+        // These have threads spin-wait without calls: Unicorn alone cannot
+        // take the guest lock from a thread like that.
+        if (bridge_flag("arm32_bridge_uses_translator")) {
+            // every block runs twice, or every atomic runs in Unicorn: fewer rounds
+            if (bridge_flag("arm32_bridge_is_checking") || bridge_flag("arm32_bridge_forces_fallbacks")) {
+                kRaceAdds = 2000;
+                kSmallRounds = 50;
+            }
+            check(shared_counters_exact(), "four threads on shared counters: atomics (32/64-bit), kuser cmpxchg, mutex, SWP lock");
+            check(small_counters_exact(), "four threads on 8- and 16-bit atomics, exact per round, neighbours untouched");
+            check(once_from_four_threads(), "pthread_once from four threads at once runs once");
+            check(code_rewrite_across_threads(), "code rewritten while other threads run it (calls and a spinning thread)");
+            check(signals_during_phone_calls(), "1000 signals to a thread making phone calls, each handled once");
+            check(signal_reaches_spinning_thread(), "a signal reaches a thread busy in a loop without calls");
+            check(signal_reaches_callback(), "a signal reaches a thread spinning in a qsort callback");
+            if (!bridge_flag("arm32_bridge_is_checking")) { // timing means nothing when every block runs twice
+                bool overlap = busy_threads_overlap();
+                if (bridge_flag("arm32_bridge_runs_in_parallel")) check(overlap, "four busy threads run at the same time");
+            }
+        }
     }
 
     {

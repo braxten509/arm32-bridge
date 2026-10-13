@@ -126,6 +126,8 @@ pub fn reference(uc: &mut Uc, pc: u32, end: u32, stop_at: u32) -> Option<Referen
         return None;
     }
     install_hook(uc);
+    // Code another thread rewrote since this engine last ran (cacheflush).
+    crate::runtime::sync_unicorn_code(uc);
     let start = uc.get_data().native.as_ref().unwrap().state;
     write_unicorn(uc, &start);
     let fault_before = uc.get_data_mut().fault.take();

@@ -99,7 +99,12 @@ impl Translator {
             return Ok(Flow::Next);
         }
         if word & 0xFFFF_FF00 == 0xF57F_F000 && matches!((word >> 4) & 0xF, 4..=6) {
-            // DSB / DMB / ISB: one guest thread runs at a time
+            // DSB / DMB / ISB
+            self.barrier((word >> 4) & 0xF);
+            return Ok(Flow::Next);
+        }
+        if word == 0xF57F_F01F {
+            self.clear_exclusive();
             return Ok(Flow::Next);
         }
         if word >> 25 == 0b1111_001 {
@@ -290,53 +295,37 @@ impl Translator {
         Ok(Flow::Next)
     }
 
-    /// LDREX/STREX and their byte/halfword/doubleword forms. Only one guest
-    /// thread runs at a time, so they are plain accesses and stores always succeed.
+    /// LDREX/STREX and their byte/halfword/doubleword forms, and SWP/SWPB.
     fn arm_synchronization(&mut self, word: u32) -> Result<Flow> {
         let (rn, rd, rt) = ((word >> 16) & 0xF, (word >> 12) & 0xF, word & 0xF);
-        if (word >> 23) & 1 == 0 || (word >> 8) & 0xF != 0xF || rn == PC {
-            return Err(()); // SWP/SWPB
+        if (word >> 23) & 1 == 0 {
+            // SWP{B} Rt, Rt2, [Rn]: Rt = bits 15-12, Rt2 = bits 3-0
+            if word & 0x0FB0_0FF0 != 0x0100_0090 {
+                return Err(());
+            }
+            return self.swap(if (word >> 22) & 1 == 1 { 0 } else { 2 }, rd, rt, rn);
+        }
+        if (word >> 8) & 0xF != 0xF {
+            return Err(());
         }
         let load = (word >> 20) & 1 == 1;
-        let kind = (word >> 21) & 3; // 0 word, 1 doubleword, 2 byte, 3 halfword
-        if load {
-            // LDREX*: Rt = bits 15-12
-            let rt = rd;
-            if rt == PC {
-                return Err(());
-            }
-            match kind {
-                0 => self.a.ldr_w_uxtw(rt, host::MEMORY, rn),
-                1 => {
-                    if rt % 2 == 1 || rt == LR {
-                        return Err(());
-                    }
-                    self.a.add_x_uxtw(T1, host::MEMORY, rn);
-                    self.a.ldp_w_off(rt, rt + 1, T1, 0);
-                }
-                2 => self.a.ldrb_w_uxtw(rt, host::MEMORY, rn),
-                _ => self.a.ldrh_w_uxtw(rt, host::MEMORY, rn),
-            }
-        } else {
-            // STREX* Rd, Rt, [Rn]
-            if rd == PC || rt == PC {
-                return Err(());
-            }
-            match kind {
-                0 => self.a.str_w_uxtw(rt, host::MEMORY, rn),
-                1 => {
-                    if rt % 2 == 1 || rt == LR {
-                        return Err(());
-                    }
-                    self.a.add_x_uxtw(T1, host::MEMORY, rn);
-                    self.a.stp_w_off(rt, rt + 1, T1, 0);
-                }
-                2 => self.a.strb_w_uxtw(rt, host::MEMORY, rn),
-                _ => self.a.strh_w_uxtw(rt, host::MEMORY, rn),
-            }
-            self.a.mov_w_imm(rd, 0);
+        // 0 word, 1 doubleword, 2 byte, 3 halfword -> size 2, 3, 0, 1
+        let size = [2, 3, 0, 1][((word >> 21) & 3) as usize];
+        // A doubleword pair starts at an even register below LR.
+        let first = if load { rd } else { rt };
+        if size == 3 && (first % 2 == 1 || first == LR) {
+            return Err(());
         }
-        Ok(Flow::Next)
+        if load {
+            // LDREX* Rt (bits 15-12), [Rn]; doubleword: Rt, Rt+1
+            self.load_exclusive(size, rd, rd + 1, rn, 0)
+        } else {
+            // STREX* Rd (bits 15-12), Rt (bits 3-0), [Rn]; doubleword: Rt, Rt+1
+            if size == 3 && rd == rt + 1 {
+                return Err(());
+            }
+            self.store_exclusive(size, rd, rt, rt + 1, rn, 0)
+        }
     }
 
     fn arm_misc(&mut self, word: u32) -> Result<Flow> {

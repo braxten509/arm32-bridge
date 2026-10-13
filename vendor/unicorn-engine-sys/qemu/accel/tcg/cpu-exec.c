@@ -112,7 +112,7 @@ static void cpu_exec_nocache(CPUState *cpu, int max_cycles,
                              TranslationBlock *orig_tb, bool ignore_icount)
 {
     TranslationBlock *tb;
-    uint32_t cflags = curr_cflags() | CF_NOCACHE;
+    uint32_t cflags = curr_cflags(cpu) | CF_NOCACHE;
 
     if (ignore_icount) {
         cflags &= ~CF_USE_ICOUNT;
@@ -605,7 +605,7 @@ int cpu_exec(struct uc_struct *uc, CPUState *cpu)
                have CF_INVALID set, -1 is a convenient invalid value that
                does not require tcg headers for cpu_common_reset.  */
             if (cflags == -1) {
-                cflags = curr_cflags();
+                cflags = curr_cflags(cpu);
             } else {
                 cpu->cflags_next_tb = -1;
             }

@@ -474,7 +474,7 @@ fn array_element_size(env: *mut JNIEnv, array: jobject) -> u32 {
 /// Copies `bytes` of host memory into a new guest buffer and remembers it.
 fn guest_copy(host: *const u8, element_size: u32, length: u32, extra: u32) -> u32 {
     let bytes = element_size * length;
-    let guest = shared().heap.malloc(bytes + extra);
+    let guest = crate::runtime::heap().malloc(bytes + extra);
     unsafe { std::ptr::copy_nonoverlapping(host, mem().host(guest), bytes as usize) };
     for i in 0..extra {
         mem().write_u8(guest + bytes + i, 0);
@@ -576,7 +576,7 @@ pub fn dispatch(uc: &mut Uc, name: &str, a: &mut Args) -> Ret {
                 return Ret::U32(0);
             }
             let bytes = size * length;
-            let guest = shared().heap.malloc(bytes.max(1));
+            let guest = crate::runtime::heap().malloc(bytes.max(1));
             unsafe { std::ptr::copy_nonoverlapping(host, mem().host(guest), bytes as usize) };
             jcall!(env, ReleasePrimitiveArrayCritical, host_array, host as *mut c_void, JNI_ABORT);
             shared().state.jni_refs.copies.insert(guest, (0, size, length));
@@ -598,7 +598,7 @@ pub fn dispatch(uc: &mut Uc, name: &str, a: &mut Args) -> Ret {
         if mode == JNI_COMMIT_MODE {
             shared().state.jni_refs.copies.insert(elements, (0, size, length));
         } else {
-            shared().heap.free(elements);
+            crate::runtime::heap().free(elements);
         }
         return Ret::Void;
     }
@@ -763,7 +763,7 @@ pub fn dispatch(uc: &mut Uc, name: &str, a: &mut Args) -> Ret {
         "ReleaseStringUTFChars" | "ReleaseStringChars" | "ReleaseStringCritical" => {
             let (_string, characters) = (a.u32(), a.u32());
             if take_copy(characters).is_some() {
-                shared().heap.free(characters);
+                crate::runtime::heap().free(characters);
             }
             Ret::Void
         }

@@ -77,7 +77,7 @@ mod host {
         let mut shared = shared();
         let assets = &mut shared.state.assets;
         if let Some(copy) = assets.copies.remove(&handle) {
-            shared.heap.free(copy);
+            crate::runtime::heap().free(copy);
         }
         shared.state.assets.objects.remove(&handle).unwrap_or(0) as *mut c_void
     }
@@ -85,7 +85,7 @@ mod host {
     fn remember_copy(handle: u32, copy: u32) {
         let old = shared().state.assets.copies.insert(handle, copy);
         if let Some(old) = old {
-            shared().heap.free(old);
+            crate::runtime::heap().free(old);
         }
     }
 
@@ -113,7 +113,7 @@ mod host {
                     return Ret::U32(0);
                 }
                 let bytes = unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes().to_vec();
-                let copy = shared().heap.strdup(&bytes);
+                let copy = crate::runtime::heap().strdup(&bytes);
                 remember_copy(directory, copy);
                 Ret::U32(copy)
             }),
@@ -143,7 +143,7 @@ mod host {
                 if data.is_null() {
                     return Ret::U32(0);
                 }
-                let copy = shared().heap.malloc(length.max(1));
+                let copy = crate::runtime::heap().malloc(length.max(1));
                 unsafe { std::ptr::copy_nonoverlapping(data, mem().host(copy), length as usize) };
                 remember_copy(asset, copy);
                 Ret::U32(copy)

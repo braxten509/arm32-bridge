@@ -356,6 +356,14 @@ uc_err reg_read(void *_env, int mode, unsigned int regid, void *value,
             CHECK_REG_TYPE(uint32_t);
             *(uint32_t *)value = env->exception.syndrome;
             break;
+        case UC_ARM_REG_EXCLUSIVE_ADDR:
+            CHECK_REG_TYPE(uint64_t);
+            *(uint64_t *)value = env->exclusive_addr;
+            break;
+        case UC_ARM_REG_EXCLUSIVE_VAL:
+            CHECK_REG_TYPE(uint64_t);
+            *(uint64_t *)value = env->exclusive_val;
+            break;
         }
     }
 
@@ -564,6 +572,18 @@ uc_err reg_write(void *_env, int mode, unsigned int regid, const void *value,
             CHECK_REG_TYPE(uint32_t);
             env->exception.syndrome = *(uint32_t *)value;
             break;
+        case UC_ARM_REG_EXCLUSIVE_ADDR:
+            CHECK_REG_TYPE(uint64_t);
+            env->exclusive_addr = *(uint64_t *)value;
+            break;
+        case UC_ARM_REG_EXCLUSIVE_VAL:
+            CHECK_REG_TYPE(uint64_t);
+            env->exclusive_val = *(uint64_t *)value;
+            break;
+        case UC_ARM_REG_PARALLEL:
+            CHECK_REG_TYPE(uint64_t);
+            env_cpu(env)->parallel = *(uint64_t *)value != 0;
+            break;
         }
     }
 
@@ -580,6 +600,7 @@ static bool arm_stop_interrupt(struct uc_struct *uc, int intno)
     case EXCP_YIELD:
         return true;
     case EXCP_INVSTATE:
+    case EXCP_ATOMIC: // arm32-bridge: never loop on an atomic Unicorn can't do in place
         uc->invalid_error = UC_ERR_EXCEPTION;
         return true;
     }

@@ -67,7 +67,8 @@ fn preempt_check(a: &mut Asm, to: super::emit::Label) {
     a.cbnz_w_to(T0, to);
 }
 
-/// Ends a block: continue at the address in `target` (bit 0 = Thumb). With
+/// Ends a block: continue at the address in `target` (bit 0 = Thumb; never
+/// T0-T2). With
 /// linking on, the jump table (engine.rs) is tried first; a miss goes to the
 /// dispatcher, which fills the table.
 fn emit_exit_to(a: &mut Asm, target: Reg) {
@@ -76,13 +77,14 @@ fn emit_exit_to(a: &mut Asm, target: Reg) {
         let miss = a.label();
         restore_vfp_mode(a);
         preempt_check(a, miss);
+        // One 64-bit entry: (code - table) << 32 | guest pc; the table is at the start of code memory.
         a.mov_x_imm(T0, table as u64);
         a.ubfx_w(T1, target, 1, super::engine::JUMP_TABLE_BITS);
-        a.add_x_lsl(T0, T0, T1, 4);
-        a.ldr_w_off(T1, T0, 0);
-        a.eor_w(T1, T1, target, shift::LSL, 0); // no compare: the guest flags live in NZCV
-        a.cbnz_w_to(T1, miss);
-        a.ldr_x_off(T0, T0, 8);
+        a.add_x_lsl(T1, T0, T1, 3);
+        a.ldr_x_off(T1, T1, 0);
+        a.eor_w(T2, T1, target, shift::LSL, 0); // no compare: the guest flags live in NZCV
+        a.cbnz_w_to(T2, miss);
+        a.add_x_asr(T0, T0, T1, 32);
         a.br(T0);
         a.bind(miss);
     }
@@ -1195,29 +1197,11 @@ impl Translator {
         let rn = h1 & 0xF;
         let op = (h1 >> 4) & 0x1F; // bits 8:4 of h1 = 0 U 1 0 L with P=W=0
         let (rt, rd) = ((h2 >> 12) & 0xF, (h2 >> 8) & 0xF);
-        // Only one guest thread runs at a time, so exclusives are plain accesses
-        // and a store-exclusive always succeeds.
         match op {
-            0b00100 => {
-                // STREX Rd, Rt, [Rn, #imm8*4]
-                if rn == PC {
-                    return Err(());
-                }
-                let offset = (h2 & 0xFF) * 4;
-                self.a.add_w_any(T0, rn, offset, T1);
-                self.a.str_w_uxtw(rt, host::MEMORY, T0);
-                self.a.mov_w_imm(rd, 0);
-                Ok(Flow::Next)
-            }
-            0b00101 => {
-                if rn == PC || rt == PC {
-                    return Err(());
-                }
-                let offset = (h2 & 0xFF) * 4;
-                self.a.add_w_any(T0, rn, offset, T1);
-                self.a.ldr_w_uxtw(rt, host::MEMORY, T0);
-                Ok(Flow::Next)
-            }
+            // STREX Rd, Rt, [Rn, #imm8*4]
+            0b00100 => self.store_exclusive(2, rd, rt, 0, rn, (h2 & 0xFF) * 4),
+            // LDREX Rt, [Rn, #imm8*4]
+            0b00101 => self.load_exclusive(2, rt, 0, rn, (h2 & 0xFF) * 4),
             0b01101 => {
                 let kind = (h2 >> 4) & 0xF;
                 let rm = h2 & 0xF;
@@ -1237,42 +1221,22 @@ impl Translator {
                         emit_exit_to(&mut self.a, T6);
                         Ok(Flow::End)
                     }
-                    4 | 5 | 7 => {
-                        // LDREXB / LDREXH / LDREXD
-                        if rn == PC {
-                            return Err(());
-                        }
-                        match kind {
-                            4 => self.a.ldrb_w_uxtw(rt, host::MEMORY, rn),
-                            5 => self.a.ldrh_w_uxtw(rt, host::MEMORY, rn),
-                            _ => {
-                                self.a.add_x_uxtw(T1, host::MEMORY, rn);
-                                self.a.ldp_w_off(rt, rd, T1, 0);
-                            }
-                        }
-                        Ok(Flow::Next)
-                    }
+                    // LDREXB / LDREXH / LDREXD Rt, Rt2 (bits 11-8), [Rn]
+                    4 => self.load_exclusive(0, rt, 0, rn, 0),
+                    5 => self.load_exclusive(1, rt, 0, rn, 0),
+                    7 => self.load_exclusive(3, rt, rd, rn, 0),
                     _ => Err(()),
                 }
             }
             0b01100 => {
-                let kind = (h2 >> 4) & 0xF;
-                let rd = h2 & 0xF;
-                let rt2 = (h2 >> 8) & 0xF;
-                if rn == PC {
-                    return Err(());
+                // STREXB / STREXH / STREXD Rd (bits 3-0), Rt, Rt2 (bits 11-8), [Rn]
+                let (rd, rt2) = (h2 & 0xF, (h2 >> 8) & 0xF);
+                match (h2 >> 4) & 0xF {
+                    4 => self.store_exclusive(0, rd, rt, 0, rn, 0),
+                    5 => self.store_exclusive(1, rd, rt, 0, rn, 0),
+                    7 => self.store_exclusive(3, rd, rt, rt2, rn, 0),
+                    _ => Err(()),
                 }
-                match kind {
-                    4 => self.a.strb_w_uxtw(rt, host::MEMORY, rn),
-                    5 => self.a.strh_w_uxtw(rt, host::MEMORY, rn),
-                    7 => {
-                        self.a.add_x_uxtw(T1, host::MEMORY, rn);
-                        self.a.stp_w_off(rt, rt2, T1, 0);
-                    }
-                    _ => return Err(()),
-                }
-                self.a.mov_w_imm(rd, 0);
-                Ok(Flow::Next)
             }
             _ => Err(()),
         }
@@ -1439,8 +1403,12 @@ impl Translator {
     }
 
     fn misc_control(&mut self, h1: u32, h2: u32) -> Result<Flow> {
-        // Barriers (DMB/DSB/ISB) and NOP hints are no-ops here: one guest thread runs at a time.
-        if h1 == 0xF3BF && h2 & 0xFF00 == 0x8F00 {
+        if h1 == 0xF3BF && h2 & 0xFFF0 == 0x8F20 {
+            self.clear_exclusive();
+            return Ok(Flow::Next);
+        }
+        if h1 == 0xF3BF && h2 & 0xFF00 == 0x8F00 && matches!((h2 >> 4) & 0xF, 4..=6) {
+            self.barrier((h2 >> 4) & 0xF);
             return Ok(Flow::Next);
         }
         if h1 == 0xF3AF && h2 == 0x8000 {
@@ -1755,5 +1723,170 @@ impl Translator {
             return self.vfp((h1 << 16) | h2);
         }
         Err(())
+    }
+}
+
+/// Whether the host has ARMv8.1 atomics (CASAL/SWPAL). Without them (or with
+/// ARM32_LSE=0 / debug.arm32bridge.lse=0) exclusives use LDAXR/STLXR loops.
+/// ARM32_FORCE_FALLBACK_SYNC=1 / debug.arm32bridge.fallback_sync=1 (testing):
+/// exclusives and SWP always run in Unicorn, so its atomic path is exercised.
+pub fn force_sync_fallback() -> bool {
+    static FORCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FORCE.get_or_init(|| {
+        let setting = std::env::var("ARM32_FORCE_FALLBACK_SYNC").ok().or_else(|| super::property("debug.arm32bridge.fallback_sync"));
+        setting.as_deref() == Some("1")
+    })
+}
+
+fn use_lse() -> bool {
+    static LSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LSE.get_or_init(|| {
+        #[cfg(target_arch = "aarch64")]
+        let present = std::arch::is_aarch64_feature_detected!("lse");
+        #[cfg(not(target_arch = "aarch64"))]
+        let present = false;
+        let setting = std::env::var("ARM32_LSE").ok().or_else(|| super::property("debug.arm32bridge.lse"));
+        present && setting.as_deref() != Some("0")
+    })
+}
+
+/// Exclusive loads and stores, emulated the way QEMU does it: LDREX records
+/// the address and the value it read (`CpuState::excl_*`); STREX stores with a
+/// compare-and-swap against that value, so it fails if another thread changed
+/// the memory in between. (A change and a change back is not noticed, unlike
+/// a real exclusive monitor.) `size`: 0 byte, 1 halfword, 2 word, 3 doubleword.
+impl Translator {
+    /// T0 = guest address `rn + offset`; an unaligned address leaves through a
+    /// fallback (Unicorn raises the alignment fault real hardware raises).
+    fn exclusive_address(&mut self, size: u32, rn: Reg, offset: u32) {
+        if offset == 0 {
+            self.a.mov_w(T0, rn);
+        } else {
+            self.a.add_w_any(T0, rn, offset, T1);
+        }
+        if size > 0 {
+            let aligned = self.a.label();
+            self.a.and_w_imm(T4, T0, (1 << size) - 1, T5);
+            self.a.cbz_w_to(T4, aligned);
+            emit_exit(&mut self.a, self.pc | self.thumb as u32, exit::FALLBACK | (1 << 8));
+            self.a.bind(aligned);
+        }
+    }
+
+    /// LDREX{B,H,D}: `rt2` is only used for doublewords.
+    fn load_exclusive(&mut self, size: u32, rt: Reg, rt2: Reg, rn: Reg, offset: u32) -> Result<Flow> {
+        if self.in_it || rn == PC || rt == PC || (size == 3 && (rt2 == PC || rt2 == rt)) || force_sync_fallback() {
+            return Err(());
+        }
+        self.exclusive_address(size, rn, offset);
+        self.a.str_w_off(T0, host::STATE, offsets::EXCL_ADDR);
+        match size {
+            0 => self.a.ldrb_w_uxtw(rt, host::MEMORY, T0),
+            1 => self.a.ldrh_w_uxtw(rt, host::MEMORY, T0),
+            2 => self.a.ldr_w_uxtw(rt, host::MEMORY, T0),
+            _ => {
+                // One 64-bit load, so the pair is read in one piece.
+                self.a.ldr_x_uxtw(T2, host::MEMORY, T0);
+                self.a.str_x_off(T2, host::STATE, offsets::EXCL_VALUE);
+                self.a.mov_w(rt, T2);
+                self.a.lsr_x_imm(T2, T2, 32);
+                self.a.mov_w(rt2, T2);
+                return Ok(Flow::Next);
+            }
+        }
+        // A w register load clears the upper half, so x(rt) is the value.
+        self.a.str_x_off(rt, host::STATE, offsets::EXCL_VALUE);
+        Ok(Flow::Next)
+    }
+
+    /// STREX{B,H,D} Rd, Rt(, Rt2), [Rn, #offset]: Rd = 0 if stored, 1 if not.
+    fn store_exclusive(&mut self, size: u32, rd: Reg, rt: Reg, rt2: Reg, rn: Reg, offset: u32) -> Result<Flow> {
+        if self.in_it || rn == PC || rt == PC || rd == PC || rd == rn || rd == rt || force_sync_fallback() {
+            return Err(());
+        }
+        if size == 3 && (rt2 == PC || rd == rt2) {
+            return Err(());
+        }
+        self.exclusive_address(size, rn, offset);
+        let (fail, done) = (self.a.label(), self.a.label());
+        // The monitor is cleared whether or not the store happens.
+        self.a.ldr_w_off(T1, host::STATE, offsets::EXCL_ADDR);
+        self.a.eor_w(T1, T1, T0, shift::LSL, 0);
+        self.a.mov_w_imm(T2, super::NO_EXCLUSIVE);
+        self.a.str_w_off(T2, host::STATE, offsets::EXCL_ADDR);
+        self.a.cbnz_w_to(T1, fail);
+        self.a.ldr_x_off(T1, host::STATE, offsets::EXCL_VALUE);
+        self.a.add_x_uxtw(T2, host::MEMORY, T0);
+        let new = if size == 3 {
+            self.a.mov_w(T5, rt);
+            self.a.orr_x(T5, T5, rt2, shift::LSL, 32);
+            T5
+        } else {
+            rt
+        };
+        if use_lse() {
+            self.a.mov_x(T3, T1);
+            self.a.casal(size, T1, new, T2);
+            self.a.eor_x(T1, T1, T3);
+            self.a.cbnz_x_to(T1, fail);
+        } else {
+            let (retry, differs) = (self.a.label(), self.a.label());
+            self.a.bind(retry);
+            self.a.ldaxr(size, T3, T2);
+            self.a.eor_x(T4, T3, T1);
+            self.a.cbnz_x_to(T4, differs);
+            self.a.stlxr(size, T4, new, T2);
+            self.a.cbnz_w_to(T4, retry);
+            self.a.mov_w_imm(rd, 0);
+            self.a.b_to(done);
+            self.a.bind(differs);
+            self.a.clrex();
+            self.a.bind(fail);
+            self.a.mov_w_imm(rd, 1);
+            self.a.bind(done);
+            return Ok(Flow::Next);
+        }
+        self.a.mov_w_imm(rd, 0);
+        self.a.b_to(done);
+        self.a.bind(fail);
+        self.a.mov_w_imm(rd, 1);
+        self.a.bind(done);
+        Ok(Flow::Next)
+    }
+
+    /// CLREX.
+    fn clear_exclusive(&mut self) {
+        self.a.mov_w_imm(T0, super::NO_EXCLUSIVE);
+        self.a.str_w_off(T0, host::STATE, offsets::EXCL_ADDR);
+    }
+
+    /// SWP / SWPB Rt, Rt2, [Rn]: Rt = old [Rn], [Rn] = Rt2, in one atomic step.
+    fn swap(&mut self, size: u32, rt: Reg, rt2: Reg, rn: Reg) -> Result<Flow> {
+        if rn == PC || rt == PC || rt2 == PC || rn == rt || rn == rt2 || force_sync_fallback() {
+            return Err(());
+        }
+        self.exclusive_address(size, rn, 0);
+        self.a.add_x_uxtw(T2, host::MEMORY, T0);
+        if use_lse() {
+            self.a.swpal(size, rt2, T3, T2);
+        } else {
+            let retry = self.a.label();
+            self.a.bind(retry);
+            self.a.ldaxr(size, T3, T2);
+            self.a.stlxr(size, T4, rt2, T2);
+            self.a.cbnz_w_to(T4, retry);
+        }
+        self.a.mov_w(rt, T3);
+        Ok(Flow::Next)
+    }
+
+    /// DSB (`kind` 4), DMB (5) or ISB (6): the host's inner-shareable barrier
+    /// of the same kind; every option (ST, LD, OSH...) is treated as the full one.
+    fn barrier(&mut self, kind: u32) {
+        match kind {
+            4 => self.a.dsb_ish(),
+            5 => self.a.dmb_ish(),
+            _ => self.a.isb(),
+        }
     }
 }

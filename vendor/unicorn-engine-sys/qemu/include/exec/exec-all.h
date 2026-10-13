@@ -375,9 +375,9 @@ static inline uint32_t tb_cflags(const TranslationBlock *tb)
 }
 
 /* current cflags for hashing/comparison */
-static inline uint32_t curr_cflags(void)
+static inline uint32_t curr_cflags(CPUState *cpu)
 {
-    return 0;
+    return cpu->parallel ? CF_PARALLEL : 0;
 }
 
 /* TranslationBlock invalidate API */

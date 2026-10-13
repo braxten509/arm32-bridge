@@ -1,11 +1,11 @@
 //! pthreads for guest code. Each guest thread is a real host thread with its
-//! own CPU engine. Guest code only runs while holding the guest lock, so the
-//! mutex and condition variable words below are read and written without
-//! races; waiting gives the lock up (`wait_for_guests`).
+//! own CPU engine. The words below are changed with atomic operations (guest
+//! threads may run at the same time); a thread that has to wait sleeps in
+//! `runtime::wait_until`, which re-checks the word under the waiters' lock.
 //!
 //! Guest object layouts (bionic ARM32, all 4 bytes):
 //! - pthread_mutex_t: bits 14-15 type (as in bionic's static initializers),
-//!   bits 16-31 owner thread, bits 0-11 lock count.
+//!   bits 16-31 owner thread, bit 13 "someone may be waiting", bits 0-11 lock count.
 //! - pthread_cond_t: a counter bumped by every signal/broadcast.
 //! - pthread_once_t: 0 not run, 1 running, 2 done.
 //! - pthread_rwlock_t (40 bytes, first word used): bits 16-31 writer thread,
@@ -14,19 +14,23 @@
 //! - pthread_attr_t (24 bytes): flags (1 = detached), stack base, stack size,
 //!   guard size, policy, priority.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::handler;
 use crate::runtime::{
-    call_guest, drop_engine, engine, hold_gil, mem, shared, stop_with_fault, wait_on, wake_on, without_gil, ArgSource,
-    Handler, Ret, Uc,
+    call_guest, drop_engine, engine, hold_gil, mem, shared, stop_with_fault, wait_until, wake_on, wake_on_count, without_gil,
+    ArgSource, Handler, Ret, Uc, Wait,
 };
 
 const TYPE_MASK: u32 = 0xC000;
 const RECURSIVE: u32 = 0x4000;
 const COUNT_MASK: u32 = 0x0FFF;
+/// Set while a thread may be asleep waiting for the mutex: unlock then wakes one.
+const WAITER_BIT: u32 = 0x2000;
 
 const EBUSY: u32 = 16;
 const EDEADLK: u32 = 35;
@@ -35,60 +39,116 @@ const EINVAL: u32 = 22;
 const ESRCH: u32 = 3;
 const ETIMEDOUT: u32 = 110;
 const EAGAIN: u32 = 11;
+const EINTR: u32 = 4;
 
 const FIRST_HANDLE: u32 = 0x1000;
 
 #[derive(Default)]
 pub struct Threads {
-    next_handle: u32,
     /// pthread_t → (finished, return value, detached)
     records: HashMap<u32, (bool, u32, bool)>,
-    /// Thread-specific data: key → live, and (thread, key) → value.
-    keys: Vec<Option<u32>>,
-    /// Futex words: address -> wake count (a waiter returns once it changes).
-    futex_wakes: HashMap<u32, u32>,
     /// Condition variables whose timed waits use CLOCK_MONOTONIC deadlines.
     monotonic_conditions: std::collections::HashSet<u32>,
-    values: HashMap<(u32, u32), u32>,
 }
 
+/// Most thread-specific data keys a program can make (bionic allows 128).
+const KEYS: usize = 1024;
+
+/// One guest thread (a pthread_t): its signals and thread-specific data. Made
+/// when the handle is handed out, so a signal can be sent before the thread runs.
+pub struct Identity {
+    pub handle: u32,
+    /// Signals sent and not delivered yet / blocked (bit n-1 = signal n).
+    pub pending: AtomicU64,
+    pub blocked: AtomicU64,
+    /// Handlers run so far (sigsuspend waits for this to change).
+    pub delivered: AtomicU64,
+    /// Set once the thread has finished; signals to it then fail with ESRCH.
+    pub dead: AtomicBool,
+    /// Set once the thread is finishing: no new helper may stand in for it.
+    pub exiting: AtomicBool,
+    /// pthread_getspecific / pthread_setspecific values by key.
+    values: Box<[AtomicU32]>,
+    /// The host thread running this guest thread's code, told when a signal comes.
+    pub runner: Mutex<Option<Arc<crate::runtime::Runner>>>,
+    /// The signal helper standing in for this thread while it is stuck in a
+    /// phone function (its number, 0 = none), and that helper's runner.
+    pub borrower: AtomicU32,
+    pub helper_runner: Mutex<Option<Arc<crate::runtime::Runner>>>,
+}
+
+impl Identity {
+    pub(crate) fn new(handle: u32) -> Identity {
+        Identity {
+            handle,
+            pending: AtomicU64::new(0),
+            blocked: AtomicU64::new(0),
+            delivered: AtomicU64::new(0),
+            dead: AtomicBool::new(false),
+            exiting: AtomicBool::new(false),
+            values: (0..KEYS).map(|_| AtomicU32::new(0)).collect(),
+            runner: Mutex::new(None),
+            borrower: AtomicU32::new(0),
+            helper_runner: Mutex::new(None),
+        }
+    }
+}
+
+/// Every guest thread by pthread_t (finished ones stay, marked dead: handles are never reused).
+static IDENTITIES: Mutex<Option<HashMap<u32, Arc<Identity>>>> = Mutex::new(None);
+static NEXT_HANDLE: AtomicU32 = AtomicU32::new(FIRST_HANDLE);
+
+/// Thread-specific data keys: bit 63 = in use, low 32 bits = destructor.
+static KEY_SLOTS: [AtomicU64; KEYS] = [const { AtomicU64::new(0) }; KEYS];
+static NEXT_KEY: AtomicU32 = AtomicU32::new(0);
+const KEY_LIVE: u64 = 1 << 63;
+
 thread_local! {
-    static SELF_HANDLE: Cell<u32> = const { Cell::new(0) };
+    static SELF: RefCell<Option<Arc<Identity>>> = const { RefCell::new(None) };
     /// Set by pthread_exit: the value the thread returns once its guest calls unwind.
     static EXIT_VALUE: Cell<Option<u32>> = const { Cell::new(None) };
 }
 
 const THREAD_EXIT: &str = "guest thread called pthread_exit";
 
+/// This thread's guest identity, handing one out on first use.
+pub fn current_identity() -> Arc<Identity> {
+    SELF.with(|me| Arc::clone(me.borrow_mut().get_or_insert_with(new_identity)))
+}
+
+/// A signal helper takes on (Some) or gives back (None) the identity of the
+/// thread it stands in for.
+pub fn adopt_identity(identity: Option<Arc<Identity>>) {
+    SELF.with(|me| *me.borrow_mut() = identity);
+}
+
 /// This thread's pthread_t, handing one out on first use.
 pub fn current_handle() -> u32 {
-    let existing = SELF_HANDLE.with(|h| h.get());
-    if existing != 0 {
-        return existing;
-    }
-    let handle = new_handle();
-    SELF_HANDLE.with(|h| h.set(handle));
-    handle
+    current_identity().handle
+}
+
+/// The live thread with handle `handle`.
+pub fn identity(handle: u32) -> Option<Arc<Identity>> {
+    let identities = IDENTITIES.lock().unwrap_or_else(|e| e.into_inner());
+    identities.as_ref()?.get(&handle).filter(|found| !found.dead.load(Ordering::Acquire)).cloned()
 }
 
 /// Whether `handle` is a thread that exists (and hasn't finished).
 pub fn is_live(handle: u32) -> bool {
-    let shared = shared();
-    let threads = &shared.state.threads;
-    if handle <= FIRST_HANDLE || handle > threads.next_handle {
-        return false;
-    }
-    !matches!(threads.records.get(&handle), Some((true, _, _)))
+    identity(handle).is_some()
 }
 
-fn new_handle() -> u32 {
-    let mut shared = shared();
-    let threads = &mut shared.state.threads;
-    if threads.next_handle == 0 {
-        threads.next_handle = FIRST_HANDLE;
-    }
-    threads.next_handle += 4;
-    threads.next_handle
+fn new_identity() -> Arc<Identity> {
+    let handle = NEXT_HANDLE.fetch_add(4, Ordering::Relaxed) + 4;
+    let made = Arc::new(Identity::new(handle));
+    IDENTITIES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(handle, Arc::clone(&made));
+    made
+}
+
+/// Marks this thread finished: from now on signals to it fail.
+fn retire_identity(identity: &Identity) {
+    let _identities = IDENTITIES.lock().unwrap_or_else(|e| e.into_inner());
+    identity.dead.store(true, Ordering::Release);
 }
 
 fn join_key(handle: u32) -> u64 {
@@ -99,71 +159,102 @@ fn owner_of(value: u32) -> u32 {
     value >> 16
 }
 
-/// Locks a guest mutex, waiting (without the guest lock) while another
-/// thread owns it. `count` is the recursion depth to restore (1 normally).
+/// Locks a guest mutex, waiting while another thread owns it. `count` is the
+/// recursion depth to restore (1 normally). A thread that had to wait takes
+/// the mutex with the waiter bit set, since others may still be asleep on it.
 fn lock(uc: &Uc, mutex: u32, count: u32, try_only: bool) -> u32 {
     let me = uc.get_data().id;
+    let word = mem().atomic_u32(mutex);
+    let mut waited = 0;
     loop {
-        let value = mem().read_u32(mutex);
+        let value = word.load(Ordering::Relaxed);
         let kind = value & TYPE_MASK;
         let owner = owner_of(value);
         if owner == 0 {
-            mem().write_u32(mutex, kind | (me << 16) | count);
-            return 0;
-        }
-        if owner == me {
-            if kind == RECURSIVE {
-                let depth = (value & COUNT_MASK) + 1;
-                mem().write_u32(mutex, kind | (me << 16) | depth);
+            let taken = kind | (value & WAITER_BIT) | waited | (me << 16) | count;
+            if word.compare_exchange_weak(value, taken, Ordering::Acquire, Ordering::Relaxed).is_ok() {
                 return 0;
             }
-            return if try_only { EBUSY } else { EDEADLK };
+            continue;
+        }
+        if owner == me {
+            if kind != RECURSIVE {
+                return if try_only { EBUSY } else { EDEADLK };
+            }
+            let deeper = (value & !COUNT_MASK) | ((value & COUNT_MASK) + 1);
+            if word.compare_exchange_weak(value, deeper, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                return 0;
+            }
+            continue;
         }
         if try_only {
             return EBUSY;
         }
-        wait_on(mutex as u64, None);
+        let marked = value | WAITER_BIT;
+        if value != marked && word.compare_exchange(value, marked, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+            continue;
+        }
+        waited = WAITER_BIT;
+        wait_until(mutex as u64, None, || word.load(Ordering::Relaxed) == marked);
     }
 }
 
 /// Unlocks fully when `all` (for condition waits); returns the old depth.
 fn unlock(uc: &Uc, mutex: u32, all: bool) -> Result<u32, u32> {
     let me = uc.get_data().id;
-    let value = mem().read_u32(mutex);
-    let kind = value & TYPE_MASK;
-    if owner_of(value) != me {
-        return Err(EPERM);
+    let word = mem().atomic_u32(mutex);
+    loop {
+        let value = word.load(Ordering::Relaxed);
+        if owner_of(value) != me {
+            return Err(EPERM);
+        }
+        let depth = value & COUNT_MASK;
+        if all || depth <= 1 {
+            if word.compare_exchange_weak(value, value & TYPE_MASK, Ordering::Release, Ordering::Relaxed).is_ok() {
+                if value & WAITER_BIT != 0 {
+                    wake_on_count(mutex as u64, 1);
+                }
+                return Ok(depth.max(1));
+            }
+        } else if word.compare_exchange_weak(value, (value & !COUNT_MASK) | (depth - 1), Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+            return Ok(depth);
+        }
     }
-    let depth = value & COUNT_MASK;
-    if all || depth <= 1 {
-        mem().write_u32(mutex, kind);
-        wake_on(mutex as u64);
-    } else {
-        mem().write_u32(mutex, kind | (me << 16) | (depth - 1));
-    }
-    Ok(depth.max(1))
+}
+
+/// A wall-clock deadline as an `Instant` (None once it has passed).
+fn instant(deadline: SystemTime) -> Option<std::time::Instant> {
+    deadline.duration_since(SystemTime::now()).ok().map(|left| std::time::Instant::now() + left)
 }
 
 /// Waits on a guest condition variable until signalled or `deadline` passes.
+/// The counter is read before the mutex is let go, so a signal sent after
+/// that is never missed.
 fn condition_wait(uc: &Uc, condition: u32, mutex: u32, deadline: Option<SystemTime>) -> u32 {
-    let start = mem().read_u32(condition);
+    let word = mem().atomic_u32(condition);
+    let start = word.load(Ordering::Acquire);
     let depth = match unlock(uc, mutex, true) {
         Ok(depth) => depth,
         Err(error) => return error,
     };
     let mut result = 0;
-    while mem().read_u32(condition) == start {
-        let timeout = match deadline {
-            Some(deadline) => match deadline.duration_since(SystemTime::now()) {
-                Ok(left) => Some(left),
-                Err(_) => {
+    loop {
+        let until = match deadline {
+            Some(deadline) => match instant(deadline) {
+                Some(until) => Some(until),
+                None => {
                     result = ETIMEDOUT;
                     break;
                 }
             },
             None => None,
         };
-        wait_on(condition as u64, timeout);
+        match wait_until(condition as u64, until, || word.load(Ordering::Acquire) == start) {
+            Wait::Woken | Wait::NotWaiting => break,
+            // A signal handler ran: waits may end early (the caller re-checks).
+            Wait::Interrupted => break,
+            Wait::TimedOut => {}
+        }
     }
     lock(uc, mutex, depth, false);
     result
@@ -172,21 +263,24 @@ fn condition_wait(uc: &Uc, condition: u32, mutex: u32, deadline: Option<SystemTi
 /// Takes one from a semaphore. `wait`: None = don't wait, Some(None) = wait
 /// as long as needed, Some(Some(deadline)) = wait until the deadline.
 fn semaphore_wait(uc: &Uc, semaphore: u32, wait: Option<Option<SystemTime>>) -> Ret {
+    let word = mem().atomic_u32(semaphore);
     loop {
-        let count = mem().read_u32(semaphore);
+        let count = word.load(Ordering::Relaxed);
         if count > 0 {
-            mem().write_u32(semaphore, count - 1);
-            return Ret::U32(0);
+            if word.compare_exchange_weak(count, count - 1, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                return Ret::U32(0);
+            }
+            continue;
         }
-        let timeout = match wait {
+        let until = match wait {
             None => return fail_with(uc, EAGAIN),
             Some(None) => None,
-            Some(Some(deadline)) => match deadline.duration_since(SystemTime::now()) {
-                Ok(left) => Some(left),
-                Err(_) => return fail_with(uc, ETIMEDOUT),
+            Some(Some(deadline)) => match instant(deadline) {
+                Some(until) => Some(until),
+                None => return fail_with(uc, ETIMEDOUT),
             },
         };
-        wait_on(semaphore as u64, timeout);
+        wait_until(semaphore as u64, until, || word.load(Ordering::Relaxed) == 0);
     }
 }
 
@@ -245,8 +339,10 @@ pub fn linux_syscall(uc: &mut Uc, number: u32, arguments: [u32; 6]) -> i64 {
         }
         // ARM cacheflush(start, end, flags): code was written there (a JIT).
         0x000f_0002 => {
-            crate::dynarec::invalidate(first, second);
-            let _ = uc.ctl_remove_cache(first as u64, second as u64);
+            // Unicorn engines see the change before translated code is dropped
+            // (both happen before this thread or any other runs it again).
+            crate::runtime::note_code_change(first, second);
+            crate::dynarec::invalidate(uc, first, second);
             0
         }
         _ => {
@@ -263,52 +359,34 @@ const FUTEX_WAKE_BITSET: u32 = 10;
 const FUTEX_PRIVATE: u32 = 128;
 const FUTEX_CLOCK_REALTIME: u32 = 256;
 
-/// futex(2) on a guest word. Guest threads only run while holding the guest
-/// lock, so waiting gives it up until a wake for this word (or the timeout).
-/// Returns the syscall result (negative errno on failure).
+/// futex(2) on a guest word. Returns the syscall result (negative errno on failure).
 fn futex(uc: &Uc, address: u32, operation: u32, value: u32, timeout: u32) -> i32 {
+    let _ = uc;
     let command = operation & !(FUTEX_PRIVATE | FUTEX_CLOCK_REALTIME);
     match command {
         FUTEX_WAIT | FUTEX_WAIT_BITSET => {
-            if mem().read_u32(address) != value {
-                return -(EAGAIN as i32);
-            }
             let deadline = (timeout != 0).then(|| {
                 if command == FUTEX_WAIT {
                     let relative = Duration::new(
                         mem().read_u32(timeout) as i32 as u64,
                         (mem().read_u32(timeout + 4) as i32).max(0) as u32,
                     );
-                    SystemTime::now() + relative
-                } else if operation & FUTEX_CLOCK_REALTIME != 0 {
-                    guest_time(timeout)
+                    std::time::Instant::now() + relative
                 } else {
-                    monotonic_deadline(timeout)
+                    let deadline = if operation & FUTEX_CLOCK_REALTIME != 0 { guest_time(timeout) } else { monotonic_deadline(timeout) };
+                    instant(deadline).unwrap_or_else(std::time::Instant::now)
                 }
             });
-            let start = shared().state.threads.futex_wakes.get(&address).copied().unwrap_or(0);
-            loop {
-                if shared().state.threads.futex_wakes.get(&address).copied().unwrap_or(0) != start {
-                    return 0;
-                }
-                let left = match deadline {
-                    Some(deadline) => match deadline.duration_since(SystemTime::now()) {
-                        Ok(left) => Some(left),
-                        Err(_) => return -(ETIMEDOUT as i32),
-                    },
-                    None => None,
-                };
-                wait_on(address as u64, left);
+            let word = mem().atomic_u32(address);
+            match wait_until(address as u64, deadline, || word.load(Ordering::Acquire) == value) {
+                Wait::Woken => 0,
+                Wait::NotWaiting => -(EAGAIN as i32),
+                Wait::TimedOut => -(ETIMEDOUT as i32),
+                Wait::Interrupted => -(EINTR as i32),
             }
         }
-        FUTEX_WAKE | FUTEX_WAKE_BITSET => {
-            let _ = uc;
-            let wakes = &mut shared().state.threads.futex_wakes;
-            *wakes.entry(address).or_insert(0) += 1;
-            wake_on(address as u64);
-            // Waiters aren't counted; report as many as were allowed.
-            value.min(i32::MAX as u32) as i32
-        }
+        // Wakes up to `value` waiters and says how many it woke.
+        FUTEX_WAKE | FUTEX_WAKE_BITSET => wake_on_count(address as u64, value) as i32,
         _ => {
             crate::log::line(&format!("[bridge] futex operation {operation} not handled"));
             -38 // ENOSYS
@@ -319,24 +397,30 @@ fn futex(uc: &Uc, address: u32, operation: u32, value: u32, timeout: u32) -> i32
 /// Takes a guest read-write lock for reading or writing.
 fn rwlock_lock(uc: &Uc, lock: u32, write: bool, try_only: bool) -> u32 {
     let me = uc.get_data().id;
+    let word = mem().atomic_u32(lock);
     loop {
-        let value = mem().read_u32(lock);
+        let value = word.load(Ordering::Relaxed);
         let (writer, readers) = (value >> 16, value & RWLOCK_READERS);
         if writer == me {
             return if try_only { EBUSY } else { EDEADLK };
         }
-        if write && value == 0 {
-            mem().write_u32(lock, me << 16);
-            return 0;
-        }
-        if !write && writer == 0 && readers < RWLOCK_READERS {
-            mem().write_u32(lock, readers + 1);
-            return 0;
+        let taken = if write && value == 0 {
+            Some(me << 16)
+        } else if !write && writer == 0 && readers < RWLOCK_READERS {
+            Some(readers + 1)
+        } else {
+            None
+        };
+        if let Some(taken) = taken {
+            if word.compare_exchange_weak(value, taken, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                return 0;
+            }
+            continue;
         }
         if try_only {
             return EBUSY;
         }
-        wait_on(lock as u64, None);
+        wait_until(lock as u64, None, || word.load(Ordering::Relaxed) == value);
     }
 }
 
@@ -358,9 +442,10 @@ fn write_attributes(attributes: u32, flags: u32, stack_base: u32, stack_size: u3
 }
 
 /// Body of a guest thread started with pthread_create.
-fn run_thread(handle: u32, start: u32, argument: u32) {
+fn run_thread(me: Arc<Identity>, start: u32, argument: u32) {
+    let handle = me.handle;
+    SELF.with(|slot| *slot.borrow_mut() = Some(Arc::clone(&me)));
     let _lock = hold_gil();
-    SELF_HANDLE.with(|h| h.set(handle));
     let uc = engine();
     let result = match call_guest(uc, start, &[argument]) {
         Ok(value) => value as u32,
@@ -373,8 +458,10 @@ fn run_thread(handle: u32, start: u32, argument: u32) {
             0
         }
     };
-    run_key_destructors(uc, handle);
-    crate::imports::signals::forget_thread(handle);
+    run_key_destructors(uc, &me);
+    me.exiting.store(true, Ordering::SeqCst);
+    crate::runtime::wait_for_borrow_end(&me);
+    retire_identity(&me);
     {
         let mut shared = shared();
         let records = &mut shared.state.threads.records;
@@ -390,21 +477,26 @@ fn run_thread(handle: u32, start: u32, argument: u32) {
     drop_engine();
 }
 
-fn run_key_destructors(uc: &mut Uc, handle: u32) {
-    let pending: Vec<(u32, u32)> = {
-        let mut shared = shared();
-        let threads = &mut shared.state.threads;
-        let keys: Vec<u32> = threads.values.keys().filter(|(t, _)| *t == handle).map(|(_, k)| *k).collect();
-        keys.iter()
-            .filter_map(|key| {
-                let value = threads.values.remove(&(handle, *key)).unwrap_or(0);
-                let destructor = threads.keys.get(*key as usize).copied().flatten().unwrap_or(0);
-                (value != 0 && destructor != 0).then_some((destructor, value))
-            })
-            .collect()
-    };
-    for (destructor, value) in pending {
-        let _ = call_guest(uc, destructor, &[value]);
+/// Calls the destructors of this thread's non-null thread-specific values
+/// (again while a destructor sets new ones, up to 4 rounds, as POSIX allows).
+fn run_key_destructors(uc: &mut Uc, me: &Identity) {
+    for _ in 0..4 {
+        let mut ran = false;
+        for key in 0..(NEXT_KEY.load(Ordering::Acquire) as usize).min(KEYS) {
+            let slot = KEY_SLOTS[key].load(Ordering::Acquire);
+            let destructor = slot as u32;
+            if slot & KEY_LIVE == 0 || destructor == 0 {
+                continue;
+            }
+            let value = me.values[key].swap(0, Ordering::Relaxed);
+            if value != 0 {
+                let _ = call_guest(uc, destructor, &[value]);
+                ran = true;
+            }
+        }
+        if !ran {
+            break;
+        }
     }
 }
 
@@ -481,9 +573,15 @@ pub fn handler(name: &str) -> Option<Handler> {
             Ret::U32(0)
         }),
         "pthread_cond_destroy" => handler!(|uc, a| Ret::U32(0)),
-        "pthread_cond_signal" | "pthread_cond_broadcast" => handler!(|uc, a| {
+        "pthread_cond_signal" => handler!(|uc, a| {
             let condition = a.u32();
-            mem().write_u32(condition, mem().read_u32(condition).wrapping_add(1));
+            mem().atomic_u32(condition).fetch_add(1, Ordering::Release);
+            wake_on_count(condition as u64, 1);
+            Ret::U32(0)
+        }),
+        "pthread_cond_broadcast" => handler!(|uc, a| {
+            let condition = a.u32();
+            mem().atomic_u32(condition).fetch_add(1, Ordering::Release);
             wake_on(condition as u64);
             Ret::U32(0)
         }),
@@ -532,13 +630,19 @@ pub fn handler(name: &str) -> Option<Handler> {
         "pthread_rwlock_trywrlock" => handler!(|uc, a| Ret::U32(rwlock_lock(uc, a.u32(), true, true))),
         "pthread_rwlock_unlock" => handler!(|uc, a| {
             let lock = a.u32();
-            let value = mem().read_u32(lock);
-            if value >> 16 == uc.get_data().id {
-                mem().write_u32(lock, 0);
-            } else if value & RWLOCK_READERS != 0 && value >> 16 == 0 {
-                mem().write_u32(lock, value - 1);
-            } else {
-                return Ret::U32(EPERM);
+            let word = mem().atomic_u32(lock);
+            loop {
+                let value = word.load(Ordering::Relaxed);
+                let next = if value >> 16 == uc.get_data().id {
+                    0
+                } else if value & RWLOCK_READERS != 0 && value >> 16 == 0 {
+                    value - 1
+                } else {
+                    return Ret::U32(EPERM);
+                };
+                if word.compare_exchange_weak(value, next, Ordering::Release, Ordering::Relaxed).is_ok() {
+                    break;
+                }
             }
             wake_on(lock as u64);
             Ret::U32(0)
@@ -621,13 +725,13 @@ pub fn handler(name: &str) -> Option<Handler> {
         "sem_destroy" => handler!(|uc, a| Ret::U32(0)),
         "sem_post" => handler!(|uc, a| {
             let semaphore = a.u32();
-            mem().write_u32(semaphore, mem().read_u32(semaphore).wrapping_add(1));
-            wake_on(semaphore as u64);
+            mem().atomic_u32(semaphore).fetch_add(1, Ordering::Release);
+            wake_on_count(semaphore as u64, 1);
             Ret::U32(0)
         }),
         "sem_getvalue" => handler!(|uc, a| {
             let (semaphore, out) = (a.u32(), a.u32());
-            mem().write_u32(out, mem().read_u32(semaphore));
+            mem().write_u32(out, mem().atomic_u32(semaphore).load(Ordering::Acquire));
             Ret::U32(0)
         }),
         "sem_wait" => handler!(|uc, a| {
@@ -642,7 +746,7 @@ pub fn handler(name: &str) -> Option<Handler> {
             let (semaphore, deadline) = (a.u32(), a.u32());
             semaphore_wait(uc, semaphore, Some(Some(guest_time(deadline))))
         }),
-        "pthread_self" => handler!(|uc, a| Ret::U32(current_handle())),
+        "pthread_self" => handler!(|uc, a| Ret::U32(uc.get_data().identity.handle)),
         "pthread_exit" => handler!(|uc, a| {
             EXIT_VALUE.with(|v| v.set(Some(a.u32())));
             stop_with_fault(uc, THREAD_EXIT.into());
@@ -654,17 +758,22 @@ pub fn handler(name: &str) -> Option<Handler> {
         }),
         "pthread_create" => handler!(|uc, a| {
             let (out, attributes, start, argument) = (a.u32(), a.u32(), a.u32(), a.u32());
-            let handle = new_handle();
+            let identity = new_identity();
+            let handle = identity.handle;
             let detached = attributes != 0 && mem().read_u32(attributes) & 1 != 0;
             shared().state.threads.records.insert(handle, (false, 0, detached));
             mem().write_u32(out, handle);
             let spawned = std::thread::Builder::new()
                 .name(format!("arm32-guest-{handle:x}"))
-                .spawn(move || run_thread(handle, start, argument));
+                .spawn({
+                    let identity = Arc::clone(&identity);
+                    move || run_thread(identity, start, argument)
+                });
             match spawned {
                 Ok(_) => Ret::U32(0),
                 Err(_) => {
                     shared().state.threads.records.remove(&handle);
+                    retire_identity(&identity);
                     Ret::U32(11)
                 }
             }
@@ -698,61 +807,65 @@ pub fn handler(name: &str) -> Option<Handler> {
                         }
                         return Ret::U32(0);
                     }
-                    Some(_) => wait_on(join_key(handle), None),
+                    Some(_) => {
+                        wait_until(join_key(handle), None, || {
+                            !matches!(shared().state.threads.records.get(&handle), Some((true, _, _)))
+                        });
+                    }
                 }
             }
         }),
         "pthread_once" => handler!(|uc, a| {
             let (control, function) = (a.u32(), a.u32());
+            let word = mem().atomic_u32(control);
             loop {
-                match mem().read_u32(control) {
+                match word.load(Ordering::Acquire) {
                     0 => {
-                        mem().write_u32(control, 1);
+                        if word.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
+                            continue;
+                        }
                         if let Err(error) = call_guest(uc, function, &[]) {
                             stop_with_fault(uc, error);
                         }
-                        mem().write_u32(control, 2);
+                        word.store(2, Ordering::Release);
                         wake_on(control as u64);
                         return Ret::U32(0);
                     }
-                    1 => wait_on(control as u64, Some(Duration::from_millis(5))),
+                    1 => {
+                        wait_until(control as u64, None, || word.load(Ordering::Acquire) == 1);
+                    }
                     _ => return Ret::U32(0),
                 }
             }
         }),
+        // Keys are never reused, as before; values live with each thread.
         "pthread_key_create" => handler!(|uc, a| {
             let (out, destructor) = (a.u32(), a.u32());
-            let mut shared = shared();
-            let keys = &mut shared.state.threads.keys;
-            keys.push(Some(destructor));
-            let key = keys.len() as u32 - 1;
+            let key = NEXT_KEY.fetch_add(1, Ordering::AcqRel);
+            if key as usize >= KEYS {
+                return Ret::U32(EAGAIN);
+            }
+            KEY_SLOTS[key as usize].store(KEY_LIVE | destructor as u64, Ordering::Release);
             mem().write_u32(out, key);
             Ret::U32(0)
         }),
         "pthread_key_delete" => handler!(|uc, a| {
-            let key = a.u32();
-            let mut shared = shared();
-            let threads = &mut shared.state.threads;
-            if let Some(slot) = threads.keys.get_mut(key as usize) {
-                *slot = None;
+            let key = a.u32() as usize;
+            if key >= KEYS || KEY_SLOTS[key].swap(0, Ordering::AcqRel) & KEY_LIVE == 0 {
+                return Ret::U32(EINVAL);
             }
-            threads.values.retain(|(_, k), _| *k != key);
             Ret::U32(0)
         }),
         "pthread_getspecific" => handler!(|uc, a| {
-            let key = a.u32();
-            let me = current_handle();
-            Ret::U32(shared().state.threads.values.get(&(me, key)).copied().unwrap_or(0))
+            let key = a.u32() as usize;
+            Ret::U32(uc.get_data().identity.values.get(key).map_or(0, |value| value.load(Ordering::Relaxed)))
         }),
         "pthread_setspecific" => handler!(|uc, a| {
-            let (key, value) = (a.u32(), a.u32());
-            let me = current_handle();
-            let mut shared = shared();
-            let threads = &mut shared.state.threads;
-            if threads.keys.get(key as usize).copied().flatten().is_none() {
+            let (key, value) = (a.u32() as usize, a.u32());
+            if key >= KEYS || KEY_SLOTS[key].load(Ordering::Acquire) & KEY_LIVE == 0 {
                 return Ret::U32(EINVAL);
             }
-            threads.values.insert((me, key), value);
+            uc.get_data().identity.values[key].store(value, Ordering::Relaxed);
             Ret::U32(0)
         }),
         "sched_yield" => handler!(|uc, a| {

@@ -656,3 +656,147 @@ Card Wars log shows libunity loaded and its JNI_OnLoad ran, no "Failure to initi
   translator cleared C, real ARM keeps it. Cause: arm.rs passed T2 as the result register to shift_register,
   which keeps the amount in T2 for its "amount was 0" check -> the check tested the result instead. Fixed (T6),
   assert added, self-test case added (6 shift/carry cases): passes on PC (Unicorn) and phone (translator).
+
+# Parallel guest threads (no guest lock in translator mode), progress record (2026-10-13)
+- Approved plan: `/tmp/a32k/parallel-plan.md` (copy `~/.cache/parallel-plan.md`): v2 + v3 (R1-R11) + v3.1 (G1-G9).
+  User choices: everything parallel, fix P1 (signals to threads stuck in host calls) and P2 (GLES state per
+  context) now. General fixes only. Sub-agents from 2026-10-13 03:1x: Codex Sol 6.1 high (not fast; out of credits until 04:34) or via `crush spawn --cli opencode`: opencode-go/mimo-v2.6-pro or glm-5.3-flash (reviews read-only). UPDATE 2026-10-13: sub-agents now Claude Sonnet 5.5 high, or OpenCode GLM 5.3 Flash (several at once) / MiMo 2.6 Pro (slow); Claude Fable 5.1 high only for the FINAL review or an absolutely critical one.
+- Checkpoint commit before this work: 0a733ae. Everything since is uncommitted.
+- State: all mechanisms built; parallel on by default (ARM32_PARALLEL=0 turns it off).
+- Phone run before the review fixes (job 263): default, LSE=0, PARALLEL=0, unicorn: 0 failures. Counters exact,
+  1000/1000 signals, blocked read 3 ms, busy threads 181/300 ms (was 4429 ms). FORCE_FALLBACK_SYNC=1: 600 s timeout,
+  blocked read 115 ms (limit 100). CHECK=all: not finished (earlier: 20 differences in rewritten code at
+  0x10001000, checker ran a stale Unicorn copy; checker fixed, not rerun).
+- Blocked-read slowness: helper picks the job up in 0.3-2.4 ms, but delivery took 1.2 ms (default), 51 ms (LSE=0),
+  111 ms (forced fallback). Cause unknown; TEMP timing split added in deliver_for (engine / entered / handlers).
+- Thread-core review (Fable, t5) fixes applied 2026-10-13: #1 call_guest_native returns to IN_GUEST when called
+  from inside guest code; #2 deliver_pending_on enters guest first (waits out a helper's borrow); #4 Identity
+  `exiting` blocks new borrows at thread exit; #5 fence after clearing attention; #6 no wake for a blocked signal
+  (pending/blocked handshake now SeqCst both sides); #7 new engine sets attention if a signal is pending;
+  #8 helper requested for any other-thread target. (#3 fixed earlier.)
+- Translator review redo (t6 failed on Fable's limit): Gemini task t8, diff `/tmp/a32k/translator.diff`.
+- Test scripts: `/tmp/a32k/excl-test2.sh` (phone build + six self-test modes, per-mode time, outputs
+  `/tmp/a32k/st-<mode>.out`), `/tmp/a32k/games-check.sh` (Puzzle Craft 2 + Card Wars 180 s, launch only).
+- 2026-10-13 slow helper delivery explained. TEMP split on the phone: handlers take ~1 ms; the time is the
+  helper's new Unicorn engine. Every new engine (each guest thread + each helper) spends 10-350 ms in its first
+  mem_map (Unicorn's lazy machine init); worse when several threads start at once. PC: ~2 ms.
+  simpleperf (dwarf): uc_init_engine -> arm_cpus_init -> register_cp_regs_for_features ->
+  define_one_arm_cp_reg -> add_cpreg_to_hashtable: thousands of tiny g_memdup/strdup mallocs; the phone's
+  hardened malloc (GrapheneOS: random slots, chacha, per-size-class locks, mprotect) makes each slow and
+  serialises threads. Explains: phone-only, grows with concurrency, fast when a helper engine is reused.
+- Forced-fallback mode is slow, not hung (simpleperf: ~45% in uc_reg_read/uc_reg_write copying ~55 registers
+  each way per fallback; no stop-the-world spinning).
+- 2026-10-13 phone run (review fixes, before pool/batching): default 0 failures (blocked read 89 ms: new helper
+  engine 85 ms); CHECK=all 0 failures, 1374425 blocks checked, 0 differences (stale-code checker fix confirmed);
+  FORCE_FALLBACK_SYNC=1 still 600 s timeout (slow fallbacks, profiled).
+- User chose (2026-10-13): engine pool (finished threads' engines reused, 2 spares built ahead by a builder
+  thread, keep at most 4) and one batch Unicorn register call each way per fallback. Both implemented; PC
+  self-test 0 failures.
+- Translator review (Gemini 3.8 Flash high, t8, 2026-10-13): exclusives, barriers, attention checks, Unicorn
+  patch and checker judged correct. Two findings, both confirmed in code and fixed: (1) HIGH invalidate() unpatched
+  links under stop-the-world without the cross-core sync the plan requires -> sync_other_cores() at the end of
+  the drop; (2) MEDIUM with linking off new blocks were never synced -> sync_other_cores() on that path too.
+- 2026-10-13 final round (pool + batch + all review fixes): default, CHECK=all (1348993 blocks, 0 differences),
+  LSE=0, PARALLEL=0, unicorn: 0 failures. Whole runs much faster (unicorn 32->7 s, PARALLEL=0 57->16 s, LSE=0
+  20->4 s); blocked read 4-5 ms. FORCE_FALLBACK_SYNC=1: still hangs in the counter test even at 2000 rounds.
+- Forced-mode hang evidence: per-thread fallback samples: all four threads at the SWP spinlock (pc 0x1017570,
+  lock 0x1029afc), every swap returns 1, ~1630 of 2000 rounds done -> lock reads taken while nobody holds it
+  (lost release). Ruled out: Unicorn serial "step atomic" (our patch stops with an error on EXCP_ATOMIC; all
+  sampled fallbacks returned Ok). Testing: SWP executed twice (acquire, then re-run reads its own 1).
+- Forced-mode hang, more evidence: FORCE_FALLBACK_SYNC=1 with PARALLEL=0 passes (0 failures) -> parallel-only.
+  Re-run detector (did a thread swap again before its critical section ran, by the test's own counter just
+  before the lock): never fired -> SWP re-execution ruled out. Unicorn engines do get the parallel flag (reg 143
+  in build_engine; not touched by context restore). Next: count acquisitions vs finished critical sections at
+  the hang. Phone was swapping heavily (Ente Photos 3.6 GB, swap full) during these runs: timings unreliable.
+- Hang accounting (07C, forced mode, parallel): all 4 threads hung at SWP, acquisitions 1361 = critical sections done 1361,
+  lock reads 1. Every taken lock was released, yet the lock is set: some SWP wrote 1 over 0 while its thread got 1 back
+  (swap ran twice, or its result was lost). Unicorn builds every block with CF_PARALLEL (checked uc_gen_tb, cpu_exec,
+  cflags_next_tb writers), so the swap itself is atomic. Next: TEMP per-thread counter inside Unicorn's xchg helper
+  (atomic_template.h + uc.c) to log fallbacks where the helper ran != 1 times or its old value != guest result.
+- TEMP helper counter (forced mode, parallel): 0 mismatches (helper ran exactly once per SWP fallback, its old value =
+  guest result), yet hang again (acquisitions 812 = critical sections 812, lock 1). So each swap was honest but not atomic.
+- ROOT CAUSE (forced-mode hang): vendor Unicorn atomic_template.h xchg is `ret = *haddr; *haddr = val;` (plain read,
+  then write) on all compilers (Unicorn's MSVC port change; upstream QEMU uses atomic_xchg__nocheck). The lock owner's
+  release store (translated `str r1=0`) landing between a spinning thread's read (1) and write (1) is lost; lock stays
+  1 forever. Explains: only parallel (PARALLEL=0 passes), only when SWP runs in Unicorn (forced fallback), every acquire
+  released. min/max helpers had the same flaw (compare then plain write). Fix: atomic_xchg__nocheck /
+  atomic_cmpxchg__nocheck (patch 10 in vendor ARM32-BRIDGE.md). All TEMP code removed.
+- 2026-10-13 round after the xchg fix (no TEMP code): phone all six modes 0 failures: default 18 s (busy 145/153 ms),
+  FORCE_FALLBACK_SYNC=1 22 s (was hung 600 s; counters exact 8000), CHECK=all 195 s (1339148 blocks, 0 differences),
+  LSE=0 23 s, PARALLEL=0 50 s, ENGINE=unicorn 29 s. PC release build clean; PC default + forced mode 0 failures.
+- MiMo 2.6 Pro review (t10) of pool / batch copy / signal fixes: all three correct. Findings, each checked in code:
+  (1) MEDIUM deliver_for cleared fault but not exit_code; exit() here only ends the guest call, and helpers keep their
+  engines, so one exit() in a helper-run handler broke every later delivery -> now cleared too. (2) LOW on_interrupt's
+  raw-syscall path (svc inside Unicorn) skipped park_registers/leave_guest, unlike call_stub, so a futex wait there
+  counted as in guest -> now clear_exclusive + park + leave/enter around it. (3) LOW PooledEngine Send over Rc-based
+  Unicorn: sound because an engine is in the pool or one thread's slot, never both -> comment added, no code change.
+- NEW HANG (default mode, 2026-10-13 04:07, build with MiMo fixes): stuck after "semaphores" in the SIGPWR pause/resume
+  test, 0.4% CPU. Threads: main + arm32-guest-101 (the worker) both in futex wait on heap condvars (parkers), signal
+  service idle, NO helper thread ever started. So the worker slept in sem_wait with SIGPWR undelivered: a lost signal
+  wake-up. Earlier runs 068/078 (200 s limit) also stopped right after "semaphores", blamed then on memory pressure,
+  so this is likely pre-existing and intermittent (worse when the phone is slow). Added TEMP dump (file `dump-now`
+  in the working dir -> logs identities, runners, waiters) and /tmp/a32k/hang-loop.sh to reproduce.
+- Repro loop (hang-loop.sh) hung on run 7 of 20. Dump: worker 0x101c in on_pause -> sigsuspend (mask = all but SIGXCPU),
+  pending 0, delivered 1; main 0x1004 waiting on paused_answer (2nd sem_wait). delivered counts FINISHED handlers, and
+  on_pause has not returned, so delivered 1 = on_resume already ran. Cause: TEST RACE, not a bridge bug. on_pause had an
+  empty sa_mask, so SIGXCPU could be delivered (block exit / phone-call return, same as a kernel's delivery points)
+  after `while (!resumed_flag)` read 0 and before sigsuspend's `before` count -> sigsuspend waits for a signal already
+  handled. Same race on real Linux. Mono blocks all signals in its suspend handler (sigfillset sa_mask). Fix: test sets
+  sigfillset(&action.sa_mask) for SIGPWR. Earlier 068/078 "stopped after semaphores" were the same hang. TEMP dump removed.
+- FINAL review, Fable 5.1 high (t11): no HIGH left. (1) MEDIUM cacheflush ran invalidate (STW) then note_code_change,
+  so between them another thread's Unicorn could run its old TB of just-patched code -> order swapped (fixed).
+  (2) MEDIUM guest stacks never reused: bump allocator, 256 MiB, ~247 pthread_creates per session then assert/abort.
+  Pre-existing; not fixed yet (asked the owner). (3) LOW raw svc in Unicorn did not set RESUME_AT -> handler context
+  PC = LR -> set like native_syscall (fixed). (4) LOW checker mode only: reused engine gets duplicate checker hooks
+  (results stay right, hooks pile up per reuse) -> not fixed yet (asked).
+- Test race fix verified: hang-loop 20 runs on the fixed selftest (see next entry).
+- 2026-10-13 04:25 build (xchg fix, MiMo fixes, Fable fixes 1+3, test sa_mask fix, no TEMP code): hang-loop 20/20 ok
+  (was hung on run 7 before the test fix); phone six modes 0 failures (default 21 s, forced 19 s, CHECK=all 185 s with
+  1347771 blocks / 0 differences, LSE=0 21 s, PARALLEL=0 48 s, unicorn 24 s); PC build clean, PC default + forced 0 failures.
+- Owner chose: fix the stack leak now, checker hooks later (TODO: per-engine "checker hooks installed" flag kept
+  through idle_thread, so a reused engine in ARM32_CHECK mode does not add them again).
+- Stack leak fix: new self-test "300 threads one after another" (create + join). Before the fix, PC: panicked at
+  runtime.rs:286 "out of guest stack space", then hung (timeout). Fix: Shared.free_stacks; drop_engine (after the guest
+  thread has finished and woken its joiners; helpers are done before it) pushes the thread's 1 MiB stack top (not
+  thread 1's main stack); alloc_stack reuses a freed one first.
+- Stack fix results: PC release build clean; PC default + forced 0 failures, "many threads: 300 of 300 ran".
+  Phone round NOT run yet: USB link gone (hours later), wireless ADB connected once (192.168.0.2:34559) then pushes
+  failed (EOF) and the phone went offline / stopped advertising. Asked the owner to reconnect.
+- 2026-10-13 phone round with the stack fix (USB): all six modes 0 failures, "many threads: 300 of 300 ran" in every
+  mode; default 15 s, forced 15 s, CHECK=all 155 s (1352627 blocks, 0 differences), LSE=0 15 s, PARALLEL=0 37 s,
+  unicorn 21 s.
+- Review of stack reuse etc., Sonnet 5.5 high (t12): stack reuse sound (helper/exit ordering, double push, lock order,
+  join race checked). (1) MEDIUM thread ids never reused + lock owner stored as id << 16: with stacks reused, churn is
+  unbounded, id 65536 wraps to "no owner" -> two threads in one lock. Fixed: Shared.free_threads keeps (id, stack top,
+  errno slot, TLS block) of finished threads; adopt_engine reuses the whole set (TLS block and errno slot zeroed).
+  (2) LOW RESUME_AT set to None after use, losing an outer value (syscall inside a handler run by deliver_for /
+  safe_point) -> all five sites now restore the previous value. (3) LOW test did not prove reuse -> each thread returns
+  __builtin_frame_address(0); test counts distinct 1 MiB stacks (< 50 of 300 required; later < 150). (4) LOW reused stack not
+  zeroed -> left as is (bionic thread stacks also hold old data when cached).
+- Owner 2026-10-13: Sol 6.1 high sub-agents allowed again (not fast).
+- Sol 6.1 high review (t13) of thread reuse + RESUME_AT + test: id reuse safe (joins/signals/waiters use Identity.handle;
+  runner removal by pointer; helpers done before slots are recycled; TLS zeroing matches a fresh block). (1) MEDIUM a
+  signal raised inside a handler got the OUTER resume point (call_stub did not set RESUME_AT; true before today too
+  unless a syscall had cleared it) -> call_stub now scopes RESUME_AT = its LR through the call and its delivery, then
+  restores. (2) LOW stack count could exceed 50 by scheduling (join returns before drop_engine) -> limit now < 150.
+  (3) LOW a faulting worker returns 0 and could fake reuse -> null frame address fails the test.
+  Previous revision (id reuse) on PC: "300 of 300 ran, on 1 stacks", 0 failures both modes.
+- FINAL verification 2026-10-13 (all fixes, no TEMP code): PC release build clean, PC default + forced 0 failures
+  (300 threads on 1 stack). Phone six modes 0 failures: default 15 s (300 threads on 2 stacks), forced 10 s,
+  CHECK=all 131 s (1343614 blocks, 0 differences), LSE=0 16 s, PARALLEL=0 37 s, unicorn 17 s (each 1 stack).
+  Open for later: checker hooks re-added on reused engines (owner chose later); reused stacks not zeroed (by design).
+
+## 2026-10-13 15:00 — game checks on the phone with today's bridge (parallel threads, engine pool, atomics fix)
+
+Converted and installed each game with `tools/convert.sh` (rebuilds `libarm32_bridge.so`), opened with no taps, read `[fps]` from logcat, closed.
+
+- **Card Wars** (180 s): alive after 180 s (pid 13056), no fatal/fault lines. Unity reached `READY` at 14:57:47 (about 15 s after launch).
+  - fps per minute: 14:57 avg 53.0 (loading; slow seconds 1.8-23.8 only before READY), 14:58 avg 72.2 (min 43.5), 14:59 avg 72.1 (min 69.1), 15:00 avg 71.4 (min 65.7). Median 72.2 over 172 samples.
+  - Steady frame: game code ~13.5-15 ms (own code ~9.3-10.3 ms, phone functions ~4.1-4.9 ms), guest-lock wait 0.00 ms, 26761 stop-all-threads events, 3 signal helpers.
+  - Before today: ~0.5-1.5 fps on the phone (~9.5 under Unicorn). About 50-100x faster.
+  - `dumpsys gfxinfo` printed nothing (Unity draws to its own surface), so the bridge `[fps]` line is the only fps source.
+- **Puzzle Craft 1** (45 s): 119.9-120.0 fps, game code ~6.7 ms. Save files unchanged.
+- **Puzzle Craft 2** (45 s): 105.9-120.1 fps (one 84 ms slow frame), game code ~6.6-8.1 ms. Save files unchanged.
+- gfxinfo for Puzzle Craft counted only 3-5 frames (cocos2d also draws to its own surface), so its janky numbers mean nothing.
+
+Next idea for Card Wars: own code is ~2/3 of the frame; the remaining limit to 120 fps is translated guest code, not locks.

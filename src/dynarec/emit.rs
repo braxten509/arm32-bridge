@@ -190,6 +190,11 @@ impl Asm {
         self.emit(0x3500_0000 | rt);
     }
 
+    pub fn cbnz_x_to(&mut self, rt: Reg, label: Label) {
+        self.fixups.push((self.code.len(), label, Fixup::Branch19));
+        self.emit(0xB500_0000 | rt);
+    }
+
     /// tbz / tbnz on bit `bit` (0-31) of a w register.
     pub fn tbz_to(&mut self, rt: Reg, bit: u32, label: Label) {
         self.fixups.push((self.code.len(), label, Fixup::Branch14));
@@ -220,6 +225,42 @@ impl Asm {
 
     pub fn nop(&mut self) {
         self.emit(0xD503_201F);
+    }
+
+    // ---- atomics and barriers ----
+
+    pub fn dmb_ish(&mut self) {
+        self.emit(0xD503_3BBF);
+    }
+    pub fn dsb_ish(&mut self) {
+        self.emit(0xD503_3B9F);
+    }
+    pub fn isb(&mut self) {
+        self.emit(0xD503_3FDF);
+    }
+    pub fn clrex(&mut self) {
+        self.emit(0xD503_3F5F);
+    }
+    /// SWPAL: rt gets the old [rn], [rn] gets rs (size as for `casal`).
+    pub fn swpal(&mut self, size: u32, rs: Reg, rt: Reg, rn: Reg) {
+        self.emit(0x38E0_8000 | (size << 30) | (rs << 16) | (rn << 5) | rt);
+    }
+    /// CASAL: compare [rn] with rs, store rt if equal; rs gets the old value.
+    /// `size`: 0 byte, 1 halfword, 2 word, 3 doubleword (x registers).
+    pub fn casal(&mut self, size: u32, rs: Reg, rt: Reg, rn: Reg) {
+        self.emit(0x08E0_FC00 | (size << 30) | (rs << 16) | (rn << 5) | rt);
+    }
+    /// LDAXR{B,H} / LDAXR (size as for `casal`).
+    pub fn ldaxr(&mut self, size: u32, rt: Reg, rn: Reg) {
+        self.emit(0x085F_FC00 | (size << 30) | (rn << 5) | rt);
+    }
+    /// STLXR{B,H} / STLXR: ws = 0 on success (size as for `casal`).
+    pub fn stlxr(&mut self, size: u32, ws: Reg, rt: Reg, rn: Reg) {
+        self.emit(0x0800_FC00 | (size << 30) | (ws << 16) | (rn << 5) | rt);
+    }
+    /// x(rd) = x(rn) + (x(rm) >> amount), arithmetic shift.
+    pub fn add_x_asr(&mut self, rd: Reg, rn: Reg, rm: Reg, amount: u32) {
+        self.emit(0x8B80_0000 | (rm << 16) | (amount << 10) | (rn << 5) | rd);
     }
 
     // ---- constants ----
@@ -458,6 +499,9 @@ impl Asm {
     }
     pub fn and_x(&mut self, rd: Reg, rn: Reg, rm: Reg) {
         self.emit(0x8A00_0000 | (rm << 16) | (rn << 5) | rd);
+    }
+    pub fn eor_x(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        self.emit(0xCA00_0000 | (rm << 16) | (rn << 5) | rd);
     }
     pub fn orr_x(&mut self, rd: Reg, rn: Reg, rm: Reg, kind: u32, amount: u32) {
         self.emit(0xAA00_0000 | (kind << 22) | (rm << 16) | (amount << 10) | (rn << 5) | rd);

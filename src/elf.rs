@@ -306,10 +306,52 @@ pub fn set_search_dirs(search_dirs: Vec<PathBuf>) {
     }
 }
 
+/// bionic holds one recursive lock across dlopen (loading and start-up code)
+/// and dlsym, so no other thread sees a library whose start-up code is still
+/// running; a constructor that opens more libraries just goes deeper. Same
+/// here: (owner pthread_t, depth); other threads wait their turn.
+static DL_LOCK: Mutex<(u32, u32)> = Mutex::new((0, 0));
+const DL_LOCK_KEY: u64 = 4 << 32;
+
+/// Holds the dynamic linker lock until dropped.
+pub struct DlLock;
+
+pub fn lock_dl() -> DlLock {
+    let me = crate::imports::threads::current_handle();
+    loop {
+        {
+            let mut lock = DL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            if lock.1 == 0 || lock.0 == me {
+                *lock = (me, lock.1 + 1);
+                return DlLock;
+            }
+        }
+        // Checked again under the waiter list's lock (the futex rule): a
+        // release between the check above and the sleep is not missed.
+        crate::runtime::wait_until(DL_LOCK_KEY, None, || {
+            let lock = DL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            lock.1 != 0 && lock.0 != me
+        });
+    }
+}
+
+impl Drop for DlLock {
+    fn drop(&mut self) {
+        let mut lock = DL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        lock.1 -= 1;
+        if lock.1 == 0 {
+            lock.0 = 0;
+            drop(lock);
+            crate::runtime::wake_on(DL_LOCK_KEY);
+        }
+    }
+}
+
 /// Loads `path` (and the game libraries it needs) into the shared loader,
 /// runs start-up code that hasn't run yet, and returns the library's index.
 /// Loading a library again returns the same index.
 pub fn open(uc: &mut Uc, path: &Path, verbose: bool) -> Result<usize, String> {
+    let _dl = lock_dl();
     let (index, pending) = {
         let mut loader = shared_loader();
         let loader = loader.as_mut().ok_or("the loader isn't set up")?;
