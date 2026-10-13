@@ -6,7 +6,8 @@
 //!   kept next to it as lib<name>-arm32.so. The bridge is added once as
 //!   libarm32_bridge.so; each stand-in hands its original to it when Java
 //!   loads the stand-in.
-//! - Known Java-side problems are fixed in the dex files (dex.rs).
+//! - Known Java-side problems are fixed in the dex files (dex.rs), and
+//!   android:extractNativeLibs is turned on so the parts are files (manifest.rs).
 //! - Phone functions the libraries import that the bridge lacks are listed.
 //!
 //! usage: apk-convert <game.apk> <out.apk> --bridge <libarm32_bridge.so> --standin <libstandin.so>
@@ -17,6 +18,7 @@
 //! Exit codes: 0 converted, 2 usage, 3 already 64-bit, 4 no 32-bit ARM code, 1 other failure.
 
 mod dex;
+mod manifest;
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -153,7 +155,9 @@ fn convert(options: &Options) -> Result<(), Failure> {
             continue;
         }
         let is_dex = name.starts_with("classes") && name.ends_with(".dex") && !name.contains('/');
-        if is_dex || entry.compression() == CompressionMethod::Stored {
+        let is_manifest = name == "AndroidManifest.xml";
+        if is_dex || is_manifest || entry.compression() == CompressionMethod::Stored {
+            let was_stored = entry.compression() == CompressionMethod::Stored;
             drop(entry);
             let mut bytes = Vec::new();
             archive.by_index(index)?.read_to_end(&mut bytes)?;
@@ -166,6 +170,14 @@ fn convert(options: &Options) -> Result<(), Failure> {
                     println!("fix {name}: {}: {} -> {}", fix.reason, fix.old, fix.new);
                 }
                 entry_options = deflated;
+            }
+            if is_manifest {
+                if manifest::extract_native_libs(&mut bytes) == Some(true) {
+                    println!("fix {name}: extractNativeLibs (the bridge reads the 32-bit parts as files): false -> true");
+                }
+                if !was_stored {
+                    entry_options = deflated;
+                }
             }
             writer.start_file(name.as_str(), entry_options)?;
             writer.write_all(&bytes)?;

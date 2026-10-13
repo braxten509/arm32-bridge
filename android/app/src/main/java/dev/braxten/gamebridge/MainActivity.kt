@@ -32,7 +32,6 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -62,7 +61,7 @@ private val Track = Color(0xFF2B2F3F)
 private val ErrorText = Color(0xFFFF8A80)
 
 /** What a game's card shows. */
-private sealed class CardState {
+sealed class CardState {
     object Ready : CardState()
     class Working(val progress: Progress) : CardState()
     object Done : CardState()
@@ -85,8 +84,8 @@ class MainActivity : ComponentActivity() {
         val scope = rememberCoroutineScope()
         var games by remember { mutableStateOf<List<Game>?>(null) }
         var problem by remember { mutableStateOf<String?>(null) }
-        val states = remember { mutableStateMapOf<String, CardState>() }
-        var busy by remember { mutableStateOf(false) }
+        val states = Conversions.states
+        val busy = Conversions.busy
 
         fun refresh() {
             scope.launch {
@@ -109,21 +108,7 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        fun convert(game: Game) {
-            busy = true
-            scope.launch {
-                val outcome = withContext(Dispatchers.IO) {
-                    Converter(this@MainActivity).convert(game) { progress ->
-                        scope.launch { states[game.packageName] = CardState.Working(progress) }
-                    }
-                }
-                states[game.packageName] = when (outcome) {
-                    is Outcome.Installed -> CardState.Done
-                    is Outcome.Failed -> CardState.Failed(outcome.reason)
-                }
-                busy = false
-            }
-        }
+        fun convert(game: Game) = Conversions.convert(this@MainActivity, game)
 
         LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { refresh() }
         LaunchedEffect(Unit) { refresh() }

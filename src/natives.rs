@@ -11,7 +11,7 @@
 //! the 32-bit code (`app::forward`).
 
 use std::ffi::{c_void, CString};
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use jni_sys::*;
@@ -32,6 +32,11 @@ struct Native {
 
 static NATIVES: Mutex<Vec<&'static Native>> = Mutex::new(Vec::new());
 
+/// Whether a connected native method's `Java_*` name ends with `ending`.
+pub fn has_native_ending(ending: &str) -> bool {
+    NATIVES.lock().unwrap().iter().any(|native| native.symbol.ends_with(ending))
+}
+
 /// (class with `/`, method, signature) of every method connected to 32-bit code.
 static CONNECTED: Mutex<Vec<(String, String, String)>> = Mutex::new(Vec::new());
 
@@ -46,6 +51,7 @@ pub extern "C" fn arm32_bridge_connected(class: *const libc::c_char, method: *co
 
 /// Bytes per generated stub.
 const STUB_SIZE: usize = 32;
+/// Stub memory is mapped in blocks of this size, as needed.
 const STUB_MEMORY: usize = 64 << 10;
 
 struct Stubs {
@@ -55,6 +61,9 @@ struct Stubs {
 unsafe impl Send for Stubs {}
 
 static STUBS: Mutex<Option<Stubs>> = Mutex::new(None);
+
+/// (class, method, signature) -> (index in NATIVES, stub address).
+static STUB_BY_METHOD: Mutex<Option<std::collections::HashMap<(String, String, String), (usize, usize)>>> = Mutex::new(None);
 
 extern "C" {
     fn __clear_cache(begin: *mut libc::c_char, end: *mut libc::c_char);
@@ -92,8 +101,10 @@ std::arch::global_asm!(
 
 /// A stub that calls the shared entry with x16 = `index`.
 fn make_stub(index: usize) -> *mut c_void {
+    assert!(index < 1 << 16, "too many native methods");
     let mut stubs = STUBS.lock().unwrap();
-    let stubs = stubs.get_or_insert_with(|| {
+    // A new block when the current one is full; old blocks stay in use.
+    if stubs.as_ref().is_none_or(|stubs| stubs.used + STUB_SIZE > STUB_MEMORY) {
         let base = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -105,9 +116,9 @@ fn make_stub(index: usize) -> *mut c_void {
             )
         };
         assert!(base != libc::MAP_FAILED, "could not map memory for native method stubs");
-        Stubs { base: base as *mut u8, used: 0 }
-    });
-    assert!(stubs.used + STUB_SIZE <= STUB_MEMORY && index < 1 << 16, "too many native methods");
+        *stubs = Some(Stubs { base: base as *mut u8, used: 0 });
+    }
+    let stubs = stubs.as_mut().unwrap();
     let entry = arm32_bridge_native_entry as *const () as u64;
     let words: [u32; 8] = [
         0xD280_0010 | ((index as u32) << 5), // movz x16, #index
@@ -291,14 +302,32 @@ fn native_signatures(env: *mut JNIEnv, class: jclass, name: &str) -> Vec<String>
 /// function at `address`. Returns false if Android refused.
 fn register(env: *mut JNIEnv, class: jclass, class_name: &str, symbol: String, name: &str, signature: &str, address: u32) -> bool {
     let Some((params, returns)) = kinds(signature) else { return false };
-    let native: &'static Native = Box::leak(Box::new(Native { symbol, params, returns, address: AtomicU32::new(address) }));
-    let index = {
-        let mut natives = NATIVES.lock().unwrap();
-        natives.push(native);
-        natives.len() - 1
+    // A method connected again (exported and also registered by the game, or
+    // registered twice) keeps its stub and points it at the new guest function.
+    let key = (class_name.to_string(), name.to_string(), signature.to_string());
+    let stub = {
+        let mut by_method = STUB_BY_METHOD.lock().unwrap();
+        let by_method = by_method.get_or_insert_with(std::collections::HashMap::new);
+        match by_method.get(&key) {
+            Some(&(index, stub)) => {
+                NATIVES.lock().unwrap()[index].address.store(address, Ordering::Relaxed);
+                stub
+            }
+            None => {
+                let native: &'static Native = Box::leak(Box::new(Native { symbol, params, returns, address: AtomicU32::new(address) }));
+                let index = {
+                    let mut natives = NATIVES.lock().unwrap();
+                    natives.push(native);
+                    natives.len() - 1
+                };
+                let stub = make_stub(index) as usize;
+                by_method.insert(key, (index, stub));
+                stub
+            }
+        }
     };
     let (Ok(name), Ok(signature)) = (CString::new(name), CString::new(signature)) else { return false };
-    let method = JNINativeMethod { name: name.as_ptr() as *mut _, signature: signature.as_ptr() as *mut _, fnPtr: make_stub(index) };
+    let method = JNINativeMethod { name: name.as_ptr() as *mut _, signature: signature.as_ptr() as *mut _, fnPtr: stub as *mut c_void };
     let result = jcall!(env, RegisterNatives, class, &method, 1);
     let ok = !clear_exception(env) && result == 0;
     if ok {

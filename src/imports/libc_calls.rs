@@ -1228,6 +1228,38 @@ pub fn handler(name: &str) -> Option<Handler> {
             let name = mem().string(a.u32());
             Ret::U32(lookup_symbol(&name))
         }),
+        "getpagesize" => handler!(|uc, a| Ret::U32(crate::mem::PAGE)),
+        "gettid" => handler!(|uc, a| Ret::U32(unsafe { libc::gettid() } as u32)),
+        // struct utsname is six 65-byte strings on both sides. A 32-bit program
+        // on a 64-bit ARM kernel sees "armv8l" as the machine.
+        "uname" => handler!(|uc, a| {
+            let out = a.u32();
+            let mut names: libc::utsname = unsafe { std::mem::zeroed() };
+            if unsafe { libc::uname(&mut names) } != 0 {
+                sync_errno(uc);
+                return Ret::U32(u32::MAX);
+            }
+            let fields = [names.sysname, names.nodename, names.release, names.version, names.machine, names.domainname];
+            for (i, field) in fields.iter().enumerate() {
+                let bytes: Vec<u8> = field.iter().map(|&c| c as u8).collect();
+                mem().write_bytes(out + i as u32 * 65, &bytes[..65]);
+            }
+            mem().write_bytes(out + 4 * 65, b"armv8l\0");
+            Ret::U32(0)
+        }),
+        // rlim_t is 32 bits for the guest; unlimited stays unlimited.
+        "getrlimit" => handler!(|uc, a| {
+            let (resource, out) = (a.u32(), a.u32());
+            let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            if unsafe { libc::getrlimit(resource as _, &mut limit) } != 0 {
+                sync_errno(uc);
+                return Ret::U32(u32::MAX);
+            }
+            let narrow = |value: libc::rlim_t| if value == libc::RLIM_INFINITY { u32::MAX } else { value.min(u32::MAX as libc::rlim_t - 1) as u32 };
+            mem().write_u32(out, narrow(limit.rlim_cur));
+            mem().write_u32(out + 4, narrow(limit.rlim_max));
+            Ret::U32(0)
+        }),
         "dlclose" => handler!(|uc, a| Ret::U32(0)),
         "dlerror" => handler!(|uc, a| Ret::U32(0)),
         "getcwd" => handler!(|uc, a| {
@@ -1235,10 +1267,13 @@ pub fn handler(name: &str) -> Option<Handler> {
             match std::env::current_dir() {
                 Ok(path) => {
                     let text = path.to_string_lossy().into_owned();
-                    if buffer == 0 || text.len() + 1 > size as usize {
+                    let needed = text.len() as u32 + 1;
+                    if (buffer != 0 || size != 0) && needed > size {
                         set_errno(uc, libc::ERANGE);
                         return Ret::U32(0);
                     }
+                    // getcwd(NULL, size) allocates the buffer (freed by the game with free).
+                    let buffer = if buffer == 0 { shared().heap.malloc(size.max(needed)) } else { buffer };
                     mem().write_bytes(buffer, text.as_bytes());
                     mem().write_u8(buffer + text.len() as u32, 0);
                     Ret::U32(buffer)

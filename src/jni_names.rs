@@ -81,7 +81,14 @@ pub fn demangle(symbol: &str) -> Option<(String, String, Option<String>)> {
         }
         Some(parts)
     };
-    let (name, arguments) = match rest.find("__") {
+    // The overload separator is `__`. A `__` followed by 0 or 1 is instead a part
+    // separator plus an escape (a method `_draw` is `Renderer__1draw`); argument
+    // lists never start with those escapes.
+    let separator = rest
+        .match_indices("__")
+        .map(|(at, _)| at)
+        .find(|&at| !matches!(rest.as_bytes().get(at + 2), Some(b'0' | b'1')));
+    let (name, arguments) = match separator {
         Some(at) => (&rest[..at], Some(&rest[at + 2..])),
         None => (rest, None),
     };
@@ -112,6 +119,18 @@ mod tests {
             Some(("com/a_b/My$Inner".into(), "do_it".into(), Some("ILjava/lang/String;".into())))
         );
         assert_eq!(mangle("com/a_b/My$Inner"), "com_a_1b_My_00024Inner");
+        assert_eq!(
+            demangle("Java_com_game_Renderer__1draw"),
+            Some(("com/game/Renderer".into(), "_draw".into(), None))
+        );
+        assert_eq!(
+            demangle("Java_com_game_Renderer__1draw__I"),
+            Some(("com/game/Renderer".into(), "_draw".into(), Some("I".into())))
+        );
+        assert_eq!(
+            demangle("Java_com_game_Renderer_draw___3B"),
+            Some(("com/game/Renderer".into(), "draw".into(), Some("[B".into())))
+        );
         assert_eq!(kinds("(I[BLjava/lang/String;JFD)Z"), Some((b"ILLJFD".to_vec(), b'Z')));
         assert_eq!(kinds("()[Ljava/lang/String;"), Some((vec![], b'L')));
     }

@@ -18,6 +18,7 @@ use crate::runtime::{mem, shared, ArgSource, Handler, Ret};
 
 const GL_ARRAY_BUFFER: u32 = 0x8892;
 const GL_ELEMENT_ARRAY_BUFFER: u32 = 0x8893;
+const GL_MAP_READ_BIT: u32 = 0x0001;
 const GL_BUFFER_SIZE: u32 = 0x8764;
 
 pub fn guest_pointer(guest: u32) -> *mut c_void {
@@ -265,6 +266,23 @@ fn special(name: &str) -> Option<Handler> {
                 return Ret::U32(0);
             }
             let copy = shared().heap.malloc(size as u32);
+            // Start from the buffer's current contents: unmapping uploads the
+            // whole copy, so parts the game doesn't write must stay as they were.
+            let current = unsafe {
+                host!("glMapBufferRange", fn(u32, isize, isize, u32) -> *mut c_void)(target, 0, size as isize, GL_MAP_READ_BIT)
+            };
+            if current.is_null() {
+                // A GLES2-only context can't read buffers back; drop the error that left.
+                unsafe {
+                    host!("glGetError", fn() -> u32)();
+                    std::ptr::write_bytes(guest_pointer(copy) as *mut u8, 0, size as usize);
+                }
+            } else {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(current as *const u8, guest_pointer(copy) as *mut u8, size as usize);
+                    host!("glUnmapBuffer", fn(u32) -> u8)(target);
+                }
+            }
             BINDINGS.with(|b| b.borrow_mut().mapped.insert(target, (copy, size as u32)));
             Ret::U32(copy)
         }),
@@ -282,6 +300,37 @@ fn special(name: &str) -> Option<Handler> {
         "glGetPointerv" => handler!(|uc, a| {
             crate::log::line("[bridge] the game asked GL for a pointer; returning NULL");
             let (_name, out) = (a.u32(), a.u32());
+            if out != 0 {
+                mem().write_u32(out, 0);
+            }
+            Ret::Void
+        }),
+        // The indices argument is a list of 32-bit guest pointers (or offsets
+        // into the bound element buffer); the 64-bit driver reads 8-byte ones.
+        "glMultiDrawElementsEXT" => handler!(|uc, a| {
+            let (mode, counts, kind, indices, draw_count) = (a.u32(), a.u32(), a.u32(), a.u32(), a.i32());
+            let has_buffer = element_buffer() != 0;
+            let host_indices: Vec<*mut c_void> = (0..draw_count.max(0) as u32)
+                .map(|i| {
+                    let entry = mem().read_u32(indices + i * 4);
+                    if has_buffer { entry as usize as *mut c_void } else { guest_pointer(entry) }
+                })
+                .collect();
+            unsafe {
+                host!("glMultiDrawElementsEXT", fn(u32, *mut c_void, u32, *const *mut c_void, i32))(
+                    mode,
+                    guest_pointer(counts),
+                    kind,
+                    host_indices.as_ptr(),
+                    draw_count,
+                )
+            };
+            Ret::Void
+        }),
+        // Driver memory sits outside the guest's 4 GiB, so the game can't use it.
+        "glExtGetBufferPointervQCOM" => handler!(|uc, a| {
+            crate::log::line("[bridge] the game asked GL for a pointer; returning NULL");
+            let (_target, out) = (a.u32(), a.u32());
             if out != 0 {
                 mem().write_u32(out, 0);
             }

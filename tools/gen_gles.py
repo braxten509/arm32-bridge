@@ -26,6 +26,7 @@ SPECIAL = {
     "glGetVertexAttribPointerv", "glGetBufferPointervOES",
     "glVertexPointer", "glColorPointer", "glTexCoordPointer", "glNormalPointer", "glPointSizePointerOES",
     "glMatrixIndexPointerOES", "glWeightPointerOES", "glGetPointerv",
+    "glMultiDrawElementsEXT", "glExtGetBufferPointervQCOM",
 }
 
 INTEGER = {

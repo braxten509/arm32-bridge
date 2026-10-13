@@ -88,6 +88,10 @@ fn load_memory(preloader: &mut Preloader) {
 
 fn remember(kind: &str, sound: &str) {
     let Some(path) = memory_file() else { return };
+    // A fresh game may not have its files folder yet.
+    if let Some(folder) = path.parent() {
+        let _ = std::fs::create_dir_all(folder);
+    }
     if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         let _ = writeln!(file, "{kind}\t{sound}");
     }

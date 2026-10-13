@@ -226,3 +226,20 @@ Card Wars log shows libunity loaded and its JNI_OnLoad ran, no "Failure to initi
   returned 0) and read address 0. Next blocker = missing phone functions (369 listed by the converter), not loading.
 - Conclusion: the loading fix works (Card Wars gets past "Failure to initialize"). Card Wars needs more phone
   functions next; stopped here to ask the user.
+### 2. Review fixes, PC1 pause guard, Card Wars step 1 (approved plans)
+- PC1 pause guard (app.rs forward): until a *_nativeInit has returned, *_nativeOnPause/OnResume are skipped, only
+  in games that have a nativeInit. Same monkey launch (Android relaunched the activity again): 3 calls skipped,
+  title reached, 119.9-120.1 fps, save kept ("Test", Lvl 2).
+- Review fixes: JNI names starting with _ (unit tests added); a re-registered method keeps its stub, stub memory
+  grows in 64 KiB blocks (no 2,048 cap); converter turns android:extractNativeLibs false -> true (checked on a
+  Card Wars copy flipped to false: aapt2 shows true after converting); glMultiDrawElementsEXT converts the 32-bit
+  index pointer list, glExtGetBufferPointervQCOM returns NULL, glMapBufferOES starts from the buffer's contents
+  (glMapBufferRange read; zero + clear error if that fails); Game Bridge conversion state lives in a process-wide
+  object; getcwd(NULL) allocates; the sound list creates files/.
+- @CriticalNative: not done. Its annotation has CLASS retention, so reflection can't see it at run time; put to the user.
+- Card Wars step 1: getpagesize, gettid, uname ("armv8l"), getrlimit, pthread_rwlock (6), pthread_condattr (3,
+  monotonic clock remembered per condition variable), pthread_attr (7, detached honoured by pthread_create),
+  pthread_getattr_np (real guest stack), sched (5), pthread_get/setschedparam, pthread_setname_np.
+  Missing list 369 -> 342. PC tests pass; PC2 120 fps.
+- Card Wars now stops at libunity's start-up: mmap (no handler, returned 0) then munmap, then a read of address 0.
+  mmap is on the "stop and ask" list (memory mapping) -> asked the user.

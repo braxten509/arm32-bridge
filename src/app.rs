@@ -11,7 +11,7 @@
 
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -75,6 +75,9 @@ fn library_directory() -> &'static PathBuf {
     static DIRECTORY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     DIRECTORY.get_or_init(|| library_path().parent().map(PathBuf::from).unwrap_or_default())
 }
+
+/// Whether a native method named *_nativeInit has returned (see `forward`).
+static NATIVE_INIT_DONE: AtomicBool = AtomicBool::new(false);
 
 /// The guest's JavaVM, made on the first load.
 static GUEST_VM: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
@@ -272,6 +275,18 @@ fn request_refresh_rate(env: *mut JNIEnv) {
 
 /// Calls the 32-bit `symbol` for a Java native method and converts the result.
 pub fn forward(env: *mut JNIEnv, symbol: &str, address: &AtomicU32, args: &[HostArg], returns: u8) -> HostValue {
+    // Android can pause a game before its renderer has started (it restarts the
+    // screen when the screen size changes at launch). Older cocos2d-x then reads
+    // objects nativeInit hasn't made yet; later versions skip these calls until
+    // nativeInit has finished, and so does the bridge (only for games that have one).
+    let is_init = symbol.ends_with("_nativeInit");
+    if (symbol.ends_with("_nativeOnPause") || symbol.ends_with("_nativeOnResume"))
+        && !NATIVE_INIT_DONE.load(Ordering::Relaxed)
+        && crate::natives::has_native_ending("_nativeInit")
+    {
+        crate::log::line(&format!("[bridge] skipped {symbol}: the game hasn't started yet"));
+        return HostValue(0);
+    }
     let is_frame = symbol.ends_with("_nativeRender");
     if symbol.ends_with("_nativeOnSurfaceChanged") || symbol.ends_with("_nativeInit") {
         request_refresh_rate(env);
@@ -322,6 +337,9 @@ pub fn forward(env: *mut JNIEnv, symbol: &str, address: &AtomicU32, args: &[Host
     };
     if is_frame {
         count_frame(started.elapsed(), crate::runtime::phone_time() - phone_before);
+    }
+    if is_init {
+        NATIVE_INIT_DONE.store(true, Ordering::Relaxed);
     }
     HostValue(value)
 }

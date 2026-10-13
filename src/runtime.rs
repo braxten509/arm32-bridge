@@ -178,7 +178,7 @@ const SVC: u32 = 0xEF00_0000;
 const BX_LR: u32 = 0xE12F_FF1E;
 const UDF: u32 = 0xE7F0_00F0;
 
-const MAIN_STACK_SIZE: u32 = 8 << 20;
+pub const MAIN_STACK_SIZE: u32 = 8 << 20;
 pub const THREAD_STACK_SIZE: u32 = 1 << 20;
 /// Phone-function calls at least this slow (in ms) are logged as "[slow]".
 const SLOW_CALL_MS: u64 = 5;

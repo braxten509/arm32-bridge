@@ -8,6 +8,11 @@
 //!   bits 16-31 owner thread, bits 0-11 lock count.
 //! - pthread_cond_t: a counter bumped by every signal/broadcast.
 //! - pthread_once_t: 0 not run, 1 running, 2 done.
+//! - pthread_rwlock_t (40 bytes, first word used): bits 16-31 writer thread,
+//!   bits 0-15 reader count.
+//! - pthread_condattr_t: the clock (CLOCK_REALTIME 0 / CLOCK_MONOTONIC 1).
+//! - pthread_attr_t (24 bytes): flags (1 = detached), stack base, stack size,
+//!   guard size, policy, priority.
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -40,6 +45,8 @@ pub struct Threads {
     records: HashMap<u32, (bool, u32, bool)>,
     /// Thread-specific data: key → live, and (thread, key) → value.
     keys: Vec<Option<u32>>,
+    /// Condition variables whose timed waits use CLOCK_MONOTONIC deadlines.
+    monotonic_conditions: std::collections::HashSet<u32>,
     values: HashMap<(u32, u32), u32>,
 }
 
@@ -175,6 +182,58 @@ fn guest_time(pointer: u32) -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(seconds.max(0) as u64) + Duration::from_nanos(nanoseconds.max(0) as u64)
 }
 
+/// A CLOCK_MONOTONIC deadline as a wall-clock time.
+fn monotonic_deadline(pointer: u32) -> SystemTime {
+    let wanted = Duration::new(mem().read_u32(pointer) as i32 as u64, (mem().read_u32(pointer + 4) as i32).max(0) as u32);
+    let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
+    let now = Duration::new(now.tv_sec as u64, now.tv_nsec as u32);
+    SystemTime::now() + wanted.saturating_sub(now)
+}
+
+const RWLOCK_READERS: u32 = 0xFFFF;
+
+/// Takes a guest read-write lock for reading or writing.
+fn rwlock_lock(uc: &Uc, lock: u32, write: bool, try_only: bool) -> u32 {
+    let me = uc.get_data().id;
+    loop {
+        let value = mem().read_u32(lock);
+        let (writer, readers) = (value >> 16, value & RWLOCK_READERS);
+        if writer == me {
+            return if try_only { EBUSY } else { EDEADLK };
+        }
+        if write && value == 0 {
+            mem().write_u32(lock, me << 16);
+            return 0;
+        }
+        if !write && writer == 0 && readers < RWLOCK_READERS {
+            mem().write_u32(lock, readers + 1);
+            return 0;
+        }
+        if try_only {
+            return EBUSY;
+        }
+        wait_for_guests(None);
+    }
+}
+
+/// Size of the guest stack of thread `id` (see runtime::engine).
+fn stack_size(id: u32) -> u32 {
+    if id == 1 {
+        crate::runtime::MAIN_STACK_SIZE
+    } else {
+        crate::runtime::THREAD_STACK_SIZE
+    }
+}
+
+/// Fills a guest pthread_attr_t.
+fn write_attributes(attributes: u32, flags: u32, stack_base: u32, stack_size: u32) {
+    let values = [flags, stack_base, stack_size, 4096, 0, 0];
+    for (i, value) in values.iter().enumerate() {
+        mem().write_u32(attributes + i as u32 * 4, *value);
+    }
+}
+
 /// Body of a guest thread started with pthread_create.
 fn run_thread(handle: u32, start: u32, argument: u32) {
     let _lock = hold_gil();
@@ -259,7 +318,15 @@ pub fn handler(name: &str) -> Option<Handler> {
             Ret::U32(0)
         }),
         "pthread_cond_init" => handler!(|uc, a| {
-            mem().write_u32(a.u32(), 0);
+            let (condition, attributes) = (a.u32(), a.u32());
+            mem().write_u32(condition, 0);
+            let monotonic = attributes != 0 && mem().read_u32(attributes) == 1;
+            let conditions = &mut shared().state.threads.monotonic_conditions;
+            if monotonic {
+                conditions.insert(condition);
+            } else {
+                conditions.remove(&condition);
+            }
             Ret::U32(0)
         }),
         "pthread_cond_destroy" => handler!(|uc, a| Ret::U32(0)),
@@ -275,8 +342,114 @@ pub fn handler(name: &str) -> Option<Handler> {
         }),
         "pthread_cond_timedwait" => handler!(|uc, a| {
             let (condition, mutex, deadline) = (a.u32(), a.u32(), a.u32());
-            Ret::U32(condition_wait(uc, condition, mutex, Some(guest_time(deadline))))
+            let monotonic = shared().state.threads.monotonic_conditions.contains(&condition);
+            let deadline = if monotonic { monotonic_deadline(deadline) } else { guest_time(deadline) };
+            Ret::U32(condition_wait(uc, condition, mutex, Some(deadline)))
         }),
+        "pthread_condattr_init" => handler!(|uc, a| {
+            mem().write_u32(a.u32(), 0);
+            Ret::U32(0)
+        }),
+        "pthread_condattr_destroy" => handler!(|uc, a| Ret::U32(0)),
+        "pthread_condattr_setclock" => handler!(|uc, a| {
+            let (attributes, clock) = (a.u32(), a.u32());
+            if clock > 1 {
+                return Ret::U32(EINVAL);
+            }
+            mem().write_u32(attributes, clock);
+            Ret::U32(0)
+        }),
+        "pthread_rwlock_init" => handler!(|uc, a| {
+            mem().write_u32(a.u32(), 0);
+            Ret::U32(0)
+        }),
+        "pthread_rwlock_destroy" => handler!(|uc, a| Ret::U32(0)),
+        "pthread_rwlock_rdlock" => handler!(|uc, a| Ret::U32(rwlock_lock(uc, a.u32(), false, false))),
+        "pthread_rwlock_tryrdlock" => handler!(|uc, a| Ret::U32(rwlock_lock(uc, a.u32(), false, true))),
+        "pthread_rwlock_wrlock" => handler!(|uc, a| Ret::U32(rwlock_lock(uc, a.u32(), true, false))),
+        "pthread_rwlock_trywrlock" => handler!(|uc, a| Ret::U32(rwlock_lock(uc, a.u32(), true, true))),
+        "pthread_rwlock_unlock" => handler!(|uc, a| {
+            let lock = a.u32();
+            let value = mem().read_u32(lock);
+            if value >> 16 == uc.get_data().id {
+                mem().write_u32(lock, 0);
+            } else if value & RWLOCK_READERS != 0 && value >> 16 == 0 {
+                mem().write_u32(lock, value - 1);
+            } else {
+                return Ret::U32(EPERM);
+            }
+            wake_guests();
+            Ret::U32(0)
+        }),
+        "pthread_attr_init" => handler!(|uc, a| {
+            write_attributes(a.u32(), 0, 0, crate::runtime::THREAD_STACK_SIZE);
+            Ret::U32(0)
+        }),
+        "pthread_attr_destroy" => handler!(|uc, a| Ret::U32(0)),
+        "pthread_attr_setdetachstate" => handler!(|uc, a| {
+            let (attributes, detached) = (a.u32(), a.u32());
+            if detached > 1 {
+                return Ret::U32(EINVAL);
+            }
+            mem().write_u32(attributes, (mem().read_u32(attributes) & !1) | detached);
+            Ret::U32(0)
+        }),
+        "pthread_attr_getdetachstate" => handler!(|uc, a| {
+            let (attributes, out) = (a.u32(), a.u32());
+            mem().write_u32(out, mem().read_u32(attributes) & 1);
+            Ret::U32(0)
+        }),
+        // Guest threads get the bridge's fixed stack size whatever is asked.
+        "pthread_attr_setstacksize" => handler!(|uc, a| {
+            let (attributes, size) = (a.u32(), a.u32());
+            mem().write_u32(attributes + 8, size);
+            Ret::U32(0)
+        }),
+        "pthread_attr_getstacksize" => handler!(|uc, a| {
+            let (attributes, out) = (a.u32(), a.u32());
+            mem().write_u32(out, mem().read_u32(attributes + 8));
+            Ret::U32(0)
+        }),
+        "pthread_attr_getstack" => handler!(|uc, a| {
+            let (attributes, base_out, size_out) = (a.u32(), a.u32(), a.u32());
+            mem().write_u32(base_out, mem().read_u32(attributes + 4));
+            mem().write_u32(size_out, mem().read_u32(attributes + 8));
+            Ret::U32(0)
+        }),
+        // The calling thread's real guest stack (garbage collectors scan it).
+        "pthread_getattr_np" => handler!(|uc, a| {
+            let (thread, attributes) = (a.u32(), a.u32());
+            if thread != current_handle() {
+                write_attributes(attributes, 0, 0, crate::runtime::THREAD_STACK_SIZE);
+                return Ret::U32(0);
+            }
+            let data = uc.get_data();
+            let size = stack_size(data.id);
+            write_attributes(attributes, 0, data.stack_top - size, size);
+            Ret::U32(0)
+        }),
+        "pthread_getschedparam" => handler!(|uc, a| {
+            let (_thread, policy, parameters) = (a.u32(), a.u32(), a.u32());
+            mem().write_u32(policy, 0);
+            mem().write_u32(parameters, 0);
+            Ret::U32(0)
+        }),
+        "pthread_setschedparam" => handler!(|uc, a| Ret::U32(0)),
+        "pthread_setname_np" => handler!(|uc, a| Ret::U32(0)),
+        // SCHED_OTHER (0) has only priority 0; SCHED_FIFO (1) and SCHED_RR (2) 1-99.
+        "sched_get_priority_max" => handler!(|uc, a| Ret::U32(if matches!(a.u32(), 1 | 2) { 99 } else { 0 })),
+        "sched_get_priority_min" => handler!(|uc, a| Ret::U32(if matches!(a.u32(), 1 | 2) { 1 } else { 0 })),
+        "sched_getcpu" => handler!(|uc, a| Ret::U32(unsafe { libc::sched_getcpu() } as u32)),
+        "sched_getaffinity" => handler!(|uc, a| {
+            let (_pid, size, mask) = (a.u32(), a.u32(), a.u32());
+            let result = unsafe { libc::sched_getaffinity(0, size as usize, crate::imports::gles::guest_pointer(mask) as *mut libc::cpu_set_t) };
+            if result < 0 {
+                return fail_with(uc, EINVAL);
+            }
+            Ret::U32(0)
+        }),
+        // The guest's threads are the bridge's; leave their CPUs alone.
+        "sched_setaffinity" => handler!(|uc, a| Ret::U32(0)),
         // Semaphores: the first word of the guest sem_t is the count.
         "sem_init" => handler!(|uc, a| {
             let (semaphore, _shared, value) = (a.u32(), a.u32(), a.u32());
@@ -313,9 +486,10 @@ pub fn handler(name: &str) -> Option<Handler> {
             Ret::U32((x == y) as u32)
         }),
         "pthread_create" => handler!(|uc, a| {
-            let (out, _attributes, start, argument) = (a.u32(), a.u32(), a.u32(), a.u32());
+            let (out, attributes, start, argument) = (a.u32(), a.u32(), a.u32(), a.u32());
             let handle = new_handle();
-            shared().state.threads.records.insert(handle, (false, 0, false));
+            let detached = attributes != 0 && mem().read_u32(attributes) & 1 != 0;
+            shared().state.threads.records.insert(handle, (false, 0, detached));
             mem().write_u32(out, handle);
             let spawned = std::thread::Builder::new()
                 .name(format!("arm32-guest-{handle:x}"))
