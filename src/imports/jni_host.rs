@@ -830,6 +830,25 @@ pub fn dispatch(uc: &mut Uc, name: &str, a: &mut Args) -> Ret {
         }
         "GetDirectBufferCapacity" => Ret::U64(jcall!(env, GetDirectBufferCapacity, to_host(a.u32())) as u64),
         "GetObjectRefType" => Ret::U32(jcall!(env, GetObjectRefType, to_host(a.u32())) as u32),
+        "FromReflectedMethod" | "FromReflectedField" => {
+            let member = to_host(a.u32());
+            if member.is_null() {
+                return Ret::U32(0);
+            }
+            let host = if name == "FromReflectedMethod" {
+                jcall!(env, FromReflectedMethod, member) as usize
+            } else {
+                jcall!(env, FromReflectedField, member) as usize
+            };
+            #[cfg(target_os = "android")]
+            let described = crate::natives::reflected_member(env, member);
+            #[cfg(not(target_os = "android"))]
+            let described: Option<(String, String)> = None;
+            match described {
+                Some((member_name, signature)) => Ret::U32(member_handle(host, member_name, signature)),
+                None => Ret::U32(0),
+            }
+        }
         other => {
             crate::log::line(&format!("[bridge] JNI {other} is not bridged; returned 0"));
             Ret::U32(0)

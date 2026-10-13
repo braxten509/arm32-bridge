@@ -140,6 +140,17 @@ pub fn reference(uc: &mut Uc, pc: u32, end: u32, stop_at: u32) -> Option<Referen
     let mut end_state = start;
     let mut failed = false;
     let exit_pc = loop {
+        // A raw system call ends the translated block before it runs (the dispatcher
+        // runs it afterwards): stop here too, and never make the call twice.
+        let (is_svc, size) = if thumb == 1 {
+            (guest_mem().read_u16(current) >> 8 == 0xDF, 2)
+        } else {
+            let word = guest_mem().read_u32(current);
+            ((word >> 24) & 0xF == 0xF && word >> 28 != 0xF, 4)
+        };
+        if is_svc && !(crate::mem::STUB_BASE..crate::mem::STUB_BASE + crate::mem::STUB_SIZE).contains(&current) {
+            break (current + size) | thumb;
+        }
         let result = uc.emu_start((current | thumb) as u64, stop_at as u64, 0, 1);
         steps += 1;
         EXECUTED.with(|ran| executed.extend(ran.borrow_mut().drain(..).map(|(address, size)| (address, size, steps))));

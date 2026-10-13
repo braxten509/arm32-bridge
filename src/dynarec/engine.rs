@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 use unicorn_engine::RegisterARM;
@@ -29,6 +29,7 @@ impl Native {
     pub fn new(tls: u32) -> Native {
         let mut state = CpuState::default();
         state.tls = tls;
+        state.preempt_flag = runtime::preempt_flag_address();
         Native { state, active: false, check_hook: false }
     }
 }
@@ -272,6 +273,12 @@ struct Cache {
     starts: Vec<(usize, u32)>,
     /// Guest pc not translated yet → exits waiting to be linked to it.
     pending: PcMap<Vec<usize>>,
+    /// Guest pc → exits linked straight to its block (undone if it's dropped).
+    incoming: PcMap<Vec<usize>>,
+    /// Blocks outside the libraries (code a game made while running), by
+    /// (first guest address, pc) → guest address just past the block, so a
+    /// cache flush can find the blocks it covers.
+    made_blocks: std::collections::BTreeMap<(u32, u32), u32>,
     table: Box<[JumpEntry]>,
     /// Fallback sites: guest pc → times run in Unicorn (ARM32_STATS=1 prints them).
     fallbacks: HashMap<u32, u64>,
@@ -294,6 +301,8 @@ fn with_cache<R>(work: impl FnOnce(&mut Cache) -> R) -> R {
             memory: CodeMemory::new(),
             blocks: PcMap::default(),
             pending: PcMap::default(),
+            incoming: PcMap::default(),
+            made_blocks: std::collections::BTreeMap::new(),
             starts: Vec::new(),
             table,
             fallbacks: HashMap::new(),
@@ -371,6 +380,44 @@ mod fault {
     }
 }
 
+/// Longest guest span one block covers (blocks stop well before this).
+const MAX_BLOCK_SPAN: u32 = 4096;
+
+/// Drops translations of guest code in [start, end) that the game made while
+/// running (it rewrote that memory and flushed the CPU cache). Exits linked
+/// to dropped blocks go back to the dispatcher and relink on retranslation.
+pub fn invalidate(start: u32, end: u32) {
+    with_cache(|cache| {
+        let dropped: Vec<u32> = cache
+            .made_blocks
+            .range((start.saturating_sub(MAX_BLOCK_SPAN), 0)..(end, 0))
+            .filter(|&(&(first, _), &block_end)| block_end > start && first < end)
+            .map(|(&(_, pc), _)| pc)
+            .collect();
+        DROPPED.fetch_add(dropped.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        for pc in dropped {
+            cache.made_blocks.remove(&(pc & !1, pc));
+            cache.blocks.remove(&pc);
+            for site in cache.incoming.remove(&pc).unwrap_or_default() {
+                unpatch_link(site);
+                cache.pending.entry(pc).or_default().push(site);
+            }
+            let entry = &mut cache.table[((pc >> 1) & ((1 << JUMP_TABLE_BITS) - 1)) as usize];
+            if entry.guest_pc == pc {
+                *entry = JumpEntry { guest_pc: u32::MAX, _pad: 0, code: 0 };
+            }
+        }
+    });
+}
+
+/// Puts the `nop` back at a linked exit, so it leaves through the dispatcher.
+fn unpatch_link(site: usize) {
+    unsafe {
+        std::ptr::write_volatile(site as *mut u32, 0xD503_201F);
+        __clear_cache(site as *mut libc::c_char, (site + 4) as *mut libc::c_char);
+    }
+}
+
 /// Turns the `nop` at `site` into `b target`.
 fn patch_link(site: usize, target: usize) {
     let offset = (target as i64 - site as i64) / 4;
@@ -397,17 +444,25 @@ fn block_for(pc: u32) -> (usize, u32, usize, usize) {
         let address = cache.memory.place(&block.code);
         cache.blocks.insert(pc, (address, block.end));
         cache.starts.push((address, pc));
+        if !(mem::LIB_BASE..mem::LIB_END).contains(&(pc & !1)) {
+            cache.made_blocks.insert((pc & !1, pc), block.end);
+        }
         if linking() {
             for &(at, target) in &block.links {
                 let site = address + at * 4;
                 if let Some(&(code, _)) = cache.blocks.get(&target) {
                     patch_link(site, code);
+                    cache.incoming.entry(target).or_default().push(site);
                 } else if !(mem::STUB_BASE..mem::STUB_BASE + mem::STUB_SIZE).contains(&(target & !1)) {
                     cache.pending.entry(target).or_default().push(site);
                 }
             }
-            for site in cache.pending.remove(&pc).unwrap_or_default() {
+            let waiting = cache.pending.remove(&pc).unwrap_or_default();
+            for &site in &waiting {
                 patch_link(site, address);
+            }
+            if !waiting.is_empty() {
+                cache.incoming.entry(pc).or_default().extend(waiting);
             }
             let entry = &mut cache.table[((pc >> 1) & ((1 << JUMP_TABLE_BITS) - 1)) as usize];
             *entry = JumpEntry { guest_pc: pc, _pad: 0, code: address };
@@ -422,9 +477,16 @@ type EnterFn = unsafe extern "C" fn(*mut CpuState, *mut u8, usize, usize) -> u32
 pub fn run(uc: &mut Uc, pc: u32, stop_at: u32) -> Result<(), String> {
     let memory_base = guest_mem().host(0) as *mut u8;
     let mut pc = pc;
+    // The block that jumped to `pc` (for fault messages).
+    let mut came_from = 0u32;
     loop {
         if pc & !1 == stop_at {
             return Ok(());
+        }
+        if runtime::preempt_requested() {
+            // Another guest thread has waited a whole time slice (linked exits
+            // came here instead of jumping on): give it a turn.
+            runtime::share_gil(pc);
         }
         let address = pc & !1;
         if address >= mem::STUB_BASE && address < mem::STUB_BASE + mem::STUB_SIZE {
@@ -455,6 +517,15 @@ pub fn run(uc: &mut Uc, pc: u32, stop_at: u32) -> Result<(), String> {
             pc = fallback(uc, pc, 1, stop_at)?;
             continue;
         }
+        if !mem::executable(address) {
+            let message = format!(
+                "jumped to {pc:#010x}, which is not code, from the block at {came_from:#010x} (lr {:#010x}, sp {:#010x})",
+                uc.reg(LR),
+                uc.reg(13)
+            );
+            uc.get_data_mut().fault = Some(message.clone());
+            return Err(message);
+        }
         let (code, end, enter, exit_stub) = block_for(pc);
         let reference = if check::enabled() { check::reference(uc, pc, end, stop_at) } else { None };
         let state = &mut uc.get_data_mut().native.as_mut().expect("translator state").state as *mut CpuState;
@@ -464,11 +535,23 @@ pub fn run(uc: &mut Uc, pc: u32, stop_at: u32) -> Result<(), String> {
             check::compare(uc, pc, end, &reference);
         }
         let state = unsafe { &mut *state };
+        came_from = pc;
         pc = state.exit_pc;
         match reason & 0xFF {
             exit::JUMP => {}
             exit::FALLBACK => {
                 pc = fallback(uc, pc, (reason >> 8).max(1), stop_at)?;
+            }
+            exit::YIELD => runtime::share_gil(pc),
+            exit::SYSCALL => {
+                runtime::native_syscall(uc, pc);
+                let thread = uc.get_data();
+                if let Some(fault) = &thread.fault {
+                    return Err(fault.clone());
+                }
+                if let Some(code) = thread.exit_code {
+                    return Err(format!("guest called exit({code})"));
+                }
             }
             other => return Err(format!("translated code left with unknown reason {other}")),
         }
@@ -500,6 +583,8 @@ const CPSR_IT: u32 = 0x0600_FC00;
 
 /// Times Unicorn still had IT state when guest state was copied in (ARM32_STATS / checker summary).
 pub(super) static STALE_IT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Blocks dropped because the game rewrote their code (shown with the stats).
+static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Copies guest state into Unicorn. Only NZCV, Q and GE move between engines;
 /// Unicorn keeps its mode bits, and the Thumb bit comes from the start address.
@@ -547,7 +632,10 @@ fn fallback(uc: &mut Uc, pc: u32, count: u32, stop_at: u32) -> Result<u32, Strin
             cache.fallback_total += 1;
             cache.fallback_total
         });
-        if total % (1 << 22) == 0 {
+        static LAST_PRINT: AtomicU64 = AtomicU64::new(0);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        if total % 4096 == 0 && now >= LAST_PRINT.load(Ordering::Relaxed) + 10 {
+            LAST_PRINT.store(now, Ordering::Relaxed);
             print_stats(); // a running app never reaches the end-of-run print
         }
     }
@@ -580,8 +668,9 @@ pub fn print_stats() {
         sites.sort_by(|a, b| b.1.cmp(a.1));
         let total: u64 = cache.fallbacks.values().sum();
         crate::log::line(&format!(
-            "[jit] {} blocks, {} fallbacks at {} sites, {} starts with leftover IT state",
+            "[jit] {} blocks ({} dropped after code changes), {} fallbacks at {} sites, {} starts with leftover IT state",
             cache.blocks.len(),
+            DROPPED.load(std::sync::atomic::Ordering::Relaxed),
             total,
             sites.len(),
             STALE_IT.load(std::sync::atomic::Ordering::Relaxed)
@@ -596,6 +685,7 @@ pub fn print_stats() {
             crate::log::line(&format!("[jit]   {count:8} x {address:#010x} {} {text}", if thumb { "T" } else { "A" }));
         }
     });
+    crate::runtime::log_top_calls(20);
     if check::enabled() {
         check::print_summary();
     }

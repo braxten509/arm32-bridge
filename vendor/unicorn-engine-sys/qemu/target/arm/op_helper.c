@@ -23,6 +23,7 @@
 #include "internals.h"
 #include "exec/exec-all.h"
 #include "exec/cpu_ldst.h"
+#include "uc_priv.h"
 
 #define SIGNBIT (uint32_t)0x80000000
 #define SIGNBIT64 ((uint64_t)1 << 63)
@@ -322,14 +323,16 @@ void HELPER(wfe)(CPUARMState *env)
 
 void HELPER(yield)(CPUARMState *env)
 {
-    CPUState *cs = env_cpu(env);
+    struct uc_struct *uc = env->uc;
+    struct hook *hook;
+    HOOK_FOREACH_VAR_DECLARE;
 
-    /* This is a non-trappable hint instruction that generally indicates
-     * that the guest is currently busy-looping. Yield control back to the
-     * top level loop so that a more deserving VCPU has a chance to run.
-     */
-    cs->exception_index = EXCP_YIELD;
-    cpu_loop_exit(cs);
+    HOOK_FOREACH(uc, hook, UC_HOOK_INTR) {
+        if (hook->to_delete) {
+            continue;
+        }
+        JIT_CALLBACK_GUARD(((uc_cb_hookintr_t)hook->callback)(uc, EXCP_YIELD, hook->user_data));
+    }
 }
 
 /* Raise an internal-to-QEMU exception. This is limited to only

@@ -16,8 +16,9 @@
 
 use std::cell::{Cell, RefCell, RefMut};
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 
 use unicorn_engine::{ArmCpuModel, Arch, HookType, MemType, Mode, Prot, RegisterARM, Unicorn};
 
@@ -311,7 +312,6 @@ pub fn init(trace: bool) {
 // ---- the guest lock ----
 
 static GIL: Mutex<()> = Mutex::new(());
-static WAKE: Condvar = Condvar::new();
 
 thread_local! {
     static GIL_GUARD: RefCell<Option<MutexGuard<'static, ()>>> = const { RefCell::new(None) };
@@ -319,6 +319,107 @@ thread_local! {
     /// Time this thread spent inside phone functions (outermost calls only), in `ticks`.
     static PHONE_TICKS: Cell<u64> = const { Cell::new(0) };
     static PHONE_DEPTH: Cell<u32> = const { Cell::new(0) };
+    static RESUME_AT: Cell<Option<u32>> = const { Cell::new(None) };
+    static HELD_SINCE: Cell<u64> = const { Cell::new(0) };
+    static LOCK_WAIT_TICKS: Cell<u64> = const { Cell::new(0) };
+}
+
+pub fn lock_wait_time() -> std::time::Duration {
+    std::time::Duration::from_nanos(LOCK_WAIT_TICKS.with(|t| t.get()) * 1_000_000 / ticks_per_ms())
+}
+
+static LOCKS_TAKEN: AtomicU64 = AtomicU64::new(0);
+static WANTING: AtomicU32 = AtomicU32::new(0);
+const TIME_SLICE_MS: u64 = 2;
+/// When the current holder took the guest lock (`ticks`), for the preempt ticker.
+static HELD_SINCE_ANY: AtomicU64 = AtomicU64::new(0);
+/// Set while a guest thread has waited a whole time slice for the lock: translated
+/// code then leaves at its next block exit and the dispatcher hands the lock over
+/// (a loop that never calls a phone function would otherwise never let go).
+static PREEMPT: AtomicU32 = AtomicU32::new(0);
+
+pub fn preempt_flag_address() -> u64 {
+    PREEMPT.as_ptr() as u64
+}
+
+pub fn preempt_requested() -> bool {
+    PREEMPT.load(Ordering::Relaxed) != 0
+}
+
+/// Started the first time a thread has to wait for the lock: sets PREEMPT when
+/// the holder has had the lock for a whole time slice while others wait.
+fn start_preempt_ticker() {
+    static STARTED: OnceLock<()> = OnceLock::new();
+    STARTED.get_or_init(|| {
+        let _ = std::thread::Builder::new().name("arm32-preempt".into()).spawn(|| loop {
+            if WANTING.load(Ordering::Relaxed) == 0 {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            let held = ticks().wrapping_sub(HELD_SINCE_ANY.load(Ordering::Relaxed));
+            if held >= TIME_SLICE_MS * ticks_per_ms() {
+                PREEMPT.store(1, Ordering::Relaxed);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        });
+    });
+}
+
+fn take_gil() {
+    let guard = match GIL.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            start_preempt_ticker();
+            let started = ticks();
+            WANTING.fetch_add(1, Ordering::Relaxed);
+            let guard = GIL.lock().unwrap_or_else(|e| e.into_inner());
+            WANTING.fetch_sub(1, Ordering::Relaxed);
+            LOCK_WAIT_TICKS.with(|t| t.set(t.get() + ticks().wrapping_sub(started)));
+            guard
+        }
+    };
+    LOCKS_TAKEN.fetch_add(1, Ordering::Relaxed);
+    let now = ticks();
+    HELD_SINCE.with(|since| since.set(now));
+    HELD_SINCE_ANY.store(now, Ordering::Relaxed);
+    PREEMPT.store(0, Ordering::Relaxed);
+    GIL_GUARD.with(|g| *g.borrow_mut() = Some(guard));
+}
+
+pub fn resume_point() -> Option<u32> {
+    RESUME_AT.with(|r| r.get())
+}
+
+fn hand_over_gil() -> bool {
+    if WANTING.load(Ordering::Relaxed) == 0 {
+        PREEMPT.store(0, Ordering::Relaxed);
+        return false;
+    }
+    let Some(guard) = GIL_GUARD.with(|g| g.borrow_mut().take()) else { return false };
+    let taken = LOCKS_TAKEN.load(Ordering::Relaxed);
+    drop(guard);
+    let started = Instant::now();
+    while LOCKS_TAKEN.load(Ordering::Relaxed) == taken && started.elapsed() < Duration::from_micros(100) {
+        std::thread::yield_now();
+    }
+    take_gil();
+    true
+}
+
+pub fn share_gil(resume: u32) {
+    if hand_over_gil() {
+        RESUME_AT.with(|r| r.set(Some(resume)));
+        crate::imports::signals::deliver_pending();
+        RESUME_AT.with(|r| r.set(None));
+    }
+}
+
+fn share_gil_after_time_slice() {
+    if WANTING.load(Ordering::Relaxed) != 0
+        && ticks().wrapping_sub(HELD_SINCE.with(|since| since.get())) >= TIME_SLICE_MS * ticks_per_ms()
+    {
+        hand_over_gil();
+    }
 }
 
 /// Total time this thread has spent inside phone functions (a phone function
@@ -346,8 +447,7 @@ pub fn hold_gil() -> GilToken {
     if gil_held() {
         return GilToken(false);
     }
-    let guard = GIL.lock().unwrap_or_else(|e| e.into_inner());
-    GIL_GUARD.with(|g| *g.borrow_mut() = Some(guard));
+    take_gil();
     GilToken(true)
 }
 
@@ -359,24 +459,89 @@ pub fn without_gil<R>(work: impl FnOnce() -> R) -> R {
     }
     drop(guard);
     let result = work();
-    let guard = GIL.lock().unwrap_or_else(|e| e.into_inner());
-    GIL_GUARD.with(|g| *g.borrow_mut() = Some(guard));
+    take_gil();
+    crate::imports::signals::deliver_pending();
     result
 }
+
+struct Parker {
+    woken: Mutex<bool>,
+    ready: Condvar,
+}
+
+struct Waiter {
+    thread: u32,
+    key: u64,
+    parker: Arc<Parker>,
+}
+
+static WAITERS: Mutex<Vec<Waiter>> = Mutex::new(Vec::new());
+
+thread_local! {
+    static PARKER: Arc<Parker> = Arc::new(Parker { woken: Mutex::new(false), ready: Condvar::new() });
+}
+
+/// Wait key for waits that any `wake_guests` ends.
+pub const ANY_EVENT: u64 = u64::MAX;
 
 /// Gives up the guest lock until another thread calls `wake_guests` (or the
 /// timeout passes). Callers re-check their condition in a loop.
 pub fn wait_for_guests(timeout: Option<Duration>) {
+    wait_on(ANY_EVENT, timeout);
+}
+
+/// Gives up the guest lock until `wake_on(key)`, `wake_guests`, a signal for
+/// this thread, or the timeout. Callers re-check their condition in a loop.
+pub fn wait_on(key: u64, timeout: Option<Duration>) {
+    // A signal sent before this thread started waiting runs instead of the wait.
+    if crate::imports::signals::deliver_pending() {
+        return;
+    }
+    let parker = PARKER.with(Arc::clone);
+    *parker.woken.lock().unwrap_or_else(|e| e.into_inner()) = false;
+    let thread = crate::imports::threads::current_handle();
+    WAITERS.lock().unwrap_or_else(|e| e.into_inner()).push(Waiter { thread, key, parker: Arc::clone(&parker) });
     let guard = GIL_GUARD.with(|g| g.borrow_mut().take()).expect("waiting without the guest lock");
-    let guard = match timeout {
-        Some(timeout) => WAKE.wait_timeout(guard, timeout).unwrap_or_else(|e| e.into_inner()).0,
-        None => WAKE.wait(guard).unwrap_or_else(|e| e.into_inner()),
-    };
-    GIL_GUARD.with(|g| *g.borrow_mut() = Some(guard));
+    drop(guard);
+    let deadline = timeout.map(|timeout| Instant::now() + timeout);
+    let mut woken = parker.woken.lock().unwrap_or_else(|e| e.into_inner());
+    while !*woken {
+        woken = match deadline {
+            Some(deadline) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                parker.ready.wait_timeout(woken, deadline - now).unwrap_or_else(|e| e.into_inner()).0
+            }
+            None => parker.ready.wait(woken).unwrap_or_else(|e| e.into_inner()),
+        };
+    }
+    drop(woken);
+    WAITERS.lock().unwrap_or_else(|e| e.into_inner()).retain(|waiter| !Arc::ptr_eq(&waiter.parker, &parker));
+    take_gil();
+    // Signals sent to this thread while it waited run now.
+    crate::imports::signals::deliver_pending();
+}
+
+fn wake_where(matches: impl Fn(&Waiter) -> bool) {
+    let waiters = WAITERS.lock().unwrap_or_else(|e| e.into_inner());
+    for waiter in waiters.iter().filter(|waiter| matches(waiter)) {
+        *waiter.parker.woken.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        waiter.parker.ready.notify_one();
+    }
 }
 
 pub fn wake_guests() {
-    WAKE.notify_all();
+    wake_where(|_| true);
+}
+
+pub fn wake_on(key: u64) {
+    wake_where(|waiter| waiter.key == key || waiter.key == ANY_EVENT);
+}
+
+pub fn wake_thread(thread: u32) {
+    wake_where(|waiter| waiter.thread == thread);
 }
 
 // ---- engines ----
@@ -473,13 +638,33 @@ fn as_static<'a, 'b>(uc: &'a mut Unicorn<'b, Thread>) -> &'a mut Uc {
     unsafe { std::mem::transmute::<&'a mut Unicorn<'b, Thread>, &'a mut Uc>(uc) }
 }
 
+const EXCP_YIELD: u32 = 0x10004;
+
 fn on_interrupt(uc: &mut Unicorn<'_, Thread>, interrupt: u32) {
     let uc = as_static(uc);
+    if interrupt == EXCP_YIELD {
+        let thumb = (uc.reg_read(RegisterARM::CPSR).unwrap() as u32 >> 5) & 1;
+        share_gil(uc.pc_read().unwrap() as u32 | thumb);
+        return;
+    }
     let pc = uc.pc_read().unwrap() as u32;
     // EXCP_SWI is 2; the PC already points past the svc.
     let svc_address = pc.wrapping_sub(4);
     let in_stub_area = svc_address >= mem::STUB_BASE && svc_address < mem::STUB_BASE + mem::STUB_SIZE;
-    if interrupt != 2 || !in_stub_area {
+    if interrupt == 2 && !in_stub_area {
+        // A Linux system call made straight from game code: number in r7,
+        // arguments in r0-r5, result (negative errno) back in r0.
+        let number = uc.reg_read(RegisterARM::R7).unwrap() as u32;
+        let registers = [RegisterARM::R0, RegisterARM::R1, RegisterARM::R2, RegisterARM::R3, RegisterARM::R4, RegisterARM::R5];
+        let arguments = registers.map(|register| uc.reg_read(register).unwrap() as u32);
+        let result = crate::imports::threads::linux_syscall(uc, number, arguments);
+        uc.reg_write(RegisterARM::R0, result as u32 as u64).unwrap();
+        if uc.get_data().fault.is_some() || uc.get_data().exit_code.is_some() {
+            uc.stop();
+        }
+        return;
+    }
+    if interrupt != 2 {
         let lr = uc.reg_read(RegisterARM::LR).unwrap();
         stop_with_fault(uc, format!("CPU exception {interrupt} at pc {pc:#010x} (lr {lr:#010x})"));
         return;
@@ -491,7 +676,76 @@ fn on_interrupt(uc: &mut Unicorn<'_, Thread>, interrupt: u32) {
     }
 }
 
+/// A Linux system call from translated game code: number in r7, arguments in
+/// r0-r5, result (negative errno) back in r0; game code goes on at `resume`.
+pub fn native_syscall(uc: &mut Uc, resume: u32) {
+    let number = uc.reg(7);
+    let arguments = [0, 1, 2, 3, 4, 5].map(|index| uc.reg(index));
+    RESUME_AT.with(|r| r.set(Some(resume)));
+    let result = crate::imports::threads::linux_syscall(uc, number, arguments);
+    RESUME_AT.with(|r| r.set(None));
+    uc.set_reg(0, result as u32);
+}
+
 /// Runs the handler for phone function `index` with the current registers.
+fn sampling() -> bool {
+    static SAMPLING: OnceLock<bool> = OnceLock::new();
+    *SAMPLING.get_or_init(|| crate::dynarec::property("debug.arm32bridge.sample").is_some_and(|value| value == "1" || value == "2"))
+}
+
+fn sample_caller(uc: &mut Uc, name: &str) {
+    thread_local! {
+        static LAST: Cell<u64> = const { Cell::new(0) };
+    }
+    let now = ticks();
+    if now.wrapping_sub(LAST.with(|last| last.get())) < 500 * ticks_per_ms() {
+        return;
+    }
+    LAST.with(|last| last.set(now));
+    let sp = uc.reg(13);
+    let memory = mem();
+    let words = (uc.get_data().stack_top.saturating_sub(sp) / 4).min(1024);
+    let stack: Vec<u32> = (0..words).map(|i| memory.read_u32(sp + i * 4)).collect();
+    let callers: Vec<String> = stack
+        .iter()
+        .filter(|&&word| (mem::LIB_BASE..mem::LIB_END).contains(&word) && mem::executable(word & !1))
+        .take(16)
+        .map(|word| format!("{word:#x}"))
+        .collect();
+    let pmip = shared().guest_exports.get("mono_pmip").copied();
+    let mut managed = Vec::new();
+    let resolve = crate::dynarec::property("debug.arm32bridge.sample").as_deref() == Some("2");
+    if let (Some(pmip), true) = (pmip, resolve) {
+        for &word in stack.iter().filter(|&&word| (mem::HEAP_BASE..mem::HEAP_END).contains(&word)) {
+            if managed.len() >= 12 {
+                break;
+            }
+            if let Ok(text) = call_guest(uc, pmip, &[word]) {
+                let text = text as u32;
+                if text != 0 {
+                    managed.push(memory.string(text));
+                }
+            }
+        }
+    }
+    crate::log::line(&format!(
+        "[sample t{}] {name} lr={:#x} r0={:#x} sp={sp:#x} stack: {} managed: {}",
+        uc.get_data().id,
+        uc.reg(14),
+        uc.reg(0),
+        callers.join(" "),
+        managed.join(" | ")
+    ));
+}
+
+/// Logs the most-called phone functions so far (with the translator stats).
+pub fn log_top_calls(count: usize) {
+    let mut calls: Vec<(u64, &'static str)> = shared().stubs.iter().map(|stub| (stub.calls, stub.name)).filter(|c| c.0 > 0).collect();
+    calls.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    let text: Vec<String> = calls.iter().take(count).map(|(calls, name)| format!("{name} {calls}")).collect();
+    crate::log::line(&format!("[calls] {}", text.join(", ")));
+}
+
 pub fn call_stub(uc: &mut Uc, index: u32) {
     let (handler, name, trace) = {
         let mut shared = shared();
@@ -509,12 +763,16 @@ pub fn call_stub(uc: &mut Uc, index: u32) {
         shared.recent.push_back(name);
         (handler, name, shared.trace)
     };
+    if sampling() {
+        sample_caller(uc, name);
+    }
+    share_gil_after_time_slice();
     uc.get_data_mut().current_call = name;
 
     let mut args = Args::from_registers(uc);
     if trace {
         let r = args.registers;
-        eprintln!("[call t{}] {name}({:#x}, {:#x}, {:#x}, {:#x})", uc.get_data().id, r[0], r[1], r[2], r[3]);
+        crate::log::line(&format!("[call t{}] {name}({:#x}, {:#x}, {:#x}, {:#x})", uc.get_data().id, r[0], r[1], r[2], r[3]));
     }
     let started = ticks();
     let result = match handler {
@@ -548,7 +806,11 @@ pub fn call_stub(uc: &mut Uc, index: u32) {
             Ret::U32(0)
         }
     };
+    let jumped = matches!(result, Ret::Jumped);
     write_result(uc, result);
+    if !jumped {
+        crate::imports::signals::deliver_pending();
+    }
 }
 
 /// Puts a handler's result where a softfp caller expects it (r0, or r0:r1).

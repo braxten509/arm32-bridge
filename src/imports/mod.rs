@@ -12,6 +12,9 @@ pub mod sles;
 pub mod gles;
 mod gles_generated;
 pub mod android;
+pub mod egl;
+pub mod signals;
+pub mod sockets;
 
 use std::collections::HashMap;
 
@@ -30,6 +33,7 @@ pub struct State {
     pub files: HashMap<u32, HostFile>,
     pub directories: HashMap<u32, (usize, u32)>,
     pub threads: threads::Threads,
+    pub signals: signals::Signals,
     pub at_exit: Vec<(u32, u32)>,
     pub strtok_next: usize,
     pub static_tm: u32,
@@ -63,10 +67,13 @@ pub fn handler_for(name: &str) -> Option<Handler> {
         return jni::handler(jni_name);
     }
     threads::handler(name)
+        .or_else(|| signals::handler(name))
+        .or_else(|| sockets::handler(name))
         .or_else(|| libc_calls::handler(name))
         .or_else(|| math::handler(name))
         .or_else(|| gles::handler(name))
         .or_else(|| android::handler(name))
+        .or_else(|| egl::handler(name))
         .or_else(|| sles::handler(name))
 }
 
@@ -99,7 +106,7 @@ pub fn missing_imports(paths: &[std::path::PathBuf]) -> Result<Vec<String>, Stri
 /// Whether the phone build of the bridge handles `name` (the PC build lacks
 /// the phone-only parts).
 pub fn phone_handles(name: &str) -> bool {
-    handler_for(name).is_some() || android::NAMES.contains(&name)
+    handler_for(name).is_some() || android::NAMES.contains(&name) || egl::NAMES.contains(&name)
 }
 
 const BIONIC_FILE_SIZE: u32 = 84;

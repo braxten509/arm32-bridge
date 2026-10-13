@@ -1,24 +1,32 @@
-//! OpenGL ES 1 and 2 for guest code. Most functions are generated from the NDK
-//! headers (gles_generated.rs); the ones here need special care:
-//! - glVertexAttribPointer / glDrawElements and the GLES1 array pointers
-//!   (glVertexPointer, ...) take either a guest pointer
-//!   (client-side arrays) or an offset into a bound buffer, depending on GL
-//!   state, so buffer bindings are tracked per thread (GL contexts are too).
-//! - glMapBufferOES returns driver memory outside the guest's 4 GiB, so the
-//!   guest writes into a guest buffer that is uploaded on unmap.
-//! - glShaderSource takes an array of pointers; glGetString returns one.
+//! OpenGL ES 1, 2 and 3.x for guest code. Most functions are generated from
+//! the NDK headers (gles_generated.rs); the ones here need special care:
+//! - vertex, index, pixel and indirect pointers are either a guest pointer or
+//!   an offset into a bound buffer, depending on GL state, so buffer bindings
+//!   are tracked per thread (GL contexts are too).
+//! - glMapBufferOES / glMapBufferRange return driver memory outside the guest's
+//!   4 GiB, so the guest writes into a guest copy that is uploaded on unmap.
+//! - glShaderSource and friends take arrays of pointers; glGetString(i) returns one.
+//! - GLsync objects are 64-bit pointers, so the guest gets small handles.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use crate::handler;
 use crate::runtime::{mem, shared, ArgSource, Handler, Ret};
 
 const GL_ARRAY_BUFFER: u32 = 0x8892;
 const GL_ELEMENT_ARRAY_BUFFER: u32 = 0x8893;
+const GL_PIXEL_PACK_BUFFER: u32 = 0x88EB;
+const GL_PIXEL_UNPACK_BUFFER: u32 = 0x88EC;
+const GL_DRAW_INDIRECT_BUFFER: u32 = 0x8F3F;
 const GL_MAP_READ_BIT: u32 = 0x0001;
+const GL_MAP_WRITE_BIT: u32 = 0x0002;
+const GL_MAP_INVALIDATE_RANGE_BIT: u32 = 0x0004;
+const GL_MAP_INVALIDATE_BUFFER_BIT: u32 = 0x0008;
+const GL_MAP_FLUSH_EXPLICIT_BIT: u32 = 0x0010;
 const GL_BUFFER_SIZE: u32 = 0x8764;
 
 pub fn guest_pointer(guest: u32) -> *mut c_void {
@@ -78,25 +86,88 @@ macro_rules! host {
 
 #[derive(Default)]
 struct Bindings {
-    array_buffer: u32,
+    /// Bound buffer per target, except the element buffer (that one belongs to
+    /// the vertex array object).
+    buffers: HashMap<u32, u32>,
     vertex_array: u32,
     /// Element buffer binding per vertex array object (0 = the default one).
     element_buffers: HashMap<u32, u32>,
-    /// Mapped buffers: target → (guest copy, size).
-    mapped: HashMap<u32, (u32, u32)>,
+    /// Mapped buffers by buffer name. GL keeps a buffer mapped after another
+    /// buffer is bound to the same target, so the target can't be the key.
+    mapped: HashMap<u32, Mapped>,
+}
+
+/// A guest copy standing in for mapped buffer memory.
+struct Mapped {
+    target: u32,
+    copy: u32,
+    offset: u32,
+    length: u32,
+    /// Upload the whole copy on unmap (else only flushed ranges were uploaded).
+    upload_on_unmap: bool,
 }
 
 thread_local! {
     static BINDINGS: RefCell<Bindings> = RefCell::new(Bindings::default());
 }
 
-/// A vertex array pointer: an offset into the bound array buffer, or else a guest address.
-fn array_pointer(pointer: u32) -> *mut c_void {
-    if BINDINGS.with(|b| b.borrow().array_buffer) != 0 {
+fn bound(target: u32) -> u32 {
+    BINDINGS.with(|b| b.borrow().buffers.get(&target).copied().unwrap_or(0))
+}
+
+/// The buffer the context has bound to `target` right now (asked from GL, as
+/// glBindBufferBase/Range binds aren't tracked here).
+fn buffer_bound_to(target: u32) -> u32 {
+    let binding = match target {
+        0x8892 => 0x8894, // array
+        0x8893 => 0x8895, // element array
+        0x88EB => 0x88ED, // pixel pack
+        0x88EC => 0x88EF, // pixel unpack
+        0x8A11 => 0x8A28, // uniform
+        0x8C8E => 0x8C8F, // transform feedback
+        0x90D2 => 0x90D3, // shader storage
+        0x8F3F => 0x8F43, // draw indirect
+        0x90EE => 0x90EF, // dispatch indirect
+        0x92C0 => 0x92C1, // atomic counter
+        other => other,   // copy read/write and texture buffer use their own name
+    };
+    let mut buffer = 0i32;
+    unsafe { host!("glGetIntegerv", fn(u32, *mut i32))(binding, &mut buffer) };
+    buffer as u32
+}
+
+/// `pointer` as a buffer offset if `buffer` is bound, else as a guest address.
+fn offset_or_guest(buffer: u32, pointer: u32) -> *mut c_void {
+    if buffer != 0 {
         pointer as usize as *mut c_void
     } else {
         guest_pointer(pointer)
     }
+}
+
+/// A vertex array pointer.
+pub fn array_pointer(pointer: u32) -> *mut c_void {
+    offset_or_guest(bound(GL_ARRAY_BUFFER), pointer)
+}
+
+/// The indices of an indexed draw.
+pub fn index_pointer(pointer: u32) -> *mut c_void {
+    offset_or_guest(element_buffer(), pointer)
+}
+
+/// The command of an indirect draw.
+pub fn indirect_pointer(pointer: u32) -> *mut c_void {
+    offset_or_guest(bound(GL_DRAW_INDIRECT_BUFFER), pointer)
+}
+
+/// Pixels read from (texture uploads).
+pub fn unpack_pointer(pointer: u32) -> *mut c_void {
+    offset_or_guest(bound(GL_PIXEL_UNPACK_BUFFER), pointer)
+}
+
+/// Pixels written to (glReadPixels).
+pub fn pack_pointer(pointer: u32) -> *mut c_void {
+    offset_or_guest(bound(GL_PIXEL_PACK_BUFFER), pointer)
 }
 
 fn element_buffer() -> u32 {
@@ -104,6 +175,114 @@ fn element_buffer() -> u32 {
         let b = b.borrow();
         b.element_buffers.get(&b.vertex_array).copied().unwrap_or(0)
     })
+}
+
+fn bind_vertex_array(array: u32) {
+    BINDINGS.with(|b| b.borrow_mut().vertex_array = array);
+}
+
+fn forget_vertex_arrays(count: i32, arrays: u32) {
+    BINDINGS.with(|b| {
+        let mut b = b.borrow_mut();
+        for i in 0..count.max(0) as u32 {
+            let array = mem().read_u32(arrays + i * 4);
+            b.element_buffers.remove(&array);
+            if b.vertex_array == array {
+                b.vertex_array = 0;
+            }
+        }
+    });
+}
+
+/// GLsync handles (shared: a fence made on one context can be waited on in another).
+#[derive(Default)]
+struct Syncs {
+    objects: HashMap<u32, usize>,
+    next: u32,
+}
+
+static SYNCS: Mutex<Option<Syncs>> = Mutex::new(None);
+
+pub fn sync_host(handle: u32) -> *mut c_void {
+    let syncs = SYNCS.lock().unwrap();
+    syncs.as_ref().and_then(|s| s.objects.get(&handle).copied()).unwrap_or(0) as *mut c_void
+}
+
+/// Copies guest string pointers into a host pointer array.
+fn string_array(strings: u32, count: i32) -> Vec<*mut c_void> {
+    (0..count.max(0) as u32).map(|i| guest_pointer(mem().read_u32(strings + i * 4))).collect()
+}
+
+/// Maps `length` bytes at `offset` into a fresh guest copy. Unless the game
+/// said it will overwrite the range, the copy starts with the current contents,
+/// because the copy is uploaded whole.
+fn map_into_copy(target: u32, offset: u32, length: u32, access: u32) -> u32 {
+    let copy = shared().heap.malloc(length.max(1));
+    if access & (GL_MAP_INVALIDATE_RANGE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT) == 0 {
+        let current = unsafe {
+            host!("glMapBufferRange", fn(u32, isize, isize, u32) -> *mut c_void)(
+                target,
+                offset as isize,
+                length as isize,
+                GL_MAP_READ_BIT,
+            )
+        };
+        if current.is_null() {
+            // A GLES2-only context can't read buffers back; drop the error that left.
+            unsafe {
+                host!("glGetError", fn() -> u32)();
+                std::ptr::write_bytes(guest_pointer(copy) as *mut u8, 0, length as usize);
+            }
+        } else {
+            unsafe {
+                std::ptr::copy_nonoverlapping(current as *const u8, guest_pointer(copy) as *mut u8, length as usize);
+                host!("glUnmapBuffer", fn(u32) -> u8)(target);
+            }
+        }
+    }
+    copy
+}
+
+/// Records a new mapping of the buffer bound to its target.
+fn remember_mapping(mapped: Mapped) {
+    static OVERLAPS_REPORTED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let buffer = buffer_bound_to(mapped.target);
+    BINDINGS.with(|b| {
+        let mut b = b.borrow_mut();
+        let others = b.mapped.iter().filter(|(&other, m)| other != buffer && m.target == mapped.target).count();
+        if others > 0 && OVERLAPS_REPORTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 10 {
+            crate::log::line(&format!(
+                "[gles] buffer {buffer} mapped on target {:#x} while {others} other buffer(s) there are still mapped",
+                mapped.target
+            ));
+        }
+        // Mapping a buffer that is already mapped is a GL error; the old copy
+        // may still be in use, so it is kept (leaked) rather than freed.
+        b.mapped.insert(buffer, mapped);
+    });
+}
+
+fn upload(target: u32, offset: u32, length: u32, data: u32) {
+    unsafe {
+        host!("glBufferSubData", fn(u32, isize, isize, *mut c_void))(
+            target,
+            offset as isize,
+            length as isize,
+            guest_pointer(data),
+        )
+    };
+}
+
+fn unmap(target: u32) -> u32 {
+    let buffer = buffer_bound_to(target);
+    let Some(mapped) = BINDINGS.with(|b| b.borrow_mut().mapped.remove(&buffer)) else {
+        return 0;
+    };
+    if mapped.upload_on_unmap {
+        upload(target, mapped.offset, mapped.length, mapped.copy);
+    }
+    shared().heap.free(mapped.copy);
+    1
 }
 
 pub fn handler(name: &str) -> Option<Handler> {
@@ -119,11 +298,11 @@ fn special(name: &str) -> Option<Handler> {
             let (target, buffer) = (a.u32(), a.u32());
             BINDINGS.with(|b| {
                 let mut b = b.borrow_mut();
-                if target == GL_ARRAY_BUFFER {
-                    b.array_buffer = buffer;
-                } else if target == GL_ELEMENT_ARRAY_BUFFER {
+                if target == GL_ELEMENT_ARRAY_BUFFER {
                     let vertex_array = b.vertex_array;
                     b.element_buffers.insert(vertex_array, buffer);
+                } else {
+                    b.buffers.insert(target, buffer);
                 }
             });
             unsafe { host!("glBindBuffer", fn(u32, u32))(target, buffer) };
@@ -135,10 +314,12 @@ fn special(name: &str) -> Option<Handler> {
                 let mut b = b.borrow_mut();
                 for i in 0..count.max(0) as u32 {
                     let buffer = mem().read_u32(buffers + i * 4);
-                    if b.array_buffer == buffer {
-                        b.array_buffer = 0;
+                    // Deleting a mapped buffer unmaps it; its copy is no longer valid.
+                    if let Some(mapped) = b.mapped.remove(&buffer) {
+                        shared().heap.free(mapped.copy);
                     }
-                    for bound in b.element_buffers.values_mut() {
+                    let b = &mut *b;
+                    for bound in b.buffers.values_mut().chain(b.element_buffers.values_mut()) {
                         if *bound == buffer {
                             *bound = 0;
                         }
@@ -150,30 +331,32 @@ fn special(name: &str) -> Option<Handler> {
         }),
         "glBindVertexArrayOES" => handler!(|uc, a| {
             let array = a.u32();
-            BINDINGS.with(|b| b.borrow_mut().vertex_array = array);
+            bind_vertex_array(array);
             unsafe { host!("glBindVertexArrayOES", fn(u32))(array) };
+            Ret::Void
+        }),
+        "glBindVertexArray" => handler!(|uc, a| {
+            let array = a.u32();
+            bind_vertex_array(array);
+            unsafe { host!("glBindVertexArray", fn(u32))(array) };
             Ret::Void
         }),
         "glDeleteVertexArraysOES" => handler!(|uc, a| {
             let (count, arrays) = (a.i32(), a.u32());
-            BINDINGS.with(|b| {
-                let mut b = b.borrow_mut();
-                for i in 0..count.max(0) as u32 {
-                    let array = mem().read_u32(arrays + i * 4);
-                    b.element_buffers.remove(&array);
-                    if b.vertex_array == array {
-                        b.vertex_array = 0;
-                    }
-                }
-            });
+            forget_vertex_arrays(count, arrays);
             unsafe { host!("glDeleteVertexArraysOES", fn(i32, *mut c_void))(count, guest_pointer(arrays)) };
+            Ret::Void
+        }),
+        "glDeleteVertexArrays" => handler!(|uc, a| {
+            let (count, arrays) = (a.i32(), a.u32());
+            forget_vertex_arrays(count, arrays);
+            unsafe { host!("glDeleteVertexArrays", fn(i32, *mut c_void))(count, guest_pointer(arrays)) };
             Ret::Void
         }),
         "glVertexAttribPointer" => handler!(|uc, a| {
             let (index, size, kind, normalized, stride, pointer) =
                 (a.u32(), a.i32(), a.u32(), a.u32() as u8, a.i32(), a.u32());
-            let bound = BINDINGS.with(|b| b.borrow().array_buffer) != 0;
-            let host_pointer = if bound { pointer as usize as *mut c_void } else { guest_pointer(pointer) };
+            let host_pointer = array_pointer(pointer);
             unsafe {
                 host!("glVertexAttribPointer", fn(u32, i32, u32, u8, i32, *mut c_void))(
                     index,
@@ -224,15 +407,13 @@ fn special(name: &str) -> Option<Handler> {
         }),
         "glDrawElements" => handler!(|uc, a| {
             let (mode, count, kind, indices) = (a.u32(), a.i32(), a.u32(), a.u32());
-            let host_indices =
-                if element_buffer() != 0 { indices as usize as *mut c_void } else { guest_pointer(indices) };
+            let host_indices = index_pointer(indices);
             unsafe { host!("glDrawElements", fn(u32, i32, u32, *mut c_void))(mode, count, kind, host_indices) };
             Ret::Void
         }),
         "glShaderSource" => handler!(|uc, a| {
             let (shader, count, strings, lengths) = (a.u32(), a.i32(), a.u32(), a.u32());
-            let pointers: Vec<*mut c_void> =
-                (0..count.max(0) as u32).map(|i| guest_pointer(mem().read_u32(strings + i * 4))).collect();
+            let pointers = string_array(strings, count);
             unsafe {
                 host!("glShaderSource", fn(u32, i32, *const *mut c_void, *mut c_void))(
                     shader,
@@ -265,37 +446,109 @@ fn special(name: &str) -> Option<Handler> {
             if size <= 0 {
                 return Ret::U32(0);
             }
-            let copy = shared().heap.malloc(size as u32);
-            // Start from the buffer's current contents: unmapping uploads the
-            // whole copy, so parts the game doesn't write must stay as they were.
-            let current = unsafe {
-                host!("glMapBufferRange", fn(u32, isize, isize, u32) -> *mut c_void)(target, 0, size as isize, GL_MAP_READ_BIT)
-            };
-            if current.is_null() {
-                // A GLES2-only context can't read buffers back; drop the error that left.
-                unsafe {
-                    host!("glGetError", fn() -> u32)();
-                    std::ptr::write_bytes(guest_pointer(copy) as *mut u8, 0, size as usize);
-                }
-            } else {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(current as *const u8, guest_pointer(copy) as *mut u8, size as usize);
-                    host!("glUnmapBuffer", fn(u32) -> u8)(target);
-                }
-            }
-            BINDINGS.with(|b| b.borrow_mut().mapped.insert(target, (copy, size as u32)));
+            let copy = map_into_copy(target, 0, size as u32, 0);
+            remember_mapping(Mapped { target, copy, offset: 0, length: size as u32, upload_on_unmap: true });
             Ret::U32(copy)
         }),
-        "glUnmapBufferOES" => handler!(|uc, a| {
-            let target = a.u32();
-            let Some((copy, size)) = BINDINGS.with(|b| b.borrow_mut().mapped.remove(&target)) else {
+        "glMapBufferRange" => handler!(|uc, a| {
+            let (target, offset, length, access) = (a.u32(), a.u32(), a.u32(), a.u32());
+            if length == 0 {
                 return Ret::U32(0);
-            };
+            }
+            let copy = map_into_copy(target, offset, length, access);
+            let upload_on_unmap = access & GL_MAP_WRITE_BIT != 0 && access & GL_MAP_FLUSH_EXPLICIT_BIT == 0;
+            if access & 0x40 != 0 {
+                static PERSISTENT_REPORTED: std::sync::Once = std::sync::Once::new();
+                PERSISTENT_REPORTED.call_once(|| {
+                    crate::log::line("[gles] game maps buffers persistently; writes reach GL only on flush or unmap")
+                });
+            }
+            remember_mapping(Mapped { target, copy, offset, length, upload_on_unmap });
+            Ret::U32(copy)
+        }),
+        "glFlushMappedBufferRange" => handler!(|uc, a| {
+            let (target, offset, length) = (a.u32(), a.u32(), a.u32());
+            let buffer = buffer_bound_to(target);
+            let found = BINDINGS.with(|b| b.borrow().mapped.get(&buffer).map(|m| (m.copy, m.offset)));
+            if let Some((copy, start)) = found {
+                upload(target, start + offset, length, copy + offset);
+            }
+            Ret::Void
+        }),
+        "glUnmapBufferOES" => handler!(|uc, a| Ret::U32(unmap(a.u32()))),
+        "glUnmapBuffer" => handler!(|uc, a| Ret::U32(unmap(a.u32()))),
+        "glGetStringi" => handler!(|uc, a| {
+            let (which, index) = (a.u32(), a.u32());
+            let key = format!("glGetStringi:{which:#x}:{index}");
+            if let Some(&address) = shared().state.data_imports.get(&key) {
+                return Ret::U32(address);
+            }
+            let text = unsafe { host!("glGetStringi", fn(u32, u32) -> *const libc::c_char)(which, index) };
+            if text.is_null() {
+                return Ret::U32(0);
+            }
+            let text = unsafe { std::ffi::CStr::from_ptr(text) }.to_string_lossy().into_owned();
+            let address = shared().misc_cstr(&text);
+            shared().state.data_imports.insert(key, address);
+            Ret::U32(address)
+        }),
+        "glTransformFeedbackVaryings" => handler!(|uc, a| {
+            let (program, count, varyings, mode) = (a.u32(), a.i32(), a.u32(), a.u32());
+            let pointers = string_array(varyings, count);
             unsafe {
-                host!("glBufferSubData", fn(u32, isize, isize, *mut c_void))(target, 0, size as isize, guest_pointer(copy))
+                host!("glTransformFeedbackVaryings", fn(u32, i32, *const *mut c_void, u32))(
+                    program,
+                    count,
+                    pointers.as_ptr(),
+                    mode,
+                )
             };
-            shared().heap.free(copy);
-            Ret::U32(1)
+            Ret::Void
+        }),
+        "glGetUniformIndices" => handler!(|uc, a| {
+            let (program, count, names, indices) = (a.u32(), a.i32(), a.u32(), a.u32());
+            let pointers = string_array(names, count);
+            unsafe {
+                host!("glGetUniformIndices", fn(u32, i32, *const *mut c_void, *mut c_void))(
+                    program,
+                    count,
+                    pointers.as_ptr(),
+                    guest_pointer(indices),
+                )
+            };
+            Ret::Void
+        }),
+        "glCreateShaderProgramv" => handler!(|uc, a| {
+            let (kind, count, strings) = (a.u32(), a.i32(), a.u32());
+            let pointers = string_array(strings, count);
+            Ret::U32(unsafe {
+                host!("glCreateShaderProgramv", fn(u32, i32, *const *mut c_void) -> u32)(kind, count, pointers.as_ptr())
+            })
+        }),
+        "glFenceSync" => handler!(|uc, a| {
+            let (condition, flags) = (a.u32(), a.u32());
+            let sync = unsafe { host!("glFenceSync", fn(u32, u32) -> *mut c_void)(condition, flags) };
+            if sync.is_null() {
+                return Ret::U32(0);
+            }
+            let mut syncs = SYNCS.lock().unwrap();
+            let syncs = syncs.get_or_insert_with(Syncs::default);
+            syncs.next = syncs.next.wrapping_add(1).max(1);
+            syncs.objects.insert(syncs.next, sync as usize);
+            Ret::U32(syncs.next)
+        }),
+        "glDeleteSync" => handler!(|uc, a| {
+            let handle = a.u32();
+            let sync = SYNCS.lock().unwrap().as_mut().and_then(|s| s.objects.remove(&handle));
+            if let Some(sync) = sync {
+                unsafe { host!("glDeleteSync", fn(*mut c_void))(sync as *mut c_void) };
+            }
+            Ret::Void
+        }),
+        // The callback is guest code; the driver would call it as host code.
+        "glDebugMessageCallback" => handler!(|uc, a| {
+            crate::log::line("[bridge] the game set a GL debug callback; ignored");
+            Ret::Void
         }),
         "glGetPointerv" => handler!(|uc, a| {
             crate::log::line("[bridge] the game asked GL for a pointer; returning NULL");
@@ -336,7 +589,7 @@ fn special(name: &str) -> Option<Handler> {
             }
             Ret::Void
         }),
-        "glGetVertexAttribPointerv" | "glGetBufferPointervOES" => handler!(|uc, a| {
+        "glGetVertexAttribPointerv" | "glGetBufferPointervOES" | "glGetBufferPointerv" => handler!(|uc, a| {
             crate::log::line("[bridge] the game asked GL for a pointer; returning NULL");
             let (_x, _y, out) = (a.u32(), a.u32(), a.u32());
             if out != 0 {

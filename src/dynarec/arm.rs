@@ -176,7 +176,9 @@ impl Translator {
         if rd == PC && set_flags && !compare {
             return Err(()); // exception return forms
         }
-        let (op, rd, rn) = data_opcode(op, rd, rn).ok_or(())?;
+        // RSC has no Thumb-2 form: it is SBC with the operands swapped (done below).
+        let reverse_carry = op == 0b0111;
+        let (op, rd, rn) = if reverse_carry { (0b1011, rd, rn) } else { data_opcode(op, rd, rn).ok_or(())? };
         let logical = matches!(op, 0b0000..=0b0100);
         let want_carry = set_flags && logical;
         let (operand, carry): (Reg, Option<Reg>) = if immediate {
@@ -203,7 +205,8 @@ impl Translator {
             if rm == PC || rs == PC {
                 return Err(());
             }
-            self.shift_register(T2, rm, rs, (word >> 5) & 3, want_carry);
+            // Not T2: shift_register keeps the amount there for its carry check.
+            self.shift_register(T6, rm, rs, (word >> 5) & 3, want_carry);
             if want_carry {
                 // An amount of 0 keeps the current C.
                 let shifted = self.a.label();
@@ -211,11 +214,15 @@ impl Translator {
                 self.a.mrs_nzcv(T5);
                 self.a.ubfx_w(T3, T5, 29, 1);
                 self.a.bind(shifted);
-                (T2, Some(T3))
+                (T6, Some(T3))
             } else {
-                (T2, None)
+                (T6, None)
             }
         };
+        if reverse_carry {
+            let n = self.read(rn, T1);
+            return self.data_processing(op, set_flags, rd, operand, n, None);
+        }
         self.data_processing(op, set_flags, rd, rn, operand, carry)
     }
 
@@ -225,6 +232,11 @@ impl Translator {
         match (word >> 20) & 0xF {
             0b0000 if rd != PC => self.a.mov_w_imm(rd, imm16), // MOVW
             0b0100 if rd != PC => self.a.emit(0x72A0_0000 | (imm16 << 5) | rd), // MOVT: movk wd, #imm16, lsl 16
+            0b0010 if word == 0xE320_F001 || word == 0xE320_F002 => {
+                let next = self.next_pc();
+                emit_exit(&mut self.a, next, exit::YIELD);
+                return Ok(Flow::End);
+            }
             0b0010 if word & 0x0FFF_FF00 == 0x0320_F000 && word & 0xFF <= 4 => {} // NOP/YIELD/WFE/WFI/SEV
             _ => return Err(()),
         }
@@ -251,6 +263,15 @@ impl Translator {
                     return Err(());
                 }
                 self.a.msub_w(rd, rn, rm, ra); // MLS
+            }
+            0b010 if !set_flags => {
+                // UMAAL: RdHi = bits 19-16, RdLo = bits 15-12
+                let (rd_hi, rd_lo) = (rd, ra);
+                if rd_lo == PC || rd_lo == rd_hi {
+                    return Err(());
+                }
+                self.multiply_accumulate_accumulate(rd_lo, rd_hi, rn, rm);
+                return Ok(Flow::Next);
             }
             0b100..=0b111 if !set_flags => {
                 // UMULL / UMLAL / SMULL / SMLAL: RdHi = bits 19-16, RdLo = bits 15-12
@@ -339,6 +360,16 @@ impl Translator {
                 return Err(());
             }
             self.a.clz_w(rd, rm);
+            return Ok(Flow::Next);
+        }
+        if word & 0x0FF0_0090 == 0x0100_0080 || word & 0x0FF0_F090 == 0x0160_0080 {
+            // SMLA<x><y> / SMUL<x><y>: N (bit 5) picks Rn's top half, M (bit 6) Rm's.
+            let (rd, ra, rs, rn) = ((word >> 16) & 0xF, (word >> 12) & 0xF, (word >> 8) & 0xF, word & 0xF);
+            if rd == PC || rn == PC || rs == PC || ra == PC {
+                return Err(());
+            }
+            let accumulate = ((word >> 21) & 3 == 0).then_some(ra);
+            self.halfword_multiply(rd, rn, (word >> 5) & 1 == 1, rs, (word >> 6) & 1 == 1, accumulate);
             return Ok(Flow::Next);
         }
         Err(())
@@ -484,6 +515,25 @@ impl Translator {
     }
 
     fn arm_media(&mut self, word: u32) -> Result<Flow> {
+        if word & 0x0FF0_0030 == 0x0680_0010 {
+            // PKHBT / PKHTB: Rn = 19-16, Rd = 15-12, imm5 = 11-7, tb = bit 6, Rm = 3-0
+            let (rn, rd, rm) = ((word >> 16) & 0xF, (word >> 12) & 0xF, word & 0xF);
+            if rd == PC || rn == PC || rm == PC {
+                return Err(());
+            }
+            self.pack_halfwords(rd, rn, rm, (word >> 6) & 1 == 1, (word >> 7) & 0x1F);
+            return Ok(Flow::Next);
+        }
+        if word & 0x0FF0_00D0 == 0x0750_0010 {
+            // SMMUL / SMMLA (R: rounded): Rd = 19-16, Ra = 15-12 (PC = none), Rm = 11-8, Rn = 3-0
+            let (rd, ra, rm, rn) = ((word >> 16) & 0xF, (word >> 12) & 0xF, (word >> 8) & 0xF, word & 0xF);
+            if rd == PC || rm == PC || rn == PC {
+                return Err(());
+            }
+            let accumulate = (ra != PC).then_some(ra);
+            self.most_significant_multiply(rd, rn, rm, accumulate, (word >> 5) & 1 == 1);
+            return Ok(Flow::Next);
+        }
         let (rd, rm) = ((word >> 12) & 0xF, word & 0xF);
         if word & 0x0FE0_0070 == 0x07E0_0050 || word & 0x0FE0_0070 == 0x07A0_0050 {
             // UBFX / SBFX Rd, Rn, #lsb, #width
@@ -568,7 +618,7 @@ impl Translator {
     fn arm_multiple(&mut self, word: u32) -> Result<Flow> {
         let (before, up, user, writeback, load) = ((word >> 24) & 1 == 1, (word >> 23) & 1 == 1, (word >> 22) & 1 == 1, (word >> 21) & 1 == 1, (word >> 20) & 1 == 1);
         let (rn, list) = ((word >> 16) & 0xF, word & 0xFFFF);
-        if user || (rn == SP && list & (1 << SP) != 0) {
+        if user || (load && rn == SP && list & (1 << SP) != 0) {
             return Err(());
         }
         self.load_store_multiple_at(load, rn, list, up, before, writeback)
@@ -587,6 +637,12 @@ impl Translator {
             self.a.ldr_w_off(rt, host::STATE, offsets::TLS);
             return Ok(Flow::Next);
         }
-        Err(()) // SVC, other coprocessors: Unicorn
+        if (word >> 24) & 0xF == 0xF {
+            // SVC: a Linux system call made straight from game code (the dispatcher runs it).
+            let next = self.next_pc();
+            emit_exit(&mut self.a, next, exit::SYSCALL);
+            return Ok(Flow::End);
+        }
+        Err(()) // other coprocessors: Unicorn
     }
 }

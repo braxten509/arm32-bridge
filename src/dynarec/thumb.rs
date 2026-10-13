@@ -36,13 +36,35 @@ const SP: u32 = 13;
 /// Ends a block: continue at `pc` (bit 0 = Thumb) for `reason`.
 pub fn emit_exit(a: &mut Asm, pc: u32, reason: u32) {
     if reason == exit::JUMP && !a.no_link {
+        // While another guest thread waits for its turn, leave through the
+        // dispatcher instead of jumping straight on (runtime::PREEMPT).
+        let unlinked = a.label();
+        restore_vfp_mode(a);
+        preempt_check(a, unlinked);
         // Becomes `b <block>` once the block at `pc` is translated (engine.rs).
         a.links.push((a.len(), pc));
         a.nop();
+        a.bind(unlinked);
     }
     a.mov_w_imm(host::EXIT_PC, pc);
     a.mov_w_imm(host::EXIT_REASON, reason);
     a.br(host::EXIT_STUB);
+}
+
+/// Puts host FPCR back in the guest's VFP mode before a linked exit from NEON mode (uses T0, T1).
+fn restore_vfp_mode(a: &mut Asm) {
+    if a.vfp_restore {
+        a.ldr_w_off(T0, host::STATE, offsets::FPSCR);
+        a.and_w_imm(T0, T0, super::FPSCR_CONTROL, T1);
+        a.msr_fpcr(T0);
+    }
+}
+
+/// Branches to `to` when the shared preempt flag is set (uses T0; flags untouched).
+fn preempt_check(a: &mut Asm, to: super::emit::Label) {
+    a.ldr_x_off(T0, host::STATE, offsets::PREEMPT_FLAG);
+    a.ldr_w_off(T0, T0, 0);
+    a.cbnz_w_to(T0, to);
 }
 
 /// Ends a block: continue at the address in `target` (bit 0 = Thumb). With
@@ -52,6 +74,8 @@ fn emit_exit_to(a: &mut Asm, target: Reg) {
     let table = super::engine::jump_table();
     if table != 0 && !a.no_link {
         let miss = a.label();
+        restore_vfp_mode(a);
+        preempt_check(a, miss);
         a.mov_x_imm(T0, table as u64);
         a.ubfx_w(T1, target, 1, super::engine::JUMP_TABLE_BITS);
         a.add_x_lsl(T0, T0, T1, 4);
@@ -285,6 +309,8 @@ impl Translator {
     /// result = rm shifted by the low byte of rs (register-controlled shift).
     /// With `carry_out`, T3 bit 0 = carry and T4 = 1 when the amount was 0.
     fn shift_register(&mut self, result: Reg, rm: Reg, rs: Reg, kind: u32, carry_out: bool) {
+        // T2 holds the amount until the end (the carry check needs it).
+        assert!(result != T2, "shift result would overwrite the amount");
         let a = &mut self.a;
         a.and_w_imm(T2, rs, 0xFF, T5); // amount
         let done = a.label();
@@ -559,8 +585,16 @@ impl Translator {
     /// LDM/STM in any of the four modes: `up` = increment, `before` = adjust before each access.
     fn load_store_multiple_at(&mut self, load: bool, rn: u32, list: u32, up: bool, before: bool, writeback: bool) -> Result<Flow> {
         let count = list.count_ones();
-        if count == 0 || rn == PC || (!load && list & (1 << PC) != 0) || (list & (1 << SP) != 0 && rn != SP && load) {
+        if count == 0 || rn == PC || (list & (1 << SP) != 0 && rn != SP && load) {
             return Err(());
+        }
+        if !load && list & (1 << PC) != 0 {
+            // Only ARM code can store PC (Mono's trampolines push it); it reads as the instruction + 8.
+            if self.thumb {
+                return Err(());
+            }
+            let value = self.pc_value();
+            self.a.mov_w_imm(T6, value);
         }
         let a = &mut self.a;
         // T0 = lowest address; T1 = host address of it.
@@ -580,7 +614,7 @@ impl Translator {
             if load {
                 a.ldr_w_off(target, T1, offset);
             } else {
-                a.str_w_off(r, T1, offset);
+                a.str_w_off(if r == PC { T6 } else { r }, T1, offset);
             }
             offset += 4;
         }
@@ -824,6 +858,12 @@ impl Translator {
             0b110100..=0b110111 => {
                 // B<c> / UDF / SVC
                 let condition = (h >> 8) & 0xF;
+                if condition == 0xF && !self.in_it {
+                    // SVC: a Linux system call (the dispatcher runs it).
+                    let next = self.next_pc() | 1;
+                    emit_exit(&mut self.a, next, exit::SYSCALL);
+                    return Ok(Flow::End);
+                }
                 if condition >= 0xE {
                     return Err(());
                 }
@@ -1036,7 +1076,11 @@ impl Translator {
             }
             0b1111000..=0b1111111 => {
                 // hints (IT is handled earlier): NOP, YIELD, WFE, WFI, SEV
-                if h & 0xF == 0 {
+                if (h == 0xBF10 || h == 0xBF20) && !self.in_it {
+                    let next = self.next_pc() | 1;
+                    emit_exit(&mut self.a, next, exit::YIELD);
+                    Ok(Flow::End)
+                } else if h & 0xF == 0 {
                     Ok(Flow::Next)
                 } else {
                     Err(())
@@ -1241,8 +1285,12 @@ impl Translator {
         let amount = (((h2 >> 12) & 7) << 2) | ((h2 >> 6) & 3);
         let kind = (h2 >> 4) & 3;
         if op == 0b0110 {
-            // PKHBT / PKHTB
-            return Err(());
+            // PKHBT / PKHTB (tb = bit 5)
+            if set_flags || kind & 1 != 0 || rd == PC || rn == PC || rm == PC {
+                return Err(());
+            }
+            self.pack_halfwords(rd, rn, rm, kind >> 1 == 1, amount);
+            return Ok(Flow::Next);
         }
         if rm == PC || rd == PC && !(set_flags && matches!(op, 0b0000 | 0b0100 | 0b1000 | 0b1101)) {
             return Err(());
@@ -1251,6 +1299,22 @@ impl Translator {
         let carry = self.shift_immediate(T2, rm, kind, amount, set_flags && logical);
         let carry = if carry && set_flags && logical { Some(T3) } else { None };
         self.data_processing(op, set_flags, rd, rn, T2, carry)
+    }
+
+    /// PKHBT: rd = rn bottom | (rm << amount) top; PKHTB: rd = rn top | (rm asr amount) bottom
+    /// (an amount of 0 means 32 for PKHTB).
+    pub(super) fn pack_halfwords(&mut self, rd: u32, rn: u32, rm: u32, top_bottom: bool, amount: u32) {
+        let a = &mut self.a;
+        if top_bottom {
+            a.asr_w_imm(T4, rm, if amount == 0 { 31 } else { amount });
+            a.mov_w(T5, rn);
+            a.bfi_w(T5, T4, 0, 16);
+            a.mov_w(rd, T5);
+        } else {
+            a.lsl_w_imm(T4, rm, amount);
+            a.bfi_w(T4, rn, 0, 16);
+            a.mov_w(rd, T4);
+        }
     }
 
     fn data_modified_immediate(&mut self, h1: u32, h2: u32) -> Result<Flow> {
@@ -1550,6 +1614,16 @@ impl Translator {
                 }
                 self.a.msub_w(rd, rn, rm, ra);
             }
+            (0b101, 0) | (0b101, 1) => {
+                // SMMUL / SMMLA (R: rounded)
+                let accumulate = (ra != PC).then_some(ra);
+                self.most_significant_multiply(rd, rn, rm, accumulate, op2 == 1);
+            }
+            (0b001, _) => {
+                // SMUL<x><y> / SMLA<x><y>: N (bit 5) picks Rn's top half, M (bit 4) Rm's.
+                let accumulate = (ra != PC).then_some(ra);
+                self.halfword_multiply(rd, rn, op2 >> 1 == 1, rm, op2 & 1 == 1, accumulate);
+            }
             _ => return Err(()),
         }
         Ok(Flow::Next)
@@ -1580,8 +1654,67 @@ impl Translator {
                 self.multiply_long(op1 == 0b000 || op1 == 0b100, op1 >= 0b100, rd_lo, rd_hi, rn, rm);
                 Ok(Flow::Next)
             }
+            (0b110, 0b0110) => {
+                // UMAAL
+                if rd_lo == PC || rd_lo == rd_hi {
+                    return Err(());
+                }
+                self.multiply_accumulate_accumulate(rd_lo, rd_hi, rn, rm);
+                Ok(Flow::Next)
+            }
             _ => Err(()),
         }
+    }
+
+    /// rd = (16-bit half of rn) * (16-bit half of rm) (+ ra, setting Q on signed overflow).
+    /// Computed without touching the host flags, which hold the guest's.
+    pub(super) fn halfword_multiply(&mut self, rd: u32, rn: u32, n_top: bool, rm: u32, m_top: bool, ra: Option<u32>) {
+        let a = &mut self.a;
+        for (target, source, top) in [(T4, rn, n_top), (T5, rm, m_top)] {
+            if top {
+                a.asr_w_imm(target, source, 16);
+            } else {
+                a.sxth_w(target, source);
+            }
+        }
+        a.mul_w(T4, T4, T5);
+        let Some(ra) = ra else {
+            a.mov_w(rd, T4);
+            return;
+        };
+        a.add_w(T5, T4, ra, shift::LSL, 0);
+        // Overflow: both inputs differ in sign from the sum.
+        a.eor_w(T6, T4, T5, shift::LSL, 0);
+        a.eor_w(T0, ra, T5, shift::LSL, 0);
+        a.and_w(T6, T6, T0, shift::LSL, 0);
+        a.lsr_w_imm(T6, T6, 31);
+        a.ldr_w_off(T0, host::STATE, offsets::CPSR_OTHER);
+        a.orr_w(T0, T0, T6, shift::LSL, 27);
+        a.str_w_off(T0, host::STATE, offsets::CPSR_OTHER);
+        a.mov_w(rd, T5);
+    }
+
+    fn multiply_accumulate_accumulate(&mut self, rd_lo: u32, rd_hi: u32, rn: u32, rm: u32) {
+        self.a.mov_w(T4, rd_lo);
+        self.a.add_x_uxtw(T4, T4, rd_hi);
+        self.a.umaddl(T4, rn, rm, T4);
+        self.a.mov_w(rd_lo, T4);
+        self.a.lsr_x_imm(T4, T4, 32);
+        self.a.mov_w(rd_hi, T4);
+    }
+
+    fn most_significant_multiply(&mut self, rd: u32, rn: u32, rm: u32, ra: Option<u32>, round: bool) {
+        self.a.smaddl(T4, rn, rm, ZR);
+        if let Some(ra) = ra {
+            self.a.mov_w(T5, ra);
+            self.a.add_x_lsl(T4, T4, T5, 32);
+        }
+        if round {
+            self.a.mov_x_imm(T5, 0x8000_0000);
+            self.a.add_x(T4, T4, T5);
+        }
+        self.a.lsr_x_imm(T4, T4, 32);
+        self.a.mov_w(rd, T4);
     }
 
     /// rd_hi:rd_lo = rn * rm (+ rd_hi:rd_lo when accumulating), 64-bit.

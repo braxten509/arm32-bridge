@@ -24,8 +24,10 @@
 #define TAG "arm32bridge"
 #define log(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 
-// Returns 0 in both x0 and d0, whatever the method's return type.
+// Returns 0 in both the integer and the floating point result register,
+// whatever the method's return type (x0/d0; rax/xmm0 in the emulator copy).
 void standin_zero(void);
+#if defined(__aarch64__)
 __asm__(".text\n"
         ".p2align 2\n"
         ".hidden standin_zero\n"
@@ -34,6 +36,18 @@ __asm__(".text\n"
         "  mov x0, #0\n"
         "  fmov d0, xzr\n"
         "  ret\n");
+#elif defined(__x86_64__)
+__asm__(".text\n"
+        ".p2align 4\n"
+        ".hidden standin_zero\n"
+        ".type standin_zero, @function\n"
+        "standin_zero:\n"
+        "  xor %eax, %eax\n"
+        "  pxor %xmm0, %xmm0\n"
+        "  ret\n");
+#else
+#error "stand-in: unsupported CPU"
+#endif
 
 typedef int (*connected_fn)(const char *class_name, const char *method, const char *signature);
 // Returns NULL once the original runs, or why it couldn't.

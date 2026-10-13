@@ -12,41 +12,55 @@
 # - The APK is re-signed with the debug key (the original signature can't survive).
 # - Phone functions the game imports that the bridge has no handler for yet are listed.
 #
-# usage: tools/convert.sh <game.apk> [--out <converted.apk>] [--no-install]
+# usage: tools/convert.sh <game.apk> [--out <converted.apk>] [--no-install] [--abi x86_64] [--device <serial>]
+#   --abi x86_64: a copy for the PC's Android emulator (x86_64 bridge, Unicorn only)
+#   --device: install on this adb device (e.g. emulator-5554) instead of the phone
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 NDK=${NDK:-$HOME/Android/Sdk/ndk/30.0.16248370}
 BUILD_TOOLS=${BUILD_TOOLS:-$HOME/Android/Sdk/build-tools/37.0.0}
-CLANG=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang
 
-usage() { echo "usage: tools/convert.sh <game.apk> [--out <converted.apk>] [--no-install]" >&2; exit 2; }
-APK="" OUT="" INSTALL=1
+usage() {
+    echo "usage: tools/convert.sh <game.apk> [--out <converted.apk>] [--no-install] [--abi x86_64] [--device <serial>]" >&2
+    exit 2
+}
+APK="" OUT="" INSTALL=1 ABI=arm64-v8a DEVICE=""
 while [ $# -gt 0 ]; do
     case $1 in
         --out) OUT=$2; shift 2 ;;
         --no-install) INSTALL=0; shift ;;
+        --abi) ABI=$2; shift 2 ;;
+        --device) DEVICE=$2; shift 2 ;;
         -*) usage ;;
         *) [ -z "$APK" ] || usage; APK=$1; shift ;;
     esac
 done
 [ -n "$APK" ] || usage
+case $ABI in
+    arm64-v8a) TARGET=aarch64-linux-android CLANG_ARCH=aarch64 ;;
+    x86_64) TARGET=x86_64-linux-android CLANG_ARCH=x86_64 ;;
+    *) usage ;;
+esac
+CLANG=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/$CLANG_ARCH-linux-android30-clang
+ADB=(adb)
+[ -z "$DEVICE" ] || ADB=(adb -s "$DEVICE")
 APK=$(realpath "$APK")
-OUT=$(realpath -m "${OUT:-$(dirname "$APK")/$(basename "$APK" .apk)-arm64.apk}")
+OUT=$(realpath -m "${OUT:-$(dirname "$APK")/$(basename "$APK" .apk)-${ABI%%-*}.apk}")
 
-WORK=$ROOT/target/apk/$(basename "$APK" .apk)
+WORK=$ROOT/target/apk/$(basename "$APK" .apk)-$ABI
 rm -rf "$WORK"
 mkdir -p "$WORK"
 
 echo "== building the bridge"
-systemd-run --user --wait --pipe -q -p AllowedCPUs=6-11,18-23 -d bash -c \
+systemd-run --user --wait --pipe -q -p AllowedCPUs=6-11,18-23 -d -E TARGET=$TARGET bash -c \
     "cd '$ROOT' && ./build-phone.sh --lib -q && cargo build --release -q -p apk-convert" >&2
 "$CLANG" -O2 -shared -fPIC -Wl,--build-id=none -o "$WORK/libstandin.so" "$ROOT/tools/standin/standin.c" -llog -ldl
 
 echo "== converting"
 set +e
 "$ROOT/target/release/apk-convert" "$APK" "$WORK/unsigned.apk" \
-    --bridge "$ROOT/target/aarch64-linux-android/release/libarm32_bridge.so" --standin "$WORK/libstandin.so" \
-    --work "$WORK" > "$WORK/convert.log"
+    --bridge "$ROOT/target/$TARGET/release/libarm32_bridge.so" --standin "$WORK/libstandin.so" \
+    --work "$WORK" --abi "$ABI" > "$WORK/convert.log"
 STATUS=$?
 set -e
 grep -v '^missing ' "$WORK/convert.log" | sed -e 's/^step /  /' -e 's/^error /  /' -e 's/^warn /  warning: /'
@@ -68,18 +82,18 @@ echo "converted: $OUT"
 
 [ "$INSTALL" = 1 ] || exit 0
 echo "== install"
-if ! adb get-state >/dev/null 2>&1; then
+if [ -z "$DEVICE" ] && ! "${ADB[@]}" get-state >/dev/null 2>&1; then
     # Wireless debugging changes its port; look for the phone on the network.
     for address in $(adb mdns services 2>/dev/null | awk '/_adb-tls-connect/ {print $NF}'); do
         adb connect "$address" >/dev/null 2>&1 && break
     done
 fi
-if ! adb get-state >/dev/null 2>&1; then
+if ! "${ADB[@]}" get-state >/dev/null 2>&1; then
     echo "No phone found. Turn on Wireless debugging on the phone (same Wi-Fi), then run:" >&2
     echo "  adb install -r --bypass-low-target-sdk-block '$OUT'" >&2
     exit 1
 fi
-if ! result=$(adb install -r --bypass-low-target-sdk-block "$OUT" 2>&1); then
+if ! result=$("${ADB[@]}" install -r --bypass-low-target-sdk-block "$OUT" 2>&1); then
     if grep -q "UPDATE_INCOMPATIBLE" <<<"$result"; then
         echo "The phone already has this game signed by someone else, so it can't be replaced in place." >&2
         echo "Uninstall it on the phone first (this deletes its saved progress), then run this again." >&2

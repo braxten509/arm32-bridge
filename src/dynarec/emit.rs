@@ -69,6 +69,29 @@ pub mod simd {
     pub const FADD: u32 = 0x0E20_D400;
     pub const FSUB: u32 = 0x0EA0_D400;
     pub const FMUL: u32 = 0x2E20_DC00;
+    pub const FMAX: u32 = 0x0E20_F400;
+    pub const FMIN: u32 = 0x0EA0_F400;
+    // Two-register (one source) single-precision vector operations.
+    pub const SCVTF: u32 = 0x0E21_D800;
+    pub const UCVTF: u32 = 0x2E21_D800;
+    pub const FCVTZS: u32 = 0x0EA1_B800;
+    pub const FCVTZU: u32 = 0x2EA1_B800;
+    // One-source operations that take an element size at bits 22-23.
+    pub const REV64: u32 = 0x0E20_0800;
+    pub const REV32: u32 = 0x2E20_0800;
+    pub const REV16: u32 = 0x0E20_1800;
+    pub const NOT: u32 = 0x2E20_5800;
+    pub const NEG: u32 = 0x2E20_B800;
+    pub const ABS: u32 = 0x0E20_B800;
+    pub const FNEG: u32 = 0x2EA0_F800;
+    pub const FABS: u32 = 0x0EA0_F800;
+    // Permutes (three-register form, element size at bits 22-23).
+    pub const TRN1: u32 = 0x0E00_2800;
+    pub const TRN2: u32 = 0x0E00_6800;
+    pub const ZIP1: u32 = 0x0E00_3800;
+    pub const ZIP2: u32 = 0x0E00_7800;
+    pub const UZP1: u32 = 0x0E00_1800;
+    pub const UZP2: u32 = 0x0E00_5800;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -92,6 +115,9 @@ pub struct Asm {
     pub links: Vec<(usize, u32)>,
     /// Exits may not link to other blocks or use the jump table (host FPCR is not in the guest's mode).
     pub no_link: bool,
+    /// Host FPCR is in NEON mode: linked exits put the guest's VFP mode back first
+    /// (the next block expects it).
+    pub vfp_restore: bool,
 }
 
 impl Asm {
@@ -692,9 +718,79 @@ impl Asm {
         self.lane_access(0, double, rt, lane, rn, post);
     }
     fn lane_access(&mut self, load: u32, double: bool, rt: Reg, lane: u32, rn: Reg, post: bool) {
-        let base = if post { 0x0D9F_8000 } else { 0x0D00_8000 };
-        let (q, s, size) = if double { (lane, 0, 0b01) } else { (lane >> 1, lane & 1, 0b00) };
-        self.emit(base | load | (q << 30) | (s << 12) | (size << 10) | (rn << 5) | rt);
+        self.lane_access_sized(load, if double { 3 } else { 2 }, rt, lane, rn, post);
+    }
+    /// ld1/st1 of one lane of 1 << `size` bytes (with `post`: [xn], #bytes).
+    fn lane_access_sized(&mut self, load: u32, size: u32, rt: Reg, lane: u32, rn: Reg, post: bool) {
+        let base = if post { 0x0D9F_0000 } else { 0x0D00_0000 };
+        // Q:S:size hold the lane index above the element size bits.
+        let (opcode, index_bits, low) = match size {
+            0 => (0b000, lane, 0),
+            1 => (0b010, lane << 1, 0),
+            2 => (0b100, lane << 2, 0),
+            _ => (0b100, lane << 3, 0b01),
+        };
+        let (q, s, size_field) = (index_bits >> 3, (index_bits >> 2) & 1, (index_bits & 3) | low);
+        self.emit(base | load | (q << 30) | (opcode << 13) | (s << 12) | (size_field << 10) | (rn << 5) | rt);
+    }
+    /// ld1 / st1 {vt.b/h/s/d}[lane], [xn] for an element of 1 << `size` bytes.
+    pub fn lane_load_store(&mut self, load: bool, size: u32, rt: Reg, lane: u32, rn: Reg) {
+        self.lane_access_sized(if load { 0x0040_0000 } else { 0 }, size, rt, lane, rn, false);
+    }
+    /// ld1r {vt.8b/4h/2s}, [xn]: one element loaded into every lane of the low half.
+    pub fn ld1r(&mut self, size: u32, rt: Reg, rn: Reg) {
+        self.emit(0x0D40_C000 | (size << 10) | (rn << 5) | rt);
+    }
+    /// Element field (imm5) for an element of 1 << `size` bytes at `lane`.
+    fn element_sized(size: u32, lane: u32) -> u32 {
+        (lane << (size + 1)) | (1 << size)
+    }
+    /// ins vd.<size>[lane], wn/xn
+    pub fn ins_general_sized(&mut self, size: u32, rd: Reg, lane: u32, rn: Reg) {
+        self.emit(0x4E00_1C00 | (Self::element_sized(size, lane) << 16) | (rn << 5) | rd);
+    }
+    /// umov / smov wd, vn.<size>[lane] (smov only for bytes and halfwords).
+    pub fn move_element_out(&mut self, signed: bool, size: u32, rd: Reg, rn: Reg, lane: u32) {
+        let op = if signed { 0x0E00_2C00 } else { 0x0E00_3C00 };
+        self.emit(op | (Self::element_sized(size, lane) << 16) | (rn << 5) | rd);
+    }
+    /// sshll / ushll vd.<2x>, vn.<x> (low half), #shift, for elements of 1 << `size` bytes.
+    pub fn shift_left_long(&mut self, signed: bool, size: u32, rd: Reg, rn: Reg, shift: u32) {
+        let op = if signed { 0x0F00_A400 } else { 0x2F00_A400 };
+        self.emit(op | (((8 << size) + shift) << 16) | (rn << 5) | rd);
+    }
+    /// One-source vector operation (`simd::SCVTF` and so on).
+    pub fn simd2(&mut self, op: u32, q: bool, rd: Reg, rn: Reg) {
+        self.emit(op | ((q as u32) << 30) | (rn << 5) | rd);
+    }
+    /// One-source vector operation with an element size (`simd::REV64` and so on).
+    pub fn simd2_sized(&mut self, op: u32, q: bool, size: u32, rd: Reg, rn: Reg) {
+        self.emit(op | ((q as u32) << 30) | (size << 22) | (rn << 5) | rd);
+    }
+    /// fmov vd.2s/4s, #imm8 (VFPExpandImm) in every lane.
+    pub fn fmov_vector_imm(&mut self, q: bool, rd: Reg, imm8: u32) {
+        self.emit(0x0F00_F400 | ((q as u32) << 30) | ((imm8 >> 5) << 16) | ((imm8 & 0x1F) << 5) | rd);
+    }
+    /// dup vd.<T>, wn: a core register in every lane (1 << `size` bytes each).
+    pub fn dup_general(&mut self, q: bool, size: u32, rd: Reg, rn: Reg) {
+        self.emit(0x0E00_0C00 | ((q as u32) << 30) | ((1 << size) << 16) | (rn << 5) | rd);
+    }
+    /// ld2/ld3/ld4 or st2/st3/st4 {vt..vt+count-1}.<T>, [xn] (interleaved structures).
+    pub fn structures(&mut self, load: bool, count: u32, q: bool, size: u32, rt: Reg, rn: Reg) {
+        let opcode = match count {
+            2 => 0b1000,
+            3 => 0b0100,
+            _ => 0b0000,
+        };
+        self.emit(0x0C00_0000 | ((q as u32) << 30) | ((load as u32) << 22) | (opcode << 12) | (size << 10) | (rn << 5) | rt);
+    }
+    /// ext vd, vn, vm, #bytes: bytes from the pair vm:vn starting at `bytes`.
+    pub fn ext(&mut self, q: bool, rd: Reg, rn: Reg, rm: Reg, bytes: u32) {
+        self.emit(0x2E00_0000 | ((q as u32) << 30) | (rm << 16) | (bytes << 11) | (rn << 5) | rd);
+    }
+    /// dup vd.<T>, vn.<size>[lane]
+    pub fn dup_lanes(&mut self, q: bool, size: u32, rd: Reg, rn: Reg, lane: u32) {
+        self.emit(0x0E00_0400 | ((q as u32) << 30) | (Self::element_sized(size, lane) << 16) | (rn << 5) | rd);
     }
 
     // ---- memory: guest accesses are [x20 (memory base), w(address), uxtw] ----

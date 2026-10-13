@@ -20,8 +20,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::handler;
 use crate::runtime::{
-    call_guest, drop_engine, engine, hold_gil, mem, shared, stop_with_fault, wait_for_guests, wake_guests, without_gil,
-    ArgSource, Handler, Ret, Uc,
+    call_guest, drop_engine, engine, hold_gil, mem, shared, stop_with_fault, wait_on, wake_on, without_gil, ArgSource,
+    Handler, Ret, Uc,
 };
 
 const TYPE_MASK: u32 = 0xC000;
@@ -45,6 +45,8 @@ pub struct Threads {
     records: HashMap<u32, (bool, u32, bool)>,
     /// Thread-specific data: key → live, and (thread, key) → value.
     keys: Vec<Option<u32>>,
+    /// Futex words: address -> wake count (a waiter returns once it changes).
+    futex_wakes: HashMap<u32, u32>,
     /// Condition variables whose timed waits use CLOCK_MONOTONIC deadlines.
     monotonic_conditions: std::collections::HashSet<u32>,
     values: HashMap<(u32, u32), u32>,
@@ -52,7 +54,11 @@ pub struct Threads {
 
 thread_local! {
     static SELF_HANDLE: Cell<u32> = const { Cell::new(0) };
+    /// Set by pthread_exit: the value the thread returns once its guest calls unwind.
+    static EXIT_VALUE: Cell<Option<u32>> = const { Cell::new(None) };
 }
+
+const THREAD_EXIT: &str = "guest thread called pthread_exit";
 
 /// This thread's pthread_t, handing one out on first use.
 pub fn current_handle() -> u32 {
@@ -65,6 +71,16 @@ pub fn current_handle() -> u32 {
     handle
 }
 
+/// Whether `handle` is a thread that exists (and hasn't finished).
+pub fn is_live(handle: u32) -> bool {
+    let shared = shared();
+    let threads = &shared.state.threads;
+    if handle <= FIRST_HANDLE || handle > threads.next_handle {
+        return false;
+    }
+    !matches!(threads.records.get(&handle), Some((true, _, _)))
+}
+
 fn new_handle() -> u32 {
     let mut shared = shared();
     let threads = &mut shared.state.threads;
@@ -73,6 +89,10 @@ fn new_handle() -> u32 {
     }
     threads.next_handle += 4;
     threads.next_handle
+}
+
+fn join_key(handle: u32) -> u64 {
+    1 << 32 | handle as u64
 }
 
 fn owner_of(value: u32) -> u32 {
@@ -102,7 +122,7 @@ fn lock(uc: &Uc, mutex: u32, count: u32, try_only: bool) -> u32 {
         if try_only {
             return EBUSY;
         }
-        wait_for_guests(None);
+        wait_on(mutex as u64, None);
     }
 }
 
@@ -117,7 +137,7 @@ fn unlock(uc: &Uc, mutex: u32, all: bool) -> Result<u32, u32> {
     let depth = value & COUNT_MASK;
     if all || depth <= 1 {
         mem().write_u32(mutex, kind);
-        wake_guests();
+        wake_on(mutex as u64);
     } else {
         mem().write_u32(mutex, kind | (me << 16) | (depth - 1));
     }
@@ -143,7 +163,7 @@ fn condition_wait(uc: &Uc, condition: u32, mutex: u32, deadline: Option<SystemTi
             },
             None => None,
         };
-        wait_for_guests(timeout);
+        wait_on(condition as u64, timeout);
     }
     lock(uc, mutex, depth, false);
     result
@@ -166,7 +186,7 @@ fn semaphore_wait(uc: &Uc, semaphore: u32, wait: Option<Option<SystemTime>>) -> 
                 Err(_) => return fail_with(uc, ETIMEDOUT),
             },
         };
-        wait_for_guests(timeout);
+        wait_on(semaphore as u64, timeout);
     }
 }
 
@@ -193,6 +213,109 @@ fn monotonic_deadline(pointer: u32) -> SystemTime {
 
 const RWLOCK_READERS: u32 = 0xFFFF;
 
+/// A Linux system call by its ARM EABI number, from libc's syscall() or a
+/// raw `svc` in game code. Returns the kernel-style result (negative errno).
+pub fn linux_syscall(uc: &mut Uc, number: u32, arguments: [u32; 6]) -> i64 {
+    let [first, second, third, fourth, _, _] = arguments;
+    match number {
+        240 => futex(uc, first, second, third, fourth) as i64,
+        224 => (unsafe { libc::gettid() }) as i64,
+        20 => (unsafe { libc::getpid() }) as i64,
+        158 => {
+            without_gil(|| std::thread::yield_now());
+            0
+        }
+        // sched_setaffinity: the guest's threads are the bridge's; leave their CPUs alone.
+        241 => 0,
+        // clock_gettime(clock, struct timespec *) with 32-bit fields.
+        263 => {
+            let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            if unsafe { libc::clock_gettime(first as i32, &mut now) } != 0 {
+                return -(EINVAL as i64);
+            }
+            mem().write_u32(second, now.tv_sec as u32);
+            mem().write_u32(second + 4, now.tv_nsec as u32);
+            0
+        }
+        // getrandom(buffer, length, flags)
+        384 => {
+            let host = crate::imports::gles::guest_pointer(first);
+            let got = unsafe { libc::getrandom(host, second as usize, third) };
+            if got < 0 { -(EAGAIN as i64) } else { got as i64 }
+        }
+        // ARM cacheflush(start, end, flags): code was written there (a JIT).
+        0x000f_0002 => {
+            crate::dynarec::invalidate(first, second);
+            let _ = uc.ctl_remove_cache(first as u64, second as u64);
+            0
+        }
+        _ => {
+            crate::log::line(&format!("[bridge] syscall {number} not handled; returning ENOSYS"));
+            -38
+        }
+    }
+}
+
+const FUTEX_WAIT: u32 = 0;
+const FUTEX_WAKE: u32 = 1;
+const FUTEX_WAIT_BITSET: u32 = 9;
+const FUTEX_WAKE_BITSET: u32 = 10;
+const FUTEX_PRIVATE: u32 = 128;
+const FUTEX_CLOCK_REALTIME: u32 = 256;
+
+/// futex(2) on a guest word. Guest threads only run while holding the guest
+/// lock, so waiting gives it up until a wake for this word (or the timeout).
+/// Returns the syscall result (negative errno on failure).
+fn futex(uc: &Uc, address: u32, operation: u32, value: u32, timeout: u32) -> i32 {
+    let command = operation & !(FUTEX_PRIVATE | FUTEX_CLOCK_REALTIME);
+    match command {
+        FUTEX_WAIT | FUTEX_WAIT_BITSET => {
+            if mem().read_u32(address) != value {
+                return -(EAGAIN as i32);
+            }
+            let deadline = (timeout != 0).then(|| {
+                if command == FUTEX_WAIT {
+                    let relative = Duration::new(
+                        mem().read_u32(timeout) as i32 as u64,
+                        (mem().read_u32(timeout + 4) as i32).max(0) as u32,
+                    );
+                    SystemTime::now() + relative
+                } else if operation & FUTEX_CLOCK_REALTIME != 0 {
+                    guest_time(timeout)
+                } else {
+                    monotonic_deadline(timeout)
+                }
+            });
+            let start = shared().state.threads.futex_wakes.get(&address).copied().unwrap_or(0);
+            loop {
+                if shared().state.threads.futex_wakes.get(&address).copied().unwrap_or(0) != start {
+                    return 0;
+                }
+                let left = match deadline {
+                    Some(deadline) => match deadline.duration_since(SystemTime::now()) {
+                        Ok(left) => Some(left),
+                        Err(_) => return -(ETIMEDOUT as i32),
+                    },
+                    None => None,
+                };
+                wait_on(address as u64, left);
+            }
+        }
+        FUTEX_WAKE | FUTEX_WAKE_BITSET => {
+            let _ = uc;
+            let wakes = &mut shared().state.threads.futex_wakes;
+            *wakes.entry(address).or_insert(0) += 1;
+            wake_on(address as u64);
+            // Waiters aren't counted; report as many as were allowed.
+            value.min(i32::MAX as u32) as i32
+        }
+        _ => {
+            crate::log::line(&format!("[bridge] futex operation {operation} not handled"));
+            -38 // ENOSYS
+        }
+    }
+}
+
 /// Takes a guest read-write lock for reading or writing.
 fn rwlock_lock(uc: &Uc, lock: u32, write: bool, try_only: bool) -> u32 {
     let me = uc.get_data().id;
@@ -213,7 +336,7 @@ fn rwlock_lock(uc: &Uc, lock: u32, write: bool, try_only: bool) -> u32 {
         if try_only {
             return EBUSY;
         }
-        wait_for_guests(None);
+        wait_on(lock as u64, None);
     }
 }
 
@@ -241,12 +364,17 @@ fn run_thread(handle: u32, start: u32, argument: u32) {
     let uc = engine();
     let result = match call_guest(uc, start, &[argument]) {
         Ok(value) => value as u32,
+        Err(_) if EXIT_VALUE.with(|v| v.get()).is_some() => {
+            uc.get_data_mut().fault = None;
+            EXIT_VALUE.with(|v| v.take()).unwrap_or(0)
+        }
         Err(error) => {
             crate::log::line(&format!("[bridge] guest thread {handle:#x} stopped: {error}"));
             0
         }
     };
     run_key_destructors(uc, handle);
+    crate::imports::signals::forget_thread(handle);
     {
         let mut shared = shared();
         let records = &mut shared.state.threads.records;
@@ -257,7 +385,7 @@ fn run_thread(handle: u32, start: u32, argument: u32) {
             records.insert(handle, (true, result, false));
         }
     }
-    wake_guests();
+    wake_on(join_key(handle));
     crate::imports::jni_host::detach_current_thread();
     drop_engine();
 }
@@ -277,6 +405,29 @@ fn run_key_destructors(uc: &mut Uc, handle: u32) {
     };
     for (destructor, value) in pending {
         let _ = call_guest(uc, destructor, &[value]);
+    }
+}
+
+fn guest_sleep(duration: Duration) {
+    let deadline = std::time::Instant::now() + duration;
+    loop {
+        let finished = without_gil(|| {
+            let mut slept_once = false;
+            loop {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return true;
+                }
+                if slept_once && crate::imports::signals::any_pending() {
+                    return false;
+                }
+                std::thread::sleep((deadline - now).min(Duration::from_millis(1)));
+                slept_once = true;
+            }
+        });
+        if finished {
+            return;
+        }
     }
 }
 
@@ -333,7 +484,7 @@ pub fn handler(name: &str) -> Option<Handler> {
         "pthread_cond_signal" | "pthread_cond_broadcast" => handler!(|uc, a| {
             let condition = a.u32();
             mem().write_u32(condition, mem().read_u32(condition).wrapping_add(1));
-            wake_guests();
+            wake_on(condition as u64);
             Ret::U32(0)
         }),
         "pthread_cond_wait" => handler!(|uc, a| {
@@ -345,6 +496,17 @@ pub fn handler(name: &str) -> Option<Handler> {
             let monotonic = shared().state.threads.monotonic_conditions.contains(&condition);
             let deadline = if monotonic { monotonic_deadline(deadline) } else { guest_time(deadline) };
             Ret::U32(condition_wait(uc, condition, mutex, Some(deadline)))
+        }),
+        // Raw system calls through libc's syscall(): -1 and errno on failure.
+        "syscall" => handler!(|uc, a| {
+            let number = a.u32();
+            let arguments = [a.u32(), a.u32(), a.u32(), a.u32(), a.u32(), a.u32()];
+            let result = linux_syscall(uc, number, arguments);
+            if result < 0 {
+                fail_with(uc, (-result) as u32)
+            } else {
+                Ret::U32(result as u32)
+            }
         }),
         "pthread_condattr_init" => handler!(|uc, a| {
             mem().write_u32(a.u32(), 0);
@@ -378,7 +540,7 @@ pub fn handler(name: &str) -> Option<Handler> {
             } else {
                 return Ret::U32(EPERM);
             }
-            wake_guests();
+            wake_on(lock as u64);
             Ret::U32(0)
         }),
         "pthread_attr_init" => handler!(|uc, a| {
@@ -460,7 +622,7 @@ pub fn handler(name: &str) -> Option<Handler> {
         "sem_post" => handler!(|uc, a| {
             let semaphore = a.u32();
             mem().write_u32(semaphore, mem().read_u32(semaphore).wrapping_add(1));
-            wake_guests();
+            wake_on(semaphore as u64);
             Ret::U32(0)
         }),
         "sem_getvalue" => handler!(|uc, a| {
@@ -481,6 +643,11 @@ pub fn handler(name: &str) -> Option<Handler> {
             semaphore_wait(uc, semaphore, Some(Some(guest_time(deadline))))
         }),
         "pthread_self" => handler!(|uc, a| Ret::U32(current_handle())),
+        "pthread_exit" => handler!(|uc, a| {
+            EXIT_VALUE.with(|v| v.set(Some(a.u32())));
+            stop_with_fault(uc, THREAD_EXIT.into());
+            Ret::Void
+        }),
         "pthread_equal" => handler!(|uc, a| {
             let (x, y) = (a.u32(), a.u32());
             Ret::U32((x == y) as u32)
@@ -531,7 +698,7 @@ pub fn handler(name: &str) -> Option<Handler> {
                         }
                         return Ret::U32(0);
                     }
-                    Some(_) => wait_for_guests(None),
+                    Some(_) => wait_on(join_key(handle), None),
                 }
             }
         }),
@@ -545,10 +712,10 @@ pub fn handler(name: &str) -> Option<Handler> {
                             stop_with_fault(uc, error);
                         }
                         mem().write_u32(control, 2);
-                        wake_guests();
+                        wake_on(control as u64);
                         return Ret::U32(0);
                     }
-                    1 => wait_for_guests(Some(Duration::from_millis(5))),
+                    1 => wait_on(control as u64, Some(Duration::from_millis(5))),
                     _ => return Ret::U32(0),
                 }
             }
@@ -597,17 +764,31 @@ pub fn handler(name: &str) -> Option<Handler> {
             let seconds = mem().read_u32(request) as i32 as i64;
             let nanoseconds = mem().read_u32(request + 4) as i32 as i64;
             let wait = Duration::from_secs(seconds.max(0) as u64) + Duration::from_nanos(nanoseconds.max(0) as u64);
-            without_gil(|| std::thread::sleep(wait));
+            guest_sleep(wait);
+            Ret::U32(0)
+        }),
+        "clock_nanosleep" => handler!(|uc, a| {
+            let (clock, flags, request) = (a.i32(), a.u32(), a.u32());
+            let seconds = mem().read_u32(request) as i32 as i64;
+            let nanoseconds = mem().read_u32(request + 4) as i32 as i64;
+            let mut wait = Duration::from_secs(seconds.max(0) as u64) + Duration::from_nanos(nanoseconds.max(0) as u64);
+            if flags & 1 != 0 {
+                let mut now: libc::timespec = unsafe { std::mem::zeroed() };
+                unsafe { libc::clock_gettime(clock, &mut now) };
+                let now = Duration::from_secs(now.tv_sec.max(0) as u64) + Duration::from_nanos(now.tv_nsec.max(0) as u64);
+                wait = wait.saturating_sub(now);
+            }
+            guest_sleep(wait);
             Ret::U32(0)
         }),
         "usleep" => handler!(|uc, a| {
             let microseconds = a.u32();
-            without_gil(|| std::thread::sleep(Duration::from_micros(microseconds as u64)));
+            guest_sleep(Duration::from_micros(microseconds as u64));
             Ret::U32(0)
         }),
         "sleep" => handler!(|uc, a| {
             let seconds = a.u32();
-            without_gil(|| std::thread::sleep(Duration::from_secs(seconds as u64)));
+            guest_sleep(Duration::from_secs(seconds as u64));
             Ret::U32(0)
         }),
         _ => None,

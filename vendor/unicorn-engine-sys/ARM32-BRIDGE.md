@@ -19,3 +19,9 @@ Copied from crates.io; speed patches and one fix for arm32-bridge:
    for every ARM instruction. Only the Thumb translator sets it (inside IT
    blocks), so after translating an IT block, later ARM code was translated
    without exit checks and `count`/`uc_emu_stop` overran to the end of the block.
+6. `qemu/target/arm/translate.c` (trans_YIELD, trans_WFE) and
+   `qemu/target/arm/op_helper.c` (helper_yield): YIELD and WFE call the
+   UC_HOOK_INTR hooks with EXCP_YIELD and carry on, instead of ending the run
+   (which Unicorn reported as INSN_INVALID, so Unity's job worker threads
+   stopped in their spin-wait loop). arm32-bridge hands the guest lock to
+   another thread there, so a spinning thread can't starve the one it waits on.

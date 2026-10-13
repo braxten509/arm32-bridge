@@ -30,15 +30,22 @@ pub const KUSER_END: u32 = 0xFFFF_1000;
 
 /// Regions handed to Unicorn as (start, end, may hold code). Everything else
 /// faults when touched. Writes to code regions pay for a self-modifying-code
-/// check (see vendor/unicorn-engine-sys), so only stubs and libraries get it.
+/// check in Unicorn (see vendor/unicorn-engine-sys); the heap needs it for
+/// code games make while running.
 pub const MAPPED_REGIONS: [(u32, u32, bool); 6] = [
     (STUB_BASE, STUB_BASE + STUB_SIZE, true),
     (LIB_BASE, LIB_END, true),
-    (HEAP_BASE, HEAP_END, false),
+    // Games with a JIT (Mono, ...) run code they write into heap blocks.
+    (HEAP_BASE, HEAP_END, true),
     (MISC_BASE, MISC_END, false),
     (STACK_BASE, STACK_TOP, false),
     (KUSER_BASE, KUSER_END, true),
 ];
+
+/// Whether guest code may run at `address` (a region mapped as code).
+pub fn executable(address: u32) -> bool {
+    MAPPED_REGIONS.iter().any(|&(start, end, code)| code && (start..end).contains(&address))
+}
 
 #[derive(Clone, Copy)]
 pub struct GuestMem {
@@ -257,6 +264,33 @@ impl GuestHeap {
             unsafe { std::ptr::write_bytes(self.mem.host(guest), 0, total as usize) };
         }
         guest
+    }
+    /// Why `guest` can't be a live block from this heap (freeing it would corrupt
+    /// the heap), or None when it looks like one. Reads dlmalloc's chunk header:
+    /// the word before the block holds its size and in-use flags.
+    pub fn not_owned(&self, guest: u32) -> Option<&'static str> {
+        let word = std::mem::size_of::<usize>();
+        let host = self.mem.host(guest) as usize;
+        let top = self.inner.allocator().next.get();
+        if host < self.mem.host(HEAP_BASE) as usize + 2 * word || host >= top {
+            return Some("not from the heap");
+        }
+        if host % (2 * word) != 0 {
+            return Some("not the start of a block");
+        }
+        let head = unsafe { *((host - word) as *const usize) };
+        let size = head & !7;
+        if head & 2 == 0 {
+            return Some("already freed (or not the start of a block)");
+        }
+        if size < 4 * word || size % (2 * word) != 0 || host - 2 * word + size > top {
+            return Some("its size field is damaged");
+        }
+        let next_head = unsafe { *((host - word + size) as *const usize) };
+        if next_head & 1 == 0 {
+            return Some("the next block's header is damaged (written past the end?)");
+        }
+        None
     }
     pub fn realloc(&mut self, guest: u32, size: u32) -> u32 {
         if guest == 0 {

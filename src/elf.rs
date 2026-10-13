@@ -25,6 +25,7 @@ const DT_INIT_ARRAY: u32 = 25;
 const DT_INIT_ARRAYSZ: u32 = 27;
 
 const R_ARM_ABS32: u32 = 2;
+const STB_WEAK: u8 = 2;
 const R_ARM_GLOB_DAT: u32 = 21;
 const R_ARM_JUMP_SLOT: u32 = 22;
 const R_ARM_RELATIVE: u32 = 23;
@@ -55,6 +56,8 @@ pub struct Symbol {
     pub value: u32,
     pub kind: u8,
     pub defined: bool,
+    /// STB_WEAK: may stay undefined (its address is then 0).
+    pub weak: bool,
 }
 
 impl Library {
@@ -70,6 +73,7 @@ impl Library {
             value,
             kind: info & 0xF,
             defined: section != 0,
+            weak: info >> 4 == STB_WEAK,
         }
     }
 
@@ -151,6 +155,7 @@ impl Loader {
             return Err("library area is full".into());
         }
         self.next_base = base + size + mem::PAGE;
+        crate::log::line(&format!("[bridge] {name} at {base:#010x}-{:#010x}", base + size));
 
         let memory = crate::runtime::mem();
         for segment in segments.iter().filter(|s| s.kind == PT_LOAD) {
@@ -364,6 +369,11 @@ fn resolve(_uc: &mut Uc, library: &Library, symbol: &crate::elf::Symbol) -> u32 
     }
     if symbol.kind == STT_OBJECT {
         return crate::imports::data_import(&symbol.name);
+    }
+    // Like the real loader: a weak function nobody defines is NULL, and game
+    // code checks for that (C++ thread_local init hooks, optional features).
+    if symbol.weak && crate::imports::handler_for(&symbol.name).is_none() {
+        return 0;
     }
     stub_for(&symbol.name)
 }

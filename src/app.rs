@@ -101,7 +101,8 @@ pub extern "C" fn arm32_bridge_load(vm: *mut JavaVM, env: *mut JNIEnv, original:
 fn load(vm: *mut JavaVM, env: *mut JNIEnv, original: *const c_char) -> Result<(), String> {
     let started = Instant::now();
     let path = PathBuf::from(unsafe { CStr::from_ptr(original) }.to_string_lossy().into_owned());
-    crate::runtime::init(false);
+    // debug.arm32bridge.trace=1 logs every phone function call (very slow).
+    crate::runtime::init(crate::dynarec::property("debug.arm32bridge.trace").as_deref() == Some("1"));
     jni_host::set_vm(vm);
     let _lock = hold_gil();
     let _entry = jni_host::enter(env);
@@ -142,11 +143,12 @@ struct FrameCounter {
     slowest: Duration,
     /// Slowest frame not counting phone-function time.
     slowest_own: Duration,
+    lock_wait: Duration,
 }
 
 static FRAMES: Mutex<Option<FrameCounter>> = Mutex::new(None);
 
-fn count_frame(spent: Duration, phone: Duration) {
+fn count_frame(spent: Duration, phone: Duration, waiting: Duration) {
     let mut counter = FRAMES.lock().unwrap_or_else(|e| e.into_inner());
     let counter = counter.get_or_insert_with(|| FrameCounter {
         window_start: Instant::now(),
@@ -155,10 +157,12 @@ fn count_frame(spent: Duration, phone: Duration) {
         phone_time: Duration::ZERO,
         slowest: Duration::ZERO,
         slowest_own: Duration::ZERO,
+        lock_wait: Duration::ZERO,
     });
     counter.frames += 1;
     counter.guest_time += spent;
     counter.phone_time += phone;
+    counter.lock_wait += waiting;
     counter.slowest = counter.slowest.max(spent);
     counter.slowest_own = counter.slowest_own.max(spent.saturating_sub(phone));
     let elapsed = counter.window_start.elapsed();
@@ -167,10 +171,11 @@ fn count_frame(spent: Duration, phone: Duration) {
         let per_frame = |time: Duration| time.as_secs_f64() * 1000.0 / counter.frames as f64;
         let ms = |time: Duration| time.as_secs_f64() * 1000.0;
         crate::log::line(&format!(
-            "[fps] {fps:.1} fps, game code {:.2} ms/frame (own code {:.2} ms, phone functions {:.2} ms; slowest {:.2} ms, own {:.2} ms)",
+            "[fps] {fps:.1} fps, game code {:.2} ms/frame (own code {:.2} ms, phone functions {:.2} ms, waiting for the guest lock {:.2} ms; slowest {:.2} ms, own {:.2} ms)",
             per_frame(counter.guest_time),
             per_frame(counter.guest_time.saturating_sub(counter.phone_time)),
             per_frame(counter.phone_time),
+            per_frame(counter.lock_wait),
             ms(counter.slowest),
             ms(counter.slowest_own)
         ));
@@ -181,6 +186,7 @@ fn count_frame(spent: Duration, phone: Duration) {
             phone_time: Duration::ZERO,
             slowest: Duration::ZERO,
             slowest_own: Duration::ZERO,
+            lock_wait: Duration::ZERO,
         };
     }
 }
@@ -296,6 +302,7 @@ pub fn forward(env: *mut JNIEnv, symbol: &str, address: &AtomicU32, args: &[Host
     }
     let started = Instant::now();
     let phone_before = crate::runtime::phone_time();
+    let waiting_before = crate::runtime::lock_wait_time();
     let _lock = hold_gil();
     let _entry = jni_host::enter(env);
     let uc = engine();
@@ -336,7 +343,11 @@ pub fn forward(env: *mut JNIEnv, symbol: &str, address: &AtomicU32, args: &[Host
         _ => result & 0xFFFF_FFFF,
     };
     if is_frame {
-        count_frame(started.elapsed(), crate::runtime::phone_time() - phone_before);
+        count_frame(
+            started.elapsed(),
+            crate::runtime::phone_time() - phone_before,
+            crate::runtime::lock_wait_time() - waiting_before,
+        );
     }
     if is_init {
         NATIVE_INIT_DONE.store(true, Ordering::Relaxed);

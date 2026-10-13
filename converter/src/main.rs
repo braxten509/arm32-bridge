@@ -11,7 +11,8 @@
 //! - Phone functions the libraries import that the bridge lacks are listed.
 //!
 //! usage: apk-convert <game.apk> <out.apk> --bridge <libarm32_bridge.so> --standin <libstandin.so>
-//!                    [--work <scratch dir>]
+//!                    [--work <scratch dir>] [--abi <output ABI, default arm64-v8a>]
+//! (`--abi x86_64` makes a copy for the PC's Android emulator, with an x86_64 bridge and stand-in.)
 //!
 //! Progress goes to stdout, one line each: `step <text>`, `abi <abi>`,
 //! `fix <file>: <what>`, `warn <text>`, `missing <name>`, `done <out.apk>`, or `error <text>`.
@@ -43,18 +44,21 @@ struct Options {
     bridge: PathBuf,
     standin: PathBuf,
     work: PathBuf,
+    /// The ABI folder the bridge, stand-ins and originals go in.
+    abi: String,
 }
 
 fn parse() -> Result<Options, String> {
     let mut arguments = std::env::args().skip(1);
     let mut positional = Vec::new();
-    let (mut bridge, mut standin, mut work) = (None, None, None);
+    let (mut bridge, mut standin, mut work, mut abi) = (None, None, None, None);
     while let Some(argument) = arguments.next() {
         let mut value = || arguments.next().ok_or(format!("{argument} needs a value"));
         match argument.as_str() {
             "--bridge" => bridge = Some(PathBuf::from(value()?)),
             "--standin" => standin = Some(PathBuf::from(value()?)),
             "--work" => work = Some(PathBuf::from(value()?)),
+            "--abi" => abi = Some(value()?),
             _ if argument.starts_with("--") => return Err(format!("unknown option {argument}")),
             _ => positional.push(PathBuf::from(argument)),
         }
@@ -66,6 +70,7 @@ fn parse() -> Result<Options, String> {
         bridge: bridge.ok_or("--bridge is required")?,
         standin: standin.ok_or("--standin is required")?,
         work: work.unwrap_or_else(std::env::temp_dir),
+        abi: abi.unwrap_or_else(|| "arm64-v8a".into()),
     })
 }
 
@@ -74,7 +79,7 @@ fn main() -> ExitCode {
         Ok(options) => options,
         Err(error) => {
             eprintln!("apk-convert: {error}");
-            eprintln!("usage: apk-convert <game.apk> <out.apk> --bridge <lib> --standin <lib> [--work <dir>]");
+            eprintln!("usage: apk-convert <game.apk> <out.apk> --bridge <lib> --standin <lib> [--work <dir>] [--abi <abi>]");
             return ExitCode::from(2);
         }
     };
@@ -192,7 +197,7 @@ fn convert(options: &Options) -> Result<(), Failure> {
             writer.raw_copy_file(entry)?;
         }
     }
-    let target = |file: &str| format!("lib/arm64-v8a/{file}");
+    let target = |file: &str| format!("lib/{}/{file}", options.abi);
     writer.start_file(target(BRIDGE_FILE), stored(LIBRARY_ALIGNMENT))?;
     writer.write_all(&bridge)?;
     for (file, bytes) in &libraries {

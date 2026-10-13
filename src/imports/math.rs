@@ -96,6 +96,19 @@ macro_rules! binary_float {
     };
 }
 
+/// ilogb: the binary exponent; FP_ILOGB0 / FP_ILOGBNAN are INT_MIN / INT_MAX on bionic.
+fn ilogb(x: f64) -> i32 {
+    if x == 0.0 {
+        i32::MIN
+    } else if x.is_nan() {
+        i32::MAX
+    } else if x.is_infinite() {
+        i32::MAX
+    } else {
+        x.abs().log2().floor() as i32
+    }
+}
+
 pub fn handler(name: &str) -> Option<Handler> {
     match name {
         "sin" => unary_double!(c::sin),
@@ -149,6 +162,63 @@ pub fn handler(name: &str) -> Option<Handler> {
         "powf" => binary_float!(c::powf),
         "fmodf" => binary_float!(c::fmodf),
         "nextafterf" => binary_float!(c::nextafterf),
+        // Float and double functions Rust's standard library has itself.
+        "acoshf" => handler!(|uc, a| Ret::F32(a.f32().acosh())),
+        "asinhf" => handler!(|uc, a| Ret::F32(a.f32().asinh())),
+        "atanhf" => handler!(|uc, a| Ret::F32(a.f32().atanh())),
+        "cbrtf" => handler!(|uc, a| Ret::F32(a.f32().cbrt())),
+        "coshf" => handler!(|uc, a| Ret::F32(a.f32().cosh())),
+        "sinhf" => handler!(|uc, a| Ret::F32(a.f32().sinh())),
+        "tanhf" => handler!(|uc, a| Ret::F32(a.f32().tanh())),
+        "log10f" => handler!(|uc, a| Ret::F32(a.f32().log10())),
+        "log2f" => handler!(|uc, a| Ret::F32(a.f32().log2())),
+        "log2" => handler!(|uc, a| Ret::F64(a.f64().log2())),
+        "roundf" => handler!(|uc, a| Ret::F32(a.f32().round())),
+        "round" => handler!(|uc, a| Ret::F64(a.f64().round())),
+        "truncf" => handler!(|uc, a| Ret::F32(a.f32().trunc())),
+        "trunc" => handler!(|uc, a| Ret::F64(a.f64().trunc())),
+        // The default rounding mode: to nearest, ties to even.
+        "rintf" | "nearbyintf" => handler!(|uc, a| Ret::F32(a.f32().round_ties_even())),
+        "fmaf" => handler!(|uc, a| {
+            let (x, y, z) = (a.f32(), a.f32(), a.f32());
+            Ret::F32(x.mul_add(y, z))
+        }),
+        "fma" => handler!(|uc, a| {
+            let (x, y, z) = (a.f64(), a.f64(), a.f64());
+            Ret::F64(x.mul_add(y, z))
+        }),
+        "fmaxf" => handler!(|uc, a| {
+            let (x, y) = (a.f32(), a.f32());
+            Ret::F32(x.max(y))
+        }),
+        "fminf" => handler!(|uc, a| {
+            let (x, y) = (a.f32(), a.f32());
+            Ret::F32(x.min(y))
+        }),
+        "ldexpf" | "scalbnf" => handler!(|uc, a| {
+            let (x, exponent) = (a.f32(), a.i32());
+            Ret::F32((x as f64 * 2f64.powi(exponent)) as f32)
+        }),
+        "ilogb" => handler!(|uc, a| Ret::U32(ilogb(a.f64()) as u32)),
+        "ilogbf" => handler!(|uc, a| Ret::U32(ilogb(a.f32() as f64) as u32)),
+        "modff" => handler!(|uc, a| {
+            let (x, integer_out) = (a.f32(), a.u32());
+            let integer = x.trunc();
+            mem().write_u32(integer_out, integer.to_bits());
+            Ret::F32(if x.is_infinite() { 0.0f32.copysign(x) } else { x - integer })
+        }),
+        "sincos" => handler!(|uc, a| {
+            let (x, sine_out, cosine_out) = (a.f64(), a.u32(), a.u32());
+            mem().write_u64(sine_out, x.sin().to_bits());
+            mem().write_u64(cosine_out, x.cos().to_bits());
+            Ret::Void
+        }),
+        "sincosf" => handler!(|uc, a| {
+            let (x, sine_out, cosine_out) = (a.f32(), a.u32(), a.u32());
+            mem().write_u32(sine_out, x.sin().to_bits());
+            mem().write_u32(cosine_out, x.cos().to_bits());
+            Ret::Void
+        }),
         "ldexp" | "scalbn" | "scalbnl" => handler!(|uc, a| {
             let x = a.f64();
             let exponent = a.i32();

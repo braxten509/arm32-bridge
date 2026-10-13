@@ -1,3 +1,369 @@
+# Resume checkpoint — Card Wars, 2026-10-12
+
+Read this section first. The older notes below are history, not the current blocker.
+
+## Goal and limits
+- Project: `/home/braxtenchenay/dev/arm32-bridge`. Make 32-bit Android games work on the
+  64-bit Pixel 10 through the shared bridge and Game Bridge converter app.
+- Active game: Card Wars 1.12.9, package `com.ThugBoatLTD.CardWars`, Unity 2022.3.33f1,
+  Mono, original APK: `~/dev/arm32-bridge-games/cardwars/CardWars.apk`.
+- User said to hold off on the phone screen and use an emulator. Continue on a headless
+  emulator only; do not launch games, tap, or capture the screen on the phone.
+- Keep all existing work. Many source files have uncommitted changes. No destructive Git
+  commands. The user's latest request only authorized adding this checkpoint, not more fixes.
+- Inside Crush, use shared skills/memory and chat instructions; do not load project or
+  personal instruction files. Run tests/builds through `crush bg` with a timeout. Keep
+  builds on CPU cores `6-11,18-23` via systemd-run. No visible windows.
+
+## What already works
+- Puzzle Craft 1/2 previously reached their title/menu at about 120 fps with saves kept.
+- Shared loader really opens guest libraries via dlopen; dlsym searches the selected
+  library. Each original game library has a shared stand-in; bridge ships once.
+- Added memory mapping, futex waits, ARM cacheflush invalidation for Mono-generated code,
+  signals for Mono's thread pause/resume, EGL/window support, GLES 3.x, and libc functions.
+- Added eight EGL timing/sync extension functions after Unity jumped through a null pointer.
+- Undefined weak imports now resolve to zero. This did not fix the later crash.
+- A real ARM carry-flag bug was fixed: register shifts now use T6 for their result instead
+  of overwriting the shift amount in T2. Six regression cases pass on PC (Unicorn) and
+  phone (fast translator); both self-test runs reported zero failures. This fix did NOT
+  fix Card Wars. Do not redo it or call it the crash's cause.
+
+## Remaining phone crash (saved evidence; do not run phone tests now)
+- Unity reaches `Product Name: Card Wars`, then faults at guest address `0x000002c0`,
+  block `0x02084505` (libunity offset `0x107f505`). r6 is zero during a copy; saved
+  registers repeat across runs: r4=0x248, r5=0, r6=0, lr=0x020dcde1.
+- Signal logging showed registers unchanged across delivery; that theory is ruled out
+  by the tests performed. The translator remains a suspect, not a proven cause.
+- Sampled checker: 51 differences in two blocks. One was the fixed carry bug; the other
+  was STREX with no matching Unicorn exclusive monitor (checker limitation). It did not
+  isolate the crash. Initial Unicorn/checker runs were invalid because the phone shade
+  paused the game. There is no valid Unicorn-only comparison past the crash yet.
+- The requested all-block checker run was not completed. Do not assume it happened.
+
+## Emulator work and exact stopping point
+- AVD `pocket_test`, Android 34 x86_64; previously `emulator-5554`. Start with `-no-window
+  -no-audio -no-snapshot -gpu swiftshader_indirect -memory 4096`. Its tracked service
+  job `0A2` was canceled; check whether the emulator still exists before using it.
+- ARM64 bridge CLI failed under Google's ARM translation layer, so native x86_64 Android
+  support was added: `.cargo/config.toml`, `build-phone.sh` TARGET option, converter
+  `--abi`, `tools/convert.sh --abi x86_64 --device <serial>`, x86_64 JNI trampolines in
+  `src/natives.rs`, and x86_64 zero-return stub in `tools/standin/standin.c`.
+- Native x86_64 bridge self-test on the emulator: zero failures. Stand-in compiled for
+  both ARM64 and x86_64. Emulator uses Unicorn; it cannot test the ARM64 fast translator.
+- Latest emulator game run (`0A5`): process alive, libmain-arm32 JNI_OnLoad returned
+  `0x10006`, then `NativeLoader.load failure, Unity libraries were not loaded` / `Your
+  hardware does not support this application`. No libunity load appeared in that log.
+  Being alive is NOT a title-screen pass. This is the current emulator blocker.
+- Last code edit, not yet built/tested: `src/app.rs` enables the existing function-call
+  trace when `debug.arm32bridge.trace=1`; `src/runtime.rs` sends trace lines to Android
+  logging. Purpose: find why NativeLoader.load returns false on x86_64.
+
+## Next step and checks
+1. Inspect the existing diff and this checkpoint; do not rebuild the finished work from
+   scratch. Restore only the headless emulator service if needed.
+2. Build the current x86_64 code through a tracked background job. Pass TARGET through
+   systemd-run with `-E TARGET=x86_64-linux-android`; setting it outside systemd-run did
+   not reach the build. Require the real command's exit status and fresh output files.
+3. On the emulator's explicit serial, set `debug.arm32bridge.trace=1`, convert/install,
+   run Card Wars, save the full log, then set trace back to `0`. Read the NativeLoader
+   call and its result before choosing a fix. Authorize any new edit plan as required.
+4. Behavioral check: log must show libunity and Mono loading beyond the current failure;
+   final game check is a visible title screen in an emulator screenshot, not just a
+   live process. Recheck the bridge self-test after changing the failing part.
+- Scratch runner: `/tmp/a32k/cw-emu.sh [seconds] [--no-convert]`; outputs
+  `/tmp/a32k/cwe.log`, `/tmp/a32k/cwe.png`, `/tmp/a32k/CardWars-x86_64.apk`.
+  Phone history: `/tmp/a32k/cw.log`, `diffs.txt`, `stacks.txt`, `cwlib/`.
+  Scratch files may disappear. Runner currently masks some failures with pipelines:
+  exit code zero alone is not trustworthy; inspect raw conversion/build/run results.
+- Do not widen scope or redo passed parts. If the same part fails after three fixes,
+  stop and ask before changing the plan. Use the kept deep-debugging skill for resumed
+  debugging; its fresh-review step is extra evidence, not a behavioral test.
+
+## Emulator attempts after the checkpoint
+### E1. Trace of NativeLoader.load failure (debug.arm32bridge.trace=1, run 2026-10-12 20:51)
+- Build fresh (libarm32_bridge.so 20:51:00, APK 20:51:21, convert exit 0).
+- Trace: libmain's NativeLoader.load runs Android's cpufeatures: reads /proc/cpuinfo into a 0xd00
+  buffer, memmem for "CPU architecture", "Features", ...; getauxval(AT_HWCAP/HWCAP2) returns 0
+  (bridge design). The x86 /proc/cpuinfo has none of the ARM fields -> no ARMv7/NEON -> "Your
+  hardware does not support this application". Never reaches dlopen(libunity).
+- Phone passes because the arm64 /proc/cpuinfo has "CPU architecture: 8". Emulator-only blocker.
+- Fix (x86_64 host only, phone build unchanged): open/__open_2/fopen of /proc/cpuinfo give the
+  guest a memfd with a 32-bit Cortex-A15 view (Unicorn's model: neon vfpv4 idiva, arch 7).
+- Check: emulator log shows libunity-arm32 loaded and "game code opened ... libunity.so".
+- Result: passed. Emulator went much further than the phone ever did: libunity, Mono, scene
+  load ("OnLevelWasLoaded was found on SLOTGame"), then SIGFPE in Kochava..cctor (E3).
+### E2. Phone, Unicorn only (user allowed phone use again 2026-10-12), engine=unicorn
+- Same fault as the translator: READ_UNMAPPED 0x2c0 at pc 0x020845ba (libunity 0x107f5ba),
+  lr 0x020dcde1. => The translator is NOT the cause (suspect ruled out).
+- Static reading of libunity 0x107f4c4: r5 = first argument (a 0x2c4-byte context) is NULL;
+  r6 = 0 only because it was reloaded from [r6+0xa0]. The earlier "r6 lost across a call"
+  reading was wrong. The context is created by 0x10876b4; one of its init steps failed, the
+  cleanup at 0x1087a62 set it to NULL, and the caller (0x108b19e) uses it anyway.
+- 0x10d836c (an init step) checks android_getCpuFeatures() (0xfe635c) bit 2 NEON / bit 1
+  VFPv3, else returns error 0x30. On the phone, cpufeatures sees getauxval = 0, the 64-bit
+  /proc/self/auxv, and the arm64 /proc/cpuinfo ("fp asimd aes pmull sha1 sha2 crc32", none
+  of the 32-bit names) -> no NEON/VFPv3 (but ARMv8 crypto) -> init fails -> crash.
+  Emulator with the E1 cpuinfo had "neon vfpv3" -> passed the same point. Explains all
+  symptoms: same on both engines, phone-only, deterministic registers.
+- Also seen: under Unicorn, Unity worker threads stop with INSN_INVALID right after a Thumb
+  YIELD (0x440484). Translator treats YIELD as a no-op. Unicorn-only side issue; not fixed.
+### E3. Emulator SIGFPE in System.DateTime..ctor (Kochava..cctor)
+- New raise() log: stack shows caller libmonobdwgc 0x12e97c: Mono's magic-number division
+  helper computes t % abs(d); abs had no handler and returned 0 -> __aeabi_uidivmod by 0 ->
+  __aeabi_idiv0 -> raise(SIGFPE).
+### E4. Fix for E2 + E3 (one change, all hosts)
+- abs/labs/llabs/imaxabs handlers.
+- /proc/cpuinfo on every host = 32-bit Cortex-A15 view (no crypto names); /proc/self/auxv =
+  empty 32-bit table (agrees with getauxval = 0, readers fall back to cpuinfo).
+- Self-test cases added (abs family; cpuinfo via fopen and open).
+- Checks: PC self-test 0 failures; emulator past Kochava; phone (translator) past the 0x2c0
+  crash; Puzzle Craft 2 still ~120 fps on the phone (it also reads cpuinfo via cocos2d-x).
+- Results so far: PC self-test 0 failures (new cases fail without the fix: x86 cpuinfo, abs 0);
+  bench 1408 ms. Emulator: no SIGFPE, Unity renders (47-54 fps reported for ~2 s).
+### E5. Unicorn YIELD/WFE (vendor patch 6) -> emulator worker threads no longer stop
+  (INSN_INVALID count 19 -> 0). PC self-test 0 failures after the patch.
+### E6. Emulator: black screen, every thread stops ~2 s after the first frames
+- debuggerd -b: all guest threads wait for the guest lock (Mutex::lock_contended) except
+  "Thread-3", sitting in host poll() inside the poll handler, which kept the lock.
+- Same thread just got socket() = 0 ("no handler yet for socket") and inet_pton = 0, so it
+  polls fd 0 in a loop (10 ms timeouts), re-taking the lock each time -> everyone starves.
+- Fix: poll releases the guest lock while waiting; new sockets.rs (socket, socketpair,
+  connect, bind, listen, accept(4), shutdown, getsockname/peername, send(to), recv(from),
+  set/getsockopt with timeval conversion, select, inet_pton/ntop/addr, getaddrinfo /
+  freeaddrinfo / gai_strerror); blocking calls run without the lock. Self-test cases added.
+- Result: emulator shows the Card Wars TITLE SCREEN (Finn + Jake, logo) at ~13 s; Unity
+  loads language files. Upsight/Adobe ClassNotFound exceptions are the game's own (stripped
+  SDK classes), harmless. Then frames stop: UnityMain 100% CPU in guest code, no frames.
+- Same moment: "no handler yet for lseek64; returning 0".
+### E7. File functions with 64-bit offsets
+- Added lseek64, pread(64), pwrite(64), ftruncate(64), truncate, fsync, rmdir, strnlen,
+  localtime_r. Self-test case (lseek64 / pread64 / localtime_r) passes on PC.
+- Result: same freeze after the title (lseek64 was not the cause).
+### E8. Freeze after the title: a spinning thread never lets go of the guest lock
+- debuggerd -b x3: UnityMain inside Unicorn-translated code each time, 96-100% CPU, every
+  other guest thread waiting for the lock (31 lock_contended). No time slicing exists, and
+  YIELD had become a no-op (E5), so a spin-wait never hands the lock to the thread it waits on.
+- Fix: YIELD/WFE hand the guest lock over (share_gil: release, yield until another thread
+  has taken it or 100 µs pass, retake, deliver pending signals with the YIELD as the resume
+  point). Translator: Thumb BF10/BF20 and ARM E320F001/2 end the block with exit::YIELD.
+  Unicorn (vendor patch 6 revised): helper_yield calls the interrupt hook with EXCP_YIELD.
+- Self-test "a thread spinning on YIELD lets the thread it waits for run" (ARM + Thumb):
+  old binary FAIL, new binary ok; 0 failures; bench 1355-1362 ms (unchanged).
+- Result: emulator still stops at WAITING_FOR_USERID; UnityMain 100% in guest code.
+### E9. Phone (user allowed ~10 min, 2026-10-12 21:33), translator, all fixes so far
+- The old libunity 0x2c0 crash is GONE: the phone shows the Card Wars TITLE SCREEN
+  (screenshot /tmp/a32k/cw-small.jpg). E2/E4 confirmed on the real target.
+- Same stall as the emulator after "WAITING_FOR_USERID": [fps] 0.1 fps, 12.5 s/frame of which
+  10 s inside phone functions; UnityMain 99.5% CPU, 37 threads waiting for the guest lock.
+### E10. Traced phone run: Mono's Boehm GC runs ~15 times a second, each pause 20-50 ms
+- t2 (UnityMain) loops: pthread_kill(SIGPWR) to 3 threads, sem_timedwait for acks, then
+  pthread_kill(SIGXCPU) restart + acks; 76k pthread_getspecific (Mono allocation path).
+- Every signal is delivered (37 of each per thread), but one thread is often late: t9 sat in
+  nanosleep (31.8 ms, guest lock released) and only answered when the sleep ended; real
+  Linux interrupts the sleep. Others answered 5-7 ms late (every wake_guests wakes ~37
+  threads that all queue for the guest lock).
+- Fix 1 (this attempt): nanosleep / usleep / sleep / new clock_nanosleep sleep in 1 ms
+  slices without the lock and come back early when a signal is pending, so the handler runs
+  at once, then sleep the rest. Self-test "a signal reaches a thread inside usleep at once".
+- Not yet: the thundering herd on the shared condition variable; why GC runs so often.
+- Result: PC self-test new case fails on the old binary, passes on the new; emulator still
+  stalls at WAITING_FOR_USERID (fix 1 alone does not unstick it).
+### Sub-agent review (codex gpt-6-astra, high), 2026-10-12 21:45
+- Challenged: "15 pauses/s" is not proven to be 15 full collections, and GC cost alone does
+  not explain no progress. Ranked next: (1) read GC_get_gc_no / heap size; (2) a game-side
+  retry/allocation loop (missing callback, JNI returning 0, unknown imports returning 0) —
+  sample guest PC/LR; (3) signal context lives in a bridge heap block, not on the guest
+  stack, so registers only in the context may be invisible to Boehm; (4) /proc/self/maps and
+  stat expose host addresses, partial munmap is a no-op, pthread_getattr_np for other threads
+  returns base 0. Our response: added guest caller sampling (debug.arm32bridge.sample=1:
+  every 0.5 s per thread, lr + library return addresses + managed frames via mono_pmip).
+### E11. Sampling the stalled main thread (emulator)
+- Native chain is stable: mono_runtime_invoke -> managed code -> mono_threads_enter_gc_safe_region
+  / mono_tls_get_lmf_addr -> pthread_getspecific, i.e. managed code looping over icalls.
+- Managed frames (mono_pmip, resolved only once debug.arm32bridge.sample=2 is set after start;
+  calling it earlier crashes Mono): TFUtils.SetupDebugChannels -> GetJsonFileContent ->
+  GetAndroidFileContents, which is `while (!www.isDone) {}` on a jar:file:// UnityWebRequest
+  (decompiled Assembly-CSharp, TFUtils.cs:588). WAITING_FOR_USERID is only SessionManager.Start.
+- ROOT CAUSE: the main thread busy-waits through icalls (phone functions) without YIELD and
+  never gives up the guest lock, so the worker that would finish the request almost never
+  runs (only during GC pauses -> 12 s frames). On a phone both run in parallel.
+### E12. Fix: time slicing of the guest lock
+- Every lock acquisition goes through take_gil, which counts threads blocked on the lock
+  (WANTING). wait_for_guests now waits on its own event counter + mutex (no lost wake-ups)
+  and then takes the lock through take_gil, so woken threads are counted too.
+- call_stub: if this thread has held the lock >= 2 ms and someone wants it, hand it over
+  (share_gil; signals then resume at lr). share_gil (also used by YIELD) does nothing when
+  nobody waits.
+- Self-test "a thread looping over phone functions lets the thread it waits for run".
+- First try delivered signals during the time-slice handoff (before the phone function ran):
+  self-test hung in the pause/resume test (restart signal consumed before sigsuspend began).
+  Time-slice handoff no longer delivers signals (they still run after the phone function).
+- Result: PC self-test 0 failures (new case FAIL on old binary); bench 1352-1355 ms (same).
+  Emulator: frames keep coming (~27 fps under Unicorn), debug channels activate, and the
+  game shows its interactive "Register/Login" dialog (/tmp/a32k/cwe-small.jpg). STALL FIXED
+  on the emulator. Phone check (translator) + Puzzle Craft 2 regression check still to do.
+- Note: earlier PC benches of 1665 / 2782 ms came from accidentally running the same job
+  twice at once (crush bg + a second background copy); not a regression.
+### E13. Phone (user allowed 10 + 15 more minutes): past the hang, but loading is very slow
+- Translator run reaches the same point but loads the language files at 1-3 s each
+  (emulator under Unicorn: ~0.5 s). simpleperf: Thread-6 mostly in Unicorn fallback
+  (uc_reg_read/write, cpu_exec). Fallback stats (debug.arm32bridge.stats=1, now printed
+  every 10 s): 2.46M fallbacks, nearly all Thumb UMAAL (fbe3 1460, libunity big-number
+  math), plus ARM SMMUL (e751f211, Mono) and NEON VMOV immediate.
+- Added UMAAL (ARM + Thumb) and SMMUL/SMMLA (+R) to the translator; self-test case for both
+  instruction sets. PC 0 failures; phone translator 0 failures; phone ARM32_CHECK=all
+  self-test 41087 blocks, 0 differences; phone bench 197.6 ms. Fallbacks 2.46M -> 98K.
+- Still slow. New [fps] field "waiting for the guest lock": UnityMain waits 1.0-3.7 s of
+  each 1.6-6.7 s frame for the lock. Every wake_guests() woke all ~37 waiting threads,
+  which all queued for the lock, and time slicing (WANTING > 0) handed it away constantly.
+### E14. Fix: targeted wake-ups
+- Each thread has its own parker; waits register (thread, key). Keys: guest address of the
+  mutex / condition / semaphore / futex word / rwlock / once control, join = 1<<32|handle,
+  sigsuspend = 2<<32|handle. wake_on(key) wakes only those waiters; a signal wakes only its
+  target thread (wake_thread). wake_guests() still wakes everyone (now unused).
+- Result (PC 0 failures, bench 1385-1397 ms; phone self-test 0 failures; phone run 50 s,
+  /tmp/a32k/phone7.log): lock wait per frame 1.0-3.7 s -> 45-177 ms. Language files load
+  in 0.1-0.6 s each (was 1-3 s). The game got further than ever: "Login: SocialID=",
+  "Starting to User login", server download done, manifest fetched from
+  cardwars.retroretreat.net, state PATCHING -> LOAD_DATA, db_Characters / db_Decks loaded,
+  main menu buttons object created. Frames still ~8.6 fps (115 ms, own code 90 ms, lock
+  wait ~50 ms) during LOAD_DATA. Card Wars force-stopped afterwards.
+### E15. Emulator re-check (keyed waits): further, then Mono abort + host heap crash
+- /tmp/a32k/cwe.log: login, PATCHING -> LOAD_DATA, db_Decks loaded, main menu buttons
+  (same as phone). Then thread 0x10a0: Mono "* Assertion: should not be reached at
+  threads.c:1350" -> abort(); 13 s later SIGSEGV in the guest heap's dlmalloc (called from
+  gles map_into_copy) = guest heap metadata corrupted.
+- Cause: pthread_exit was not implemented (it is in the missing-functions list), so it
+  returned. Mono's start_wrapper calls mono_thread_info_exit -> pthread_exit, then
+  g_assert_not_reached(). The thread then ran its TLS destructors after Mono's own exit
+  path had already torn its thread info down: a likely double free, which fits the later
+  heap corruption.
+- Fix: pthread_exit stores the value and stops the guest (same unwinding as abort through
+  nested calls); run_thread clears the stop, runs key destructors and hands the value to
+  join. Self-test: thread exits from inside a qsort callback; join gets 77, code after the
+  call never runs, destructor runs.
+- Check after fix: phone (translator) self-test 0 failures incl. the new case; Card Wars on
+  phone 100 s: no Mono assertion, no crash; login -> LOAD_DATA -> db_Decks -> main menu
+  buttons; then states "WAITING_FOR_USERID" again and frames drop to 1.0-1.6 fps (phone
+  functions 300-460 ms, lock wait 400-600 ms per frame). Emulator: no assertion either, but
+  the same dlmalloc SIGSEGV from map_into_copy on the render thread ~50 s in. So the heap
+  damage is a separate bug. Puzzle Craft 2 on phone (regression check): 117-120 fps, own
+  code 2.2 ms, lock wait 0, save files kept.
+- GC: Boehm suspend/restart signals (24/30) arrive ~400 per 10 s during loading (many
+  collections), almost none in the 1 fps phase, so that phase is not GC.
+### E16. Heap guard (evidence for the heap damage)
+- free/realloc now check dlmalloc's chunk header first (in heap range, aligned, in-use bit,
+  sane size, next block's prev-in-use bit) and refuse + log "[heap] refused ..." with the
+  caller lr (first 30). Self-test: double free + free of a stack address leave the heap
+  intact (both refusals logged). PC 0 failures, bench 1357 ms.
+- Emulator run (emu16.log): no refusals at all, same SIGSEGV in dlmalloc from
+  map_into_copy. So nobody frees a bad pointer; the damage comes from writes.
+### E17. Root cause of the heap damage: mapped GL buffers were keyed by target
+- gles.rs kept mapped-buffer copies per *target*. GL keeps buffer A mapped when buffer B is
+  bound to the same target and mapped too. The old code replaced A's record with B's, and
+  unmapping A later uploaded and freed B's copy while the game still wrote into it: a
+  use-after-free in the guest heap, hit next in malloc (map_into_copy) on the render thread.
+- Fix: key by buffer name (asked from GL with glGetIntegerv of the target's binding,
+  because glBindBufferBase/Range aren't tracked); glDeleteBuffers drops and frees a mapped
+  buffer's copy; a log line reports mapping while another buffer on the target is mapped.
+- Emulator (emu17.log, 150 s): the log fires on target 0x8f37 (GL_COPY_WRITE_BUFFER,
+  Unity's staging copies), buffers 32/34 alternating, confirming the old code freed the
+  wrong copy. No crash. The game goes LOAD_DATA -> CHECK_SAVE_CONFLICT -> LOADING ->
+  MESSAGE_FETCH -> SAVING -> READY and shows the tree fort with a Terms of Use dialog
+  (/tmp/a32k/cwe17-small.jpg), ~9.5 fps under Unicorn.
+### E18. Phone with the fix (user allowed 15 more minutes, ~22:55)
+- Self-test 0 failures (both new cases). Card Wars 150 s: no crash, renders the tree fort
+  with Jake and Finn and "connecting..." (/tmp/a32k/cw9-small.jpg), but only 0.5-1.5 fps
+  (lock wait 600-700 ms, phone functions 450-520 ms per frame) and never reaches READY,
+  while the emulator under Unicorn reached READY at ~9.5 fps. So the phone is ~10x slower
+  than the PC emulator here: something phone/translator specific.
+- logcat lost the start: 21K bridge lines in 105 s, mostly "[slow]" for waiting calls
+  (syscall futex 10K, usleep 8K, postFrameCallback 2K). "phone functions" time includes
+  those waits.
+- Next: simpleperf + per-thread CPU over 15 s in the slow phase, translator stats with a
+  new "dropped after code changes" counter (Mono JIT writes code at run time).
+### E19. Phone profile of the slow phase: Unicorn fallbacks, not locking
+- simpleperf 15 s (/tmp/a32k/perf3-*.txt): the busiest thread (arm32-guest-108, 34%) and
+  UnityMain (18%) spend their time in the bridge's fallback path (reg_read_arm,
+  uc_reg_read/write, engine::read/write, cpu_exec, sigsetjmp), not in translated code.
+- Translator stats: ~150K fallbacks per second (4.49M -> 6.40M -> 7.90M every 10 s);
+  217K blocks, 19.7K dropped after code changes (small).
+- Top sites: one libunity loop at 0x020c91f2-0x020c9296 (file 0x10c41f0: int16 -> float
+  audio conversion with resampling), 13 sites x 384K: VMOV.16 core->scalar, VLD1.16 one
+  lane, VMOVL.S16/U16, VCVT.F32.S32. Then ARM `push {r0,r1,r12,pc}` in Mono JIT code
+  (232K), Thumb SMLABB/SMULBB (207K), raw `svc 0` in libmono (59K), NEON VMOV immediate
+  (~100K), VMAX/VMIN.F32 (75K).
+- Each fallback copies ~100 registers into and out of Unicorn, so the audio thread holds
+  the guest lock most of the time and the main thread waits (the 600 ms lock wait).
+### E20. Translator: the missing instruction families
+- Added (ARM and Thumb, ARM encoding shared): VMOV core<->scalar for 8/16/32-bit lanes
+  (signed/unsigned to core), VLD1/VST1 one lane of 8/16/32 bits, VLD1 to all lanes,
+  VMOVL/VSHLL, VCVT F32<->S32/U32, VMAX/VMIN.F32, all VMOV/VMVN/VORR/VBIC immediates
+  (AdvSIMDExpandImm), SMLA<x><y> (Q flag set without touching host flags) and
+  SMUL<x><y>, ARM STM with PC in the list (stores the STM address + 8).
+- Self-test cases for each (ARM and Thumb functions), checked on the PC (Unicorn) for the
+  expected values and on the phone with ARM32_CHECK=all against Unicorn.
+- Phone: self-test 0 failures, checker 41476 blocks 0 differences, bench 144.7 ms (was
+  197.6). Card Wars (USB; Wi-Fi ADB dropped and came back at 192.168.0.2): fallbacks
+  ~11K/s (was ~150K/s); login -> LOAD_DATA within the 120 s, still 0.5-9 fps. New top
+  sites: PKHBT (Thumb), a libunity matrix routine (VEXT, VREV64, VNEG.F32, VTRN, VZIP,
+  VDUP scalar), the same family in ARM code at 0x019af3xx, `svc 0` in libmono.
+### E21. Translator: permutes and PKH
+- Added VEXT, VDUP (scalar), VREV64/32/16, VMVN, VABS/VNEG (integer and F32),
+  VSWP/VTRN/VUZP/VZIP, PKHBT/PKHTB (ARM and Thumb). Self-test: a byte-pattern check of
+  every permute (expected bytes computed in C) and PKH cases.
+- Phone: self-test 0 failures, checker 41518 blocks 0 differences, bench 143.9 ms.
+  Card Wars: fallbacks ~2.5-8K/s; start-up to LOAD_DATA in ~30 s (was 80+ s), but frames
+  still 1.3-2.7 fps with 250-500 ms lock wait. simpleperf: 99.9% of samples in ONE thread
+  (arm32-guest-108) running translated code (a ~1 KB host-code loop); every other thread
+  asleep waiting for the guest lock.
+### E22. Cause: no time slicing inside translated code
+- Time slicing only happened in phone-function calls and YIELD. A guest loop with neither
+  (a spin-wait on memory, or long pure computation) keeps the guest lock forever: on real
+  hardware the threads would run side by side.
+- Fix: a shared PREEMPT flag. A ticker thread (started the first time anyone waits) sets
+  it when someone has waited and the holder has had the lock for a 2 ms slice. Linked
+  block exits and jump-table exits check it (3 instructions) and go to the dispatcher
+  instead; the dispatcher hands the lock over (share_gil). Taking the lock clears it.
+- Self-test: a thread spinning with no calls and no YIELD must let the thread it waits
+  for run (translator only; Unicorn has no slicing inside game code yet).
+- Phone: self-test 0 failures incl. the new spin case, checker 41697 blocks 0 differences,
+  bench 143.6 ms (no cost). Card Wars: UnityMain now gets CPU (profile: UnityMain 27%
+  bridge + 26% translated, guest-108 9%); 3-7 fps, lock wait 60-160 ms.
+- New profile: UnityMain spends ~20% in the dispatcher (engine::run, thread-local lookups,
+  call_stub). Cause: blocks ending in NEON floating-point mode never linked (no_link), and
+  the new NEON coverage put far more blocks in that mode. Fallbacks back to 12-16K/s: raw
+  `svc 0` in libmono (6K/s), ARM `stmdb sp!, {sp, lr}` and RSC next to it.
+### E23. Linking from NEON mode, raw system calls, RSC, STM {sp, lr}
+- NEON-mode blocks now link: linked exits put host FPCR back in the guest's VFP mode first
+  (3 instructions) instead of going through the dispatcher.
+- `svc` outside the stub area (ARM, and Thumb outside IT blocks) ends the block with a new
+  exit reason; the dispatcher runs the Linux system call on the translator's registers
+  (no Unicorn round trip).
+- RSC (ARM only; SBC with swapped operands) and STM with SP as base and in the list
+  (stores keep the original SP; loads still go to Unicorn).
+- Self-test: raw getpid via svc (ARM, Thumb), a loop whose block ends in NEON mode and
+  jumps back to a VFP divide under round-toward-zero, RSC with both carries, push {sp, lr}.
+- Phone (user: work on the phone only from now on): all new cases pass. The checker
+  flagged the svc block: its Unicorn reference ran the system call itself (and would run
+  it twice). Fixed: the reference stops before a raw svc, like the translated block.
+- Card Wars still ~12-17K fallbacks/s; new sites are more NEON families: compares
+  (VCEQ/VCGT/VCLT #0 ...), VPADD/VPMIN/VPMAX, VBSL, VRSQRTE/VRSQRTS, integer VMIN/VMAX,
+  VLD2, VDUP from a core register.
+### E24. NEON: the whole three-same and two-misc tables, VDUP core, VLD2-4/VST2-4
+- Rather than one instruction at a time, every entry of the ARMv7 "three registers same
+  length" and "two registers misc" tables that has a one-to-one ARM64 vector instruction
+  (same lanes, same saturation, QC sticky flag in FPSR -> FPSCR) is now translated.
+  VRECPS/VRSQRTS round the product first (ARMv7 and Unicorn), so they are done as
+  FMUL + FSUB (+ *0.5), with the fused ARM64 instruction used only where that gives NaN
+  (inf * 0, defined as 2.0 / 1.5). Also VDUP from a core register and the interleaved
+  VLD2/3/4 and VST2/3/4 forms (via ld2-4/st2-4 into v16-v19 and lane inserts).
+- Self-test: one function runs ~80 of these on mixed data (negative, large, inf, denormal
+  floats) in ARM and Thumb; its checksum must match between ARM and Thumb, between the
+  translator and Unicorn (ARM32_ENGINE=unicorn), and the checker compares every block.
+
+---
+
 # Debugging: self-test "malloc + string functions" fails only with the checker on (ARM32_CHECK=all)
 
 ## Symptom
@@ -253,3 +619,40 @@ Card Wars log shows libunity loaded and its JNI_OnLoad ran, no "Failure to initi
   newlocale, fscanf, syscall, prctl (all returned 0). Suspect (not yet proven): Unity's locks use raw
   syscall(SYS_futex); a wait that returns 0 at once makes a waiter spin. ANativeWindow/EGL = Unity's own screen
   setup, on the stop-and-ask list. Stopped and asked.
+### 4. Keep going on Card Wars (user: "keep working, no need to ask")
+- Futex: syscall(SYS_futex) WAIT/WAKE/BITSET on guest words (generation counter + wait_for_guests). The spinning
+  thread stopped. One linux_syscall serves libc syscall() (-1 + errno) and raw `svc` (raw -errno in r0).
+- __memcpy_chk and friends (_chk aliases) were missing: Unity called exit(1) after one returned 0. Added.
+- Mono's JIT writes code into heap memory and flushes with ARM cacheflush (svc 0xf0002): the translator now drops
+  the blocks in that range (unlinks incoming jumps, resets jump-table entries) and Unicorn drops its cache; the heap
+  is executable. Unity then logs "Company Name: ThugBoatLTD / Product Name: Card Wars"; process alive.
+- Batch of small functions (ctype, wide chars, math, clock, file state, locale, signals).
+- Next blocker: ANativeWindow_fromSurface and all of EGL had no handler. Added egl.rs: EGL, ANativeWindow and
+  ALooper with small handles for 64-bit host pointers (same host pointer -> same handle). Added GLES 3.0-3.2 to the
+  generator (555 GL functions): index/indirect/pixel/vertex pointers are buffer offsets when a buffer is bound for
+  that target (bindings tracked per target), glMapBufferRange uses a guest copy (read back unless invalidated,
+  uploaded on unmap or flush), GLsync handles, pointer-array functions by hand, debug callback ignored.
+- With EGL in: no more ANativeWindow "no handler". New stop: right after "no handler yet for pthread_kill", every
+  guest thread asleep (0% CPU). Three clues agree on Mono's garbage collector pausing threads: libmonobdwgc imports
+  pthread_kill + sigaction + sigsuspend + pthread_sigmask; Mono on Android pauses with SIGPWR and resumes with
+  SIGXCPU, waiting on a semaphore for each answer; the bridge dropped every signal, so the answer never came.
+- Added signals.rs: per-signal actions, per-thread blocked/pending sets, pthread_kill/raise/kill, sigsuspend,
+  pthread_sigmask/sigprocmask. A signalled thread runs the handler (siginfo + ucontext with its registers, pc =
+  return address of the phone function it is parked in) when it next holds the guest lock: before/after a wait,
+  after without_gil, after a phone function. First self-test hung: the signal arrived before the worker started
+  waiting and the wait slept without checking -> waits now check first. Self-test 0 failures on the PC (new check:
+  pause/resume another thread like Mono, blocked signal held until unblocked).
+- Unity then asked eglGetProcAddress for eglGetFrameTimestampSupportedANDROID and called it unchecked (jump to 0):
+  added the 8 EGL extension functions libunity names (sync fences, frame timestamps, presentation time). Jumps to
+  non-code now stop with a guest fault naming the jumping block instead of crashing the translator.
+- Weak imports nobody defines now resolve to 0 like the real loader (was: a stand-in that returns 0), e.g.
+  _ZTH15gDeferredAction (C++ thread_local init hook). Missing list 226 -> 198. Did not change the next crash.
+### 5. Crash: callee-saved registers wrong after a call (libunity 0x107f504, r6 = 0 although checked non-zero)
+- Same registers every run (not timing). Signal deliveries logged with before/after registers: unchanged.
+- Unicorn-only and checker runs first looked "fine" but the notification shade was open (game paused): void.
+  cw-run.sh now waits while the shade is open.
+- Checker (sampled) with the game in front: 51 differences in 2 blocks. (a) STREX right after LDREX in an earlier
+  block: checker blind spot (Unicorn has no monitor), not a bug. (b) ARM `tst r12, r2, lsr r6` with r6 = 0:
+  translator cleared C, real ARM keeps it. Cause: arm.rs passed T2 as the result register to shift_register,
+  which keeps the amount in T2 for its "amount was 0" check -> the check tested the result instead. Fixed (T6),
+  assert added, self-test case added (6 shift/carry cases): passes on PC (Unicorn) and phone (translator).

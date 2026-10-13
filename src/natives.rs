@@ -66,13 +66,21 @@ static STUBS: Mutex<Option<Stubs>> = Mutex::new(None);
 static STUB_BY_METHOD: Mutex<Option<std::collections::HashMap<(String, String, String), (usize, usize)>>> = Mutex::new(None);
 
 extern "C" {
+    #[cfg(target_arch = "aarch64")]
     fn __clear_cache(begin: *mut libc::c_char, end: *mut libc::c_char);
     fn arm32_bridge_native_entry();
 }
 
+/// Integer argument registers saved by the entry (x0-x7; rdi, rsi, rdx, rcx, r8, r9).
+#[cfg(target_arch = "aarch64")]
+const INT_REGISTERS: usize = 8;
+#[cfg(target_arch = "x86_64")]
+const INT_REGISTERS: usize = 6;
+
 // x16 = method number. Saves x0-x7 and d0-d7, passes them and the caller's
 // stack arguments to `dispatch`, and returns its result in both x0 and d0
 // (the caller reads whichever its return type uses).
+#[cfg(target_arch = "aarch64")]
 std::arch::global_asm!(
     ".global arm32_bridge_native_entry",
     ".p2align 2",
@@ -99,6 +107,41 @@ std::arch::global_asm!(
     dispatch = sym dispatch,
 );
 
+// The same for x86_64 (the PC's Android emulator): r11 = method number; the
+// save area has the same layout (6 integer registers, then xmm0-xmm7 at 64).
+#[cfg(target_arch = "x86_64")]
+std::arch::global_asm!(
+    ".global arm32_bridge_native_entry",
+    ".p2align 4",
+    "arm32_bridge_native_entry:",
+    "push rbp",
+    "mov rbp, rsp",
+    "sub rsp, 128",
+    "mov [rsp], rdi",
+    "mov [rsp + 8], rsi",
+    "mov [rsp + 16], rdx",
+    "mov [rsp + 24], rcx",
+    "mov [rsp + 32], r8",
+    "mov [rsp + 40], r9",
+    "movsd [rsp + 64], xmm0",
+    "movsd [rsp + 72], xmm1",
+    "movsd [rsp + 80], xmm2",
+    "movsd [rsp + 88], xmm3",
+    "movsd [rsp + 96], xmm4",
+    "movsd [rsp + 104], xmm5",
+    "movsd [rsp + 112], xmm6",
+    "movsd [rsp + 120], xmm7",
+    "mov rdi, r11",
+    "mov rsi, rsp",
+    "lea rdx, [rbp + 16]",
+    "call {dispatch}",
+    "movq xmm0, rax",
+    "mov rsp, rbp",
+    "pop rbp",
+    "ret",
+    dispatch = sym dispatch,
+);
+
 /// A stub that calls the shared entry with x16 = `index`.
 fn make_stub(index: usize) -> *mut c_void {
     assert!(index < 1 << 16, "too many native methods");
@@ -120,6 +163,14 @@ fn make_stub(index: usize) -> *mut c_void {
     }
     let stubs = stubs.as_mut().unwrap();
     let entry = arm32_bridge_native_entry as *const () as u64;
+    let at = unsafe { stubs.base.add(stubs.used) };
+    write_stub(at, index, entry);
+    stubs.used += STUB_SIZE;
+    at as *mut c_void
+}
+
+#[cfg(target_arch = "aarch64")]
+fn write_stub(at: *mut u8, index: usize, entry: u64) {
     let words: [u32; 8] = [
         0xD280_0010 | ((index as u32) << 5), // movz x16, #index
         0x5800_0071,                         // ldr x17, [pc, #12] (the address below)
@@ -130,13 +181,21 @@ fn make_stub(index: usize) -> *mut c_void {
         0,
         0,
     ];
-    let at = unsafe { stubs.base.add(stubs.used) };
     unsafe {
         std::ptr::copy_nonoverlapping(words.as_ptr() as *const u8, at, STUB_SIZE);
         __clear_cache(at as *mut libc::c_char, at.add(STUB_SIZE) as *mut libc::c_char);
     }
-    stubs.used += STUB_SIZE;
-    at as *mut c_void
+}
+
+#[cfg(target_arch = "x86_64")]
+fn write_stub(at: *mut u8, index: usize, entry: u64) {
+    let mut bytes = [0xCCu8; STUB_SIZE]; // int3 padding
+    bytes[..2].copy_from_slice(&[0x41, 0xBB]); // mov r11d, index
+    bytes[2..6].copy_from_slice(&(index as u32).to_le_bytes());
+    bytes[6..8].copy_from_slice(&[0x49, 0xBA]); // movabs r10, entry
+    bytes[8..16].copy_from_slice(&entry.to_le_bytes());
+    bytes[16..19].copy_from_slice(&[0x41, 0xFF, 0xE2]); // jmp r10
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), at, STUB_SIZE) };
 }
 
 /// Called by the shared entry: `registers` = x0-x7 then d0-d7, `stack` = the
@@ -151,7 +210,7 @@ extern "C" fn dispatch(index: u64, registers: *const u64, stack: *const u64) -> 
         if float && next_d < 8 {
             next_d += 1;
             registers[8 + next_d - 1]
-        } else if !float && next_x < 8 {
+        } else if !float && next_x < INT_REGISTERS {
             next_x += 1;
             registers[next_x - 1]
         } else {
@@ -261,6 +320,49 @@ fn descriptor(env: *mut JNIEnv, reflection: &Reflection, class: jobject) -> Stri
         name if name.starts_with('[') => name.replace('.', "/"),
         name => format!("L{};", name.replace('.', "/")),
     }
+}
+
+/// Name and JNI signature of a java.lang.reflect.Method, Constructor or Field
+/// object (for FromReflectedMethod / FromReflectedField).
+pub fn reflected_member(env: *mut JNIEnv, member: jobject) -> Option<(String, String)> {
+    let reflection = reflection(env)?;
+    let kind = jcall!(env, GetObjectClass, member);
+    let id = |name: &std::ffi::CStr, signature: &std::ffi::CStr| {
+        let id = jcall!(env, GetMethodID, kind, name.as_ptr(), signature.as_ptr());
+        (!clear_exception(env) && !id.is_null()).then_some(id)
+    };
+    let call = |id: jmethodID| jcall!(env, CallObjectMethodA, member, id, std::ptr::null());
+    let kind_name = java_string(env, jcall!(env, CallObjectMethodA, kind, reflection.class_get_name, std::ptr::null()));
+    let result = if kind_name == "java.lang.reflect.Field" {
+        let name = java_string(env, call(id(c"getName", c"()Ljava/lang/String;")?));
+        let field_type = call(id(c"getType", c"()Ljava/lang/Class;")?);
+        let signature = descriptor(env, reflection, field_type);
+        jcall!(env, DeleteLocalRef, field_type);
+        (name, signature)
+    } else {
+        let constructor = kind_name == "java.lang.reflect.Constructor";
+        let name = if constructor { "<init>".to_string() } else { java_string(env, call(id(c"getName", c"()Ljava/lang/String;")?)) };
+        let types = call(id(c"getParameterTypes", c"()[Ljava/lang/Class;")?);
+        let mut signature = String::from("(");
+        for i in 0..jcall!(env, GetArrayLength, types as jarray) {
+            let parameter = jcall!(env, GetObjectArrayElement, types as jobjectArray, i);
+            signature.push_str(&descriptor(env, reflection, parameter));
+            jcall!(env, DeleteLocalRef, parameter);
+        }
+        jcall!(env, DeleteLocalRef, types);
+        signature.push(')');
+        if constructor {
+            signature.push('V');
+        } else {
+            let returned = call(id(c"getReturnType", c"()Ljava/lang/Class;")?);
+            signature.push_str(&descriptor(env, reflection, returned));
+            jcall!(env, DeleteLocalRef, returned);
+        }
+        (name, signature)
+    };
+    jcall!(env, DeleteLocalRef, kind);
+    clear_exception(env);
+    Some(result)
 }
 
 /// Signatures of `class`'s native methods called `name`.

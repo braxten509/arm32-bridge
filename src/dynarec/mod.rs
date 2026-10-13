@@ -10,7 +10,7 @@ pub mod emit;
 pub mod thumb;
 
 mod engine;
-pub use engine::{enabled, print_stats, property, run, Native};
+pub use engine::{enabled, invalidate, print_stats, property, run, Native};
 
 /// Guest register state while (or between) running translated code.
 /// Offsets are used by the generated code; keep them in sync with `offsets`.
@@ -33,7 +33,9 @@ pub struct CpuState {
     pub tls: u32,
     /// The host's FPCR while translated code runs (restored on exit).
     pub host_fpcr: u32,
-    pub _pad: [u32; 6],
+    /// Address of the shared "leave translated code" flag (runtime::PREEMPT), read at linked exits.
+    pub preempt_flag: u64,
+    pub _pad: [u32; 4],
     /// q0-q15 = d0-d31 (d(2n) is the low half of q(n)).
     pub q: [[u64; 2]; 16],
 }
@@ -48,6 +50,7 @@ pub mod offsets {
     pub const CPSR_OTHER: u32 = 92;
     pub const TLS: u32 = 96;
     pub const HOST_FPCR: u32 = 100;
+    pub const PREEMPT_FLAG: u32 = 104;
     pub const Q: u32 = 128;
 }
 
@@ -62,6 +65,7 @@ const _: () = {
     assert!(offset_of!(CpuState, cpsr_other) == offsets::CPSR_OTHER as usize);
     assert!(offset_of!(CpuState, tls) == offsets::TLS as usize);
     assert!(offset_of!(CpuState, host_fpcr) == offsets::HOST_FPCR as usize);
+    assert!(offset_of!(CpuState, preempt_flag) == offsets::PREEMPT_FLAG as usize);
     assert!(offset_of!(CpuState, q) == offsets::Q as usize);
 };
 
@@ -93,6 +97,9 @@ pub mod exit {
     pub const JUMP: u32 = 0;
     /// Run `exit_reason >> 8` instructions at `exit_pc` in Unicorn.
     pub const FALLBACK: u32 = 1;
+    pub const YIELD: u32 = 2;
+    /// A Linux system call (`svc` outside the stub area): run it, continue at `exit_pc`.
+    pub const SYSCALL: u32 = 3;
 }
 
 /// Host registers with a fixed job inside translated code.

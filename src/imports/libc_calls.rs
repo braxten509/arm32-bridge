@@ -88,6 +88,49 @@ fn host_open_flags(flags: u32) -> i32 {
     host
 }
 
+fn emulated_cpu_file(path: u32) -> Option<i32> {
+    if path == 0 {
+        return None;
+    }
+    let contents = match mem().string(path).as_str() {
+        "/proc/cpuinfo" => cpuinfo_text().into_bytes(),
+        "/proc/self/auxv" => vec![0; 8],
+        _ => return None,
+    };
+    let fd = unsafe { libc::memfd_create(c"cpu".as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return None;
+    }
+    let written = unsafe { libc::write(fd, contents.as_ptr().cast(), contents.len()) };
+    if written != contents.len() as isize || unsafe { libc::lseek(fd, 0, libc::SEEK_SET) } != 0 {
+        unsafe { libc::close(fd) };
+        return None;
+    }
+    Some(fd)
+}
+
+fn cpuinfo_text() -> String {
+    let processors = std::thread::available_parallelism().map_or(1, |count| count.get());
+    let mut text = String::new();
+    for processor in 0..processors {
+        text.push_str(&format!(
+            "processor\t: {processor}\nmodel name\t: ARMv7 Processor rev 0 (v7l)\nBogoMIPS\t: 38.40\n\
+             Features\t: half thumb fastmult vfp edsp neon vfpv3 tls vfpv4 idiva idivt vfpd32 lpae\n\
+             CPU implementer\t: 0x41\nCPU architecture: 7\nCPU variant\t: 0x0\nCPU part\t: 0xc0f\n\
+             CPU revision\t: 0\n\n"
+        ));
+    }
+    text.push_str("Hardware\t: arm32-bridge\nRevision\t: 0000\nSerial\t\t: 0000000000000000\n");
+    text
+}
+
+fn open_guest_path(path: u32, flags: u32, mode: u32) -> i32 {
+    if let Some(fd) = emulated_cpu_file(path) {
+        return fd;
+    }
+    unsafe { libc::open(host_c(path), host_open_flags(flags), mode) }
+}
+
 /// Writes a host `struct stat` as bionic ARM32's 104-byte `struct stat`.
 fn write_stat32(memory: GuestMem, guest: u32, st: &libc::stat) {
     unsafe { std::ptr::write_bytes(memory.host(guest), 0, 104) };
@@ -258,6 +301,18 @@ fn restore_jump_buffer(cpu: &mut Uc, buffer: u32, value: u32) -> Ret {
     Ret::Jumped
 }
 
+/// The guest's one locale handle (a small zeroed block; bionic never looks inside).
+fn locale_handle() -> u32 {
+    static HANDLE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let existing = HANDLE.load(std::sync::atomic::Ordering::Relaxed);
+    if existing != 0 {
+        return existing;
+    }
+    let handle = shared().misc_alloc(16, 4);
+    HANDLE.store(handle, std::sync::atomic::Ordering::Relaxed);
+    handle
+}
+
 fn page_round(length: u32) -> u32 {
     length.saturating_add(crate::mem::PAGE - 1) & !(crate::mem::PAGE - 1)
 }
@@ -332,7 +387,7 @@ fn lookup_symbol(name: &str) -> u32 {
     if crate::imports::handler_for(name).is_some() {
         return stub_for(name);
     }
-    eprintln!("[bridge] run-time lookup of {name}: not available");
+    crate::log::line(&format!("[bridge] run-time lookup of {name}: not available"));
     0
 }
 
@@ -372,6 +427,20 @@ extern "C" {
     fn strerror_r(errnum: i32, buffer: *mut libc::c_char, length: usize) -> *mut libc::c_char;
 }
 
+/// A free or realloc of something that isn't a live heap block would corrupt
+/// the heap; log who did it (first few times) and leave the heap alone.
+fn refuse_bad_block(uc: &mut Uc, call: &str, pointer: u32) -> bool {
+    static REPORTED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let Some(reason) = shared().heap.not_owned(pointer) else { return false };
+    if REPORTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 30 {
+        crate::log::line(&format!(
+            "[heap] refused {call}({pointer:#x}): {reason}; called from lr {:#x}",
+            uc.reg(14)
+        ));
+    }
+    true
+}
+
 pub fn handler(name: &str) -> Option<Handler> {
     match name {
         // ---- memory ----
@@ -387,10 +456,16 @@ pub fn handler(name: &str) -> Option<Handler> {
         "realloc" => handler!(|uc, a| {
             let pointer = a.u32();
             let size = a.u32();
+            if pointer != 0 && refuse_bad_block(uc, "realloc", pointer) {
+                return Ret::U32(0);
+            }
             Ret::U32(shared().heap.realloc(pointer, size))
         }),
         "free" => handler!(|uc, a| {
             let pointer = a.u32();
+            if pointer != 0 && refuse_bad_block(uc, "free", pointer) {
+                return Ret::Void;
+            }
             shared().heap.free(pointer);
             Ret::Void
         }),
@@ -408,13 +483,13 @@ pub fn handler(name: &str) -> Option<Handler> {
             Ret::U32(if pointer == 0 { libc::ENOMEM as u32 } else { 0 })
         }),
         "memcpy" | "__aeabi_memcpy" | "__aeabi_memcpy4" | "__aeabi_memcpy8" | "memmove" | "__aeabi_memmove"
-        | "__aeabi_memmove4" | "__aeabi_memmove8" => handler!(|uc, a| {
+        | "__aeabi_memmove4" | "__aeabi_memmove8" | "__memcpy_chk" | "__memmove_chk" => handler!(|uc, a| {
             let (destination, source, length) = (a.u32(), a.u32(), a.u32());
             let m = mem();
             unsafe { std::ptr::copy(m.host(source), m.host(destination), length as usize) };
             Ret::U32(destination)
         }),
-        "memset" => handler!(|uc, a| {
+        "memset" | "__memset_chk" => handler!(|uc, a| {
             let (destination, value, length) = (a.u32(), a.u32(), a.u32());
             unsafe { std::ptr::write_bytes(mem().host(destination), value as u8, length as usize) };
             Ret::U32(destination)
@@ -456,7 +531,7 @@ pub fn handler(name: &str) -> Option<Handler> {
         }),
 
         // ---- strings ----
-        "strlen" => handler!(|uc, a| Ret::U32(unsafe { libc::strlen(host_c(a.u32())) } as u32)),
+        "strlen" | "__strlen_chk" => handler!(|uc, a| Ret::U32(unsafe { libc::strlen(host_c(a.u32())) } as u32)),
         "strcmp" => handler!(|uc, a| {
             let (x, y) = (a.u32(), a.u32());
             Ret::U32(unsafe { libc::strcmp(host_c(x), host_c(y)) } as u32)
@@ -473,11 +548,11 @@ pub fn handler(name: &str) -> Option<Handler> {
             let (x, y, n) = (a.u32(), a.u32(), a.u32());
             Ret::U32(unsafe { libc::strncasecmp(host_c(x), host_c(y), n as usize) } as u32)
         }),
-        "strchr" => handler!(|uc, a| {
+        "strchr" | "__strchr_chk" => handler!(|uc, a| {
             let (text, c) = (a.u32(), a.i32());
             back(unsafe { libc::strchr(host_c(text), c) })
         }),
-        "strrchr" => handler!(|uc, a| {
+        "strrchr" | "__strrchr_chk" => handler!(|uc, a| {
             let (text, c) = (a.u32(), a.i32());
             back(unsafe { libc::strrchr(host_c(text), c) })
         }),
@@ -497,7 +572,7 @@ pub fn handler(name: &str) -> Option<Handler> {
             let (text, reject) = (a.u32(), a.u32());
             Ret::U32(unsafe { libc::strcspn(host_c(text), host_c(reject)) } as u32)
         }),
-        "strcpy" => handler!(|uc, a| {
+        "strcpy" | "__strcpy_chk" => handler!(|uc, a| {
             let (destination, source) = (a.u32(), a.u32());
             unsafe { libc::strcpy(host_c(destination), host_c(source)) };
             Ret::U32(destination)
@@ -512,7 +587,7 @@ pub fn handler(name: &str) -> Option<Handler> {
             unsafe { libc::strcat(host_c(destination), host_c(source)) };
             Ret::U32(destination)
         }),
-        "strlcpy" => handler!(|uc, a| {
+        "strlcpy" | "__strlcpy_chk" => handler!(|uc, a| {
             let (destination, source, size) = (a.u32(), a.u32(), a.u32());
             let m = mem();
             let text = m.c_str(source).to_bytes().to_vec();
@@ -545,7 +620,7 @@ pub fn handler(name: &str) -> Option<Handler> {
         }),
         "strtol" => handler!(|uc, a| strtol_32(uc, a, true)),
         "strtoul" => handler!(|uc, a| strtol_32(uc, a, false)),
-        "strtoll" | "strtoull" => handler!(|uc, a| {
+        "strtoll" | "strtoull" | "strtoll_l" | "strtoull_l" => handler!(|uc, a| {
             let (text, end_out, base) = (a.u32(), a.u32(), a.i32());
             let mut end: *mut libc::c_char = std::ptr::null_mut();
             let value = unsafe { libc::strtoull(host_c(text), &mut end, base) };
@@ -555,7 +630,7 @@ pub fn handler(name: &str) -> Option<Handler> {
             sync_errno(uc);
             Ret::U64(value)
         }),
-        "strtod" => handler!(|uc, a| {
+        "strtod" | "strtold" | "strtold_l" => handler!(|uc, a| {
             let (text, end_out) = (a.u32(), a.u32());
             let mut end: *mut libc::c_char = std::ptr::null_mut();
             let value = unsafe { libc::strtod(host_c(text), &mut end) };
@@ -575,11 +650,98 @@ pub fn handler(name: &str) -> Option<Handler> {
         }),
         "atoi" | "atol" => handler!(|uc, a| Ret::U32(unsafe { libc::atoll(host_c(a.u32())) } as i32 as u32)),
         "atof" => handler!(|uc, a| Ret::F64(unsafe { libc::atof(host_c(a.u32())) })),
+        "abs" | "labs" => handler!(|uc, a| Ret::U32(a.i32().wrapping_abs() as u32)),
+        "llabs" | "imaxabs" => handler!(|uc, a| Ret::U64(a.i64().wrapping_abs() as u64)),
         "tolower" => handler!(|uc, a| Ret::U32(unsafe { libc::tolower(a.i32()) } as u32)),
         "toupper" => handler!(|uc, a| Ret::U32(unsafe { libc::toupper(a.i32()) } as u32)),
         "isspace" => handler!(|uc, a| Ret::U32((unsafe { libc::isspace(a.i32()) } != 0) as u32)),
         "isupper" => handler!(|uc, a| Ret::U32((unsafe { libc::isupper(a.i32()) } != 0) as u32)),
         "isblank" => handler!(|uc, a| Ret::U32((unsafe { libc::isblank(a.i32()) } != 0) as u32)),
+        "isdigit" => handler!(|uc, a| Ret::U32((unsafe { libc::isdigit(a.i32()) } != 0) as u32)),
+        "isxdigit" => handler!(|uc, a| Ret::U32((unsafe { libc::isxdigit(a.i32()) } != 0) as u32)),
+        "isalpha" => handler!(|uc, a| Ret::U32((unsafe { libc::isalpha(a.i32()) } != 0) as u32)),
+        "isalnum" => handler!(|uc, a| Ret::U32((unsafe { libc::isalnum(a.i32()) } != 0) as u32)),
+        "isascii" => handler!(|uc, a| Ret::U32((a.u32() < 0x80) as u32)),
+        "iswlower" => handler!(|uc, a| Ret::U32(char::from_u32(a.u32()).is_some_and(|c| c.is_lowercase()) as u32)),
+        // wchar_t is 32 bits for the guest too; the C library is always UTF-8.
+        "wcslen" => handler!(|uc, a| {
+            let text = a.u32();
+            let mut length = 0;
+            while mem().read_u32(text + length * 4) != 0 {
+                length += 1;
+            }
+            Ret::U32(length)
+        }),
+        "wmemcpy" | "wmemmove" => handler!(|uc, a| {
+            let (destination, source, count) = (a.u32(), a.u32(), a.u32());
+            unsafe { std::ptr::copy(mem().host(source), mem().host(destination), count as usize * 4) };
+            Ret::U32(destination)
+        }),
+        "wmemset" => handler!(|uc, a| {
+            let (destination, value, count) = (a.u32(), a.u32(), a.u32());
+            for i in 0..count {
+                mem().write_u32(destination + i * 4, value);
+            }
+            Ret::U32(destination)
+        }),
+        "wcrtomb" => handler!(|uc, a| {
+            let (out, character) = (a.u32(), a.u32());
+            if out == 0 {
+                return Ret::U32(1);
+            }
+            let Some(character) = char::from_u32(character) else {
+                set_errno(uc, libc::EILSEQ);
+                return Ret::U32(u32::MAX);
+            };
+            let mut bytes = [0u8; 4];
+            let encoded = character.encode_utf8(&mut bytes);
+            mem().write_bytes(out, encoded.as_bytes());
+            Ret::U32(encoded.len() as u32)
+        }),
+        // mbrtowc(out, text, length, state) / mbtowc(out, text, length) / mbrlen(text, length, state).
+        "mbrtowc" | "mbtowc" | "mbrlen" => handler!(|uc, a| {
+            let name = uc.get_data().current_call;
+            let out = if name == "mbrlen" { 0 } else { a.u32() };
+            let (text, length) = (a.u32(), a.u32());
+            if text == 0 {
+                return Ret::U32(0);
+            }
+            let available = (length.min(4)) as usize;
+            let bytes = mem().bytes(text, available).to_vec();
+            let needed = match bytes.first() {
+                None => return Ret::U32(u32::MAX - 1),
+                Some(0) => {
+                    if out != 0 {
+                        mem().write_u32(out, 0);
+                    }
+                    return Ret::U32(0);
+                }
+                Some(&b) if b < 0x80 => 1,
+                Some(&b) if b >> 5 == 0b110 => 2,
+                Some(&b) if b >> 4 == 0b1110 => 3,
+                Some(&b) if b >> 3 == 0b11110 => 4,
+                Some(_) => {
+                    set_errno(uc, libc::EILSEQ);
+                    return Ret::U32(u32::MAX);
+                }
+            };
+            if needed > bytes.len() {
+                // Incomplete: -2 (mbtowc reports it as invalid).
+                return Ret::U32(if name == "mbtowc" { u32::MAX } else { u32::MAX - 1 });
+            }
+            match std::str::from_utf8(&bytes[..needed]).ok().and_then(|text| text.chars().next()) {
+                Some(character) => {
+                    if out != 0 {
+                        mem().write_u32(out, character as u32);
+                    }
+                    Ret::U32(needed as u32)
+                }
+                None => {
+                    set_errno(uc, libc::EILSEQ);
+                    Ret::U32(u32::MAX)
+                }
+            }
+        }),
         "wcscmp" => handler!(|uc, a| {
             // wchar_t is 4 bytes on both sides.
             let (x, y) = (a.u32(), a.u32());
@@ -745,7 +907,10 @@ pub fn handler(name: &str) -> Option<Handler> {
         // ---- stdio ----
         "fopen" => handler!(|uc, a| {
             let (path, mode) = (a.u32(), a.u32());
-            let stream = unsafe { libc::fopen(host_c(path), host_c(mode)) };
+            let stream = match emulated_cpu_file(path) {
+                Some(fd) => unsafe { libc::fdopen(fd, host_c(mode)) },
+                None => unsafe { libc::fopen(host_c(path), host_c(mode)) },
+            };
             Ret::U32(register_file(uc, stream))
         }),
         "fdopen" => handler!(|uc, a| {
@@ -829,6 +994,20 @@ pub fn handler(name: &str) -> Option<Handler> {
             }
             Ret::Void
         }),
+        "feof" | "ferror" | "fileno" | "clearerr" => handler!(|uc, a| {
+            let file = a.u32();
+            let Some(HostFile::Stream(stream)) = host_file(file) else { return Ret::U32(0) };
+            let stream = stream as *mut libc::FILE;
+            Ret::U32(match uc.get_data().current_call {
+                "feof" => (unsafe { libc::feof(stream) }) as u32,
+                "ferror" => (unsafe { libc::ferror(stream) }) as u32,
+                "fileno" => (unsafe { libc::fileno(stream) }) as u32,
+                _ => {
+                    unsafe { libc::clearerr(stream) };
+                    0
+                }
+            })
+        }),
         "fgets" => handler!(|uc, a| {
             let (buffer, size, file) = (a.u32(), a.i32(), a.u32());
             match host_file(file) {
@@ -899,9 +1078,39 @@ pub fn handler(name: &str) -> Option<Handler> {
         }),
 
         // ---- files and directories ----
+        // The _chk forms of the string and memory calls above only add a buffer size at the end.
+        "__vsprintf_chk" => handler!(|uc, a| {
+            let (buffer, _flags, _size, format, list) = (a.u32(), a.u32(), a.u32(), a.u32(), a.u32());
+            let mut list = VaList { pointer: list };
+            let text = printf::format(mem(), format, &mut list);
+            mem().write_bytes(buffer, &text);
+            mem().write_u8(buffer + text.len() as u32, 0);
+            Ret::U32(text.len() as u32)
+        }),
+        // fd_set is an array of 32-bit words for the guest.
+        "__FD_SET_chk" => handler!(|uc, a| {
+            let (fd, set) = (a.u32(), a.u32());
+            let word = set + fd / 32 * 4;
+            mem().write_u32(word, mem().read_u32(word) | 1 << (fd % 32));
+            Ret::Void
+        }),
+        "__FD_ISSET_chk" => handler!(|uc, a| {
+            let (fd, set) = (a.u32(), a.u32());
+            Ret::U32(mem().read_u32(set + fd / 32 * 4) >> (fd % 32) & 1)
+        }),
+        "__open_2" => handler!(|uc, a| {
+            let (path, flags) = (a.u32(), a.u32());
+            checked(uc, open_guest_path(path, flags, 0) as i64)
+        }),
+        "getpriority" => handler!(|uc, a| {
+            let (which, who) = (a.u32(), a.u32());
+            clear_errno();
+            Ret::U32(unsafe { libc::getpriority(which as _, who as _) } as u32)
+        }),
+        "sigaltstack" => handler!(|uc, a| Ret::U32(0)),
         "open" => handler!(|uc, a| {
             let (path, flags, mode) = (a.u32(), a.u32(), a.u32());
-            checked(uc, unsafe { libc::open(host_c(path), host_open_flags(flags), mode) } as i64)
+            checked(uc, open_guest_path(path, flags, mode) as i64)
         }),
         // The _chk forms add a buffer size after the same arguments.
         "read" | "__read_chk" => handler!(|uc, a| {
@@ -916,6 +1125,48 @@ pub fn handler(name: &str) -> Option<Handler> {
         "lseek" => handler!(|uc, a| {
             let (fd, offset, whence) = (a.i32(), a.i32(), a.i32());
             checked(uc, unsafe { libc::lseek(fd, offset as libc::off_t, whence) } as i64)
+        }),
+        "lseek64" => handler!(|uc, a| {
+            let (fd, offset, whence) = (a.i32(), a.i64(), a.i32());
+            let result = unsafe { libc::lseek(fd, offset as libc::off_t, whence) } as i64;
+            if result < 0 {
+                sync_errno(uc);
+            }
+            Ret::U64(result as u64)
+        }),
+        "pread" => handler!(|uc, a| {
+            let (fd, buffer, length, offset) = (a.i32(), a.u32(), a.u32(), a.i32());
+            checked(uc, unsafe { libc::pread(fd, mem().host(buffer).cast(), length as usize, offset as libc::off_t) } as i64)
+        }),
+        "pread64" => handler!(|uc, a| {
+            let (fd, buffer, length, offset) = (a.i32(), a.u32(), a.u32(), a.i64());
+            checked(uc, unsafe { libc::pread(fd, mem().host(buffer).cast(), length as usize, offset as libc::off_t) } as i64)
+        }),
+        "pwrite" => handler!(|uc, a| {
+            let (fd, buffer, length, offset) = (a.i32(), a.u32(), a.u32(), a.i32());
+            checked(uc, unsafe { libc::pwrite(fd, mem().host(buffer).cast(), length as usize, offset as libc::off_t) } as i64)
+        }),
+        "pwrite64" => handler!(|uc, a| {
+            let (fd, buffer, length, offset) = (a.i32(), a.u32(), a.u32(), a.i64());
+            checked(uc, unsafe { libc::pwrite(fd, mem().host(buffer).cast(), length as usize, offset as libc::off_t) } as i64)
+        }),
+        "ftruncate" => handler!(|uc, a| {
+            let (fd, length) = (a.i32(), a.i32());
+            checked(uc, unsafe { libc::ftruncate(fd, length as libc::off_t) } as i64)
+        }),
+        "ftruncate64" => handler!(|uc, a| {
+            let (fd, length) = (a.i32(), a.i64());
+            checked(uc, unsafe { libc::ftruncate(fd, length as libc::off_t) } as i64)
+        }),
+        "truncate" => handler!(|uc, a| {
+            let (path, length) = (a.u32(), a.i32());
+            checked(uc, unsafe { libc::truncate(host_c(path), length as libc::off_t) } as i64)
+        }),
+        "fsync" => handler!(|uc, a| checked(uc, unsafe { libc::fsync(a.i32()) } as i64)),
+        "rmdir" => handler!(|uc, a| checked(uc, unsafe { libc::rmdir(host_c(a.u32())) } as i64)),
+        "strnlen" => handler!(|uc, a| {
+            let (text, limit) = (a.u32(), a.u32());
+            Ret::U32(unsafe { libc::strnlen(host_c(text), limit as usize) } as u32)
         }),
         "access" => handler!(|uc, a| {
             let (path, mode) = (a.u32(), a.i32());
@@ -980,7 +1231,15 @@ pub fn handler(name: &str) -> Option<Handler> {
         "poll" => handler!(|uc, a| {
             // struct pollfd is the same 8 bytes on both sides.
             let (fds, count, timeout) = (a.u32(), a.u32(), a.i32());
-            checked(uc, unsafe { libc::poll(mem().host(fds).cast(), count as libc::nfds_t, timeout) } as i64)
+            let fds = mem().host(fds) as usize;
+            let (result, error) = crate::runtime::without_gil(|| {
+                let result = unsafe { libc::poll(fds as *mut libc::pollfd, count as libc::nfds_t, timeout) };
+                (result, last_errno())
+            });
+            if result < 0 {
+                set_errno(uc, error);
+            }
+            Ret::U32(result as u32)
         }),
         "opendir" => handler!(|uc, a| {
             let path = a.u32();
@@ -1046,6 +1305,44 @@ pub fn handler(name: &str) -> Option<Handler> {
             }
             Ret::U32(0)
         }),
+        // clock_t is 32 bits; CLOCKS_PER_SEC is a million.
+        "clock" => handler!(|uc, a| {
+            let mut used: libc::timespec = unsafe { std::mem::zeroed() };
+            unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut used) };
+            Ret::U32((used.tv_sec as u64 * 1_000_000 + used.tv_nsec as u64 / 1000) as u32)
+        }),
+        "clock_getres" => handler!(|uc, a| {
+            let (clock, out) = (a.i32(), a.u32());
+            let mut resolution: libc::timespec = unsafe { std::mem::zeroed() };
+            let result = unsafe { libc::clock_getres(clock, &mut resolution) };
+            if result == 0 && out != 0 {
+                mem().write_u32(out, resolution.tv_sec as u32);
+                mem().write_u32(out + 4, resolution.tv_nsec as u32);
+            }
+            checked(uc, result as i64)
+        }),
+        "readlink" => handler!(|uc, a| {
+            let (path, buffer, size) = (a.u32(), a.u32(), a.u32());
+            checked(uc, unsafe { libc::readlink(host_c(path), host_c(buffer), size as usize) } as i64)
+        }),
+        "isatty" => handler!(|uc, a| Ret::U32((unsafe { libc::isatty(a.i32()) } == 1) as u32)),
+        // bionic's __pthread_cleanup_t: { prev, routine, arg }.
+        "__pthread_cleanup_push" => handler!(|uc, a| {
+            let (record, routine, argument) = (a.u32(), a.u32(), a.u32());
+            mem().write_u32(record + 4, routine);
+            mem().write_u32(record + 8, argument);
+            Ret::Void
+        }),
+        "__pthread_cleanup_pop" => handler!(|uc, a| {
+            let (record, execute) = (a.u32(), a.u32());
+            if execute != 0 {
+                let (routine, argument) = (mem().read_u32(record + 4), mem().read_u32(record + 8));
+                if let Err(error) = call_guest(uc, routine, &[argument]) {
+                    stop_with_fault(uc, error);
+                }
+            }
+            Ret::Void
+        }),
         "clock_gettime" => handler!(|uc, a| {
             let (clock, out) = (a.i32(), a.u32());
             let mut now: libc::timespec = unsafe { std::mem::zeroed() };
@@ -1063,6 +1360,14 @@ pub fn handler(name: &str) -> Option<Handler> {
             let seconds = mem().read_u32(clock) as i32 as libc::time_t;
             let mut tm: libc::tm = unsafe { std::mem::zeroed() };
             unsafe { libc::gmtime_r(&seconds, &mut tm) };
+            write_tm32(out, &tm);
+            Ret::U32(out)
+        }),
+        "localtime_r" => handler!(|uc, a| {
+            let (clock, out) = (a.u32(), a.u32());
+            let seconds = mem().read_u32(clock) as i32 as libc::time_t;
+            let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+            unsafe { libc::localtime_r(&seconds, &mut tm) };
             write_tm32(out, &tm);
             Ret::U32(out)
         }),
@@ -1144,6 +1449,8 @@ pub fn handler(name: &str) -> Option<Handler> {
             Ret::Void
         }),
         "getpwuid" => handler!(|uc, a| Ret::U32(0)),
+        // For the self-test: tests that need the translator (time slicing inside game code).
+        "arm32_bridge_uses_translator" => handler!(|uc, a| Ret::U32(crate::dynarec::enabled() as u32)),
         "fork" | "execl" | "system" | "setsid" => handler!(|uc, a| {
             set_errno(uc, libc::ENOSYS);
             Ret::U32(u32::MAX)
@@ -1176,23 +1483,8 @@ pub fn handler(name: &str) -> Option<Handler> {
         }),
         "__cxa_finalize" => handler!(|uc, a| Ret::Void),
 
-        // ---- signals: recorded, never installed on the host ----
-        "sigaction" => handler!(|uc, a| {
-            let (_signal, _action, old) = (a.u32(), a.u32(), a.u32());
-            if old != 0 {
-                unsafe { std::ptr::write_bytes(mem().host(old), 0, 16) };
-            }
-            Ret::U32(0)
-        }),
-        "bsd_signal" | "signal" => handler!(|uc, a| Ret::U32(0)),
-        "sigprocmask" => handler!(|uc, a| {
-            let (_how, _set, old) = (a.u32(), a.u32(), a.u32());
-            if old != 0 {
-                mem().write_u32(old, 0);
-            }
-            Ret::U32(0)
-        }),
-        "raise" | "kill" | "alarm" => handler!(|uc, a| Ret::U32(0)),
+        // Signals between game threads are in signals.rs; no timer signals.
+        "alarm" => handler!(|uc, a| Ret::U32(0)),
 
         // ---- setjmp / longjmp ----
         "setjmp" | "_setjmp" | "sigsetjmp" => handler!(|uc, a| {
@@ -1289,6 +1581,59 @@ pub fn handler(name: &str) -> Option<Handler> {
             Ret::U32(lookup_symbol(&name))
         }),
         "getpagesize" => handler!(|uc, a| Ret::U32(crate::mem::PAGE)),
+        // A 32-bit sigset_t is one word: bit n-1 for signal n.
+        "sigemptyset" => handler!(|uc, a| {
+            mem().write_u32(a.u32(), 0);
+            Ret::U32(0)
+        }),
+        "sigfillset" => handler!(|uc, a| {
+            mem().write_u32(a.u32(), u32::MAX);
+            Ret::U32(0)
+        }),
+        "sigaddset" | "sigdelset" | "sigismember" => handler!(|uc, a| {
+            let (set, signal) = (a.u32(), a.u32());
+            if !(1..=32).contains(&signal) {
+                set_errno(uc, libc::EINVAL);
+                return Ret::U32(u32::MAX);
+            }
+            let bit = 1u32 << (signal - 1);
+            let value = mem().read_u32(set);
+            match uc.get_data().current_call {
+                "sigaddset" => mem().write_u32(set, value | bit),
+                "sigdelset" => mem().write_u32(set, value & !bit),
+                _ => return Ret::U32((value & bit != 0) as u32),
+            }
+            Ret::U32(0)
+        }),
+        // Thread names and similar process settings don't matter to the bridge.
+        "prctl" => handler!(|uc, a| {
+            let option = a.u32();
+            if option != libc::PR_SET_NAME as u32 {
+                crate::log::line(&format!("[bridge] prctl option {option} ignored"));
+            }
+            Ret::U32(0)
+        }),
+        // Bionic has only the C/UTF-8 locale; one shared handle stands for it.
+        "newlocale" | "duplocale" => handler!(|uc, a| Ret::U32(locale_handle())),
+        "uselocale" => handler!(|uc, a| Ret::U32(locale_handle())),
+        "freelocale" => handler!(|uc, a| Ret::Void),
+        // Reads one line and scans it: enough for the /proc and /sys values games read.
+        "fscanf" => handler!(|uc, a| {
+            let (file, format) = (a.u32(), a.u32());
+            let Some(HostFile::Stream(stream)) = host_file(file) else { return Ret::U32(u32::MAX) };
+            let mut line = [0u8; 1024];
+            let got = unsafe { libc::fgets(line.as_mut_ptr().cast(), line.len() as i32, stream as *mut libc::FILE) };
+            if got.is_null() {
+                return Ret::U32(u32::MAX);
+            }
+            let length = line.iter().position(|&b| b == 0).unwrap_or(line.len() - 1);
+            let input = shared().heap.malloc(length as u32 + 1);
+            mem().write_bytes(input, &line[..=length.min(line.len() - 1)]);
+            mem().write_u8(input + length as u32, 0);
+            let result = scanf::scan(mem(), input, format, a);
+            shared().heap.free(input);
+            Ret::U32(result as u32)
+        }),
         // Memory blocks come from the guest heap, page aligned. File mappings are
         // private copies (writes don't reach the file).
         "mmap" | "mmap64" => handler!(|uc, a| {

@@ -8523,10 +8523,8 @@ static bool trans_YIELD(DisasContext *s, arg_YIELD *a)
      * MTTCG we don't generate jumps to the helper as it won't affect the
      * scheduling of other vCPUs.
      */
-    if (!(tb_cflags(s->base.tb) & CF_PARALLEL)) {
-        gen_set_pc_im(s, s->base.pc_next);
-        s->base.is_jmp = DISAS_YIELD;
-    }
+    gen_set_pc_im(s, s->base.pc_next);
+    gen_helper_yield(s->uc->tcg_ctx, s->uc->tcg_ctx->cpu_env);
     return true;
 }
 
@@ -8539,10 +8537,8 @@ static bool trans_WFE(DisasContext *s, arg_WFE *a)
      * which are *one* of many ways to wake the CPU from WFE, are not
      * implemented so we can't sleep like WFI does.
      */
-    if (!(tb_cflags(s->base.tb) & CF_PARALLEL)) {
-        gen_set_pc_im(s, s->base.pc_next);
-        s->base.is_jmp = DISAS_WFE;
-    }
+    gen_set_pc_im(s, s->base.pc_next);
+    gen_helper_yield(s->uc->tcg_ctx, s->uc->tcg_ctx->cpu_env);
     return true;
 }
 

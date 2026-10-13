@@ -235,6 +235,7 @@ impl Translator {
                         self.a.and_w_imm(T0, T2, FPSCR_CONTROL, T1);
                         self.a.msr_fpcr(T0);
                         self.neon_fp = false;
+                        self.a.vfp_restore = false;
                         let next = self.next_pc() | self.mode_bit();
                         // Unlinked: the dispatcher checks the new LEN/STRIDE.
                         self.a.no_link = true;
@@ -247,16 +248,47 @@ impl Translator {
                 _ => Err(()),
             }
         } else {
-            // VMOV.32 Dd[x], Rt / VMOV.32 Rt, Dn[x] (8- and 16-bit lanes are left to Unicorn)
-            if (word >> 22) & 3 != 0 || (word >> 5) & 3 != 0 || word & 0xF != 0 || rt == PC {
+            // VMOV.<size> Dd[x], Rt / VMOV.<U|S><size> Rt, Dn[x] with 8-, 16- or 32-bit lanes.
+            let (opc1, opc2, unsigned) = ((word >> 21) & 3, (word >> 5) & 3, (word >> 23) & 1 == 1);
+            if word & 0xF != 0 || rt == PC {
                 return Err(());
             }
-            let d = Fp::decode(true, (word >> 16) & 0xF, (word >> 7) & 1);
-            let lane = d.lane() * 2 + ((word >> 21) & 1);
-            if to_core {
-                self.a.umov(false, rt, d.host(), lane);
+            if !to_core && unsigned {
+                // VDUP.<size> Qd/Dd, Rt: B (bit 22) and E (bit 5) give the size, bit 21 is Q.
+                let (b, e, q) = ((word >> 22) & 1, (word >> 5) & 1, (word >> 21) & 1 == 1);
+                let size = match (b, e) {
+                    (0, 0) => 2,
+                    (0, 1) => 1,
+                    (1, 0) => 0,
+                    _ => return Err(()),
+                };
+                let d = (((word >> 7) & 1) << 4) | ((word >> 16) & 0xF);
+                if q && d & 1 == 1 {
+                    return Err(());
+                }
+                if q {
+                    self.a.dup_general(true, size, d / 2, rt);
+                } else {
+                    self.a.dup_general(false, size, V0, rt);
+                    self.a.ins_element(true, d / 2, d % 2, V0, 0);
+                }
+                return Ok(Flow::Next);
+            }
+            let (size, index) = if opc1 & 2 != 0 {
+                (0, ((opc1 & 1) << 2) | opc2)
+            } else if opc2 & 1 != 0 {
+                (1, ((opc1 & 1) << 1) | (opc2 >> 1))
+            } else if opc2 == 0 && !unsigned {
+                (2, opc1 & 1)
             } else {
-                self.a.ins_general(false, d.host(), lane, rt);
+                return Err(());
+            };
+            let d = Fp::decode(true, (word >> 16) & 0xF, (word >> 7) & 1);
+            let lane = d.lane() * (8 >> size) + index;
+            if to_core {
+                self.a.move_element_out(size < 2 && !unsigned, size, rt, d.host(), lane);
+            } else {
+                self.a.ins_general_sized(size, d.host(), lane, rt);
             }
             Ok(Flow::Next)
         }
