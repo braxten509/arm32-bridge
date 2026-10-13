@@ -164,3 +164,5 @@ engine.rs run(): an address at stub+4 (the `bx lr` half) just returns to LR. Tem
 - 120 Hz: generic GLSurfaceView fallback works for PC1 ("asked for 120 Hz", display 120 Hz with a uid override),
   but PC1 still draws 60 fps: its Cocos2dxRenderer.onDrawFrame sleeps until animationInterval has passed (the
   game's own frame cap, set from native code). PC2 (cocos2d-x 3.x) has no such cap below 1/60 s. Put to the user.
+- User chose to lift frame limits for all games. patch_dex.py fix 3: Thread.sleep inside any
+  onDrawFrame(GL10) becomes nops. PC1: 116-120 fps (own code ~0.7 ms/frame); PC2 unchanged at 118-120.

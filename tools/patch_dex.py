@@ -13,6 +13,12 @@ Android each decode goes through the media service and they queue, so the
 game froze for 76-500 ms per new effect. The wait becomes 1 ms; the sound's
 own load-complete listener still plays it as soon as it is ready.
 
+Fix 3 - frame limiters: a Thread.sleep inside a GLSurfaceView renderer's
+onDrawFrame only ever holds the game below the screen's rate (old cocos2d-x
+sleeps until its 1/60 s animation interval has passed). The call becomes nops,
+so the game draws at the screen's rate (120 Hz on the Pixel 10). Games move by
+elapsed time, so they only get smoother.
+
 usage: patch_dex.py <dexdump binary> <classes.dex>...
 Prints one line per change; exit code 0 even when nothing needed fixing.
 """
@@ -31,17 +37,32 @@ INSTRUCTION = re.compile(r"^([0-9a-f]{6}): [0-9a-f ]+\|[0-9a-f]{4}: (.*)$")
 CONST = re.compile(r"^const(/16)? v(\d+), #int (-?\d+)")
 INVOKE = re.compile(r"^invoke-virtual \{v\d+, v(\d+)\}, (.*)$")
 SPUT = re.compile(r"^sput v(\d+), (.*)$")
+SLEEP = re.compile(r"^invoke-static(/range)? \{[^}]*\}, Ljava/lang/Thread;\.sleep:\(J\)V")
+METHOD_NAME = re.compile(r"^\s+name\s+: '(.*)'$")
+METHOD_TYPE = re.compile(r"^\s+type\s+: '(.*)'$")
+ON_DRAW_FRAME = ("onDrawFrame", "(Ljavax/microedition/khronos/opengles/GL10;)V")
 
 
 def fixes(dexdump: str, path: str):
     """Yields (file offset of a const instruction, its opcode form, old value, new value, reason)."""
     listing = subprocess.run([dexdump, "-d", path], capture_output=True, text=True, errors="replace").stdout
     previous = None
+    method_name = method_type = None
     for line in listing.splitlines():
+        name = METHOD_NAME.match(line)
+        if name:
+            method_name, method_type = name.group(1), None
+            continue
+        kind = METHOD_TYPE.match(line)
+        if kind:
+            method_type = kind.group(1)
+            continue
         match = INSTRUCTION.match(line)
         if not match:
             continue
         offset, text = int(match.group(1), 16), match.group(2)
+        if (method_name, method_type) == ON_DRAW_FRAME and SLEEP.match(text):
+            yield offset, "sleep", "Thread.sleep", "nop", "frame limiter in onDrawFrame removed"
         invoke = INVOKE.match(text)
         if invoke and SET_FLAGS in invoke.group(2) and previous:
             const_offset, form, register, value = previous
@@ -60,7 +81,10 @@ def patch(dexdump: str, path: str) -> int:
     data = bytearray(open(path, "rb").read())
     changed = 0
     for offset, form, value, new_value, reason in fixes(dexdump, path):
-        if form == "/16":  # 13 AA BBBB
+        if form == "sleep":  # invoke-static(/range): 71|77 AA BBBB CCCC -> three nops
+            assert data[offset] in (0x71, 0x77)
+            data[offset : offset + 6] = bytes(6)
+        elif form == "/16":  # 13 AA BBBB
             assert data[offset] == 0x13
             data[offset + 2 : offset + 4] = (new_value & 0xFFFF).to_bytes(2, "little")
         else:  # const: 14 AA BBBBBBBB
