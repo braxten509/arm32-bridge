@@ -1,2 +1,9 @@
 /target
 /tests/guest/build
+/android/.gradle
+/android/build
+/android/app/build
+/android/local.properties
+# Filled by tools/build-app.sh (built files and the debug signing key).
+/android/app/src/main/jniLibs
+/android/app/src/main/assets

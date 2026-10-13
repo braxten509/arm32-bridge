@@ -174,3 +174,12 @@ engine.rs run(): an address at stub+4 (the `bx lr` half) just returns to LR. Tem
 - Check: dex output byte-identical to patch_dex.py for both games (PC1 classes.dex + classes2.dex, PC2 both),
   zipalign -c -p 4 passes, missing counts 0 / 32 as before; PC2 converted this way runs at 119.9-120.2 fps.
 - User: the phone app installs with root for now; may move to a non-root install later (keep that step separate).
+
+# Packaging part C: Game Bridge phone app (2026-10-12)
+- android/ (Compose, card grid = user's sketch C). Lists 32-bit-only APKs in Downloads (file access granted once
+  through root appops), merges identical package+version, Convert / Open / Convert again. Runs apk-convert
+  (shipped as libapkconvert.so), signs with apksig and the PC's debug key, installs with root
+  (`pm install -r --bypass-low-target-sdk-block`) through a replaceable Installer.
+- Check: on the phone, "Convert again" on Puzzle Craft 2 from Downloads (sha256 = original) converted, signed and
+  installed in ~15 s with no PC involvement (lastUpdateTime 18:42:15); opened from the app: 119.9-120.3 fps, save kept
+  (New Puzzlonia, LVL 4). Harmless SELinux denials: the converter's search of /data/local/tests.
