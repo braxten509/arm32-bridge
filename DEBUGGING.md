@@ -140,3 +140,27 @@ engine.rs run(): an address at stub+4 (the `bx lr` half) just returns to LR. Tem
   Java method", stand-in "1 do-nothing native methods in 1 classes" (same as the old generator), menu 119.8-120.1 fps,
   own code ~2 ms/frame; checker 1,048,576 blocks, 0 differences (30 ran past); self-test 0 failures on PC, and on the
   phone with jit, unicorn and ARM32_CHECK=all (35,328 checks, 0 differences).
+
+# Packaging part B: second game, Puzzle Craft 1 (armeabi, cocos2d-x 1.x/2.x, 2026-10-12)
+- tools/convert.sh (one step: detect armeabi/armeabi-v7a + main library, report missing imports via the new
+  `arm32-bridge imports` command, sign, install over Wi-Fi). PC2: converted + installed with one command.
+- PC1 report before: 44 missing (26 GLES1, 13 zlib, sem_*, getcwd, __gnu_Unwind_Find_exidx). Added: GLES1 from the
+  NDK headers (212 generated + client array pointers by hand), built-in 32-bit libz.so from the NDK's libz.a
+  (build.rs, used when a game needs libz.so and ships none), semaphores, getcwd, unwind alias, _chk forms, getauxval.
+  Report after: 0 missing. PC CLI: load + JNI_OnLoad PASS.
+- Phone crash 1: SIGSEGV in dynarec translate() reading guest pc 0xffff0fc0 = Linux kuser helper __kuser_cmpxchg
+  (ARMv5 code has no ldrex/strex, so its atomics call the kernel's fixed-address helpers). Fixed generically: a
+  KUSER page at 0xffff0000 with cmpxchg64/barrier/cmpxchg/get_tls (encodings checked with the NDK assembler) and
+  version 5. Self-test check added; PC + phone (jit, unicorn, ARM32_CHECK=all: 40,370 checks, 0 differences) pass.
+- Phone crash 2: "JNI DETECTED ERROR: mid == null in CallStaticObjectMethodA from Cocos2dxRenderer.nativeInit".
+  Not the game: the bridge's own 120 Hz request called Cocos2dxGLSurfaceView.getInstance, which older cocos2d-x
+  lacks (no "[bridge] Java has no method" line from the game's lookups, which are now logged). Fixed: every step
+  checked; generic fallback through GLSurfaceView$GLThread.mGLSurfaceViewWeakRef for any GLSurfaceView game.
+- After crash 2's first fix: PC1 title screen drawn (screenshot), 60 fps, game code ~1.2 ms/frame; one 3.5 s
+  loading frame at start (own code 3.45 s; not investigated yet).
+- Android shows its one-time "Review permissions" screen for targetSdk < 23 apps before the first start (user
+  allowed test taps; tapped Continue).
+- REA's Android tools need apktool/jadx (not installed); used aapt2/dexdump instead.
+- 120 Hz: generic GLSurfaceView fallback works for PC1 ("asked for 120 Hz", display 120 Hz with a uid override),
+  but PC1 still draws 60 fps: its Cocos2dxRenderer.onDrawFrame sleeps until animationInterval has passed (the
+  game's own frame cap, set from native code). PC2 (cocos2d-x 3.x) has no such cap below 1/60 s. Put to the user.

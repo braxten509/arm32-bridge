@@ -709,6 +709,14 @@ pub fn dispatch(uc: &mut Uc, name: &str, a: &mut Args) -> Ret {
                 "GetFieldID" => jcall!(env, GetFieldID, class, host_c(member_name), host_c(signature)) as usize,
                 _ => jcall!(env, GetStaticFieldID, class, host_c(member_name), host_c(signature)) as usize,
             };
+            if host == 0 {
+                crate::log::line(&format!(
+                    "[bridge] Java has no {} {} {}",
+                    if name.contains("Field") { "field" } else { "method" },
+                    guest_string(member_name),
+                    guest_string(signature)
+                ));
+            }
             Ret::U32(member_handle(host, guest_string(member_name), guest_string(signature)))
         }
         "AllocObject" => Ret::U32(to_guest(jcall!(env, AllocObject, to_host(a.u32())))),

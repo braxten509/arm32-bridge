@@ -285,6 +285,7 @@ pub fn init(trace: bool) {
         return;
     }
     let memory = GuestMem::reserve();
+    memory.write_kernel_helpers();
     MEMORY.set(memory).ok();
     for depth in 0..MAX_DEPTH {
         memory.write_u32(trap_address(depth), UDF);

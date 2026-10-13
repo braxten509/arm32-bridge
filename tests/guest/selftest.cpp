@@ -8,7 +8,10 @@
 #include <pthread.h>
 #include <sched.h>
 #include <time.h>
+#include <semaphore.h>
 #include <setjmp.h>
+#include <unistd.h>
+#include <zlib.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -151,6 +154,46 @@ extern "C" int run_all() {
     int waited = pthread_cond_timedwait(&counter_changed, &counter_lock, &deadline);
     pthread_mutex_unlock(&counter_lock);
     check(waited == ETIMEDOUT, "condition wait times out");
+
+    {
+        // The Linux kuser helpers old ARMv5 (armeabi) code calls at fixed addresses.
+        typedef int (*cmpxchg_t)(int old_value, int new_value, volatile int *pointer);
+        typedef int (*cmpxchg64_t)(const long long *old_value, const long long *new_value, volatile long long *pointer);
+        typedef void *(*get_tls_t)();
+        typedef void (*barrier_t)();
+        volatile int word = 5;
+        volatile long long wide = 1LL << 40;
+        long long old_wide = 1LL << 40, new_wide = 3LL << 40, wrong = 7;
+        bool ok = ((cmpxchg_t)0xffff0fc0)(5, 9, &word) == 0 && word == 9 && ((cmpxchg_t)0xffff0fc0)(5, 1, &word) != 0 &&
+                  word == 9 && ((cmpxchg64_t)0xffff0f60)(&old_wide, &new_wide, &wide) == 0 && wide == new_wide &&
+                  ((cmpxchg64_t)0xffff0f60)(&wrong, &old_wide, &wide) != 0 && wide == new_wide &&
+                  *(volatile int *)0xffff0ffc >= 3;
+        void *tls;
+        __asm__ volatile("mrc p15, 0, %0, c13, c0, 3" : "=r"(tls));
+        ((barrier_t)0xffff0fa0)();
+        check(ok && ((get_tls_t)0xffff0fe0)() == tls, "kernel helpers (cmpxchg, cmpxchg64, barrier, get_tls)");
+    }
+
+    sem_t semaphore;
+    sem_init(&semaphore, 0, 1);
+    int semaphore_ok = sem_wait(&semaphore) == 0 && sem_trywait(&semaphore) == -1 && errno == EAGAIN &&
+                       sem_post(&semaphore) == 0 && sem_trywait(&semaphore) == 0;
+    sem_destroy(&semaphore);
+    check(semaphore_ok, "semaphores");
+
+    char directory[512];
+    check(getcwd(directory, sizeof directory) == directory && directory[0] == '/', "getcwd");
+
+    {
+        const char message[] = "zlib round trip zlib round trip zlib round trip";
+        unsigned char packed[256], unpacked[256];
+        uLongf packed_size = sizeof packed, unpacked_size = sizeof unpacked;
+        bool ok = compress(packed, &packed_size, (const Bytef *)message, sizeof message) == Z_OK &&
+                  uncompress(unpacked, &unpacked_size, packed, packed_size) == Z_OK &&
+                  unpacked_size == sizeof message && memcmp(unpacked, message, sizeof message) == 0 &&
+                  crc32(0, (const Bytef *)"123456789", 9) == 0xCBF43926;
+        check(ok, "zlib compress / uncompress / crc32 (built-in 32-bit libz.so)");
+    }
 
     __android_log_print(ANDROID_LOG_INFO, TAG, "%d failures", failures);
     return failures;

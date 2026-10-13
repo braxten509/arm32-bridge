@@ -22,16 +22,22 @@ pub const MISC_END: u32 = 0xD000_0000;
 /// Guest stack (grows down from STACK_TOP).
 pub const STACK_BASE: u32 = 0xE000_0000;
 pub const STACK_TOP: u32 = 0xF000_0000;
+/// The Linux "kuser helpers" page: small routines the kernel places at fixed
+/// addresses that old (ARMv5, armeabi) code calls for atomics and the thread
+/// pointer. See `write_kernel_helpers`.
+pub const KUSER_BASE: u32 = 0xFFFF_0000;
+pub const KUSER_END: u32 = 0xFFFF_1000;
 
 /// Regions handed to Unicorn as (start, end, may hold code). Everything else
 /// faults when touched. Writes to code regions pay for a self-modifying-code
 /// check (see vendor/unicorn-engine-sys), so only stubs and libraries get it.
-pub const MAPPED_REGIONS: [(u32, u32, bool); 5] = [
+pub const MAPPED_REGIONS: [(u32, u32, bool); 6] = [
     (STUB_BASE, STUB_BASE + STUB_SIZE, true),
     (LIB_BASE, LIB_END, true),
     (HEAP_BASE, HEAP_END, false),
     (MISC_BASE, MISC_END, false),
     (STACK_BASE, STACK_TOP, false),
+    (KUSER_BASE, KUSER_END, true),
 ];
 
 #[derive(Clone, Copy)]
@@ -68,6 +74,48 @@ impl GuestMem {
         }
         unsafe { libc::mprotect((base as *mut u8).add(start).cast(), size - start, libc::PROT_NONE) };
         GuestMem { base: base as *mut u8 }
+    }
+
+    /// Writes the kuser helpers at the addresses Linux uses. Only one guest
+    /// thread runs at a time, so plain loads and stores are atomic. Results
+    /// match the kernel's: 0 and carry set on success.
+    pub fn write_kernel_helpers(&self) {
+        const HELPERS: [(u32, &[u32]); 4] = [
+            // __kuser_cmpxchg64(const u64 *old, const u64 *new, u64 *ptr)
+            (0xFFFF_0F60, &[
+                0xE92D_00F0, // push {r4-r7}
+                0xE1C0_40D0, // ldrd r4, r5, [r0]
+                0xE1C2_60D0, // ldrd r6, r7, [r2]
+                0xE156_0004, // cmp r6, r4
+                0x0157_0005, // cmpeq r7, r5
+                0x01C1_40D0, // ldrdeq r4, r5, [r1]
+                0x01C2_40F0, // strdeq r4, r5, [r2]
+                0x03A0_0000, // moveq r0, #0
+                0x13A0_0001, // movne r0, #1
+                0xE270_0000, // rsbs r0, r0, #0
+                0xE8BD_00F0, // pop {r4-r7}
+                0xE12F_FF1E, // bx lr
+            ]),
+            // __kuser_memory_barrier
+            (0xFFFF_0FA0, &[0xF57F_F05B, 0xE12F_FF1E]), // dmb ish; bx lr
+            // __kuser_cmpxchg(u32 old, u32 new, u32 *ptr)
+            (0xFFFF_0FC0, &[
+                0xE592_3000, // ldr r3, [r2]
+                0xE053_3000, // subs r3, r3, r0
+                0x0582_1000, // streq r1, [r2]
+                0xE273_0000, // rsbs r0, r3, #0
+                0xE12F_FF1E, // bx lr
+            ]),
+            // __kuser_get_tls
+            (0xFFFF_0FE0, &[0xEE1D_0F70, 0xE12F_FF1E]), // mrc p15, 0, r0, c13, c0, 3; bx lr
+        ];
+        for (address, words) in HELPERS {
+            for (i, word) in words.iter().enumerate() {
+                self.write_u32(address + i as u32 * 4, *word);
+            }
+        }
+        // __kuser_helper_version: the number of 32-byte helper slots.
+        self.write_u32(0xFFFF_0FFC, 5);
     }
 
     pub fn host(&self, guest: u32) -> *mut u8 {

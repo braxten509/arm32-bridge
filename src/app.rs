@@ -179,11 +179,11 @@ macro_rules! jcall {
 }
 
 /// Asks Android to run the game's surface at 120 Hz (Surface.setFrameRate, API 30).
-fn request_refresh_rate(env: *mut JNIEnv) {
+/// The game's view through cocos2d-x's Cocos2dxGLSurfaceView.getInstance (newer cocos2d-x).
+fn cocos_view(env: *mut JNIEnv) -> Option<jobject> {
     let view_class = jcall!(env, FindClass, c"org/cocos2dx/lib/Cocos2dxGLSurfaceView".as_ptr());
     if view_class.is_null() {
-        jcall!(env, ExceptionClear);
-        return;
+        return None;
     }
     let get_instance = jcall!(
         env,
@@ -192,7 +192,48 @@ fn request_refresh_rate(env: *mut JNIEnv) {
         c"getInstance".as_ptr(),
         c"()Lorg/cocos2dx/lib/Cocos2dxGLSurfaceView;".as_ptr()
     );
+    if get_instance.is_null() {
+        return None;
+    }
     let view = jcall!(env, CallStaticObjectMethodA, view_class, get_instance, std::ptr::null());
+    (!view.is_null()).then_some(view)
+}
+
+/// The game's view for any game drawing with android.opengl.GLSurfaceView:
+/// its drawing thread keeps a weak reference to the view.
+fn gl_thread_view(env: *mut JNIEnv) -> Option<jobject> {
+    let thread_class = jcall!(env, FindClass, c"java/lang/Thread".as_ptr());
+    let current = jcall!(env, GetStaticMethodID, thread_class, c"currentThread".as_ptr(), c"()Ljava/lang/Thread;".as_ptr());
+    let thread = jcall!(env, CallStaticObjectMethodA, thread_class, current, std::ptr::null());
+    let gl_thread_class = jcall!(env, FindClass, c"android/opengl/GLSurfaceView$GLThread".as_ptr());
+    if thread.is_null() || gl_thread_class.is_null() || jcall!(env, IsInstanceOf, thread, gl_thread_class) == 0 {
+        return None;
+    }
+    let field = jcall!(env, GetFieldID, gl_thread_class, c"mGLSurfaceViewWeakRef".as_ptr(), c"Ljava/lang/ref/WeakReference;".as_ptr());
+    if field.is_null() {
+        return None;
+    }
+    let reference = jcall!(env, GetObjectField, thread, field);
+    let reference_class = jcall!(env, FindClass, c"java/lang/ref/Reference".as_ptr());
+    let get = jcall!(env, GetMethodID, reference_class, c"get".as_ptr(), c"()Ljava/lang/Object;".as_ptr());
+    if reference.is_null() || get.is_null() {
+        return None;
+    }
+    let view = jcall!(env, CallObjectMethodA, reference, get, std::ptr::null());
+    (!view.is_null()).then_some(view)
+}
+
+fn request_refresh_rate(env: *mut JNIEnv) {
+    // A failed lookup leaves a Java exception pending; clear it before the next try.
+    let view = cocos_view(env).or_else(|| {
+        jcall!(env, ExceptionClear);
+        gl_thread_view(env)
+    });
+    jcall!(env, ExceptionClear);
+    let Some(view) = view else {
+        crate::log::line("[bridge] could not reach the game's surface to ask for 120 Hz");
+        return;
+    };
     let surface_view = jcall!(env, FindClass, c"android/view/SurfaceView".as_ptr());
     let get_holder = jcall!(env, GetMethodID, surface_view, c"getHolder".as_ptr(), c"()Landroid/view/SurfaceHolder;".as_ptr());
     let holder = if view.is_null() { std::ptr::null_mut() } else { jcall!(env, CallObjectMethodA, view, get_holder, std::ptr::null()) };
