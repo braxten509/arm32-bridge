@@ -14,7 +14,7 @@
 //!                    [--work <scratch dir>]
 //!
 //! Progress goes to stdout, one line each: `step <text>`, `abi <abi>`,
-//! `fix <file>: <what>`, `missing <name>`, `done <out.apk>`, or `error <text>`.
+//! `fix <file>: <what>`, `warn <text>`, `missing <name>`, `done <out.apk>`, or `error <text>`.
 //! Exit codes: 0 converted, 2 usage, 3 already 64-bit, 4 no 32-bit ARM code, 1 other failure.
 
 mod dex;
@@ -32,6 +32,8 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 const LIBRARY_ALIGNMENT: u16 = 4096;
 /// zipalign's alignment for other uncompressed entries.
 const ENTRY_ALIGNMENT: u16 = 4;
+/// The annotation marking a native method that is called without env and class.
+const CRITICAL_NATIVE: &[u8] = b"Ldalvik/annotation/optimization/CriticalNative;";
 /// The bridge's file name in the converted APK; the stand-in looks for it.
 const BRIDGE_FILE: &str = "libarm32_bridge.so";
 
@@ -168,6 +170,11 @@ fn convert(options: &Options) -> Result<(), Failure> {
                 }
                 for fix in dex::patch(&mut bytes) {
                     println!("fix {name}: {}: {} -> {}", fix.reason, fix.old, fix.new);
+                }
+                // Such methods get no env/class arguments; the bridge can't tell them
+                // apart at run time (the annotation isn't visible through reflection).
+                if bytes.windows(CRITICAL_NATIVE.len()).any(|window| window == CRITICAL_NATIVE) {
+                    println!("warn {name} uses @CriticalNative, a call style the bridge doesn't support yet; those calls may get wrong values");
                 }
                 entry_options = deflated;
             }

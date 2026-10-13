@@ -243,3 +243,13 @@ Card Wars log shows libunity loaded and its JNI_OnLoad ran, no "Failure to initi
   Missing list 369 -> 342. PC tests pass; PC2 120 fps.
 - Card Wars now stops at libunity's start-up: mmap (no handler, returned 0) then munmap, then a read of address 0.
   mmap is on the "stop and ask" list (memory mapping) -> asked the user.
+### 3. Memory blocks (approved) + @CriticalNative warning (approved)
+- mmap/mmap64/__mmap2 (page-aligned guest heap blocks; file mappings are private copies), munmap (whole blocks),
+  mprotect (logs when non-library memory is made executable), madvise (DONTNEED zeroes). Converter prints
+  "warn ... @CriticalNative" (checked: only the copy with the marker added warns). PC tests pass; PC2 120 fps.
+- Card Wars: libunity, then libmonobdwgc opened by game code, "Mono: JNI_OnLoad called", Unity main thread starts,
+  Unity logs "MemoryManager: Using 'Dynamic Heap' Allocator." Then a black screen; process alive, one guest
+  pthread (arm32-guest-100) at ~100% CPU. Last missing functions hit: sigemptyset, ANativeWindow_fromSurface,
+  newlocale, fscanf, syscall, prctl (all returned 0). Suspect (not yet proven): Unity's locks use raw
+  syscall(SYS_futex); a wait that returns 0 at once makes a waiter spin. ANativeWindow/EGL = Unity's own screen
+  setup, on the stop-and-ask list. Stopped and asked.

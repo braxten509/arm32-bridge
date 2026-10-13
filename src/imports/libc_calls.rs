@@ -258,6 +258,66 @@ fn restore_jump_buffer(cpu: &mut Uc, buffer: u32, value: u32) -> Ret {
     Ret::Jumped
 }
 
+fn page_round(length: u32) -> u32 {
+    length.saturating_add(crate::mem::PAGE - 1) & !(crate::mem::PAGE - 1)
+}
+
+/// Whether [address, address + length) lies inside one block mmap handed out.
+fn inside_mapping(address: u32, length: u32) -> bool {
+    let mappings = &shared().state.mappings;
+    mappings
+        .range(..=address)
+        .next_back()
+        .is_some_and(|(&start, &size)| address as u64 + length as u64 <= start as u64 + size as u64)
+}
+
+/// Whether `address` is in a loaded library (its code is already translated as usual).
+fn mapped_by_library(address: u32) -> bool {
+    (crate::mem::LIB_BASE..crate::mem::LIB_END).contains(&address)
+}
+
+/// mmap for the guest: a page-aligned heap block, filled from `fd` for file mappings.
+fn map_memory(uc: &mut Uc, address: u32, length: u32, _protection: u32, flags: u32, fd: u32, offset: u64) -> Ret {
+    const MAP_FAILED: u32 = u32::MAX;
+    let size = page_round(length);
+    if length == 0 || size == 0 {
+        set_errno(uc, libc::EINVAL);
+        return Ret::U32(MAP_FAILED);
+    }
+    let anonymous = flags & libc::MAP_ANONYMOUS as u32 != 0;
+    let start = if flags & libc::MAP_FIXED as u32 != 0 {
+        // Only inside a block already handed out (allocators trim and reuse those).
+        if !inside_mapping(address, size) {
+            crate::log::line(&format!("[bridge] mmap at fixed address {address:#x} ({length} bytes) outside its blocks"));
+            set_errno(uc, libc::ENOMEM);
+            return Ret::U32(MAP_FAILED);
+        }
+        unsafe { std::ptr::write_bytes(mem().host(address), 0, size as usize) };
+        address
+    } else {
+        let block = shared().heap.memalign(crate::mem::PAGE, size);
+        if block == 0 {
+            set_errno(uc, libc::ENOMEM);
+            return Ret::U32(MAP_FAILED);
+        }
+        unsafe { std::ptr::write_bytes(mem().host(block), 0, size as usize) };
+        shared().state.mappings.insert(block, size);
+        block
+    };
+    if !anonymous {
+        let read = unsafe { libc::pread(fd as i32, mem().host(start).cast(), length as usize, offset as libc::off_t) };
+        if read < 0 {
+            sync_errno(uc);
+            if start != address {
+                shared().state.mappings.remove(&start);
+                shared().heap.free(start);
+            }
+            return Ret::U32(MAP_FAILED);
+        }
+    }
+    Ret::U32(start)
+}
+
 /// dlopen handle for phone libraries (and dlopen(NULL)).
 const PHONE_HANDLE: u32 = 1;
 /// dlopen handle of the shared loader's first game library.
@@ -1229,6 +1289,43 @@ pub fn handler(name: &str) -> Option<Handler> {
             Ret::U32(lookup_symbol(&name))
         }),
         "getpagesize" => handler!(|uc, a| Ret::U32(crate::mem::PAGE)),
+        // Memory blocks come from the guest heap, page aligned. File mappings are
+        // private copies (writes don't reach the file).
+        "mmap" | "mmap64" => handler!(|uc, a| {
+            let (address, length, protection, flags, fd, offset) = (a.u32(), a.u32(), a.u32(), a.u32(), a.u32(), a.u32());
+            map_memory(uc, address, length, protection, flags, fd, offset as u64)
+        }),
+        "__mmap2" => handler!(|uc, a| {
+            let (address, length, protection, flags, fd, pages) = (a.u32(), a.u32(), a.u32(), a.u32(), a.u32(), a.u32());
+            map_memory(uc, address, length, protection, flags, fd, pages as u64 * crate::mem::PAGE as u64)
+        }),
+        "munmap" => handler!(|uc, a| {
+            let (address, length) = (a.u32(), a.u32());
+            let whole = shared().state.mappings.get(&address).copied() == Some(page_round(length));
+            if whole {
+                shared().state.mappings.remove(&address);
+                shared().heap.free(address);
+            }
+            // Part of a block: it stays in use until the whole block goes.
+            Ret::U32(0)
+        }),
+        "mprotect" => handler!(|uc, a| {
+            let (address, length, protection) = (a.u32(), a.u32(), a.u32());
+            if protection & libc::PROT_EXEC as u32 != 0 && !mapped_by_library(address) {
+                crate::log::line(&format!(
+                    "[bridge] game made memory executable at {address:#x} ({length} bytes): code made while running"
+                ));
+            }
+            Ret::U32(0)
+        }),
+        // MADV_DONTNEED empties anonymous memory; other advice changes nothing.
+        "madvise" => handler!(|uc, a| {
+            let (address, length, advice) = (a.u32(), a.u32(), a.u32());
+            if advice == libc::MADV_DONTNEED as u32 && inside_mapping(address, length) {
+                unsafe { std::ptr::write_bytes(mem().host(address), 0, length as usize) };
+            }
+            Ret::U32(0)
+        }),
         "gettid" => handler!(|uc, a| Ret::U32(unsafe { libc::gettid() } as u32)),
         // struct utsname is six 65-byte strings on both sides. A 32-bit program
         // on a 64-bit ARM kernel sees "armv8l" as the machine.

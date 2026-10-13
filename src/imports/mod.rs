@@ -43,6 +43,8 @@ pub struct State {
     pub jni_refs: jni_host::Refs,
     pub assets: android::Assets,
     pub sound: sles::Sound,
+    /// Blocks handed out by mmap: start -> length (page multiples).
+    pub mappings: std::collections::BTreeMap<u32, u32>,
 }
 
 /// Wraps a closure body as a `Handler` with the right parameter types.

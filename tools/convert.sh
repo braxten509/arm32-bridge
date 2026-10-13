@@ -49,7 +49,7 @@ set +e
     --work "$WORK" > "$WORK/convert.log"
 STATUS=$?
 set -e
-grep -v '^missing ' "$WORK/convert.log" | sed -e 's/^step /  /' -e 's/^error /  /'
+grep -v '^missing ' "$WORK/convert.log" | sed -e 's/^step /  /' -e 's/^error /  /' -e 's/^warn /  warning: /'
 case $STATUS in
     0) ;;
     3) exit 0 ;;
