@@ -29,6 +29,7 @@ const EPERM: u32 = 1;
 const EINVAL: u32 = 22;
 const ESRCH: u32 = 3;
 const ETIMEDOUT: u32 = 110;
+const EAGAIN: u32 = 11;
 
 const FIRST_HANDLE: u32 = 0x1000;
 
@@ -141,6 +142,33 @@ fn condition_wait(uc: &Uc, condition: u32, mutex: u32, deadline: Option<SystemTi
     result
 }
 
+/// Takes one from a semaphore. `wait`: None = don't wait, Some(None) = wait
+/// as long as needed, Some(Some(deadline)) = wait until the deadline.
+fn semaphore_wait(uc: &Uc, semaphore: u32, wait: Option<Option<SystemTime>>) -> Ret {
+    loop {
+        let count = mem().read_u32(semaphore);
+        if count > 0 {
+            mem().write_u32(semaphore, count - 1);
+            return Ret::U32(0);
+        }
+        let timeout = match wait {
+            None => return fail_with(uc, EAGAIN),
+            Some(None) => None,
+            Some(Some(deadline)) => match deadline.duration_since(SystemTime::now()) {
+                Ok(left) => Some(left),
+                Err(_) => return fail_with(uc, ETIMEDOUT),
+            },
+        };
+        wait_for_guests(timeout);
+    }
+}
+
+/// Returns -1 with the guest's errno set to `error`.
+fn fail_with(uc: &Uc, error: u32) -> Ret {
+    mem().write_u32(uc.get_data().errno_slot, error);
+    Ret::U32(u32::MAX)
+}
+
 fn guest_time(pointer: u32) -> SystemTime {
     let seconds = mem().read_u32(pointer) as i32 as i64;
     let nanoseconds = mem().read_u32(pointer + 4) as i32 as i64;
@@ -248,6 +276,36 @@ pub fn handler(name: &str) -> Option<Handler> {
         "pthread_cond_timedwait" => handler!(|uc, a| {
             let (condition, mutex, deadline) = (a.u32(), a.u32(), a.u32());
             Ret::U32(condition_wait(uc, condition, mutex, Some(guest_time(deadline))))
+        }),
+        // Semaphores: the first word of the guest sem_t is the count.
+        "sem_init" => handler!(|uc, a| {
+            let (semaphore, _shared, value) = (a.u32(), a.u32(), a.u32());
+            mem().write_u32(semaphore, value);
+            Ret::U32(0)
+        }),
+        "sem_destroy" => handler!(|uc, a| Ret::U32(0)),
+        "sem_post" => handler!(|uc, a| {
+            let semaphore = a.u32();
+            mem().write_u32(semaphore, mem().read_u32(semaphore).wrapping_add(1));
+            wake_guests();
+            Ret::U32(0)
+        }),
+        "sem_getvalue" => handler!(|uc, a| {
+            let (semaphore, out) = (a.u32(), a.u32());
+            mem().write_u32(out, mem().read_u32(semaphore));
+            Ret::U32(0)
+        }),
+        "sem_wait" => handler!(|uc, a| {
+            let semaphore = a.u32();
+            semaphore_wait(uc, semaphore, Some(None))
+        }),
+        "sem_trywait" => handler!(|uc, a| {
+            let semaphore = a.u32();
+            semaphore_wait(uc, semaphore, None)
+        }),
+        "sem_timedwait" => handler!(|uc, a| {
+            let (semaphore, deadline) = (a.u32(), a.u32());
+            semaphore_wait(uc, semaphore, Some(Some(guest_time(deadline))))
         }),
         "pthread_self" => handler!(|uc, a| Ret::U32(current_handle())),
         "pthread_equal" => handler!(|uc, a| {

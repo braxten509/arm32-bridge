@@ -35,6 +35,8 @@ pub struct State {
     pub static_tm: u32,
     pub static_text: u32,
     pub data_imports: HashMap<String, u32>,
+    /// Data imports the bridge doesn't know (given zero bytes).
+    pub unknown_data: Vec<String>,
     /// (start, end, exidx address, exidx entry count) per loaded library.
     pub unwind_tables: Vec<(u32, u32, u32, u32)>,
     pub jni: jni::Jni,
@@ -64,6 +66,12 @@ pub fn handler_for(name: &str) -> Option<Handler> {
         .or_else(|| gles::handler(name))
         .or_else(|| android::handler(name))
         .or_else(|| sles::handler(name))
+}
+
+/// Whether the phone build of the bridge handles `name` (the PC build lacks
+/// the phone-only parts).
+pub fn phone_handles(name: &str) -> bool {
+    handler_for(name).is_some() || android::NAMES.contains(&name)
 }
 
 const BIONIC_FILE_SIZE: u32 = 84;
@@ -118,6 +126,7 @@ pub fn data_import(name: &str) -> u32 {
         }
         _ => {
             crate::log::line(&format!("[bridge] unknown data import {name}; giving it 64 zero bytes"));
+            runtime.state.unknown_data.push(name.to_string());
             runtime.misc_alloc(64, 8)
         }
     };

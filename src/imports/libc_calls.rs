@@ -23,6 +23,17 @@ fn sync_errno(uc: &Uc) {
     mem().write_u32(slot, last_errno() as u32);
 }
 
+fn vsnprintf(buffer: u32, size: u32, format: u32, list: u32) -> Ret {
+    let mut list = VaList { pointer: list };
+    let text = printf::format(mem(), format, &mut list);
+    if size > 0 {
+        let copy = text.len().min(size as usize - 1);
+        mem().write_bytes(buffer, &text[..copy]);
+        mem().write_u8(buffer + copy as u32, 0);
+    }
+    Ret::U32(text.len() as u32)
+}
+
 fn set_errno(uc: &Uc, value: i32) {
     let slot = uc.get_data().errno_slot;
     mem().write_u32(slot, value as u32);
@@ -586,15 +597,14 @@ pub fn handler(name: &str) -> Option<Handler> {
         }),
         "vsnprintf" => handler!(|uc, a| {
             let (buffer, size, format, list) = (a.u32(), a.u32(), a.u32(), a.u32());
-            let mut list = VaList { pointer: list };
-            let text = printf::format(mem(), format, &mut list);
-            if size > 0 {
-                let copy = text.len().min(size as usize - 1);
-                mem().write_bytes(buffer, &text[..copy]);
-                mem().write_u8(buffer + copy as u32, 0);
-            }
-            Ret::U32(text.len() as u32)
+            vsnprintf(buffer, size, format, list)
         }),
+        "__vsnprintf_chk" => handler!(|uc, a| {
+            let (buffer, size, _flags, _buffer_size, format, list) = (a.u32(), a.u32(), a.u32(), a.u32(), a.u32(), a.u32());
+            vsnprintf(buffer, size, format, list)
+        }),
+        // CPU feature bits: none, so libraries take their plain code paths.
+        "getauxval" => handler!(|uc, a| Ret::U32(0)),
         "vsprintf" => handler!(|uc, a| {
             let (buffer, format, list) = (a.u32(), a.u32(), a.u32());
             let mut list = VaList { pointer: list };
@@ -828,11 +838,12 @@ pub fn handler(name: &str) -> Option<Handler> {
             let (path, flags, mode) = (a.u32(), a.u32(), a.u32());
             checked(uc, unsafe { libc::open(host_c(path), host_open_flags(flags), mode) } as i64)
         }),
-        "read" => handler!(|uc, a| {
+        // The _chk forms add a buffer size after the same arguments.
+        "read" | "__read_chk" => handler!(|uc, a| {
             let (fd, buffer, length) = (a.i32(), a.u32(), a.u32());
             checked(uc, unsafe { libc::read(fd, mem().host(buffer).cast(), length as usize) } as i64)
         }),
-        "write" => handler!(|uc, a| {
+        "write" | "__write_chk" => handler!(|uc, a| {
             let (fd, buffer, length) = (a.i32(), a.u32(), a.u32());
             checked(uc, unsafe { libc::write(fd, mem().host(buffer).cast(), length as usize) } as i64)
         }),
@@ -1191,7 +1202,27 @@ pub fn handler(name: &str) -> Option<Handler> {
         }),
         "dlclose" => handler!(|uc, a| Ret::U32(0)),
         "dlerror" => handler!(|uc, a| Ret::U32(0)),
-        "dl_unwind_find_exidx" => handler!(|uc, a| {
+        "getcwd" => handler!(|uc, a| {
+            let (buffer, size) = (a.u32(), a.u32());
+            match std::env::current_dir() {
+                Ok(path) => {
+                    let text = path.to_string_lossy().into_owned();
+                    if buffer == 0 || text.len() + 1 > size as usize {
+                        set_errno(uc, libc::ERANGE);
+                        return Ret::U32(0);
+                    }
+                    mem().write_bytes(buffer, text.as_bytes());
+                    mem().write_u8(buffer + text.len() as u32, 0);
+                    Ret::U32(buffer)
+                }
+                Err(_) => {
+                    sync_errno(uc);
+                    Ret::U32(0)
+                }
+            }
+        }),
+        // Older ARM toolchains' name for dl_unwind_find_exidx.
+        "dl_unwind_find_exidx" | "__gnu_Unwind_Find_exidx" => handler!(|uc, a| {
             let (pc, count_out) = (a.u32(), a.u32());
             for &(start, end, table, count) in &shared().state.unwind_tables {
                 if pc >= start && pc < end {

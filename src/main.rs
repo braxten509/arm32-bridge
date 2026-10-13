@@ -10,6 +10,9 @@
 //!       Load a library and call one exported function with integer arguments.
 //!   bench <lib.so> <function> <number>
 //!       Time one exported function through the bridge.
+//!   imports <lib.so>
+//!       Load a library without running it and list the phone functions and
+//!       data it imports that the bridge has no handler for (one per line).
 
 use arm32_bridge::{elf, imports, runtime};
 
@@ -164,6 +167,36 @@ fn command_load(options: &Options) -> ExitCode {
     }
 }
 
+fn command_imports(options: &Options) -> ExitCode {
+    let Some(path) = options.positional.get(1) else {
+        eprintln!("usage: arm32-bridge imports <lib.so>");
+        return ExitCode::from(2);
+    };
+    runtime::init(false);
+    let uc = runtime::engine();
+    imports::jni::create_vm(uc);
+    let path = Path::new(path);
+    let mut loader = elf::Loader::new(vec![path.parent().map(PathBuf::from).unwrap_or_default()]);
+    if let Err(error) = loader.load(uc, path) {
+        eprintln!("[bridge] {error}");
+        return ExitCode::FAILURE;
+    }
+    let runtime = runtime::shared();
+    let mut missing: Vec<&str> = runtime
+        .stubs
+        .iter()
+        .filter(|stub| !stub.name.starts_with("jni:") && !imports::phone_handles(stub.name))
+        .map(|stub| stub.name)
+        .collect();
+    missing.extend(runtime.state.unknown_data.iter().map(String::as_str));
+    missing.sort_unstable();
+    for name in &missing {
+        println!("{name}");
+    }
+    eprintln!("[bridge] {} imports without a handler", missing.len());
+    ExitCode::SUCCESS
+}
+
 fn command_call(options: &Options, timed: bool) -> ExitCode {
     let (Some(path), Some(function)) = (options.positional.get(1), options.positional.get(2)) else {
         eprintln!("usage: arm32-bridge call|bench <lib.so> <function> [number ...]");
@@ -208,8 +241,9 @@ fn main() -> ExitCode {
         Some("load") => command_load(&options),
         Some("call") => command_call(&options, false),
         Some("bench") => command_call(&options, true),
+        Some("imports") => command_imports(&options),
         _ => {
-            eprintln!("usage: arm32-bridge load|call|bench ... (see src/main.rs)");
+            eprintln!("usage: arm32-bridge load|call|bench|imports ... (see src/main.rs)");
             ExitCode::from(2)
         }
     };

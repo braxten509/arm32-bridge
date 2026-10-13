@@ -2,6 +2,23 @@
 //! Host AAssetManager / AAsset / AAssetDir pointers are 64-bit, so the guest
 //! gets small handles; data is read straight into guest memory.
 
+/// Functions handled here. Only the phone build has them; the PC tool's
+/// `imports` report counts them as handled.
+pub const NAMES: &[&str] = &[
+    "AAssetManager_fromJava",
+    "AAssetManager_open",
+    "AAssetManager_openDir",
+    "AAssetDir_getNextFileName",
+    "AAssetDir_close",
+    "AAsset_read",
+    "AAsset_seek",
+    "AAsset_getLength",
+    "AAsset_getRemainingLength",
+    "AAsset_getBuffer",
+    "AAsset_openFileDescriptor",
+    "AAsset_close",
+];
+
 #[cfg(not(target_os = "android"))]
 use crate::runtime::Handler;
 

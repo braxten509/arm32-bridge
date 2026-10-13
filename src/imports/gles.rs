@@ -1,6 +1,7 @@
-//! OpenGL ES 2 for guest code. Most functions are generated from the NDK
+//! OpenGL ES 1 and 2 for guest code. Most functions are generated from the NDK
 //! headers (gles_generated.rs); the ones here need special care:
-//! - glVertexAttribPointer / glDrawElements take either a guest pointer
+//! - glVertexAttribPointer / glDrawElements and the GLES1 array pointers
+//!   (glVertexPointer, ...) take either a guest pointer
 //!   (client-side arrays) or an offset into a bound buffer, depending on GL
 //!   state, so buffer bindings are tracked per thread (GL contexts are too).
 //! - glMapBufferOES returns driver memory outside the guest's 4 GiB, so the
@@ -45,11 +46,15 @@ fn lookup(name: &str) -> usize {
     }
     let symbol = std::ffi::CString::new(name).unwrap();
     unsafe {
-        let library = libc::dlopen(c"libGLESv2.so".as_ptr(), libc::RTLD_NOW | libc::RTLD_NOLOAD);
-        let library = if library.is_null() { libc::dlopen(c"libGLESv2.so".as_ptr(), libc::RTLD_NOW) } else { library };
-        let direct = libc::dlsym(library, symbol.as_ptr());
-        if !direct.is_null() {
-            return direct as usize;
+        // GLES2's library also serves GLES1 contexts for the names both have;
+        // GLES1-only functions (glMatrixMode, ...) come from libGLESv1_CM.
+        for name in [c"libGLESv2.so", c"libGLESv1_CM.so"] {
+            let library = libc::dlopen(name.as_ptr(), libc::RTLD_NOW | libc::RTLD_NOLOAD);
+            let library = if library.is_null() { libc::dlopen(name.as_ptr(), libc::RTLD_NOW) } else { library };
+            let direct = if library.is_null() { std::ptr::null_mut() } else { libc::dlsym(library, symbol.as_ptr()) };
+            if !direct.is_null() {
+                return direct as usize;
+            }
         }
         eglGetProcAddress(symbol.as_ptr()) as usize
     }
@@ -82,6 +87,15 @@ struct Bindings {
 
 thread_local! {
     static BINDINGS: RefCell<Bindings> = RefCell::new(Bindings::default());
+}
+
+/// A vertex array pointer: an offset into the bound array buffer, or else a guest address.
+fn array_pointer(pointer: u32) -> *mut c_void {
+    if BINDINGS.with(|b| b.borrow().array_buffer) != 0 {
+        pointer as usize as *mut c_void
+    } else {
+        guest_pointer(pointer)
+    }
 }
 
 fn element_buffer() -> u32 {
@@ -171,6 +185,42 @@ fn special(name: &str) -> Option<Handler> {
             };
             Ret::Void
         }),
+        // GLES1 arrays: (size, type, stride, pointer) or (type, stride, pointer).
+        "glVertexPointer" => handler!(|uc, a| {
+            let (size, kind, stride, pointer) = (a.i32(), a.u32(), a.i32(), array_pointer(a.u32()));
+            unsafe { host!("glVertexPointer", fn(i32, u32, i32, *mut c_void))(size, kind, stride, pointer) };
+            Ret::Void
+        }),
+        "glColorPointer" => handler!(|uc, a| {
+            let (size, kind, stride, pointer) = (a.i32(), a.u32(), a.i32(), array_pointer(a.u32()));
+            unsafe { host!("glColorPointer", fn(i32, u32, i32, *mut c_void))(size, kind, stride, pointer) };
+            Ret::Void
+        }),
+        "glTexCoordPointer" => handler!(|uc, a| {
+            let (size, kind, stride, pointer) = (a.i32(), a.u32(), a.i32(), array_pointer(a.u32()));
+            unsafe { host!("glTexCoordPointer", fn(i32, u32, i32, *mut c_void))(size, kind, stride, pointer) };
+            Ret::Void
+        }),
+        "glMatrixIndexPointerOES" => handler!(|uc, a| {
+            let (size, kind, stride, pointer) = (a.i32(), a.u32(), a.i32(), array_pointer(a.u32()));
+            unsafe { host!("glMatrixIndexPointerOES", fn(i32, u32, i32, *mut c_void))(size, kind, stride, pointer) };
+            Ret::Void
+        }),
+        "glWeightPointerOES" => handler!(|uc, a| {
+            let (size, kind, stride, pointer) = (a.i32(), a.u32(), a.i32(), array_pointer(a.u32()));
+            unsafe { host!("glWeightPointerOES", fn(i32, u32, i32, *mut c_void))(size, kind, stride, pointer) };
+            Ret::Void
+        }),
+        "glNormalPointer" => handler!(|uc, a| {
+            let (kind, stride, pointer) = (a.u32(), a.i32(), array_pointer(a.u32()));
+            unsafe { host!("glNormalPointer", fn(u32, i32, *mut c_void))(kind, stride, pointer) };
+            Ret::Void
+        }),
+        "glPointSizePointerOES" => handler!(|uc, a| {
+            let (kind, stride, pointer) = (a.u32(), a.i32(), array_pointer(a.u32()));
+            unsafe { host!("glPointSizePointerOES", fn(u32, i32, *mut c_void))(kind, stride, pointer) };
+            Ret::Void
+        }),
         "glDrawElements" => handler!(|uc, a| {
             let (mode, count, kind, indices) = (a.u32(), a.i32(), a.u32(), a.u32());
             let host_indices =
@@ -228,6 +278,14 @@ fn special(name: &str) -> Option<Handler> {
             };
             shared().heap.free(copy);
             Ret::U32(1)
+        }),
+        "glGetPointerv" => handler!(|uc, a| {
+            crate::log::line("[bridge] the game asked GL for a pointer; returning NULL");
+            let (_name, out) = (a.u32(), a.u32());
+            if out != 0 {
+                mem().write_u32(out, 0);
+            }
+            Ret::Void
         }),
         "glGetVertexAttribPointerv" | "glGetBufferPointervOES" => handler!(|uc, a| {
             crate::log::line("[bridge] the game asked GL for a pointer; returning NULL");

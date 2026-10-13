@@ -30,6 +30,10 @@ const R_ARM_RELATIVE: u32 = 23;
 
 const STT_OBJECT: u8 = 1;
 
+/// 32-bit phone libraries that 64-bit-only phones no longer have, built into
+/// the bridge (build.rs). A game's own copy, if it ships one, comes first.
+const BUILT_IN: &[(&str, &[u8])] = &[("libz.so", include_bytes!(concat!(env!("OUT_DIR"), "/guest/libz.so")))];
+
 /// File name ending of a 32-bit library packed next to its 64-bit replacement.
 pub const ORIGINAL_SUFFIX: &str = "-arm32.so";
 
@@ -98,10 +102,15 @@ impl Loader {
     pub fn load(&mut self, uc: &mut Uc, path: &Path) -> Result<usize, String> {
         let file = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        self.load_bytes(uc, name, &file)
+    }
+
+    /// Loads a library from memory (see `load`).
+    pub fn load_bytes(&mut self, uc: &mut Uc, name: String, file: &[u8]) -> Result<usize, String> {
         if let Some(index) = self.libraries.iter().position(|l| l.name == name) {
             return Ok(index);
         }
-        check_header(&file)?;
+        check_header(file)?;
 
         let header_u32 = |offset: usize| u32::from_le_bytes(file[offset..offset + 4].try_into().unwrap());
         let header_u16 = |offset: usize| u16::from_le_bytes(file[offset..offset + 2].try_into().unwrap());
@@ -170,8 +179,14 @@ impl Loader {
         // Load needed game libraries first so their exports can be used.
         for (_, offset) in tags.iter().filter(|(t, _)| *t == DT_NEEDED) {
             let needed = memory.string(string_table + offset);
-            if let Some(found) = self.find_guest_library(&needed) {
-                let index = self.load(uc, &found)?;
+            let index = if let Some(found) = self.find_guest_library(&needed) {
+                Some(self.load(uc, &found)?)
+            } else if let Some((_, bytes)) = BUILT_IN.iter().find(|(name, _)| *name == needed) {
+                Some(self.load_bytes(uc, needed.clone(), bytes)?)
+            } else {
+                None
+            };
+            if let Some(index) = index {
                 for (name, address) in self.libraries[index].exports(uc) {
                     shared().guest_exports.entry(name).or_insert(address);
                 }
