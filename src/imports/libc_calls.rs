@@ -258,6 +258,11 @@ fn restore_jump_buffer(cpu: &mut Uc, buffer: u32, value: u32) -> Ret {
     Ret::Jumped
 }
 
+/// dlopen handle for phone libraries (and dlopen(NULL)).
+const PHONE_HANDLE: u32 = 1;
+/// dlopen handle of the shared loader's first game library.
+const FIRST_LIBRARY_HANDLE: u32 = 0x100;
+
 /// Address for a symbol looked up at run time (dlsym, eglGetProcAddress):
 /// a loaded game library's export, or a stand-in if the bridge has one.
 fn lookup_symbol(name: &str) -> u32 {
@@ -1184,17 +1189,40 @@ pub fn handler(name: &str) -> Option<Handler> {
         }),
 
         // ---- dynamic linking ----
+        // A game library is really loaded (its lib<name>-arm32.so); its
+        // handle is its loader index + FIRST_LIBRARY_HANDLE. Phone libraries
+        // get PHONE_HANDLE: the bridge supplies their functions itself.
         "dlopen" => handler!(|uc, a| {
             let (name, _flags) = (a.u32(), a.u32());
-            if name != 0 {
-                eprintln!("[bridge] dlopen({})", mem().string(name));
+            if name == 0 {
+                return Ret::U32(PHONE_HANDLE);
             }
-            Ret::U32(0x0000_0001)
+            let name = mem().string(name);
+            match crate::elf::open_by_name(uc, &name) {
+                Some(Ok(index)) => {
+                    crate::log::line(&format!("[bridge] game code opened {name}"));
+                    Ret::U32(FIRST_LIBRARY_HANDLE + index as u32)
+                }
+                Some(Err(error)) => {
+                    crate::log::line(&format!("[bridge] game code could not open {name}: {error}"));
+                    Ret::U32(0)
+                }
+                None => {
+                    eprintln!("[bridge] dlopen({name})");
+                    Ret::U32(PHONE_HANDLE)
+                }
+            }
         }),
         "dlsym" => handler!(|uc, a| {
-            let (_handle, name) = (a.u32(), a.u32());
+            let (handle, name) = (a.u32(), a.u32());
             let name = mem().string(name);
-            Ret::U32(lookup_symbol(&name))
+            // A game library's own symbol first (each part has its own JNI_OnLoad).
+            let own = handle
+                .checked_sub(FIRST_LIBRARY_HANDLE)
+                .and_then(|index| {
+                    crate::elf::with_loader(|loader| loader.libraries.get(index as usize).and_then(|l| l.export(uc, &name)))
+                });
+            Ret::U32(own.unwrap_or_else(|| lookup_symbol(&name)))
         }),
         "eglGetProcAddress" => handler!(|uc, a| {
             let name = mem().string(a.u32());

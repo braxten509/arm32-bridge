@@ -3,6 +3,7 @@
 //! bridge stand-ins, then runs the library's start-up code.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 
 use crate::mem;
 use crate::runtime::{call_guest, shared, stub_for, Uc};
@@ -45,6 +46,8 @@ pub struct Library {
     string_table: u32,
     symbol_count: u32,
     pub init_functions: Vec<u32>,
+    /// Whether `init_functions` have been handed out to run.
+    started: bool,
 }
 
 pub struct Symbol {
@@ -201,6 +204,7 @@ impl Loader {
             string_table,
             symbol_count,
             init_functions: Vec::new(),
+            started: false,
         };
 
         let relocate = |uc: &mut Uc, table: Option<u32>, table_size: Option<u32>| -> Result<(), String> {
@@ -265,19 +269,71 @@ impl Loader {
             .find(|p| p.is_file() && is_arm32(p))
     }
 
-    /// Runs DT_INIT and every DT_INIT_ARRAY entry (C++ static constructors).
-    pub fn run_init(&self, uc: &mut Uc, index: usize, verbose: bool) -> Result<usize, String> {
-        let library = &self.libraries[index];
-        for (i, function) in library.init_functions.iter().enumerate() {
-            if verbose {
-                eprintln!("[init] {} {}/{} at {function:#010x}", library.name, i + 1, library.init_functions.len());
-            }
-            call_guest(uc, *function, &[]).map_err(|e| {
-                format!("start-up function {} of {} ({function:#010x}) failed: {e}", i + 1, library.name)
-            })?;
-        }
-        Ok(library.init_functions.len())
+    /// Start-up code (DT_INIT, then DT_INIT_ARRAY: C++ static constructors) of
+    /// libraries that haven't started yet, dependencies first. Each library's
+    /// code is handed out once.
+    fn take_pending_init(&mut self) -> Vec<(String, Vec<u32>)> {
+        self.libraries
+            .iter_mut()
+            .filter(|library| !library.started)
+            .map(|library| {
+                library.started = true;
+                (library.name.clone(), library.init_functions.clone())
+            })
+            .collect()
     }
+}
+
+/// The one loader every game part shares, so parts Java loads and parts the
+/// game's own code opens (dlopen) live in the same guest and see each other.
+static SHARED_LOADER: Mutex<Option<Loader>> = Mutex::new(None);
+
+/// Never held while guest code runs: start-up code may open more parts.
+fn shared_loader() -> MutexGuard<'static, Option<Loader>> {
+    SHARED_LOADER.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Sets where the shared loader finds the game's libraries. Only the first call counts.
+pub fn set_search_dirs(search_dirs: Vec<PathBuf>) {
+    let mut loader = shared_loader();
+    if loader.is_none() {
+        *loader = Some(Loader::new(search_dirs));
+    }
+}
+
+/// Loads `path` (and the game libraries it needs) into the shared loader,
+/// runs start-up code that hasn't run yet, and returns the library's index.
+/// Loading a library again returns the same index.
+pub fn open(uc: &mut Uc, path: &Path, verbose: bool) -> Result<usize, String> {
+    let (index, pending) = {
+        let mut loader = shared_loader();
+        let loader = loader.as_mut().ok_or("the loader isn't set up")?;
+        let index = loader.load(uc, path)?;
+        (index, loader.take_pending_init())
+    };
+    for (name, functions) in pending {
+        for (i, function) in functions.iter().enumerate() {
+            if verbose {
+                eprintln!("[init] {name} {}/{} at {function:#010x}", i + 1, functions.len());
+            }
+            call_guest(uc, *function, &[])
+                .map_err(|e| format!("start-up function {} of {name} ({function:#010x}) failed: {e}", i + 1))?;
+        }
+    }
+    Ok(index)
+}
+
+/// For game code opening a library by name or path (dlopen): opens the
+/// game's own 32-bit library of that name, if it has one. None means it is
+/// not a game library (a phone library such as libGLESv2.so, or missing).
+pub fn open_by_name(uc: &mut Uc, name: &str) -> Option<Result<usize, String>> {
+    let found = shared_loader().as_ref()?.find_guest_library(name)?;
+    Some(open(uc, &found, false))
+}
+
+/// Runs `f` with the shared loader (set up by `set_search_dirs`).
+pub fn with_loader<R>(f: impl FnOnce(&Loader) -> R) -> R {
+    f(shared_loader().as_ref().expect("the loader isn't set up"))
 }
 
 fn check_header(file: &[u8]) -> Result<(), String> {

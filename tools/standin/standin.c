@@ -1,14 +1,15 @@
-// A 64-bit stand-in for a game's helper 32-bit library (crash reporting, ads,
-// analytics, ...). One prebuilt copy serves every game: it is packed as
-// lib<name>.so, with the original 32-bit library next to it as
-// lib<name>-arm32.so.
+// A 64-bit stand-in for each of a game's 32-bit libraries. One prebuilt copy
+// serves every game: it is packed as lib<name>.so, with the original 32-bit
+// library next to it as lib<name>-arm32.so and the bridge as
+// libarm32_bridge.so.
 //
-// When Java loads it, it reads the class names the original library mentions,
-// finds those classes' native methods through reflection, and registers a
-// "do nothing" implementation (returns 0 / false / null) for each, so Java
-// code that calls them keeps working with that feature switched off.
-// Methods the bridge already connected to real 32-bit code are left alone.
-#include <dirent.h>
+// When Java loads it, it hands its original to the bridge, which runs it.
+// If the bridge can't, it falls back to switching the library off: it reads
+// the class names the original library mentions, finds those classes' native
+// methods through reflection, and registers a "do nothing" implementation
+// (returns 0 / false / null) for each, so Java code that calls them keeps
+// working with that feature off. Methods the bridge already connected to real
+// 32-bit code are left alone.
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <jni.h>
@@ -35,6 +36,10 @@ __asm__(".text\n"
         "  ret\n");
 
 typedef int (*connected_fn)(const char *class_name, const char *method, const char *signature);
+// Returns NULL once the original runs, or why it couldn't.
+typedef const char *(*load_fn)(JavaVM *vm, JNIEnv *env, const char *original);
+
+#define BRIDGE_FILE "libarm32_bridge.so"
 
 static jmethodID class_get_name, class_get_loader, get_declared_methods, method_get_name, get_modifiers,
     get_parameter_types, get_return_type;
@@ -127,23 +132,6 @@ done:
     return count;
 }
 
-// The bridge's "is this method connected to 32-bit code?" check, if the
-// bridge is already loaded from this directory.
-static connected_fn find_bridge(const char *directory) {
-    DIR *dir = opendir(directory);
-    if (!dir) return NULL;
-    connected_fn found = NULL;
-    struct dirent *entry;
-    while (!found && (entry = readdir(dir))) {
-        size_t length = strlen(entry->d_name);
-        if (length < 4 || strcmp(entry->d_name + length - 3, ".so") != 0) continue;
-        void *library = dlopen(entry->d_name, RTLD_NOW | RTLD_NOLOAD);
-        if (library) found = (connected_fn)dlsym(library, "arm32_bridge_connected");
-    }
-    closedir(dir);
-    return found;
-}
-
 static int is_class_char(char c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '$' ||
            c == '/';
@@ -171,10 +159,26 @@ JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved) {
         if (fd >= 0) close(fd);
         return JNI_VERSION_1_6;
     }
+
+    char bridge_path[4096];
+    snprintf(bridge_path, sizeof bridge_path, "%s/" BRIDGE_FILE, directory);
+    void *bridge = dlopen(bridge_path, RTLD_NOW);
+    load_fn load = bridge ? (load_fn)dlsym(bridge, "arm32_bridge_load") : NULL;
+    if (load) {
+        const char *error = load(vm, env, original);
+        if (!error) {
+            close(fd);
+            return JNI_VERSION_1_6;
+        }
+        log("[standin] %s: the bridge couldn't run it (%s); switching it off instead", info.dli_fname, error);
+    } else {
+        log("[standin] %s: no bridge at %s (%s); switching it off instead", info.dli_fname, bridge_path, dlerror());
+    }
+    connected_fn connected = bridge ? (connected_fn)dlsym(bridge, "arm32_bridge_connected") : NULL;
+
     const char *data = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
     if (data == MAP_FAILED || !load_reflection(env)) return JNI_VERSION_1_6;
-    connected_fn connected = find_bridge(directory);
 
     // Every run of class-name characters that looks like a/b/C is tried once.
     int classes = 0, methods = 0;

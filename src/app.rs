@@ -1,13 +1,15 @@
-//! Android app side: this library replaces the game's 32-bit native library
-//! inside its APK. Java loads it like the original; `JNI_OnLoad` loads the
-//! real 32-bit library (packed next to it as lib<name>-arm32.so) into the bridge
+//! Android app side: this library is packed into a converted game's APK once,
+//! as libarm32_bridge.so. Each of the game's 32-bit libraries is replaced by
+//! the small stand-in (tools/standin), with the original next to it as
+//! lib<name>-arm32.so. When Java loads a stand-in, it calls
+//! `arm32_bridge_load`, which loads that original into the one shared guest
 //! and connects the game's Java native methods to it (natives.rs), so the
 //! same prebuilt bridge works for every game.
 //!
 //! It also asks Android for 120 Hz on the game's surface and logs a frame
 //! counter (tag "arm32bridge") once a second.
 
-use std::ffi::{c_void, CStr};
+use std::ffi::{c_char, c_void, CStr, CString};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
@@ -58,12 +60,12 @@ fn fail(message: &str) -> ! {
     std::process::abort();
 }
 
-/// Path this library was loaded from (lib<name>.so in the app's native library dir).
+/// Path this library was loaded from (libarm32_bridge.so in the app's native library dir).
 fn library_path() -> &'static PathBuf {
     static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     PATH.get_or_init(|| {
         let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
-        unsafe { libc::dladdr(JNI_OnLoad as *const c_void, &mut info) };
+        unsafe { libc::dladdr(arm32_bridge_load as *const c_void, &mut info) };
         PathBuf::from(unsafe { CStr::from_ptr(info.dli_fname) }.to_string_lossy().into_owned())
     })
 }
@@ -74,50 +76,58 @@ fn library_directory() -> &'static PathBuf {
     DIRECTORY.get_or_init(|| library_path().parent().map(PathBuf::from).unwrap_or_default())
 }
 
+/// The guest's JavaVM, made on the first load.
+static GUEST_VM: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+/// Called by a stand-in from its JNI_OnLoad: loads its 32-bit original at
+/// `original` (and the game libraries it needs) into the shared guest,
+/// connects its exported Java_* functions and runs its JNI_OnLoad. Returns
+/// null on success, or an error message (never freed) when the stand-in
+/// should fall back to its do-nothing methods.
 #[no_mangle]
-pub extern "system" fn JNI_OnLoad(vm: *mut JavaVM, _reserved: *mut c_void) -> jint {
-    let started = Instant::now();
-    crate::runtime::init(false);
-    jni_host::set_vm(vm);
-    let mut env: *mut c_void = std::ptr::null_mut();
-    unsafe { ((**vm).GetEnv.unwrap())(vm, &mut env, JNI_VERSION_1_6) };
-
-    let _lock = hold_gil();
-    let _entry = jni_host::enter(env as *mut JNIEnv);
-    let uc = engine();
-    let (guest_vm, _guest_env) = jni::create_vm(uc);
-
-    let directory = library_directory().clone();
-    let own_name = library_path().file_name().unwrap_or_default().to_string_lossy();
-    let path = directory.join(format!("{}{}", own_name.strip_suffix(".so").unwrap_or(&own_name), crate::elf::ORIGINAL_SUFFIX));
-    crate::log::line(&format!("[bridge] loading {}", path.display()));
-    let mut loader = crate::elf::Loader::new(vec![directory]);
-    let index = match loader.load(uc, &path) {
-        Ok(index) => index,
-        Err(error) => fail(&format!("[bridge] could not load {}: {error}", path.display())),
-    };
-    for i in 0..loader.libraries.len() {
-        if let Err(error) = loader.run_init(uc, i, false) {
-            fail(&format!("[bridge] start-up code failed: {error}"));
+pub extern "C" fn arm32_bridge_load(vm: *mut JavaVM, env: *mut JNIEnv, original: *const c_char) -> *const c_char {
+    match load(vm, env, original) {
+        Ok(()) => std::ptr::null(),
+        Err(error) => {
+            crate::log::line(&format!("[bridge] {error}"));
+            CString::new(error).unwrap_or_default().into_raw()
         }
     }
+}
+
+fn load(vm: *mut JavaVM, env: *mut JNIEnv, original: *const c_char) -> Result<(), String> {
+    let started = Instant::now();
+    let path = PathBuf::from(unsafe { CStr::from_ptr(original) }.to_string_lossy().into_owned());
+    crate::runtime::init(false);
+    jni_host::set_vm(vm);
+    let _lock = hold_gil();
+    let _entry = jni_host::enter(env);
+    let uc = engine();
+    let guest_vm = *GUEST_VM.get_or_init(|| jni::create_vm(uc).0);
+    crate::elf::set_search_dirs(vec![library_directory().clone()]);
+
+    crate::log::line(&format!("[bridge] loading {}", path.display()));
+    let index = crate::elf::open(uc, &path, false).map_err(|e| format!("could not load {}: {e}", path.display()))?;
     // Connect exported Java_* functions first, so the game's own
     // RegisterNatives calls in its JNI_OnLoad take priority, as on a real phone.
-    let exports: Vec<(String, u32)> =
-        loader.libraries[index].exports(uc).into_iter().filter(|(name, _)| name.starts_with("Java_")).collect();
-    crate::natives::register_exports(env as *mut JNIEnv, &exports);
-    let Some(onload) = loader.libraries[index].export(uc, "JNI_OnLoad") else {
-        return JNI_VERSION_1_6;
+    let (exports, onload) = crate::elf::with_loader(|loader| {
+        let library = &loader.libraries[index];
+        let exports: Vec<(String, u32)> =
+            library.exports(uc).into_iter().filter(|(name, _)| name.starts_with("Java_")).collect();
+        (exports, library.export(uc, "JNI_OnLoad"))
+    });
+    crate::natives::register_exports(env, &exports);
+    let Some(onload) = onload else {
+        return Ok(());
     };
-    let version = match call_guest(uc, onload, &[guest_vm, 0]) {
-        Ok(version) => version as u32,
-        Err(error) => fail(&format!("[bridge] game JNI_OnLoad failed: {error}")),
-    };
+    let version = call_guest(uc, onload, &[guest_vm, 0]).map_err(|e| format!("game JNI_OnLoad of {} failed: {e}", path.display()))?;
     crate::log::line(&format!(
-        "[bridge] game library ready in {} ms (JNI_OnLoad returned {version:#x})",
-        started.elapsed().as_millis()
+        "[bridge] {} ready in {} ms (JNI_OnLoad returned {:#x})",
+        path.display(),
+        started.elapsed().as_millis(),
+        version as u32
     ));
-    JNI_VERSION_1_6
+    Ok(())
 }
 
 struct FrameCounter {

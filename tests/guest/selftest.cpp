@@ -12,6 +12,7 @@
 #include <setjmp.h>
 #include <unistd.h>
 #include <zlib.h>
+#include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -193,6 +194,20 @@ extern "C" int run_all() {
                   unpacked_size == sizeof message && memcmp(unpacked, message, sizeof message) == 0 &&
                   crc32(0, (const Bytef *)"123456789", 9) == 0xCBF43926;
         check(ok, "zlib compress / uncompress / crc32 (built-in 32-bit libz.so)");
+    }
+
+    {
+        // Game code opening another of the game's libraries (libsecond.so, built next to this one).
+        void *second = dlopen("libsecond.so", RTLD_NOW);
+        typedef int (*value_fn)(void);
+        typedef jint (*onload_fn)(JavaVM *, void *);
+        value_fn value = second ? (value_fn)dlsym(second, "second_value") : nullptr;
+        onload_fn onload = second ? (onload_fn)dlsym(second, "JNI_OnLoad") : nullptr;
+        check(second && value && value() == 42, "dlopen loads a game library and runs its start-up code");
+        check(onload && onload(nullptr, nullptr) == 0x7777, "dlsym on a library's handle finds that library's JNI_OnLoad");
+        check(dlopen("libsecond.so", RTLD_NOW) == second, "dlopen of an open library returns the same handle");
+        void *phone = dlopen("libGLESv2.so", RTLD_NOW);
+        check(phone && dlsym(phone, "glClear"), "dlopen of a phone library still finds its functions");
     }
 
     __android_log_print(ANDROID_LOG_INFO, TAG, "%d failures", failures);

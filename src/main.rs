@@ -52,19 +52,16 @@ fn parse_number(text: &str) -> u32 {
 
 /// Creates the CPU, loads the library (and game libraries next to it) and
 /// runs every library's start-up code, dependencies first.
-fn boot(path: &Path, options: &Options) -> Result<(&'static mut Uc, elf::Loader, usize), String> {
+fn boot(path: &Path, options: &Options) -> Result<(&'static mut Uc, usize), String> {
     runtime::init(options.trace);
     let uc = runtime::engine();
     imports::jni::create_vm(uc);
     let directory = path.parent().map(PathBuf::from).unwrap_or_default();
-    let mut loader = elf::Loader::new(vec![directory]);
-    let index = loader.load(uc, path)?;
-    let mut total = 0;
-    for i in 0..loader.libraries.len() {
-        total += loader.run_init(uc, i, options.verbose)?;
-    }
+    elf::set_search_dirs(vec![directory]);
+    let index = elf::open(uc, path, options.verbose)?;
+    let total: usize = elf::with_loader(|loader| loader.libraries.iter().map(|l| l.init_functions.len()).sum());
     eprintln!("[bridge] start-up code finished: {total} functions ran");
-    Ok((uc, loader, index))
+    Ok((uc, index))
 }
 
 fn print_report(uc: &Uc) {
@@ -110,24 +107,27 @@ fn command_load(options: &Options) -> ExitCode {
         return ExitCode::from(2);
     };
     let started = Instant::now();
-    let (uc, loader, index) = match boot(Path::new(path), options) {
+    let (uc, index) = match boot(Path::new(path), options) {
         Ok(booted) => booted,
         Err(error) => {
             eprintln!("[bridge] {error}");
             return ExitCode::FAILURE;
         }
     };
-    let library = &loader.libraries[index];
-    println!("Loaded {} at {:#010x} ({} KiB)", library.name, library.base, library.size / 1024);
-    for other in loader.libraries.iter().filter(|l| l.name != library.name) {
-        println!("Also loaded {} at {:#010x}", other.name, other.base);
-    }
-    println!("Start-up functions run: {}", loader.libraries.iter().map(|l| l.init_functions.len()).sum::<usize>());
+    let (name, onload) = elf::with_loader(|loader| {
+        let library = &loader.libraries[index];
+        println!("Loaded {} at {:#010x} ({} KiB)", library.name, library.base, library.size / 1024);
+        for other in loader.libraries.iter().filter(|l| l.name != library.name) {
+            println!("Also loaded {} at {:#010x}", other.name, other.base);
+        }
+        println!("Start-up functions run: {}", loader.libraries.iter().map(|l| l.init_functions.len()).sum::<usize>());
+        (library.name.clone(), library.export(uc, "JNI_OnLoad"))
+    });
 
     let mut passed = true;
     if options.jni_onload {
-        let Some(onload) = library.export(uc, "JNI_OnLoad") else {
-            println!("{} has no JNI_OnLoad", library.name);
+        let Some(onload) = onload else {
+            println!("{name} has no JNI_OnLoad");
             return ExitCode::FAILURE;
         };
         let vm = runtime::shared().state.jni.vm;
@@ -168,11 +168,12 @@ fn command_load(options: &Options) -> ExitCode {
 }
 
 fn command_imports(options: &Options) -> ExitCode {
-    let Some(path) = options.positional.get(1) else {
-        eprintln!("usage: arm32-bridge imports <lib.so>");
+    let paths: Vec<PathBuf> = options.positional[1..].iter().map(PathBuf::from).collect();
+    if paths.is_empty() {
+        eprintln!("usage: arm32-bridge imports <lib.so> [<lib.so> ...]");
         return ExitCode::from(2);
-    };
-    match imports::missing_imports(Path::new(path)) {
+    }
+    match imports::missing_imports(&paths) {
         Ok(missing) => {
             for name in &missing {
                 println!("{name}");
@@ -193,14 +194,14 @@ fn command_call(options: &Options, timed: bool) -> ExitCode {
         return ExitCode::from(2);
     };
     let arguments: Vec<u32> = options.positional[3..].iter().map(|s| parse_number(s)).collect();
-    let (uc, loader, index) = match boot(Path::new(path), options) {
+    let (uc, index) = match boot(Path::new(path), options) {
         Ok(booted) => booted,
         Err(error) => {
             eprintln!("[bridge] {error}");
             return ExitCode::FAILURE;
         }
     };
-    let Some(address) = loader.libraries[index].export(uc, function) else {
+    let Some(address) = elf::with_loader(|loader| loader.libraries[index].export(uc, function)) else {
         eprintln!("[bridge] {function} is not exported");
         return ExitCode::FAILURE;
     };

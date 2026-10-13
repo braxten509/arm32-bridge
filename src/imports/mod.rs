@@ -68,16 +68,19 @@ pub fn handler_for(name: &str) -> Option<Handler> {
         .or_else(|| sles::handler(name))
 }
 
-/// Loads a 32-bit library (and the game libraries next to it) without running
-/// it, and returns the phone functions and data it imports that the bridge
-/// has no handler for, sorted.
-pub fn missing_imports(path: &std::path::Path) -> Result<Vec<String>, String> {
+/// Loads 32-bit libraries (and the game libraries next to them) without
+/// running them, and returns the phone functions and data they import that
+/// the bridge has no handler for, sorted.
+pub fn missing_imports(paths: &[std::path::PathBuf]) -> Result<Vec<String>, String> {
     crate::runtime::init(false);
     let _lock = crate::runtime::hold_gil();
     let uc = crate::runtime::engine();
     jni::create_vm(uc);
-    let directory = path.parent().map(std::path::PathBuf::from).unwrap_or_default();
-    crate::elf::Loader::new(vec![directory]).load(uc, path)?;
+    let directories = paths.iter().map(|path| path.parent().map(std::path::PathBuf::from).unwrap_or_default()).collect();
+    let mut loader = crate::elf::Loader::new(directories);
+    for path in paths {
+        loader.load(uc, path)?;
+    }
     let runtime = shared();
     let mut missing: Vec<String> = runtime
         .stubs
@@ -87,6 +90,7 @@ pub fn missing_imports(path: &std::path::Path) -> Result<Vec<String>, String> {
         .collect();
     missing.extend(runtime.state.unknown_data.iter().cloned());
     missing.sort_unstable();
+    missing.dedup();
     Ok(missing)
 }
 

@@ -2,30 +2,28 @@
 # Converts a 32-bit-only Android game APK so it runs on 64-bit-only phones,
 # then installs it on the phone (over Wi-Fi ADB).
 #
-# - The game's main 32-bit library (the largest one, or --main) is replaced by
-#   the bridge (the same build for every game) and kept next to it as
-#   lib<main>-arm32.so.
-# - Other 32-bit libraries are replaced by the shared stand-in (tools/standin),
-#   with their originals kept next to them the same way.
+# - Every 32-bit library lib<name>.so is replaced by the shared stand-in
+#   (tools/standin) and kept next to it as lib<name>-arm32.so. The bridge (the
+#   same build for every game) is added once as libarm32_bridge.so; each
+#   stand-in hands its original to it.
 # - Known Java-side problems are fixed in the dex files.
 # The conversion itself is done by apk-convert (converter/), the same program
 # the phone app uses; this script builds it, signs the result and installs it.
 # - The APK is re-signed with the debug key (the original signature can't survive).
 # - Phone functions the game imports that the bridge has no handler for yet are listed.
 #
-# usage: tools/convert.sh <game.apk> [--out <converted.apk>] [--main <library name>] [--no-install]
+# usage: tools/convert.sh <game.apk> [--out <converted.apk>] [--no-install]
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 NDK=${NDK:-$HOME/Android/Sdk/ndk/30.0.16248370}
 BUILD_TOOLS=${BUILD_TOOLS:-$HOME/Android/Sdk/build-tools/37.0.0}
 CLANG=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang
 
-usage() { echo "usage: tools/convert.sh <game.apk> [--out <converted.apk>] [--main <library name>] [--no-install]" >&2; exit 2; }
-APK="" OUT="" MAIN="" INSTALL=1
+usage() { echo "usage: tools/convert.sh <game.apk> [--out <converted.apk>] [--no-install]" >&2; exit 2; }
+APK="" OUT="" INSTALL=1
 while [ $# -gt 0 ]; do
     case $1 in
         --out) OUT=$2; shift 2 ;;
-        --main) MAIN=${2#lib}; MAIN=${MAIN%.so}; shift 2 ;;
         --no-install) INSTALL=0; shift ;;
         -*) usage ;;
         *) [ -z "$APK" ] || usage; APK=$1; shift ;;
@@ -48,7 +46,7 @@ echo "== converting"
 set +e
 "$ROOT/target/release/apk-convert" "$APK" "$WORK/unsigned.apk" \
     --bridge "$ROOT/target/aarch64-linux-android/release/libarm32_bridge.so" --standin "$WORK/libstandin.so" \
-    --work "$WORK" ${MAIN:+--main "$MAIN"} > "$WORK/convert.log"
+    --work "$WORK" > "$WORK/convert.log"
 STATUS=$?
 set -e
 grep -v '^missing ' "$WORK/convert.log" | sed -e 's/^step /  /' -e 's/^error /  /'

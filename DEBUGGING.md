@@ -183,3 +183,46 @@ engine.rs run(): an address at stub+4 (the `bx lr` half) just returns to LR. Tem
 - Check: on the phone, "Convert again" on Puzzle Craft 2 from Downloads (sha256 = original) converted, signed and
   installed in ~15 s with no PC involvement (lastUpdateTime 18:42:15); opened from the app: 119.9-120.3 fps, save kept
   (New Puzzlonia, LVL 4). Harmless SELinux denials: the converter's search of /data/local/tests.
+
+# Debugging: Card Wars "NativeLoader.load failure, Unity libraries were not loaded" (2026-10-12)
+## Symptom
+Card Wars (com.ThugBoatLTD.CardWars 1.12.9, Unity 2022.3.33f1, Mono) converted in the Game Bridge app opens to
+"Failure to initialize! Your hardware does not support this application. NativeLoader.load failure, Unity
+libraries were not loaded." Every launch. Log: `[standin] .../libmain.so: 2 do-nothing native methods in 1 classes`
+then `E Unity: NativeLoader.load failure`.
+## Cause (from the log, the converter code and libmain's own imports)
+- The converter put the bridge in the largest library (libunity.so) and the do-nothing stand-in in libmain.so.
+  Unity's Java calls System.loadLibrary("main") and then NativeLoader.load (a native method in libmain); the
+  stand-in returned 0 (false), so Unity showed the box. Sol's review found the same flaw independently (finding 3).
+- libmain-arm32.so imports dlopen/dlsym and names libunity.so and libmonobdwgc-2.0.so: it loads the real game at
+  run time. The bridge's guest dlopen only pretended (returned handle 1, loaded nothing), and dlsym searched one
+  global table (libmain's own JNI_OnLoad would be found first). Puzzle Craft 1/2 only dlopen phone libraries
+  (libGLESv2, libOpenSLES, ...), so the pretend was enough for them.
+## Fix (user approved "make every part real", exact plan approved)
+1. elf.rs: one shared loader; start-up code of each library runs once (dependencies first), never under the lock.
+2. Guest dlopen really loads the game's own 32-bit library (lib<name>-arm32.so, full paths too) and runs its
+   start-up code; handle = 0x100 + loader index; dlsym looks in that library first. Phone libraries keep handle 1.
+3. Every game library becomes the stand-in; the bridge ships once as libarm32_bridge.so. The stand-in's JNI_OnLoad
+   calls arm32_bridge_load(vm, env, original): load, connect Java_* exports, run its JNI_OnLoad. On failure it
+   falls back to the do-nothing methods (old behaviour).
+4. apk-convert / convert.sh: no --main; missing-function report covers every library.
+5. Self-test: tests/guest/second.c (libsecond.so) opened by selftest with dlopen.
+Check: PC self-test (translator + Unicorn) and cargo tests pass; PC1/PC2 reconverted keep ~120 fps and saves;
+Card Wars log shows libunity loaded and its JNI_OnLoad ran, no "Failure to initialize".
+## Attempts
+### 1. Shared loader + real dlopen + every part a stand-in (the approved fix)
+- PC: cargo build clean; self-test 0 failures on the translator and on Unicorn, incl. 4 new dlopen checks; cargo
+  tests pass.
+- Puzzle Craft 2 (reconverted, adb install, started from the PC with monkey, no taps): libcrashlytics now really
+  loaded (JNI_OnLoad 0x10006; it opened libcrashlytics-envelope.so with the real dlopen; mmap has no handler and
+  returns 0), libcocos2dcpp 47 methods connected, 119-120 fps for 20 s, save kept (New Puzzlonia LVL 4).
+- Puzzle Craft 1: SIGSEGV on GLThread in Java_..._nativeOnPause (0x10cc62: bl to a shared-instance getter that
+  returns 0, then ldr [r0]) before nativeInit. Android relaunched the activity at launch (wm_relaunch_resume_activity,
+  config 0x400 = screen size) only in the monkey launches, never in the user's earlier taps. A/B: the OLD converter
+  and bridge from the installed Game Bridge app, same monkey launch -> identical fault (same block 0x0110cc69, same
+  registers). Not caused by this change: the game's own pause-before-init bug, triggered by the relaunch.
+- Card Wars: libmain-arm32 loaded through its stand-in (JNI_OnLoad 0x10006), its NativeLoader.load now runs and
+  opened libunity.so through the real dlopen. Then libunity's start-up code called getpagesize (no handler,
+  returned 0) and read address 0. Next blocker = missing phone functions (369 listed by the converter), not loading.
+- Conclusion: the loading fix works (Card Wars gets past "Failure to initialize"). Card Wars needs more phone
+  functions next; stopped here to ask the user.
