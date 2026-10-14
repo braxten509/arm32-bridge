@@ -108,8 +108,11 @@ class MainActivity : ComponentActivity() {
                     for (game in found) {
                         val state = states[game.packageName]
                         if (state !is CardState.Working && state !is CardState.Failed) {
-                            states[game.packageName] =
-                                if (Games.isConverted(this@MainActivity, game.packageName)) CardState.Done else CardState.Ready
+                            val installed = when (game.action) {
+                                Action.Convert -> Games.isConverted(this@MainActivity, game.packageName)
+                                Action.Install -> Games.isInstalled(this@MainActivity, game.packageName)
+                            }
+                            states[game.packageName] = if (installed) CardState.Done else CardState.Ready
                         }
                     }
                     found to null
@@ -137,7 +140,7 @@ class MainActivity : ComponentActivity() {
                 RefreshButton(enabled = !searching && problem == null, onClick = ::refresh)
             }
             Text(
-                "32-bit games on this phone",
+                "32-bit games and game bundles on this phone",
                 color = Muted,
                 fontSize = 13.sp,
                 modifier = Modifier.padding(start = 18.dp, bottom = 14.dp),
@@ -145,7 +148,7 @@ class MainActivity : ComponentActivity() {
             when {
                 problem != null -> Message(problem!!)
                 games == null -> Message("Looking for games…")
-                games!!.isEmpty() -> Message("No 32-bit games on this phone. Download a game's APK, then tap ↻.")
+                games!!.isEmpty() -> Message("No 32-bit games or game bundles on this phone. Download a game's APK, XAPK, APKM or APKS file, then tap ↻.")
                 else -> LazyVerticalGrid(
                     columns = GridCells.Fixed(2),
                     contentPadding = PaddingValues(start = 12.dp, end = 12.dp, bottom = 24.dp),
@@ -241,7 +244,7 @@ class MainActivity : ComponentActivity() {
                         colors = ButtonDefaults.buttonColors(containerColor = Accent),
                         contentPadding = PaddingValues(0.dp),
                         modifier = Modifier.fillMaxSize(),
-                    ) { Text("Convert", fontSize = 13.sp) }
+                    ) { Text(if (game.action == Action.Install) "Install" else "Convert", fontSize = 13.sp) }
                     is CardState.Working -> Column(Modifier.fillMaxWidth()) {
                         Text("${state.progress.percent}% · ${state.progress.text}", color = Muted, fontSize = 12.sp, maxLines = 1,
                             overflow = TextOverflow.Ellipsis, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
@@ -268,8 +271,8 @@ class MainActivity : ComponentActivity() {
             }
             // The same space on every card, so cards in a row stay the same height.
             Box(Modifier.padding(top = 6.dp).height(28.dp), contentAlignment = Alignment.Center) {
-                // Needs the original game file, so not for games found only as installed.
-                if (state == CardState.Done && game.file != null) {
+                // Needs the original game file, so not for games found only as installed; nothing to redo for as-is installs.
+                if (state == CardState.Done && game.file != null && game.action == Action.Convert) {
                     // For when the bridge has been updated: replaces the installed copy and keeps its saves.
                     Text(
                         "Convert again",

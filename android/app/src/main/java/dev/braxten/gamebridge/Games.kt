@@ -11,9 +11,18 @@ import android.os.storage.StorageManager
 import java.io.File
 import java.util.zip.ZipFile
 
+/** What the card's button does. */
+enum class Action {
+    /** 32-bit code: convert it, then install. */
+    Convert,
+    /** A bundle that already runs on this phone: install its pieces as they are. */
+    Install,
+}
+
 /**
- * A 32-bit game: an APK found on the phone with 32-bit ARM code and no 64-bit code, or an
- * already converted game that is installed (then `file` is null when no APK of it was found).
+ * A game: an APK or bundle found on the phone with 32-bit ARM code and no 64-bit code, a bundle
+ * that already runs here (Android's own installer can't install bundles), or an already converted
+ * game that is installed (then `file` is null when no file of it was found).
  */
 class Game(
     val file: File?,
@@ -23,15 +32,25 @@ class Game(
     val packageName: String,
     val versionCode: Long,
     val icon: Bitmap?,
-)
+    val action: Action = Action.Convert,
+) {
+    /** One game split over several APKs in one file (.xapk, .apkm, .apks). */
+    val isBundle get() = file != null && Games.isBundle(file)
+}
 
 object Games {
     /** At the top of a drive, "Android" holds other apps' private files, never games to convert. */
     private val skipped = setOf("Android")
 
+    /** Bundle file types: APKPure's .xapk, APKMirror's .apkm, SAI's and bundletool's .apks. */
+    private val bundleEndings = listOf(".xapk", ".apkm", ".apks")
+
+    fun isBundle(file: File) = bundleEndings.any { file.name.endsWith(it, ignoreCase = true) }
+
     /**
-     * Every 32-bit-only game APK in the phone's storage and on SD cards, plus converted games that
-     * are installed without an APK on the phone, by name. Only each APK's file list and manifest are read.
+     * Every 32-bit-only game APK or bundle in the phone's storage and on SD cards, bundles that
+     * already run here, plus converted games that are installed without a file on the phone, by name.
+     * Only each APK's file list and manifest are read (for a bundle, its base APK is copied out to read them).
      */
     fun scan(context: Context): List<Game> {
         val found = storageRoots(context).flatMap { (root, name) ->
@@ -59,7 +78,7 @@ object Games {
             when {
                 entry.name.startsWith('.') -> emptyList()
                 entry.isDirectory -> if (entry.name in skipped && isRoot(folder)) emptyList() else apks(entry)
-                entry.name.endsWith(".apk", ignoreCase = true) -> listOf(entry)
+                entry.name.endsWith(".apk", ignoreCase = true) || isBundle(entry) -> listOf(entry)
                 else -> emptyList()
             }
         }
@@ -92,14 +111,37 @@ object Games {
     }
 
     private fun read(context: Context, file: File, place: String): Game? {
+        if (isBundle(file)) return readBundle(context, file, place)
         if (!isThirtyTwoBitOnly(file)) return null
+        return fromApk(context, file, file, place, Action.Convert)
+    }
+
+    /** The converter looks inside (the pieces' file lists) and copies the base APK out for its name and icon. */
+    private fun readBundle(context: Context, file: File, place: String): Game? {
+        val work = File(context.cacheDir, "inspect").apply { deleteRecursively(); mkdirs() }
+        try {
+            val base = File(work, "base.apk")
+            val action = when (Converter.inspect(context, file, base, work)["bits"]) {
+                "32" -> Action.Convert
+                // Already 64-bit, or no native code at all: both run here as they are.
+                "64", "none" -> Action.Install
+                else -> return null
+            }
+            return fromApk(context, base, file, place, action)
+        } finally {
+            work.deleteRecursively()
+        }
+    }
+
+    /** A card for `file`, with the name, package and icon read from `apk` (the file itself, or a bundle's base). */
+    private fun fromApk(context: Context, apk: File, file: File, place: String, action: Action): Game? {
         val packages = context.packageManager
-        val info = packages.getPackageArchiveInfo(file.path, 0) ?: return null
+        val info = packages.getPackageArchiveInfo(apk.path, 0) ?: return null
         val application = info.applicationInfo ?: return null
-        application.sourceDir = file.path
-        application.publicSourceDir = file.path
+        application.sourceDir = apk.path
+        application.publicSourceDir = apk.path
         val icon = iconBitmap(runCatching { application.loadIcon(packages) }.getOrNull())
-        return Game(file, place, application.loadLabel(packages).toString(), info.packageName, info.longVersionCode, icon)
+        return Game(file, place, application.loadLabel(packages).toString(), info.packageName, info.longVersionCode, icon, action)
     }
 
     private fun iconBitmap(drawable: Drawable?): Bitmap? = drawable?.let {
@@ -120,6 +162,10 @@ object Games {
         }
         thirtyTwo
     }
+
+    fun isInstalled(context: Context, packageName: String): Boolean = runCatching {
+        context.packageManager.getPackageInfo(packageName, PackageManager.PackageInfoFlags.of(0))
+    }.isSuccess
 
     /** True when a converted copy of this game is installed (its library folder holds a kept 32-bit original). */
     fun isConverted(context: Context, packageName: String): Boolean = runCatching {

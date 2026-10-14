@@ -11,8 +11,11 @@
 # the phone app uses; this script builds it, signs the result and installs it.
 # - The APK is re-signed with the debug key (the original signature can't survive).
 # - Phone functions the game imports that the bridge has no handler for yet are listed.
+# - A bundle (.xapk, .apkm, .apks) becomes a folder of pieces, all signed with
+#   the same key and installed together; its game data (OBB) is copied to
+#   /sdcard/Android/obb/.
 #
-# usage: tools/convert.sh <game.apk> [--out <converted.apk>] [--no-install] [--abi x86_64] [--device <serial>]
+# usage: tools/convert.sh <game.apk|bundle> [--out <converted.apk|folder>] [--no-install] [--abi x86_64] [--device <serial>]
 #   --abi x86_64: a copy for the PC's Android emulator (x86_64 bridge, Unicorn only)
 #   --device: install on this adb device (e.g. emulator-5554) instead of the phone
 set -euo pipefail
@@ -21,7 +24,7 @@ NDK=${NDK:-$HOME/Android/Sdk/ndk/30.0.16248370}
 BUILD_TOOLS=${BUILD_TOOLS:-$HOME/Android/Sdk/build-tools/37.0.0}
 
 usage() {
-    echo "usage: tools/convert.sh <game.apk> [--out <converted.apk>] [--no-install] [--abi x86_64] [--device <serial>]" >&2
+    echo "usage: tools/convert.sh <game.apk|bundle> [--out <converted.apk|folder>] [--no-install] [--abi x86_64] [--device <serial>]" >&2
     exit 2
 }
 APK="" OUT="" INSTALL=1 ABI=arm64-v8a DEVICE=""
@@ -45,9 +48,17 @@ CLANG=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/$CLANG_ARCH-linux-android30
 ADB=(adb)
 [ -z "$DEVICE" ] || ADB=(adb -s "$DEVICE")
 APK=$(realpath "$APK")
-OUT=$(realpath -m "${OUT:-$(dirname "$APK")/$(basename "$APK" .apk)-${ABI%%-*}.apk}")
+STEM=$(basename "$APK")
+STEM=${STEM%.*}
+BUNDLE=0
+case ${APK,,} in *.xapk|*.apkm|*.apks) BUNDLE=1 ;; esac
+if [ $BUNDLE = 1 ]; then
+    OUT=$(realpath -m "${OUT:-$(dirname "$APK")/$STEM-${ABI%%-*}}")
+else
+    OUT=$(realpath -m "${OUT:-$(dirname "$APK")/$STEM-${ABI%%-*}.apk}")
+fi
 
-WORK=$ROOT/target/apk/$(basename "$APK" .apk)-$ABI
+WORK=$ROOT/target/apk/$STEM-$ABI
 rm -rf "$WORK"
 mkdir -p "$WORK"
 
@@ -58,12 +69,14 @@ systemd-run --user --wait --pipe -q -p AllowedCPUs=6-11,18-23 -d -E TARGET=$TARG
 
 echo "== converting"
 set +e
-"$ROOT/target/release/apk-convert" "$APK" "$WORK/unsigned.apk" \
+UNSIGNED=$WORK/unsigned.apk
+[ $BUNDLE = 0 ] || UNSIGNED=$WORK/unsigned
+"$ROOT/target/release/apk-convert" "$APK" "$UNSIGNED" \
     --bridge "$ROOT/target/$TARGET/release/libarm32_bridge.so" --standin "$WORK/libstandin.so" \
     --work "$WORK" --abi "$ABI" > "$WORK/convert.log"
 STATUS=$?
 set -e
-grep -v '^missing ' "$WORK/convert.log" | sed -e 's/^step /  /' -e 's/^error /  /' -e 's/^warn /  warning: /'
+grep -v -e '^missing ' -e '^piece ' -e '^obb ' "$WORK/convert.log" | sed -e 's/^step /  /' -e 's/^error /  /' -e 's/^warn /  warning: /'
 case $STATUS in
     0) ;;
     3) exit 0 ;;
@@ -76,8 +89,22 @@ if [ -n "$MISSING" ]; then
 fi
 
 echo "== signing"
-"$BUILD_TOOLS/apksigner" sign --ks "$HOME/.android/debug.keystore" --ks-pass pass:android --key-pass pass:android \
-    --ks-key-alias androiddebugkey --out "$OUT" "$WORK/unsigned.apk" 2>/dev/null
+sign() {
+    "$BUILD_TOOLS/apksigner" sign --ks "$HOME/.android/debug.keystore" --ks-pass pass:android --key-pass pass:android \
+        --ks-key-alias androiddebugkey --out "$2" "$1" 2>/dev/null
+}
+if [ $BUNDLE = 1 ]; then
+    mkdir -p "$OUT"
+    rm -f "$OUT"/*.apk "$OUT"/*.idsig
+    rm -rf "$OUT/obb"
+    # Every piece gets the same key: Android only installs pieces signed alike.
+    for piece in "$UNSIGNED"/*.apk; do
+        sign "$piece" "$OUT/$(basename "$piece")"
+    done
+    [ ! -d "$UNSIGNED/obb" ] || cp -r "$UNSIGNED/obb" "$OUT/obb"
+else
+    sign "$UNSIGNED" "$OUT"
+fi
 echo "converted: $OUT"
 
 [ "$INSTALL" = 1 ] || exit 0
@@ -93,7 +120,9 @@ if ! "${ADB[@]}" get-state >/dev/null 2>&1; then
     echo "  adb install -r --bypass-low-target-sdk-block '$OUT'" >&2
     exit 1
 fi
-if ! result=$("${ADB[@]}" install -r --bypass-low-target-sdk-block "$OUT" 2>&1); then
+INSTALL_COMMAND=(install -r --bypass-low-target-sdk-block "$OUT")
+[ $BUNDLE = 0 ] || INSTALL_COMMAND=(install-multiple -r --bypass-low-target-sdk-block "$OUT"/*.apk)
+if ! result=$("${ADB[@]}" "${INSTALL_COMMAND[@]}" 2>&1); then
     if grep -q "UPDATE_INCOMPATIBLE" <<<"$result"; then
         echo "The phone already has this game signed by someone else, so it can't be replaced in place." >&2
         echo "Uninstall it on the phone first (this deletes its saved progress), then run this again." >&2
@@ -101,5 +130,11 @@ if ! result=$("${ADB[@]}" install -r --bypass-low-target-sdk-block "$OUT" 2>&1);
         echo "$result" >&2
     fi
     exit 1
+fi
+if [ -d "$OUT/obb" ]; then
+    echo "== copying game data"
+    (cd "$OUT/obb" && find . -type f) | while read -r file; do
+        "${ADB[@]}" push "$OUT/obb/${file#./}" "/sdcard/Android/obb/${file#./}" >/dev/null 2>&1 || echo "  couldn't copy ${file#./}" >&2
+    done
 fi
 echo "installed"
