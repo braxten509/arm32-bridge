@@ -1,4 +1,45 @@
-# Resume checkpoint — Card Wars, 2026-10-12
+# Status summary (2026-10-14): read this first
+
+Card Wars plays smoothly with sound on the Pixel 10 (owner, 2026-10-14: "runs like normal"). Puzzle Craft 1/2 run at
+~120 fps with saves intact. The sections below are the full history, oldest first; the 2026-10-12 checkpoint
+after this one is out of date (the phone is allowed again: running and tapping Card Wars, never spending gems).
+Repo: https://github.com/braxten509/arm32-bridge (public since 2026-10-14).
+
+## Fixed (commit, section)
+- Card Wars start-up crashes (~13% of launches): workaround = `dmb ishst` at the start of every translated block
+  in parallel mode (a2abb57). Root cause NOT found, see "OPEN: root cause behind the light barrier".
+- Four translator/fallback gaps from review t12: shift dependencies, Unicorn LDRD/STRD split, exclusive record
+  at safe points, mprotect un-fixing read-only library memory (a2abb57).
+- Guest thread stacks leaked (abort after ~247 thread creations): reused (fixed 2026-10-13).
+- Stutter, step by step ("Debugging: Card Wars stutters during real play"):
+  light phone functions + jump table 4096 -> 65536 (50dc1c9); ADPF performance hint (3078709);
+  spin-before-sleep waits (f072f2e); jump table 16 MB + code space 128 MB (99e22cd);
+  A missing NEON ops, B cache-flush log, C less work per new block (c805592);
+  D batched publication of new code (c57e0c8); E no thread stop when a flush changed nothing (f72a872);
+  ISB only when new code was written since the thread's last sync (444b990).
+- No sound in Card Wars (never had any): dlsym returned 0 for SL_IID_*, then the AndroidConfiguration
+  interface was missing (cf14135; "Debugging: Card Wars has no sound").
+- Not a bug fix, same day: Game Bridge app icon (984f083).
+
+## Still open (none blocks play today)
+1. Root cause behind the light barrier (the ~5% cost barrier stays until it is found). Leads listed in the
+   OPEN section.
+2. Card Wars still has ~27-29 seconds with a frame >50 ms per 3-minute scripted run (f-t1/f-t2). Most are the
+   game's own ~56 ms frames, the same on every build; not credited to or blamed on any change without a
+   same-session control.
+3. ~9.7k thread stops per run from flushes that changed nothing but are not fully inside a kept copy (likely
+   12-byte patches running past a block's end). Possible next improvement; would need a review.
+4. Inherited: a drop whose core sync (membarrier) fails is not followed by an ISB on paths that skip block_for
+   (table / linked code). Never seen to happen.
+5. ARM32_LINK=0 self-test mode fails "four busy threads run at the same time" on every build (pre-existing,
+   debug mode only).
+6. Checker mode only: a reused engine adds its checker hooks again (owner chose "later").
+7. Unicorn only: Unity worker threads stop with INSN_INVALID after a Thumb YIELD (translator is fine).
+8. Puzzle Craft 2 writes files/stgs.atgsave as 0 bytes on every launch: normal for the game or a bridge
+   file-write bug? Main save pc2.atgsave is untouched.
+9. One 56 ms OpenSL SetPlayState on the frame thread when Card Wars starts its sound (seen once, launch only).
+
+# Resume checkpoint — Card Wars, 2026-10-12 (HISTORY, out of date; see the summary above)
 
 Read this section first. The older notes below are history, not the current blocker.
 
