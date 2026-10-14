@@ -962,16 +962,44 @@ pub fn without_gil<R>(work: impl FnOnce() -> R) -> R {
     result
 }
 
+/// One thread's sleeping place. Only its own thread waits on it, so a late
+/// notify from an earlier wait is just a spurious wake-up (waits re-check).
 struct Parker {
-    woken: Mutex<bool>,
+    lock: Mutex<()>,
     ready: Condvar,
 }
 
-impl Parker {
-    fn wake(&self) {
-        *self.woken.lock().unwrap_or_else(|e| e.into_inner()) = true;
-        self.ready.notify_one();
+/// One wait: who ended it, and whether its thread went to the kernel to sleep.
+struct Slot {
+    /// Claimed exactly once (a waker, the timeout or a signal).
+    outcome: std::sync::atomic::AtomicU8,
+    sleeping: std::sync::atomic::AtomicBool,
+}
+
+impl Slot {
+    /// After claiming the outcome: notify the thread only if it sleeps in the
+    /// kernel. Both sides use SeqCst (waker: claim, then read `sleeping`;
+    /// waiter: set `sleeping`, then read the outcome), so at least one of them
+    /// sees the other and the wake-up is never lost.
+    fn wake(&self, parker: &Parker) {
+        if self.sleeping.load(Ordering::SeqCst) {
+            drop(parker.lock.lock().unwrap_or_else(|e| e.into_inner()));
+            parker.ready.notify_one();
+        }
     }
+}
+
+/// How long a waiting thread watches for a wake-up before sleeping in the
+/// kernel. A wake-up in that window is a memory write: neither side makes a
+/// system call, and the waker doesn't pay for the kernel waking a sleeping
+/// thread (10.5% of Card Wars' main thread, DEBUGGING.md "Thread wake-ups").
+/// debug.arm32bridge.spin=<microseconds> changes it (0 = sleep at once).
+fn spin_time() -> Duration {
+    static SPIN: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *SPIN.get_or_init(|| {
+        let micros = crate::dynarec::property("debug.arm32bridge.spin").and_then(|value| value.trim().parse().ok()).unwrap_or(50);
+        Duration::from_micros(micros)
+    })
 }
 
 /// How a wait ended.
@@ -995,15 +1023,15 @@ struct Waiter {
     thread: u32,
     key: u64,
     parker: Arc<Parker>,
-    /// Claimed exactly once (a waker, the timeout or a signal), under WAITERS.
-    outcome: Arc<std::sync::atomic::AtomicU8>,
+    /// Its outcome is claimed under WAITERS.
+    slot: Arc<Slot>,
 }
 
 /// Threads asleep in a bridge wait, oldest first.
 static WAITERS: Mutex<Vec<Waiter>> = Mutex::new(Vec::new());
 
 thread_local! {
-    static PARKER: Arc<Parker> = Arc::new(Parker { woken: Mutex::new(false), ready: Condvar::new() });
+    static PARKER: Arc<Parker> = Arc::new(Parker { lock: Mutex::new(()), ready: Condvar::new() });
 }
 
 fn waiters() -> MutexGuard<'static, Vec<Waiter>> {
@@ -1028,8 +1056,7 @@ fn signal_ready() -> bool {
 pub fn wait_until(key: u64, deadline: Option<Instant>, still_waiting: impl FnOnce() -> bool) -> Wait {
     assert_no_bridge_locks("a wait");
     let parker = PARKER.with(Arc::clone);
-    *parker.woken.lock().unwrap_or_else(|e| e.into_inner()) = false;
-    let outcome = Arc::new(std::sync::atomic::AtomicU8::new(UNCLAIMED));
+    let slot = Arc::new(Slot { outcome: std::sync::atomic::AtomicU8::new(UNCLAIMED), sleeping: std::sync::atomic::AtomicBool::new(false) });
     {
         let mut list = waiters();
         if signal_ready() {
@@ -1041,33 +1068,44 @@ pub fn wait_until(key: u64, deadline: Option<Instant>, still_waiting: impl FnOnc
             return Wait::NotWaiting;
         }
         let thread = crate::imports::threads::current_handle();
-        list.push(Waiter { thread, key, parker: Arc::clone(&parker), outcome: Arc::clone(&outcome) });
+        list.push(Waiter { thread, key, parker: Arc::clone(&parker), slot: Arc::clone(&slot) });
     }
     // Asleep without the guest lock (GIL mode), so the thread that wakes this one can run.
     let held = GIL_GUARD.with(|g| g.borrow_mut().take()).is_some();
     // A signal wakes this wait and is delivered by this thread (no helper needed).
     let runner = CURRENT_RUNNER.with(|current| current.borrow().clone());
     let before = runner.as_ref().map(|runner| runner.state.swap(WAITING, Ordering::SeqCst));
-    {
-        let mut woken = parker.woken.lock().unwrap_or_else(|e| e.into_inner());
-        while !*woken {
-            woken = match deadline {
+    let claimed = || slot.outcome.load(Ordering::SeqCst) != UNCLAIMED;
+    // Watch for a quick wake-up first (see spin_time).
+    let spin = spin_time();
+    if !spin.is_zero() {
+        let started = Instant::now();
+        let until = deadline.map_or(started + spin, |deadline| deadline.min(started + spin));
+        while !claimed() && Instant::now() < until {
+            std::hint::spin_loop();
+        }
+    }
+    if !claimed() {
+        let mut guard = parker.lock.lock().unwrap_or_else(|e| e.into_inner());
+        slot.sleeping.store(true, Ordering::SeqCst);
+        while !claimed() {
+            guard = match deadline {
                 Some(deadline) => {
                     let now = Instant::now();
                     if now >= deadline {
                         break;
                     }
-                    parker.ready.wait_timeout(woken, deadline - now).unwrap_or_else(|e| e.into_inner()).0
+                    parker.ready.wait_timeout(guard, deadline - now).unwrap_or_else(|e| e.into_inner()).0
                 }
-                None => parker.ready.wait(woken).unwrap_or_else(|e| e.into_inner()),
+                None => parker.ready.wait(guard).unwrap_or_else(|e| e.into_inner()),
             };
         }
     }
-    if outcome.load(Ordering::Acquire) == UNCLAIMED {
+    if !claimed() {
         // Timed out, unless a waker claims it first (then the wake counts).
         let mut list = waiters();
-        if outcome.compare_exchange(UNCLAIMED, TIMED_OUT, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-            list.retain(|waiter| !Arc::ptr_eq(&waiter.outcome, &outcome));
+        if slot.outcome.compare_exchange(UNCLAIMED, TIMED_OUT, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            list.retain(|waiter| !Arc::ptr_eq(&waiter.slot, &slot));
         }
     }
     if let (Some(runner), Some(before)) = (runner, before) {
@@ -1077,7 +1115,7 @@ pub fn wait_until(key: u64, deadline: Option<Instant>, still_waiting: impl FnOnc
         take_gil();
     }
     crate::imports::signals::deliver_pending();
-    match outcome.load(Ordering::Acquire) {
+    match slot.outcome.load(Ordering::SeqCst) {
         WOKEN => Wait::Woken,
         INTERRUPTED => Wait::Interrupted,
         _ => Wait::TimedOut,
@@ -1085,21 +1123,27 @@ pub fn wait_until(key: u64, deadline: Option<Instant>, still_waiting: impl FnOnc
 }
 
 /// Wakes up to `count` threads waiting on `key`, oldest first; returns how many.
+/// The kernel wake-ups happen after the waiters' lock is let go, so other
+/// threads starting or ending a wait don't queue behind them.
 pub fn wake_on_count(key: u64, count: u32) -> u32 {
-    let mut woken = 0;
-    let mut list = waiters();
-    list.retain(|waiter| {
-        if woken >= count || waiter.key != key {
-            return true;
-        }
-        if waiter.outcome.compare_exchange(UNCLAIMED, WOKEN, Ordering::AcqRel, Ordering::Acquire).is_err() {
-            return false;
-        }
-        waiter.parker.wake();
-        woken += 1;
-        false
-    });
-    woken
+    let mut picked = Vec::new();
+    {
+        let mut list = waiters();
+        list.retain(|waiter| {
+            if picked.len() as u32 >= count || waiter.key != key {
+                return true;
+            }
+            if waiter.slot.outcome.compare_exchange(UNCLAIMED, WOKEN, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+                return false;
+            }
+            picked.push((Arc::clone(&waiter.slot), Arc::clone(&waiter.parker)));
+            false
+        });
+    }
+    for (slot, parker) in &picked {
+        slot.wake(parker);
+    }
+    picked.len() as u32
 }
 
 /// Wakes every thread waiting on `key`.
@@ -1109,16 +1153,22 @@ pub fn wake_on(key: u64) {
 
 /// Wakes guest thread `thread` from any bridge wait (a signal came for it).
 pub fn wake_thread(thread: u32) {
-    let mut list = waiters();
-    list.retain(|waiter| {
-        if waiter.thread != thread {
-            return true;
-        }
-        if waiter.outcome.compare_exchange(UNCLAIMED, INTERRUPTED, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-            waiter.parker.wake();
-        }
-        false
-    });
+    let mut picked = Vec::new();
+    {
+        let mut list = waiters();
+        list.retain(|waiter| {
+            if waiter.thread != thread {
+                return true;
+            }
+            if waiter.slot.outcome.compare_exchange(UNCLAIMED, INTERRUPTED, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                picked.push((Arc::clone(&waiter.slot), Arc::clone(&waiter.parker)));
+            }
+            false
+        });
+    }
+    for (slot, parker) in &picked {
+        slot.wake(parker);
+    }
 }
 
 /// Waits on `key` until woken, a signal or the timeout (callers re-check

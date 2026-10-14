@@ -537,6 +537,30 @@ fn patch_link(site: usize, target: usize) {
     }
 }
 
+/// ARM32_BLOCKMAP=<file> (or the Android property debug.arm32bridge.blockmap=<file>,
+/// for testing): appends "time host-address bytes guest-pc" (hex, time in ns of
+/// CLOCK_MONOTONIC) for every translated block, so profiles of translated code
+/// can be named by game address (scripts in arm32-bridge-games/analysis).
+fn block_map() -> Option<&'static std::sync::Mutex<std::fs::File>> {
+    static FILE: OnceLock<Option<std::sync::Mutex<std::fs::File>>> = OnceLock::new();
+    FILE.get_or_init(|| {
+        let path = std::env::var("ARM32_BLOCKMAP").ok().or_else(|| property("debug.arm32bridge.blockmap"))?;
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(&path);
+        crate::log::line(&format!("[bridge] block map to {path}: {}", if file.is_ok() { "on" } else { "could not open" }));
+        file.ok().map(std::sync::Mutex::new)
+    })
+    .as_ref()
+}
+
+fn note_block(address: usize, bytes: usize, pc: u32) {
+    use std::io::Write;
+    let Some(file) = block_map() else { return };
+    let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
+    let time = now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64;
+    let _ = writeln!(file.lock().unwrap_or_else(|e| e.into_inner()), "{time} {address:x} {bytes:x} {pc:x}");
+}
+
 /// The translated block for a guest pc (bit 0 = Thumb), translating it on
 /// first use: (code, block end, enter glue, exit stub).
 fn block_for(pc: u32) -> (usize, u32, usize, usize) {
@@ -560,6 +584,7 @@ fn block_for(pc: u32) -> (usize, u32, usize, usize) {
         let (enter, exit_stub) = (cache.memory.enter, cache.memory.exit_stub);
         let block = if pc & 1 == 1 { thumb::translate(guest_mem(), pc & !1) } else { thumb::translate_arm(guest_mem(), pc) };
         let address = cache.memory.place(&block.code);
+        note_block(address, block.code.len() * 4, pc);
         cache.blocks.insert(pc, (address, block.end));
         cache.starts.push((address, pc));
         // Watched unless all of it is fixed: a block may run on into a page

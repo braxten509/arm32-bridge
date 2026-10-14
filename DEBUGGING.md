@@ -1604,3 +1604,59 @@ ms/frame must improve beyond noise; self-test 0 failures in six modes; three gam
   plus files/stgs.atgsave, which PC2 rewrites as 0 bytes on every launch (not touched on Home/stop). Main save
   pc2.atgsave unchanged (6516 bytes, last written 2026-10-13 23:36). OPEN: is a 0-byte stgs.atgsave normal for
   PC2 or a bridge file-write bug? Not related to the hint (frame timing only).
+
+## Cleanup (garbage collection) pauses (owner chose "find why cleanup pauses so long", 2026-10-14)
+- Boehm's own stats via debug.arm32bridge.env="GC_PRINT_STATS=1;GC_LOG_FILE=/data/data/<pkg>/cache/gc.log"
+  (no code change), scripted menu run runs/gcstats1 (hint on: 105.9 fps, >50 ms seconds 21, >100 ms 4, worst 204 ms).
+  Unity uses incremental GC: time-sliced stopped marking ("Abandoning stopped marking after ~3.6 ms"), dirty pages.
+  530 collections (48 full); final stopped mark mean 3.3 ms, max 25 ms, total 1755 ms; abandoned slices 227 x ~3 ms
+  = 677 ms. Total GC stop time ~2.4 s in ~4.5 min (~1%). Median 2.4 MB allocated between collections.
+  => RULED OUT as the cause of 50-200 ms pauses (plumber rule: 3 ms pauses can't make 100+ ms frames). The earlier
+  "90% of slow seconds have a GC" was just GC happening in ~65% of all seconds.
+- Long screen gaps (>45 ms) in trace2-jt16 with the exact clock offset (analysis/long-gaps.py): 13 gaps
+  (50-175 ms). UnityMain inside them: translated 67%, engine::run 7%, kernel wake 4.6%, Args::from_registers 2.5%,
+  check_in 1.5%, call_light 1.4% = the same mix as normal frames, just more of it. So long frames are more GAME code.
+- Unicorn (fallback engine) shows up on worker threads (tcg_gen_code/tcg_optimize, reg_read/write): 1-2% of samples
+  overall (UnityMain 0.8%). Small; not the cause.
+- Next need: names for translated code (which game function runs in long frames). Profiles only see "unknown".
+- Naming tool (owner approved): debug.arm32bridge.blockmap=<file> / ARM32_BLOCKMAP writes "time host-addr bytes
+  guest-pc" per translated block (engine.rs note_block); analysis/named-gaps.py names samples (libunity by 4 KiB
+  page, libmono by symbol, rest "mono-jit" = C# code compiled by Mono) and groups them by kind.
+- Named profile runs/named1 (hint on, menu path; 99.0 fps, >50 ms seconds 27, >100 ms 7, worst 321 ms). UnityMain,
+  10 gaps >45 ms (200, 108, 108, 50-58 ms), share inside long gaps vs overall:
+    bridge running/phone calls 18.4 vs 12.9 | libunity 18.1 vs 45.7 | Mono runtime other 13.8 vs 5.5 |
+    kernel other 9.5 vs 13.4 | C# code 8.1 vs 7.7 | Mono stack walking/exceptions 6.1 vs 0.3 (mono_handle_exception
+    present) | Mono GC 5.5 vs 2.6 | host malloc 5.3 vs 2.1 | glue 4.5 vs 3.4 | Mono JIT compiler 4.1 vs 0.1 |
+    new-code sync IPI 2.2 vs 0.0 | Unicorn fallback 2.2 vs 0.6.
+  => long pauses are bursts of the game's C# runtime work (exceptions being thrown and unwound, first-time JIT,
+  GC marking, runtime lookups) on menu actions, made slower by the bridge's general overhead (~28% of the pause:
+  dispatch/phone calls, malloc, Unicorn, IPIs). No single bridge hotspot; the 200 ms gap has the same mix.
+- Overall on UnityMain the kernel wake path (_raw_spin_unlock_irqrestore) is 11.5% and clock_gettime 4.8%.
+
+## Thread wake-ups (owner chose "cheaper thread wake-ups", 2026-10-14)
+- Call-graph profile of UnityMain (scripts/cw-callgraph.sh, simpleperf --call-graph fp, 30 s menu loop, hint on;
+  analysis/kernel-callers.py, runs/callgraph1): kernel 12.6% of samples; _raw_spin_unlock_irqrestore 10.5%, and
+  99.6% of that is futex_wake < __arm64_sys_futex. User side: the guest's own raw futex WAKE syscalls
+  (linux_syscall -> futex -> wake_on_count -> Parker condvar notify -> libc syscall). Performance hint 0.5%.
+  => the main thread spends ~10% of its time waking sleeping helper threads (Unity job workers). wake_on_count only
+  makes a host syscall when a waiter is listed, so the bridge isn't adding wakes; the cost is the kernel waking a
+  sleeping thread on another core (IPI). The waker also holds the global WAITERS lock during that syscall.
+- Fix (owner approved, 2026-10-14): spin before sleeping (runtime.rs wait_until/Slot). Each wait gets a Slot
+  {outcome, sleeping}. The waiting thread first watches its outcome for up to 50 us (debug.arm32bridge.spin=<us>,
+  0 = sleep at once), then sets `sleeping` under its own lock and sleeps on its condvar. A waker claims the outcome
+  under WAITERS as before, lets WAITERS go, and only locks + notifies the thread when `sleeping` is set (SeqCst on
+  both sides, so a wake is never lost). A wake inside the spin window is a memory write with no system call.
+  Predicted: the futex_wake share of UnityMain drops well below 10.5%; if it stays ~10% the helpers wait longer
+  than 50 us between jobs and the spin doesn't help (then try a longer spin once, else revert).
+- spin50-cg (call graph, spin 50 us, hint on, menu path; runs/spin50-cg): UnityMain kernel 12.6% -> 5.7%,
+  _raw_spin_unlock_irqrestore (futex_wake) 10.5% -> 4.5%. Prediction confirmed: most wakes now land in the spin
+  window. (Crush restarted during the run's end; the call graph was already pulled.)
+- spin50-t1 (frame trace, spin 50 us + hint, menu path; analysis/gaps.py): 117.0 updates/s | doubled (17 ms)
+  1.1/s | >24 ms 0.52/s | >33 ms 0.08/s | >50 ms 0.05/s | max 175 ms. Compare hint-1 105.2 | 10.7 | 1.28 | 0.32 |
+  0.05 | 200 and no-hint ctl-1/2 89-93 | 20-23 | 2.6-3.0. Bridge log: fps avg 118.4 (was ~103), game 8.42 ms/frame
+  (was 9.74); seconds with a frame >50 ms 22, >100 ms 6, >250 ms 1 (worst 269 ms) = about the same as before.
+  => KEPT (call-graph + frame run both show a clear gain). Steady frames are now near a locked 120; the remaining
+  stutter is the rarer long pauses (game C# runtime bursts, see "Cleanup pauses").
+- Safety checks (spin 50 us): PC self-test 0 failures; phone self-test all six modes 0 failures (checker 3438442
+  blocks, 0 differences); pc-check spin50: PC1 120.0 fps, saves unchanged; PC2 119.9 fps, pc2.atgsave unchanged
+  (only the 0-byte stgs.atgsave rewritten at launch, same open question as before); no crash lines.
