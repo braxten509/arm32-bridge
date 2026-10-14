@@ -365,13 +365,17 @@ const PHONE_HANDLE: u32 = 1;
 const FIRST_LIBRARY_HANDLE: u32 = 0x100;
 
 /// Address for a symbol looked up at run time (dlsym, eglGetProcAddress):
-/// a loaded game library's export, or a stand-in if the bridge has one.
+/// a loaded game library's export, or a stand-in or data object if the bridge has one.
 fn lookup_symbol(name: &str) -> u32 {
     if let Some(&address) = shared().guest_exports.get(name) {
         return address;
     }
     if crate::imports::handler_for(name).is_some() {
         return stub_for(name);
+    }
+    // Data the bridge provides at load time (OpenSL ES interface IDs...) too.
+    if crate::imports::known_data_import(name) {
+        return crate::imports::data_import(name);
     }
     crate::log::line(&format!("[bridge] run-time lookup of {name}: not available"));
     0

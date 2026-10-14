@@ -101,6 +101,16 @@ const INTERFACES: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     ("BufferQueue", &[("Enqueue", "pu"), ("Clear", ""), ("GetState", "p"), ("RegisterCallback", "*")]),
+    (
+        // Settings such as the stream type and performance mode (key string, value, size).
+        "AndroidConfiguration",
+        &[
+            ("SetConfiguration", "ppu"),
+            ("GetConfiguration", "ppp"),
+            ("AcquireJavaProxy", "*"),
+            ("ReleaseJavaProxy", "u"),
+        ],
+    ),
 ];
 
 /// Which interface type each SL_IID_ name gives.
@@ -113,6 +123,7 @@ const INTERFACE_IDS: &[(&str, &str)] = &[
     ("SL_IID_PREFETCHSTATUS", "PrefetchStatus"),
     ("SL_IID_BUFFERQUEUE", "BufferQueue"),
     ("SL_IID_ANDROIDSIMPLEBUFFERQUEUE", "BufferQueue"),
+    ("SL_IID_ANDROIDCONFIGURATION", "AndroidConfiguration"),
 ];
 
 #[derive(Default)]
@@ -171,7 +182,6 @@ fn resolve_interface_id(guest_id: u32) -> Option<(usize, &'static str)> {
     // Interface types the bridge doesn't know still work through GetInterface;
     // the matching host ID is found by scanning a few more names.
     for name in [
-        "SL_IID_ANDROIDCONFIGURATION",
         "SL_IID_ANDROIDEFFECT",
         "SL_IID_ANDROIDEFFECTSEND",
         "SL_IID_EFFECTSEND",

@@ -1,6 +1,7 @@
 // Self-test for the bridge: each check exercises one part (loader,
 // calling convention, libc stand-ins, guest callbacks, setjmp, C++
 // exceptions, the pretend Java side). run_all() returns the failure count.
+#include <SLES/OpenSLES.h>
 #include <android/log.h>
 #include <jni.h>
 #include <EGL/egl.h>
@@ -2339,6 +2340,14 @@ extern "C" int run_all() {
         check(dlopen("libsecond.so", RTLD_NOW) == second, "dlopen of an open library returns the same handle");
         void *phone = dlopen("libGLESv2.so", RTLD_NOW);
         check(phone && dlsym(phone, "glClear"), "dlopen of a phone library still finds its functions");
+    }
+
+    {
+        // Sound engines (FMOD) look up OpenSL ES interface IDs by name while running.
+        void *sles = dlopen("libOpenSLES.so", RTLD_NOW);
+        const SLInterfaceID *engine = sles ? (const SLInterfaceID *)dlsym(sles, "SL_IID_ENGINE") : nullptr;
+        check(engine && engine == &SL_IID_ENGINE && *engine && !dlsym(sles, "arm32_bridge_missing_name"),
+              "dlsym finds OpenSL ES interface IDs (the same ones a linked import gets); unknown names stay missing");
     }
 
     {

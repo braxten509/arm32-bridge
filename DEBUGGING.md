@@ -1902,3 +1902,49 @@ ms/frame must improve beyond noise; self-test 0 failures in six modes; three gam
   Same session: D 43/7/0 213 ms, 43/5/0 240 ms; old build 46/6/0 222 ms. >100 ms seconds and worst pause lean
   slightly better; >50 ms count unchanged (dominated by today's ~56 ms game frames). KEPT (stops -32%, no
   correctness cost found).
+- ISB follow-up round (job 024, committed 444b990): builds clean, 7 unit tests, PC self-test 0 failures; phone modes
+  all pass except the pre-existing LINK=0 four-thread timing. LINK=0 one-thread 2449 ms (D: ~4000, old build ~2200-2600)
+  => the per-call ISB cost is gone. CHECK=all 3,730,340 blocks, 0 differences. pc-check fpub: PC1 119.9 fps saves
+  unchanged; PC2 119.9 fps (only the settings file, as before). Counter run: 248,812 blocks, 10,954 dropped,
+  19,324 flushes changed none, 32,375 core syncs, 20,683 stops.
+  Play runs: f-t1 116.3 fps | 8.54 ms | 29/4/0 | 220 ms;  f-t2 118.0 | 8.45 | 27/3/0 | 202 ms.
+  Better than e-t1/e-t2 (42/43) but run later in the day with no same-session control, so the drop in slow seconds
+  is not credited to this change. KEPT on the LINK=0 timing (clear) and no correctness cost.
+
+# Debugging: Card Wars has no sound (never had)
+
+## Symptom
+Card Wars plays silently on the bridge from the first day. Log every launch:
+  "[bridge] run-time lookup of SL_IID_ENGINE: not available" then
+  "E arm32:Unity: FMOD failed to initialize the output device.: "Error loading file. " (19)" (twice).
+Puzzle Craft (cocos2d-x, OpenSL ES linked at load time) has sound.
+
+## Cause
+Unity 2022's FMOD opens libOpenSLES.so with dlopen and fetches slCreateEngine and the SL_IID_* interface IDs with
+dlsym (libunity.so strings: SL_IID_ENGINE, _PLAY, _ANDROIDSIMPLEBUFFERQUEUE, _ANDROIDCONFIGURATION, _RECORD; no
+AAudio). The bridge gave SL_IID_* only as load-time data imports (imports::data_import); the run-time lookup
+(libc_calls.rs lookup_symbol, used by dlsym/eglGetProcAddress) only knew functions, so it answered 0 and FMOD gave up.
+
+## Attempts
+### 1. Run-time lookup also returns known data imports (owner approved 2026-10-14)
+- Where: imports/mod.rs known_data_import(); libc_calls.rs lookup_symbol; selftest.cpp new check (+ -lOpenSLES).
+- Predicted: self-test fails on the old build, passes on the new; FMOD error gone; Card Wars has a started player.
+- PC: old build "FAIL dlsym finds OpenSL ES interface IDs ..." (1 failure), new build 0 failures; unit tests pass.
+- Phone round (job 026): self-test 7 modes as before (only the pre-existing LINK=0 timing), new dlsym check ok;
+  PC1/PC2 ~120 fps, PC2 sound player started=1. Card Wars: the lookup error is gone but FMOD still fails, now with
+  error 33 ("An error occured that wasn't supposed to") right after "[bridge] sl:Unknown.0: sound interface not
+  bridged" (twice). No player was made (dumpsys audio: 0 players for the pid).
+### 2. Bridge the SL_IID_ANDROIDCONFIGURATION interface (plan step 4)
+- Unknown.0 = method 0 of an interface the bridge only resolved as "Unknown": FMOD's player settings
+  (AndroidConfiguration SetConfiguration: stream type / performance mode, called before Realize).
+- Where: sles.rs INTERFACES gets AndroidConfiguration (SetConfiguration ppu, GetConfiguration ppp, ReleaseJavaProxy u;
+  AcquireJavaProxy answers unsupported), INTERFACE_IDS maps the ID to it.
+- Predicted: no "not bridged" line, no FMOD error, a started player for Card Wars.
+- Result (job 027): phone self-test 0 failures; PC1/PC2 120 fps, PC2 sound player started. Owner listened to
+  Card Wars on the phone 2026-10-14: "Works!" — sound plays.
+
+## Current best explanation (sound)
+Root cause: FMOD (Unity 2022) reaches OpenSL ES only through dlopen/dlsym. The bridge's run-time lookup knew only
+functions, so dlsym("SL_IID_ENGINE") was 0 (error 19); after that, the player's AndroidConfiguration interface was
+not bridged (error 33). Fixed by (1) run-time lookup returning known data imports and (2) bridging
+AndroidConfiguration. Regression test: selftest "dlsym finds OpenSL ES interface IDs".

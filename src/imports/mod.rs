@@ -109,6 +109,12 @@ pub fn phone_handles(name: &str) -> bool {
 
 const BIONIC_FILE_SIZE: u32 = 84;
 
+/// Whether `data_import` has real data for `name` (not just zero bytes).
+pub fn known_data_import(name: &str) -> bool {
+    name.starts_with("SL_IID_")
+        || matches!(name, "__sF" | "__stack_chk_guard" | "_ctype_" | "_tolower_tab_" | "_toupper_tab_")
+}
+
 /// Guest address for a data object the game imports (stdio, ctype tables...).
 pub fn data_import(name: &str) -> u32 {
     if let Some(&address) = shared().state.data_imports.get(name) {
