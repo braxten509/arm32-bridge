@@ -38,6 +38,8 @@ pub struct State {
     pub strtok_next: usize,
     pub static_tm: u32,
     pub static_text: u32,
+    /// gethostbyname's result area (one for the whole game, like bionic's).
+    pub hostent: u32,
     pub data_imports: HashMap<String, u32>,
     /// Data imports the bridge doesn't know (given zero bytes).
     pub unknown_data: Vec<String>,

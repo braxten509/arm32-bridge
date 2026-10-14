@@ -13,6 +13,11 @@
 #include <netdb.h>
 #include <poll.h>
 #include <arpa/inet.h>
+#include <net/if.h>
+#include <sys/ioctl.h>
+#include <sys/uio.h>
+#include <wchar.h>
+#include <wctype.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/mman.h>
@@ -2490,6 +2495,86 @@ extern "C" int run_all() {
                          getsockname(tcp, (struct sockaddr *)&local, &local_size) == 0 && local.sin_port != 0;
         if (tcp >= 0) close(tcp);
         check(addresses && resolved && listening, "inet_pton / inet_ntop / getaddrinfo / TCP socket bind + listen");
+    }
+
+    {
+        // Functions Broken Age needs (2026-10-14).
+        char joined[16] = "ab";
+        strncat(joined, "cdef", 2);
+        char transformed[8];
+        size_t length = strxfrm(transformed, "xyz", sizeof transformed);
+        volatile double twelve = 12.0;
+        int exponent = 0;
+        double fraction = frexp(twelve, &exponent);
+        check(strcmp(joined, "abcd") == 0 && strcoll("a", "b") < 0 && length == 3 && strcmp(transformed, "xyz") == 0 &&
+                  fraction == 0.75 && exponent == 4,
+              "strncat / strcoll / strxfrm / frexp");
+        wchar_t wide[] = L"Hello";
+        wchar_t copy[8];
+        wchar_t when[32];
+        struct tm moment = {};
+        moment.tm_year = 115;
+        moment.tm_mon = 4;
+        moment.tm_mday = 14;
+        check(towlower(L'\u00c9') == L'\u00e9' && towupper(L'q') == L'Q' && iswctype(L'7', wctype("digit")) &&
+                  !iswctype(L'x', wctype("upper")) && wctype("nonsense") == 0 && btowc('A') == L'A' &&
+                  btowc(0xC3) == WEOF && wctob(L'z') == 'z' && wctob(L'\u00e9') == EOF && wmemchr(wide, L'l', 5) == wide + 2 &&
+                  wmemcmp(wide, L"Help", 4) < 0 && wcscoll(L"a", L"a") == 0 && wcsxfrm(copy, wide, 8) == 5 &&
+                  wcscmp(copy, wide) == 0 && wcsftime(when, 32, L"%Y-%m-%d", &moment) == 10 && wcscmp(when, L"2015-05-14") == 0,
+              "wide character functions");
+        FILE *scratch = tmpfile();
+        bool wide_file = false;
+        if (scratch) {
+            setbuf(scratch, nullptr);
+            putwc(L'\u00e9', scratch);
+            putwc(L'x', scratch);
+            rewind(scratch);
+            wint_t first = getwc(scratch);
+            ungetwc(first, scratch);
+            wide_file = getwc(scratch) == L'\u00e9' && getwc(scratch) == L'x' && getwc(scratch) == WEOF;
+            fclose(scratch);
+        }
+        char name[L_tmpnam];
+        check(wide_file && tmpnam(name) == name && name[0] == '/', "tmpfile / setbuf / putwc / getwc / ungetwc / tmpnam");
+        FILE *command = popen("echo hi", "r");
+        char said[8] = "";
+        if (command) {
+            fgets(said, sizeof said, command);
+        }
+        check(command && strcmp(said, "hi\n") == 0 && pclose(command) == 0, "popen / pclose");
+        int ends[2];
+        int waiting = 0;
+        char received[8] = "";
+        struct iovec parts[2] = {{(void *)"wri", 3}, {(void *)"tev", 3}};
+        bool written = pipe(ends) == 0 && writev(ends[1], parts, 2) == 6 && ioctl(ends[0], FIONREAD, &waiting) == 0 &&
+                       waiting == 6 && read(ends[0], received, 6) == 6 && strcmp(received, "writev") == 0;
+        close(ends[0]);
+        close(ends[1]);
+        check(written, "writev / ioctl FIONREAD");
+        struct in_addr loopback;
+        loopback.s_addr = htonl(0x7f000001);
+        struct hostent *host = gethostbyname("localhost");
+        check(strcmp(inet_ntoa(loopback), "127.0.0.1") == 0 && host && host->h_addrtype == AF_INET && host->h_length == 4 &&
+                  host->h_addr_list[0] && ((struct in_addr *)host->h_addr_list[0])->s_addr == htonl(0x7f000001),
+              "inet_ntoa / gethostbyname");
+        // What Broken Age does at start: list the network interfaces, then read each one's flags.
+        int udp = socket(AF_INET, SOCK_DGRAM, 0);
+        struct ifreq interfaces[10];
+        struct ifconf list;
+        list.ifc_len = sizeof interfaces;
+        list.ifc_req = interfaces;
+        bool listed = udp >= 0 && ioctl(udp, SIOCGIFCONF, &list) == 0 && list.ifc_len >= (int)sizeof(struct ifreq) &&
+                      list.ifc_len % sizeof(struct ifreq) == 0 && interfaces[0].ifr_addr.sa_family == AF_INET;
+        bool has_loopback = false;
+        for (int i = 0; listed && i < list.ifc_len / (int)sizeof(struct ifreq); i++) {
+            struct ifreq one = interfaces[i];
+            if (ioctl(udp, SIOCGIFFLAGS, &one) == 0 && (one.ifr_flags & IFF_LOOPBACK) &&
+                ((struct sockaddr_in *)&interfaces[i].ifr_addr)->sin_addr.s_addr == htonl(0x7f000001))
+                has_loopback = true;
+        }
+        if (udp >= 0) close(udp);
+        check(listed && has_loopback && ioctl(0, 0x1234, nullptr) == -1 && errno == ENOTTY,
+              "ioctl SIOCGIFCONF / SIOCGIFFLAGS / unknown request");
     }
 
     __android_log_print(ANDROID_LOG_INFO, TAG, "%d failures", failures);

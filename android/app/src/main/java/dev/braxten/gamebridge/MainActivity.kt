@@ -2,6 +2,8 @@ package dev.braxten.gamebridge
 
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.Image
@@ -39,6 +41,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.text.font.FontWeight
@@ -84,6 +90,8 @@ class MainActivity : ComponentActivity() {
         val scope = rememberCoroutineScope()
         var games by remember { mutableStateOf<List<Game>?>(null) }
         var problem by remember { mutableStateOf<String?>(null) }
+        // What happened to the last game picked with "Add a game" (null: nothing to say).
+        var addNote by remember { mutableStateOf<String?>(null) }
         val states = Conversions.states
         val busy = Conversions.busy
 
@@ -110,6 +118,15 @@ class MainActivity : ComponentActivity() {
 
         fun convert(game: Game) = Conversions.convert(this@MainActivity, game)
 
+        val pickGame = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            if (uri == null) return@rememberLauncherForActivityResult
+            addNote = "Adding…"
+            scope.launch {
+                addNote = withContext(Dispatchers.IO) { Games.add(this@MainActivity, uri) }
+                refresh()
+            }
+        }
+
         LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { refresh() }
         LaunchedEffect(Unit) { refresh() }
 
@@ -122,15 +139,22 @@ class MainActivity : ComponentActivity() {
                 modifier = Modifier.padding(start = 18.dp, top = 22.dp, bottom = 4.dp),
             )
             Text(
-                "32-bit games in Downloads",
+                "32-bit games",
                 color = Muted,
                 fontSize = 13.sp,
                 modifier = Modifier.padding(start = 18.dp, bottom = 14.dp),
             )
+            if (problem == null) {
+                AddButton(enabled = addNote != "Adding…") {
+                    // Some file apps don't label APKs as apps, so plain files are offered too.
+                    pickGame.launch(arrayOf("application/vnd.android.package-archive", "application/octet-stream"))
+                }
+                addNote?.let { Message(it) }
+            }
             when {
                 problem != null -> Message(problem!!)
-                games == null -> Message("Looking in Downloads…")
-                games!!.isEmpty() -> Message("No 32-bit games in Downloads. Download a game's APK, then come back.")
+                games == null -> Message("Looking for games…")
+                games!!.isEmpty() -> Message("No 32-bit games yet. Download a game's APK, or add one from anywhere above.")
                 else -> LazyVerticalGrid(
                     columns = GridCells.Fixed(2),
                     contentPadding = PaddingValues(start = 12.dp, end = 12.dp, bottom = 24.dp),
@@ -144,6 +168,29 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
+        }
+    }
+
+    /** The dashed "Add a game from anywhere…" button above the games. */
+    @Composable
+    private fun AddButton(enabled: Boolean, onClick: () -> Unit) {
+        Box(
+            Modifier.padding(start = 12.dp, end = 12.dp, bottom = 14.dp).fillMaxWidth().height(44.dp)
+                .clip(RoundedCornerShape(14.dp))
+                .drawBehind {
+                    val width = 1.5.dp.toPx()
+                    drawRoundRect(
+                        color = Accent,
+                        topLeft = androidx.compose.ui.geometry.Offset(width / 2, width / 2),
+                        size = androidx.compose.ui.geometry.Size(size.width - width, size.height - width),
+                        cornerRadius = CornerRadius(14.dp.toPx() - width / 2),
+                        style = Stroke(width, pathEffect = PathEffect.dashPathEffect(floatArrayOf(4.dp.toPx(), 3.dp.toPx()))),
+                    )
+                }
+                .clickable(enabled = enabled, onClick = onClick),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text("+ Add a game from anywhere…", color = if (enabled) AccentText else Muted, fontSize = 14.sp)
         }
     }
 
@@ -170,6 +217,7 @@ class MainActivity : ComponentActivity() {
                 overflow = TextOverflow.Ellipsis,
                 textAlign = TextAlign.Center,
             )
+            Text(game.place, color = Muted, fontSize = 11.sp, maxLines = 1, modifier = Modifier.padding(top = 3.dp))
             Spacer(Modifier.height(10.dp))
             // Every state uses the same 36dp slot, so cards keep their height while converting.
             Box(Modifier.fillMaxWidth().height(36.dp), contentAlignment = Alignment.Center) {

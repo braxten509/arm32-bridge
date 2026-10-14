@@ -45,6 +45,7 @@ mod c {
         pub fn nextafter(x: f64, y: f64) -> f64;
         pub fn remquo(x: f64, y: f64, quotient: *mut i32) -> f64;
         pub fn modf(x: f64, integer: *mut f64) -> f64;
+        pub fn frexp(x: f64, exponent: *mut i32) -> f64;
         pub fn scalbn(x: f64, exponent: i32) -> f64;
         pub fn lrint(x: f64) -> i64;
         pub fn llrint(x: f64) -> i64;
@@ -230,6 +231,14 @@ pub fn handler(name: &str) -> Option<Handler> {
             let mut integer = 0.0;
             let fraction = unsafe { c::modf(x, &mut integer) };
             mem().write_u64(integer_out, integer.to_bits());
+            Ret::F64(fraction)
+        }),
+        "frexp" => handler!(|uc, a| {
+            let x = a.f64();
+            let exponent_out = a.u32();
+            let mut exponent = 0;
+            let fraction = unsafe { c::frexp(x, &mut exponent) };
+            mem().write_u32(exponent_out, exponent as u32);
             Ret::F64(fraction)
         }),
         "remquo" => handler!(|uc, a| {

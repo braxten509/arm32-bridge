@@ -1,10 +1,86 @@
 use crate::handler;
-use crate::runtime::{mem, without_gil, ArgSource, Handler, Ret, Uc};
+use crate::runtime::{mem, shared, without_gil, ArgSource, Handler, Ret, Uc};
 
 const SOL_SOCKET: i32 = 1;
 const SO_RCVTIMEO: i32 = 20;
 const SO_SNDTIMEO: i32 = 21;
 const ADDRINFO_SIZE: u32 = 32;
+
+const TIOCGWINSZ: u32 = 0x5413;
+const FIONREAD: u32 = 0x541B;
+const FIONBIO: u32 = 0x5421;
+const SIOCGIFNAME: u32 = 0x8910;
+const SIOCGIFCONF: u32 = 0x8912;
+const SIOCSIFHWBROADCAST: u32 = 0x8937;
+/// struct ifreq: a 16-byte name, then a union holding a sockaddr or a pointer (8 bytes on the phone).
+const IFREQ_SIZE: usize = 32;
+const HOST_IFREQ_SIZE: usize = 40;
+
+/// The phone's struct ifconf.
+#[repr(C)]
+struct HostIfconf {
+    length: i32,
+    buffer: *mut u8,
+}
+
+/// SIOCGIFCONF: the network interfaces and their addresses, as an array of
+/// 32-byte guest ifreqs (the phone's are 40 bytes).
+fn interface_list(uc: &Uc, fd: i32, argument: u32) -> Ret {
+    let guest_length = mem().read_u32(argument) as i32;
+    let guest_buffer = mem().read_u32(argument + 4);
+    let mut host = vec![0u8; guest_length.max(0) as usize / IFREQ_SIZE * HOST_IFREQ_SIZE];
+    // With no buffer the call only reports the length needed.
+    let buffer = if guest_buffer == 0 { std::ptr::null_mut() } else { host.as_mut_ptr() };
+    let mut conf = HostIfconf { length: host.len() as i32, buffer };
+    let result = unsafe { libc::ioctl(fd, SIOCGIFCONF as _, &mut conf) };
+    if result < 0 {
+        return finish(uc, -1, std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+    }
+    let count = conf.length.max(0) as usize / HOST_IFREQ_SIZE;
+    if guest_buffer != 0 {
+        for i in 0..count {
+            let entry = &host[i * HOST_IFREQ_SIZE..i * HOST_IFREQ_SIZE + IFREQ_SIZE];
+            mem().write_bytes(guest_buffer + (i * IFREQ_SIZE) as u32, entry);
+        }
+    }
+    mem().write_u32(argument, (count * IFREQ_SIZE) as u32);
+    Ret::U32(0)
+}
+
+const HOSTENT_ADDRESSES: usize = 16;
+// The result area: struct hostent (20 bytes), the empty alias list, the
+// address list, the addresses, then the name.
+const HOSTENT_ALIASES: u32 = 20;
+const HOSTENT_ADDRESS_LIST: u32 = 24;
+const HOSTENT_ADDRESS_BYTES: u32 = HOSTENT_ADDRESS_LIST + (HOSTENT_ADDRESSES as u32 + 1) * 4;
+const HOSTENT_NAME: u32 = HOSTENT_ADDRESS_BYTES + HOSTENT_ADDRESSES as u32 * 4;
+const HOSTENT_NAME_SIZE: u32 = 256;
+
+/// Fills gethostbyname's shared result area for IPv4 `addresses`; returns its struct hostent.
+fn write_hostent(name: &[u8], addresses: &[[u8; 4]]) -> u32 {
+    if shared().state.hostent == 0 {
+        let area = shared().misc_alloc(HOSTENT_NAME + HOSTENT_NAME_SIZE, 8);
+        shared().state.hostent = area;
+    }
+    let base = shared().state.hostent;
+    let m = mem();
+    let name = &name[..name.len().min(HOSTENT_NAME_SIZE as usize - 1)];
+    m.write_bytes(base + HOSTENT_NAME, name);
+    m.write_u8(base + HOSTENT_NAME + name.len() as u32, 0);
+    m.write_u32(base + HOSTENT_ALIASES, 0);
+    for (i, address) in addresses.iter().take(HOSTENT_ADDRESSES).enumerate() {
+        let at = base + HOSTENT_ADDRESS_BYTES + i as u32 * 4;
+        m.write_bytes(at, address);
+        m.write_u32(base + HOSTENT_ADDRESS_LIST + i as u32 * 4, at);
+    }
+    m.write_u32(base + HOSTENT_ADDRESS_LIST + addresses.len().min(HOSTENT_ADDRESSES) as u32 * 4, 0);
+    m.write_u32(base, base + HOSTENT_NAME); // h_name
+    m.write_u32(base + 4, base + HOSTENT_ALIASES); // h_aliases
+    m.write_u32(base + 8, libc::AF_INET as u32); // h_addrtype
+    m.write_u32(base + 12, 4); // h_length
+    m.write_u32(base + 16, base + HOSTENT_ADDRESS_LIST); // h_addr_list
+    base
+}
 
 fn pointer(guest: u32) -> *mut u8 {
     mem().host_or_null(guest)
@@ -304,6 +380,53 @@ pub fn handler(name: &str) -> Option<Handler> {
                 node = next;
             }
             Ret::Void
+        }),
+        "ioctl" => handler!(|uc, a| {
+            let (fd, request, argument) = (a.i32(), a.u32(), a.u32());
+            match request {
+                // An int (or struct winsize) the same size on both sides.
+                FIONREAD | FIONBIO | TIOCGWINSZ => host_call(uc, || unsafe { libc::ioctl(fd, request as _, pointer(argument)) } as i64),
+                SIOCGIFCONF => interface_list(uc, fd, argument),
+                // One struct ifreq with the answer inside it (name, address, flags, ...).
+                SIOCGIFNAME..=SIOCSIFHWBROADCAST => {
+                    let mut request_buffer = [0u8; HOST_IFREQ_SIZE];
+                    request_buffer[..IFREQ_SIZE].copy_from_slice(mem().bytes(argument, IFREQ_SIZE));
+                    let result = host_call(uc, || unsafe { libc::ioctl(fd, request as _, request_buffer.as_mut_ptr()) } as i64);
+                    mem().write_bytes(argument, &request_buffer[..IFREQ_SIZE]);
+                    result
+                }
+                _ => finish(uc, -1, libc::ENOTTY),
+            }
+        }),
+        "inet_ntoa" => handler!(|uc, a| {
+            // struct in_addr is passed by value: the address bytes in memory order.
+            let text = std::net::Ipv4Addr::from(a.u32().to_ne_bytes()).to_string();
+            Ret::U32(shared().cached_cstr(format!("inet_ntoa:{text}"), &text))
+        }),
+        "gethostbyname" => handler!(|uc, a| {
+            let name_pointer = a.u32();
+            let name = mem().c_str(name_pointer).to_owned();
+            let addresses: Vec<[u8; 4]> = without_gil(move || {
+                let mut hints: libc::addrinfo = unsafe { std::mem::zeroed() };
+                hints.ai_family = libc::AF_INET;
+                hints.ai_socktype = libc::SOCK_STREAM;
+                let mut list: *mut libc::addrinfo = std::ptr::null_mut();
+                let mut found = Vec::new();
+                if unsafe { libc::getaddrinfo(name.as_ptr(), std::ptr::null(), &hints, &mut list) } == 0 {
+                    let mut node = list;
+                    while !node.is_null() && found.len() < HOSTENT_ADDRESSES {
+                        let address = unsafe { &*((*node).ai_addr as *const libc::sockaddr_in) };
+                        found.push(address.sin_addr.s_addr.to_ne_bytes());
+                        node = unsafe { (*node).ai_next };
+                    }
+                    unsafe { libc::freeaddrinfo(list) };
+                }
+                found
+            });
+            if addresses.is_empty() {
+                return Ret::U32(0);
+            }
+            Ret::U32(write_hostent(&mem().c_str(name_pointer).to_bytes().to_vec(), &addresses))
         }),
         "gai_strerror" => handler!(|uc, a| {
             let text = unsafe { std::ffi::CStr::from_ptr(libc::gai_strerror(a.i32())) }.to_bytes().to_vec();

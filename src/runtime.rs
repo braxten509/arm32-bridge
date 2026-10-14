@@ -197,7 +197,7 @@ const LIGHT: &[&str] = &[
     "__aeabi_memmove8", "__memcpy_chk", "__memmove_chk", "memset", "__memset_chk", "__aeabi_memset", "__aeabi_memset4",
     "__aeabi_memset8", "bzero", "__aeabi_memclr", "__aeabi_memclr4", "__aeabi_memclr8", "memcmp", "memchr", "memrchr",
     "strlen", "__strlen_chk", "strcmp", "strncmp", "strcasecmp", "strncasecmp", "strchr", "__strchr_chk", "strrchr",
-    "__strrchr_chk", "strstr", "malloc", "calloc", "realloc", "free", "memalign", "pthread_getspecific",
+    "__strrchr_chk", "strstr", "malloc", "calloc", "realloc", "free", "_ZdlPv", "memalign", "pthread_getspecific",
     "pthread_setspecific", "pthread_self", "pthread_mutex_trylock", "pthread_mutex_unlock", "clock_gettime",
 ];
 

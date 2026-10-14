@@ -6,7 +6,7 @@
 use crate::handler;
 use crate::imports::{printf, scanf, HostFile};
 use crate::mem::GuestMem;
-use crate::runtime::{call_guest, mem, shared, stop_with_fault, stub_for, ArgSource, Args, GuestCpu, Handler, Ret, Uc, VaList, LR, SP};
+use crate::runtime::{call_guest, mem, shared, stop_with_fault, stub_for, ArgSource, Args, GuestCpu, Handler, Ret, Uc, VaList, without_gil, LR, SP};
 
 
 fn host_c(guest: u32) -> *mut libc::c_char {
@@ -50,6 +50,30 @@ fn checked(uc: &Uc, result: i64) -> Ret {
 /// Guest pointer for a host pointer that points into guest memory.
 fn back(host: *const libc::c_char) -> Ret {
     Ret::U32(mem().guest(host as *const u8))
+}
+
+/// The classes wctype() knows, numbered from 1 in this order.
+const WIDE_CLASSES: [&str; 12] =
+    ["alnum", "alpha", "blank", "cntrl", "digit", "graph", "lower", "print", "punct", "space", "upper", "xdigit"];
+
+/// A guest wchar_t string (4-byte characters), without its end mark. Characters that aren't valid become U+FFFD.
+fn guest_wide_text(guest: u32) -> Vec<char> {
+    let mut text = Vec::new();
+    loop {
+        let c = mem().read_u32(guest + text.len() as u32 * 4);
+        if c == 0 {
+            return text;
+        }
+        text.push(char::from_u32(c).unwrap_or('\u{FFFD}'));
+    }
+}
+
+/// Writes `text` and an end mark as a guest wchar_t string.
+fn write_wide_text(guest: u32, text: &[char]) {
+    for (i, &c) in text.iter().enumerate() {
+        mem().write_u32(guest + i as u32 * 4, c as u32);
+    }
+    mem().write_u32(guest + text.len() as u32 * 4, 0);
 }
 
 fn guest_string_in_heap(text: &[u8]) -> u32 {
@@ -451,7 +475,7 @@ pub fn handler(name: &str) -> Option<Handler> {
             }
             Ret::U32(crate::runtime::heap().realloc(pointer, size))
         }),
-        "free" => handler!(|uc, a| {
+        "free" | "_ZdlPv" => handler!(|uc, a| {
             let pointer = a.u32();
             if pointer != 0 && refuse_bad_block(uc, "free", pointer) {
                 return Ret::Void;
@@ -522,7 +546,8 @@ pub fn handler(name: &str) -> Option<Handler> {
 
         // ---- strings ----
         "strlen" | "__strlen_chk" => handler!(|uc, a| Ret::U32(unsafe { libc::strlen(host_c(a.u32())) } as u32)),
-        "strcmp" => handler!(|uc, a| {
+        // Only the C locale exists, so collating is plain comparing.
+        "strcmp" | "strcoll" => handler!(|uc, a| {
             let (x, y) = (a.u32(), a.u32());
             Ret::U32(unsafe { libc::strcmp(host_c(x), host_c(y)) } as u32)
         }),
@@ -576,6 +601,21 @@ pub fn handler(name: &str) -> Option<Handler> {
             let (destination, source) = (a.u32(), a.u32());
             unsafe { libc::strcat(host_c(destination), host_c(source)) };
             Ret::U32(destination)
+        }),
+        "strncat" => handler!(|uc, a| {
+            let (destination, source, n) = (a.u32(), a.u32(), a.u32());
+            unsafe { libc::strncat(host_c(destination), host_c(source), n as usize) };
+            Ret::U32(destination)
+        }),
+        // C locale: the transformed text is the text itself.
+        "strxfrm" => handler!(|uc, a| {
+            let (destination, source, size) = (a.u32(), a.u32(), a.u32());
+            let text = mem().c_str(source).to_bytes().to_vec();
+            if (text.len() as u32) < size {
+                mem().write_bytes(destination, &text);
+                mem().write_u8(destination + text.len() as u32, 0);
+            }
+            Ret::U32(text.len() as u32)
         }),
         "strlcpy" | "__strlcpy_chk" => handler!(|uc, a| {
             let (destination, source, size) = (a.u32(), a.u32(), a.u32());
@@ -732,7 +772,8 @@ pub fn handler(name: &str) -> Option<Handler> {
                 }
             }
         }),
-        "wcscmp" => handler!(|uc, a| {
+        // Only the C locale exists, so collating is plain comparing.
+        "wcscmp" | "wcscoll" => handler!(|uc, a| {
             // wchar_t is 4 bytes on both sides.
             let (x, y) = (a.u32(), a.u32());
             let m = mem();
@@ -744,6 +785,74 @@ pub fn handler(name: &str) -> Option<Handler> {
                 }
                 i += 1;
             }
+        }),
+        "wmemchr" => handler!(|uc, a| {
+            let (text, character, count) = (a.u32(), a.u32(), a.u32());
+            Ret::U32((0..count).map(|i| text + i * 4).find(|&at| mem().read_u32(at) == character).unwrap_or(0))
+        }),
+        "wmemcmp" => handler!(|uc, a| {
+            let (x, y, count) = (a.u32(), a.u32(), a.u32());
+            let m = mem();
+            for i in 0..count {
+                let (cx, cy) = (m.read_u32(x + i * 4), m.read_u32(y + i * 4));
+                if cx != cy {
+                    return Ret::U32(if cx < cy { u32::MAX } else { 1 });
+                }
+            }
+            Ret::U32(0)
+        }),
+        // C locale: the transformed text is the text itself.
+        "wcsxfrm" => handler!(|uc, a| {
+            let (destination, source, size) = (a.u32(), a.u32(), a.u32());
+            let text = guest_wide_text(source);
+            if (text.len() as u32) < size {
+                write_wide_text(destination, &text);
+            }
+            Ret::U32(text.len() as u32)
+        }),
+        "towlower" | "towupper" => handler!(|uc, a| {
+            let character = a.u32();
+            let Some(c) = char::from_u32(character) else { return Ret::U32(character) };
+            // Only one-to-one mappings: wide functions can't grow a letter into two.
+            let mapped: Vec<char> = if uc.get_data().current_call == "towlower" {
+                c.to_lowercase().collect()
+            } else {
+                c.to_uppercase().collect()
+            };
+            Ret::U32(if mapped.len() == 1 { mapped[0] as u32 } else { character })
+        }),
+        // wctype(name) -> class number (0 = unknown); iswctype(character, class).
+        "wctype" => handler!(|uc, a| {
+            let name = mem().string(a.u32());
+            Ret::U32(WIDE_CLASSES.iter().position(|&class| class == name).map_or(0, |i| i as u32 + 1))
+        }),
+        "iswctype" => handler!(|uc, a| {
+            let (character, class) = (a.u32(), a.u32());
+            let Some(c) = char::from_u32(character) else { return Ret::U32(0) };
+            let Some(&name) = (class as usize).checked_sub(1).and_then(|i| WIDE_CLASSES.get(i)) else { return Ret::U32(0) };
+            Ret::U32(match name {
+                "alnum" => c.is_alphanumeric(),
+                "alpha" => c.is_alphabetic(),
+                "blank" => c == ' ' || c == '\t',
+                "cntrl" => c.is_control(),
+                "digit" => c.is_ascii_digit(),
+                "graph" => !c.is_control() && !c.is_whitespace(),
+                "lower" => c.is_lowercase(),
+                "print" => !c.is_control(),
+                "punct" => c.is_ascii_punctuation() || (!c.is_ascii() && !c.is_alphanumeric() && !c.is_whitespace() && !c.is_control()),
+                "space" => c.is_whitespace(),
+                "upper" => c.is_uppercase(),
+                _ => c.is_ascii_hexdigit(),
+            } as u32)
+        }),
+        // UTF-8: only the 7-bit characters are single bytes. EOF and WEOF are -1.
+        "btowc" => handler!(|uc, a| {
+            let c = a.i32();
+            Ret::U32(if (0..0x80).contains(&c) { c as u32 } else { u32::MAX })
+        }),
+        "wctob" => handler!(|uc, a| {
+            let c = a.u32();
+            Ret::U32(if c < 0x80 { c } else { u32::MAX })
         }),
         "wcscpy" => handler!(|uc, a| {
             let (destination, source) = (a.u32(), a.u32());
@@ -956,7 +1065,7 @@ pub fn handler(name: &str) -> Option<Handler> {
             write_to_file(file, &[c as u8]);
             Ret::U32(c & 0xFF)
         }),
-        "fputwc" => handler!(|uc, a| {
+        "fputwc" | "putwc" => handler!(|uc, a| {
             let (c, file) = (a.u32(), a.u32());
             let mut buffer = [0u8; 4];
             let text = char::from_u32(c).unwrap_or('?').encode_utf8(&mut buffer);
@@ -1022,6 +1131,51 @@ pub fn handler(name: &str) -> Option<Handler> {
                 _ => Ret::U32(u32::MAX),
             }
         }),
+        // Wide characters in files are UTF-8, like everything else in the C library.
+        "getwc" => handler!(|uc, a| {
+            let Some(HostFile::Stream(stream)) = host_file(a.u32()) else { return Ret::U32(u32::MAX) };
+            let stream = stream as *mut libc::FILE;
+            let first = unsafe { libc::fgetc(stream) };
+            if first < 0 {
+                return Ret::U32(u32::MAX);
+            }
+            let length = match first {
+                0..0x80 => 1,
+                _ if first >> 5 == 0b110 => 2,
+                _ if first >> 4 == 0b1110 => 3,
+                _ if first >> 3 == 0b11110 => 4,
+                _ => 0,
+            };
+            let mut bytes = vec![first as u8];
+            while bytes.len() < length {
+                let next = unsafe { libc::fgetc(stream) };
+                if next < 0 {
+                    break;
+                }
+                bytes.push(next as u8);
+            }
+            match std::str::from_utf8(&bytes).ok().and_then(|text| text.chars().next()) {
+                Some(c) => Ret::U32(c as u32),
+                None => {
+                    set_errno(uc, libc::EILSEQ);
+                    Ret::U32(u32::MAX)
+                }
+            }
+        }),
+        "ungetwc" => handler!(|uc, a| {
+            let (character, file) = (a.u32(), a.u32());
+            let (Some(c), Some(HostFile::Stream(stream))) = (char::from_u32(character), host_file(file)) else {
+                return Ret::U32(u32::MAX);
+            };
+            let mut buffer = [0u8; 4];
+            // Pushed back last byte first, so they are read again in order.
+            for &byte in c.encode_utf8(&mut buffer).as_bytes().iter().rev() {
+                if unsafe { libc::ungetc(byte as i32, stream as *mut libc::FILE) } < 0 {
+                    return Ret::U32(u32::MAX);
+                }
+            }
+            Ret::U32(character)
+        }),
         "fseek" | "fseeko" => handler!(|uc, a| {
             let (file, offset, whence) = (a.u32(), a.i32(), a.i32());
             match host_file(file) {
@@ -1053,6 +1207,48 @@ pub fn handler(name: &str) -> Option<Handler> {
             Ret::U32(0)
         }),
         "setvbuf" => handler!(|uc, a| Ret::U32(0)),
+        "setbuf" => handler!(|uc, a| Ret::Void),
+        // A file with no name, deleted when closed.
+        "tmpfile" => handler!(|uc, a| {
+            let fd = unsafe { libc::memfd_create(c"tmpfile".as_ptr(), libc::MFD_CLOEXEC) };
+            if fd < 0 {
+                sync_errno(uc);
+                return Ret::U32(0);
+            }
+            let stream = unsafe { libc::fdopen(fd, c"w+".as_ptr()) };
+            if stream.is_null() {
+                unsafe { libc::close(fd) };
+            }
+            Ret::U32(register_file(uc, stream))
+        }),
+        "tmpnam" => handler!(|uc, a| {
+            let out = a.u32();
+            static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let count = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let name = format!("{}/tmp.{}.{count}", std::env::temp_dir().display(), unsafe { libc::getpid() });
+            if out == 0 {
+                return Ret::U32(static_text(name.as_bytes()));
+            }
+            // L_tmpnam is 4096 on bionic.
+            let length = name.len().min(4095);
+            mem().write_bytes(out, &name.as_bytes()[..length]);
+            mem().write_u8(out + length as u32, 0);
+            Ret::U32(out)
+        }),
+        "popen" => handler!(|uc, a| {
+            let (command, mode) = (a.u32(), a.u32());
+            let stream = unsafe { libc::popen(host_c(command), host_c(mode)) };
+            Ret::U32(register_file(uc, stream))
+        }),
+        "pclose" => handler!(|uc, a| {
+            let file = a.u32();
+            let Some(HostFile::Stream(stream)) = host_file(file) else { return Ret::U32(u32::MAX) };
+            shared().state.files.remove(&file);
+            crate::runtime::heap().free(file);
+            // Waits for the command to finish.
+            let status = without_gil(move || unsafe { libc::pclose(stream as *mut libc::FILE) });
+            checked(uc, status as i64)
+        }),
         "freopen" => handler!(|uc, a| {
             let (path, mode, file) = (a.u32(), a.u32(), a.u32());
             if let Some(HostFile::Stream(stream)) = host_file(file) {
@@ -1147,6 +1343,17 @@ pub fn handler(name: &str) -> Option<Handler> {
         "write" | "__write_chk" => handler!(|uc, a| {
             let (fd, buffer, length) = (a.i32(), a.u32(), a.u32());
             checked(uc, unsafe { libc::write(fd, mem().host(buffer).cast(), length as usize) } as i64)
+        }),
+        "writev" => handler!(|uc, a| {
+            // struct iovec is { pointer, length }: 8 bytes here, 16 on the phone.
+            let (fd, vector, count) = (a.i32(), a.u32(), a.i32());
+            let parts: Vec<libc::iovec> = (0..count.max(0) as u32)
+                .map(|i| libc::iovec {
+                    iov_base: mem().host_or_null(mem().read_u32(vector + i * 8)).cast(),
+                    iov_len: mem().read_u32(vector + i * 8 + 4) as usize,
+                })
+                .collect();
+            checked(uc, unsafe { libc::writev(fd, parts.as_ptr(), parts.len() as i32) } as i64)
         }),
         "close" => handler!(|uc, a| checked(uc, unsafe { libc::close(a.i32()) } as i64)),
         "lseek" => handler!(|uc, a| {
@@ -1415,6 +1622,21 @@ pub fn handler(name: &str) -> Option<Handler> {
             Ret::U32(unsafe { libc::strftime(host_c(buffer), size as usize, host_c(format), &tm) } as u32)
         }),
 
+        "wcsftime" => handler!(|uc, a| {
+            let (buffer, size, format, guest_tm) = (a.u32(), a.u32(), a.u32(), a.u32());
+            let tm = read_tm32(mem(), guest_tm);
+            let mut format: Vec<u8> = guest_wide_text(format).into_iter().collect::<String>().into_bytes();
+            format.push(0);
+            let mut text = vec![0u8; size as usize * 4 + 1];
+            let length = unsafe { libc::strftime(text.as_mut_ptr().cast(), text.len(), format.as_ptr().cast(), &tm) };
+            let wide: Vec<char> = String::from_utf8_lossy(&text[..length]).chars().collect();
+            if length == 0 || wide.len() >= size as usize {
+                return Ret::U32(0);
+            }
+            write_wide_text(buffer, &wide);
+            Ret::U32(wide.len() as u32)
+        }),
+
         // ---- process and environment ----
         "getpid" => handler!(|uc, a| Ret::U32(unsafe { libc::getpid() } as u32)),
         "getppid" => handler!(|uc, a| Ret::U32(unsafe { libc::getppid() } as u32)),
@@ -1506,7 +1728,17 @@ pub fn handler(name: &str) -> Option<Handler> {
             shared().state.at_exit.push((function, argument));
             Ret::U32(0)
         }),
+        // The ARM form of __cxa_atexit, with the first two arguments swapped.
+        "__aeabi_atexit" => handler!(|uc, a| {
+            let (argument, function) = (a.u32(), a.u32());
+            shared().state.at_exit.push((function, argument));
+            Ret::U32(0)
+        }),
         "__cxa_finalize" => handler!(|uc, a| Ret::Void),
+        "__cxa_pure_virtual" => handler!(|uc, a| {
+            stop_with_fault(uc, "game called a pure virtual function (__cxa_pure_virtual)".into());
+            Ret::Void
+        }),
 
         // Signals between game threads are in signals.rs; no timer signals.
         "alarm" => handler!(|uc, a| Ret::U32(0)),
