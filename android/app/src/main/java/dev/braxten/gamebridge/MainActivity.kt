@@ -4,6 +4,7 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -42,7 +43,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.translate
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -162,7 +169,41 @@ class MainActivity : ComponentActivity() {
             Modifier.size(40.dp).clip(CircleShape).background(CardColor).clickable(enabled = enabled, onClick = onClick),
             contentAlignment = Alignment.Center,
         ) {
-            Text("↻", color = if (enabled) AccentText else Muted, fontSize = 22.sp)
+            RefreshIcon(if (enabled) AccentText else Muted)
+        }
+    }
+
+    /**
+     * A circle arrow drawn by hand: a font's arrow sign sits off-center and is too thin. The
+     * whole shape (ring plus arrowhead) is centered, so the arrowhead doesn't pull it up and right.
+     */
+    @Composable
+    private fun RefreshIcon(color: Color) {
+        Canvas(Modifier.size(24.dp)) {
+            val stroke = 2.8.dp.toPx()
+            val head = 5.5.dp.toPx()
+            val radius = (size.minDimension - stroke) / 2 - 2.5.dp.toPx()
+            val start = Math.toRadians(-60.0)
+            val tip = Offset(center.x + radius * Math.cos(start).toFloat(), center.y + radius * Math.sin(start).toFloat())
+            // The arrowhead points back along the ring from where it starts.
+            val forward = Offset(Math.sin(start).toFloat(), -Math.cos(start).toFloat())
+            val outward = Offset(Math.cos(start).toFloat(), Math.sin(start).toFloat())
+            val corners = listOf(tip + forward * head, tip + outward * (head * 0.75f), tip - outward * (head * 0.75f))
+            val xs = corners.map { it.x } + listOf(center.x - radius - stroke / 2, center.x + radius + stroke / 2)
+            val ys = corners.map { it.y } + listOf(center.y - radius - stroke / 2, center.y + radius + stroke / 2)
+            translate(center.x - (xs.min() + xs.max()) / 2, center.y - (ys.min() + ys.max()) / 2) {
+                drawArc(
+                    color, startAngle = -60f, sweepAngle = 290f, useCenter = false,
+                    topLeft = Offset(center.x - radius, center.y - radius), size = Size(radius * 2, radius * 2),
+                    style = Stroke(stroke, cap = StrokeCap.Round),
+                )
+                drawPath(Path().apply {
+                    moveTo(corners[0].x, corners[0].y)
+                    lineTo(corners[1].x, corners[1].y)
+                    lineTo(corners[2].x, corners[2].y)
+                    close()
+                }, color)
+            }
         }
     }
 
