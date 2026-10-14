@@ -52,6 +52,20 @@ fn back(host: *const libc::c_char) -> Ret {
     Ret::U32(mem().guest(host as *const u8))
 }
 
+/// Writes a host directory entry as a bionic ARM32 dirent: u64 d_ino, i64 d_off, u16 d_reclen,
+/// u8 d_type, char d_name[256].
+fn write_dirent(buffer: u32, entry: &libc::dirent) {
+    let m = mem();
+    m.write_u64(buffer, entry.d_ino as u64);
+    m.write_u64(buffer + 8, entry.d_off as u64);
+    m.write_u16(buffer + 16, 280);
+    m.write_u8(buffer + 18, entry.d_type);
+    let name = unsafe { std::ffi::CStr::from_ptr(entry.d_name.as_ptr()) }.to_bytes();
+    let length = name.len().min(255);
+    m.write_bytes(buffer + 19, &name[..length]);
+    m.write_u8(buffer + 19 + length as u32, 0);
+}
+
 /// The classes wctype() knows, numbered from 1 in this order.
 const WIDE_CLASSES: [&str; 12] =
     ["alnum", "alpha", "blank", "cntrl", "digit", "graph", "lower", "print", "punct", "space", "upper", "xdigit"];
@@ -966,6 +980,13 @@ pub fn handler(name: &str) -> Option<Handler> {
             unsafe { libc::write(1, text.as_ptr().cast(), text.len()) };
             Ret::U32(text.len() as u32)
         }),
+        "vprintf" => handler!(|uc, a| {
+            let (format, list) = (a.u32(), a.u32());
+            let mut list = VaList { pointer: list };
+            let text = printf::format(mem(), format, &mut list);
+            unsafe { libc::write(1, text.as_ptr().cast(), text.len()) };
+            Ret::U32(text.len() as u32)
+        }),
         "syslog" => handler!(|uc, a| {
             let (priority, format) = (a.u32(), a.u32());
             let text = printf::format(mem(), format, a);
@@ -1423,6 +1444,71 @@ pub fn handler(name: &str) -> Option<Handler> {
         }),
         "umask" => handler!(|uc, a| Ret::U32(unsafe { libc::umask(a.u32() as libc::mode_t) } as u32)),
         "mkstemp" => handler!(|uc, a| checked(uc, unsafe { libc::mkstemp(host_c(a.u32())) } as i64)),
+        "statfs" => handler!(|uc, a| {
+            let (path, out) = (a.u32(), a.u32());
+            let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+            let result = unsafe { libc::statfs(host_c(path), &mut st) };
+            if result == 0 {
+                // bionic ARM32 struct statfs: u32 type and block size, five u64 counts, then
+                // fsid (2 x i32), name length, fragment size, flags and 4 spare words (84 bytes). Flags
+                // stay 0: not every host libc reports them in statfs.
+                let m = mem();
+                m.write_bytes(out, &[0; 84]);
+                m.write_u32(out, st.f_type as u32);
+                m.write_u32(out + 4, st.f_bsize as u32);
+                for (i, count) in [st.f_blocks, st.f_bfree, st.f_bavail, st.f_files, st.f_ffree].into_iter().enumerate() {
+                    m.write_u64(out + 8 + i as u32 * 8, count as u64);
+                }
+                let fsid: [i32; 2] = unsafe { std::mem::transmute(st.f_fsid) };
+                m.write_u32(out + 48, fsid[0] as u32);
+                m.write_u32(out + 52, fsid[1] as u32);
+                m.write_u32(out + 56, st.f_namelen as u32);
+                m.write_u32(out + 60, st.f_frsize as u32);
+            }
+            checked(uc, result as i64)
+        }),
+        // utime(path, times): times is { time_t actime, modtime } with 32-bit time_t, or null for now.
+        "utime" => handler!(|uc, a| {
+            let (path, times) = (a.u32(), a.u32());
+            let host_times = (times != 0).then(|| libc::utimbuf {
+                actime: mem().read_u32(times) as i32 as libc::time_t,
+                modtime: mem().read_u32(times + 4) as i32 as libc::time_t,
+            });
+            let pointer = host_times.as_ref().map_or(std::ptr::null(), |t| t as *const libc::utimbuf);
+            checked(uc, unsafe { libc::utime(host_c(path), pointer) } as i64)
+        }),
+        "pathconf" => handler!(|uc, a| {
+            let (path, name) = (a.u32(), a.u32());
+            // Games use bionic's _PC_ numbers (0-19), the same as the phone's own; glibc (the PC
+            // tool) numbers them differently.
+            #[cfg(target_os = "android")]
+            let host = (name < 20).then_some(name as i32);
+            #[cfg(not(target_os = "android"))]
+            let host = [13, 0, 1, 2, 3, 4, 5, 20, 18, 14, 15, 16, 17, 19, 6, 7, 8, 10, 11, 9].get(name as usize).copied();
+            let Some(host) = host else {
+                set_errno(uc, libc::EINVAL);
+                return Ret::U32(u32::MAX);
+            };
+            // long is 32 bits here.
+            let value = unsafe { libc::pathconf(host_c(path), host) };
+            checked(uc, value.clamp(i32::MIN as libc::c_long, i32::MAX as libc::c_long) as i64)
+        }),
+        "fnmatch" => handler!(|uc, a| {
+            let (pattern, text, flags) = (a.u32(), a.u32(), a.u32());
+            // bionic flag bits: NOESCAPE 1, PATHNAME 2, PERIOD 4, LEADING_DIR 8, CASEFOLD 16.
+            let host_flags = [
+                (1, libc::FNM_NOESCAPE),
+                (2, libc::FNM_PATHNAME),
+                (4, libc::FNM_PERIOD),
+                (16, libc::FNM_CASEFOLD),
+            ]
+            .into_iter()
+            .filter(|&(bit, _)| flags & bit != 0)
+            .fold(0, |all, (_, host)| all | host);
+            let result = unsafe { libc::fnmatch(host_c(pattern), host_c(text), host_flags) };
+            // FNM_NOMATCH is 1 on bionic.
+            Ret::U32(if result == 0 { 0 } else { 1 })
+        }),
         "stat" | "lstat" => handler!(|uc, a| {
             let (path, out) = (a.u32(), a.u32());
             let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -1450,6 +1536,7 @@ pub fn handler(name: &str) -> Option<Handler> {
                 Ret::U32(u32::MAX)
             }
         }),
+        "dup" => handler!(|uc, a| checked(uc, unsafe { libc::dup(a.i32()) } as i64)),
         "dup2" => handler!(|uc, a| {
             let (from, to) = (a.i32(), a.i32());
             checked(uc, unsafe { libc::dup2(from, to) } as i64)
@@ -1494,18 +1581,21 @@ pub fn handler(name: &str) -> Option<Handler> {
             if entry.is_null() {
                 return Ret::U32(0);
             }
-            // bionic ARM32 dirent: u64 d_ino, i64 d_off, u16 d_reclen, u8 d_type, char d_name[256].
-            let entry = unsafe { &*entry };
-            let m = mem();
-            m.write_u64(buffer, entry.d_ino as u64);
-            m.write_u64(buffer + 8, entry.d_off as u64);
-            m.write_u16(buffer + 16, 280);
-            m.write_u8(buffer + 18, entry.d_type);
-            let name = unsafe { std::ffi::CStr::from_ptr(entry.d_name.as_ptr()) }.to_bytes();
-            let length = name.len().min(255);
-            m.write_bytes(buffer + 19, &name[..length]);
-            m.write_u8(buffer + 19 + length as u32, 0);
+            write_dirent(buffer, unsafe { &*entry });
             Ret::U32(buffer)
+        }),
+        // readdir_r(directory, entry, result): fills the caller's entry; *result is it, or null at the end.
+        "readdir_r" => handler!(|uc, a| {
+            let (handle, out, result) = (a.u32(), a.u32(), a.u32());
+            let Some(&(directory, _)) = shared().state.directories.get(&handle) else { return Ret::U32(libc::EBADF as u32) };
+            let entry = unsafe { libc::readdir(directory as *mut libc::DIR) };
+            if entry.is_null() {
+                mem().write_u32(result, 0);
+            } else {
+                write_dirent(out, unsafe { &*entry });
+                mem().write_u32(result, out);
+            }
+            Ret::U32(0)
         }),
         "closedir" => handler!(|uc, a| {
             let handle = a.u32();
@@ -1834,6 +1924,31 @@ pub fn handler(name: &str) -> Option<Handler> {
                     crate::elf::with_loader(|loader| loader.libraries.get(index as usize).and_then(|l| l.export(uc, &name)))
                 });
             Ret::U32(own.unwrap_or_else(|| lookup_symbol(&name)))
+        }),
+        // dladdr(address, info): which game library holds an address, and the nearest symbol at or
+        // below it. Dl_info is { file name, base, symbol name, symbol address }.
+        "dladdr" => handler!(|uc, a| {
+            let (address, info) = (a.u32(), a.u32());
+            let found = crate::elf::with_loader(|loader| {
+                let library = loader.libraries.iter().find(|l| (l.base..l.base + l.size).contains(&address))?;
+                let symbol = library.exports(uc).into_iter().filter(|(_, at)| *at <= address).max_by_key(|(_, at)| *at);
+                Some((library.name.clone(), library.base, symbol))
+            });
+            let Some((name, base, symbol)) = found else { return Ret::U32(0) };
+            let m = mem();
+            m.write_u32(info, shared().cached_cstr(format!("dladdr:{name}"), &name));
+            m.write_u32(info + 4, base);
+            match symbol {
+                Some((symbol_name, at)) => {
+                    m.write_u32(info + 8, shared().cached_cstr(format!("dladdr:{symbol_name}"), &symbol_name));
+                    m.write_u32(info + 12, at);
+                }
+                None => {
+                    m.write_u32(info + 8, 0);
+                    m.write_u32(info + 12, 0);
+                }
+            }
+            Ret::U32(1)
         }),
         "eglGetProcAddress" => handler!(|uc, a| {
             let name = mem().string(a.u32());

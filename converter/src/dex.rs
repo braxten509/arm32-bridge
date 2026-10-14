@@ -13,8 +13,22 @@
 //! Fix 3 - frame limiters: a Thread.sleep inside a GLSurfaceView renderer's
 //! onDrawFrame only ever holds the game below the screen's rate. The call
 //! becomes nops, so the game draws at the screen's rate.
+//!
+//! Fix 4 - expansion-file download screen: games built with Google Play's APK
+//! Expansion kit first open a download screen that fetches the game data from
+//! Play. Copies with the data already inside the APK still open it and get
+//! stuck there. Only for APKs over Play's 100 MB limit for an APK that comes
+//! with expansion files, which therefore must carry their data themselves:
+//! every `const-class` of the download screen outside the screen itself
+//! becomes the screen the download screen opens when it's done (the game).
+
+use std::collections::HashMap;
 
 const FLAG_HW_AV_SYNC: i32 = 0x10;
+const DOWNLOADER_CLIENT: &str = "Lcom/google/android/vending/expansion/downloader/IDownloaderClient;";
+const INTENT_FOR_CLASS: &str = "Landroid/content/Intent;.<init>:(Landroid/content/Context;Ljava/lang/Class;)V";
+/// Google Play's size limit for an APK that comes with expansion files.
+pub const PLAY_EXPANSION_APK_LIMIT: u64 = 100 * 1024 * 1024;
 const SHORT_LOAD_WAIT: i32 = 1;
 
 /// One change made to a dex file.
@@ -56,6 +70,17 @@ impl<'a> Dex<'a> {
     }
     fn type_name(&self, index: u32) -> String {
         self.string(self.u32(self.u32(0x44) as usize + index as usize * 4))
+    }
+    fn type_index(&self, name: &str) -> Option<u32> {
+        (0..self.u32(0x40)).find(|&index| self.type_name(index) == name)
+    }
+    /// The type indices of the interfaces class definition `class` implements.
+    fn interfaces(&self, class_def: usize) -> Vec<u32> {
+        let list = self.u32(class_def + 12) as usize;
+        if list == 0 {
+            return Vec::new();
+        }
+        (0..self.u32(list) as usize).map(|i| self.u16(list + 4 + i * 2).into()).collect()
     }
     /// `Lclass;.name:type` like dexdump prints a field reference.
     fn field(&self, index: u32) -> String {
@@ -105,32 +130,111 @@ fn instruction_length(units: &[u16]) -> usize {
     }
 }
 
-/// Finds every fix to make in a dex file.
-pub fn find_fixes(data: &[u8]) -> Vec<Fix> {
+/// The (method index, code offset) of every method with code in class definition `class_def`.
+fn methods(dex: &Dex, class_def: usize) -> Vec<(u32, usize)> {
+    let class_data = dex.u32(class_def + 24) as usize;
+    if class_data == 0 {
+        return Vec::new();
+    }
+    let mut at = class_data;
+    let counts: Vec<u32> = (0..4).map(|_| dex.uleb(&mut at)).collect();
+    for _ in 0..counts[0] + counts[1] {
+        dex.uleb(&mut at);
+        dex.uleb(&mut at);
+    }
+    let mut found = Vec::new();
+    for list in [counts[2], counts[3]] {
+        let mut method_index = 0;
+        for _ in 0..list {
+            method_index += dex.uleb(&mut at);
+            dex.uleb(&mut at);
+            let code = dex.uleb(&mut at) as usize;
+            if code != 0 {
+                found.push((method_index, code));
+            }
+        }
+    }
+    found
+}
+
+/// The instructions of the method whose code item starts at `code`: (offset in the file, units).
+fn instructions(dex: &Dex, code: usize) -> Vec<(usize, Vec<u16>)> {
+    let size = dex.u32(code + 12) as usize;
+    let start = code + 16;
+    let units: Vec<u16> = (0..size).map(|i| dex.u16(start + i * 2)).collect();
+    let mut list = Vec::new();
+    let mut pc = 0;
+    while pc < size {
+        let length = instruction_length(&units[pc..]).max(1).min(size - pc);
+        list.push((start + pc * 2, units[pc..pc + length].to_vec()));
+        pc += length;
+    }
+    list
+}
+
+/// Fix 4: expansion-file download screens -> the screen each opens when its download is done.
+fn download_screens(dex: &Dex) -> HashMap<u32, u32> {
+    let (class_count, class_defs) = (dex.u32(0x60) as usize, dex.u32(0x64) as usize);
+    let mut targets: HashMap<u32, Vec<u32>> = HashMap::new();
+    for class in 0..class_count {
+        let class_def = class_defs + class * 32;
+        let own_type = dex.u32(class_def);
+        if !dex.interfaces(class_def).iter().any(|&index| dex.type_name(index) == DOWNLOADER_CLIENT) {
+            continue;
+        }
+        // `const-class vA, X` followed by `new Intent(context, X)`: the screen it opens.
+        for (_, code) in methods(dex, class_def) {
+            let list = instructions(dex, code);
+            for pair in list.windows(2) {
+                let (first, next) = (&pair[0].1, &pair[1].1);
+                if first[0] & 0xFF == 0x1C
+                    && u32::from(first[1]) != own_type
+                    && next[0] & 0xFF == 0x70
+                    && dex.method(next[1].into()).0 == INTENT_FOR_CLASS
+                {
+                    targets.entry(own_type).or_default().push(first[1].into());
+                }
+            }
+        }
+    }
+    let opened: Vec<u32> = targets.values().flatten().copied().collect();
+    targets
+        .into_iter()
+        .filter_map(|(screen, mut to)| {
+            to.sort_unstable();
+            to.dedup();
+            // Exactly one place to go, and never a screen that another download screen opens
+            // (the game's own screen can take part in the download kit too).
+            (to.len() == 1 && !opened.contains(&screen)).then(|| (screen, to[0]))
+        })
+        .collect()
+}
+
+/// Finds every fix to make in a dex file. `carries_game_data`: the APK is too big to rely on
+/// expansion files, so their download screen can be skipped (fix 4).
+pub fn find_fixes(data: &[u8], carries_game_data: bool) -> Vec<Fix> {
     let dex = Dex { data };
     let mut fixes = Vec::new();
     let mut seen_code = std::collections::HashSet::new();
+    let skipped_screens = if carries_game_data { download_screens(&dex) } else { HashMap::new() };
     let (class_count, class_defs) = (dex.u32(0x60) as usize, dex.u32(0x64) as usize);
     for class in 0..class_count {
-        let class_data = dex.u32(class_defs + class * 32 + 24) as usize;
-        if class_data == 0 {
-            continue;
-        }
-        let mut at = class_data;
-        let counts: Vec<u32> = (0..4).map(|_| dex.uleb(&mut at)).collect();
-        for _ in 0..counts[0] + counts[1] {
-            dex.uleb(&mut at);
-            dex.uleb(&mut at);
-        }
-        for list in [counts[2], counts[3]] {
-            let mut method_index = 0;
-            for _ in 0..list {
-                method_index += dex.uleb(&mut at);
-                dex.uleb(&mut at);
-                let code = dex.uleb(&mut at) as usize;
-                if code != 0 && seen_code.insert(code) {
-                    let (_, name, signature) = dex.method(method_index);
-                    scan_code(&dex, code, &name, &signature, &mut fixes);
+        let class_def = class_defs + class * 32;
+        let own_type = dex.u32(class_def);
+        for (method_index, code) in methods(&dex, class_def) {
+            if seen_code.insert(code) {
+                let (_, name, signature) = dex.method(method_index);
+                scan_code(&dex, code, &name, &signature, &mut fixes);
+                for (offset, units) in instructions(&dex, code) {
+                    let Some(&target) = skipped_screens.get(&u32::from(units.get(1).copied().unwrap_or(0))) else { continue };
+                    if units[0] & 0xFF == 0x1C && u32::from(units[1]) != own_type {
+                        fixes.push(Fix {
+                            offset,
+                            reason: "expansion-file download screen skipped (the APK already has the game data)",
+                            old: dex.type_name(units[1].into()),
+                            new: dex.type_name(target),
+                        });
+                    }
                 }
             }
         }
@@ -203,9 +307,10 @@ fn scan_code(dex: &Dex, code: usize, method_name: &str, method_signature: &str, 
 }
 
 /// Applies the fixes and updates the header checksums. Returns what changed.
-pub fn patch(data: &mut [u8]) -> Vec<Fix> {
-    let fixes = find_fixes(data);
-    for fix in &fixes {
+pub fn patch(data: &mut [u8], carries_game_data: bool) -> Vec<Fix> {
+    let fixes = find_fixes(data, carries_game_data);
+    let new_types: Vec<Option<u32>> = fixes.iter().map(|fix| Dex { data }.type_index(&fix.new)).collect();
+    for (fix, new_type) in fixes.iter().zip(new_types) {
         let at = fix.offset;
         match data[at] {
             0x71 | 0x77 => data[at..at + 6].fill(0),
@@ -216,6 +321,10 @@ pub fn patch(data: &mut [u8]) -> Vec<Fix> {
             0x14 => {
                 let value: i32 = fix.new.parse().unwrap();
                 data[at + 2..at + 6].copy_from_slice(&(value as u32).to_le_bytes());
+            }
+            0x1C => {
+                let index = new_type.expect("the new class is a type in this dex") as u16;
+                data[at + 2..at + 4].copy_from_slice(&index.to_le_bytes());
             }
             other => panic!("unexpected opcode {other:#x} at {at:#x}"),
         }

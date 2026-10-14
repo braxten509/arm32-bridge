@@ -252,6 +252,7 @@ pub fn handler(name: &str) -> Option<Handler> {
         }),
         // long is 32 bits on ARM32.
         "lrint" => handler!(|uc, a| Ret::U32(unsafe { c::lrint(a.f64()) }.clamp(i32::MIN as i64, i32::MAX as i64) as u32)),
+        "lrintf" => handler!(|uc, a| Ret::U32((a.f32().round_ties_even() as f64).clamp(i32::MIN as f64, i32::MAX as f64) as i32 as u32)),
         "llrint" => handler!(|uc, a| Ret::U64(unsafe { c::llrint(a.f64()) } as u64)),
         "isnan" | "__isnan" => handler!(|uc, a| Ret::U32(a.f64().is_nan() as u32)),
         "isnanf" | "__isnanf" => handler!(|uc, a| Ret::U32(a.f32().is_nan() as u32)),

@@ -18,6 +18,12 @@
 #include <sys/uio.h>
 #include <wchar.h>
 #include <wctype.h>
+#include <dirent.h>
+#include <fnmatch.h>
+#include <utime.h>
+#include <sys/stat.h>
+#include <sys/vfs.h>
+#include <stdarg.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/mman.h>
@@ -2126,6 +2132,18 @@ static bool library_code_made_writable() {
 }
 static double take_mixed(int a, double b, int c, long long d, float e) { return a + b + c + (double)d + e; }
 
+// Old bionic names that today's headers no longer declare.
+extern "C" unsigned int __page_size;
+extern "C" const char *const sys_siglist[];
+extern "C" int pthread_cond_timedwait_monotonic_np(pthread_cond_t *, pthread_mutex_t *, const struct timespec *);
+static int print_through_vprintf(const char *format, ...) {
+    va_list list;
+    va_start(list, format);
+    int written = vprintf(format, list);
+    va_end(list);
+    return written;
+}
+
 extern "C" int run_all() {
     check(constructor_ran == 42, "constructor ran at load");
     check(built_at_load == "made at load", "C++ static object built at load");
@@ -2575,6 +2593,61 @@ extern "C" int run_all() {
         if (udp >= 0) close(udp);
         check(listed && has_loopback && ioctl(0, 0x1234, nullptr) == -1 && errno == ENOTTY,
               "ioctl SIOCGIFCONF / SIOCGIFFLAGS / unknown request");
+    }
+
+    {
+        // Functions Angry Birds needs (2026-10-14).
+        volatile float two_and_half = 2.5f, three_and_half = 3.5f;
+        int copy = dup(1);
+        check(lrintf(two_and_half) == 2 && lrintf(three_and_half) == 4 && copy > 2 && close(copy) == 0 &&
+                  __page_size == (unsigned)getpagesize() && sys_siglist[SIGSEGV] && strlen(sys_siglist[SIGSEGV]) > 0 &&
+                  print_through_vprintf("%s %d\n", "vprintf", 7) == 10,
+              "lrintf / dup / __page_size / sys_siglist / vprintf");
+        check(fnmatch("*.txt", "notes.txt", 0) == 0 && fnmatch("*.txt", "dir/notes.txt", FNM_PATHNAME) == FNM_NOMATCH &&
+                  fnmatch("A*", "apple", FNM_CASEFOLD) == 0 && pathconf("/", _PC_NAME_MAX) == 255,
+              "fnmatch / pathconf");
+        DIR *directory = opendir("/proc/self");
+        struct dirent entry, *result = nullptr;
+        bool found_status = false;
+        while (directory && readdir_r(directory, &entry, &result) == 0 && result) {
+            if (result == &entry && strcmp(entry.d_name, "status") == 0) found_status = true;
+        }
+        if (directory) closedir(directory);
+        struct statfs disk;
+        check(found_status && statfs("/", &disk) == 0 && disk.f_bsize > 0 && disk.f_blocks > 0, "readdir_r / statfs");
+        char name[L_tmpnam];
+        tmpnam(name);
+        FILE *made = fopen(name, "w");
+        if (made) fclose(made);
+        struct utimbuf times = {1000000, 2000000};
+        struct stat after;
+        check(made && utime(name, &times) == 0 && stat(name, &after) == 0 && after.st_mtime == 2000000 &&
+                  after.st_atime == 1000000 && unlink(name) == 0,
+              "utime");
+        Dl_info info;
+        check(dladdr((void *)run_all, &info) && strstr(info.dli_fname, "selftest") && info.dli_sname &&
+                  strcmp(info.dli_sname, "run_all") == 0 && info.dli_saddr == (void *)run_all,
+              "dladdr");
+        char interface_name[IF_NAMESIZE] = "";
+        unsigned loopback = if_nametoindex("lo");
+        struct servent *web = getservbyport(htons(80), "tcp");
+        check(loopback > 0 && if_indextoname(loopback, interface_name) == interface_name && strcmp(interface_name, "lo") == 0 &&
+                  web && strcmp(web->s_name, "http") == 0 && web->s_port == htons(80) && strcmp(web->s_proto, "tcp") == 0,
+              "if_nametoindex / if_indextoname / getservbyport");
+        pthread_cond_t never = PTHREAD_COND_INITIALIZER;
+        pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+        struct timespec deadline;
+        clock_gettime(CLOCK_MONOTONIC, &deadline);
+        deadline.tv_nsec += 20000000;
+        if (deadline.tv_nsec >= 1000000000) {
+            deadline.tv_sec++;
+            deadline.tv_nsec -= 1000000000;
+        }
+        double before = seconds_now();
+        pthread_mutex_lock(&lock);
+        int waited = pthread_cond_timedwait_monotonic_np(&never, &lock, &deadline);
+        pthread_mutex_unlock(&lock);
+        check(waited == ETIMEDOUT && seconds_now() - before < 2.0, "pthread_cond_timedwait_monotonic_np");
     }
 
     __android_log_print(ANDROID_LOG_INFO, TAG, "%d failures", failures);

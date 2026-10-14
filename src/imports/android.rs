@@ -13,6 +13,7 @@ pub const NAMES: &[&str] = &[
     "AAsset_read",
     "AAsset_seek",
     "AAsset_getLength",
+    "AAsset_getLength64",
     "AAsset_getRemainingLength",
     "AAsset_getBuffer",
     "AAsset_openFileDescriptor",
@@ -45,6 +46,7 @@ mod host {
         fn AAsset_read(asset: *mut c_void, buffer: *mut c_void, count: usize) -> i32;
         fn AAsset_seek(asset: *mut c_void, offset: libc::off_t, whence: i32) -> libc::off_t;
         fn AAsset_getLength(asset: *mut c_void) -> libc::off_t;
+        fn AAsset_getLength64(asset: *mut c_void) -> i64;
         fn AAsset_getRemainingLength(asset: *mut c_void) -> libc::off_t;
         fn AAsset_getBuffer(asset: *mut c_void) -> *const c_void;
         fn AAsset_openFileDescriptor(asset: *mut c_void, start: *mut libc::off_t, length: *mut libc::off_t) -> i32;
@@ -161,6 +163,7 @@ mod host {
                 Ret::U32(unsafe { AAsset_seek(get(asset), offset as libc::off_t, whence) } as u32)
             }),
             "AAsset_getLength" => handler!(|uc, a| Ret::U32(unsafe { AAsset_getLength(get(a.u32())) } as u32)),
+            "AAsset_getLength64" => handler!(|uc, a| Ret::U64(unsafe { AAsset_getLength64(get(a.u32())) } as u64)),
             "AAsset_getRemainingLength" => {
                 handler!(|uc, a| Ret::U32(unsafe { AAsset_getRemainingLength(get(a.u32())) } as u32))
             }

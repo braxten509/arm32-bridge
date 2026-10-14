@@ -40,6 +40,8 @@ pub struct State {
     pub static_text: u32,
     /// gethostbyname's result area (one for the whole game, like bionic's).
     pub hostent: u32,
+    /// getservbyport's result area.
+    pub servent: u32,
     pub data_imports: HashMap<String, u32>,
     /// Data imports the bridge doesn't know (given zero bytes).
     pub unknown_data: Vec<String>,
@@ -114,7 +116,7 @@ const BIONIC_FILE_SIZE: u32 = 84;
 /// Whether `data_import` has real data for `name` (not just zero bytes).
 pub fn known_data_import(name: &str) -> bool {
     name.starts_with("SL_IID_")
-        || matches!(name, "__sF" | "__stack_chk_guard" | "_ctype_" | "_tolower_tab_" | "_toupper_tab_")
+        || matches!(name, "__sF" | "__stack_chk_guard" | "_ctype_" | "_tolower_tab_" | "_toupper_tab_" | "__page_size" | "sys_siglist")
 }
 
 /// Guest address for a data object the game imports (stdio, ctype tables...).
@@ -156,6 +158,25 @@ pub fn data_import(name: &str) -> u32 {
             let pointer = runtime.misc_alloc(4, 4);
             memory.write_u32(pointer, table);
             pointer
+        }
+        // Old bionic exported the page size as data (`unsigned int __page_size`).
+        "__page_size" => {
+            let address = runtime.misc_alloc(4, 4);
+            memory.write_u32(address, crate::mem::PAGE);
+            address
+        }
+        // `const char* const sys_siglist[NSIG]`: each signal's description (NSIG is 65 on 32-bit ARM).
+        "sys_siglist" => {
+            const NSIG: u32 = 65;
+            let table = runtime.misc_alloc(NSIG * 4, 4);
+            for signal in 1..NSIG as i32 {
+                let text = unsafe { std::ffi::CStr::from_ptr(libc::strsignal(signal)) }.to_bytes().to_vec();
+                let string = runtime.misc_alloc(text.len() as u32 + 1, 1);
+                memory.write_bytes(string, &text);
+                memory.write_u8(string + text.len() as u32, 0);
+                memory.write_u32(table + signal as u32 * 4, string);
+            }
+            table
         }
         "_tolower_tab_" | "_toupper_tab_" => {
             let table = runtime.misc_alloc(257 * 2, 4);

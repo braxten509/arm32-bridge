@@ -118,6 +118,7 @@ impl<E: std::fmt::Display> From<E> for Failure {
 fn convert(options: &Options) -> Result<(), Failure> {
     println!("step Reading the game");
     let mut archive = ZipArchive::new(File::open(&options.input)?)?;
+    let carries_game_data = std::fs::metadata(&options.input)?.len() > dex::PLAY_EXPANSION_APK_LIMIT;
     let names: Vec<String> = archive.file_names().map(String::from).collect();
     let library_in = |abi: &str, name: &str| {
         name.strip_prefix(&format!("lib/{abi}/")).filter(|file| file.ends_with(".so") && !file.contains('/')).map(String::from)
@@ -173,7 +174,7 @@ fn convert(options: &Options) -> Result<(), Failure> {
                 if name == "classes.dex" {
                     println!("step Fixing known Java problems");
                 }
-                for fix in dex::patch(&mut bytes) {
+                for fix in dex::patch(&mut bytes, carries_game_data) {
                     println!("fix {name}: {}: {} -> {}", fix.reason, fix.old, fix.new);
                 }
                 // Such methods get no env/class arguments; the bridge can't tell them

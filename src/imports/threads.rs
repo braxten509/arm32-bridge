@@ -601,6 +601,11 @@ pub fn handler(name: &str) -> Option<Handler> {
             let deadline = if monotonic { monotonic_deadline(deadline) } else { guest_time(deadline) };
             Ret::U32(condition_wait(uc, condition, mutex, Some(deadline)))
         }),
+        // Old bionic: the deadline is on the monotonic clock whatever the condition was made with.
+        "pthread_cond_timedwait_monotonic" | "pthread_cond_timedwait_monotonic_np" => handler!(|uc, a| {
+            let (condition, mutex, deadline) = (a.u32(), a.u32(), a.u32());
+            Ret::U32(condition_wait(uc, condition, mutex, Some(monotonic_deadline(deadline))))
+        }),
         // Raw system calls through libc's syscall(): -1 and errno on failure.
         "syscall" => handler!(|uc, a| {
             let number = a.u32();

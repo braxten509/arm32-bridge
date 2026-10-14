@@ -415,7 +415,8 @@ fn resolve(_uc: &mut Uc, library: &Library, symbol: &crate::elf::Symbol) -> u32 
     if let Some(&address) = shared().guest_exports.get(&symbol.name) {
         return address;
     }
-    if symbol.kind == STT_OBJECT {
+    // Data the bridge knows by name counts as data even when the import isn't marked as an object.
+    if symbol.kind == STT_OBJECT || crate::imports::known_data_import(&symbol.name) {
         return crate::imports::data_import(&symbol.name);
     }
     // Like the real loader: a weak function nobody defines is NULL, and game

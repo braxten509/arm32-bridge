@@ -47,6 +47,33 @@ fn interface_list(uc: &Uc, fd: i32, argument: u32) -> Ret {
     Ret::U32(0)
 }
 
+// getservbyport's result area: struct servent (16 bytes), the empty alias list, the name, the protocol.
+const SERVENT_ALIASES: u32 = 16;
+const SERVENT_NAME: u32 = 20;
+const SERVENT_TEXT_SIZE: u32 = 64;
+const SERVENT_PROTOCOL: u32 = SERVENT_NAME + SERVENT_TEXT_SIZE;
+
+/// Fills getservbyport's shared result area; returns its struct servent.
+fn write_servent(name: &[u8], port: i32, protocol: &[u8]) -> u32 {
+    if shared().state.servent == 0 {
+        let area = shared().misc_alloc(SERVENT_PROTOCOL + SERVENT_TEXT_SIZE, 4);
+        shared().state.servent = area;
+    }
+    let base = shared().state.servent;
+    let m = mem();
+    for (at, text) in [(SERVENT_NAME, name), (SERVENT_PROTOCOL, protocol)] {
+        let text = &text[..text.len().min(SERVENT_TEXT_SIZE as usize - 1)];
+        m.write_bytes(base + at, text);
+        m.write_u8(base + at + text.len() as u32, 0);
+    }
+    m.write_u32(base + SERVENT_ALIASES, 0);
+    m.write_u32(base, base + SERVENT_NAME); // s_name
+    m.write_u32(base + 4, base + SERVENT_ALIASES); // s_aliases
+    m.write_u32(base + 8, port as u32); // s_port
+    m.write_u32(base + 12, base + SERVENT_PROTOCOL); // s_proto
+    base
+}
+
 const HOSTENT_ADDRESSES: usize = 16;
 // The result area: struct hostent (20 bytes), the empty alias list, the
 // address list, the addresses, then the name.
@@ -427,6 +454,28 @@ pub fn handler(name: &str) -> Option<Handler> {
                 return Ret::U32(0);
             }
             Ret::U32(write_hostent(&mem().c_str(name_pointer).to_bytes().to_vec(), &addresses))
+        }),
+        "if_nametoindex" => handler!(|uc, a| Ret::U32(unsafe { libc::if_nametoindex(pointer(a.u32()).cast()) })),
+        "if_indextoname" => handler!(|uc, a| {
+            let (index, out) = (a.u32(), a.u32());
+            let result = unsafe { libc::if_indextoname(index, pointer(out).cast()) };
+            if result.is_null() {
+                finish(uc, -1, std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+                return Ret::U32(0);
+            }
+            Ret::U32(out)
+        }),
+        // getservbyport(port in network order, protocol or null) from the phone's service list.
+        "getservbyport" => handler!(|uc, a| {
+            let (port, protocol) = (a.i32(), a.u32());
+            let found = unsafe { libc::getservbyport(port, pointer(protocol) as *const libc::c_char) };
+            if found.is_null() {
+                return Ret::U32(0);
+            }
+            let found = unsafe { &*found };
+            let name = unsafe { std::ffi::CStr::from_ptr(found.s_name) }.to_bytes().to_vec();
+            let protocol = unsafe { std::ffi::CStr::from_ptr(found.s_proto) }.to_bytes().to_vec();
+            Ret::U32(write_servent(&name, found.s_port, &protocol))
         }),
         "gai_strerror" => handler!(|uc, a| {
             let text = unsafe { std::ffi::CStr::from_ptr(libc::gai_strerror(a.i32())) }.to_bytes().to_vec();
