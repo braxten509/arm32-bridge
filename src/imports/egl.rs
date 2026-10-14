@@ -58,6 +58,21 @@ pub const NAMES: &[&str] = &[
     "ALooper_wake",
     "ALooper_pollAll",
     "ALooper_pollOnce",
+    "ASensorManager_getInstance",
+    "ASensorManager_getSensorList",
+    "ASensorManager_getDefaultSensor",
+    "ASensorManager_createEventQueue",
+    "ASensorManager_destroyEventQueue",
+    "ASensor_getName",
+    "ASensor_getVendor",
+    "ASensor_getType",
+    "ASensor_getResolution",
+    "ASensor_getMinDelay",
+    "ASensorEventQueue_enableSensor",
+    "ASensorEventQueue_disableSensor",
+    "ASensorEventQueue_setEventRate",
+    "ASensorEventQueue_hasEvents",
+    "ASensorEventQueue_getEvents",
 ];
 
 #[cfg(not(target_os = "android"))]
@@ -132,6 +147,42 @@ mod host {
         fn ALooper_wake(looper: Pointer);
         fn ALooper_pollAll(timeout: i32, fd: *mut i32, events: *mut i32, data: *mut Pointer) -> i32;
         fn ALooper_pollOnce(timeout: i32, fd: *mut i32, events: *mut i32, data: *mut Pointer) -> i32;
+        fn ASensorManager_getInstance() -> Pointer;
+        fn ASensorManager_getSensorList(manager: Pointer, list: *mut *const Pointer) -> i32;
+        fn ASensorManager_getDefaultSensor(manager: Pointer, kind: i32) -> Pointer;
+        fn ASensorManager_createEventQueue(manager: Pointer, looper: Pointer, ident: i32, callback: Pointer, data: Pointer) -> Pointer;
+        fn ASensorManager_destroyEventQueue(manager: Pointer, queue: Pointer) -> i32;
+        fn ASensor_getName(sensor: Pointer) -> *const libc::c_char;
+        fn ASensor_getVendor(sensor: Pointer) -> *const libc::c_char;
+        fn ASensor_getType(sensor: Pointer) -> i32;
+        fn ASensor_getResolution(sensor: Pointer) -> f32;
+        fn ASensor_getMinDelay(sensor: Pointer) -> i32;
+        fn ASensorEventQueue_enableSensor(queue: Pointer, sensor: Pointer) -> i32;
+        fn ASensorEventQueue_disableSensor(queue: Pointer, sensor: Pointer) -> i32;
+        fn ASensorEventQueue_setEventRate(queue: Pointer, sensor: Pointer, microseconds: i32) -> i32;
+        fn ASensorEventQueue_hasEvents(queue: Pointer) -> i32;
+        fn ASensorEventQueue_getEvents(queue: Pointer, events: *mut u8, count: usize) -> isize;
+    }
+
+    /// ASensorEvent is 104 bytes with the same layout on 32- and 64-bit
+    /// Android (fixed-size fields only), so events are copied as bytes.
+    const SENSOR_EVENT_SIZE: usize = 104;
+
+    /// Guest copies of sensor lists (by manager) and names/vendors (by sensor
+    /// and which), kept for the process, as the host keeps the originals.
+    static SENSOR_COPIES: Mutex<Option<HashMap<(u32, u32), u32>>> = Mutex::new(None);
+
+    fn sensor_copy(key: (u32, u32), make: impl FnOnce() -> u32) -> u32 {
+        let mut copies = SENSOR_COPIES.lock().unwrap();
+        *copies.get_or_insert_with(HashMap::new).entry(key).or_insert_with(make)
+    }
+
+    fn guest_c_string(text: *const libc::c_char) -> u32 {
+        if text.is_null() {
+            return 0;
+        }
+        let bytes = unsafe { std::ffi::CStr::from_ptr(text) }.to_bytes().to_vec();
+        crate::runtime::heap().strdup(&bytes)
     }
 
     /// An EGL extension function, looked up once through eglGetProcAddress.
@@ -218,8 +269,8 @@ mod host {
         }
     }
 
-    /// Polls the host looper; the data pointer can't fit in 32 bits, and the
-    /// game never added an fd of its own, so it reads back as NULL.
+    /// Polls the host looper. The data pointer handed back is the game's own
+    /// 32-bit value (only fds the game added, such as sensor queues, report one).
     fn poll(once: bool, timeout: i32, fd_out: u32, events_out: u32, data_out: u32) -> i32 {
         let (mut fd, mut events, mut data) = (0i32, 0i32, std::ptr::null_mut());
         let result = unsafe {
@@ -236,7 +287,9 @@ mod host {
             mem().write_u32(events_out, events as u32);
         }
         if data_out != 0 {
-            mem().write_u32(data_out, 0);
+            // Only fds the game added (sensor queues) report data here, and their
+            // data is the game's own 32-bit value.
+            mem().write_u32(data_out, data as usize as u32);
         }
         result
     }
@@ -474,6 +527,77 @@ mod host {
             "ALooper_pollOnce" => handler!(|uc, a| {
                 let (timeout, fd, events, data) = (a.i32(), a.u32(), a.u32(), a.u32());
                 Ret::U32(poll(true, timeout, fd, events, data) as u32)
+            }),
+            "ASensorManager_getInstance" => handler!(|uc, a| Ret::U32(guest(unsafe { ASensorManager_getInstance() }))),
+            "ASensorManager_getSensorList" => handler!(|uc, a| {
+                let (manager, out) = (a.u32(), a.u32());
+                let mut list: *const Pointer = std::ptr::null();
+                let count = unsafe { ASensorManager_getSensorList(host(manager), &mut list) }.max(0);
+                if out != 0 {
+                    let array = sensor_copy((manager, 0), || {
+                        let array = crate::runtime::heap().malloc(count as u32 * 4 + 4);
+                        for i in 0..count as usize {
+                            mem().write_u32(array + i as u32 * 4, guest(unsafe { *list.add(i) }));
+                        }
+                        array
+                    });
+                    mem().write_u32(out, array);
+                }
+                Ret::U32(count as u32)
+            }),
+            "ASensorManager_getDefaultSensor" => handler!(|uc, a| {
+                let (manager, kind) = (a.u32(), a.i32());
+                Ret::U32(guest(unsafe { ASensorManager_getDefaultSensor(host(manager), kind) }))
+            }),
+            "ASensorManager_createEventQueue" => handler!(|uc, a| {
+                let (manager, looper, ident, callback, data) = (a.u32(), a.u32(), a.i32(), a.u32(), a.u32());
+                if callback != 0 {
+                    // The host looper would call this guest address as host code.
+                    crate::log::line("[bridge] ASensorManager_createEventQueue with a callback: not supported, events come by ident only");
+                }
+                let queue = unsafe {
+                    ASensorManager_createEventQueue(host(manager), host(looper), ident, std::ptr::null_mut(), data as usize as Pointer)
+                };
+                Ret::U32(guest(queue))
+            }),
+            "ASensorManager_destroyEventQueue" => handler!(|uc, a| {
+                let (manager, queue) = (a.u32(), a.u32());
+                let result = unsafe { ASensorManager_destroyEventQueue(host(manager), host(queue)) };
+                forget(queue);
+                Ret::U32(result as u32)
+            }),
+            "ASensor_getName" => handler!(|uc, a| {
+                let sensor = a.u32();
+                Ret::U32(sensor_copy((sensor, 1), || guest_c_string(unsafe { ASensor_getName(host(sensor)) })))
+            }),
+            "ASensor_getVendor" => handler!(|uc, a| {
+                let sensor = a.u32();
+                Ret::U32(sensor_copy((sensor, 2), || guest_c_string(unsafe { ASensor_getVendor(host(sensor)) })))
+            }),
+            "ASensor_getType" => handler!(|uc, a| Ret::U32(unsafe { ASensor_getType(host(a.u32())) } as u32)),
+            "ASensor_getResolution" => handler!(|uc, a| Ret::F32(unsafe { ASensor_getResolution(host(a.u32())) })),
+            "ASensor_getMinDelay" => handler!(|uc, a| Ret::U32(unsafe { ASensor_getMinDelay(host(a.u32())) } as u32)),
+            "ASensorEventQueue_enableSensor" => handler!(|uc, a| {
+                let (queue, sensor) = (a.u32(), a.u32());
+                Ret::U32(unsafe { ASensorEventQueue_enableSensor(host(queue), host(sensor)) } as u32)
+            }),
+            "ASensorEventQueue_disableSensor" => handler!(|uc, a| {
+                let (queue, sensor) = (a.u32(), a.u32());
+                Ret::U32(unsafe { ASensorEventQueue_disableSensor(host(queue), host(sensor)) } as u32)
+            }),
+            "ASensorEventQueue_setEventRate" => handler!(|uc, a| {
+                let (queue, sensor, microseconds) = (a.u32(), a.u32(), a.i32());
+                Ret::U32(unsafe { ASensorEventQueue_setEventRate(host(queue), host(sensor), microseconds) } as u32)
+            }),
+            "ASensorEventQueue_hasEvents" => handler!(|uc, a| Ret::U32(unsafe { ASensorEventQueue_hasEvents(host(a.u32())) } as u32)),
+            "ASensorEventQueue_getEvents" => handler!(|uc, a| {
+                let (queue, events, count) = (a.u32(), a.u32(), a.u32().min(256) as usize);
+                let mut buffer = vec![0u8; count * SENSOR_EVENT_SIZE];
+                let got = unsafe { ASensorEventQueue_getEvents(host(queue), buffer.as_mut_ptr(), count) };
+                if got > 0 {
+                    mem().write_bytes(events, &buffer[..got as usize * SENSOR_EVENT_SIZE]);
+                }
+                Ret::U32(got as i32 as u32)
             }),
             _ => None,
         }

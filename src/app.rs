@@ -98,11 +98,27 @@ pub extern "C" fn arm32_bridge_load(vm: *mut JavaVM, env: *mut JNIEnv, original:
     }
 }
 
+/// debug.arm32bridge.env="NAME=VALUE;NAME2=VALUE2" sets environment variables
+/// the guest reads through getenv, once, before any game code runs. For tests.
+fn set_debug_environment() {
+    static DONE: std::sync::Once = std::sync::Once::new();
+    DONE.call_once(|| {
+        let Some(list) = crate::dynarec::property("debug.arm32bridge.env") else { return };
+        for (name, value) in list.split(';').filter_map(|pair| pair.split_once('=')) {
+            if !name.is_empty() {
+                crate::log::line(&format!("[bridge] debug environment {name}={value}"));
+                std::env::set_var(name, value);
+            }
+        }
+    });
+}
+
 fn load(vm: *mut JavaVM, env: *mut JNIEnv, original: *const c_char) -> Result<(), String> {
     let started = Instant::now();
     let path = PathBuf::from(unsafe { CStr::from_ptr(original) }.to_string_lossy().into_owned());
     // debug.arm32bridge.trace=1 logs every phone function call (very slow).
     crate::runtime::init(crate::dynarec::property("debug.arm32bridge.trace").as_deref() == Some("1"));
+    set_debug_environment();
     jni_host::set_vm(vm);
     let _lock = hold_gil();
     let _entry = jni_host::enter(env);
@@ -310,11 +326,11 @@ pub fn forward(env: *mut JNIEnv, symbol: &str, address: &AtomicU32, args: &[Host
         crate::sound_preload::on_frame(env, library_directory());
     }
     let started = Instant::now();
-    let phone_before = crate::runtime::phone_time();
     let waiting_before = crate::runtime::lock_wait_time();
     let _lock = hold_gil();
     let _entry = jni_host::enter(env);
     let uc = engine();
+    let phone_before = crate::runtime::phone_time(uc);
     let mut guest_address = address.load(Ordering::Relaxed);
     if guest_address == 0 {
         let found = shared().guest_exports.get(symbol).copied();
@@ -354,7 +370,7 @@ pub fn forward(env: *mut JNIEnv, symbol: &str, address: &AtomicU32, args: &[Host
     if is_frame {
         count_frame(
             started.elapsed(),
-            crate::runtime::phone_time() - phone_before,
+            crate::runtime::phone_time(uc) - phone_before,
             crate::runtime::lock_wait_time() - waiting_before,
         );
     }

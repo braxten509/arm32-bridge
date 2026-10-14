@@ -322,7 +322,12 @@ fn run_handler(uc: &mut Uc, me: &Identity, signal: u32, action: Action, blocked:
     }
     set_blocked(me, during);
 
-    let frame = crate::runtime::heap().malloc(SIGINFO_SIZE + UCONTEXT_SIZE);
+    // The frame goes on the thread's own stack, below its stack pointer, as the
+    // kernel puts it: a garbage collector's pause handler (Boehm GC in Mono)
+    // scans the stack from its own frame up and counts on finding the
+    // interrupted code's registers there.
+    let interrupted_sp = uc.reg(13);
+    let frame = interrupted_sp.wrapping_sub(SIGINFO_SIZE + UCONTEXT_SIZE) & !7;
     let memory = mem();
     unsafe { std::ptr::write_bytes(memory.host(frame), 0, (SIGINFO_SIZE + UCONTEXT_SIZE) as usize) };
     let info = frame;
@@ -334,7 +339,7 @@ fn run_handler(uc: &mut Uc, me: &Identity, signal: u32, action: Action, blocked:
         memory.write_u32(context + MCONTEXT_R0 + register as u32 * 4, uc.reg(register));
     }
     // Parked in a phone function: the thread carries on at its return address.
-    let resume = crate::runtime::resume_point().unwrap_or_else(|| uc.reg(14));
+    let resume = crate::runtime::resume_point(uc).unwrap_or_else(|| uc.reg(14));
     let thumb = resume & 1;
     memory.write_u32(context + MCONTEXT_PC, resume & !1);
     memory.write_u32(context + MCONTEXT_CPSR, 0x10 | (thumb << 5));
@@ -345,9 +350,12 @@ fn run_handler(uc: &mut Uc, me: &Identity, signal: u32, action: Action, blocked:
     let before: Vec<u32> = (0..16).map(|r| uc.reg(r)).collect();
     let arguments: &[u32] =
         if action.flags & SA_SIGINFO != 0 { &[signal, info, context] } else { &[signal] };
+    // The handler runs below the frame; the thread's own stack pointer comes back after.
+    uc.set_reg(13, frame);
     if let Err(error) = crate::runtime::call_guest(uc, action.handler, arguments) {
         crate::log::line(&format!("[bridge] handler for signal {signal} stopped: {error}"));
     }
+    uc.set_reg(13, interrupted_sp);
     let after: Vec<u32> = (0..16).map(|r| uc.reg(r)).collect();
     let changed: Vec<String> = (0..16)
         .filter(|&r| before[r] != after[r])
@@ -365,7 +373,6 @@ fn run_handler(uc: &mut Uc, me: &Identity, signal: u32, action: Action, blocked:
     // Returning from a handler restores the mask saved in the context.
     let restored = memory.read_u32(context + SIGMASK) as u64 | (memory.read_u32(context + SIGMASK + 4) as u64) << 32;
     set_blocked(me, restored);
-    crate::runtime::heap().free(frame);
     me.delivered.fetch_add(1, Ordering::AcqRel);
 }
 

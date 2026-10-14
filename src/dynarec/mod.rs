@@ -10,7 +10,7 @@ pub mod emit;
 pub mod thumb;
 
 mod engine;
-pub use engine::{enabled, invalidate, print_stats, property, run, seed_from_unicorn, Native};
+pub use engine::{enabled, invalidate, invalidate_library, print_stats, property, run, seed_from_unicorn, Native};
 
 /// Guest register state while (or between) running translated code.
 /// Offsets are used by the generated code; keep them in sync with `offsets`.

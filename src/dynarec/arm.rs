@@ -8,6 +8,9 @@ use super::{LR, MAX_INSTRUCTIONS, PC, SP, T0, T1, T2, T3, T4, T5, T6};
 /// Translates the ARM block starting at `start` (4-byte aligned).
 pub fn translate(mem: GuestMem, start: u32) -> Block {
     let mut t = Translator { a: Asm::new(), mem, pc: start, size: 4, count: 0, in_it: false, thumb: false, neon_fp: false };
+    if let Some(word) = super::fence_prefix() {
+        t.a.emit(word);
+    }
     let end;
     loop {
         if t.count >= MAX_INSTRUCTIONS {
@@ -442,13 +445,11 @@ impl Translator {
         }
         self.a.add_x_uxtw(T1, host::MEMORY, T0);
         if load {
-            if rt == rn {
-                self.a.ldr_w_off(T3, T1, 0);
-                self.a.ldr_w_off(rt2, T1, 4);
-                self.a.mov_w(rt, T3);
-            } else {
-                self.a.ldp_w_off(rt, rt2, T1, 0);
-            }
+            // One LDP even when rt is the base register (the address is in T1): an
+            // 8-byte-aligned LDRD is one single-copy-atomic read on LPAE cores, and so is
+            // this LDP on hosts with FEAT_LSE2 (every ARMv8.4+ core, the Pixel 10's too).
+            // Two separate loads let another core's write land between them.
+            self.a.ldp_w_off(rt, rt2, T1, 0);
         } else {
             self.a.stp_w_off(rt, rt2, T1, 0);
         }
@@ -504,6 +505,20 @@ impl Translator {
     }
 
     fn arm_media(&mut self, word: u32) -> Result<Flow> {
+        if word & 0x0FA0_0030 == 0x06A0_0010 {
+            // SSAT / USAT (U = bit 22): sat = 20-16, Rd = 15-12, imm5 = 11-7, sh = bit 6, Rn = 3-0
+            let signed = (word >> 22) & 1 == 0;
+            let (rd, rn) = ((word >> 12) & 0xF, word & 0xF);
+            let bits = ((word >> 16) & 0x1F) + signed as u32;
+            let kind = if (word >> 6) & 1 == 1 { shift::ASR } else { shift::LSL };
+            return self.saturate_instruction(rd, rn, signed, bits, kind, (word >> 7) & 0x1F);
+        }
+        if word & 0x0FB0_0FF0 == 0x06A0_0F30 {
+            // SSAT16 / USAT16 (U = bit 22): sat = 19-16, Rd = 15-12, Rn = 3-0
+            let signed = (word >> 22) & 1 == 0;
+            let bits = ((word >> 16) & 0xF) + signed as u32;
+            return self.saturate_halves_instruction((word >> 12) & 0xF, word & 0xF, signed, bits);
+        }
         if word & 0x0FF0_0030 == 0x0680_0010 {
             // PKHBT / PKHTB: Rn = 19-16, Rd = 15-12, imm5 = 11-7, tb = bit 6, Rm = 3-0
             let (rn, rd, rm) = ((word >> 16) & 0xF, (word >> 12) & 0xF, word & 0xF);
@@ -624,6 +639,11 @@ impl Translator {
                 return Err(());
             }
             self.a.ldr_w_off(rt, host::STATE, offsets::TLS);
+            return Ok(Flow::Next);
+        }
+        // The condition was already handled by arm_instruction; match as if AL.
+        if let Some(kind) = super::cp15_barrier((word & 0x0FFF_FFFF) | 0xE000_0000) {
+            self.barrier(kind);
             return Ok(Flow::Next);
         }
         if (word >> 24) & 0xF == 0xF {

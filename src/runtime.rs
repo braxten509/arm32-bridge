@@ -314,6 +314,13 @@ pub struct Thread {
     /// The last code change (`note_code_change`) this thread's Unicorn has dropped.
     pub code_generation: u64,
     pub clean: Option<unicorn_engine::Context>,
+    /// Where the thread goes on after the phone function or system call it is in
+    /// (signals taken meanwhile resume there).
+    pub resume_at: Option<u32>,
+    /// Phone functions in progress (they can call back into game code), and the
+    /// time spent in outermost ones, in `ticks`.
+    pub phone_depth: u32,
+    pub phone_ticks: u64,
 }
 
 static SHARED: Mutex<Option<Shared>> = Mutex::new(None);
@@ -356,7 +363,7 @@ impl std::ops::DerefMut for SharedGuard {
 impl Drop for SharedGuard {
     fn drop(&mut self) {
         SHARED_OWNER.store(0, Ordering::Relaxed);
-        LOCKS_HELD.with(|held| held.set(held.get() - 1));
+        count_lock(-1);
     }
 }
 
@@ -365,12 +372,24 @@ thread_local! {
     static LOCKS_HELD: Cell<u32> = const { Cell::new(0) };
 }
 
+/// Whether bridge locks are counted (debug builds, ARM32_LOCKCHECK=1). The
+/// count is a thread-local, which is slow on Android, so it is kept only then.
+fn lock_checking() -> bool {
+    static CHECKING: OnceLock<bool> = OnceLock::new();
+    *CHECKING.get_or_init(|| cfg!(debug_assertions) || std::env::var("ARM32_LOCKCHECK").as_deref() == Ok("1"))
+}
+
+/// Adds `change` to this thread's count of bridge locks held (when checking).
+fn count_lock(change: i32) {
+    if lock_checking() {
+        LOCKS_HELD.with(|held| held.set(held.get().wrapping_add_signed(change)));
+    }
+}
+
 /// Debug builds and ARM32_LOCKCHECK=1: code that may block for long (or
 /// stop every thread) must hold no bridge lock, or other threads hang behind it.
 pub fn assert_no_bridge_locks(place: &str) {
-    static CHECKING: OnceLock<bool> = OnceLock::new();
-    let checking = *CHECKING.get_or_init(|| cfg!(debug_assertions) || std::env::var("ARM32_LOCKCHECK").as_deref() == Ok("1"));
-    if checking && LOCKS_HELD.with(|held| held.get()) != 0 {
+    if lock_checking() && LOCKS_HELD.with(|held| held.get()) != 0 {
         crate::log::line(&format!("[bridge] lock check: {place} runs while this thread holds a bridge lock"));
         debug_assert!(false, "{place} runs while holding a bridge lock");
     }
@@ -387,7 +406,7 @@ pub fn shared() -> SharedGuard {
         }
     };
     SHARED_OWNER.store(me, Ordering::Relaxed);
-    LOCKS_HELD.with(|held| held.set(held.get() + 1));
+    count_lock(1);
     SharedGuard(guard)
 }
 
@@ -410,13 +429,13 @@ impl std::ops::DerefMut for HeapGuard {
 
 pub fn heap() -> HeapGuard {
     let guard = HEAP.lock().unwrap_or_else(|e| e.into_inner());
-    LOCKS_HELD.with(|held| held.set(held.get() + 1));
+    count_lock(1);
     HeapGuard(guard)
 }
 
 impl Drop for HeapGuard {
     fn drop(&mut self) {
-        LOCKS_HELD.with(|held| held.set(held.get() - 1));
+        count_lock(-1);
     }
 }
 
@@ -628,11 +647,11 @@ pub fn deliver_for(identity: &Arc<crate::imports::threads::Identity>, target: &R
     let _ = uc.reg_write(RegisterARM::C13_C0_3, target.tls_block as u64);
     // Signals sent meanwhile poke this helper too.
     *identity.helper_runner.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&uc.get_data().runner));
-    let resume_before = RESUME_AT.with(|r| r.replace(Some(target.parked[15].load(Ordering::Relaxed))));
+    let resume_before = std::mem::replace(&mut uc.get_data_mut().resume_at, Some(target.parked[15].load(Ordering::Relaxed)));
     enter_guest(uc);
     crate::imports::signals::deliver_pending_on(uc);
     leave_guest(uc);
-    RESUME_AT.with(|r| r.set(resume_before));
+    uc.get_data_mut().resume_at = resume_before;
     let thread = uc.get_data_mut();
     thread.depth = 0;
     thread.fault = None;
@@ -710,7 +729,7 @@ pub fn check_in(uc: &mut Uc, resume: u32) {
             safe_point(uc, resume);
         }
     } else if preempt_requested() {
-        share_gil(resume);
+        share_gil(uc, resume);
     }
 }
 
@@ -723,10 +742,14 @@ pub fn safe_point(uc: &mut Uc, resume: u32) {
     if STOP.load(Ordering::SeqCst) {
         runner.state.store(PARKED, Ordering::SeqCst);
         enter_guest(uc);
+        // Stopped like an interrupt: the kernel's return to user space forgets
+        // an outstanding LDREX, so a STREX after the pause fails and retries
+        // (other threads may have changed the word and changed it back).
+        clear_exclusive(uc);
     }
-    let resume_before = RESUME_AT.with(|r| r.replace(Some(resume)));
+    let resume_before = std::mem::replace(&mut uc.get_data_mut().resume_at, Some(resume));
     crate::imports::signals::deliver_pending_on(uc);
-    RESUME_AT.with(|r| r.set(resume_before));
+    uc.get_data_mut().resume_at = resume_before;
 }
 
 // ---- the guest lock (one thread at a time; not used in parallel mode) ----
@@ -736,10 +759,6 @@ static GIL: Mutex<()> = Mutex::new(());
 thread_local! {
     static GIL_GUARD: RefCell<Option<MutexGuard<'static, ()>>> = const { RefCell::new(None) };
     static ENGINE: Cell<*mut Uc> = const { Cell::new(std::ptr::null_mut()) };
-    /// Time this thread spent inside phone functions (outermost calls only), in `ticks`.
-    static PHONE_TICKS: Cell<u64> = const { Cell::new(0) };
-    static PHONE_DEPTH: Cell<u32> = const { Cell::new(0) };
-    static RESUME_AT: Cell<Option<u32>> = const { Cell::new(None) };
     /// This host thread's helper number (signals.rs), set before its engine is made.
     static HELPER: Cell<u32> = const { Cell::new(0) };
     /// This host thread's runner, once it has an engine.
@@ -818,8 +837,8 @@ pub fn become_helper(number: u32) {
     HELPER.with(|helper| helper.set(number));
 }
 
-pub fn resume_point() -> Option<u32> {
-    RESUME_AT.with(|r| r.get())
+pub fn resume_point(uc: &Uc) -> Option<u32> {
+    uc.get_data().resume_at
 }
 
 fn hand_over_gil() -> bool {
@@ -838,14 +857,14 @@ fn hand_over_gil() -> bool {
     true
 }
 
-pub fn share_gil(resume: u32) {
+pub fn share_gil(uc: &mut Uc, resume: u32) {
     if parallel() {
         return;
     }
     if hand_over_gil() {
-        let resume_before = RESUME_AT.with(|r| r.replace(Some(resume)));
-        crate::imports::signals::deliver_pending();
-        RESUME_AT.with(|r| r.set(resume_before));
+        let resume_before = std::mem::replace(&mut uc.get_data_mut().resume_at, Some(resume));
+        crate::imports::signals::deliver_pending_on(uc);
+        uc.get_data_mut().resume_at = resume_before;
     }
 }
 
@@ -859,8 +878,8 @@ fn share_gil_after_time_slice() {
 
 /// Total time this thread has spent inside phone functions (a phone function
 /// that calls back into game code counts that game code too).
-pub fn phone_time() -> std::time::Duration {
-    std::time::Duration::from_nanos(PHONE_TICKS.with(|t| t.get()) * 1_000_000 / ticks_per_ms())
+pub fn phone_time(uc: &Uc) -> std::time::Duration {
+    std::time::Duration::from_nanos(uc.get_data().phone_ticks * 1_000_000 / ticks_per_ms())
 }
 
 /// Whether this thread may touch guest state: always in parallel mode,
@@ -1175,6 +1194,9 @@ fn idle_thread(code_generation: u64, clean: Option<unicorn_engine::Context>) -> 
         runner: make_runner(0, 0, 0),
         code_generation,
         clean,
+        resume_at: None,
+        phone_depth: 0,
+        phone_ticks: 0,
     }
 }
 
@@ -1247,6 +1269,9 @@ fn adopt_engine(uc: &mut Uc) {
         runner: new_runner(id, errno_slot, tls_block),
         code_generation,
         clean,
+        resume_at: None,
+        phone_depth: 0,
+        phone_ticks: 0,
     };
     // A helper's engine is made while it stands in for a thread: that
     // thread keeps its own runner.
@@ -1311,7 +1336,8 @@ fn on_interrupt(uc: &mut Unicorn<'_, Thread>, interrupt: u32) {
     let uc = as_static(uc);
     if interrupt == EXCP_YIELD {
         let thumb = (uc.reg_read(RegisterARM::CPSR).unwrap() as u32 >> 5) & 1;
-        share_gil(uc.pc_read().unwrap() as u32 | thumb);
+        let resume = uc.pc_read().unwrap() as u32 | thumb;
+        share_gil(uc, resume);
         return;
     }
     let pc = uc.pc_read().unwrap() as u32;
@@ -1327,12 +1353,12 @@ fn on_interrupt(uc: &mut Unicorn<'_, Thread>, interrupt: u32) {
         // As for a phone function: it may block (futex), so it waits outside guest code.
         clear_exclusive(uc);
         let thumb = (uc.reg_read(RegisterARM::CPSR).unwrap() as u32 >> 5) & 1;
-        let resume_before = RESUME_AT.with(|r| r.replace(Some(pc | thumb)));
+        let resume_before = std::mem::replace(&mut uc.get_data_mut().resume_at, Some(pc | thumb));
         park_registers(uc, pc | thumb);
         leave_guest(uc);
         let result = crate::imports::threads::linux_syscall(uc, number, arguments);
         enter_guest(uc);
-        RESUME_AT.with(|r| r.set(resume_before));
+        uc.get_data_mut().resume_at = resume_before;
         uc.reg_write(RegisterARM::R0, result as u32 as u64).unwrap();
         if uc.get_data().fault.is_some() || uc.get_data().exit_code.is_some() {
             uc.stop();
@@ -1357,12 +1383,12 @@ pub fn native_syscall(uc: &mut Uc, resume: u32) {
     clear_exclusive(uc);
     let number = uc.reg(7);
     let arguments = [0, 1, 2, 3, 4, 5].map(|index| uc.reg(index));
-    let resume_before = RESUME_AT.with(|r| r.replace(Some(resume)));
+    let resume_before = std::mem::replace(&mut uc.get_data_mut().resume_at, Some(resume));
     park_registers(uc, resume);
     leave_guest(uc);
     let result = crate::imports::threads::linux_syscall(uc, number, arguments);
     enter_guest(uc);
-    RESUME_AT.with(|r| r.set(resume_before));
+    uc.get_data_mut().resume_at = resume_before;
     uc.set_reg(0, result as u32);
 }
 
@@ -1510,20 +1536,19 @@ pub fn call_stub(uc: &mut Uc, index: u32) {
     let started = ticks();
     let resume = uc.reg(LR);
     // Signals taken during or right after this call resume at its return address.
-    let resume_before = RESUME_AT.with(|r| r.replace(Some(resume)));
+    let resume_before = std::mem::replace(&mut uc.get_data_mut().resume_at, Some(resume));
     park_registers(uc, resume);
     leave_guest(uc);
     let result = match handler {
         Some(handler) => {
-            PHONE_DEPTH.with(|depth| depth.set(depth.get() + 1));
+            uc.get_data_mut().phone_depth += 1;
             let result = handler(uc, &mut args);
             // Calls this slow show up as stutters at 120 Hz (8.3 ms per frame).
             let spent = ticks().wrapping_sub(started);
-            if PHONE_DEPTH.with(|depth| {
-                depth.set(depth.get() - 1);
-                depth.get() == 0
-            }) {
-                PHONE_TICKS.with(|total| total.set(total.get() + spent));
+            let thread = uc.get_data_mut();
+            thread.phone_depth -= 1;
+            if thread.phone_depth == 0 {
+                thread.phone_ticks += spent;
             }
             if spent >= SLOW_CALL_MS * ticks_per_ms() {
                 let java = if name.starts_with("jni:Call") { crate::imports::jni_host::last_method() } else { String::new() };
@@ -1550,7 +1575,7 @@ pub fn call_stub(uc: &mut Uc, index: u32) {
     if !jumped && gil_held() {
         crate::imports::signals::deliver_pending_on(uc);
     }
-    RESUME_AT.with(|r| r.set(resume_before));
+    uc.get_data_mut().resume_at = resume_before;
 }
 
 /// Puts a handler's result where a softfp caller expects it (r0, or r0:r1).

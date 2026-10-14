@@ -17,6 +17,10 @@ pub const NAMES: &[&str] = &[
     "AAsset_getBuffer",
     "AAsset_openFileDescriptor",
     "AAsset_close",
+    "AConfiguration_new",
+    "AConfiguration_delete",
+    "AConfiguration_fromAssetManager",
+    "AConfiguration_getOrientation",
 ];
 
 #[cfg(not(target_os = "android"))]
@@ -45,6 +49,10 @@ mod host {
         fn AAsset_getBuffer(asset: *mut c_void) -> *const c_void;
         fn AAsset_openFileDescriptor(asset: *mut c_void, start: *mut libc::off_t, length: *mut libc::off_t) -> i32;
         fn AAsset_close(asset: *mut c_void);
+        fn AConfiguration_new() -> *mut c_void;
+        fn AConfiguration_delete(config: *mut c_void);
+        fn AConfiguration_fromAssetManager(config: *mut c_void, manager: *mut c_void);
+        fn AConfiguration_getOrientation(config: *mut c_void) -> i32;
     }
 
     const HANDLE_BASE: u32 = 0xDC00_0000;
@@ -91,6 +99,26 @@ mod host {
 
     pub fn handler(name: &str) -> Option<Handler> {
         match name {
+            // AConfiguration objects get handles like the asset ones.
+            "AConfiguration_new" => handler!(|uc, a| Ret::U32(add(unsafe { AConfiguration_new() }))),
+            "AConfiguration_delete" => handler!(|uc, a| {
+                let config = remove(a.u32());
+                if !config.is_null() {
+                    unsafe { AConfiguration_delete(config) };
+                }
+                Ret::Void
+            }),
+            "AConfiguration_fromAssetManager" => handler!(|uc, a| {
+                let (config, manager) = (get(a.u32()), get(a.u32()));
+                if !config.is_null() && !manager.is_null() {
+                    unsafe { AConfiguration_fromAssetManager(config, manager) };
+                }
+                Ret::Void
+            }),
+            "AConfiguration_getOrientation" => handler!(|uc, a| {
+                let config = get(a.u32());
+                Ret::U32(if config.is_null() { 0 } else { (unsafe { AConfiguration_getOrientation(config) }) as u32 })
+            }),
             "AAssetManager_fromJava" => handler!(|uc, a| {
                 let (_env, manager) = (a.u32(), a.u32());
                 let env = jni_host::env();

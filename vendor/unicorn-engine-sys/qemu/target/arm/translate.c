@@ -9012,11 +9012,110 @@ static bool op_store_rr(DisasContext *s, arg_ldst_rr *a,
     return true;
 }
 
-static bool trans_LDRD_rr(DisasContext *s, arg_ldst_rr *a)
+/*
+ * arm32-bridge: LDRD/STRD the way the architecture asks for it. An 8-byte
+ * aligned address is one 64-bit access (single-copy atomic on LPAE cores);
+ * anything else is two 32-bit accesses as before. Two separate accesses at an
+ * aligned address let another thread's write land between the halves. Rt is
+ * always the word at the lower address. Returns the address as a local temp
+ * (the branch below ends the basic block) for the writeback code.
+ */
+static TCGv_i32 do_ldrd_load(DisasContext *s, TCGv_i32 addr, int rt, int rt2)
 {
     TCGContext *tcg_ctx = s->uc->tcg_ctx;
     int mem_idx = get_mem_index(s);
-    TCGv_i32 addr, tmp;
+    TCGLabel *split = gen_new_label(tcg_ctx);
+    TCGLabel *done = gen_new_label(tcg_ctx);
+    TCGv_i32 local_addr = tcg_temp_local_new_i32(tcg_ctx);
+    TCGv_i32 first = tcg_temp_local_new_i32(tcg_ctx);
+    TCGv_i32 second = tcg_temp_local_new_i32(tcg_ctx);
+    TCGv_i32 tmp = tcg_temp_new_i32(tcg_ctx);
+    TCGv_i64 t64;
+    TCGv taddr;
+
+    tcg_gen_mov_i32(tcg_ctx, local_addr, addr);
+    tcg_temp_free_i32(tcg_ctx, addr);
+    tcg_gen_andi_i32(tcg_ctx, tmp, local_addr, 7);
+    tcg_gen_brcondi_i32(tcg_ctx, TCG_COND_NE, tmp, 0, split);
+    tcg_temp_free_i32(tcg_ctx, tmp);
+
+    t64 = tcg_temp_new_i64(tcg_ctx);
+    taddr = gen_aa32_addr(s, local_addr, MO_Q);
+    tcg_gen_qemu_ld_i64(tcg_ctx, t64, taddr, mem_idx, MO_Q | s->be_data);
+    tcg_temp_free(tcg_ctx, taddr);
+    if (s->be_data == MO_BE) {
+        tcg_gen_extr_i64_i32(tcg_ctx, second, first, t64);
+    } else {
+        tcg_gen_extr_i64_i32(tcg_ctx, first, second, t64);
+    }
+    tcg_temp_free_i64(tcg_ctx, t64);
+    tcg_gen_br(tcg_ctx, done);
+
+    gen_set_label(tcg_ctx, split);
+    gen_aa32_ld_i32(s, first, local_addr, mem_idx, MO_UL | s->be_data);
+    tmp = tcg_temp_new_i32(tcg_ctx);
+    tcg_gen_addi_i32(tcg_ctx, tmp, local_addr, 4);
+    gen_aa32_ld_i32(s, second, tmp, mem_idx, MO_UL | s->be_data);
+    tcg_temp_free_i32(tcg_ctx, tmp);
+
+    gen_set_label(tcg_ctx, done);
+    store_reg(s, rt, first);
+    store_reg(s, rt2, second);
+    return local_addr;
+}
+
+static TCGv_i32 do_strd_store(DisasContext *s, TCGv_i32 addr, int rt, int rt2)
+{
+    TCGContext *tcg_ctx = s->uc->tcg_ctx;
+    int mem_idx = get_mem_index(s);
+    TCGLabel *split = gen_new_label(tcg_ctx);
+    TCGLabel *done = gen_new_label(tcg_ctx);
+    TCGv_i32 local_addr = tcg_temp_local_new_i32(tcg_ctx);
+    TCGv_i32 tmp = tcg_temp_new_i32(tcg_ctx);
+    TCGv_i32 first, second;
+    TCGv_i64 t64;
+    TCGv taddr;
+
+    tcg_gen_mov_i32(tcg_ctx, local_addr, addr);
+    tcg_temp_free_i32(tcg_ctx, addr);
+    tcg_gen_andi_i32(tcg_ctx, tmp, local_addr, 7);
+    tcg_gen_brcondi_i32(tcg_ctx, TCG_COND_NE, tmp, 0, split);
+    tcg_temp_free_i32(tcg_ctx, tmp);
+
+    first = load_reg(s, rt);
+    second = load_reg(s, rt2);
+    t64 = tcg_temp_new_i64(tcg_ctx);
+    if (s->be_data == MO_BE) {
+        tcg_gen_concat_i32_i64(tcg_ctx, t64, second, first);
+    } else {
+        tcg_gen_concat_i32_i64(tcg_ctx, t64, first, second);
+    }
+    tcg_temp_free_i32(tcg_ctx, first);
+    tcg_temp_free_i32(tcg_ctx, second);
+    taddr = gen_aa32_addr(s, local_addr, MO_Q);
+    tcg_gen_qemu_st_i64(tcg_ctx, t64, taddr, mem_idx, MO_Q | s->be_data);
+    tcg_temp_free(tcg_ctx, taddr);
+    tcg_temp_free_i64(tcg_ctx, t64);
+    tcg_gen_br(tcg_ctx, done);
+
+    gen_set_label(tcg_ctx, split);
+    first = load_reg(s, rt);
+    gen_aa32_st_i32(s, first, local_addr, mem_idx, MO_UL | s->be_data);
+    tcg_temp_free_i32(tcg_ctx, first);
+    tmp = tcg_temp_new_i32(tcg_ctx);
+    tcg_gen_addi_i32(tcg_ctx, tmp, local_addr, 4);
+    second = load_reg(s, rt2);
+    gen_aa32_st_i32(s, second, tmp, mem_idx, MO_UL | s->be_data);
+    tcg_temp_free_i32(tcg_ctx, second);
+    tcg_temp_free_i32(tcg_ctx, tmp);
+
+    gen_set_label(tcg_ctx, done);
+    return local_addr;
+}
+
+static bool trans_LDRD_rr(DisasContext *s, arg_ldst_rr *a)
+{
+    TCGv_i32 addr;
 
     if (!ENABLE_ARCH_5TE) {
         return false;
@@ -9026,27 +9125,16 @@ static bool trans_LDRD_rr(DisasContext *s, arg_ldst_rr *a)
         return true;
     }
     addr = op_addr_rr_pre(s, a);
-
-    tmp = tcg_temp_new_i32(tcg_ctx);
-    gen_aa32_ld_i32(s, tmp, addr, mem_idx, MO_UL | s->be_data);
-    store_reg(s, a->rt, tmp);
-
-    tcg_gen_addi_i32(tcg_ctx, addr, addr, 4);
-
-    tmp = tcg_temp_new_i32(tcg_ctx);
-    gen_aa32_ld_i32(s, tmp, addr, mem_idx, MO_UL | s->be_data);
-    store_reg(s, a->rt + 1, tmp);
+    addr = do_ldrd_load(s, addr, a->rt, a->rt + 1);
 
     /* LDRD w/ base writeback is undefined if the registers overlap.  */
-    op_addr_rr_post(s, a, addr, -4);
+    op_addr_rr_post(s, a, addr, 0);
     return true;
 }
 
 static bool trans_STRD_rr(DisasContext *s, arg_ldst_rr *a)
 {
-    TCGContext *tcg_ctx = s->uc->tcg_ctx;
-    int mem_idx = get_mem_index(s);
-    TCGv_i32 addr, tmp;
+    TCGv_i32 addr;
 
     if (!ENABLE_ARCH_5TE) {
         return false;
@@ -9056,18 +9144,9 @@ static bool trans_STRD_rr(DisasContext *s, arg_ldst_rr *a)
         return true;
     }
     addr = op_addr_rr_pre(s, a);
+    addr = do_strd_store(s, addr, a->rt, a->rt + 1);
 
-    tmp = load_reg(s, a->rt);
-    gen_aa32_st_i32(s, tmp, addr, mem_idx, MO_UL | s->be_data);
-    tcg_temp_free_i32(tcg_ctx, tmp);
-
-    tcg_gen_addi_i32(tcg_ctx, addr, addr, 4);
-
-    tmp = load_reg(s, a->rt + 1);
-    gen_aa32_st_i32(s, tmp, addr, mem_idx, MO_UL | s->be_data);
-    tcg_temp_free_i32(tcg_ctx, tmp);
-
-    op_addr_rr_post(s, a, addr, -4);
+    op_addr_rr_post(s, a, addr, 0);
     return true;
 }
 
@@ -9164,24 +9243,13 @@ static bool op_store_ri(DisasContext *s, arg_ldst_ri *a,
 
 static bool op_ldrd_ri(DisasContext *s, arg_ldst_ri *a, int rt2)
 {
-    TCGContext *tcg_ctx = s->uc->tcg_ctx;
-    int mem_idx = get_mem_index(s);
-    TCGv_i32 addr, tmp;
+    TCGv_i32 addr;
 
     addr = op_addr_ri_pre(s, a);
-
-    tmp = tcg_temp_new_i32(tcg_ctx);
-    gen_aa32_ld_i32(s, tmp, addr, mem_idx, MO_UL | s->be_data);
-    store_reg(s, a->rt, tmp);
-
-    tcg_gen_addi_i32(tcg_ctx, addr, addr, 4);
-
-    tmp = tcg_temp_new_i32(tcg_ctx);
-    gen_aa32_ld_i32(s, tmp, addr, mem_idx, MO_UL | s->be_data);
-    store_reg(s, rt2, tmp);
+    addr = do_ldrd_load(s, addr, a->rt, rt2);
 
     /* LDRD w/ base writeback is undefined if the registers overlap.  */
-    op_addr_ri_post(s, a, addr, -4);
+    op_addr_ri_post(s, a, addr, 0);
     return true;
 }
 
@@ -9204,23 +9272,12 @@ static bool trans_LDRD_ri_t32(DisasContext *s, arg_ldst_ri2 *a)
 
 static bool op_strd_ri(DisasContext *s, arg_ldst_ri *a, int rt2)
 {
-    TCGContext *tcg_ctx = s->uc->tcg_ctx;
-    int mem_idx = get_mem_index(s);
-    TCGv_i32 addr, tmp;
+    TCGv_i32 addr;
 
     addr = op_addr_ri_pre(s, a);
+    addr = do_strd_store(s, addr, a->rt, rt2);
 
-    tmp = load_reg(s, a->rt);
-    gen_aa32_st_i32(s, tmp, addr, mem_idx, MO_UL | s->be_data);
-    tcg_temp_free_i32(tcg_ctx, tmp);
-
-    tcg_gen_addi_i32(tcg_ctx, addr, addr, 4);
-
-    tmp = load_reg(s, rt2);
-    gen_aa32_st_i32(s, tmp, addr, mem_idx, MO_UL | s->be_data);
-    tcg_temp_free_i32(tcg_ctx, tmp);
-
-    op_addr_ri_post(s, a, addr, -4);
+    op_addr_ri_post(s, a, addr, 0);
     return true;
 }
 

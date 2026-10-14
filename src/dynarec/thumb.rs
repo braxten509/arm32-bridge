@@ -130,6 +130,9 @@ pub struct Block {
 /// Translates the block starting at `start` (a Thumb address without bit 0).
 pub fn translate(mem: GuestMem, start: u32) -> Block {
     let mut t = Translator { a: Asm::new(), mem, pc: start, size: 2, count: 0, in_it: false, thumb: true, neon_fp: false };
+    if let Some(word) = fence_prefix() {
+        t.a.emit(word);
+    }
     let end;
     loop {
         if t.count >= MAX_INSTRUCTIONS {
@@ -273,7 +276,11 @@ impl Translator {
                     a.ubfx_w(T3, rm, n - 1, 1);
                 }
                 if n == 32 {
-                    a.mov_w_imm(result, 0);
+                    // 0, but computed from rm: a constant would drop the data
+                    // dependency native code keeps (a load addressed with it stays ordered).
+                    // Two W shifts, so the upper half of the host register doesn't matter.
+                    a.lsr_w_imm(result, rm, 31);
+                    a.lsr_w_imm(result, result, 1);
                 } else {
                     a.lsr_w_imm(result, rm, n);
                 }
@@ -344,19 +351,23 @@ impl Translator {
                 }
                 a.b_to(done);
                 a.bind(big);
-                a.mov_w_imm(result, 0);
+                // 0, but computed from the shifted value (keeps its data dependency).
                 if carry_out {
-                    a.mov_w_imm(T3, 0);
+                    a.eor_w(T3, T5, T5, shift::LSL, 0);
                 }
+                a.eor_w(result, T5, T5, shift::LSL, 0);
             }
             shift::ASR => {
                 // Amounts of 32+ fill with the sign; carry = bit 31.
                 a.sxtw_x(T6, rm);
-                let small = a.label();
-                a.lsr_w_imm(T4, T2, 5);
-                a.cbz_w_to(T4, small);
-                a.mov_w_imm(T2, 32);
-                a.bind(small);
+                // asrv uses the amount mod 64; any amount from 32 up fills with
+                // the sign. Amounts 64-255 become 61-63 by arithmetic, not a
+                // branch or a flag test (the guest flags live in NZCV), so the
+                // amount stays a data dependency: T2 |= (0 - (T2 >> 6)) & 63.
+                a.lsr_w_imm(T4, T2, 6);
+                a.sub_w(T4, ZR, T4, shift::LSL, 0);
+                a.and_w_imm(T4, T4, 63, T5);
+                a.orr_w(T2, T2, T4, shift::LSL, 0);
                 if carry_out {
                     a.lsl_x_imm(T5, T6, 1);
                     a.emit(0x9AC0_2800 | (T2 << 16) | (T5 << 5) | T5); // asrv x
@@ -532,8 +543,12 @@ impl Translator {
         if rn == PC {
             // Literal: the address is a constant (Align(PC, 4) + offset).
             let address = (self.pc_value() & !3).wrapping_add(offset);
-            if load && size == 4 {
-                // Literal pools live in code, which never changes: load at translation time.
+            if load && size == 4 && crate::mem::fixed(address) && crate::mem::fixed(address + 3) {
+                // A read-only library segment never changes: load it at translation time.
+                // Code the game made while running (a JIT, or code in a library's .data)
+                // may patch its literals in place (a call target, say) and flush just
+                // those 4 bytes, which need not touch this block's range, so there the
+                // load stays a real load (below).
                 let value = self.mem.read_u32(address);
                 if rt == PC {
                     self.a.mov_w_imm(T6, value);
@@ -549,6 +564,10 @@ impl Translator {
             }
             let target = if rt == PC { T6 } else { rt };
             self.access(load, size, signed, target, T0);
+            if rt == PC {
+                emit_exit_to(&mut self.a, T6);
+                return Ok(Flow::End);
+            }
             return Ok(Flow::Next);
         }
         let n = rn;
@@ -1177,13 +1196,11 @@ impl Translator {
             if rt == rt2 || (w == 1 && (rt == rn || rt2 == rn)) {
                 return Err(());
             }
-            if rt == rn {
-                self.a.ldr_w_off(T2, T1, 0);
-                self.a.ldr_w_off(rt2, T1, 4);
-                self.a.mov_w(rt, T2);
-            } else {
-                self.a.ldp_w_off(rt, rt2, T1, 0);
-            }
+            // One LDP even when rt is the base register (the address is in T1): an
+            // 8-byte-aligned LDRD is one single-copy-atomic read on LPAE cores, and so is
+            // this LDP on hosts with FEAT_LSE2 (every ARMv8.4+ core, the Pixel 10's too).
+            // Two separate loads let another core's write land between them.
+            self.a.ldp_w_off(rt, rt2, T1, 0);
         } else {
             self.a.stp_w_off(rt, rt2, T1, 0);
         }
@@ -1348,6 +1365,19 @@ impl Translator {
                 } else {
                     self.a.ubfx_w(rd, rn, lsb, width);
                 }
+            }
+            0b10000 | 0b10010 | 0b11000 | 0b11010 => {
+                // SSAT / USAT Rd, #sat, Rn{, LSL/ASR #imm} (sh = bit 1 of op); ASR #0 is the
+                // halfword form SSAT16 / USAT16
+                let signed = op & 0b01000 == 0;
+                let amount = (((h2 >> 12) & 7) << 2) | ((h2 >> 6) & 3);
+                let kind = if op & 0b10 != 0 { shift::ASR } else { shift::LSL };
+                if kind == shift::ASR && amount == 0 {
+                    let bits = (h2 & 0xF) + signed as u32;
+                    return self.saturate_halves_instruction(rd, rn, signed, bits);
+                }
+                let bits = (h2 & 0x1F) + signed as u32;
+                return self.saturate_instruction(rd, rn, signed, bits, kind, amount);
             }
             0b10110 => {
                 // BFI / BFC
@@ -1662,6 +1692,73 @@ impl Translator {
         a.mov_w(rd, T5);
     }
 
+    /// SSAT / USAT Rd, #bits, Rn{, LSL/ASR #amount} (ASR #0 = ASR #32): signed `bits` 1-32,
+    /// unsigned 0-31.
+    pub(super) fn saturate_instruction(&mut self, rd: u32, rn: u32, signed: bool, bits: u32, kind: u32, amount: u32) -> Result<Flow> {
+        if rd == PC || rn == PC {
+            return Err(());
+        }
+        let value = if kind == shift::LSL && amount == 0 {
+            rn
+        } else {
+            self.shift_immediate(T2, rn, kind, amount, false);
+            T2
+        };
+        self.saturate(rd, value, signed, bits);
+        Ok(Flow::Next)
+    }
+
+    /// SSAT16 / USAT16 Rd, #bits, Rn: each signed halfword saturated on its own.
+    pub(super) fn saturate_halves_instruction(&mut self, rd: u32, rn: u32, signed: bool, bits: u32) -> Result<Flow> {
+        if rd == PC || rn == PC {
+            return Err(());
+        }
+        self.a.sxth_w(T2, rn);
+        self.a.asr_w_imm(T3, rn, 16);
+        self.saturate(T2, T2, signed, bits);
+        self.saturate(T3, T3, signed, bits);
+        self.a.bfi_w(T2, T3, 16, 16);
+        self.a.mov_w(rd, T2);
+        Ok(Flow::Next)
+    }
+
+    /// rd = value clamped to a signed (`bits` 1-32) or unsigned (0-31) range, setting Q
+    /// when it was clamped. Branches with cbz, so the guest flags stay put (uses T0, T4, T6).
+    fn saturate(&mut self, rd: Reg, value: Reg, signed: bool, bits: u32) {
+        let a = &mut self.a;
+        if signed && bits == 32 {
+            a.mov_w(rd, value);
+            return;
+        }
+        // T4 = 0 when the value is in range.
+        if signed {
+            a.sbfx_w(T4, value, 0, bits);
+            a.eor_w(T4, T4, value, shift::LSL, 0);
+        } else {
+            a.lsr_w_imm(T4, value, bits);
+        }
+        let done = a.label();
+        a.mov_w(rd, value);
+        a.cbz_w_to(T4, done);
+        // Out of range: the bound on the value's side (value asr 31 is 0 or -1).
+        let max = if signed { (1u32 << (bits - 1)) - 1 } else { (1u32 << bits) - 1 };
+        let bound = if max == 0 {
+            ZR
+        } else {
+            a.mov_w_imm(T6, max);
+            T6
+        };
+        if signed {
+            a.eor_w(rd, bound, value, shift::ASR, 31); // max, or !max = min
+        } else {
+            a.bic_w(rd, bound, value, shift::ASR, 31); // max, or 0
+        }
+        a.ldr_w_off(T0, host::STATE, offsets::CPSR_OTHER);
+        a.orr_w_imm(T0, T0, 1 << 27, T6);
+        a.str_w_off(T0, host::STATE, offsets::CPSR_OTHER);
+        a.bind(done);
+    }
+
     fn multiply_accumulate_accumulate(&mut self, rd_lo: u32, rd_hi: u32, rn: u32, rm: u32) {
         self.a.mov_w(T4, rd_lo);
         self.a.add_x_uxtw(T4, T4, rd_hi);
@@ -1714,6 +1811,10 @@ impl Translator {
             self.a.ldr_w_off(rt, host::STATE, offsets::TLS);
             return Ok(Flow::Next);
         }
+        if let Some(kind) = cp15_barrier((h1 << 16) | h2) {
+            self.barrier(kind);
+            return Ok(Flow::Next);
+        }
         if h1 & 0xEF00 == 0xEF00 {
             // Advanced SIMD data processing: 111U 1111 is ARM's 1111 001U
             return self.neon_data(0xF200_0000 | (((h1 >> 12) & 1) << 24) | ((h1 & 0xFF) << 16) | h2);
@@ -1723,6 +1824,50 @@ impl Translator {
             return self.vfp((h1 << 16) | h2);
         }
         Err(())
+    }
+}
+
+/// One extra host instruction at the start of every translated block.
+/// Default with parallel guest threads: `dmb ishst`. Card Wars (Mono) corrupts
+/// its allocator memory about once in eight launches on two or more cores
+/// without it and not once in 48 launches with it (9/70 without); the
+/// exact guest code that needs it is not found yet (DEBUGGING.md, "OPEN: root
+/// cause behind the light barrier"). Costs about 5% of own-code time.
+/// debug.arm32bridge.fence / ARM32_FENCE (testing): "off" nothing, "1" dmb ish,
+/// "ld" dmb ishld, "st" dmb ishst, "nop" a nop (same size, no ordering).
+pub(super) fn fence_prefix() -> Option<u32> {
+    static FENCE: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *FENCE.get_or_init(|| {
+        let setting = std::env::var("ARM32_FENCE").ok().or_else(|| super::property("debug.arm32bridge.fence"));
+        let prefix = match setting.as_deref().filter(|value| !value.is_empty()) {
+            Some("off") => None,
+            Some("1") => Some(0xD503_3BBF),
+            Some("ld") => Some(0xD503_39BF),
+            Some("st") => Some(0xD503_3ABF),
+            Some("nop") => Some(0xD503_201F),
+            _ if crate::runtime::parallel() => Some(0xD503_3ABF),
+            _ => None,
+        };
+        crate::log::line(&format!("[bridge] block start prefix: {}", match prefix {
+            Some(0xD503_3BBF) => "dmb ish",
+            Some(0xD503_39BF) => "dmb ishld",
+            Some(0xD503_3ABF) => "dmb ishst",
+            Some(_) => "nop",
+            None => "none",
+        }));
+        prefix
+    })
+}
+
+/// The ARMv6-style CP15 barriers, still used by code built for old CPUs:
+/// MCR p15, 0, Rt, c7, c10, 4 (DSB), c7, c10, 5 (DMB), c7, c5, 4 (ISB).
+/// Returns the `barrier` kind. The same encoding in ARM (condition AL) and Thumb.
+fn cp15_barrier(word: u32) -> Option<u32> {
+    match word & 0xFFFF_0FFF {
+        0xEE07_0F9A => Some(4),
+        0xEE07_0FBA => Some(5),
+        0xEE07_0F95 => Some(6),
+        _ => None,
     }
 }
 

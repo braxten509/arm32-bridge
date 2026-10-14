@@ -42,6 +42,50 @@ pub const MAPPED_REGIONS: [(u32, u32, bool); 6] = [
     (KUSER_BASE, KUSER_END, true),
 ];
 
+/// Read-only segments of loaded libraries, as (start, end). Their bytes never
+/// change, so translated code may use them as constants (literal pools) and
+/// skip watching them for new code. Writable library parts (.data, .bss) are
+/// not here: a game may build code there.
+static FIXED: std::sync::RwLock<Vec<(u32, u32)>> = std::sync::RwLock::new(Vec::new());
+
+pub fn add_fixed(start: u32, end: u32) {
+    FIXED.write().unwrap().push((start, end));
+}
+
+/// The game made [start, end) writable (mprotect): its bytes may change from
+/// now on, so that part of any read-only library segment stops being fixed.
+/// Returns whether any of it was fixed.
+pub fn unfix(start: u32, end: u32) -> bool {
+    let mut fixed = FIXED.write().unwrap();
+    let mut changed = false;
+    let mut kept = Vec::with_capacity(fixed.len() + 1);
+    for &(first, last) in fixed.iter() {
+        if last <= start || first >= end {
+            kept.push((first, last));
+            continue;
+        }
+        changed = true;
+        if first < start {
+            kept.push((first, start));
+        }
+        if last > end {
+            kept.push((end, last));
+        }
+    }
+    *fixed = kept;
+    changed
+}
+
+/// Whether all of [start, end) lies in one read-only library segment.
+pub fn fixed_range(start: u32, end: u32) -> bool {
+    FIXED.read().unwrap().iter().any(|&(first, last)| first <= start && end <= last)
+}
+
+/// Whether `address` is in a read-only library segment (see `FIXED`).
+pub fn fixed(address: u32) -> bool {
+    FIXED.read().unwrap().iter().any(|&(start, end)| (start..end).contains(&address))
+}
+
 /// Whether guest code may run at `address` (a region mapped as code).
 pub fn executable(address: u32) -> bool {
     MAPPED_REGIONS.iter().any(|&(start, end, code)| code && (start..end).contains(&address))

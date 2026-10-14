@@ -67,13 +67,18 @@ static void *add_to_counter(void *amount) {
 // Mono's way of pausing a thread: a pause signal whose handler answers on a
 // semaphore, then waits in sigsuspend for the resume signal.
 static sem_t paused_answer, release_worker;
-static volatile int resumed_flag = 0, handler_thread_ok = 0, context_ok = 0, pauses = 0;
+static volatile int resumed_flag = 0, handler_thread_ok = 0, context_ok = 0, pauses = 0, frame_on_stack = 0;
 static pthread_t worker_thread;
 static void on_resume(int, siginfo_t *, void *) { resumed_flag = 1; }
 static void on_pause(int signal, siginfo_t *info, void *context) {
     ucontext_t *uc = (ucontext_t *)context;
     handler_thread_ok = pthread_equal(pthread_self(), worker_thread);
     context_ok = info->si_signo == signal && uc->uc_mcontext.arm_sp != 0 && uc->uc_mcontext.arm_pc != 0;
+    // As on Linux, the saved registers sit on this thread's stack between the
+    // handler's frame and the interrupted stack pointer (Boehm GC scans there).
+    volatile char here = 0;
+    uintptr_t low = (uintptr_t)&here, high = uc->uc_mcontext.arm_sp;
+    frame_on_stack = low < (uintptr_t)uc && (uintptr_t)uc < high && low < (uintptr_t)info && (uintptr_t)info < high;
     pauses++;
     sigset_t wait_mask;
     sigfillset(&wait_mask);
@@ -224,11 +229,21 @@ __attribute__((target("arm"), noinline)) static void swp_lock_add(void) {
                          : "r"(1), "r"(&race_swp_lock)
                          : "memory");
     } while (old_value != 0);
-    __asm__ volatile("dmb ish" ::: "memory");
+    // ARMv6-style CP15 barriers, as code built for old CPUs still has them.
+    __asm__ volatile("mcr p15, 0, %0, c7, c10, 5" ::"r"(0) : "memory");
     race_swp++;
-    __asm__ volatile("dmb ish" ::: "memory");
+    __asm__ volatile("mcr p15, 0, %0, c7, c10, 5" ::"r"(0) : "memory");
     race_swp_lock = 0;
 }
+// All three CP15 barriers (DSB, DMB, ISB) in one mode.
+#define CP15_BARRIERS(mode)                                                                            \
+    __attribute__((target(#mode), noinline)) static void cp15_barriers_##mode(void) {                  \
+        __asm__ volatile("mcr p15, 0, %0, c7, c10, 4\n\tmcr p15, 0, %0, c7, c10, 5\n\t"               \
+                         "mcr p15, 0, %0, c7, c5, 4" ::"r"(0)                                          \
+                         : "memory");                                                                  \
+    }
+CP15_BARRIERS(arm)
+CP15_BARRIERS(thumb)
 #define RACE_ADDER(mode)                                                                               \
     __attribute__((target(#mode), noinline)) static void *race_adder_##mode(void *) {                  \
         kuser_cmpxchg_fn cmpxchg = (kuser_cmpxchg_fn)0xffff0fc0;                                       \
@@ -250,6 +265,7 @@ __attribute__((target("arm"), noinline)) static void swp_lock_add(void) {
             race_locked++;                                                                             \
             pthread_mutex_unlock(&race_lock);                                                          \
             swp_lock_add();                                                                            \
+            cp15_barriers_##mode();                                                                    \
         }                                                                                              \
         return nullptr;                                                                                \
     }
@@ -505,7 +521,8 @@ static bool futex_wake_counts(void) {
     for (int i = 0; i < 3; i++)
         if (pthread_create(&threads[i], nullptr, futex_waiter, nullptr) != 0) return false;
     while (futex_waiters_in < 3) usleep(1000);
-    usleep(50000); // all three asleep
+    // all three asleep (the checker runs every block twice: give it longer)
+    usleep(bridge_flag("arm32_bridge_is_checking") ? 1000000 : 50000);
     futex_word = 1;
     long first = futex_call(&futex_word, FUTEX_WAKE, 2, nullptr);
     usleep(20000);
@@ -566,6 +583,40 @@ static bool code_rewrite_across_threads(void) {
     bool seen = made_seen_new[0] && made_seen_new[1] && made_spinner_got == 2 && made_code() == 2;
     munmap(code, 4096);
     return first && seen;
+}
+
+// A JIT patches a literal right after a block's last instruction and flushes
+// only those 4 bytes: the next run must see the new value (a constant, and a
+// call target loaded straight into pc).
+static int made_returns_one(void) { return 1; }
+static int made_returns_two(void) { return 2; }
+static bool patched_literals_seen_at(unsigned *code) {
+    code[0] = 0xE59F0000u; // ldr r0, [pc, #0]  (the word at code + 8)
+    code[1] = 0xE12FFF1Eu; // bx lr
+    code[2] = 11;
+    code[4] = 0xE51FF004u; // ldr pc, [pc, #-4]  (the word at code + 20)
+    code[5] = (unsigned)(uintptr_t)made_returns_one;
+    __builtin___clear_cache((char *)code, (char *)(code + 6));
+    made_function constant = (made_function)code, call = (made_function)(code + 4);
+    bool before = constant() == 11 && call() == 1;
+    code[2] = 22;
+    __builtin___clear_cache((char *)(code + 2), (char *)(code + 3));
+    code[5] = (unsigned)(uintptr_t)made_returns_two;
+    __builtin___clear_cache((char *)(code + 5), (char *)(code + 6));
+    bool after = constant() == 22 && call() == 2;
+    return before && after;
+}
+// Code made in a library's own writable data (.bss) is made code too.
+static unsigned code_in_library_data[1024] __attribute__((aligned(4096)));
+static bool patched_literals_seen(void) {
+    unsigned *code = (unsigned *)mmap(nullptr, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (code == MAP_FAILED) return false;
+    bool heap = patched_literals_seen_at(code);
+    munmap(code, 4096);
+    if (mprotect(code_in_library_data, sizeof code_in_library_data, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return false;
+    bool data = patched_literals_seen_at(code_in_library_data);
+    if (!heap || !data) __android_log_print(ANDROID_LOG_INFO, TAG, "patched literals: heap %d, library data %d", heap, data);
+    return heap && data;
 }
 
 // A signal reaches a thread spinning inside a qsort comparator (game code
@@ -871,6 +922,196 @@ MULTIPLY_TESTS(thumb)
     }
 HALFWORD_TESTS(arm)
 HALFWORD_TESTS(thumb)
+
+// USAT / SSAT and the halfword-pair forms USAT16 / SSAT16: every width, LSL and
+// ASR, edge values, the sticky Q flag (set only when a result saturated, never
+// cleared) and NZCV left alone. Each function runs one instruction between
+// msr APSR_nzcvq (the flags going in) and mrs APSR (the flags coming out).
+typedef unsigned (*saturate_fn)(int x, unsigned flags_in, int *result);
+struct SaturateCase {
+    saturate_fn fn;
+    int bits;
+    bool is_signed, pairs, asr;
+    int amount;
+    const char *what;
+};
+static long long saturate_expected(long long value, int bits, bool is_signed, bool *saturated) {
+    long long low = is_signed ? -(1LL << (bits - 1)) : 0;
+    long long high = is_signed ? (1LL << (bits - 1)) - 1 : (1LL << bits) - 1;
+    long long result = value < low ? low : value > high ? high : value;
+    if (result != value) *saturated = true;
+    return result;
+}
+static bool saturate_case_ok(const SaturateCase &s, int x, unsigned flags_in, const char *mode) {
+    bool saturated = false;
+    unsigned want;
+    if (s.pairs) {
+        long long low = saturate_expected((short)x, s.bits, s.is_signed, &saturated);
+        long long high = saturate_expected((short)(x >> 16), s.bits, s.is_signed, &saturated);
+        want = ((unsigned)low & 0xFFFF) | ((unsigned)high << 16);
+    } else {
+        int operand = s.asr ? x >> (s.amount < 32 ? s.amount : 31) : (int)((unsigned)x << s.amount);
+        want = (unsigned)saturate_expected(operand, s.bits, s.is_signed, &saturated);
+    }
+    int got = 0;
+    unsigned flags = s.fn(x, flags_in, &got) & 0xF8000000u;
+    unsigned want_flags = flags_in | (saturated ? 0x08000000u : 0);
+    if ((unsigned)got == want && flags == want_flags) return true;
+    __android_log_print(ANDROID_LOG_ERROR, TAG, "%s %s of %#x, flags %#x: got %#x flags %#x, want %#x flags %#x", mode,
+                        s.what, (unsigned)x, flags_in, (unsigned)got, flags, want, want_flags);
+    return false;
+}
+static bool saturate_cases(const SaturateCase *cases, int count, const char *mode) {
+    static const int inputs[] = {0, 1, -1, 2, -2, 3, 4, 7, 8, 15, 16, 127, 128, -128, -129, 255, 256, 0x7FFF, 0x8000,
+                                 -0x8000, -0x8001, 0xFFFF, 0x10000, 0x00FF0100, (int)0xFF7FFF80, 0x01000080,
+                                 (int)0x80017FFF, 0x3FFFFFFF, 0x40000000, -0x40000000, -0x40000001, 0x7FFFFFFE,
+                                 0x7FFFFFFF, (int)0x80000000, (int)0x80000001};
+    static const unsigned flag_inputs[] = {0, 0x50000000u, 0xA8000000u}; // none; Z V; N C Q
+    const int fixed = sizeof inputs / sizeof *inputs;
+    for (int c = 0; c < count; c++) {
+        const SaturateCase &s = cases[c];
+        // Just inside and outside the range (each half's range for the pair forms).
+        long long low = s.is_signed ? -(1LL << (s.bits - 1)) : 0;
+        long long high = s.is_signed ? (1LL << (s.bits - 1)) - 1 : (1LL << s.bits) - 1;
+        long long edges[] = {low - 1, low, low + 1, high - 1, high, high + 1};
+        int values[fixed + 36];
+        int n = 0;
+        for (int x : inputs) values[n++] = x;
+        for (long long top : edges) {
+            if (!s.pairs) {
+                values[n++] = (int)top;
+                continue;
+            }
+            for (long long bottom : edges) values[n++] = (int)(((unsigned)top << 16) | ((unsigned)bottom & 0xFFFF));
+        }
+        for (int i = 0; i < n; i++)
+            for (unsigned flags_in : flag_inputs)
+                if (!saturate_case_ok(s, values[i], flags_in, mode)) return false;
+    }
+    return true;
+}
+#define SATURATE_FN(mode, name, text)                                                                \
+    __attribute__((target(#mode), noinline)) static unsigned name##_##mode(int x, unsigned flags_in, int *result) { \
+        unsigned flags;                                                                              \
+        int d;                                                                                       \
+        __asm__ volatile("msr APSR_nzcvq, %[in]\n" text "\nmrs %[f], APSR\n"                        \
+                         : [d] "=&r"(d), [f] "=&r"(flags)                                            \
+                         : [x] "r"(x), [in] "r"(flags_in)                                            \
+                         : "cc");                                                                    \
+        *result = d;                                                                                 \
+        return flags;                                                                                \
+    }
+#define SATURATE_WIDTHS_1_15(X, mode)                                                                \
+    X(mode, 1) X(mode, 2) X(mode, 3) X(mode, 4) X(mode, 5) X(mode, 6) X(mode, 7) X(mode, 8) X(mode, 9) \
+    X(mode, 10) X(mode, 11) X(mode, 12) X(mode, 13) X(mode, 14) X(mode, 15)
+#define SATURATE_WIDTHS_16_31(X, mode)                                                               \
+    X(mode, 16) X(mode, 17) X(mode, 18) X(mode, 19) X(mode, 20) X(mode, 21) X(mode, 22) X(mode, 23)  \
+    X(mode, 24) X(mode, 25) X(mode, 26) X(mode, 27) X(mode, 28) X(mode, 29) X(mode, 30) X(mode, 31)
+#define USAT_FN(mode, w) SATURATE_FN(mode, usat##w, "usat %[d], #" #w ", %[x]")
+#define SSAT_FN(mode, w) SATURATE_FN(mode, ssat##w, "ssat %[d], #" #w ", %[x]")
+#define USAT16_FN(mode, w) SATURATE_FN(mode, usat16_##w, "usat16 %[d], #" #w ", %[x]")
+#define SSAT16_FN(mode, w) SATURATE_FN(mode, ssat16_##w, "ssat16 %[d], #" #w ", %[x]")
+#define USAT_CASE(mode, w) {usat##w##_##mode, w, false, false, false, 0, "usat #" #w},
+#define SSAT_CASE(mode, w) {ssat##w##_##mode, w, true, false, false, 0, "ssat #" #w},
+#define USAT16_CASE(mode, w) {usat16_##w##_##mode, w, false, true, false, 0, "usat16 #" #w},
+#define SSAT16_CASE(mode, w) {ssat16_##w##_##mode, w, true, true, false, 0, "ssat16 #" #w},
+
+// A conditional USAT/SSAT (ARM condition, Thumb IT block) runs only when its condition holds.
+__attribute__((target("arm"), noinline)) static unsigned saturate_conditional_arm(int x, unsigned flags_in, int *ne, int *eq) {
+    unsigned flags;
+    int d = -7, e = -7;
+    __asm__ volatile("msr APSR_nzcvq, %[in]\n"
+                     "usatne %[d], #8, %[x]\n"
+                     "ssateq %[e], #8, %[x], asr #1\n"
+                     "mrs %[f], APSR\n"
+                     : [d] "+&r"(d), [e] "+&r"(e), [f] "=&r"(flags)
+                     : [x] "r"(x), [in] "r"(flags_in)
+                     : "cc");
+    *ne = d;
+    *eq = e;
+    return flags;
+}
+__attribute__((target("thumb"), noinline)) static unsigned saturate_conditional_thumb(int x, unsigned flags_in, int *ne, int *eq) {
+    unsigned flags;
+    int d = -7, e = -7;
+    __asm__ volatile("msr APSR_nzcvq, %[in]\n"
+                     "ite ne\n"
+                     "usatne %[d], #8, %[x]\n"
+                     "ssateq %[e], #8, %[x], asr #1\n"
+                     "mrs %[f], APSR\n"
+                     : [d] "+&r"(d), [e] "+&r"(e), [f] "=&r"(flags)
+                     : [x] "r"(x), [in] "r"(flags_in)
+                     : "cc");
+    *ne = d;
+    *eq = e;
+    return flags;
+}
+static bool saturate_conditionals(unsigned (*fn)(int, unsigned, int *, int *)) {
+    int ne = 0, eq = 0;
+    unsigned flags = fn(1000, 0, &ne, &eq) & 0xF8000000u; // Z clear: usatne saturates to 255
+    bool z_clear = ne == 255 && eq == -7 && flags == 0x08000000u;
+    flags = fn(1000, 0x40000000u, &ne, &eq) & 0xF8000000u; // Z set: ssateq saturates 500 to 127
+    bool z_set = ne == -7 && eq == 127 && flags == 0x48000000u;
+    flags = fn(100, 0, &ne, &eq) & 0xF8000000u; // in range: no Q
+    bool in_range = ne == 100 && eq == -7 && flags == 0;
+    return z_clear && z_set && in_range;
+}
+
+// ASR #32 exists only in ARM code (Thumb's ASR #0 is the halfword form).
+SATURATE_FN(arm, usat_asr32, "usat %[d], #8, %[x], asr #32")
+SATURATE_FN(arm, ssat_asr32, "ssat %[d], #2, %[x], asr #32")
+static bool saturates_asr32_arm(void) {
+    static const SaturateCase cases[] = {{usat_asr32_arm, 8, false, false, true, 32, "usat #8, asr #32"},
+                                         {ssat_asr32_arm, 2, true, false, true, 32, "ssat #2, asr #32"}};
+    return saturate_cases(cases, sizeof cases / sizeof *cases, "arm");
+}
+
+#define SATURATE_TESTS(mode)                                                                         \
+    USAT_FN(mode, 0) SATURATE_WIDTHS_1_15(USAT_FN, mode) SATURATE_WIDTHS_16_31(USAT_FN, mode)        \
+    SATURATE_WIDTHS_1_15(SSAT_FN, mode) SATURATE_WIDTHS_16_31(SSAT_FN, mode) SSAT_FN(mode, 32)       \
+    USAT16_FN(mode, 0) SATURATE_WIDTHS_1_15(USAT16_FN, mode)                                         \
+    SATURATE_WIDTHS_1_15(SSAT16_FN, mode) SSAT16_FN(mode, 16)                                        \
+    SATURATE_FN(mode, usat_lsl1, "usat %[d], #8, %[x], lsl #1")                                     \
+    SATURATE_FN(mode, usat_lsl16, "usat %[d], #0, %[x], lsl #16")                                   \
+    SATURATE_FN(mode, usat_lsl31, "usat %[d], #31, %[x], lsl #31")                                  \
+    SATURATE_FN(mode, usat_asr1, "usat %[d], #8, %[x], asr #1")                                     \
+    SATURATE_FN(mode, usat_asr31, "usat %[d], #4, %[x], asr #31")                                   \
+    SATURATE_FN(mode, ssat_lsl4, "ssat %[d], #16, %[x], lsl #4")                                    \
+    SATURATE_FN(mode, ssat_lsl31, "ssat %[d], #32, %[x], lsl #31")                                  \
+    SATURATE_FN(mode, ssat_asr8, "ssat %[d], #8, %[x], asr #8")                                     \
+    SATURATE_FN(mode, ssat_asr31, "ssat %[d], #1, %[x], asr #31")                                   \
+    /* Rd = Rn: usat r, #5, r then ssat r, #8, r, lsl #1 */                                          \
+    __attribute__((target(#mode), noinline)) static int saturate_in_place_##mode(int x) {           \
+        __asm__ volatile("usat %0, #5, %0\n"                                                        \
+                         "sub %0, %0, #40\n"                                                        \
+                         "ssat %0, #8, %0, lsl #1\n"                                                \
+                         : "+r"(x)                                                                   \
+                         :                                                                           \
+                         : "cc");                                                                    \
+        return x;                                                                                    \
+    }                                                                                                \
+    static bool saturates_##mode(void) {                                                             \
+        static const SaturateCase cases[] = {                                                        \
+            USAT_CASE(mode, 0) SATURATE_WIDTHS_1_15(USAT_CASE, mode) SATURATE_WIDTHS_16_31(USAT_CASE, mode) \
+            SATURATE_WIDTHS_1_15(SSAT_CASE, mode) SATURATE_WIDTHS_16_31(SSAT_CASE, mode) SSAT_CASE(mode, 32) \
+            USAT16_CASE(mode, 0) SATURATE_WIDTHS_1_15(USAT16_CASE, mode)                             \
+            SATURATE_WIDTHS_1_15(SSAT16_CASE, mode) SSAT16_CASE(mode, 16)                            \
+            {usat_lsl1_##mode, 8, false, false, false, 1, "usat #8, lsl #1"},                        \
+            {usat_lsl16_##mode, 0, false, false, false, 16, "usat #0, lsl #16"},                     \
+            {usat_lsl31_##mode, 31, false, false, false, 31, "usat #31, lsl #31"},                   \
+            {usat_asr1_##mode, 8, false, false, true, 1, "usat #8, asr #1"},                         \
+            {usat_asr31_##mode, 4, false, false, true, 31, "usat #4, asr #31"},                      \
+            {ssat_lsl4_##mode, 16, true, false, false, 4, "ssat #16, lsl #4"},                       \
+            {ssat_lsl31_##mode, 32, true, false, false, 31, "ssat #32, lsl #31"},                    \
+            {ssat_asr8_##mode, 8, true, false, true, 8, "ssat #8, asr #8"},                          \
+            {ssat_asr31_##mode, 1, true, false, true, 31, "ssat #1, asr #31"},                       \
+        };                                                                                           \
+        return saturate_cases(cases, sizeof cases / sizeof *cases, #mode) &&                         \
+               saturate_conditionals(saturate_conditional_##mode) && saturate_in_place_##mode(100) == -18 && \
+               saturate_in_place_##mode(-3) == -80;                                                  \
+    }
+SATURATE_TESTS(arm)
+SATURATE_TESTS(thumb)
 
 // What neon_permutes_* must produce from the bytes 0..31 (see the instructions there).
 static void neon_permute_expected(unsigned char *want) {
@@ -1398,6 +1639,184 @@ __attribute__((target("arm"), noinline)) static unsigned shift_carry(unsigned va
         : "cc");
     return carry;
 }
+// Shifts by a register amount (its low byte) past the word size: LSL/LSR give 0,
+// ASR fills with the sign bit, ROR wraps. Also LSR #32 and ASR #32 as immediates.
+// Each runs with chosen flags going in: the S forms must set N, Z and C (C kept
+// when the amount is 0) and keep V; the plain forms must keep all four.
+#define SHIFT_FN(mode, name, text)                                                                           \
+    __attribute__((target(#mode), noinline)) static unsigned name##_##mode(unsigned value, unsigned amount,   \
+                                                                            unsigned *flags) {                \
+        unsigned result, out;                                                                                \
+        __asm__ volatile("msr APSR_nzcvq, %[f]\n" text "\nmrs %[o], APSR"                                   \
+                         : [r] "=&r"(result), [o] "=&r"(out)                                                 \
+                         : [v] "r"(value), [a] "r"(amount), [f] "r"(*flags)                                  \
+                         : "cc");                                                                            \
+        *flags = out & 0xF0000000u;                                                                          \
+        return result;                                                                                       \
+    }
+SHIFT_FN(arm, shift_lsl, "mov %[r], %[v], lsl %[a]")
+SHIFT_FN(arm, shift_lsr, "mov %[r], %[v], lsr %[a]")
+SHIFT_FN(arm, shift_asr, "mov %[r], %[v], asr %[a]")
+SHIFT_FN(arm, shift_ror, "mov %[r], %[v], ror %[a]")
+SHIFT_FN(arm, shifts_lsl, "movs %[r], %[v], lsl %[a]")
+SHIFT_FN(arm, shifts_lsr, "movs %[r], %[v], lsr %[a]")
+SHIFT_FN(arm, shifts_asr, "movs %[r], %[v], asr %[a]")
+SHIFT_FN(arm, shifts_ror, "movs %[r], %[v], ror %[a]")
+SHIFT_FN(thumb, shift_lsl, "lsl.w %[r], %[v], %[a]")
+SHIFT_FN(thumb, shift_lsr, "lsr.w %[r], %[v], %[a]")
+SHIFT_FN(thumb, shift_asr, "asr.w %[r], %[v], %[a]")
+SHIFT_FN(thumb, shift_ror, "ror.w %[r], %[v], %[a]")
+SHIFT_FN(thumb, shifts_lsl, "lsls.w %[r], %[v], %[a]")
+SHIFT_FN(thumb, shifts_lsr, "lsrs.w %[r], %[v], %[a]")
+SHIFT_FN(thumb, shifts_asr, "asrs.w %[r], %[v], %[a]")
+SHIFT_FN(thumb, shifts_ror, "rors.w %[r], %[v], %[a]")
+SHIFT_FN(arm, lsr32, "mov %[r], %[v], lsr #32")
+SHIFT_FN(arm, asr32, "mov %[r], %[v], asr #32")
+SHIFT_FN(arm, lsrs32, "movs %[r], %[v], lsr #32")
+SHIFT_FN(arm, asrs32, "movs %[r], %[v], asr #32")
+SHIFT_FN(thumb, lsr32, "lsr.w %[r], %[v], #32")
+SHIFT_FN(thumb, asr32, "asr.w %[r], %[v], #32")
+SHIFT_FN(thumb, lsrs32, "lsrs.w %[r], %[v], #32")
+SHIFT_FN(thumb, asrs32, "asrs.w %[r], %[v], #32")
+// kind: 0 LSL, 1 LSR, 2 ASR, 3 ROR. Returns the result; *flags goes from the
+// flags before to the flags after an S form.
+static unsigned expected_shift(int kind, unsigned value, unsigned amount, unsigned *flags) {
+    amount &= 0xFF;
+    unsigned result, carry = *flags >> 29 & 1;
+    switch (kind) {
+    case 0: result = amount >= 32 ? 0 : value << amount; break;
+    case 1: result = amount >= 32 ? 0 : value >> amount; break;
+    case 2: result = (unsigned)((int)value >> (amount >= 32 ? 31 : amount)); break;
+    default: result = amount & 31 ? value >> (amount & 31) | value << (32 - (amount & 31)) : value; break;
+    }
+    if (amount) {
+        switch (kind) {
+        case 0: carry = amount <= 32 ? value >> (32 - amount) & 1 : 0; break;
+        case 1: carry = amount <= 32 ? value >> (amount - 1) & 1 : 0; break;
+        case 2: carry = value >> (amount >= 32 ? 31 : amount - 1) & 1; break;
+        default: carry = result >> 31; break;
+        }
+    }
+    *flags = (result & 0x80000000u) | (result == 0) << 30 | carry << 29 | (*flags & 0x10000000u);
+    return result;
+}
+static bool big_shifts_ok() {
+    typedef unsigned (*Shift)(unsigned, unsigned, unsigned *);
+    static const Shift plain[2][4] = {{shift_lsl_arm, shift_lsr_arm, shift_asr_arm, shift_ror_arm},
+                                      {shift_lsl_thumb, shift_lsr_thumb, shift_asr_thumb, shift_ror_thumb}};
+    static const Shift setting[2][4] = {{shifts_lsl_arm, shifts_lsr_arm, shifts_asr_arm, shifts_ror_arm},
+                                        {shifts_lsl_thumb, shifts_lsr_thumb, shifts_asr_thumb, shifts_ror_thumb}};
+    // by immediate #32: {plain, S} x {LSR, ASR}
+    static const Shift by32[2][2][2] = {{{lsr32_arm, asr32_arm}, {lsrs32_arm, asrs32_arm}},
+                                        {{lsr32_thumb, asr32_thumb}, {lsrs32_thumb, asrs32_thumb}}};
+    static const unsigned values[] = {0x80000001u, 0x7FFFFFFFu, 0xDEADBEEFu, 1, 0, 0xFFFFFFFFu};
+    static const unsigned flags_in[] = {0x10000000u, 0xE0000000u, 0x20000000u, 0x40000000u};
+    auto same = [](Shift shift, int kind, bool sets, unsigned value, unsigned amount, unsigned in) {
+        unsigned want_flags = in, got_flags = in;
+        unsigned want = expected_shift(kind, value, amount, &want_flags);
+        unsigned got = shift(value, amount, &got_flags);
+        return got == want && got_flags == (sets ? want_flags : in);
+    };
+    for (int mode = 0; mode < 2; mode++)
+        for (int kind = 0; kind < 4; kind++)
+            for (unsigned value : values)
+                for (unsigned in : flags_in) {
+                    for (unsigned amount = 0; amount <= 259; amount++)
+                        if (!same(plain[mode][kind], kind, false, value, amount, in) ||
+                            !same(setting[mode][kind], kind, true, value, amount, in))
+                            return false;
+                    if (kind == 1 || kind == 2)
+                        for (int sets = 0; sets < 2; sets++)
+                            if (!same(by32[mode][sets][kind - 1], kind, sets, value, 32, in))
+                                return false;
+                }
+    return true;
+}
+// LDRD/STRD at an 8-byte aligned address (Unicorn: one 64-bit access) and at one
+// that is only 4-byte aligned (two 32-bit accesses): immediate offsets, pre- and
+// post-index writeback, and a load whose first register is the base. The first
+// register always gets the word at the lower address. `w` is 16-byte aligned,
+// w[i] = 0xC0DE0000 + i on entry.
+#define DUAL_FN(mode)                                                                                     \
+    __attribute__((target(#mode), noinline)) static void dual_##mode(unsigned *w, unsigned *out) {         \
+        __asm__ volatile("ldrd r2, r3, [%[w]]\n\tstr r2, [%[o]]\n\tstr r3, [%[o], #4]\n\t"                  \
+                         "ldrd r2, r3, [%[w], #4]\n\tstr r2, [%[o], #8]\n\tstr r3, [%[o], #12]\n\t"         \
+                         "mov r4, %[w]\n\tldrd r2, r3, [r4, #8]!\n\tstr r2, [%[o], #16]\n\tstr r3, [%[o], #20]\n\t" \
+                         "ldrd r2, r3, [r4], #4\n\tstr r2, [%[o], #24]\n\tstr r3, [%[o], #28]\n\t"          \
+                         "sub r4, r4, %[w]\n\tstr r4, [%[o], #32]\n\t"                                      \
+                         "mov r2, %[w]\n\tldrd r2, r3, [r2, #20]\n\tstr r2, [%[o], #36]\n\tstr r3, [%[o], #40]\n\t" \
+                         "mov r2, %[w]\n\tldrd r2, r3, [r2, #16]\n\tstr r2, [%[o], #44]\n\tstr r3, [%[o], #48]\n\t" \
+                         "movw r2, #0x1111\n\tmovw r3, #0x2222\n\tstrd r2, r3, [%[w], #32]\n\t"             \
+                         "movw r2, #0x3333\n\tmovw r3, #0x4444\n\tstrd r2, r3, [%[w], #44]\n\t"             \
+                         "add r4, %[w], #52\n\tmovw r2, #0x5555\n\tmovw r3, #0x6666\n\tstrd r2, r3, [r4, #4]!\n\t" \
+                         "add r4, r4, #12\n\tmovw r2, #0x7777\n\tmovw r3, #0x8888\n\tstrd r2, r3, [r4], #-4\n\t" \
+                         "sub r4, r4, %[w]\n\tstr r4, [%[o], #52]"                                          \
+                         :                                                                                  \
+                         : [w] "r"(w), [o] "r"(out)                                                         \
+                         : "r2", "r3", "r4", "memory");                                                     \
+    }
+DUAL_FN(arm)
+DUAL_FN(thumb)
+// ARM only: a register offset, with and without writeback.
+__attribute__((target("arm"), noinline)) static void dual_register_arm(unsigned *w, unsigned *out) {
+    __asm__ volatile("mov r5, #24\n\tldrd r2, r3, [%[w], r5]\n\tstr r2, [%[o]]\n\tstr r3, [%[o], #4]\n\t"
+                     "mov r5, #12\n\tldrd r2, r3, [%[w], r5]\n\tstr r2, [%[o], #8]\n\tstr r3, [%[o], #12]\n\t"
+                     "mov r4, %[w]\n\tmov r5, #8\n\tldrd r2, r3, [r4, r5]!\n\tstr r2, [%[o], #16]\n\tstr r3, [%[o], #20]\n\t"
+                     "sub r4, r4, %[w]\n\tstr r4, [%[o], #24]\n\t"
+                     "mov r5, #20\n\tmovw r2, #0x9999\n\tmovw r3, #0xAAAA\n\tstrd r2, r3, [%[w], r5]"
+                     :
+                     : [w] "r"(w), [o] "r"(out)
+                     : "r2", "r3", "r4", "r5", "memory");
+}
+static bool dual_loads_stores_ok() {
+    typedef void (*Dual)(unsigned *, unsigned *);
+    static const Dual duals[] = {dual_arm, dual_thumb};
+    alignas(16) unsigned w[20];
+    for (Dual dual : duals) {
+        unsigned out[14] = {};
+        for (unsigned i = 0; i < 20; i++) w[i] = 0xC0DE0000u + i;
+        dual(w, out);
+        const unsigned b = 0xC0DE0000u;
+        const unsigned want_out[14] = {b, b + 1, b + 1, b + 2, b + 2, b + 3, b + 2, b + 3, 12, b + 5, b + 6, b + 4, b + 5, 64};
+        unsigned want_w[20];
+        for (unsigned i = 0; i < 20; i++) want_w[i] = b + i;
+        want_w[8] = 0x1111, want_w[9] = 0x2222, want_w[11] = 0x3333, want_w[12] = 0x4444;
+        want_w[14] = 0x5555, want_w[15] = 0x6666, want_w[17] = 0x7777, want_w[18] = 0x8888;
+        if (memcmp(out, want_out, sizeof out) != 0 || memcmp(w, want_w, sizeof w) != 0) return false;
+    }
+    unsigned out[7] = {};
+    for (unsigned i = 0; i < 20; i++) w[i] = 0xC0DE0000u + i;
+    dual_register_arm(w, out);
+    const unsigned b = 0xC0DE0000u;
+    const unsigned want_out[7] = {b + 6, b + 7, b + 3, b + 4, b + 2, b + 3, 8};
+    return memcmp(out, want_out, sizeof out) == 0 && w[4] == b + 4 && w[5] == 0x9999 && w[6] == 0xAAAA && w[7] == b + 7;
+}
+// Library code made writable with mprotect, then patched and flushed: the new
+// instruction and the new literal must both be seen (a read-only library
+// segment may be translated with its literals folded in as constants).
+__attribute__((target("arm"), naked, noinline, aligned(64))) static unsigned patched_library_code() {
+    __asm__("ldr r0, 1f\n\t"
+            "add r0, r0, #0\n\t"
+            "bx lr\n\t"
+            "1: .word 0x12345678");
+}
+static bool library_code_made_writable() {
+    unsigned (*volatile call)() = patched_library_code;
+    unsigned *code = (unsigned *)(void *)patched_library_code;
+    if (code[1] != 0xE2800000u || code[3] != 0x12345678u || call() != 0x12345678u) return false;
+    void *page = (void *)((uintptr_t)code & ~(uintptr_t)4095);
+    if (mprotect(page, 8192, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return false;
+    code[1] = 0xE2800001u; // add r0, r0, #1
+    code[3] = 0x22222222u;
+    __builtin___clear_cache((char *)code, (char *)(code + 4));
+    bool ok = call() == 0x22222223u;
+    code[1] = 0xE2800000u;
+    code[3] = 0x12345678u;
+    __builtin___clear_cache((char *)code, (char *)(code + 4));
+    ok = ok && call() == 0x12345678u;
+    mprotect(page, 8192, PROT_READ | PROT_EXEC);
+    return ok;
+}
 static double take_mixed(int a, double b, int c, long long d, float e) { return a + b + c + (double)d + e; }
 
 extern "C" int run_all() {
@@ -1583,11 +2002,15 @@ extern "C" int run_all() {
         check(read_back.sa_sigaction == on_pause && sent == 0 && was_paused && handler_thread_ok && context_ok &&
                   pauses == 1 && held && usr1 == 1,
               "signals: pause and resume another thread (Mono's garbage collector), blocked signals wait");
+        check(frame_on_stack, "signals: saved registers sit on the thread's own stack (where a garbage collector looks)");
     }
 
     check(shift_carry(5, 0) == 1 && shift_carry(1, 2) == 0 && shift_carry(2, 1) == 0 && shift_carry(1, 1) == 1 &&
               shift_carry(0x80000000u, 32) == 1 && shift_carry(1, 33) == 0,
           "carry from a shift by a register amount (0 keeps it)");
+    check(big_shifts_ok(), "shifts by 32 or more (register amounts 0-259, LSR/ASR #32), result and flags, S and plain, ARM and Thumb");
+    check(dual_loads_stores_ok(), "LDRD/STRD at 8- and 4-byte aligned addresses: offsets, writeback, base as first register, ARM and Thumb");
+    check(library_code_made_writable(), "library code made writable (mprotect), patched and flushed: new instruction and new literal seen");
 
     char directory[512];
     check(getcwd(directory, sizeof directory) == directory && directory[0] == '/', "getcwd");
@@ -1660,6 +2083,8 @@ extern "C" int run_all() {
         }
         check(multiplies_arm() && multiplies_thumb(), "UMAAL / SMMUL / SMMULR / SMMLA (ARM and Thumb)");
         check(halfword_multiplies_arm() && halfword_multiplies_thumb(), "SMLA<x><y> with Q flag / SMUL<x><y> / PKHBT / PKHTB (ARM and Thumb)");
+        check(saturates_arm() && saturates_asr32_arm() && saturates_thumb(),
+              "USAT / SSAT / USAT16 / SSAT16: every width, LSL / ASR, Q flag, conditional, Rd = Rn (ARM and Thumb)");
         check(neon_extras_arm() && neon_extras_thumb(), "NEON lanes, VMOVL/VSHLL, VCVT, VMAX/VMIN, immediates, permutes (ARM and Thumb)");
         check(stored_pc_offset() == 4, "STM storing PC (ARM)");
         check(raw_getpid_arm() == getpid() && raw_getpid_thumb() == getpid(), "raw svc system call (ARM and Thumb)");
@@ -1684,6 +2109,7 @@ extern "C" int run_all() {
         check(ping_pong_without_lost_wakeups(), "mutex + condition and semaphore ping-pong without lost wake-ups");
         check(futex_wake_counts(), "futex wake counts: 3 sleepers, wake 2 then 2; timed waits racing wakes");
         check(handler_reads_thread_data(), "a signal handler reads thread-specific data its thread keeps changing");
+        check(patched_literals_seen(), "made code (heap, library data): a literal patched after the block's end (constant, call target) is seen");
         if (bridge_flag("arm32_bridge_runs_in_parallel"))
             check(signals_reach_blocked_read(), "two signals reach a thread blocked in read() while it stays blocked");
         int gl = gl_state_follows_context();
@@ -1699,7 +2125,7 @@ extern "C" int run_all() {
                 kRaceAdds = 2000;
                 kSmallRounds = 50;
             }
-            check(shared_counters_exact(), "four threads on shared counters: atomics (32/64-bit), kuser cmpxchg, mutex, SWP lock");
+            check(shared_counters_exact(), "four threads on shared counters: atomics (32/64-bit), kuser cmpxchg, mutex, SWP lock, CP15 barriers");
             check(small_counters_exact(), "four threads on 8- and 16-bit atomics, exact per round, neighbours untouched");
             check(once_from_four_threads(), "pthread_once from four threads at once runs once");
             check(code_rewrite_across_threads(), "code rewritten while other threads run it (calls and a spinning thread)");

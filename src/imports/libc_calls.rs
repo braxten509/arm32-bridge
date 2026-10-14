@@ -313,11 +313,6 @@ fn inside_mapping(shared: &crate::runtime::Shared, address: u32, length: u32) ->
         .is_some_and(|(&start, &size)| address as u64 + length as u64 <= start as u64 + size as u64)
 }
 
-/// Whether `address` is in a loaded library (its code is already translated as usual).
-fn mapped_by_library(address: u32) -> bool {
-    (crate::mem::LIB_BASE..crate::mem::LIB_END).contains(&address)
-}
-
 /// mmap for the guest: a page-aligned heap block, filled from `fd` for file mappings.
 fn map_memory(uc: &mut Uc, address: u32, length: u32, _protection: u32, flags: u32, fd: u32, offset: u64) -> Ret {
     const MAP_FAILED: u32 = u32::MAX;
@@ -1098,6 +1093,43 @@ pub fn handler(name: &str) -> Option<Handler> {
             clear_errno();
             Ret::U32(unsafe { libc::getpriority(which as _, who as _) } as u32)
         }),
+        "setpriority" => handler!(|uc, a| {
+            let (which, who, priority) = (a.u32(), a.u32(), a.i32());
+            checked(uc, unsafe { libc::setpriority(which as _, who as _, priority) } as i64)
+        }),
+        // struct rusage for the guest: two 32-bit timevals, then 14 longs (72 bytes).
+        "getrusage" => handler!(|uc, a| {
+            let (who, out) = (a.i32(), a.u32());
+            let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+            if unsafe { libc::getrusage(who, &mut usage) } != 0 {
+                sync_errno(uc);
+                return Ret::U32(u32::MAX);
+            }
+            let fields = [
+                usage.ru_utime.tv_sec as i64,
+                usage.ru_utime.tv_usec as i64,
+                usage.ru_stime.tv_sec as i64,
+                usage.ru_stime.tv_usec as i64,
+                usage.ru_maxrss as i64,
+                usage.ru_ixrss as i64,
+                usage.ru_idrss as i64,
+                usage.ru_isrss as i64,
+                usage.ru_minflt as i64,
+                usage.ru_majflt as i64,
+                usage.ru_nswap as i64,
+                usage.ru_inblock as i64,
+                usage.ru_oublock as i64,
+                usage.ru_msgsnd as i64,
+                usage.ru_msgrcv as i64,
+                usage.ru_nsignals as i64,
+                usage.ru_nvcsw as i64,
+                usage.ru_nivcsw as i64,
+            ];
+            for (i, value) in fields.iter().enumerate() {
+                mem().write_u32(out + i as u32 * 4, (*value).clamp(i32::MIN as i64, i32::MAX as i64) as i32 as u32);
+            }
+            Ret::U32(0)
+        }),
         "sigaltstack" => handler!(|uc, a| Ret::U32(0)),
         "open" => handler!(|uc, a| {
             let (path, flags, mode) = (a.u32(), a.u32(), a.u32());
@@ -1648,10 +1680,23 @@ pub fn handler(name: &str) -> Option<Handler> {
         }),
         "mprotect" => handler!(|uc, a| {
             let (address, length, protection) = (a.u32(), a.u32(), a.u32());
-            if protection & libc::PROT_EXEC as u32 != 0 && !mapped_by_library(address) {
+            if protection & libc::PROT_EXEC as u32 != 0 && !crate::mem::fixed(address) {
                 crate::log::line(&format!(
                     "[bridge] game made memory executable at {address:#x} ({length} bytes): code made while running"
                 ));
+            }
+            // Library code or constants made writable: they may change now.
+            // One at a time, so a second call for the same page returns only
+            // after the first has dropped the old translations.
+            static UNFIXING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let _one_at_a_time = UNFIXING.lock().unwrap_or_else(|e| e.into_inner());
+            let end = address.saturating_add(page_round(length));
+            if protection & libc::PROT_WRITE as u32 != 0 && crate::mem::unfix(address, end) {
+                crate::log::line(&format!(
+                    "[bridge] game made read-only library memory writable at {address:#x} ({length} bytes): watched as made code from now on"
+                ));
+                crate::runtime::note_code_change(address, end);
+                crate::dynarec::invalidate_library(uc, address, end);
             }
             Ret::U32(0)
         }),

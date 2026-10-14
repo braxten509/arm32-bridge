@@ -11,6 +11,7 @@ use crate::runtime::{call_guest, shared, stub_for, Uc};
 const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
 const PT_ARM_EXIDX: u32 = 0x7000_0001;
+const PF_W: u32 = 2;
 
 const DT_NEEDED: u32 = 1;
 const DT_PLTRELSZ: u32 = 2;
@@ -130,6 +131,7 @@ impl Loader {
             address: u32,
             file_size: u32,
             memory_size: u32,
+            flags: u32,
         }
         let segments: Vec<Segment> = (0..program_count)
             .map(|i| {
@@ -140,6 +142,7 @@ impl Loader {
                     address: header_u32(at + 8),
                     file_size: header_u32(at + 16),
                     memory_size: header_u32(at + 20),
+                    flags: header_u32(at + 24),
                 }
             })
             .collect();
@@ -161,6 +164,9 @@ impl Loader {
         for segment in segments.iter().filter(|s| s.kind == PT_LOAD) {
             let bytes = &file[segment.offset as usize..(segment.offset + segment.file_size) as usize];
             memory.write_bytes(base + segment.address, bytes);
+            if segment.flags & PF_W == 0 {
+                mem::add_fixed(base + segment.address, base + segment.address + segment.memory_size);
+            }
         }
         if let Some(exidx) = segments.iter().find(|s| s.kind == PT_ARM_EXIDX) {
             // C++ exception unwinding asks for this via dl_unwind_find_exidx.

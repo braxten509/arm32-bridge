@@ -260,7 +260,33 @@ fn jump_entry(pc: u32) -> &'static AtomicU64 {
 
 fn set_jump(pc: u32, code: usize) {
     let offset = (code - CODE_BASE.load(Ordering::Relaxed)) as u64;
-    jump_entry(pc).store(offset << 32 | pc as u64, Ordering::Release);
+    let entry = jump_entry(pc);
+    let wanted = offset << 32 | pc as u64;
+    // Rewrite only on a change: every core reads this table, and a store
+    // would take the cache line away from all of them.
+    if entry.load(Ordering::Relaxed) != wanted {
+        entry.store(wanted, Ordering::Release);
+    }
+}
+
+/// The enter glue and exit stub (fixed once code memory exists).
+static ENTER: AtomicUsize = AtomicUsize::new(0);
+static EXIT_STUB: AtomicUsize = AtomicUsize::new(0);
+
+/// The dispatcher's lock-free first look: the jump table entry for `pc`, if
+/// it holds that pc (blocks are only dropped with every other thread stopped,
+/// and their entries cleared then). The block end is not known here; it is
+/// only needed by the checker, which turns linking (and this table) off.
+fn table_block(pc: u32) -> Option<(usize, u32, usize, usize)> {
+    if jump_table() == 0 {
+        return None;
+    }
+    let entry = jump_entry(pc).load(Ordering::Acquire);
+    if entry as u32 != pc {
+        return None;
+    }
+    let code = CODE_BASE.load(Ordering::Relaxed) + (entry >> 32) as usize;
+    Some((code, 0, ENTER.load(Ordering::Relaxed), EXIT_STUB.load(Ordering::Relaxed)))
 }
 
 pub(super) fn jump_table() -> usize {
@@ -305,6 +331,8 @@ static CACHE: OnceLock<RwLock<Cache>> = OnceLock::new();
 fn cache() -> &'static RwLock<Cache> {
     CACHE.get_or_init(|| {
         let memory = CodeMemory::new();
+        ENTER.store(memory.enter, Ordering::Relaxed);
+        EXIT_STUB.store(memory.exit_stub, Ordering::Relaxed);
         if linking() {
             JUMP_TABLE.store(CODE_BASE.load(Ordering::Relaxed), Ordering::Relaxed);
         }
@@ -437,14 +465,37 @@ const MAX_BLOCK_SPAN: u32 = 4096;
 /// Other threads are stopped first (outside translated code), since the
 /// dropped code may be running on them.
 pub fn invalidate(uc: &Uc, start: u32, end: u32) {
-    let covered = |cache: &Cache| -> Vec<u32> {
+    drop_blocks(uc, |cache| {
         cache
             .made_blocks
             .range((start.saturating_sub(MAX_BLOCK_SPAN), 0)..(end, 0))
             .filter(|&(&(first, _), &block_end)| block_end > start && first < end)
             .map(|(&(_, pc), _)| pc)
             .collect()
-    };
+    });
+}
+
+/// How far a folded literal can lie from its block, with room to spare: an
+/// offset up to 4095 from PC (the instruction + 8 in ARM) and a 4-byte word.
+const LITERAL_REACH: u32 = 8192;
+
+/// A read-only library segment in [start, end) was made writable (`mem::unfix`
+/// has already run): drops every block that may hold its bytes, its own code
+/// and blocks nearby that folded a literal from it. Retranslated blocks there
+/// are watched like code the game made.
+pub fn invalidate_library(uc: &Uc, start: u32, end: u32) {
+    let (low, high) = (start.saturating_sub(LITERAL_REACH), end.saturating_add(LITERAL_REACH));
+    drop_blocks(uc, |cache| {
+        cache
+            .blocks
+            .iter()
+            .filter(|&(&pc, &(_, block_end))| block_end > low && (pc & !1) < high)
+            .map(|(&pc, _)| pc)
+            .collect()
+    });
+}
+
+fn drop_blocks(uc: &Uc, covered: impl Fn(&Cache) -> Vec<u32>) {
     if CACHE.get().is_none() || covered(&read_cache()).is_empty() {
         return;
     }
@@ -511,7 +562,9 @@ fn block_for(pc: u32) -> (usize, u32, usize, usize) {
         let address = cache.memory.place(&block.code);
         cache.blocks.insert(pc, (address, block.end));
         cache.starts.push((address, pc));
-        if !(mem::LIB_BASE..mem::LIB_END).contains(&(pc & !1)) {
+        // Watched unless all of it is fixed: a block may run on into a page
+        // the game made writable (`mem::unfix`).
+        if !mem::fixed_range(pc & !1, block.end) {
             cache.made_blocks.insert((pc & !1, pc), block.end);
         }
         if linking() {
@@ -594,7 +647,7 @@ pub fn run(uc: &mut Uc, pc: u32, stop_at: u32) -> Result<(), String> {
             uc.get_data_mut().fault = Some(message.clone());
             return Err(message);
         }
-        let (code, end, enter, exit_stub) = block_for(pc);
+        let (code, end, enter, exit_stub) = table_block(pc).unwrap_or_else(|| block_for(pc));
         let reference = if check::enabled() { check::reference(uc, pc, end, stop_at) } else { None };
         let state = &mut uc.get_data_mut().native.as_mut().expect("translator state").state as *mut CpuState;
         let enter: EnterFn = unsafe { std::mem::transmute(enter) };

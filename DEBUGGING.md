@@ -800,3 +800,656 @@ Converted and installed each game with `tools/convert.sh` (rebuilds `libarm32_br
 - gfxinfo for Puzzle Craft counted only 3-5 frames (cocos2d also draws to its own surface), so its janky numbers mean nothing.
 
 Next idea for Card Wars: own code is ~2/3 of the frame; the remaining limit to 120 fps is translated guest code, not locks.
+
+# What's left (2026-10-13, after commit 06c499c)
+
+State: translator is the default; guest threads run in parallel. Phone results with 06c499c:
+Card Wars ~72 fps steady after loading (idle, no taps), Puzzle Craft 1 ~120, Puzzle Craft 2 106-120.
+Self-test: 0 failures in all six modes on the phone, default and forced modes on the PC.
+
+## Rule for all remaining work
+Engine work only: no code that checks a game's name, package, library hash or fixed address, and no change
+aimed at one function of one game. A fix must be a general bridge/translator change. After every speed or
+correctness change, check all three games (Card Wars, Puzzle Craft 1, Puzzle Craft 2) plus the self-test.
+
+## 1. Card Wars to full speed (main goal)
+- Now: 70-74 fps; game code 13.4-15.2 ms/frame = own code (translated guest code) 9.2-10.3 ms + phone functions
+  4.1-4.9 ms; guest-lock wait 0.00 ms; "stops of every thread" stays at 26761 after loading (no new stops in
+  steady state).
+- Goal: 115+ fps average over 30 s (display is 120 Hz), i.e. game code <= ~8 ms/frame, no stall > 100 ms after
+  loading. Same bar as docs/translator.md pass check 6.
+- Not done yet: a steady-state profile of Card Wars on the translator. First step: simpleperf on the running game
+  (`su -c 'simpleperf record -p PID --duration 15 -f 2000 -g -o /data/local/tmp/cw.perf'`, all threads), split time
+  into translated code, dispatcher/block lookup, call_stub + phone-function handlers, Unicorn fallbacks, exclusive
+  monitor (LDREX/STREX), signal delivery, kernel. Pick the change from the profile, not from a guess.
+- Suspects to check against the profile (none proven): Mono JIT code reached by indirect jumps that miss the
+  jump table; Unicorn fallbacks for instructions the translator lacks; per-call cost of the phone-function path
+  (how many calls per frame); exclusive-monitor cost now that threads are parallel; GL wrapper copies.
+
+## 2. Card Wars loading
+- ~15 s from launch to Unity "READY"; seconds at 1.8-24 fps while loading; 26761 stop-every-thread events, all
+  during loading. Profile the loading window too (likely Mono JIT writes + cacheflush invalidations).
+
+## 3. Phone functions with no handler that the games really call (from today's logs)
+- Card Wars: setpriority, getrusage, ASensorManager_getInstance. Puzzle Craft 2: ASensorManager_getInstance,
+  AConfiguration_new. Each returns 0 today. (The converter's longer lists, 162 and 29, are imports that may never
+  be called.)
+
+## 4. Smaller open items
+- Own-code spikes: Puzzle Craft 2 had one 84 ms frame (own code 71 ms); older note "own code 45-59 ms every few
+  seconds, unknown". Not explained.
+- Checker mode: checker hooks are added again on reused pool engines (duplicate hooks). Owner chose "later".
+- Reused thread stacks are not zeroed (by design, like real pthreads). Keep.
+- Checker blind spot: STREX right after LDREX in an earlier block (Unicorn has no monitor). Not a bug.
+- Card Wars was only tested idle (no taps). Play, sound and touch are untested; taps need the owner's permission.
+
+## How to measure (scripts lived in /tmp/a32k, which gets cleaned; rebuild from these)
+- Convert + install one game (rebuilds libarm32_bridge.so itself):
+  `tools/convert.sh <apk> --out /tmp/a32k/<name>-arm64.apk --device 56280DLCR0026M`
+  APKs: Card Wars `~/dev/arm32-bridge-games/cardwars/CardWars.apk` (com.ThugBoatLTD.CardWars);
+  Puzzle Craft 1 `~/pixel10-flash/games/puzzlecraft1/com.chillingo.puzzlecraft.android.rowgplay.apk`;
+  Puzzle Craft 2 `~/pixel10-flash/games/puzzlecraft2/com.chillingo.puzzlecraft2.android.gplay.apk`.
+- Run: `adb shell am force-stop P; adb logcat -c; adb shell monkey -p P -c android.intent.category.LAUNCHER 1`,
+  wait (Card Wars 180 s, Puzzle Craft 45 s), `adb logcat -d > log`, `adb shell pidof P`, force-stop.
+  Read `grep 'fps\]' log` (tag arm32bridge, one line per second), faults with
+  `grep -E 'F libc|FATAL|\[fault\]|panick|no handler yet'`, Card Wars state with `grep 'Changing State'`.
+- dumpsys gfxinfo is useless here (games draw on their own surface); use the [fps] lines and SurfaceFlinger
+  timestats.
+- Puzzle Craft saves: list `/data/data/P/files` and `shared_prefs` with `su -c 'ls -la --time-style=full-iso ...'`
+  before and after; they must not change.
+- Self-test, phone, six modes: build with `systemd-run --user --wait --pipe --quiet -p AllowedCPUs=6-11,18-23
+  --working-directory=$HOME/dev/arm32-bridge ./build-phone.sh`, push `target/aarch64-linux-android/release/arm32-bridge`
+  and `tests/guest/build/{selftest,libsecond,libslowinit}.so` to /data/local/tmp/a32, run
+  `./arm32-bridge call selftest.so run_all` with each of: (none), ARM32_FORCE_FALLBACK_SYNC=1, ARM32_CHECK=all,
+  ARM32_LSE=0, ARM32_PARALLEL=0, ARM32_ENGINE=unicorn. 0 failures required in every mode.
+- Self-test, PC: `cargo build --release` under the same systemd-run wrapper, then
+  `./target/release/arm32-bridge call tests/guest/build/selftest.so run_all` (also with ARM32_FORCE_FALLBACK_SYNC=1).
+- Noise: run the unchanged build at least 3 times before judging a change; compare whole runs.
+
+# Card Wars speed + crashes, session 2026-10-13 afternoon (start: commit 06c499c, unchanged build)
+
+## Baseline (unchanged build, 3 launches, no taps, 120 s each, steady = from READY+15 s)
+Scripts (outside the repo): `~/dev/arm32-bridge-games/scripts/` (cw-measure.sh, fps-summary.py, cw-profile.sh,
+perf-split.py, perf-ips.py, cw-crashloop.sh); raw logs in `~/dev/arm32-bridge-games/runs/`.
+- base1: 71.7 fps avg (min 65.0), game 13.92 ms, own 9.48, phone 4.44; 30 s windows 71.5 / 72.2 / 71.5
+- base2: 72.5 fps avg (min 64.4), game 13.78, own 9.37, phone 4.41; windows 72.0 / 72.7 / 72.8
+- base3: 72.7 fps avg (min 66.8), game 13.74, own 9.33, phone 4.41; windows 72.7 / 72.6 / 72.9
+- Noise: whole-run averages within 1.0 fps (71.7-72.7). READY 19-20 s after launch.
+- Game code per frame (13.7-13.9 ms) is the whole frame at 72 fps: the main thread is CPU bound.
+
+## Steady-state profile (prof1: simpleperf 2000 Hz, 15 s, 60 s after launch, all threads, no call graph)
+- By thread (share of all samples): guest workers "arm32-guest-103x" 35.4%, UnityMain 23.1%, "102x" 19.1%,
+  "108x" 17.4% (thread names are cut to 15 chars, so each covers up to 16 guest threads). The worker pool
+  burns ~2.5 cores: ~42% translated code (spinning), ~27% kernel futex wake/wait (_raw_spin_unlock_irqrestore),
+  ~25% bridge.
+- UnityMain (86% busy): translated code 43.2%, bridge 48.1% (engine::run 26.5% self, thread_local get 8.6%,
+  call_stub 6.1%, park_registers 2.9%, RwLock read_contended 1.2%), vdso clock_gettime 3.0%, kernel 4.4%.
+- Inside engine::run on UnityMain (6839 samples), hot spots (llvm-objdump of the same build):
+  0x1435ac 1453 + 0x14358c 648 (block-cache RwLock read acquire: ldaxr/stxr on the shared lock word),
+  0x14362c 1629 (hash map bucket load in block_for), 0x1436f0 1663 (RwLock read release: ldxr/stlxr).
+  => ~80% of the dispatcher's own time is the block-cache read lock + hash lookup done on EVERY dispatcher
+  entry, and the lock word is shared by all threads (cache-line ping-pong between cores).
+- Conclusion: the main thread loses ~half its time outside translated code; the dispatcher lookup is the
+  biggest single piece. Next: count dispatcher entries and why they happen (jump-table misses with a
+  4096-entry table, phone-function calls/returns, fallbacks) before choosing the speed change.
+
+## NEW: Card Wars crashes during loading (unchanged build)
+- prof1 launch: abort 13 s after launch on UnityMain: `* Assertion at class.c:4575, condition
+  m_class_get_rank (ac)' not met` (Mono), while loading card data (tombstone runs/prof1.tombstone).
+- Crash loop, parallel (default), 10 launches x 40 s: 8 alive, 2 dead:
+  run 3 `Assertion at ../../mono/metadata/handle.h:681, condition m_class_is_valuetype(...)`;
+  run 5 `[fault] bad guest memory access at 0x00000041 in translated code (guest block 0x026414e4)` =
+  inside libmonobdwgc (0x0221f000-0x02861000), r0=0x31 (garbage object pointer).
+  Total with prof1: 3 dead of 14 launches (~20%). All during loading (before READY).
+- Crash loop, parallel off (debug.arm32bridge.parallel=0): loading is so slow that no run reached READY in
+  40 s, so this loop cannot show the loading crash either way. Not usable as evidence.
+- Each loading run shows 1000-2400 pairs of "[signal] 30 ran" / "[signal] 24 ran" (SIGPWR = Boehm GC
+  suspend, SIGXCPU = restart): one stop-the-world GC pause of every thread many times per second.
+
+### Suspects (ranked)
+1. Signal frame not on the guest stack (most likely). run_handler (src/imports/signals.rs) puts the
+   siginfo + ucontext (all 15 registers of the interrupted code) in a heap block (heap().malloc), and the
+   handler runs on the thread's stack 256 bytes below sp. On Linux the kernel writes that frame onto the
+   thread's own stack. Boehm GC's suspend handler records its own sp (GC_approx_sp) as the top of the
+   thread's stack to scan, and relies on the full register context being in the signal frame on that
+   stack (bdwgc pthread_stop_world.c: "We believe that in this case the full context is already in the
+   signal handler frame."). The handler's prologue saves only r4-r11; a GC pointer that lives only in
+   r0-r3, r12 or lr at the moment of the pause is in the heap block, which the GC never scans -> the
+   object is freed while in use -> later Mono asserts / bad reads. Fits: intermittent (needs a pointer
+   only in a scratch register at a pause), loading only (thousands of GC pauses + heavy allocation),
+   different symptom each time (whatever object got freed), parallel mode (signals now land at any
+   block boundary in the middle of guest code via the attention flag, where scratch registers are live;
+   with the guest lock they were only taken at phone-function returns).
+   Evidence: (a) code: heap frame; (b) bdwgc source comment; (c) runtime: Mono object corruption only
+   during GC-heavy loading.
+2. Literal values baked into translated code (thumb.rs load_store, "Literal pools live in code, which never
+   changes"): true for library files, not for code Mono's JIT writes and later patches; a cache flush only
+   drops blocks that overlap the flushed bytes, and a literal usually sits just past its block's end. Would
+   make calls go to stale targets. General bug, but crashes are in libmonobdwgc / Mono runtime asserts, not
+   in JIT code, so it explains the symptoms less well. Fix separately after suspect 1.
+3. Translator race in parallel mode (exclusives are CAS-based: ABA not noticed). Mono/Boehm use CAS-style
+   loops, which have the same ABA behaviour natively. Unlikely.
+- Parallel-off loop final: 10 alive, 0 dead, but 0 of 10 reached READY in 40 s (loading too slow), so it
+  says nothing about the loading crash.
+
+### Attempt 1 (approved by the owner): signal frame on the guest stack
+- Where: src/imports/signals.rs run_handler: frame = (interrupted sp - 872) & !7 instead of heap().malloc;
+  guest sp = frame while the handler runs (call_guest starts it 256 bytes lower), interrupted sp restored
+  after; heap free removed. tests/guest/selftest.cpp: on_pause checks that ucontext and siginfo lie between
+  the handler's own frame and the interrupted sp; new check "signals: saved registers sit on the thread's
+  own stack (where a garbage collector looks)".
+- Predicted: the new check FAILS on the old build and passes on the new one; Card Wars 20 launches x 40 s
+  with 0 crashes (before: 3 of 14; chance of 0/20 by luck at a 20% rate is ~1%).
+- PC result: old PC binary + new self-test: "FAIL signals: saved registers sit on the thread's own stack",
+  1 failure. New PC build: 0 failures in default and ARM32_FORCE_FALLBACK_SYNC=1.
+- Phone result: (running: six modes, 20-launch loop, fps x2, Puzzle Craft 1 + 2)
+- Review (Claude Sonnet 5.5 high, read-only, t1): no HIGH/MEDIUM. Frame lands below the interrupted sp in
+  every path (call_stub, safe_point, helper deliver_for with parked sp, Unicorn call_guest_with, nested
+  handlers, unicorn_live fallback); state restore correct; GC range [handler sp, stack_end] now covers the
+  frame. LOW notes: pthread-specific values live host-side (Identity.values), invisible to a GC (not
+  traced; Mono keeps thread objects in GC roots too); per-level stack use grows 872 bytes (old 256-byte gap
+  already had the same edge risk); test covers only the self-delivery path and checks position, not contents
+  (a stronger test would plant a value in a scratch register and find it on the stack). Not acted on: outside
+  the approved scope; noted here.
+- Phone result (fix 1 build): six modes 0 failures, new check ok in all: default 18 s, forced 14 s,
+  CHECK=all 197 s (1369944 blocks, 0 differences), LSE=0 17 s, PARALLEL=0 54 s, unicorn 25 s.
+
+## Research: does Mono rewrite literal words next to its JIT code? (suspect 2)
+- Unity's Mono, mono/mini/tramp-arm.c mono_arch_patch_callsite (unity-main): for a `bx ip` call site it
+  calls arm_patch(code) then `mono_arch_flush_icache ((guint8*)(code - 2), 4)`; mini-arm.c arm_patch_general
+  "patching from magic trampoline" for the sequence
+      ldr ip, [pc, #0] / b 0xc / .word code_ptr / mov lr, pc / bx ip
+  writes only `code32 [-2] = target` (the .word). So after Mono resolves a call it rewrites the literal and
+  flushes exactly those 4 bytes.
+- In the bridge: the block starting at the `ldr ip, [pc, #0]` ends at the `b` (block [A, A+8)); the literal
+  is at A+8, so invalidate()'s overlap test (block_end > start: A+8 > A+8 is false) keeps the block, and its
+  folded literal still holds the old target (Mono's resolver trampoline). Every later call through that site
+  goes through the resolver again (C code + locks) and re-patches + flushes again, forever. So suspect 2 is
+  real, but it is a SPEED bug (calls keep taking Mono's slow path), not a likely crash cause.
+- Thunks (emit_thunk: ldr ip,[pc,#0]; bx ip; .word target) flush all 12 bytes, so their blocks are dropped
+  correctly.
+- Card Wars 20-launch loop with fix 1 (x 40 s): 19 alive, 1 dead (run 6: `[fault] bad guest memory access at
+  0x0000003b in translated code (guest block 0x025f63b0)`, r0=0xb, during LOAD_DATA right after
+  "CardDataScript DeckData path"). Fix 1 did NOT remove the crash.
+
+## Sub-agent critique (Codex Sol 6.1 high, read-only, t2) of the crash theory
+- Statistics: 3/14 before vs 1/13 (then 1/20) after is not significant (one-sided p ~0.33 at 1/13). Keep fix 1
+  (it is Linux behaviour), but it is not shown to help.
+- The fixed-build fault at 0x025f63b0 = libmonobdwgc offset 0x003d73b0 = mono_string_is_interned_lookup
+  (reads [r0+0x30] at 0x3d73c4 with r0=0xb): damaged object metadata / wrong pointer chain, not specifically a
+  premature collection.
+- Ruled out from the shipped library: no dl_iterate_phdr import, GC_register_data_segments is `bx lr` (Unity
+  Mono registers its own roots); GC_dirty_init sets no page protection (no-op mprotect does not matter);
+  stack bounds come from pthread_self -> pthread_getattr_np (self-query path is right).
+- Strongest untested GC-contract issue: a signal helper (signals.rs:121, runtime.rs:609) acknowledges a
+  SIGPWR pause for a thread that is still inside a host call, which keeps running; host memcpy/memmove/memset
+  (libc_calls.rs:476) can write guest memory after the GC thinks the thread stopped. Against it: the fixed-
+  build crash run had only one helper borrow, ~5 s before the crash, target likely in a futex syscall.
+- Other real gaps (weaker matches): outer CPU state/parked registers saved only in Rust during guest
+  callbacks (runtime.rs:1770/1796); helper's pthread_getattr_np returns the helper's own stack, other-thread
+  query returns base 0; VFP registers not in the signal frame; new threads don't inherit the signal mask;
+  gettid on a helper returns the helper's tid; sigaltstack fake; MADV_DONTNEED on unknown ranges silently
+  not cleared; partial munmap keeps memory; membarrier failure ignored.
+- Folded literals: confirmed defect; not only call targets: other literals may hold mutable pointers.
+- Recommended order: (1) checker (check=1) through real loading; (2) parallel=0 runs long enough to pass
+  loading; (3) trace helper borrows during loading (parked function, memory writes); then decide.
+  Note: check=1 also turns parallel and linking off, so "checker passes and game lives" cannot separate a
+  concurrency bug from a translator bug.
+- Card Wars fps runs with fix 1: both died during loading. fps1: `[fault] bad guest memory access at
+  0x00000010 (guest block 0x027072c8)` on worker arm32-guest-109 = libmonobdwgc +0x4E82C8, nearest symbol
+  GC_clear_fl_marks (Boehm walking a free list: a free-list link was overwritten = classic sign of an object
+  freed while still in use and then written). fps2: SIGSEGV in translated code on UnityMain at guest 0x10,
+  abort message `* Assertion at boehm-gc.c:1433, condition GC_base (obj) == (char*)obj - offset` (pointer not
+  at the start of a GC object). The bridge's own lines were lost: logcat ring buffer overflowed (thousands of
+  [signal] lines); scripts now stream logcat live.
+- Fix 1 build total: 3 dead of 22 launches (~14%), vs 3/14 before. No measurable change.
+- Helper theory checked against data: the crashed runs loop-par/3, loop-par/5 and fix1-fps1 show
+  "0 signal helpers" in their last [fps] line before the crash (fix1-loop/6 had 1, ~5 s earlier). Alive runs
+  had 2-3. => helper borrows during host memcpy cannot explain these crashes. Ruled out for now.
+- GC_get_main_stack_base (libmonobdwgc +0x4fb5e8) uses pthread_self -> pthread_getattr_np ->
+  pthread_attr_getstack (self query, correct in the bridge). Ruled out.
+- Puzzle Craft with fix 1: PC1 119.9 fps avg (min 117.9), PC2 119.9 (min 118.2), save files unchanged.
+- fps2 detail: guest thread 0x1094 called abort() (boehm-gc.c:1433 assert), then UnityMain faulted in block
+  0x02707178 (same function area as fps1's 0x027072c8 = GC_clear_fl_marks, same r1=146d7000/146d8000 r2=0x43):
+  two crashes at the same Boehm free-list walk.
+- Checker run (round2, fix-1 build, check=1, 300 s; note check=1 also turns parallel and linking off):
+  predicted: a "difference in block" line = translator bug found; 0 differences through loading = translator
+  bug in checked code unlikely. Actual: `[check] 2359296 blocks checked, 0 differences, not compared: 0
+  (Unicorn stopped), 72 (Unicorn ran past the block)`. Mono init and the first scene load ran under the
+  checker (Mono "Locale en-US" at +78 s, Unity "OnLevelWasLoaded" at +207 s, first [fps] line at +240 s,
+  0.2 then 0.6 fps), game still alive when logging stopped at +300 s, no fault, no assert.
+  Conclusion: no translator difference in 2.36 M checked blocks through the crash window; one alive run is
+  not proof of no crash (14% rate), and parallel was off, so this does not separate the two theories.
+- Crash timing (all 5 crashes so far): 11-16 s after the bridge starts, during loading. 3 of 5 right after
+  `PATCHING ==> LOAD_DATA` while it reads Blueprints/db_Characters.json / db_Decks.json (heavy allocation,
+  many GC pauses), 1 at WAITING_FOR_USERID. Parallel on: LOAD_DATA at +10 s, READY at +19 s.
+- Parallel-off loop (fix1-nopar, 150 s each): loading ~7x slower (LOAD_DATA at +30 s, READY at ~+140 s or
+  later), but every run passed LOAD_DATA and reached WAITING_FOR_USERID or READY, so unlike the earlier 40 s
+  loop these runs do cover the crash window and count as evidence.
+- fix1-nopar result: 6 alive, 0 dead of 6 (all passed LOAD_DATA). At a 14% crash rate, 6 clean runs happen ~40% of the time by chance: not decisive yet. Next: 14 more 100 s parallel-off launches (fix1-nopar2) to reach 20 (chance of 20 clean at 14% ~5%).
+- Sub-agent review (2026-10-13, Sol 6.1 high, read-only), hunting parallel-only races. No proven cause.
+  Found sound: enter/leave ordering, helper ownership, jump-table entries (one aligned atomic word), semaphore
+  ordering, no double handler. In the 5 crash logs all 5,720 completed SIGPWR handlers ran at depth 1 (none
+  inside a nested guest callback). Ranked gaps: (1) outer registers during guest callbacks kept only in Rust
+  (runtime.rs:1770/1796/1804; callers qsort/bsearch/pthread_once/Java re-entry), moderate fit, weakened by
+  depth-1 data; (2) VFP/NEON registers missing from the signal frame (signals.rs:332), low-moderate;
+  (3) mprotect is a no-op (libc_calls.rs:1649) but libmonobdwgc's mono_memory_barrier_process_wide
+  (+0x4bc888) uses the mprotect trick to force a barrier on all cores; only direct caller found is managed
+  Interlocked.MemoryBarrierProcessWide, use during loading unknown; (4) helper acks while host writes go on,
+  poor fit (0 helpers); (5) CAS STREX ABA, no Boehm/Mono site found relying on it; (6) code published even if
+  the instruction-sync call failed (engine.rs:343/350). Also: new threads start with an empty signal mask
+  (threads.rs:85). Suggested checks: count mprotect calls during loading; parallel with link=0; fault-time
+  helper count and SIGPWR-entry callback depth.
+- fix1-nopar2 (parallel off, 14 x 100 s): 14 alive, 0 dead; all 14 passed LOAD_DATA and reached
+  WAITING_FOR_USERID. Total parallel off: 20 alive of 20. With parallel on: 3 dead of 22 (fix-1 build) and
+  3 of 14 before. If parallel-off had the same ~14% rate, 20 clean runs would happen ~5% of the time.
+  Conclusion: the crash needs parallel guest threads (or the different timing they bring). Translator
+  instruction bugs and single-thread bridge bugs are now unlikely. Next: parallel on, block linking off.
+- Checked (static): this Boehm build has no parallel marker threads (no GC_MARKERS string) and finds each
+  thread's free lists through pthread_getspecific (imports pthread_key_create/get/setspecific). Bridge:
+  values live per guest Identity, start at 0 for every new thread, handles are never reused
+  (threads.rs:59-147). A new thread cannot inherit an old thread's free lists. Ruled out.
+- Linking-off loop, first try (parallel on, link=0, 45 s): stopped after 3 runs: with linking off, loading is
+  ~5x slower (first WAITING_FOR_USERID at +44 s vs +8 s), so 45 s never reached LOAD_DATA. Not evidence.
+  Restarted as 15 x 110 s (fix1-nolink). Caveat: slower runs also mean fewer chances for a race, so a
+  clean result would be weak evidence unless crashes still show up.
+- fix1-nolink (parallel on, link=0, 15 x 110 s): 15 alive, 0 dead. Every run entered LOAD_DATA (~+83 s) but
+  none finished it before the 110 s cut (most parallel-on crashes came within ~1.5 s of LOAD_DATA start,
+  i.e. ~5-10 s here). At 14%, 15 clean runs happen ~10% of the time by chance. Suggests block linking (or
+  the speed it brings) is part of the crash, but slowness alone could also hide a race. Next: one-core
+  pinned loop (parallel and linking on, all threads on cpu 6) to separate "true simultaneous execution"
+  from "bridge thread-switching logic".
+- One-core loop (fix1-onecore, parallel and linking on, every game thread pinned to cpu 6 with taskset -a
+  right after launch; checked: all 74 threads "Cpus_allowed_list: 6"). Loading timing stays close to normal
+  (LOAD_DATA +15 s, READY +28 s vs +10/+19 s), so unlike parallel-off and link-off this keeps the timing.
+  Predicted: crashes still at ~14% = a bridge logic race in thread switching/signals (interleaving only);
+  0 of 20 = needs two cores at once (memory ordering, cross-core code/patch visibility, true data races).
+- Found (static): the old ARMv6 CP15 barriers (MCR p15,0,Rt,c7,c10,5 = DMB; c7,c10,4 = DSB) are not
+  translated (arm.rs:616 arm_coprocessor handles only TPIDRURO; thumb.rs:1707 the same) and go to Unicorn,
+  whose helper.c:717-720 marks them ARM_CP_NOP: no host barrier at all. Harmless with one core, a real
+  ordering gap with parallel threads on several cores. libmonobdwgc has 343 `dmb ish`, 4 `dmb sy`, and 1
+  CP15 DMB; Mono's JIT (mini-arm.c:4259) emits `dmb ish` when v7_supported (forced TRUE when built
+  HAVE_ARMV7), else the CP15 form. Whether the CP15 one runs during loading is unknown: the stats run
+  (fallback sites) will tell. General engine gap either way; candidate fix: translate CP15 DMB/DSB/ISB to
+  the host barriers.
+- fix1-onecore: 20 alive, 0 dead of 20, all 20 reached READY (timing near normal). At 14%, 20 clean runs
+  happen ~5% by chance. Conclusion so far: the crash needs guest threads running on two cores at the same
+  moment (memory ordering / cross-core visibility / a true simultaneous race), not just the bridge's
+  thread-switching logic. Caveat: base rate measured earlier in the day; a same-day control loop (normal
+  settings, 20 x 45 s) runs next to make sure the crash still shows up.
+- Checked (static) for two-core-only gaps, ruled out: guest mutex lock/unlock use Acquire/Release
+  (threads.rs:165-225), pthread_once Acquire/Release, semaphores Acquire; kuser helpers have dmb ish
+  (mem.rs:90-126); exclusive monitor address AND value are passed both ways between translator and Unicorn
+  (engine.rs:677-745); DMB/DSB translate to host dmb/dsb ish (thumb.rs:1885). Only open two-core gap found
+  so far: CP15 barriers -> Unicorn NOP.
+- Control loop (fix1-control, normal settings) run 1: DEAD at +13 s, 0.9 s after "DeckData path:
+  Blueprints/db_Decks.json" (LOAD_DATA). UnityMain faulted at guest 0x3b in block 0x025f63b0 (same block as
+  an earlier crash, mono_string_is_interned_lookup area; r0=0xb, garbage pointer), and in the same
+  millisecond thread 15598 hit `Assertion: should not be reached at class-accessors.c:86` (bad MonoClass
+  kind). Two threads reading the same corrupted Mono metadata at once. Crash still present today.
+- Control run 6 also DEAD, same block 0x025f63b0, r1 same. Disassembly (libmonobdwgc +0x3d73b0, inside
+  mono_string_is_interned_lookup, built -O0): r0 = str->vtable; ldr [vtable] (klass); ldr [klass+8];
+  ldr [+0x30] faults at 0x3b/0x45, so klass+8 held 0xb/0x15. The string being interned has a garbage
+  vtable chain: the look of a GC free-list link in the object's first word, i.e. the string object was
+  freed by Boehm while UnityMain still used it (a missed root / missed mark), then reused. Matches the
+  other crash kinds (free-list walk faults, GC_base assert, bad MonoClass asserts).
+- Next decisive split (needs a small code change, asked the user): run with Boehm collection turned off
+  (GC_DONT_GC=1, read by Boehm via getenv, which the bridge passes to the host getenv). If crashes vanish,
+  the GC is freeing live objects (root/marking problem on two cores); if they stay, it is a plain data
+  race / ordering problem in other code. The app process env can't be set from outside on a user build,
+  so this needs a general debug property (debug.arm32bridge.env) that the bridge applies with setenv at start.
+- Control loop result (fix1-control, normal settings, 20 x 45 s): 17 alive, 3 dead (runs 1, 6, 14), all
+  in block 0x025f63b0 (fault 0x3b/0x45/0x3b). Same-day rate ~15%, matches the earlier 3/22. So the
+  parallel-off 20/20, link-off 15/15 and one-core 20/20 results stand against a live base rate
+  (chance of 20/20 at 15%: ~4%).
+- The stats run after it (debug.arm32bridge.stats=1, 100 s) also died in loading: fault at 0x10 in block
+  0x02707178 (r0=0), a different spot - 4 deaths in the last 21 normal launches.
+- Fallback sites from that stats run (37 sites, top: Thumb f383 0205 x1072 (MSR APSR_g), ARM f2e10070,
+  Thumb efe1 8070/2072 (NEON), e6e2/e6e1 0010 (USAT) x80 each, e89cffff (LDM with pc)): no CP15
+  barrier (ee070fba) anywhere. Mono's JIT detects v7 and emits `dmb ish`. So CP15 barrier -> Unicorn
+  NOP is NOT what causes this crash. The only CP15 DMB in libmonobdwgc is inside
+  mono_arch_output_basic_block (JIT emitter path for pre-v7 CPUs).
+- Fixed anyway (general gap, tiny; owner asked 2026-10-13 to fix obvious problems at once): the
+  translator now turns the ARMv6 CP15 barriers (MCR p15,0,Rt,c7,c10,4/5 and c7,c5,4) into host
+  dsb ish / dmb ish / isb in ARM and Thumb (thumb.rs cp15_barrier, used by arm.rs arm_coprocessor and
+  thumb.rs coprocessor) instead of leaving them to Unicorn, where QEMU treats them as no-ops. Self-test:
+  the SWP spinlock now uses CP15 DMB for its acquire/release, and every race adder runs all three CP15
+  barriers in its own mode.
+- Ruled out by reading: VFP registers missing from the signal frame. Signals are only delivered while a
+  thread is parked in a phone function (a call boundary); the handler is an AAPCS function that keeps
+  d8-d15, and d0-d7/d16-d31 are dead at a call. Not a real gap.
+- mono_memory_barrier_process_wide (mprotect trick; guest mprotect is a no-op) is only reached from the
+  C# icall Interlocked.MemoryBarrierProcessWide: unlikely to matter here; left alone.
+- Test switch added (owner approved, 10 launches): debug.arm32bridge.env="NAME=VALUE;..." is applied once
+  with setenv at the first bridge load (app.rs set_debug_environment), before any game code. Off unless
+  set. Boehm in libmonobdwgc reads GC_DONT_GC (string present).
+- GC split result (gcoff, debug.arm32bridge.env=GC_DONT_GC=1, 10 x 45 s; "debug environment GC_DONT_GC=1" in
+  all 10 logs; fps lines show 0 signal helpers, i.e. no GC pauses at all): 7 alive, 3 dead. Run 1 alive but
+  never READY after "Assertion: should not be reached at class-accessors.c:184"; run 2 fault at 0x0 in block
+  0x026ccd20; run 8 fault 0x3e in block 0x025f63b0 (the same mono_string_is_interned_lookup spot, r1 same);
+  run 10 fault 0x3c in block 0x02504578. Same rate and same kinds as with the GC on (3/20 + 1).
+  Conclusion: the collector freeing live objects is RULED OUT. With nothing ever freed, Mono still sees
+  garbage class/vtable chains: a real two-core race (memory ordering / missed exclusion / wrong
+  publication) in bridge or translator behavior. Also ruled out by reading: pthread key values (per
+  Identity, per engine), mutex word layout (owner id << 16, small sequential ids), stack/TLS block reuse
+  (handed back only in drop_engine, after the thread's last guest code).
+- Phone self-test after the CP15 change: 0 failures in five modes; ARM32_CHECK=all had 1 failure,
+  "futex wake counts" (first WAKE 2 reported 1): the test sleeps 50 ms expecting three threads asleep,
+  and under the checker (every block runs twice, 183 s run) they were not yet asleep. Test timing, not an
+  engine bug: the wait is now 1 s when the checker is on.
+- Sub-agent review started (Sonnet 5.5 high, read-only, t4): attack the race theory, list ordering gaps.
+
+### Speed: lock-free dispatcher lookup (owner approved)
+- Profile prof2g (dwarf, 6 s, steady state, before the change): UnityMain spends 25% of its samples in
+  engine::run itself (whole process: 20%). Instruction histogram (perf-ips.py): 813 samples on the
+  HashMap bucket key load (cache miss in a 186k-block table), 613 + 494 + 199 on the RwLock read lock /
+  unlock atomics (the lock's cache line bounces between cores), plus a jump-table store on every lookup
+  (set_jump in block_for's hit path, also a shared line). ~2000 of 2644 run() samples.
+- Change (engine.rs): run() first reads the jump-table entry for pc (one Acquire load, no lock); a match
+  gives the block (code = CODE_BASE + offset; enter glue and exit stub from new statics ENTER/EXIT_STUB).
+  Only on a miss does it take the RwLock path (block_for), which refills the entry. set_jump now stores
+  only when the entry changes. Safe because blocks are dropped only in invalidate() under stop_world,
+  which clears their entries; the table is only used when linking is on (checker turns linking off, and
+  it is the only user of the block end, which the fast path returns as 0).
+- Expected: run() self time down by most of the ~75% lock/hash share, main thread ~15% less work; fps up
+  from ~72 if the main thread is the limit. Measuring: 3 x 120 s fps runs + crash loop + all checks.
+- Second speed change, tested together with the lookup change (the first check round was stopped
+  because its phone build may have caught this edit half-done): the slow per-thread values (Rust
+  thread_local! on Android is pthread-key based, `std::sys::thread_local::os::Storage::get`, 8.7% of
+  UnityMain samples, half from call_stub). call_stub used 5 of them per phone call (RESUME_AT x2,
+  PHONE_DEPTH x2, PHONE_TICKS); they are now fields of the thread's engine data (Thread.resume_at,
+  phone_depth, phone_ticks; resume_point(uc)). The bridge-lock counter LOCKS_HELD (2 per shared()/heap()
+  lock, ~1.6M heap calls per 100 s) is now kept only when lock checking is on (debug builds,
+  ARM32_LOCKCHECK=1), which is the only reader. No behavior change. fps result is the combined effect.
+
+### Review t4 (Sonnet 5.5 high, read-only) and the ordering split
+- Corrections it made, checked: gcoff runs 1 and 2 were out-of-memory deaths (no collection, so memory
+  runs out: 101 OutOfMemoryException lines and refused frees in run 2, low-memory-killer in run 1), so
+  only runs 8 and 10 are real crashes (0 OOM lines, 0 refused frees). And GC pauses were not zero: 15
+  SIGPWR rounds per run (vs ~1000-2400 normally); the GC is far less involved but not absent.
+  Revised: GC-off 2 real crashes / 8 usable runs, with ~100x fewer pauses. Freeing live objects is
+  impossible there (nothing is freed), so that theory stays ruled out; pause handling stays unlikely.
+- Its main point: all three safe settings also add strong ordering. Link-off sends every block boundary
+  through block_for's RwLock (an acquire + release RMW on one shared word, close to a full fence).
+  So link-off safe does not point at link patching; it fits "ordering at block boundaries" as well.
+  (Note: the new lock-free dispatcher removes that lock from the dispatcher path too.)
+- Other candidates it ranked: stale folded literals (literal at exactly a block's end is outside the
+  invalidate range, thumb.rs:536-545 / engine.rs invalidate); CAS-emulated exclusives (ABA, wider
+  window); latent game race exposed by sysconf reporting all host CPUs. Cleared: stop_world /
+  enter_guest Dekker pairing, link bookkeeping, encodings, pthread code, made_blocks range maths.
+  Smaller defects it found (not the cause): GuestHeap::not_owned may refuse frees of big mapped
+  chunks (mem.rs:296); normal-mutex unlock by a non-owner returns EPERM; partial munmap is a no-op.
+- My doubt about its top theory: the same Mono/Unity code runs natively in AArch32 on out-of-order
+  ARMv8 cores (A76/A78 phones) without crashing, and the translator keeps loads/stores 1:1 with their
+  barriers, so a pure "host reorders more" story needs something the translator changes. Still, a
+  block-start barrier is the cheapest decisive split.
+- Experiment switch added (off by default): debug.arm32bridge.fence=1 / ARM32_FENCE=1 puts dmb ish at
+  the start of every translated block (thumb.rs fence_blocks, used by both translate functions), so
+  linked jumps order memory like the lock path did. Prediction: if ordering at block boundaries is
+  the cause, 0 of 20 die; if 2+ of 20 die, it is not.
+- Phone cores: cpu0-1 Cortex-A520 (in-order, midr d801), cpu2-6 A725 (d871), cpu7 X4 (d821).
+
+### Fix 2: literals in game-made code are read at run time
+- Confirmed by reading (review t4 and thumb.rs load_store): every word LDR with a pc base was folded
+  into a constant at translation time. Mono's JIT patches literal words in place (call sites like
+  `ldr pc, [pc, #-4]; .word target`, constants) and flushes only those 4 bytes. A literal sitting at
+  or after a block's end is outside the block's range, so invalidate keeps the block and the
+  translated code keeps the OLD value (for a call site: the trampoline, every time).
+- Change (thumb.rs load_store, shared by ARM): fold only when the literal address is inside library
+  code (LIB_BASE..LIB_END, which never changes); otherwise emit a real load (and for rt = pc, a real
+  load into T6 then the normal computed jump, which the old non-folded path never handled).
+  VLDR literal and LDRD literal were already real loads.
+- Self-test added (all modes): made code with `ldr r0,[pc,#0]; bx lr; .word` and
+  `ldr pc,[pc,#-4]; .word target`, each literal patched and flushed alone; the new value must be seen.
+  Expected: the build before the fix FAILS it on the translator; the new build passes.
+- Note: the speed round's Puzzle Craft step (job 011) rebuilds the bridge library, so it ran with this
+  change (and the fence switch, off) included; cocos2d-x makes no code at run time, so it is unaffected.
+- PC self-test can't show the literal bug: on the PC there is no translator (it emits AArch64), so
+  everything runs in Unicorn, which reads literals at run time. The old PC build passed the new test,
+  as it must. The before/after check runs on the phone (old phone binary + new self-test first).
+- Speed round results (lock-free lookup + per-thread values; fps from [fps] lines, steady part, 120 s
+  runs): run 1 75.8 fps (game 13.22 ms, own 8.72, phone 4.49); run 2 died in loading (fault 0x34 in
+  block 0x02504578, a known crash kind); run 3 76.4 fps (game 13.11, own 8.57, phone 4.54).
+  Before (this session's runs): ~72 fps, game 13.4-13.6, own ~9.25, phone ~4.2. Gain ~+4 fps,
+  own code -0.6 ms per frame: smaller than the profile suggested (run() was 25% of UnityMain).
+  Next: profile again to see where run() time went.
+- Speed round crash loop (speed2-loop) INVALID from run 5: runs 3 and 4 died back to back (Mono
+  asserts class.c:2214 and handle.h:681 m_class_is_valuetype), Android then showed its "Application
+  Error: com.ThugBoatLTD.CardWars" box, which kept focus (mCurrentFocus = Application Error window), so
+  later launches never got window focus: UnityMain idle in epoll, no guest threads, no [fps]. Runs 5-7
+  "alive ready=0" are that, not freezes. Usable: runs 1-4, 2 dead. Stopped the round; asked the owner
+  how to clear the box (screen action). Test scripts must check mCurrentFocus before trusting a run.
+- Literal fix confirmed on the phone: OLD phone build + new self-test -> "FAIL made code: a literal
+  patched after the block's end (constant, call target) is seen" (1 failure); new phone build -> ok,
+  0 failures (translator and forced-fallback modes so far). So Mono-style 4-byte literal patches were
+  really missed before.
+- Crash-box handling (owner chose "turn off Android's crash box during tests"): originals were unset;
+  set global hide_error_dialogs=1 (the setting that also stops the repeat-crash box; the first-crash
+  setting alone does not) and show_first_crash_dialog=0; restore = delete both
+  (/tmp/a32k/crash-dialogs.sh restore). cw-crashloop.sh now records mCurrentFocus after each run and
+  marks a run INVALID(error box) if an Android error/ANR box had focus.
+
+### Review t7 (Sol 6.1 high, read-only), early findings, fixed at once (2026-10-13)
+- **Frame timer took the engine before the guest lock.** `app.rs` read `phone_time()` (now `engine().get_data().phone_ticks`) before `hold_gil()`. With parallel mode off, Unicorn mode or the checker on, `engine()` asserts "engine used without the guest lock". The self-test never goes through this Java entry path, so all six modes still passed. Fix: read `phone_before` right after `engine()`. Ticks only change inside guest calls, so reading it after the lock wait gives the same number. `cargo check` clean (job 014).
+- **Conditional ARM CP15 barriers fell back to Unicorn.** `cp15_barrier()` masks with 0xFFFF_0FFF, so the ARM condition nibble had to be E. `arm_instruction` has already emitted the condition skip before `arm_body`, so `arm_coprocessor` now matches `(word & 0x0FFF_FFFF) | 0xE000_0000`. Thumb is unchanged (IT blocks are handled outside).
+
+### Review t7 (Sol 6.1 high), final findings and what was done (2026-10-13)
+- **P1, two live `&mut Uc` to one engine.** `phone_time()` and `share_gil()` called `engine()` while the caller still held its own `uc`. Fix: `phone_time(uc: &Uc)` and `share_gil(uc, resume)`, which uses `deliver_pending_on(uc)`. Both call sites already had `uc`. `cargo check` clean (job 015).
+- **P2, the library range admitted writable data.** Literal folding and "never watch for new code" applied to all of `LIB_BASE..LIB_END`, which includes each library's .data and .bss. Fix: the ELF loader records the PT_LOAD segments without PF_W (`mem::add_fixed`). `mem::fixed(addr)` is now used for literal folding (both ends of the word), for skipping `made_blocks` in engine.rs, and for the mprotect "code made while running" log. The old `mapped_by_library` helper is removed. All three games keep code in R E segments (readelf: libunity, libmonobdwgc, libmono-native, libmain, libMonoPosixHelper, libcocos2dcpp), so their speed should not change. The self-test now also runs the patched-literal check on a page-aligned .bss buffer made RWX with mprotect. Known limit: a library whose *code* is later made writable by guest mprotect is still treated as fixed (no game seen doing that).
+- **P2, sensor callbacks dropped.** Not changed. The bridge has no looper-callback support at all (no ALooper_addFd), so this is a wider gap. Returning NULL could crash a game that runs fine without sensor data today. createEventQueue logs when a callback is passed, so a game that needs it will show up in the log.
+
+### Per-thread guest malloc cache (sub-agent t6, Opus 5.5 high) — kept aside, not merged (2026-10-13)
+- What: each engine keeps small freed blocks (chunks ≤ 1024 B) so malloc/calloc/free mostly skip the HEAP mutex; not_owned made lock-free; double-free mark in freed payload. Worktree ~/dev/arm32-bridge-malloc (branch agent/malloc), own diff /tmp/a32k/malloc.diff.
+- PC results (agent): self-test 0 failures in 3 modes; cargo test 6/6 (release + debug); 4 real host threads × 200k pairs: heap lock 128 ms → caches 2.1 ms; guest self-test 66 → 61 ms (PC Unicorn runs one guest thread at a time).
+- Its "not_owned refuses mapped chunks" suspicion is wrong for dlmalloc 0.2.14 (no mmap path; checked by review t8 too).
+- Review t8 (Sol 6.1 high): P1 lock-free header reads race with dlmalloc's plain writes to neighbour headers (formal UB). P2 engines of Java/audio host threads are never dropped, so their caches pin up to ~440 KiB each forever. P2 double-free swap can accept a block after the winning cache drained (corrupts dlmalloc free list). P2 HEAP during realloc does not exclude a concurrent cached free. (P2s 3-4 need invalid guest behaviour.)
+- Decision: not merged. Profiles say the heap is not a hot spot for Card Wars: today's UnityMain profile (prof2g) has no dlmalloc/heap entry in its top list; perf7 had Mutex::lock_contended 0.43% for everything. ~1.6M heap calls / 100 s ≈ 130 per frame × ~0.3 µs ≈ 40 µs of a 13 ms frame. Best case < 1% fps, against 4 open issues. Revisit only if a profile shows heap time.
+- Profile lead noted while checking: linux_syscall → wake_on_count 5.2% (Vec::retain 3.9% inside, futex_wake 4.0%) on the game thread. Candidate for the next speed step.
+- Checked the lead right away: `Vec::retain` has only 0.17% self time. Its 3.75% children are `Parker::wake` → Condvar notify → kernel futex_wake / try_to_wake_up (`_raw_spin_unlock_irqrestore` 3.57%). That is the cost of really waking a sleeping thread, which native code pays for its own futex wake too. The waiter scan itself is cheap, so there is nothing to gain here. Not pursued.
+
+### Round 13 barrier split, partial (2026-10-13), and its speed cost
+- Blocks of 10 Card Wars launches x 45 s, debug.arm32bridge.fence on/off alternating; literal fix in.
+- fence-on1: 10 alive, 0 dead. fence-off1: 8 alive, 2 dead (runs 3, 9: fault 0x30 / 0x3b in block 0x025f63b0, the usual spot). fence-on2: 7 so far, 0 dead.
+- Speed, last 10 [fps] lines of each run (fps / game ms / own ms): fence on ≈ 61 / 16.2 / 12.1; fence off ≈ 76 / 13.2 / 8.6. A dmb at every block start costs ~40% of own-code time. Not acceptable as a fix; it only locates the problem.
+- Checked by reading while it ran: the bridge's pthread mutex/rwlock/sem (threads.rs) use Acquire CAS to lock and Release CAS to unlock; kuser helpers have dmb; the Unicorn fallback runs single unsupported instructions (no guest barrier lost). Exclusives are QEMU-style (LDREX records value, STREX = CASAL against it; ABA passes). Not yet tied to the crash.
+- Asked a fresh critical sub-agent (t10, Sol 6.1 high) to attack the ordering theory and propose split experiments.
+
+### Round 13 result (job 013, 2026-10-13)
+- Old phone build + new self-test: `FAIL made code: a literal patched after the block's end` (1 failure). New build: 0 failures in all six modes (translator, forced fallback, ARM32_CHECK=all [1415994 blocks, 0 differences], LSE=0, PARALLEL=0, Unicorn). Literal fix confirmed on the phone.
+- Barrier split, 10 launches x 45 s per block: on1 0/10 dead, off1 2/10 (0x30 / 0x3b in block 0x025f63b0), on2 0/10, off2 2/10 (0x10 in blocks 0x02707178 / 0x027072c8, r1=146d7000 both: libmonobdwgc free-list walk area). Total: fence on 0/20, fence off 4/20. One-sided Fisher p = C(20,4)/C(40,4) ≈ 0.053.
+- Puzzle Craft (build from the tree at that time, with review fixes): pc1 119.6 avg / 116.2 min fps, pc2 119.8 / 116.6, save files unchanged.
+
+### Critique t10 (Sol 6.1 high, read-only) of the ordering theory
+- The fence result shows "something changes when cores overlap", not specifically missing ordering. Per-block dmb also slows guest work ~40% and moves code, so timing could explain it too. Asked for split experiments.
+- Proven gap: LDRD with rt == base emitted two separate `ldr w` (arm.rs ~448, thumb.rs ~1191), which can tear an 8-byte-aligned pair. Native LPAE cores read it in one go (QEMU also keeps one 64-bit access). Unicorn's own LDRD/STRD split too, so the checker cannot see this. FIXED at once: always one LDP (single-copy atomic as a whole with FEAT_LSE2, which the Pixel 10 cores have). Static count in the shipped libraries: libmonobdwgc 0 of 1 LDRD have rt == base, libunity 1 of 592, libcocos2dcpp 3 of 701. So this is unlikely to be the Card Wars crash (only Mono's JIT output is left unchecked).
+- Jump-table read in generated code is a plain `ldr x` (thumb.rs emit_exit_to); the Rust dispatcher uses Acquire. A protocol mismatch, but code visibility comes from __clear_cache + membarrier SYNC_CORE, and an acquire does not order instruction fetch. Lower rank; kept for a later toggle.
+- Exclusives: QEMU-style value compare (ABA, same-value stores unnoticed); only a specific algorithm (read head, read head->next, replace head) would break. ARM32_LSE=0 does not test faithful monitor semantics.
+- Ruled lower by the reviewer: pointer dependencies (kept, including through register spills), conditional/IT branches, LDM/STM, VLDR/VSTR, barrier option mapping, safe points, code invalidation. Correction: signals can be delivered at block boundaries (safe_point), not only at calls.
+- Its experiments: (1) same-size prefix with no ordering (nop) vs dmb; (2) LDRD fix (done); (3) ldar for the generated jump-table read; (4) dmb ishld vs dmb ishst.
+- Done: the fence switch now has modes: debug.arm32bridge.fence = 1 (dmb ish), ld (dmb ishld), st (dmb ishst), nop.
+
+### USAT / SSAT / USAT16 / SSAT16 translated (sub-agent t5, Opus 5.5 high), merged 2026-10-13
+- Why: the stats run listed Thumb f383 0205 x1072 (earlier misread as MSR APSR_g; it is `usat r2,#5,r3`) and ARM e6e2/e6e1 0010 (USAT) x80 among the top Unicorn fallback sites.
+- What: thumb.rs saturate / saturate_instruction / saturate_halves_instruction, decoded from Thumb plain-binary-immediate ops 10000/10010/11000/11010 and ARM arm_media (before PKH). Range test sbfx+eor (signed) or lsr (unsigned), cbz to keep the value, else eor/bic of the bound with x asr #31; Q (CPSR_OTHER bit 27) set only when saturating; NZCV untouched. Self-test: every width, LSL/ASR shifts (ARM ASR #32), Q sticky, NZCV unchanged, conditional ARM and Thumb IT forms, Rd = Rn.
+- The agent could not compile in its own session. I built its worktree: PC build clean, PC self-test 0 failures in default and forced-fallback modes (the new check passes: Unicorn matches the C reference).
+- Review t11 (GLM 5.3 Flash, read-only; t9 Gemini 3.8 Flash gave no output in 23 min and was stopped): no functional bugs. Encodings checked with clang; no decode overlap with PKH, parallel add/sub, SEL, SXTAH, REV/RBIT, SMUL/BFX/BFI. It modelled the emitted sequence in Python: 300k random + edge inputs, every width, 0 mismatches. Nit only: Thumb SP as Rd/Rn (UNPREDICTABLE) translated like the rest of the data-processing code.
+- Merged into the main tree (/tmp/a32k/usat.diff). cargo check clean. Phone translator self-test still to run.
+- Store-only block-start barrier (dmb ishst), cost from round 14 block 1 (last 10 [fps] lines per run): ≈ 73 fps / 13.7 ms game / 9.1 ms own, against ≈ 75 / 13.4 / 8.7 with no barrier (round 13 off blocks). About 5% of own code, against ~40% for the full dmb.
+- Ruled out by reading: Mono's JIT emitting no barriers because it thinks the CPU is pre-v6 (OP_MEMORY_BARRIER emits nothing when neither v7 nor v6 is detected). libmonobdwgc's mono-hwcap-arm.c strings: "!uname (&name)", "armv8", "/proc/cpuinfo", "model name", "(v", "Features". uname reports the host machine (aarch64/armv8 counts as v7), and the bridge's fake /proc/cpuinfo says "model name : ARMv7 Processor rev 0 (v7l)" plus "CPU architecture: 7". Both paths give v7, so the JIT emits dmb. Mono does not import getauxval (the bridge's getauxval returns 0).
+
+### Round 14 (jobs 019 + 01A + 01B, 2026-10-13): fence modes on the build with review fixes + LDRD fix
+- Build differs from round 13's by: review fixes (phone_time/share_gil take uc, fixed = read-only library segments for literal folding and made_blocks, conditional ARM CP15 barriers), the LDRD single-LDP fix, and the fence-mode code (no prefix when unset).
+- PC check: new self-test fails on the old PC build only on the signal-frame test (as expected); new PC build 0 failures, default and forced fallback. Phone: six modes, 0 failures.
+- Card Wars, 10 x 45 s per block (owner asked for 10 each; a watcher cut the planned second pass): fence=st 0/10, fence=ld 0/10, fence=nop 0/10 (counted from saved logs by fault/assert lines; the same count gives 2/2/0 for round 13's off1/off2/on1, so the method is right).
+- 0/30 against the old ~20% rate (P ≈ 0.8^30 ≈ 0.001). Either a code change since round 13 fixed it, or any one-instruction block prefix (even a nop: layout/timing) hides it. Job 01B runs fence unset on the same install to split these.
+- Static check while 01B runs: PC-relative loads (ldr/ldr.w/ldrd/ldrb/ldrh/... [pc]) whose target lies in a writable segment: libmonobdwgc 0 of 36574, libunity 0 of 4059, libmain 0 of 3, libmono-native 0 of 943. So the "fold only read-only segments" fix changes nothing for Card Wars' library code. The phone_time/share_gil fixes do nothing in parallel mode (share_gil returns early; phone_time only feeds the [fps] line), and none of the CP15 barriers are hit. If 01B is clean, the LDRD fix is the only code change left that touches Card Wars (1 rt==base LDRD in libunity, plus whatever Mono's JIT emits).
+- 01B (fence unset, same round-14 install): 9 alive, 1 dead (run 10: fault 0x35 in block 0x025f63b0 + "Assertion: should not be reached at class-accessors.c:86"). The crash is still in today's code; no change since round 13 fixed it. Round 15 (rerun round-13 code from worktree agent/r13) was stopped before it built anything; the phone still has the round-14 install (lastUpdateTime 20:16:52).
+- Totals on comparable builds: any one-instruction block prefix (1 / st / ld / nop) 0/50; no prefix 5/30. Prefix vs none: one-sided Fisher p = C(30,5)/C(80,5) ≈ 0.006. But nop alone is only 0/10 (P(0/10 | 1/6) ≈ 0.16), so "ordering" vs "layout/timing" is still open.
+- Round 16 (job started 20:5x): six-mode self-test with USAT merged, then nop / off / nop blocks of 10 on the round-14 install.
+- New working theory to test against the nop result: Mono/Unity may have a latent publication race (e.g. object fields vs the pointer to the object) that older AArch32-capable cores rarely expose. The X4/A725 reorder more aggressively and no longer run AArch32, so nobody has run this code natively on them. If true, the translator is not weakening anything; the bridge would have to give stronger ordering than ARM promises (TSO-like store ordering) to run such code safely.
+
+### Round 16 (2026-10-13): nop vs off, same round-14 install
+- Phone self-test (current main with USAT/SSAT, LDRD as one LDP, fence switch, read-only literal fold, library-data literal test): 0 failures in all six modes; ARM32_CHECK=all 1,685,652 blocks checked, 0 differences.
+- Card Wars, 10 x 45 s per block: nop 2/10 dead (fault 0x10 block unknown; assert class.c:4575 m_class_get_rank), off 1/10 (fault 0x10 block 0x027072c8), nop 1/10 (fault 0x39 block 0x025f63b0).
+- Prediction was: nop crashes like off -> ordering; nop clean -> layout/timing. Result: nop 3/20 here (3/30 with round 14), so the nop does nothing. ORDERING it is.
+- Totals over rounds 13-16: real barrier prefix (dmb ish / ishst / ishld) 0/40; no barrier (none or nop) 9/70. P(0/40 at 9/70) ~ 0.4%.
+- Static reading while it ran:
+  - Block 0x027072c8 = libmonobdwgc +0x4e82c8 = GC_clear_fl_marks, at `hhdr = HDR(h)` for the next free-list block; the ldr [hhdr+0x10] (hb_sz) faults because HDR() is 0: a global free-list link points outside the GC heap. The faulting thread (UnityMain) is the collector, right after its own world restart (GC_finish_collection runs with the world running but under the allocation lock).
+  - The 1-2 ms gap between a helper-run GC signal (thread 4244) and two crashes is NOT a lead: 4244 is thread 37, always asleep in nanosleep (2^24 ns = Boehm GC_lock back-off), so a helper serves it in every GC cycle.
+  - Boehm here has no parallel marking (no "GC_MARKERS"/mark-helper strings) and no thread-local allocation (GC_malloc_kind -> GC_malloc_kind_global). Its allocation lock: AO_test_and_set = word `ldrex; strex` loop in one block, then `dmb sy`; unlock = `dmb sy; str #0`. LOCK() is guarded by GC_need_to_lock (Mono sets it via GC_allow_register_threads). Translated correctly as far as reading shows.
+  - Code publication reread: code space is a bump allocator (never reused), sync_other_cores before linking, jump-table Release store. No gap seen.
+  - Open: ARM conditional non-branch instructions are emitted as a branch around the body (arm.rs arm_instruction), which turns a flags/data dependency into a control dependency. Not yet shown to matter.
+- Sub-agent t12 (Sol 6.1 high, read-only) started: hunt for any place translated code gives weaker ordering/atomicity than native AArch32.
+- t12 (Sol 6.1 high) result: no confirmed cause behind Boehm's correctly fenced lock. Real gaps found, all judged low fit:
+  1. Value-based exclusives allow ABA; safe-point parking (runtime.rs:738) keeps the record. Fits lock-free lists, not this lock; barrier prefixes would not repair it (so it does not fit the 0/40).
+  2. Shift expansion drops dependencies: thumb.rs:279 LSR #32 -> constant 0, :350-352 register shifts >= 64 -> 0, :361 ASR amount >= 32 -> 32. ishld would close it, ishst not. No A32 `LSR #32` in libmonobdwgc code; Mono JIT output unchecked.
+  3. Unicorn fallback still splits aligned LDRD/STRD (vendor translate.c:9174/9214); QEMU fixed this upstream. Reachable only via fallback paths (unsupported instruction in an IT block, arm.rs:431 register-offset overlap).
+  4. mprotect does not update FIXED (libc_calls.rs:1681): a library segment made writable and patched keeps stale translations. No sign Card Wars does it.
+  Also: the generated jump-table ldr has no acquire, but no stale-data failure found (no host literal pools, append-only code, cross-core sync before publication); unchecked sync syscall result at engine.rs:378.
+  Its caution: ld 0/10 and st 0/10 do not prove both repair the same defect.
+- Status: targeted cause not found after rounds 13-16 plus two read-only audits. Next step is a choice for the owner (speed cost vs crash fix).
+
+# OPEN: root cause behind the light barrier (handoff, 2026-10-13)
+
+The owner chose (2026-10-13) to ship a general workaround: a `dmb ishst` at the start of every translated
+block in parallel mode (about 5% more own-code time). We may come back and find the real cause so the
+barrier can go. Everything needed to restart is below; also read rounds 13-16 above.
+
+## Symptom
+- Card Wars (Unity + Mono 2.0 "bdwgc" build, ARM mode, -O0) dies in ~13% of 45 s launches, almost always
+  while loading (ready=0). Puzzle Craft 1/2 (cocos2d-x) never showed it.
+- Crash kinds (all look like the same corruption of allocator / Mono metadata memory):
+  - fault at 0x10, block 0x027072c8 / 0x02707178 = libmonobdwgc +0x4e82c8 / +0x4e8178 = GC_clear_fl_marks:
+    a GLOBAL free-list link points outside the GC heap, HDR() returns 0, `ldr [hhdr+0x10]` faults.
+    Faulting thread = UnityMain = the thread that just ran the collection (GC_finish_collection, world
+    already restarted, allocation lock held).
+  - fault at 0x30-0x45, block 0x025f63b0 = libmonobdwgc +0x3d73b0, mono_string_is_interned_lookup:
+    str->vtable->klass chain garbage ([klass+8] = 0xb/0x15, looks like a free-list link in the object's
+    first word).
+  - Mono asserts: class.c:4575 `m_class_get_rank (ac)`, class-accessors.c:86/184 (bad MonoClass kind),
+    GC_base assert.
+- Library base for offsets: libmonobdwgc loaded at 0x0221f000 in these runs (0x025f63b0 - 0x3d73b0).
+  APK: ~/dev/arm32-bridge-games/cardwars/CardWars.apk; extracted lib in /tmp/a32k/cw (re-extract with unzip).
+
+## What the barrier data says (10-launch blocks, 45 s each)
+| prefix at every block start | dead / runs |
+|---|---|
+| none | 6/40 |
+| nop (same code size, no ordering) | 3/30 |
+| dmb ish (full) | 0/20 |
+| dmb ishst | 0/10 (+ round 17, see below) |
+| dmb ishld | 0/10 |
+- Barrier 0/40 vs no barrier 9/70: p ~ 1.4% (Fisher exact; the first "0.4%" was a binomial shortcut, corrected by review t17). nop does nothing, so it is ORDERING, not code layout/timing.
+- Caution (t12): ld 0/10 and st 0/10 each are weak; they may not repair the same defect.
+- Needs two cores at once: all threads pinned to one cpu 0/20; parallel off (one guest lock) 0/20; block
+  linking off 0/15. Same-day controls kept the ~15% rate, so those are real.
+- GC turned off (debug.arm32bridge.env=GC_DONT_GC=1, verified 0 GC signals): still 3/10 dead with the same
+  kinds. So the collector freeing live objects is RULED OUT; it looks like allocation handing out the same
+  memory twice, a lost/torn update, or a stale read of allocator/metadata state.
+
+## Ruled out (with how)
+- Bridge mutex / rwlock / pthread_once / semaphores: Acquire/Release (threads.rs reading).
+- kuser helpers: have dmb ish (mem.rs).
+- Guest DMB/DSB/ISB, all options: become host dmb ish / dsb ish / isb (thumb.rs barrier()). ARMv6 CP15
+  barriers now translated too (were Unicorn no-ops; not executed by Card Wars per stats run).
+- Mono emitting no barriers: hwcap detection gives v7 (uname armv8, fake cpuinfo v7l) so the JIT emits dmb.
+- Boehm build facts: no parallel marking (no GC_MARKERS / mark-helper strings), no thread-local allocation
+  (GC_malloc_kind -> GC_malloc_kind_global). Allocation lock GC_allocate_lock (0x5c5dc4): AO_test_and_set =
+  word `ldrex; strex` loop in one block (+0x5022e4), then `dmb sy` (+0x4df8b0); unlock = `dmb sy; str #0`
+  (+0x4df8b8). LOCK() guarded by GC_need_to_lock (0x5c5dc0). GC_lock spins sched_yield x12, then nanosleep
+  2^i ns up to 2^24 (~17 ms), which is what thread 37 shows in logs. Translation of all of this reads correct.
+- Exclusive monitor address+value passed both ways between translator and Unicorn (engine.rs ~705).
+- LDRD rt==base tearing: fixed (one LDP); libmono had 0 such sites, libunity 1.
+- Literal folding from writable segments: fold now limited to non-PF_W segments; Card Wars had 0 of ~41k
+  PC-relative loads targeting writable segments anyway.
+- Futex wake cost/counting, heap (malloc) contention: not involved.
+- Signal frames: frame on the guest stack with r0-r14 (signals.rs run_handler); helpers stand in for
+  threads stuck in phone functions and the thread cannot re-enter guest code until the helper is done
+  (enter_guest / borrowed_from). The "helper ran 1 ms before the crash" pattern is a coincidence: thread 37
+  is always asleep in GC_lock's nanosleep, so a helper serves it in every GC cycle.
+- Code publication: append-only code space, sync_other_cores before linking/publishing, jump-table Release
+  store, entries can't tear, no host literal pools (t12 confirmed).
+- ARM conditional non-branch instructions emitted as branch-around: native predication is also only a
+  control dependency, so no ordering promise is lost (t12).
+
+## Known real gaps (found by t12; being fixed one by one, none shown to cause this)
+1. Shift shortcuts drop dependencies (thumb.rs ~279, ~350-352, ~361).
+2. Unicorn fallback splits aligned LDRD/STRD (vendor translate.c ~9174/~9214).
+3. Value-based exclusives (ABA) and the record survives safe-point parking (runtime.rs ~738).
+4. mprotect to writable doesn't drop the FIXED mark (libc_calls.rs ~1681).
+Not repairable by a barrier prefix: 2, 3, 4. Only 1 is closed by ishld (not ishst).
+
+## Leads not yet followed
+- Find WHICH guest code needs the extra store ordering: e.g. emit the barrier only in blocks from certain
+  regions (libmonobdwgc vs libmono JIT code vs libunity) via a debug switch and bisect by address range;
+  with ~13% base rate each split needs ~20-30 runs.
+- Mono JIT output was never scanned (only shipped .so files); a dump of JIT code regions could be checked
+  for patterns (dependency through shifts/ands, LDRD via fallback, ldrex/strex split across blocks).
+- Check whether any guest store is emitted as two host stores or moved past another store (e.g. STM,
+  VSTM, unaligned paths, store + post-increment writeback ordering) in code that runs during loading.
+- Count fallback (Unicorn) instructions during loading with debug.arm32bridge.stats=1 and look for
+  memory instructions among them.
+- An `rr`-like record is not available on the phone; a cheaper probe is a guest-side free-list check
+  (walk GC_obj_kinds freelists after each GC_lock acquire) to catch the corruption earlier.
+
+## How to reproduce
+- Install the build, then: debug.arm32bridge.fence = "" (none) / nop / st / ld / 1 via adb setprop
+  (once the default is the light barrier, the switch value "off" turns it off).
+- ~/dev/arm32-bridge-games/scripts/cw-crashloop.sh <name> 10 45; logs in ~/dev/arm32-bridge-games/runs/<name>/;
+  count deaths with grep -E "\[fault\]|F arm32|Assertion".
+- Scripts used: /tmp/a32k/round14.sh, round16.sh, round17.sh (may be cleaned by the daily temp cleanup;
+  they are short, see round16 text above).
+
+### Round 17 (2026-10-13): light barrier (fence st) as the candidate fix, round-14 install
+- Pass rule set before running: 0 deaths in 20 clean runs (with round 14's 0/10 that is 0/30; chance at a 1-in-8 rate ~1.5%). Any death = the light barrier fails.
+- Result: r17-st-1 10/10 alive, r17-st-2 10/10 alive. The owner touched the phone during r17-st-1 run 4 (swipe on Card Wars at 21:31:38) and run 5 (home screen at 21:31:58): both alive but excluded, 2 replacement runs queued (r17-st-3).
+- Speed (median of last 20 [fps] lines per run, median over runs): st 70.9 / 69.3 fps, own code 9.15 / 9.41 ms; without a barrier (round 16 off/nop) 72.4 / 74.7 / 71.6 fps, own 8.95 / 8.67 / 9.02 ms. Cost ~4% of own-code time, ~3-4% fps.
+- Light barrier made the default (thumb.rs fence_prefix: parallel -> dmb ishst; "off" disables; one log line "[bridge] block start prefix: ..."). r17-st-3 replacement runs: 2/2 alive, so 20 clean runs, 0 dead.
+- Review t13 (GLM 5.3 Flash, read-only): no defects. Every entry (linked exits, pending sites, jump table, dispatcher) lands on the block base = the prefix; link-site offsets and the fault `starts` table stay consistent; parallel() and log::line are safe inside the OnceLock; checker mode and the PC build get no prefix. Caveat it raised: ishst orders store->store only; if the crash ever comes back with it on, retest with "1" (dmb ish). A prefix only in blocks with stores would not be equivalent.
+- Round 18 (default light barrier build, full checks): PC self-test default + forced fallback pass (old PC build fails the new signal-frame test, as expected); phone self-test 0 failures in all six modes, ARM32_CHECK=all 2,023,747 blocks / 0 differences; Card Wars fresh install, no property set: 10/10 alive, every log shows "block start prefix: dmb ishst"; Puzzle Craft 1 119.4 fps (min 116.9), Puzzle Craft 2 119.8 (min 117.6), save files unchanged. The crash fix is DONE (workaround; root cause still open, see the OPEN section).
+
+### Round 19 (2026-10-13): gap 1, shift shortcuts keep the data dependency
+- Change (thumb.rs): LSR #32 by immediate is now `mov w,rm; lsr x,#32` (was the constant 0); register LSL/LSR by 32 or more give `eor w,T5,T5` (result and carry), not a constant; register ASR clamps the amount with flag-free arithmetic (`T2 |= (0 - (T2 >> 6)) & 63`) instead of cbz + mov. The first ASR version used cmp + csel, which would clobber the guest flags kept in host NZCV; replaced before building.
+- Expected: no change in behaviour (results are the same values), no measurable speed change (paths are rare). This closes gap 1 (native ARM keeps an address dependency through such results).
+- New self-test check "shifts by 32 or more (register amounts up to 255, LSR/ASR #32), ARM and Thumb": LSL/LSR/ASR/ROR by register, amounts {0,1,31,32,33,63,64,65,127,200,255,259}, values {0x80000001, 0x7FFFFFFF, 0xDEADBEEF, 1}, plus LSR/ASR #32.
+- Results: PC self-test default + forced fallback 0 failures (new check ok); phone 0 failures in all six modes, new check ok in all six, ARM32_CHECK=all 1,715,026 blocks / 0 differences; Card Wars r19-shift 3/3 alive (prefix dmb ishst); Puzzle Craft 1 119.4 fps (min 115.6), Puzzle Craft 2 119.8 (min 118.0), save files unchanged.
+- Conclusion: passes. Review t14 (Sol 6.1 high) pending.
+- Review t14 (Sol 6.1 high, read-only): no translator bug. Its own model of all amounts 0-255 x 4 kinds x 69 values x both carries (141,312 cases) matched; no flag or scratch clobber; `eor w,x,x` keeps the dependency (Arm's own litmus example). Gap: the self-test only used plain (non-S) forms and checked results, not flags.
+- Fix (test only): the shift self-test now runs every form with chosen flags going in and reads the flags after: plain and S forms, LSL/LSR/ASR/ROR by register, amounts 0-259, 6 values, 4 flag sets, plus LSR/ASR #32 (plain and S) in ARM and Thumb. Expected: S forms set N, Z, C (C kept when the amount's low byte is 0) and keep V; plain forms keep all flags.
+- Round 19b (test-only, /tmp/a32k/round19b.sh): PC default + forced fallback ok; phone six modes 0 failures, the wider shift check ok in all six; ARM32_CHECK=all 2,752,614 blocks / 0 differences. Gap 1 DONE.
+
+### Gap 2 (2026-10-13): Unicorn LDRD/STRD at an 8-byte aligned address as one 64-bit access
+- Where: vendor/unicorn-engine-sys/qemu/target/arm/translate.c, new do_ldrd_load / do_strd_store used by trans_LDRD_rr, trans_STRD_rr, op_ldrd_ri, op_strd_ri (copy of the old file: /tmp/a32k/translate.c.before-gap2).
+- What: address & 7 == 0 -> one tcg_gen_qemu_{ld,st}_i64 (MO_Q), split/joined with extr/concat (Rt = lower address word; BE swaps halves); otherwise the old two 32-bit accesses (ARM only promises two single-copy-atomic words there, and one host 8-byte access at a 4-aligned address that crosses 16 bytes is only byte-atomic on the host). The branch ends the TCG basic block, so the address and both loaded words are local temps; writeback offset now 0 (the address is no longer bumped by 4). Like upstream QEMU 8 ("Use tcg_gen_qemu_{ld,st}_i64 for LDRD/STRD", MO_ATOM_SUBALIGN), which this QEMU 5 copy lacks.
+- How much it matters (checked before testing): small. The translator already does every valid LDRD/STRD as one LDP/STP. Only UNPREDICTABLE forms (Thumb rt == rt2, ARM rt = LR, load with writeback into a loaded register, ARM register offset equal to a loaded register) fall back to Unicorn in translator mode; ARM32_ENGINE=unicorn runs guest threads one at a time under the guest lock, so a tearing test cannot fail there. So no tearing test was added: none could tell the old code from the new.
+- New self-test check (correctness of both paths, known answers): "LDRD/STRD at 8- and 4-byte aligned addresses: offsets, writeback, base as first register, ARM and Thumb" (+ ARM register offset). It runs through the patched Unicorn code on the PC and in ARM32_ENGINE=unicorn; ARM32_CHECK=all runs every block in both engines and compares.
+- Expected: no behaviour change in any mode, 0 differences in the checker, games unchanged.
+- Review t15 (GLM 5.3, read-only): no bugs. Temp lifetimes right (everything read across the branch is a local temp, every temp freed once), writeback offset 0 right, rt == rn safe (base copied first, registers written only at the end), BE order matches gen_load_exclusive, aligned 8-byte access never crosses a page, hooks size-agnostic, all self-test expected values traced by hand. Side gain: a fault on the second word no longer leaves Rt half-written.
+- The owner asked to do the last small gaps together with one test round (2026-10-13). Round 20 (gap 2 alone) was stopped before its phone part; round 21 tests gaps 2+3+4.
+
+### Gap 3 (2026-10-13): forget the LDREX record when parked at a safe point
+- runtime.rs safe_point: after a thread parks for a stopped world, `clear_exclusive(uc)` (the kernel's return to user space does CLREX after any interrupt). A STREX after the pause then fails and its loop retries, so a value changed and changed back while parked is not missed. Already done before: phone calls, system calls, signal handlers, thread start.
+- No self-test: whether a parked thread's STREX fails needs a stop-the-world in the narrow window between LDREX and STREX; not reproducible on demand. Covered by the existing atomics/counter tests for "nothing breaks".
+
+### Gap 4 (2026-10-13): mprotect to writable un-fixes read-only library memory
+- mem.rs `unfix(start, end)` removes the range from FIXED (splitting segments). libc_calls.rs mprotect: PROT_WRITE on any fixed bytes -> unfix, log "[bridge] game made read-only library memory writable ...", runtime::note_code_change (Unicorn), dynarec::invalidate_library (engine.rs: drops every block whose span is within LITERAL_REACH bytes of the range (first 4096, raised to 8192 after review t16), since nearby blocks may have folded a literal from it). Retranslated blocks there are in made_blocks (not fixed), so a later cache flush finds them and their literals are real loads. invalidate and invalidate_library share drop_blocks.
+- New self-test "library code made writable (mprotect), patched and flushed: new instruction and new literal seen": an ARM function in the self-test library's own .text (`ldr r0, =lit; add r0, #0; bx lr`), called once, then mprotect RWX, patch the add to #1 and the literal to 0x22222222, flush, expect 0x22222223, patch back, expect 0x12345678. On the translator without the fix the old block (not watched, literal folded) would keep returning 0x12345678.
+- Round 21 (gaps 2+3+4, first version): PC default + forced fallback exit 0; phone translator, FORCE_FALLBACK_SYNC, CHECK=all 0 failures; stopped there to apply the t16 fixes below (the later game steps rebuild from the tree).
+- Review t16 (Sol 6.1 high, read-only): gap 3 fine (clears the live state for both engines; STOP only comes from drop_blocks, not every translation, so no livelock). Gap 4 had three real edge cases, all fixed at once:
+  1. A block starting in a fixed page and running into the unfixed page was not watched after retranslation (made_blocks used only the first address). Now `mem::fixed_range(start, end)`: watched unless the whole block is in one fixed segment.
+  2. 4096 was too short: ARM `ldr pc, [pc, #4092]` reads 4100 bytes past its instruction (PC + 8). LITERAL_REACH is now 8192.
+  3. Two overlapping mprotect calls: the second saw nothing left to unfix and returned before the first dropped the old blocks. Now the unfix + drop runs under one lock (UNFIXING), so the second waits. The waiting thread is in an import (marked outside guest code), so stop_world doesn't wait for it.
+- Round 22 = round 21 with these fixes (job 005).
+- Round 22 results (gaps 2+3+4 with the t16 fixes, /tmp/a32k/round22.sh): PC default + forced fallback 0 failures; phone 0 failures in all six modes; ARM32_CHECK=all 2,770,148 blocks / 0 differences; the new checks "LDRD/STRD at 8- and 4-byte aligned addresses ..." and "library code made writable (mprotect) ..." ok on PC default, PC forced fallback and all six phone modes (8/8 each); Card Wars r22-gaps 3/3 alive (prefix dmb ishst); Puzzle Craft 1 119.6 fps (min 117.4), Puzzle Craft 2 120.0 (min 117.4), save files unchanged. Gaps 2, 3, 4 DONE. All four t12 gaps are closed (the light barrier stays; the root cause is still open, see the OPEN section).
+
+### Final review t17 (Claude Fable 5.1, high, read-only, 2026-10-13)
+- No correctness bug in the light barrier or gaps 1-4. Gap 2 temps, gap 3 live-state clearing, gap 4 locking (UNFIXING before STOPPER, waiter is outside guest code, no deadlock), reach 8192 >= worst ARM case 4106 bytes, only one literal-folding site (thumb.rs load_store), raw `svc` mprotect is ENOSYS so no bypass.
+- Statistics corrected: ishst record is 0/48 launches (r14 10, r17 22, r18 10, r19 3, r22 3) vs 9/70 without: Fisher exact ~0.7%, so the default is supported, but the 95% upper bound on the remaining crash rate is ~6%: "not seen in 48 launches", not "never". All barrier runs so far 0/78 vs 9/70 (~0.1%).
+- Open question it raised: ishst orders store->store only, yet ishld was also 0/10; no single missing ordering is fixed by both. Either the ld result was chance (p ~ 0.25 at 13%) or the mechanism differs. Cheapest next experiment: 30 runs with fence=ld. Also: the prefix sits only at block starts, so two stores inside one block get no barrier between them; the barrier only separates stores in different blocks (fits a "build it in a call, publish it after return" pattern).
+- Fixed at once: LSR #32 relied on the host register's upper half being 0 (`mov w` skipped when result == rm, then `lsr x, #32`). True today (guest registers only get W writes) but not enforced; now two W shifts (`lsr w,rm,#31; lsr w,w,#1`), still computed from rm.
+- Fixed: thumb.rs fence_prefix comment ("not once in 48 launches"), the p-value and the stale LITERAL_REACH text above.
+- Done as it asked: show the mprotect self-test fails without gap 4 (round 23 runs it on a build of the last commit, 06c499c).
+- Round 23 (b), current tree with the LSR #32 two-W-shift change: PC default + forced fallback 0 failures (shift check ok); phone 0 failures in all six modes, shift check ok in all six; ARM32_CHECK=all 2,767,131 blocks / 0 differences. (Games not rerun for this one-instruction change; the shift self-test covers LSR #32 in ARM and Thumb, plain and S.)
+- Round 23 (a), the control (06c499c + new self-test): first try built the wrong tree (log shows the ~/dev path, cause unclear; cargo in the copy resolves correctly), retried as round23b.
+- Round 23b (control, 06c499c built in /tmp/a32k/head-src, new self-test, translator mode): "FAIL library code made writable (mprotect) ..." as predicted, so the test catches the missing gap 4. Also FAIL (expected, fixed earlier and not in that commit): signal frame on the thread's own stack, patched literal in made code. Shift and LDRD/STRD checks pass there (their values never changed; they guard correctness, not the dependency).
+- State at the end of this round: light barrier default (workaround, root cause open), gaps 1-4 closed, all checks green, phone crash-box setting restored. Card Wars speed with the barrier ~70 fps (target 115 not reached).
