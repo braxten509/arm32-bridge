@@ -115,6 +115,11 @@ impl CodeMemory {
         memory
     }
 
+    /// Where the next `place` puts its code.
+    fn next_address(&self) -> usize {
+        unsafe { self.base.add(self.used) as usize }
+    }
+
     /// Copies code in and returns its address.
     fn place(&mut self, code: &[u32]) -> usize {
         assert!((self.used + code.len()) * 4 <= CODE_SIZE, "translated code memory is full");
@@ -343,13 +348,16 @@ fn cache() -> &'static RwLock<Cache> {
         if linking() {
             JUMP_TABLE.store(CODE_BASE.load(Ordering::Relaxed), Ordering::Relaxed);
         }
+        // Sized for a big game up front: regrowing a table of a few hundred
+        // thousand blocks rehashes it all while every other thread waits for
+        // the lock (untouched pages cost no memory).
         RwLock::new(Cache {
             memory,
-            blocks: PcMap::default(),
-            pending: PcMap::default(),
-            incoming: PcMap::default(),
+            blocks: PcMap::with_capacity_and_hasher(1 << 19, Default::default()),
+            pending: PcMap::with_capacity_and_hasher(1 << 16, Default::default()),
+            incoming: PcMap::with_capacity_and_hasher(1 << 16, Default::default()),
             made_blocks: std::collections::BTreeMap::new(),
-            starts: Vec::new(),
+            starts: Vec::with_capacity(1 << 19),
             fallbacks: HashMap::new(),
             fallback_total: 0,
         })
@@ -472,14 +480,75 @@ const MAX_BLOCK_SPAN: u32 = 4096;
 /// Other threads are stopped first (outside translated code), since the
 /// dropped code may be running on them.
 pub fn invalidate(uc: &Uc, start: u32, end: u32) {
-    drop_blocks(uc, |cache| {
+    let covered = |cache: &Cache| -> Vec<u32> {
         cache
             .made_blocks
             .range((start.saturating_sub(MAX_BLOCK_SPAN), 0)..(end, 0))
             .filter(|&(&(first, _), &block_end)| block_end > start && first < end)
             .map(|(&(_, pc), _)| pc)
             .collect()
-    });
+    };
+    if flush_log().is_some() && CACHE.get().is_some() {
+        note_flush(start, end, &covered(&read_cache()));
+    }
+    drop_blocks(uc, covered);
+}
+
+/// ARM32_FLUSHLOG=<file> (or debug.arm32bridge.flushlog=<file>, for testing):
+/// keeps a copy of the guest bytes of every block made from code the game
+/// wrote, and appends one line per cache flush: "time start end blocks-hit
+/// changed unchanged [address old new]" (hex; the last three name the first
+/// guest word that really changed). Shows whether flushes that drop blocks
+/// (and stop every thread) changed the code those blocks were made from.
+fn flush_log() -> Option<&'static std::sync::Mutex<(std::fs::File, HashMap<u32, (u32, Vec<u8>)>)>> {
+    static LOG: OnceLock<Option<std::sync::Mutex<(std::fs::File, HashMap<u32, (u32, Vec<u8>)>)>>> = OnceLock::new();
+    LOG.get_or_init(|| {
+        let path = std::env::var("ARM32_FLUSHLOG").ok().or_else(|| property("debug.arm32bridge.flushlog"))?;
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(&path);
+        crate::log::line(&format!("[bridge] flush log to {path}: {}", if file.is_ok() { "on" } else { "could not open" }));
+        file.ok().map(|file| std::sync::Mutex::new((file, HashMap::new())))
+    })
+    .as_ref()
+}
+
+/// The guest bytes [first, end) as they are now.
+fn guest_bytes(first: u32, end: u32) -> Vec<u8> {
+    (first..end).map(|address| unsafe { *guest_mem().host(address) }).collect()
+}
+
+/// Keeps a copy of a made block's guest bytes (flush log only).
+fn snapshot_block(pc: u32, end: u32) {
+    let Some(log) = flush_log() else { return };
+    let bytes = guest_bytes(pc & !1, end);
+    log.lock().unwrap_or_else(|e| e.into_inner()).1.insert(pc, (end, bytes));
+}
+
+fn note_flush(start: u32, end: u32, covered: &[u32]) {
+    use std::io::Write;
+    let Some(log) = flush_log() else { return };
+    let mut log = log.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut changed, mut unchanged, mut first_change) = (0, 0, None);
+    for pc in covered {
+        let Some((block_end, old)) = log.1.get(pc) else { continue };
+        let now = guest_bytes(pc & !1, *block_end);
+        match old.iter().zip(&now).position(|(a, b)| a != b) {
+            None => unchanged += 1,
+            Some(at) => {
+                changed += 1;
+                if first_change.is_none() {
+                    let word = at & !3;
+                    let read = |bytes: &[u8]| bytes.get(word..word + 4).map_or(0, |w| u32::from_le_bytes(w.try_into().unwrap()));
+                    first_change = Some(((pc & !1) + word as u32, read(old), read(&now)));
+                }
+            }
+        }
+    }
+    let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
+    let time = now.tv_sec as u64 * 1_000_000_000 + now.tv_nsec as u64;
+    let change = first_change.map_or(String::new(), |(address, old, new)| format!(" {address:x} {old:08x} {new:08x}"));
+    let line = format!("{time} {start:x} {end:x} {} {changed} {unchanged}{change}", covered.len());
+    let _ = writeln!(log.0, "{line}");
 }
 
 /// How far a folded literal can lie from its block, with room to spare: an
@@ -534,10 +603,15 @@ fn unpatch_link(site: usize) {
     }
 }
 
+/// `b target` placed at `site`.
+fn branch_word(site: usize, target: usize) -> u32 {
+    let offset = (target as i64 - site as i64) / 4;
+    0x1400_0000 | (offset as u32 & 0x03FF_FFFF)
+}
+
 /// Turns the `nop` at `site` into `b target`.
 fn patch_link(site: usize, target: usize) {
-    let offset = (target as i64 - site as i64) / 4;
-    let word = 0x1400_0000 | (offset as u32 & 0x03FF_FFFF);
+    let word = branch_word(site, target);
     unsafe {
         std::ptr::write_volatile(site as *mut u32, word);
         __clear_cache(site as *mut libc::c_char, (site + 4) as *mut libc::c_char);
@@ -589,8 +663,24 @@ fn block_for(pc: u32) -> (usize, u32, usize, usize) {
     {
         let cache = &mut *guard;
         let (enter, exit_stub) = (cache.memory.enter, cache.memory.exit_stub);
-        let block = if pc & 1 == 1 { thumb::translate(guest_mem(), pc & !1) } else { thumb::translate_arm(guest_mem(), pc) };
-        let address = cache.memory.place(&block.code);
+        let mut block = if pc & 1 == 1 { thumb::translate(guest_mem(), pc & !1) } else { thumb::translate_arm(guest_mem(), pc) };
+        // Exits to blocks that already exist (or to this one) are linked in
+        // the copy before it's placed, so one cache flush covers them.
+        let address = cache.memory.next_address();
+        if linking() {
+            for &(at, target) in &block.links {
+                let site = address + at * 4;
+                let code = if target == pc { Some(address) } else { cache.blocks.get(&target).map(|&(code, _)| code) };
+                if let Some(code) = code {
+                    block.code[at] = branch_word(site, code);
+                    cache.incoming.entry(target).or_default().push(site);
+                } else if !(mem::STUB_BASE..mem::STUB_BASE + mem::STUB_SIZE).contains(&(target & !1)) {
+                    cache.pending.entry(target).or_default().push(site);
+                }
+            }
+        }
+        let placed = cache.memory.place(&block.code);
+        debug_assert_eq!(placed, address);
         note_block(address, block.code.len() * 4, pc);
         cache.blocks.insert(pc, (address, block.end));
         cache.starts.push((address, pc));
@@ -598,17 +688,9 @@ fn block_for(pc: u32) -> (usize, u32, usize, usize) {
         // the game made writable (`mem::unfix`).
         if !mem::fixed_range(pc & !1, block.end) {
             cache.made_blocks.insert((pc & !1, pc), block.end);
+            snapshot_block(pc, block.end);
         }
         if linking() {
-            for &(at, target) in &block.links {
-                let site = address + at * 4;
-                if let Some(&(code, _)) = cache.blocks.get(&target) {
-                    patch_link(site, code);
-                    cache.incoming.entry(target).or_default().push(site);
-                } else if !(mem::STUB_BASE..mem::STUB_BASE + mem::STUB_SIZE).contains(&(target & !1)) {
-                    cache.pending.entry(target).or_default().push(site);
-                }
-            }
             // Nothing jumps to the new code yet; other cores sync before anything does.
             sync_other_cores();
             let waiting = cache.pending.remove(&pc).unwrap_or_default();

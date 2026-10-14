@@ -122,7 +122,8 @@ pub struct Asm {
 
 impl Asm {
     pub fn new() -> Asm {
-        Asm::default()
+        // Room for a typical block, so translating one rarely regrows these.
+        Asm { code: Vec::with_capacity(512), labels: Vec::with_capacity(32), fixups: Vec::with_capacity(32), links: Vec::with_capacity(8), ..Asm::default() }
     }
 
     pub fn len(&self) -> usize {
@@ -802,6 +803,12 @@ impl Asm {
     pub fn shift_left_long(&mut self, signed: bool, size: u32, rd: Reg, rn: Reg, shift: u32) {
         let op = if signed { 0x0F00_A400 } else { 0x2F00_A400 };
         self.emit(op | (((8 << size) + shift) << 16) | (rn << 5) | rd);
+    }
+    /// Shift by immediate (SSHR, SRI, SHRN, SQSHL, ...): `op` holds U and the opcode,
+    /// `imm7` is immh:immb. 64-bit elements without `q` (no 1D vector form) use the scalar encoding.
+    pub fn shift_immediate(&mut self, op: u32, q: bool, imm7: u32, rd: Reg, rn: Reg) {
+        let base = if !q && imm7 >= 64 { 0x5F00_0400 } else { 0x0F00_0400 | ((q as u32) << 30) };
+        self.emit(base | op | (imm7 << 16) | (rn << 5) | rd);
     }
     /// One-source vector operation (`simd::SCVTF` and so on).
     pub fn simd2(&mut self, op: u32, q: bool, rd: Reg, rn: Reg) {

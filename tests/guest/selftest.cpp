@@ -1309,6 +1309,272 @@ static void neon_permute_expected(unsigned char *want) {
 NEON_TESTS(arm)
 NEON_TESTS(thumb)
 
+// Inputs d16-d21 for the shift and long/narrow tests (results worked out by hand per lane).
+static const unsigned long long neon_shift_in[6] = {0x800000017FFFFFFFull, 0xFFFF000100F08000ull, 0x0123456789ABCDEFull,
+                                                    0xFEDCBA9876543210ull, 0x807F01FF10203040ull, 0x3ull};
+static const unsigned long long neon_shift_want[33] = {
+    0xFFFFFFFF00000000ull, 0xFFFFFFFF00000000ull, // vshr.s32 q #31
+    0x0FFF0000000F0800ull,                        // vshr.u16 d23 #4
+    0xFFFF00000000FFFFull,                        // vshr.s16 #16
+    0x89ABCDEF00000000ull,                        // vshl.i64 d25 #32
+    0x00000002FFFFFFFEull, 0xFFFE000201E10000ull, // vshl.i32 q #1
+    0x0222456789ABCE6Full,                        // vsra.u16 #8
+    0xC000000140000000ull,                        // vrshr.s32 d23 #1
+    0x0000000000000001ull,                        // vrshr.u64 #64
+    0x0100000100000003ull,                        // vrsra.u8 #8
+    0x0123456789ABCDEFull, 0xFEDCBA9876543210ull, // vsri.32 q #32 (unchanged)
+    0xF0120456089A8CDEull,                        // vsri.16 d23 #4
+    0x23456789ABCDEF10ull,                        // vsli.64 #8
+    0x00F010F000000003ull,                        // vsli.8 d23 #4
+    0x807F02FE2040607Full,                        // vqshl.s8 #1
+    0x0000000201E00000ull,                        // vqshlu.s16 #1
+    0xFFFFFFFFFFFFFFFFull,                        // vqshl.u64 d25 #1
+    0x8091A2B544D5E6F7ull, 0xFF6D5D4D3C1A9908ull, // vrsra.s64 q #1
+    0xFFFF00F080007FFFull,                        // vshrn.i32 #16
+    0x0000018080008000ull,                        // vrshrn.i16 d23 #8
+    0x80007FFF7FFF8000ull,                        // vqshrn.s32 #8
+    0x00000000807F01FFull,                        // vqrshrn.u64 d23 #32
+    0x000000000020FFFFull,                        // vqrshrun.s16 #4
+    0x0000000001234567ull,                        // vqshrun.s64 d23 #32
+    0xFF000FFFFF00FFFFull,                        // vqshrn.u16 #4
+    0xC700000047000000ull, 0xBF7FFF0043708000ull, // vcvt.f32.s32 q #16
+    0x000000000000F080ull,                        // vcvt.u32.f32 d25 #8
+    0xFFFF000000010000ull, 0xFFFFFFFF000001E1ull, // vcvt.s32.f32 q #1
+};
+static const unsigned long long neon_long_want[34] = {
+    0x01236367A1ABCDEFull, 0x7E5C39197654330Full, // vmlal.u8
+    0xFEBA77B2814509CDull,                        // vaddhn.i16 d25
+    0xFEDC7745812309ACull,                        // vraddhn.i32
+    0x000000F0FFFF8003ull, 0xFFFFFFFF00000001ull, // vaddl.s16
+    0x0133458789DBCE2Full, 0xFF5CBB177655330Full, // vaddw.u8
+    0xFFFFFFFFF6543210ull, 0x000000007EDCBA9Aull, // vsubl.u32
+    0x01134547897BCDAFull, 0xFF5CBA1976533211ull, // vsubw.s8
+    0xFEDDBA9781234566ull,                        // vsubhn.i64 d23
+    0xFFBB75B281450ACEull,                        // vrsubhn.i16
+    0x001000200030003Dull, 0x0080007F00010001ull, // vabdl.s8
+    0x8000756580004DEFull, 0xFFFF012400F13A97ull, // vabal.u16
+    0x0000000000018000ull, 0x0000000000000000ull, // vmlsl.s16
+    0xC4D5E6F7F6543211ull, 0xFF6E5D4C81234567ull, // vmull.s32
+    0x0100040005001000ull, 0x4000155500015555ull, // vmull.p8
+    0x006EEEC019080000ull, 0xFEDB01240000BA98ull, // vmull.u16 (odd d17, d19)
+    0x80000002E2FC962Full, 0xFFFF000100F08000ull, // vmlal.s32
+    0x0001C2007FFFFFFFull, 0x0000000200000002ull, // vqdmull.s16 (saturates)
+    0x0123456A89ABCDE9ull, 0xFEDCBA9876543210ull, // vqdmlal.s32
+    0x0123456789AECDEFull, 0xFEDCBA9876543210ull, // vqdmlsl.s16
+};
+// FPSCR.QC after each saturating instruction run alone (and after VSHR, which never sets it).
+static const unsigned neon_qc_want[10] = {1, 1, 1, 1, 1, 0, 1, 0, 1, 0};
+
+// Shifts by an immediate, three registers of different lengths and FPSCR.QC.
+#define NEON_SHIFT_TESTS(mode)                                                                       \
+    __attribute__((target(#mode), noinline)) static void neon_shifts_##mode(const unsigned long long *in, unsigned long long *out) { \
+        __asm__ volatile(".fpu neon\n"                                                               \
+                         "vld1.64 {d16, d17, d18, d19}, [%[in]]!\n"                                  \
+                         "vld1.64 {d20, d21}, [%[in]]\n"                                             \
+                         "vshr.s32 q11, q8, #31\n"                                                   \
+                         "vst1.64 {d22, d23}, [%[out]]!\n"                                           \
+                         "vshr.u16 d23, d17, #4\n"                                                   \
+                         "vst1.64 {d23}, [%[out]]!\n"                                                \
+                         "vshr.s16 d22, d17, #16\n"                                                  \
+                         "vst1.64 {d22}, [%[out]]!\n"                                                \
+                         "vshl.i64 d25, d18, #32\n"                                                  \
+                         "vst1.64 {d25}, [%[out]]!\n"                                                \
+                         "vshl.i32 q12, q8, #1\n"                                                    \
+                         "vst1.64 {d24, d25}, [%[out]]!\n"                                           \
+                         "vorr d22, d18, d18\n"                                                      \
+                         "vsra.u16 d22, d17, #8\n"                                                   \
+                         "vst1.64 {d22}, [%[out]]!\n"                                                \
+                         "vrshr.s32 d23, d16, #1\n"                                                  \
+                         "vst1.64 {d23}, [%[out]]!\n"                                                \
+                         "vrshr.u64 d22, d19, #64\n"                                                 \
+                         "vst1.64 {d22}, [%[out]]!\n"                                                \
+                         "vorr d22, d21, d21\n"                                                      \
+                         "vrsra.u8 d22, d20, #8\n"                                                   \
+                         "vst1.64 {d22}, [%[out]]!\n"                                                \
+                         "vorr q11, q9, q9\n"                                                        \
+                         "vsri.32 q11, q8, #32\n"                                                    \
+                         "vst1.64 {d22, d23}, [%[out]]!\n"                                           \
+                         "vorr d23, d17, d17\n"                                                      \
+                         "vsri.16 d23, d18, #4\n"                                                    \
+                         "vst1.64 {d23}, [%[out]]!\n"                                                \
+                         "vorr d22, d19, d19\n"                                                      \
+                         "vsli.64 d22, d18, #8\n"                                                    \
+                         "vst1.64 {d22}, [%[out]]!\n"                                                \
+                         "vorr d23, d21, d21\n"                                                      \
+                         "vsli.8 d23, d20, #4\n"                                                     \
+                         "vst1.64 {d23}, [%[out]]!\n"                                                \
+                         "vqshl.s8 d23, d20, #1\n"                                                   \
+                         "vst1.64 {d23}, [%[out]]!\n"                                                \
+                         "vqshlu.s16 d22, d17, #1\n"                                                 \
+                         "vst1.64 {d22}, [%[out]]!\n"                                                \
+                         "vqshl.u64 d25, d19, #1\n"                                                  \
+                         "vst1.64 {d25}, [%[out]]!\n"                                                \
+                         "vorr q12, q8, q8\n"                                                        \
+                         "vrsra.s64 q12, q9, #1\n"                                                   \
+                         "vst1.64 {d24, d25}, [%[out]]!\n"                                           \
+                         "vshrn.i32 d22, q8, #16\n"                                                  \
+                         "vst1.64 {d22}, [%[out]]!\n"                                                \
+                         "vrshrn.i16 d23, q8, #8\n"                                                  \
+                         "vst1.64 {d23}, [%[out]]!\n"                                                \
+                         "vqshrn.s32 d22, q9, #8\n"                                                  \
+                         "vst1.64 {d22}, [%[out]]!\n"                                                \
+                         "vqrshrn.u64 d23, q10, #32\n"                                               \
+                         "vst1.64 {d23}, [%[out]]!\n"                                                \
+                         "vqrshrun.s16 d22, q10, #4\n"                                               \
+                         "vst1.64 {d22}, [%[out]]!\n"                                                \
+                         "vqshrun.s64 d23, q9, #32\n"                                           \
+                         "vst1.64 {d23}, [%[out]]!\n"                                                \
+                         "vqshrn.u16 d22, q8, #4\n"                                                  \
+                         "vst1.64 {d22}, [%[out]]!\n"                                                \
+                         "vcvt.f32.s32 q11, q8, #16\n"                                               \
+                         "vst1.64 {d22, d23}, [%[out]]!\n"                                           \
+                         "vcvt.u32.f32 d25, d23, #8\n"                                               \
+                         "vst1.64 {d25}, [%[out]]!\n"                                                \
+                         "vcvt.s32.f32 q12, q11, #1\n"                                               \
+                         "vst1.64 {d24, d25}, [%[out]]\n"                                            \
+                         : [in] "+r"(in), [out] "+r"(out)                                            \
+                         :                                                                           \
+                         : "d16", "d17", "d18", "d19", "d20", "d21", "d22", "d23", "d24", "d25", "memory"); \
+    }                                                                                                \
+    __attribute__((target(#mode), noinline)) static void neon_long_##mode(const unsigned long long *in, unsigned long long *out) { \
+        __asm__ volatile(".fpu neon\n"                                                               \
+                         "vld1.64 {d16, d17, d18, d19}, [%[in]]!\n"                                  \
+                         "vld1.64 {d20, d21}, [%[in]]\n"                                             \
+                         "vorr q11, q9, q9\n"                                                        \
+                         "vmlal.u8 q11, d20, d17\n"                                                  \
+                         "vst1.64 {d22, d23}, [%[out]]!\n"                                           \
+                         "vaddhn.i16 d25, q8, q9\n"                                                  \
+                         "vst1.64 {d25}, [%[out]]!\n"                                                \
+                         "vraddhn.i32 d24, q8, q9\n"                                                 \
+                         "vst1.64 {d24}, [%[out]]!\n"                                                \
+                         "vaddl.s16 q12, d17, d21\n"                                                 \
+                         "vst1.64 {d24, d25}, [%[out]]!\n"                                           \
+                         "vaddw.u8 q13, q9, d20\n"                                                   \
+                         "vst1.64 {d26, d27}, [%[out]]!\n"                                           \
+                         "vsubl.u32 q13, d16, d18\n"                                                 \
+                         "vst1.64 {d26, d27}, [%[out]]!\n"                                           \
+                         "vsubw.s8 q12, q9, d20\n"                                                   \
+                         "vst1.64 {d24, d25}, [%[out]]!\n"                                           \
+                         "vsubhn.i64 d23, q9, q8\n"                                                  \
+                         "vst1.64 {d23}, [%[out]]!\n"                                                \
+                         "vrsubhn.i16 d22, q9, q8\n"                                                 \
+                         "vst1.64 {d22}, [%[out]]!\n"                                                \
+                         "vabdl.s8 q12, d20, d21\n"                                                  \
+                         "vst1.64 {d24, d25}, [%[out]]!\n"                                           \
+                         "vorr q13, q8, q8\n"                                                        \
+                         "vabal.u16 q13, d17, d19\n"                                                 \
+                         "vst1.64 {d26, d27}, [%[out]]!\n"                                           \
+                         "vmov.i32 q12, #0\n"                                                        \
+                         "vmlsl.s16 q12, d17, d21\n"                                                 \
+                         "vst1.64 {d24, d25}, [%[out]]!\n"                                           \
+                         "vmull.s32 q13, d16, d18\n"                                                 \
+                         "vst1.64 {d26, d27}, [%[out]]!\n"                                           \
+                         "vmull.p8 q12, d20, d20\n"                                                  \
+                         "vst1.64 {d24, d25}, [%[out]]!\n"                                           \
+                         "vmull.u16 q13, d17, d19\n"                                                 \
+                         "vst1.64 {d26, d27}, [%[out]]!\n"                                           \
+                         "vorr q12, q8, q8\n"                                                        \
+                         "vmlal.s32 q12, d19, d21\n"                                                 \
+                         "vst1.64 {d24, d25}, [%[out]]!\n"                                           \
+                         "vqdmull.s16 q12, d17, d17\n"                                               \
+                         "vst1.64 {d24, d25}, [%[out]]!\n"                                           \
+                         "vorr q13, q9, q9\n"                                                        \
+                         "vqdmlal.s32 q13, d16, d21\n"                                               \
+                         "vst1.64 {d26, d27}, [%[out]]!\n"                                           \
+                         "vorr q12, q9, q9\n"                                                        \
+                         "vqdmlsl.s16 q12, d17, d21\n"                                               \
+                         "vst1.64 {d24, d25}, [%[out]]\n"                                            \
+                         : [in] "+r"(in), [out] "+r"(out)                                            \
+                         :                                                                           \
+                         : "d16", "d17", "d18", "d19", "d20", "d21", "d22", "d23", "d24", "d25", "d26", \
+                           "d27", "memory");                                                         \
+    }                                                                                                \
+    /* FPSCR cleared before each instruction, then read back; also the saturated VQDMLSL.S32. */    \
+    __attribute__((target(#mode), noinline)) static void neon_qc_##mode(const unsigned long long *in, unsigned *flags, unsigned long long *out) { \
+        unsigned saved, value;                                                                       \
+        __asm__ volatile(".fpu neon\n"                                                               \
+                         "vmrs %[saved], fpscr\n"                                                    \
+                         "vld1.64 {d16, d17, d18, d19}, [%[in]]!\n"                                  \
+                         "vld1.64 {d20, d21}, [%[in]]\n"                                             \
+                         "vmsr fpscr, %[zero]\n"                                                     \
+                         "vqshl.u64 d22, d19, #1\n"                                                  \
+                         "vmrs %[value], fpscr\n"                                                    \
+                         "str %[value], [%[flags]], #4\n"                                            \
+                         "vmsr fpscr, %[zero]\n"                                                     \
+                         "vqshrn.s32 d22, q9, #8\n"                                                  \
+                         "vmrs %[value], fpscr\n"                                                    \
+                         "str %[value], [%[flags]], #4\n"                                            \
+                         "vmsr fpscr, %[zero]\n"                                                     \
+                         "vqrshrun.s16 d22, q10, #4\n"                                               \
+                         "vmrs %[value], fpscr\n"                                                    \
+                         "str %[value], [%[flags]], #4\n"                                            \
+                         "vmsr fpscr, %[zero]\n"                                                     \
+                         "vqdmull.s16 q11, d17, d17\n"                                               \
+                         "vmrs %[value], fpscr\n"                                                    \
+                         "str %[value], [%[flags]], #4\n"                                            \
+                         "vorr q11, q8, q8\n"                                                        \
+                         "vmsr fpscr, %[zero]\n"                                                     \
+                         "vqdmlsl.s32 q11, d16, d16\n"                                               \
+                         "vmrs %[value], fpscr\n"                                                    \
+                         "str %[value], [%[flags]], #4\n"                                            \
+                         "vst1.64 {d22, d23}, [%[out]]\n"                                            \
+                         "vmsr fpscr, %[zero]\n"                                                     \
+                         "vqrshrn.u64 d22, q10, #32\n"                                               \
+                         "vmrs %[value], fpscr\n"                                                    \
+                         "str %[value], [%[flags]], #4\n"                                            \
+                         "vmsr fpscr, %[zero]\n"                                                     \
+                         "vqshlu.s16 d22, d17, #1\n"                                                 \
+                         "vmrs %[value], fpscr\n"                                                    \
+                         "str %[value], [%[flags]], #4\n"                                            \
+                         "vorr q11, q9, q9\n"                                                        \
+                         "vmsr fpscr, %[zero]\n"                                                     \
+                         "vqdmlal.s32 q11, d16, d21\n"                                               \
+                         "vmrs %[value], fpscr\n"                                                    \
+                         "str %[value], [%[flags]], #4\n"                                            \
+                         "vmsr fpscr, %[zero]\n"                                                     \
+                         "vqshl.s8 d22, d20, #1\n"                                                   \
+                         "vmrs %[value], fpscr\n"                                                    \
+                         "str %[value], [%[flags]], #4\n"                                            \
+                         "vmsr fpscr, %[zero]\n"                                                     \
+                         "vshr.s32 q11, q8, #31\n"                                                   \
+                         "vmrs %[value], fpscr\n"                                                    \
+                         "str %[value], [%[flags]]\n"                                                \
+                         "vmsr fpscr, %[saved]\n"                                                    \
+                         : [in] "+r"(in), [flags] "+r"(flags), [saved] "=&r"(saved), [value] "=&r"(value) \
+                         : [out] "r"(out), [zero] "r"(0)                                             \
+                         : "d16", "d17", "d18", "d19", "d20", "d21", "d22", "d23", "memory");        \
+    }                                                                                                \
+    static bool neon_shift_long_##mode(void) {                                                       \
+        unsigned long long shifted[33], longs[34], saturated[2];                                     \
+        unsigned flags[10];                                                                          \
+        neon_shifts_##mode(neon_shift_in, shifted);                                                  \
+        neon_long_##mode(neon_shift_in, longs);                                                      \
+        neon_qc_##mode(neon_shift_in, flags, saturated);                                             \
+        bool ok = true;                                                                              \
+        for (int i = 0; i < 33; i++)                                                                 \
+            if (shifted[i] != neon_shift_want[i]) {                                                  \
+                __android_log_print(ANDROID_LOG_INFO, TAG, #mode " neon shift %d: %016llx want %016llx", i, shifted[i], neon_shift_want[i]); \
+                ok = false;                                                                          \
+            }                                                                                        \
+        for (int i = 0; i < 34; i++)                                                                 \
+            if (longs[i] != neon_long_want[i]) {                                                     \
+                __android_log_print(ANDROID_LOG_INFO, TAG, #mode " neon long %d: %016llx want %016llx", i, longs[i], neon_long_want[i]); \
+                ok = false;                                                                          \
+            }                                                                                        \
+        for (int i = 0; i < 10; i++)                                                                 \
+            if (((flags[i] >> 27) & 1) != neon_qc_want[i]) {                                         \
+                __android_log_print(ANDROID_LOG_INFO, TAG, #mode " neon QC %d: fpscr %08x", i, flags[i]); \
+                ok = false;                                                                          \
+            }                                                                                        \
+        if (saturated[0] != 0x8000000000000000ull || saturated[1] != 0x8000000000000000ull) {        \
+            __android_log_print(ANDROID_LOG_INFO, TAG, #mode " neon vqdmlsl.s32: %016llx %016llx", saturated[0], saturated[1]); \
+            ok = false;                                                                              \
+        }                                                                                            \
+        return ok;                                                                                   \
+    }
+NEON_SHIFT_TESTS(arm)
+NEON_SHIFT_TESTS(thumb)
+
 // Runs many NEON instructions on mixed data; the self-test logs a checksum of the results so the
 // translator (and ARM32_CHECK=all) can be compared with Unicorn (ARM32_ENGINE=unicorn).
 #define NEON_COVERAGE(mode)                                                                         \
@@ -2086,6 +2352,8 @@ extern "C" int run_all() {
         check(saturates_arm() && saturates_asr32_arm() && saturates_thumb(),
               "USAT / SSAT / USAT16 / SSAT16: every width, LSL / ASR, Q flag, conditional, Rd = Rn (ARM and Thumb)");
         check(neon_extras_arm() && neon_extras_thumb(), "NEON lanes, VMOVL/VSHLL, VCVT, VMAX/VMIN, immediates, permutes (ARM and Thumb)");
+        check(neon_shift_long_arm() && neon_shift_long_thumb(),
+              "NEON shifts by immediate, narrowing shifts, VCVT fixed point, long/wide/narrow forms, FPSCR.QC (ARM and Thumb)");
         check(stored_pc_offset() == 4, "STM storing PC (ARM)");
         check(raw_getpid_arm() == getpid() && raw_getpid_thumb() == getpid(), "raw svc system call (ARM and Thumb)");
         {

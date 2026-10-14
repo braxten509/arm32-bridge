@@ -1714,3 +1714,116 @@ ms/frame must improve beyond noise; self-test 0 failures in six modes; three gam
 - Safety (16 MB, final): PC self-test 0 failures; phone six modes 0 failures (checker 3716843 blocks, 0 differences);
   pc-check jt21: PC1 119.9 fps saves unchanged, PC2 120.0 fps (stgs.atgsave only, emptied on launch as before;
   pc2.atgsave untouched), no crash lines. Card Wars reinstalled with this build.
+
+## Leftover pauses (owner: "Much better! But yes, dig into the leftover pauses", 2026-10-14)
+- The >100 ms frames are repeatable: in every scripted run they land at +6-7 s, +9-10 s (~210-225 ms) and +74-76 s
+  (175-240 ms) after start.txt (jt21-t1/t2, jt20-t1, jt16-ctl1) = the first visits to menu screens. The 60 s trace
+  window (READY+75 s on) mostly misses them.
+- jt21-cg1 (16 MB build, menu loop, CG=1 BLOCKMAP=1; 118.5 fps, >50/>100/>250 = 17/4/1, worst 257 ms): 24 gaps >25 ms
+  (max 117). gap-callers.py: bridge/host share inside gaps 25.5% vs 25.0% overall = no pause-only bridge cost in the
+  menu loop. Only pause-leaning item: engine::invalidate (sched_yield + syscall) ~1.5% inside gaps, ~0 overall.
+- Suspect for first-visit pauses (code reading, not yet measured): the game's Mono JIT calls ARM cacheflush after
+  writing code (threads.rs 0xf0002 -> dynarec::invalidate). When the range overlaps translated blocks (e.g. Mono
+  patching a call site after compiling a method) drop_blocks runs runtime::stop_world (parks every guest thread,
+  spinning with yield until each reaches a safe point) + membarrier, and the block is translated again. Each new
+  block also does a membarrier SYNC_CORE (IPI to every core) under the cache write lock. named1 had "new-code sync
+  IPI 2.2% vs 0.0" and "Mono JIT 4.1% vs 0.1" inside long gaps.
+  Predicted: early1 shows invalidate/stop_world/membarrier/translate as a large share of the +7/+10/+75 s pauses
+  (confirms); if those pauses are >85% game code (libunity/mono/C#) with the bridge share near 25%, ruled out.
+- early1 (16 MB build; /tmp/early/early-trace.sh = cw-trace-play.sh with trace + call-graph profile starting at READY
+  for 95 s, BLOCKMAP on; 118.3 fps, >50/>100/>250 = 17/5/1, worst 320 ms). UnityMain, 10 gaps >45 ms (108, 75, 117,
+  325, 133, 67, 192, 100, 133, 75). Bridge/host share inside them 48.1% vs ~25% overall (block-map file writes, a
+  test-only cost, are ~6% of it: sys_write 5.8% inside vs 0.1%).
+  Kernel by syscall inside gaps vs overall: membarrier 7.3% vs 0.1 | write (block map) 5.8 vs 0.1 | futex 2.2 vs 4.3 |
+  sched_yield 1.0 vs 0.0. Per gap (ms | blocks translated by any thread | membarrier | invalidate/stop_world | Unicorn
+  translating): 108|1922|9.0|7.6|0.9  117|1919|7.9|2.2|7.0  325|4745|13.7|15.9|4.1  133|990|8.1|3.5|1.5
+  192|759|2.9|2.6|8.1  100|406|3.5|8.2|11.7  133|1223|7.1|6.3|1.2  67|172|0|1.2|20.0  (75 ms gaps: 28/303 blocks).
+  => CONFIRMED (three sources agree: code path, per-gap block counts, syscall profile): the long first-visit pauses
+  are translation bursts, and the bridge's per-translation costs are a big part: (1) one membarrier SYNC_CORE per
+  new block (block_for -> sync_other_cores, an IPI to every core running the game, under the cache write lock),
+  (2) stop_world for every cacheflush that touches translated code, (3) Unicorn translating fallback instructions.
+- Block map: 270132 translations of 253731 distinct pcs: 16393 blocks dropped and retranslated (6%), 16398 of them to
+  the same host size. Fits Mono's mono_arch_patch_callsite (mini-arm.c): after compiling a method it rewrites the
+  caller's BL (trampoline -> method) and flushes those 4 bytes -> invalidate -> stop_world + drop + membarrier, then
+  the block is translated again (another membarrier). So up to ~16k stop-the-worlds per run.
+- stats1 (debug.arm32bridge.stats=1, scripted menu run, no code change; 118.1 fps, >50/>100/>250 = 31/4/0, worst
+  223 ms): "[jit] 240491 blocks (30294 dropped after code changes), 4755456 fallbacks at 123 sites"; "parallel:
+  301084 core syncs after new code, 30299 stops of every thread". So in ~4 min: ~30k stop-the-worlds (one per
+  cacheflush that hit translated code) and ~300k membarriers (one per new block + one per drop).
+- Fallback sites (llvm-mc): ~4.6M of the 4.75M are NEON instructions the translator does not handle:
+  shift by immediate (VSHR.S32 #31 alone 3.1M at 6 sites; VSHL.I32/I64 #n, VSHR.U32/U16, VSRA.U16) and "three
+  registers of different lengths" (VMLAL.U8, VADDHN.I16; 4 x 44k). neon.rs neon_shift only does VSHLL/VMOVL; neon_data
+  has no branch for the different-lengths group. Also LDM r12 with SP+PC (57k) and one Thumb IT-block word (27k).
+- Fallback time (early1, all threads, analysis /tmp/early/fb.py): 7.0 of 303 CPU-s (2.3%), 1.1 CPU-s of it Unicorn
+  translating. arm32-guest-103 (Unity job workers) 4.2% of its time, -102 4.0%, UnityMain 1.4%, render 0.4%.
+- Sub-agent review t2 (codex gpt-6.1-sol high, read-only, 2026-10-14) of the "drop without stop_world" idea:
+  * VERDICT: unsafe as proposed. A thread can load a jump-table entry (engine.rs:291 / generated lookup thumb.rs:84)
+    or hold a block address, get delayed, and enter the old block after cacheflush returned; guest ISB only syncs
+    host instructions, still the old guest code. Dropped blocks' own outgoing sites stay in other targets'
+    incoming/pending lists and get re-patched. Unicorn fallbacks check the code generation before emu_start only.
+    Checker mode turns off parallel + linking, so it cannot catch these races. stop_world supplies the quiescence.
+  * Measurement corrections: 48.1% host share inside gaps vs 23.2% overall (not ~25); it counts all host/kernel
+    work (incl. useful guest-requested libc work and the block-map writes, 5.8 points). It is CPU samples (2261 =
+    1.13 CPU-s across 1.325 s of gaps), not elapsed time; membarrier and invalidate overlap. Block map: 16,401
+    retranslations of 16,393 pcs; BL patching is plausible, not shown (earlier notes also saw literal patches).
+    Stop count comes from STOPS: 30,299 in stats1. Frame query uses SurfaceFlinger display frames.
+  * Safer ideas: batch new blocks, one sync, then publish (must cover cache.blocks too); one cache flush per block
+    (outgoing links resolved before place's flush, engine.rs:124/605); pre-sized vectors/maps; fixed_range takes a
+    second RwLock + scan per block; Unicorn: count-limited fallback adds an inline hook, >64 changes behind flushes
+    its whole cache (runtime.rs:1524); membarrier result unchecked (engine.rs:385).
+  * Next it suggests: log cacheflush ranges + stops + whether the guest words really changed; try batching while
+    keeping stop_world; parallel stress tests before any retirement change.
+
+## Owner chose A + B + C + D (2026-10-14)
+- B (built): debug.arm32bridge.flushlog=<file> / ARM32_FLUSHLOG keeps a copy of each made block's guest bytes and logs
+  every cacheflush: "time start end blocks-hit changed unchanged [first changed word: address old new]". Off = no cost.
+- C (built): block_for links exits to existing blocks (and itself) in the copy before placing it, so one
+  __clear_cache covers the block (was one more 4-byte flush per linked exit); Asm vectors start with room for a
+  typical block; blocks/starts sized 2^19 and pending/incoming 2^16 up front (no rehash of a 270k table under the
+  write lock). Behaviour otherwise unchanged (same incoming/pending bookkeeping, same sync point).
+- A: sub-agent t3 (Opus, high) adds NEON shift-by-immediate + three-registers-different-lengths to neon.rs.
+- D design (for review before building): consumer-side ISB instead of one membarrier per new block.
+  ARM rule: after the writer's IC IVAU + DSB complete, another PE must execute a context-synchronizing event (ISB,
+  exception return) before running the new code. Today the writer forces that on every core with membarrier
+  SYNC_CORE per block. Proposal:
+  1. A new block is placed, flushed (__clear_cache = DC CVAU, DSB, IC IVAU, DSB, ISB on the writer's core) and put in
+     cache.blocks, but marked unpublished: no jump-table entry, pending exits of other blocks to it NOT patched yet.
+     Its own exits to existing blocks are linked in its copy (C).
+  2. Any thread that gets a block from block_for (read or write path) and the block is unpublished executes `isb`
+     on its own core before entering it (it already holds/held the cache lock, so the writer's code + flush are
+     visible). A thread that migrates cores meanwhile passes an exception return (context synchronizing).
+  3. Lock-free paths (jump table in run()/table_block and the generated lookup, linked branches from published
+     blocks) only ever lead to published code. Published = placed before a membarrier SYNC_CORE that completed.
+  4. Publishing a batch (under the write lock): one sync_other_cores(), then for every unpublished block still in
+     cache.blocks: set_jump, patch pending sites waiting for it, incoming bookkeeping. Triggered when 32 blocks are
+     unpublished, or when block_for finds an unpublished block whose batch started > 0.5 ms ago (so a burst's
+     leftovers get onto the fast paths soon).
+  5. found() in block_for must not set_jump for an unpublished block. drop_blocks (stop_world, unchanged) also
+     removes dropped pcs from the unpublished list. Linking off (checker): no lock-free paths, so new blocks never
+     need the global sync, only the consumer ISB.
+  Expected: membarriers per new block 1 -> ~1/32 during bursts (~300k -> ~10k per run); cost: unpublished blocks
+  are reached through block_for (read lock + ISB) for up to 0.5 ms / 32 translations.
+- B + C alone (before A touched neon.rs; build copied to /tmp/bc): phone self-test six modes 0 failures, CHECK=all
+  2,796,513 blocks, 0 differences. PC + phone builds clean, no warnings.
+- Review t4 (codex gpt-6.1-sol high, read-only) of D: ARM argument SOUND (checked the NDK __clear_cache disassembly:
+  DC/IC + DSB + ISB; lock handoff + consumer ISB valid; migration passes an exception return), including C's links
+  from a new block to an older unpublished one, as long as the WHOLE unpublished batch is published together.
+  No bug found in C. Required for D: (1) sync_other_cores must return success; never publish after a failed or
+  unregistered membarrier (today the result is ignored, engine.rs:385). (2) PARALLEL=0 still links but the sync is
+  a no-op today and taking the GIL with try_lock needs no kernel entry: publication must sync there too. (3) Don't
+  take the write lock while the read guard from found(&read_cache()) is alive (deadlock); drop it first.
+  (4) The 0.5 ms trigger is opportunistic (a self-loop in linked unpublished code never comes back); also check age
+  on new-block insertion. Simplest form: one unconditional ISB at the end of every block_for (before the enter
+  glue), unpublished set + bounded batch, linking-off skips publication entirely. Drops: keep stop_world, remove
+  dropped pcs from the unpublished set. Tests: six modes plus ARM32_LINK=0 with parallel threads on.
+- A + B + C safety round (job 011): PC build/self-test 0 failures; phone six modes 0 failures (CHECK=all 2,807,477
+  blocks, 0 differences, now including the new NEON forms); pc-check abc: PC1 119.8 fps saves unchanged, PC2 120.0
+  fps (only the 0-byte stgs.atgsave, pc2.atgsave untouched), no crash lines. Card Wars reinstalled.
+- Counter run abc-stats: "240842 blocks (30318 dropped), 81920 fallbacks at 7 sites" (was 4,755,456 at 123 sites);
+  301483 core syncs, 30323 stops (unchanged, as expected: D targets those). Left: LDM r12 with SP+PC (55k, Mono
+  context restore), one Thumb word inside an IT block (26k), VMUL.I32 by scalar (Thumb, 244), LDM sp with SP+PC (24).
+- A + B + C play runs (scripted menu path, no tracing; play-summary fps | game ms | >50/>100/>250 | worst):
+    abc-t1 119.2 | 8.35 | 10/3/0 | 181 ms;  abc-t2 119.3 | 8.34 | 9/2/0 | 191 ms
+  vs 16 MB table alone: jt21-t1 118.2 | 8.43 | 30/3/0 | 226;  jt21-t2 118.1 | 8.44 | 31/3/0 | 210 (jt16 controls 31-35).
+  => KEPT: seconds with a frame >50 ms ~30 -> ~10, worst pause ~210-226 -> 181-191 ms, fps +1. (Owner rule: two runs
+  pointing the same way is enough for a speed change.)

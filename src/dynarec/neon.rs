@@ -82,6 +82,8 @@ impl Translator {
             self.neon_modified_immediate(word)
         } else if bit(4) == 1 {
             self.neon_shift(word)
+        } else if bit(6) == 0 && (word >> 20) & 3 != 3 {
+            self.neon_three_different(word)
         } else if bit(6) == 1 && (word >> 20) & 3 != 3 {
             self.neon_by_scalar(word)
         } else if (word >> 20) & 3 == 3 && bit(24) == 0 {
@@ -172,13 +174,59 @@ impl Translator {
         Ok(Flow::Next)
     }
 
-    /// Two registers and a shift amount: VSHLL / VMOVL (more can follow).
+    /// Two registers and a shift amount: VSHR, VSRA, VRSHR, VRSRA, VSRI, VSHL, VSLI,
+    /// VQSHL/VQSHLU, the narrowing shifts, VSHLL / VMOVL and VCVT (fixed point).
     fn neon_shift(&mut self, word: u32) -> Result<Flow> {
         let bit = |i: u32| (word >> i) & 1;
         let d = (bit(22) << 4) | ((word >> 12) & 0xF);
         let m = (bit(5) << 4) | (word & 0xF);
         let imm6 = (word >> 16) & 0x3F;
-        if (word >> 8) & 0xF == 0b1010 && bit(6) == 0 && bit(7) == 0 {
+        let (kind, u, long, b) = ((word >> 8) & 0xF, bit(24), bit(7) == 1, bit(6) == 1);
+        // ARM64 immh:immb is L:imm6 for every form: both store 2*esize - shift for right
+        // shifts and esize + shift for left shifts (esize the narrow size when narrowing).
+        let imm7 = (bit(7) << 6) | imm6;
+        // U and the ARM64 opcode go in the instruction; U means the same in both.
+        let op = |opcode: u32| (u << 29) | (opcode << 11);
+        if kind <= 0b0111 {
+            // ARM64 opcode is A << 1: SSHR/USHR, SSRA, SRSHR, SRSRA, SRI, SHL/SLI, SQSHLU, SQSHL/UQSHL.
+            if (u == 0 && (kind == 0b0100 || kind == 0b0110)) || (b && (d | m) & 1 == 1) {
+                return Err(()); // VSRI and VQSHLU are U = 1 only; odd Q registers
+            }
+            let accumulate = matches!(kind, 0b0001 | 0b0011 | 0b0100) || (kind == 0b0101 && u == 1);
+            let vm = self.vector_read(b, m, V1);
+            let target = Self::vector_target(b, d);
+            if accumulate && !b {
+                let vd = self.vector_read(false, d, V0);
+                if vd != V0 {
+                    self.a.mov_vector(V0, vd);
+                }
+            }
+            self.a.shift_immediate(op(kind << 1), b, imm7, target, vm);
+            self.vector_write(b, d, target);
+            return Ok(Flow::Next);
+        }
+        if kind == 0b1000 || kind == 0b1001 {
+            // Narrowing: SHRN/RSHRN (U 0) or SQSHRUN/SQRSHRUN (U 1); SQSHRN/UQSHRN, SQRSHRN/UQRSHRN.
+            if long || m & 1 == 1 {
+                return Err(());
+            }
+            self.a.shift_immediate(op(0b10000 | ((kind & 1) << 1) | b as u32), false, imm7, V0, m / 2);
+            self.vector_write(false, d, V0);
+            return Ok(Flow::Next);
+        }
+        if kind >= 0b1110 {
+            // VCVT between F32 and fixed point (imm6 = 64 - fraction bits): SCVTF/UCVTF, FCVTZS/FCVTZU.
+            if long || imm6 < 32 || (b && (d | m) & 1 == 1) {
+                return Err(());
+            }
+            self.fp_mode(true);
+            let vm = self.vector_read(b, m, V1);
+            let target = Self::vector_target(b, d);
+            self.a.shift_immediate(op(if kind == 0b1110 { 0b11100 } else { 0b11111 }), b, imm7, target, vm);
+            self.vector_write(b, d, target);
+            return Ok(Flow::Next);
+        }
+        if kind == 0b1010 && !b && !long {
             // VSHLL #shift (shift < element size) / VMOVL (shift 0): signedness is U.
             if d & 1 == 1 {
                 return Err(());
@@ -438,6 +486,35 @@ impl Translator {
         Ok(Flow::Next)
     }
 
+    /// Three registers of different lengths: VADDL/VADDW, VSUBL/VSUBW, VADDHN/VRADDHN,
+    /// VSUBHN/VRSUBHN, VABAL, VABDL, VMLAL/VMLSL, VQDMLAL/VQDMLSL, VMULL (and .P8), VQDMULL.
+    /// ARM64's opcode and U are ARMv7's A and U; the 64-bit forms use the low halves.
+    fn neon_three_different(&mut self, word: u32) -> Result<Flow> {
+        let bit = |i: u32| (word >> i) & 1;
+        let d = (bit(22) << 4) | ((word >> 12) & 0xF);
+        let n = (bit(7) << 4) | ((word >> 16) & 0xF);
+        let m = (bit(5) << 4) | (word & 0xF);
+        let (size, kind, u) = ((word >> 20) & 3, (word >> 8) & 0xF, bit(24));
+        // (Vd is Q, Vn is Q, Vm is Q)
+        let (wide_d, wide_n, wide_m) = match kind {
+            0b0001 | 0b0011 => (true, true, false),   // VADDW / VSUBW
+            0b0100 | 0b0110 => (false, true, true),   // VADDHN / VSUBHN (and rounding)
+            0b1001 | 0b1011 | 0b1101 if u == 1 || size == 0 => return Err(()), // VQDMLAL / VQDMLSL / VQDMULL
+            0b1110 if u == 1 || size != 0 => return Err(()), // VMULL.P8 only (P64 is ARMv8 crypto)
+            0b1111 => return Err(()),
+            _ => (true, false, false),
+        };
+        if (wide_d && d & 1 == 1) || (wide_n && n & 1 == 1) || (wide_m && m & 1 == 1) {
+            return Err(());
+        }
+        let vn = self.vector_read(wide_n, n, V1);
+        let vm = self.vector_read(wide_m, m, V2);
+        let target = Self::vector_target(wide_d, d);
+        self.a.simd3(0x0E20_0000 | (u << 29) | (kind << 12), false, size, target, vn, vm);
+        self.vector_write(wide_d, d, target);
+        Ok(Flow::Next)
+    }
+
     /// Two registers and a scalar: VMUL, VMLA, VMLS (.F32) by an element.
     fn neon_by_scalar(&mut self, word: u32) -> Result<Flow> {
         let bit = |i: u32| (word >> i) & 1;
@@ -606,4 +683,79 @@ fn expand_simd_immediate(op: u32, cmode: u32, imm8: u32) -> Option<u64> {
             _ => return None,
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Translator;
+    use crate::dynarec::emit::Asm;
+    use crate::mem::GuestMem;
+
+    /// Shifts by immediate and three-different-length forms, translated; both sides
+    /// checked against the NDK assembler (guest ARMv7, host ARM64).
+    #[test]
+    fn shift_and_long_translations() {
+        let cases: &[(u32, &[u32])] = &[
+            (0xF2A1_2054, &[0x4F21_0441]),                           // vshr.s32 q1, q2, #31
+            (0xF2A0_3595, &[0x5E18_0451, 0x5F60_5630, 0x6E18_0601]), // vshl.i64 d3, d5, #32
+            (0xF39D_4116, &[0x4EA2_1C50, 0x2F1D_1470, 0x6E08_0602]), // vsra.u16 d4, d6, #3
+            (0xF3A0_0452, &[0x6F20_4420]),                           // vsri.32 q0, q1, #32
+            (0xF3BF_45D6, &[0x6F7F_5462]),                           // vsli.64 q2, q3, #63
+            (0xF38F_1612, &[0x2F0F_6430, 0x6E18_0600]),              // vqshlu.s8 d1, d2, #7
+            (0xF385_0791, &[0x5E18_0411, 0x7F45_7630, 0x6E08_0600]), // vqshl.u64 d0, d1, #5
+            (0xF280_2292, &[0x5F40_2430, 0x6E08_0601]),              // vrshr.s64 d2, d2, #64
+            (0xF388_835A, &[0x6F08_34A4]),                           // vrsra.u8 q4, q5, #8
+            (0xF288_1814, &[0x0F08_8450, 0x6E18_0600]),              // vshrn.i16 d1, q2, #8
+            (0xF2A0_0852, &[0x0F20_8C30, 0x6E08_0600]),              // vrshrn.i64 d0, q1, #32
+            (0xF390_3818, &[0x2F10_8490, 0x6E18_0601]),              // vqshrun.s32 d3, q4, #16
+            (0xF38F_2850, &[0x2F0F_8C10, 0x6E08_0601]),              // vqrshrun.s16 d2, q0, #1
+            (0xF39D_2910, &[0x2F1D_9410, 0x6E08_0601]),              // vqshrn.u32 d2, q0, #3
+            (0xF2AC_595C, &[0x0F2C_9CD0, 0x6E18_0602]),              // vqrshrn.s64 d5, q6, #20
+            (0xF2B0_0F52, &[0x4F30_FC20]),                           // vcvt.s32.f32 q0, q1, #16
+            (0xF3BF_1E13, &[0x5E18_0431, 0x2F3F_E630, 0x6E18_0600]), // vcvt.f32.u32 d1, d3, #1
+            (0xF2E5_0572, &[0x4F25_5528]),                           // vshl.i32 q8, q9, #5
+            (0xF384_2805, &[0x5E18_0452, 0x2E32_8041]),              // vmlal.u8 q1, d4, d5
+            (0xF282_0404, &[0x0E22_4030, 0x6E08_0600]),              // vaddhn.i16 d0, q1, q2
+            (0xF292_0103, &[0x5E18_0432, 0x0E72_1020]),              // vaddw.s16 q0, q1, d3
+            (0xF3A0_4201, &[0x5E18_0412, 0x2EB2_2002]),              // vsubl.u32 q2, d0, d1
+            (0xF3A4_1406, &[0x2EA3_4050, 0x6E18_0600]),              // vraddhn.i64 d1, q2, q3
+            (0xF287_6509, &[0x5E18_0471, 0x5E18_0492, 0x0E32_5223]), // vabal.s8 q3, d7, d9
+            (0xF392_8703, &[0x5E18_0432, 0x2E72_7024]),              // vabdl.u16 q4, d2, d3
+            (0xF2AA_AA0B, &[0x5E18_04B2, 0x0EB2_A0A5]),              // vmlsl.s32 q5, d10, d11
+            (0xF291_C902, &[0x5E18_0411, 0x0E61_9226]),              // vqdmlal.s16 q6, d1, d2
+            (0xF2A3_EB04, &[0x5E18_0431, 0x0EA2_B227]),              // vqdmlsl.s32 q7, d3, d4
+            (0xF295_0D06, &[0x5E18_0451, 0x0E63_D220]),              // vqdmull.s16 q0, d5, d6
+            (0xF281_0E02, &[0x5E18_0411, 0x0E21_E220]),              // vmull.p8 q0, d1, d2
+            (0xF2EE_ECAF, &[0x5E18_05F2, 0x0EB2_C1EF]),              // vmull.s32 q15, d30, d31
+            (0xF298_360A, &[0x0E65_6090, 0x6E18_0601]),              // vsubhn.i32 d3, q4, q5
+            (0xF380_2602, &[0x2E21_6010, 0x6E08_0601]),              // vrsubhn.i16 d2, q0, q1
+            (0xF382_2302, &[0x2E21_3021]),                           // vsubw.u8 q1, q1, d2
+            (0xF280_0000, &[0x0E20_0000]),                           // vaddl.s8 q0, d0, d0
+        ];
+        // Undefined encodings stay with the fallback.
+        let undefined = [
+            0xF2A1_3054, // vshr q with an odd Vd
+            0xF2A0_0452, // vsri with U = 0
+            0xF288_1815, // vshrn from an odd Vm
+            0xF288_1894, // vshrn with L = 1
+            0xF2B0_0F52 & !(0x20 << 16), // vcvt with imm6 < 32
+            0xF384_3805, // vmlal into an odd Vd
+            0xF283_0404, // vaddhn from an odd Vn
+            0xF285_0D06, // vqdmull.s8
+            0xF391_C902, // vqdmlal with U = 1
+            0xF381_0E02, // vmull.p8 with U = 1
+            0xF2A1_0E02, // vmull.p64 (ARMv8 crypto)
+        ];
+        let mem = GuestMem::reserve();
+        let translate = |word: u32| {
+            let mut t = Translator { a: Asm::new(), mem, pc: 0, size: 4, count: 0, in_it: false, thumb: false, neon_fp: true };
+            t.neon_data(word).map(|_| t.a.code)
+        };
+        for &(word, host) in cases {
+            assert_eq!(translate(word), Ok(host.to_vec()), "{word:#010x}");
+        }
+        for word in undefined {
+            assert!(translate(word).is_err(), "{word:#010x}");
+        }
+    }
 }
