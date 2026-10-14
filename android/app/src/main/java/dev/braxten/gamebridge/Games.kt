@@ -1,19 +1,22 @@
 package dev.braxten.gamebridge
 
 import android.content.Context
+import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Canvas
-import android.net.Uri
+import android.graphics.drawable.Drawable
 import android.os.Environment
-import android.provider.DocumentsContract
-import android.provider.OpenableColumns
+import android.os.storage.StorageManager
 import java.io.File
 import java.util.zip.ZipFile
 
-/** A game APK (in Downloads or added by the user) that has 32-bit ARM code and no 64-bit code. */
+/**
+ * A 32-bit game: an APK found on the phone with 32-bit ARM code and no 64-bit code, or an
+ * already converted game that is installed (then `file` is null when no APK of it was found).
+ */
 class Game(
-    val file: File,
+    val file: File?,
     /** Where it was found, shown under its name. */
     val place: String,
     val label: String,
@@ -23,66 +26,70 @@ class Game(
 )
 
 object Games {
-    fun downloads(): File = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-
-    /** Paths of games the user added with "Add a game", kept between runs. */
-    private fun added(context: Context) = context.getSharedPreferences("games", Context.MODE_PRIVATE)
-
-    /** The 32-bit-only games in Downloads and the added ones, by name. Only each APK's file list and manifest are read. */
-    fun scan(context: Context): List<Game> {
-        val downloaded = downloads().listFiles { file -> file.isFile && file.name.endsWith(".apk", ignoreCase = true) }
-            .orEmpty().sortedBy { it.name.lowercase() }.map { it to "Downloads" }
-        // An added file that was moved or deleted just stops showing.
-        val picked = added(context).getStringSet("paths", emptySet()).orEmpty()
-            .map(::File).filter { it.isFile }.sortedBy { it.name.lowercase() }.map { it to "Added by you" }
-        // The same game and version found twice shows once.
-        return (downloaded + picked)
-            .mapNotNull { (file, place) -> runCatching { read(context, file, place) }.getOrNull() }
-            .distinctBy { it.packageName to it.versionCode }
-            .sortedBy { it.label.lowercase() }
-    }
+    /** At the top of a drive, "Android" holds other apps' private files, never games to convert. */
+    private val skipped = setOf("Android")
 
     /**
-     * Adds a game the user picked in the phone's file picker. Files on the phone or an SD card are
-     * used where they are; files from elsewhere (cloud drives, other apps) are copied into this app first.
-     * Returns null when added, or a plain-language reason it wasn't.
+     * Every 32-bit-only game APK in the phone's storage and on SD cards, plus converted games that
+     * are installed without an APK on the phone, by name. Only each APK's file list and manifest are read.
      */
-    fun add(context: Context, uri: Uri): String? {
-        val file = localFile(uri) ?: copyIn(context, uri) ?: return "Couldn't read that file."
-        if (!file.name.endsWith(".apk", ignoreCase = true) && !isApk(file)) return "That file isn't an app (APK)."
-        if (runCatching { read(context, file, "") }.getOrNull() == null) {
-            if (file.startsWith(context.filesDir)) file.delete()
-            return "That app has no 32-bit-only game code, so it doesn't need Game Bridge."
+    fun scan(context: Context): List<Game> {
+        val found = storageRoots(context).flatMap { (root, name) ->
+            apks(root).sortedBy { it.path.lowercase() }.map { it to place(root, name, it) }
         }
-        val paths = added(context).getStringSet("paths", emptySet()).orEmpty() + file.path
-        added(context).edit().putStringSet("paths", paths).apply()
-        return null
+        // The same game and version found twice shows once.
+        val games = found
+            .mapNotNull { (file, place) -> runCatching { read(context, file, place) }.getOrNull() }
+            .distinctBy { it.packageName to it.versionCode }
+        val withFiles = games.map { it.packageName }.toSet()
+        return (games + installed(context).filter { it.packageName !in withFiles }).sortedBy { it.label.lowercase() }
     }
 
-    /** The real path of a picked file in shared storage (this app may read all of it). */
-    private fun localFile(uri: Uri): File? {
-        val id = runCatching { DocumentsContract.getDocumentId(uri) }.getOrNull() ?: return null
-        // The Downloads shortcut sometimes names the file directly.
-        if (uri.authority == "com.android.providers.downloads.documents" && id.startsWith("raw:")) {
-            return File(id.removePrefix("raw:")).takeIf { it.isFile && it.canRead() }
-        }
-        if (uri.authority != "com.android.externalstorage.documents") return null
-        val (volume, path) = id.split(':', limit = 2).takeIf { it.size == 2 } ?: return null
-        val root = if (volume == "primary") Environment.getExternalStorageDirectory().path else "/storage/$volume"
-        return File(root, path).takeIf { it.isFile && it.canRead() }
+    /** The phone's own storage ("Phone"), then each SD card or USB drive. */
+    private fun storageRoots(context: Context): List<Pair<File, String>> {
+        val phone = Environment.getExternalStorageDirectory()
+        val others = context.getSystemService(StorageManager::class.java).storageVolumes
+            .mapNotNull { volume -> volume.directory?.takeIf { it != phone }?.let { it to (volume.getDescription(context) ?: it.name) } }
+        return listOf(phone to "Phone") + others
     }
 
-    private fun copyIn(context: Context, uri: Uri): File? = runCatching {
-        val resolver = context.contentResolver
-        val name = resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
-            if (cursor.moveToFirst()) cursor.getString(0) else null
-        }?.replace('/', '_') ?: "game.apk"
-        val target = File(File(context.filesDir, "added").apply { mkdirs() }, name)
-        resolver.openInputStream(uri)!!.use { input -> target.outputStream().use { input.copyTo(it, 1 shl 20) } }
-        target
-    }.getOrNull()
+    private fun apks(folder: File): List<File> {
+        val entries = folder.listFiles() ?: return emptyList()
+        return entries.flatMap { entry ->
+            when {
+                entry.name.startsWith('.') -> emptyList()
+                entry.isDirectory -> if (entry.name in skipped && isRoot(folder)) emptyList() else apks(entry)
+                entry.name.endsWith(".apk", ignoreCase = true) -> listOf(entry)
+                else -> emptyList()
+            }
+        }
+    }
 
-    private fun isApk(file: File): Boolean = runCatching { ZipFile(file).use { it.getEntry("AndroidManifest.xml") != null } }.getOrDefault(false)
+    private fun isRoot(folder: File) = folder == Environment.getExternalStorageDirectory() ||
+        folder.parentFile?.path == "/storage"
+
+    /** "Download", "Documents/Games", or the drive's name for files on an SD card. */
+    private fun place(root: File, rootName: String, file: File): String {
+        val folder = file.parentFile!!.relativeTo(root).path
+        return when {
+            rootName == "Phone" && folder.isEmpty() -> "Phone storage"
+            rootName == "Phone" -> folder
+            folder.isEmpty() -> rootName
+            else -> "$rootName/$folder"
+        }
+    }
+
+    /** Converted games that are installed, shown with their installed name and icon. */
+    private fun installed(context: Context): List<Game> {
+        val packages = context.packageManager
+        return packages.getInstalledApplications(PackageManager.ApplicationInfoFlags.of(0))
+            .filter { isConverted(it) && packages.getLaunchIntentForPackage(it.packageName) != null }
+            .map { application ->
+                val info = packages.getPackageInfo(application.packageName, PackageManager.PackageInfoFlags.of(0))
+                Game(null, "Installed", application.loadLabel(packages).toString(), application.packageName,
+                    info.longVersionCode, iconBitmap(runCatching { application.loadIcon(packages) }.getOrNull()))
+            }
+    }
 
     private fun read(context: Context, file: File, place: String): Game? {
         if (!isThirtyTwoBitOnly(file)) return null
@@ -91,14 +98,16 @@ object Games {
         val application = info.applicationInfo ?: return null
         application.sourceDir = file.path
         application.publicSourceDir = file.path
-        val icon = runCatching { application.loadIcon(packages) }.getOrNull()?.let { drawable ->
-            val size = 192
-            Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888).also { bitmap ->
-                drawable.setBounds(0, 0, size, size)
-                drawable.draw(Canvas(bitmap))
-            }
-        }
+        val icon = iconBitmap(runCatching { application.loadIcon(packages) }.getOrNull())
         return Game(file, place, application.loadLabel(packages).toString(), info.packageName, info.longVersionCode, icon)
+    }
+
+    private fun iconBitmap(drawable: Drawable?): Bitmap? = drawable?.let {
+        val size = 192
+        Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888).also { bitmap ->
+            it.setBounds(0, 0, size, size)
+            it.draw(Canvas(bitmap))
+        }
     }
 
     private fun isThirtyTwoBitOnly(file: File): Boolean = ZipFile(file).use { zip ->
@@ -114,7 +123,9 @@ object Games {
 
     /** True when a converted copy of this game is installed (its library folder holds a kept 32-bit original). */
     fun isConverted(context: Context, packageName: String): Boolean = runCatching {
-        val application = context.packageManager.getApplicationInfo(packageName, PackageManager.ApplicationInfoFlags.of(0))
-        File(application.nativeLibraryDir).list()?.any { it.endsWith("-arm32.so") } == true
+        isConverted(context.packageManager.getApplicationInfo(packageName, PackageManager.ApplicationInfoFlags.of(0)))
     }.getOrDefault(false)
+
+    private fun isConverted(application: ApplicationInfo): Boolean =
+        File(application.nativeLibraryDir ?: return false).list()?.any { it.endsWith("-arm32.so") } == true
 }

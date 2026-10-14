@@ -2,8 +2,6 @@ package dev.braxten.gamebridge
 
 import android.os.Bundle
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.Image
@@ -12,6 +10,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -23,6 +22,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -41,10 +41,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.drawBehind
-import androidx.compose.ui.geometry.CornerRadius
-import androidx.compose.ui.graphics.PathEffect
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.text.font.FontWeight
@@ -52,8 +48,6 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.compose.LifecycleEventEffect
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -90,16 +84,18 @@ class MainActivity : ComponentActivity() {
         val scope = rememberCoroutineScope()
         var games by remember { mutableStateOf<List<Game>?>(null) }
         var problem by remember { mutableStateOf<String?>(null) }
-        // What happened to the last game picked with "Add a game" (null: nothing to say).
-        var addNote by remember { mutableStateOf<String?>(null) }
+        // True while the phone is being searched (the refresh button waits).
+        var searching by remember { mutableStateOf(false) }
         val states = Conversions.states
         val busy = Conversions.busy
 
         fun refresh() {
+            if (searching) return
+            searching = true
             scope.launch {
                 val result = withContext(Dispatchers.IO) {
                     if (!Root.available()) return@withContext null to
-                        "Game Bridge needs root (Magisk) to read Downloads and install games. Allow it in Magisk, then reopen."
+                        "Game Bridge needs root (Magisk) to find games and install them. Allow it in Magisk, then reopen."
                     Root.grantFileAccess(packageName)
                     val found = Games.scan(this@MainActivity)
                     for (game in found) {
@@ -113,55 +109,43 @@ class MainActivity : ComponentActivity() {
                 }
                 games = result.first
                 problem = result.second
+                searching = false
             }
         }
 
         fun convert(game: Game) = Conversions.convert(this@MainActivity, game)
 
-        val pickGame = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-            if (uri == null) return@rememberLauncherForActivityResult
-            addNote = "Adding…"
-            scope.launch {
-                addNote = withContext(Dispatchers.IO) { Games.add(this@MainActivity, uri) }
-                refresh()
-            }
-        }
-
-        LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { refresh() }
+        // Searching the whole phone takes a moment, so only when the app opens and on the refresh button.
         LaunchedEffect(Unit) { refresh() }
 
         Column(Modifier.fillMaxSize().background(Background).safeDrawingPadding()) {
+            Row(Modifier.fillMaxWidth().padding(end = 14.dp), verticalAlignment = Alignment.Bottom) {
+                Text(
+                    "Game Bridge",
+                    color = Color(0xFFE8E8EE),
+                    fontSize = 22.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.weight(1f).padding(start = 18.dp, top = 22.dp, bottom = 4.dp),
+                )
+                RefreshButton(enabled = !searching && problem == null, onClick = ::refresh)
+            }
             Text(
-                "Game Bridge",
-                color = Color(0xFFE8E8EE),
-                fontSize = 22.sp,
-                fontWeight = FontWeight.SemiBold,
-                modifier = Modifier.padding(start = 18.dp, top = 22.dp, bottom = 4.dp),
-            )
-            Text(
-                "32-bit games",
+                "32-bit games on this phone",
                 color = Muted,
                 fontSize = 13.sp,
                 modifier = Modifier.padding(start = 18.dp, bottom = 14.dp),
             )
-            if (problem == null) {
-                AddButton(enabled = addNote != "Adding…") {
-                    // Some file apps don't label APKs as apps, so plain files are offered too.
-                    pickGame.launch(arrayOf("application/vnd.android.package-archive", "application/octet-stream"))
-                }
-                addNote?.let { Message(it) }
-            }
             when {
                 problem != null -> Message(problem!!)
                 games == null -> Message("Looking for games…")
-                games!!.isEmpty() -> Message("No 32-bit games yet. Download a game's APK, or add one from anywhere above.")
+                games!!.isEmpty() -> Message("No 32-bit games on this phone. Download a game's APK, then tap ↻.")
                 else -> LazyVerticalGrid(
                     columns = GridCells.Fixed(2),
                     contentPadding = PaddingValues(start = 12.dp, end = 12.dp, bottom = 24.dp),
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
-                    items(games!!, key = { it.file.path }) { game ->
+                    items(games!!, key = { it.file?.path ?: it.packageName }) { game ->
                         GameCard(game, states[game.packageName] ?: CardState.Ready, busy, onConvert = { convert(game) }, onOpen = {
                             packageManager.getLaunchIntentForPackage(game.packageName)?.let(::startActivity)
                         })
@@ -171,26 +155,14 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** The dashed "Add a game from anywhere…" button above the games. */
+    /** The round "search the phone again" button next to the title; dimmed while a search runs. */
     @Composable
-    private fun AddButton(enabled: Boolean, onClick: () -> Unit) {
+    private fun RefreshButton(enabled: Boolean, onClick: () -> Unit) {
         Box(
-            Modifier.padding(start = 12.dp, end = 12.dp, bottom = 14.dp).fillMaxWidth().height(44.dp)
-                .clip(RoundedCornerShape(14.dp))
-                .drawBehind {
-                    val width = 1.5.dp.toPx()
-                    drawRoundRect(
-                        color = Accent,
-                        topLeft = androidx.compose.ui.geometry.Offset(width / 2, width / 2),
-                        size = androidx.compose.ui.geometry.Size(size.width - width, size.height - width),
-                        cornerRadius = CornerRadius(14.dp.toPx() - width / 2),
-                        style = Stroke(width, pathEffect = PathEffect.dashPathEffect(floatArrayOf(4.dp.toPx(), 3.dp.toPx()))),
-                    )
-                }
-                .clickable(enabled = enabled, onClick = onClick),
+            Modifier.size(40.dp).clip(CircleShape).background(CardColor).clickable(enabled = enabled, onClick = onClick),
             contentAlignment = Alignment.Center,
         ) {
-            Text("+ Add a game from anywhere…", color = if (enabled) AccentText else Muted, fontSize = 14.sp)
+            Text("↻", color = if (enabled) AccentText else Muted, fontSize = 22.sp)
         }
     }
 
@@ -255,7 +227,8 @@ class MainActivity : ComponentActivity() {
             }
             // The same space on every card, so cards in a row stay the same height.
             Box(Modifier.padding(top = 6.dp).height(28.dp), contentAlignment = Alignment.Center) {
-                if (state == CardState.Done) {
+                // Needs the original game file, so not for games found only as installed.
+                if (state == CardState.Done && game.file != null) {
                     // For when the bridge has been updated: replaces the installed copy and keeps its saves.
                     Text(
                         "Convert again",

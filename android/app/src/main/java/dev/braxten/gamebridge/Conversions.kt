@@ -27,7 +27,7 @@ object Conversions {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
     fun convert(context: Context, game: Game) {
-        if (busy) return
+        if (busy || game.file == null) return
         busy = true
         val appContext = context.applicationContext
         scope.launch {

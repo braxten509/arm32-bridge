@@ -41,7 +41,7 @@ class Converter(private val context: Context, private val installer: Installer =
             report(Progress(0, "Starting"))
             val process = ProcessBuilder(
                 File(libraries, "libapkconvert.so").path,
-                game.file.path,
+                game.file!!.path,
                 unsigned.path,
                 "--bridge", File(libraries, "libarm32_bridge.so").path,
                 "--standin", File(libraries, "libstandin.so").path,
