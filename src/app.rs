@@ -82,6 +82,24 @@ static NATIVE_INIT_DONE: AtomicBool = AtomicBool::new(false);
 /// The guest's JavaVM, made on the first load.
 static GUEST_VM: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 
+pub fn guest_vm() -> u32 {
+    GUEST_VM.get().copied().unwrap_or(0)
+}
+
+/// Originals loaded so far: a NativeActivity game's library can arrive twice
+/// (Java's System.loadLibrary, then Android starting the activity).
+static LOADED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Loads `original` like a stand-in's JNI_OnLoad does, unless it is loaded already.
+pub fn load_original(vm: *mut JavaVM, env: *mut JNIEnv, original: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+    if LOADED.lock().unwrap().iter().any(|loaded| loaded == original) {
+        return Ok(());
+    }
+    let path = CString::new(original.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+    load(vm, env, path.as_ptr())
+}
+
 /// Called by a stand-in from its JNI_OnLoad: loads its 32-bit original at
 /// `original` (and the game libraries it needs) into the shared guest,
 /// connects its exported Java_* functions and runs its JNI_OnLoad. Returns
@@ -116,6 +134,9 @@ fn set_debug_environment() {
 fn load(vm: *mut JavaVM, env: *mut JNIEnv, original: *const c_char) -> Result<(), String> {
     let started = Instant::now();
     let path = PathBuf::from(unsafe { CStr::from_ptr(original) }.to_string_lossy().into_owned());
+    if LOADED.lock().unwrap().contains(&path) {
+        return Ok(());
+    }
     // debug.arm32bridge.trace=1 logs every phone function call (very slow).
     crate::runtime::init(crate::dynarec::property("debug.arm32bridge.trace").as_deref() == Some("1"));
     set_debug_environment();
@@ -137,6 +158,7 @@ fn load(vm: *mut JavaVM, env: *mut JNIEnv, original: *const c_char) -> Result<()
         (exports, library.export(uc, "JNI_OnLoad"))
     });
     crate::natives::register_exports(env, &exports);
+    LOADED.lock().unwrap().push(path.clone());
     let Some(onload) = onload else {
         return Ok(());
     };

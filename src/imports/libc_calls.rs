@@ -481,6 +481,17 @@ pub fn handler(name: &str) -> Option<Handler> {
             let size = a.u32();
             Ret::U32(crate::runtime::heap().calloc(count, size))
         }),
+        "malloc_usable_size" | "dlmalloc_usable_size" => handler!(|uc, a| Ret::U32(crate::runtime::heap().usable_size(a.u32()))),
+        // struct mallinfo is ten size_t fields, returned through a hidden pointer (r0). Free
+        // space inside the heap isn't tracked, so all of it counts as in use.
+        "mallinfo" => handler!(|uc, a| {
+            let out = a.u32();
+            let arena = crate::runtime::heap().arena_size();
+            mem().write_bytes(out, &[0; 40]);
+            mem().write_u32(out, arena);
+            mem().write_u32(out + 28, arena);
+            Ret::U32(out)
+        }),
         "realloc" => handler!(|uc, a| {
             let pointer = a.u32();
             let size = a.u32();
@@ -693,6 +704,48 @@ pub fn handler(name: &str) -> Option<Handler> {
             Ret::F32(value)
         }),
         "atoi" | "atol" => handler!(|uc, a| Ret::U32(unsafe { libc::atoll(host_c(a.u32())) } as i32 as u32)),
+        "atoll" => handler!(|uc, a| Ret::U64(unsafe { libc::atoll(host_c(a.u32())) } as u64)),
+        // Multibyte text is UTF-8 (bionic's only locale). Without `out`, only counts.
+        "mbstowcs" => handler!(|uc, a| {
+            let (out, text, count) = (a.u32(), a.u32(), a.u32());
+            let bytes = mem().c_str(text).to_bytes().to_vec();
+            let Ok(text) = std::str::from_utf8(&bytes) else {
+                set_errno(uc, libc::EILSEQ);
+                return Ret::U32(u32::MAX);
+            };
+            let characters: Vec<char> = text.chars().collect();
+            if out == 0 {
+                return Ret::U32(characters.len() as u32);
+            }
+            let written = characters.len().min(count as usize);
+            for (i, &c) in characters[..written].iter().enumerate() {
+                mem().write_u32(out + i as u32 * 4, c as u32);
+            }
+            if written < count as usize {
+                mem().write_u32(out + written as u32 * 4, 0);
+            }
+            Ret::U32(written as u32)
+        }),
+        // Wide printf: the wide format is formatted like printf's and written back as wchar_t.
+        // -1 when it doesn't fit (the caller isn't told the size it needs, unlike vsnprintf).
+        "vswprintf" => handler!(|uc, a| {
+            let (buffer, count, format, list) = (a.u32(), a.u32(), a.u32(), a.u32());
+            let format: String = guest_wide_text(format).into_iter().collect();
+            let mut list = VaList { pointer: list };
+            let text = printf::format_text(mem(), format.as_bytes(), &mut list);
+            let text: Vec<char> = String::from_utf8_lossy(&text).chars().collect();
+            if count == 0 {
+                set_errno(uc, libc::EOVERFLOW);
+                return Ret::U32(u32::MAX);
+            }
+            if text.len() >= count as usize {
+                write_wide_text(buffer, &text[..count as usize - 1]);
+                set_errno(uc, libc::EOVERFLOW);
+                return Ret::U32(u32::MAX);
+            }
+            write_wide_text(buffer, &text);
+            Ret::U32(text.len() as u32)
+        }),
         "atof" => handler!(|uc, a| Ret::F64(unsafe { libc::atof(host_c(a.u32())) })),
         "abs" | "labs" => handler!(|uc, a| Ret::U32(a.i32().wrapping_abs() as u32)),
         "llabs" | "imaxabs" => handler!(|uc, a| Ret::U64(a.i64().wrapping_abs() as u64)),
@@ -1477,6 +1530,25 @@ pub fn handler(name: &str) -> Option<Handler> {
             let pointer = host_times.as_ref().map_or(std::ptr::null(), |t| t as *const libc::utimbuf);
             checked(uc, unsafe { libc::utime(host_c(path), pointer) } as i64)
         }),
+        // utimes(path, times): two 32-bit timevals (access, then modification), or null for now.
+        "utimes" => handler!(|uc, a| {
+            let (path, times) = (a.u32(), a.u32());
+            let read = |at: u32| libc::timeval {
+                tv_sec: mem().read_u32(at) as i32 as libc::time_t,
+                tv_usec: mem().read_u32(at + 4) as i32 as libc::suseconds_t,
+            };
+            let host_times = (times != 0).then(|| [read(times), read(times + 8)]);
+            let pointer = host_times.as_ref().map_or(std::ptr::null(), |t| t.as_ptr());
+            checked(uc, unsafe { libc::utimes(host_c(path), pointer) } as i64)
+        }),
+        "fchmod" => handler!(|uc, a| {
+            let (fd, mode) = (a.i32(), a.u32());
+            checked(uc, unsafe { libc::fchmod(fd, mode as libc::mode_t) } as i64)
+        }),
+        "fchown" => handler!(|uc, a| {
+            let (fd, owner, group) = (a.i32(), a.u32(), a.u32());
+            checked(uc, unsafe { libc::fchown(fd, owner, group) } as i64)
+        }),
         "pathconf" => handler!(|uc, a| {
             let (path, name) = (a.u32(), a.u32());
             // Games use bionic's _PC_ numbers (0-19), the same as the phone's own; glibc (the PC
@@ -1596,6 +1668,13 @@ pub fn handler(name: &str) -> Option<Handler> {
                 mem().write_u32(result, out);
             }
             Ret::U32(0)
+        }),
+        "rewinddir" => handler!(|uc, a| {
+            let found = shared().state.directories.get(&a.u32()).copied();
+            if let Some((directory, _)) = found {
+                unsafe { libc::rewinddir(directory as *mut libc::DIR) };
+            }
+            Ret::Void
         }),
         "closedir" => handler!(|uc, a| {
             let handle = a.u32();
@@ -1739,6 +1818,41 @@ pub fn handler(name: &str) -> Option<Handler> {
             let (buffer, length) = (a.u32(), a.u32());
             checked(uc, unsafe { libc::gethostname(host_c(buffer), length as usize) } as i64)
         }),
+        "setenv" => handler!(|uc, a| {
+            let (name, value, overwrite) = (a.u32(), a.u32(), a.i32());
+            checked(uc, unsafe { libc::setenv(host_c(name), host_c(value), overwrite) } as i64)
+        }),
+        "strsignal" => handler!(|uc, a| {
+            let signal = a.i32();
+            let text = unsafe { std::ffi::CStr::from_ptr(libc::strsignal(signal)) }.to_string_lossy().into_owned();
+            Ret::U32(shared().cached_cstr(format!("strsignal:{signal}"), &text))
+        }),
+        // Timers are remembered but never fire: the bridge doesn't pass system signals
+        // (SIGALRM, SIGPROF) to game code, and a real one would end the app. Games use
+        // them for optional profiling (monstartup).
+        "setitimer" => handler!(|uc, a| {
+            let (which, new, old) = (a.u32(), a.u32(), a.u32());
+            if which > 2 {
+                set_errno(uc, libc::EINVAL);
+                return Ret::U32(u32::MAX);
+            }
+            let mut shared = shared();
+            let timer = &mut shared.state.timers[which as usize];
+            if old != 0 {
+                for (i, word) in timer.iter().enumerate() {
+                    mem().write_u32(old + i as u32 * 4, *word);
+                }
+            }
+            if new != 0 {
+                for (i, word) in timer.iter_mut().enumerate() {
+                    *word = mem().read_u32(new + i as u32 * 4);
+                }
+                if timer.iter().any(|&word| word != 0) {
+                    crate::log::line(&format!("[bridge] setitimer({which}): remembered, but the bridge never fires system timers"));
+                }
+            }
+            Ret::U32(0)
+        }),
         "getenv" => handler!(|uc, a| {
             let name = a.u32();
             let value = unsafe { libc::getenv(host_c(name)) };
@@ -1804,6 +1918,13 @@ pub fn handler(name: &str) -> Option<Handler> {
         "__errno" => handler!(|uc, a| Ret::U32(uc.get_data().errno_slot)),
         "__stack_chk_fail" => handler!(|uc, a| {
             stop_with_fault(uc, "stack protector tripped (__stack_chk_fail)".into());
+            Ret::Void
+        }),
+        "__assert" => handler!(|uc, a| {
+            let (file, line, message) = (a.u32(), a.u32(), a.u32());
+            let m = mem();
+            let text = format!("game assertion failed: {} at {}:{}", m.string(message), m.string(file), line);
+            stop_with_fault(uc, text);
             Ret::Void
         }),
         "__assert2" => handler!(|uc, a| {
@@ -2017,6 +2138,41 @@ pub fn handler(name: &str) -> Option<Handler> {
         "__mmap2" => handler!(|uc, a| {
             let (address, length, protection, flags, fd, pages) = (a.u32(), a.u32(), a.u32(), a.u32(), a.u32(), a.u32());
             map_memory(uc, address, length, protection, flags, fd, pages as u64 * crate::mem::PAGE as u64)
+        }),
+        // Blocks are heap blocks: shrinking keeps the block, growing moves it (when
+        // allowed) to a new one with the contents copied.
+        "mremap" => handler!(|uc, a| {
+            const MAP_FAILED: u32 = u32::MAX;
+            const MREMAP_MAYMOVE: u32 = 1;
+            let (old, old_length, new_length, flags) = (a.u32(), a.u32(), a.u32(), a.u32());
+            let size = shared().state.mappings.get(&old).copied();
+            let Some(size) = size else {
+                set_errno(uc, libc::EFAULT);
+                return Ret::U32(MAP_FAILED);
+            };
+            if new_length == 0 {
+                set_errno(uc, libc::EINVAL);
+                return Ret::U32(MAP_FAILED);
+            }
+            if page_round(new_length) <= size {
+                // munmap of the new length frees the whole block later.
+                shared().state.mappings.insert(old, page_round(new_length));
+                return Ret::U32(old);
+            }
+            if flags & MREMAP_MAYMOVE == 0 {
+                set_errno(uc, libc::ENOMEM);
+                return Ret::U32(MAP_FAILED);
+            }
+            let new = match map_memory(uc, 0, new_length, 0, libc::MAP_ANONYMOUS as u32 | libc::MAP_PRIVATE as u32, u32::MAX, 0) {
+                Ret::U32(new) if new != MAP_FAILED => new,
+                failed => return failed,
+            };
+            let kept = page_round(old_length).min(size) as usize;
+            unsafe { std::ptr::copy_nonoverlapping(mem().host(old), mem().host(new), kept) };
+            let mut shared = shared();
+            shared.state.mappings.remove(&old);
+            crate::runtime::heap().free(old);
+            Ret::U32(new)
         }),
         "munmap" => handler!(|uc, a| {
             let (address, length) = (a.u32(), a.u32());

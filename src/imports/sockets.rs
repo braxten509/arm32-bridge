@@ -109,6 +109,24 @@ fn write_hostent(name: &[u8], addresses: &[[u8; 4]]) -> u32 {
     base
 }
 
+/// getnameinfo's NI_ flags: bionic uses the BSD numbers (as does the phone);
+/// the PC's glibc numbers them differently.
+fn name_flags(bionic: u32) -> i32 {
+    #[cfg(target_os = "android")]
+    return bionic as i32;
+    #[cfg(not(target_os = "android"))]
+    {
+        const BIONIC: [(u32, i32); 5] = [
+            (0x1, libc::NI_NOFQDN),
+            (0x2, libc::NI_NUMERICHOST),
+            (0x4, libc::NI_NAMEREQD),
+            (0x8, libc::NI_NUMERICSERV),
+            (0x10, libc::NI_DGRAM),
+        ];
+        BIONIC.iter().filter(|(bit, _)| bionic & bit != 0).fold(0, |flags, (_, host)| flags | host)
+    }
+}
+
 fn pointer(guest: u32) -> *mut u8 {
     mem().host_or_null(guest)
 }
@@ -364,6 +382,25 @@ pub fn handler(name: &str) -> Option<Handler> {
             let text = mem().string(a.u32());
             let address = text.parse::<std::net::Ipv4Addr>().map_or(u32::MAX, |ip| u32::from_ne_bytes(ip.octets()));
             Ret::U32(address)
+        }),
+        // Socket addresses have no pointers, so the guest's is used as is.
+        "getnameinfo" => handler!(|uc, a| {
+            let (address, length, host, host_length, service, service_length) =
+                (a.u32(), a.u32(), a.u32(), a.u32(), a.u32(), a.u32());
+            let flags = name_flags(a.u32());
+            let (address, host, service) = (pointer(address) as usize, pointer(host) as usize, pointer(service) as usize);
+            let result = without_gil(move || unsafe {
+                libc::getnameinfo(
+                    address as *const libc::sockaddr,
+                    length,
+                    host as *mut libc::c_char,
+                    host_length as _,
+                    service as *mut libc::c_char,
+                    service_length as _,
+                    flags,
+                )
+            });
+            Ret::U32(result as u32)
         }),
         "getaddrinfo" => handler!(|uc, a| {
             let (node, service, hints, out) = (a.u32(), a.u32(), a.u32(), a.u32());

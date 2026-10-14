@@ -52,6 +52,8 @@ __asm__(".text\n"
 typedef int (*connected_fn)(const char *class_name, const char *method, const char *signature);
 // Returns NULL once the original runs, or why it couldn't.
 typedef const char *(*load_fn)(JavaVM *vm, JNIEnv *env, const char *original);
+// Starts a NativeActivity game's original (see ANativeActivity_onCreate below).
+typedef void (*native_activity_fn)(void *activity, void *saved_state, size_t saved_state_size, const char *original);
 
 #define BRIDGE_FILE "libarm32_bridge.so"
 
@@ -151,31 +153,58 @@ static int is_class_char(char c) {
            c == '/';
 }
 
-JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved) {
-    (void)reserved;
-    JNIEnv *env;
-    if ((*vm)->GetEnv(vm, (void **)&env, JNI_VERSION_1_6) != JNI_OK) return JNI_VERSION_1_6;
+// This library's original (lib<name>-arm32.so) and the bridge, both next to it.
+static int find_parts(void *self, char *original, size_t original_size, char *bridge_path, size_t bridge_size,
+                      const char **own_name) {
     Dl_info info;
-    if (!dladdr((void *)JNI_OnLoad, &info) || !info.dli_fname) return JNI_VERSION_1_6;
-    char original[4096], directory[4096];
-    snprintf(original, sizeof original, "%s", info.dli_fname);
+    if (!dladdr(self, &info) || !info.dli_fname) return 0;
+    char directory[4096];
+    snprintf(original, original_size, "%s", info.dli_fname);
     snprintf(directory, sizeof directory, "%s", info.dli_fname);
     char *slash = strrchr(directory, '/');
     if (slash) *slash = 0;
     size_t length = strlen(original);
     if (length > 3 && strcmp(original + length - 3, ".so") == 0) original[length - 3] = 0;
-    strncat(original, "-arm32.so", sizeof original - strlen(original) - 1);
+    strncat(original, "-arm32.so", original_size - strlen(original) - 1);
+    snprintf(bridge_path, bridge_size, "%s/" BRIDGE_FILE, directory);
+    *own_name = info.dli_fname;
+    return 1;
+}
+
+// A NativeActivity game: Android calls this instead of Java loading the
+// library. The bridge loads the original (if Java hasn't already) and hands
+// it the activity: window, touch input and the activity's life events.
+JNIEXPORT void ANativeActivity_onCreate(void *activity, void *saved_state, size_t saved_state_size) {
+    char original[4096], bridge_path[4096];
+    const char *own_name;
+    if (!find_parts((void *)ANativeActivity_onCreate, original, sizeof original, bridge_path, sizeof bridge_path, &own_name))
+        return;
+    void *bridge = dlopen(bridge_path, RTLD_NOW);
+    native_activity_fn start = bridge ? (native_activity_fn)dlsym(bridge, "arm32_bridge_native_activity") : NULL;
+    if (!start) {
+        log("[standin] %s: no bridge at %s to start the game (%s)", own_name, bridge_path, dlerror());
+        return;
+    }
+    start(activity, saved_state, saved_state_size, original);
+}
+
+JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved) {
+    (void)reserved;
+    JNIEnv *env;
+    if ((*vm)->GetEnv(vm, (void **)&env, JNI_VERSION_1_6) != JNI_OK) return JNI_VERSION_1_6;
+    char original[4096], bridge_path[4096];
+    const char *own_name;
+    if (!find_parts((void *)JNI_OnLoad, original, sizeof original, bridge_path, sizeof bridge_path, &own_name))
+        return JNI_VERSION_1_6;
 
     int fd = open(original, O_RDONLY | O_CLOEXEC);
     struct stat st;
     if (fd < 0 || fstat(fd, &st) != 0 || st.st_size == 0) {
-        log("[standin] %s: no original library at %s; nothing registered", info.dli_fname, original);
+        log("[standin] %s: no original library at %s; nothing registered", own_name, original);
         if (fd >= 0) close(fd);
         return JNI_VERSION_1_6;
     }
 
-    char bridge_path[4096];
-    snprintf(bridge_path, sizeof bridge_path, "%s/" BRIDGE_FILE, directory);
     void *bridge = dlopen(bridge_path, RTLD_NOW);
     load_fn load = bridge ? (load_fn)dlsym(bridge, "arm32_bridge_load") : NULL;
     if (load) {
@@ -184,9 +213,9 @@ JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved) {
             close(fd);
             return JNI_VERSION_1_6;
         }
-        log("[standin] %s: the bridge couldn't run it (%s); switching it off instead", info.dli_fname, error);
+        log("[standin] %s: the bridge couldn't run it (%s); switching it off instead", own_name, error);
     } else {
-        log("[standin] %s: no bridge at %s (%s); switching it off instead", info.dli_fname, bridge_path, dlerror());
+        log("[standin] %s: no bridge at %s (%s); switching it off instead", own_name, bridge_path, dlerror());
     }
     connected_fn connected = bridge ? (connected_fn)dlsym(bridge, "arm32_bridge_connected") : NULL;
 
@@ -212,6 +241,6 @@ JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved) {
         start = end + 1;
     }
     munmap((void *)data, st.st_size);
-    log("[standin] %s: %d do-nothing native methods in %d classes", info.dli_fname, methods, classes);
+    log("[standin] %s: %d do-nothing native methods in %d classes", own_name, methods, classes);
     return JNI_VERSION_1_6;
 }

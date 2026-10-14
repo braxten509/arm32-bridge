@@ -606,6 +606,15 @@ pub fn handler(name: &str) -> Option<Handler> {
             let (condition, mutex, deadline) = (a.u32(), a.u32(), a.u32());
             Ret::U32(condition_wait(uc, condition, mutex, Some(monotonic_deadline(deadline))))
         }),
+        // Old bionic: waits at most `relative` (a timespec) from now.
+        "pthread_cond_timedwait_relative_np" => handler!(|uc, a| {
+            let (condition, mutex, relative) = (a.u32(), a.u32(), a.u32());
+            let wait = Duration::new(
+                (mem().read_u32(relative) as i32).max(0) as u64,
+                (mem().read_u32(relative + 4) as i32).clamp(0, 999_999_999) as u32,
+            );
+            Ret::U32(condition_wait(uc, condition, mutex, Some(SystemTime::now() + wait)))
+        }),
         // Raw system calls through libc's syscall(): -1 and errno on failure.
         "syscall" => handler!(|uc, a| {
             let number = a.u32();
@@ -734,6 +743,8 @@ pub fn handler(name: &str) -> Option<Handler> {
             Ret::U32(0)
         }),
         "sem_destroy" => handler!(|uc, a| Ret::U32(0)),
+        // Named semaphores (sem_open) aren't made here, so there's nothing to close.
+        "sem_close" => handler!(|uc, a| Ret::U32(0)),
         "sem_post" => handler!(|uc, a| {
             let semaphore = a.u32();
             mem().atomic_u32(semaphore).fetch_add(1, Ordering::Release);

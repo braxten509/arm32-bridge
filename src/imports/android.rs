@@ -22,6 +22,22 @@ pub const NAMES: &[&str] = &[
     "AConfiguration_delete",
     "AConfiguration_fromAssetManager",
     "AConfiguration_getOrientation",
+    "AConfiguration_getLanguage",
+    "AConfiguration_getCountry",
+    "AConfiguration_getSdkVersion",
+    "AConfiguration_getDensity",
+    "AConfiguration_getKeyboard",
+    "AConfiguration_getNavigation",
+    "AConfiguration_getTouchscreen",
+    "AConfiguration_getScreenSize",
+    "AConfiguration_getScreenLong",
+    "AConfiguration_getScreenWidthDp",
+    "AConfiguration_getScreenHeightDp",
+    "AConfiguration_getSmallestScreenWidthDp",
+    "AConfiguration_getUiModeType",
+    "AConfiguration_getUiModeNight",
+    "AConfiguration_getMcc",
+    "AConfiguration_getMnc",
 ];
 
 #[cfg(not(target_os = "android"))]
@@ -55,6 +71,22 @@ mod host {
         fn AConfiguration_delete(config: *mut c_void);
         fn AConfiguration_fromAssetManager(config: *mut c_void, manager: *mut c_void);
         fn AConfiguration_getOrientation(config: *mut c_void) -> i32;
+        fn AConfiguration_getLanguage(config: *mut c_void, out: *mut libc::c_char);
+        fn AConfiguration_getCountry(config: *mut c_void, out: *mut libc::c_char);
+        fn AConfiguration_getSdkVersion(config: *mut c_void) -> i32;
+        fn AConfiguration_getDensity(config: *mut c_void) -> i32;
+        fn AConfiguration_getKeyboard(config: *mut c_void) -> i32;
+        fn AConfiguration_getNavigation(config: *mut c_void) -> i32;
+        fn AConfiguration_getTouchscreen(config: *mut c_void) -> i32;
+        fn AConfiguration_getScreenSize(config: *mut c_void) -> i32;
+        fn AConfiguration_getScreenLong(config: *mut c_void) -> i32;
+        fn AConfiguration_getScreenWidthDp(config: *mut c_void) -> i32;
+        fn AConfiguration_getScreenHeightDp(config: *mut c_void) -> i32;
+        fn AConfiguration_getSmallestScreenWidthDp(config: *mut c_void) -> i32;
+        fn AConfiguration_getUiModeType(config: *mut c_void) -> i32;
+        fn AConfiguration_getUiModeNight(config: *mut c_void) -> i32;
+        fn AConfiguration_getMcc(config: *mut c_void) -> i32;
+        fn AConfiguration_getMnc(config: *mut c_void) -> i32;
     }
 
     const HANDLE_BASE: u32 = 0xDC00_0000;
@@ -79,6 +111,11 @@ mod host {
         handle
     }
 
+    /// The guest handle for a host AAssetManager (NativeActivity hands the game one).
+    pub fn asset_manager_handle(manager: *mut c_void) -> u32 {
+        add(manager)
+    }
+
     fn get(handle: u32) -> *mut c_void {
         shared().state.assets.objects.get(&handle).copied().unwrap_or(0) as *mut c_void
     }
@@ -100,7 +137,46 @@ mod host {
     }
 
     pub fn handler(name: &str) -> Option<Handler> {
+        /// AConfiguration getters that return a plain int (0 for an unknown handle).
+        macro_rules! config_int {
+            ($function:ident) => {
+                handler!(|uc, a| {
+                    let config = get(a.u32());
+                    Ret::U32(if config.is_null() { 0 } else { (unsafe { $function(config) }) as u32 })
+                })
+            };
+        }
+        /// getLanguage/getCountry write two letters into the caller's buffer.
+        macro_rules! config_letters {
+            ($function:ident) => {
+                handler!(|uc, a| {
+                    let (config, out) = (get(a.u32()), a.u32());
+                    let mut letters = [0 as libc::c_char; 2];
+                    if !config.is_null() {
+                        unsafe { $function(config, letters.as_mut_ptr()) };
+                    }
+                    mem().write_bytes(out, &[letters[0] as u8, letters[1] as u8]);
+                    Ret::Void
+                })
+            };
+        }
         match name {
+            "AConfiguration_getLanguage" => config_letters!(AConfiguration_getLanguage),
+            "AConfiguration_getCountry" => config_letters!(AConfiguration_getCountry),
+            "AConfiguration_getSdkVersion" => config_int!(AConfiguration_getSdkVersion),
+            "AConfiguration_getDensity" => config_int!(AConfiguration_getDensity),
+            "AConfiguration_getKeyboard" => config_int!(AConfiguration_getKeyboard),
+            "AConfiguration_getNavigation" => config_int!(AConfiguration_getNavigation),
+            "AConfiguration_getTouchscreen" => config_int!(AConfiguration_getTouchscreen),
+            "AConfiguration_getScreenSize" => config_int!(AConfiguration_getScreenSize),
+            "AConfiguration_getScreenLong" => config_int!(AConfiguration_getScreenLong),
+            "AConfiguration_getScreenWidthDp" => config_int!(AConfiguration_getScreenWidthDp),
+            "AConfiguration_getScreenHeightDp" => config_int!(AConfiguration_getScreenHeightDp),
+            "AConfiguration_getSmallestScreenWidthDp" => config_int!(AConfiguration_getSmallestScreenWidthDp),
+            "AConfiguration_getUiModeType" => config_int!(AConfiguration_getUiModeType),
+            "AConfiguration_getUiModeNight" => config_int!(AConfiguration_getUiModeNight),
+            "AConfiguration_getMcc" => config_int!(AConfiguration_getMcc),
+            "AConfiguration_getMnc" => config_int!(AConfiguration_getMnc),
             // AConfiguration objects get handles like the asset ones.
             "AConfiguration_new" => handler!(|uc, a| Ret::U32(add(unsafe { AConfiguration_new() }))),
             "AConfiguration_delete" => handler!(|uc, a| {
@@ -200,7 +276,7 @@ mod host {
 }
 
 #[cfg(target_os = "android")]
-pub use host::{handler, Assets};
+pub use host::{asset_manager_handle, handler, Assets};
 
 #[cfg(not(target_os = "android"))]
 #[derive(Default)]

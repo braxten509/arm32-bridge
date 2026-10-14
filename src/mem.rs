@@ -349,6 +349,20 @@ impl GuestHeap {
         }
         None
     }
+    /// Bytes usable in a live block (at least what was asked for), or 0 for a
+    /// pointer that isn't one. An in-use chunk's size word, minus its own word.
+    pub fn usable_size(&self, guest: u32) -> u32 {
+        if guest == 0 || self.not_owned(guest).is_some() {
+            return 0;
+        }
+        let word = std::mem::size_of::<usize>();
+        let head = unsafe { *((self.mem.host(guest) as usize - word) as *const usize) };
+        ((head & !7) - word) as u32
+    }
+    /// Bytes of guest memory the heap has taken so far (used and free blocks).
+    pub fn arena_size(&self) -> u32 {
+        (self.inner.allocator().next.get() - self.mem.host(HEAP_BASE) as usize) as u32
+    }
     pub fn realloc(&mut self, guest: u32, size: u32) -> u32 {
         if guest == 0 {
             return self.malloc(size);

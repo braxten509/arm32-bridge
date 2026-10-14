@@ -256,6 +256,7 @@ pub fn handler(name: &str) -> Option<Handler> {
         "llrint" => handler!(|uc, a| Ret::U64(unsafe { c::llrint(a.f64()) } as u64)),
         "isnan" | "__isnan" => handler!(|uc, a| Ret::U32(a.f64().is_nan() as u32)),
         "isnanf" | "__isnanf" => handler!(|uc, a| Ret::U32(a.f32().is_nan() as u32)),
+        "__isfinitef" | "isfinitef" => handler!(|uc, a| Ret::U32(a.f32().is_finite() as u32)),
         "__isfinite" | "isfinite" => handler!(|uc, a| Ret::U32(a.f64().is_finite() as u32)),
         "__signbit" => handler!(|uc, a| Ret::U32(a.f64().is_sign_negative() as u32)),
         // bionic: FP_INFINITE 1, FP_NAN 2, FP_NORMAL 4, FP_SUBNORMAL 8, FP_ZERO 16.

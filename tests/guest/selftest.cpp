@@ -24,6 +24,7 @@
 #include <sys/stat.h>
 #include <sys/vfs.h>
 #include <stdarg.h>
+#include <malloc.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/mman.h>
@@ -2136,6 +2137,16 @@ static double take_mixed(int a, double b, int c, long long d, float e) { return 
 extern "C" unsigned int __page_size;
 extern "C" const char *const sys_siglist[];
 extern "C" int pthread_cond_timedwait_monotonic_np(pthread_cond_t *, pthread_mutex_t *, const struct timespec *);
+extern "C" int pthread_cond_timedwait_relative_np(pthread_cond_t *, pthread_mutex_t *, const struct timespec *);
+extern "C" size_t dlmalloc_usable_size(const void *);
+extern "C" int __isfinitef(float);
+static int wide_print(wchar_t *buffer, size_t count, const wchar_t *format, ...) {
+    va_list list;
+    va_start(list, format);
+    int result = vswprintf(buffer, count, format, list);
+    va_end(list);
+    return result;
+}
 static int print_through_vprintf(const char *format, ...) {
     va_list list;
     va_start(list, format);
@@ -2648,6 +2659,86 @@ extern "C" int run_all() {
         int waited = pthread_cond_timedwait_monotonic_np(&never, &lock, &deadline);
         pthread_mutex_unlock(&lock);
         check(waited == ETIMEDOUT && seconds_now() - before < 2.0, "pthread_cond_timedwait_monotonic_np");
+    }
+
+    {
+        // Functions Assassin's Creed Pirates needs (2026-10-14).
+        char text[64];
+        wchar_t wide[32];
+        snprintf(text, sizeof text, "%ls|%lc", L"wide", (wint_t)L'x');
+        int printed = wide_print(wide, 32, L"%ls=%d %s", L"wide", 5, "narrow");
+        bool too_small = wide_print(wide + 20, 4, L"%d", 123456) == -1;
+        check(strcmp(text, "wide|x") == 0 && printed == 13 && wcscmp(wide, L"wide=5 narrow") == 0 && too_small,
+              "printf %ls %lc / vswprintf");
+        wchar_t decoded[8];
+        check(mbstowcs(nullptr, "h\xc3\xa9llo", 0) == 5 && mbstowcs(decoded, "h\xc3\xa9llo", 8) == 5 && decoded[1] == 0xe9 &&
+                  decoded[5] == 0 && atoll("123456789012") == 123456789012LL,
+              "mbstowcs / atoll");
+        void *block = malloc(10);
+        struct mallinfo heap = mallinfo();
+        check(block && malloc_usable_size(block) >= 10 && dlmalloc_usable_size(block) == malloc_usable_size(block) && heap.arena > 0,
+              "malloc_usable_size / dlmalloc_usable_size / mallinfo");
+        free(block);
+        long page = sysconf(_SC_PAGESIZE);
+        char *mapped = (char *)mmap(nullptr, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        bool remapped = false;
+        if (mapped != MAP_FAILED) {
+            mapped[0] = 'm';
+            mapped[page - 1] = 'z';
+            char *grown = (char *)mremap(mapped, page, page * 3, MREMAP_MAYMOVE);
+            remapped = grown != MAP_FAILED && grown[0] == 'm' && grown[page - 1] == 'z' && grown[page * 3 - 1] == 0 &&
+                       mremap(grown, page * 3, page, 0) == grown && munmap(grown, page) == 0;
+        }
+        check(remapped, "mremap");
+        struct sockaddr_in address = {};
+        address.sin_family = AF_INET;
+        address.sin_port = htons(80);
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        char host[64] = "", service[16] = "";
+        int named = getnameinfo((struct sockaddr *)&address, sizeof address, host, sizeof host, service, sizeof service,
+                                NI_NUMERICHOST | NI_NUMERICSERV);
+        check(named == 0 && strcmp(host, "127.0.0.1") == 0 && strcmp(service, "80") == 0, "getnameinfo");
+        // A real SIGPROF timer would end this test a second from now.
+        struct itimerval profile = {{0, 0}, {1, 0}}, stopped = {{0, 0}, {0, 0}}, old;
+        check(setitimer(ITIMER_PROF, &profile, nullptr) == 0 && setitimer(ITIMER_PROF, &stopped, &old) == 0 &&
+                  old.it_value.tv_sec == 1 && setitimer(99, &stopped, nullptr) == -1,
+              "setitimer");
+        char name[L_tmpnam];
+        tmpnam(name);
+        int fd = open(name, O_CREAT | O_RDWR, 0644);
+        struct timeval times[2] = {{3000000, 0}, {4000000, 0}};
+        struct stat after;
+        check(fd >= 0 && fchmod(fd, 0600) == 0 && fchown(fd, (uid_t)-1, (gid_t)-1) == 0 && utimes(name, times) == 0 &&
+                  fstat(fd, &after) == 0 && (after.st_mode & 0777) == 0600 && after.st_mtime == 4000000 &&
+                  after.st_atime == 3000000 && close(fd) == 0 && unlink(name) == 0,
+              "fchmod / fchown / utimes");
+        DIR *directory = opendir("/proc/self");
+        int first = 0, second = 0;
+        while (directory && readdir(directory)) first++;
+        if (directory) {
+            rewinddir(directory);
+            while (readdir(directory)) second++;
+            closedir(directory);
+        }
+        check(first > 2 && first == second, "rewinddir");
+        const char *signal_name = strsignal(SIGSEGV);
+        check(setenv("ARM32_SELFTEST", "yes", 1) == 0 && getenv("ARM32_SELFTEST") && strcmp(getenv("ARM32_SELFTEST"), "yes") == 0 &&
+                  setenv("ARM32_SELFTEST", "no", 0) == 0 && strcmp(getenv("ARM32_SELFTEST"), "yes") == 0 && signal_name &&
+                  strcmp(signal_name, sys_siglist[SIGSEGV]) == 0,
+              "setenv / strsignal");
+        sem_t semaphore;
+        volatile float one = 1.0f, endless = INFINITY;
+        check(sem_init(&semaphore, 0, 0) == 0 && sem_close(&semaphore) == 0 && __isfinitef(one) && !__isfinitef(endless),
+              "sem_close / __isfinitef");
+        pthread_cond_t never = PTHREAD_COND_INITIALIZER;
+        pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+        struct timespec relative = {0, 20000000};
+        double before = seconds_now();
+        pthread_mutex_lock(&lock);
+        int waited = pthread_cond_timedwait_relative_np(&never, &lock, &relative);
+        pthread_mutex_unlock(&lock);
+        double took = seconds_now() - before;
+        check(waited == ETIMEDOUT && took >= 0.015 && took < 2.0, "pthread_cond_timedwait_relative_np");
     }
 
     __android_log_print(ANDROID_LOG_INFO, TAG, "%d failures", failures);

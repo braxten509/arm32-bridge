@@ -58,6 +58,8 @@ pub const NAMES: &[&str] = &[
     "ALooper_wake",
     "ALooper_pollAll",
     "ALooper_pollOnce",
+    "ALooper_addFd",
+    "ALooper_removeFd",
     "ASensorManager_getInstance",
     "ASensorManager_getSensorList",
     "ASensorManager_getDefaultSensor",
@@ -147,6 +149,8 @@ mod host {
         fn ALooper_wake(looper: Pointer);
         fn ALooper_pollAll(timeout: i32, fd: *mut i32, events: *mut i32, data: *mut Pointer) -> i32;
         fn ALooper_pollOnce(timeout: i32, fd: *mut i32, events: *mut i32, data: *mut Pointer) -> i32;
+        fn ALooper_addFd(looper: Pointer, fd: i32, ident: i32, events: i32, callback: Pointer, data: Pointer) -> i32;
+        fn ALooper_removeFd(looper: Pointer, fd: i32) -> i32;
         fn ASensorManager_getInstance() -> Pointer;
         fn ASensorManager_getSensorList(manager: Pointer, list: *mut *const Pointer) -> i32;
         fn ASensorManager_getDefaultSensor(manager: Pointer, kind: i32) -> Pointer;
@@ -243,6 +247,19 @@ mod host {
         }
     }
 
+    /// Handles shared with activity.rs (input queues and events use the same table).
+    pub fn handle_for(object: Pointer) -> u32 {
+        guest(object)
+    }
+
+    pub fn object_for(handle: u32) -> Pointer {
+        host(handle)
+    }
+
+    pub fn forget_handle(handle: u32) {
+        forget(handle)
+    }
+
     fn host(handle: u32) -> Pointer {
         if handle == 0 {
             return std::ptr::null_mut();
@@ -270,16 +287,22 @@ mod host {
     }
 
     /// Polls the host looper. The data pointer handed back is the game's own
-    /// 32-bit value (only fds the game added, such as sensor queues, report one).
+    /// 32-bit value (only fds the game added report one). A wait releases the
+    /// guest lock: other threads (Android's main thread passing activity events
+    /// to the game) must be able to run game code meanwhile.
     fn poll(once: bool, timeout: i32, fd_out: u32, events_out: u32, data_out: u32) -> i32 {
-        let (mut fd, mut events, mut data) = (0i32, 0i32, std::ptr::null_mut());
-        let result = unsafe {
-            if once {
-                ALooper_pollOnce(timeout, &mut fd, &mut events, &mut data)
-            } else {
-                ALooper_pollAll(timeout, &mut fd, &mut events, &mut data)
-            }
+        let call = move || {
+            let (mut fd, mut events, mut data) = (0i32, 0i32, std::ptr::null_mut::<c_void>());
+            let result = unsafe {
+                if once {
+                    ALooper_pollOnce(timeout, &mut fd, &mut events, &mut data)
+                } else {
+                    ALooper_pollAll(timeout, &mut fd, &mut events, &mut data)
+                }
+            };
+            (result, fd, events, data as usize)
         };
+        let (result, fd, events, data) = if timeout == 0 { call() } else { crate::runtime::without_gil(call) };
         if fd_out != 0 {
             mem().write_u32(fd_out, fd as u32);
         }
@@ -531,6 +554,15 @@ mod host {
                 let (timeout, fd, events, data) = (a.i32(), a.u32(), a.u32(), a.u32());
                 Ret::U32(poll(true, timeout, fd, events, data) as u32)
             }),
+            "ALooper_addFd" => handler!(|uc, a| {
+                let (looper, fd, ident, events, callback, data) = (a.u32(), a.i32(), a.i32(), a.i32(), a.u32(), a.u32());
+                let (host_callback, host_data) = crate::imports::activity::looper_callback_for(looper, fd, callback, data);
+                Ret::U32(unsafe { ALooper_addFd(host(looper), fd, ident, events, host_callback, host_data) } as u32)
+            }),
+            "ALooper_removeFd" => handler!(|uc, a| {
+                let (looper, fd) = (a.u32(), a.i32());
+                Ret::U32(unsafe { ALooper_removeFd(host(looper), fd) } as u32)
+            }),
             "ASensorManager_getInstance" => handler!(|uc, a| Ret::U32(guest(unsafe { ASensorManager_getInstance() }))),
             "ASensorManager_getSensorList" => handler!(|uc, a| {
                 let (manager, out) = (a.u32(), a.u32());
@@ -608,7 +640,7 @@ mod host {
 }
 
 #[cfg(target_os = "android")]
-pub use host::{current_context, handler};
+pub use host::{current_context, forget_handle, handle_for, handler, object_for};
 
 /// The host EGL context current on this thread (0 = none).
 #[cfg(not(target_os = "android"))]

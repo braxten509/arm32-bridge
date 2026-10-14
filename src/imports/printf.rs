@@ -8,7 +8,13 @@ use crate::mem::GuestMem;
 use crate::runtime::ArgSource;
 
 pub fn format(mem: GuestMem, format_address: u32, args: &mut dyn ArgSource) -> Vec<u8> {
-    let format = mem.c_str(format_address).to_bytes();
+    format_text(mem, mem.c_str(format_address).to_bytes(), args)
+}
+
+/// Formats `format` (UTF-8 text already read from the guest; wide formats
+/// are converted first). `%ls`/`%S` take a wchar_t string and `%lc`/`%C` a
+/// wide character, written out as UTF-8.
+pub fn format_text(mem: GuestMem, format: &[u8], args: &mut dyn ArgSource) -> Vec<u8> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < format.len() {
@@ -82,6 +88,29 @@ pub fn format(mem: GuestMem, format_address: u32, args: &mut dyn ArgSource) -> V
                 };
                 let c = conversion as char;
                 host_format(&mut out, &format!("{spec}ll{c}"), |f, b, n| unsafe { libc::snprintf(b, n, f, value) });
+            }
+            b'c' | b'C' if length == b"l" || conversion == b'C' => {
+                let value = args.u32();
+                let text = CString::new(char::from_u32(value).unwrap_or('\u{FFFD}').to_string()).unwrap_or_default();
+                host_format(&mut out, &format!("{spec}s"), |f, b, n| unsafe { libc::snprintf(b, n, f, text.as_ptr()) });
+            }
+            b's' | b'S' if length == b"l" || conversion == b'S' => {
+                let pointer = args.u32();
+                let mut text = String::new();
+                if pointer == 0 {
+                    text.push_str("(null)");
+                }
+                let mut at = pointer;
+                while pointer != 0 {
+                    let c = mem.read_u32(at);
+                    if c == 0 {
+                        break;
+                    }
+                    text.push(char::from_u32(c).unwrap_or('\u{FFFD}'));
+                    at += 4;
+                }
+                let text = CString::new(text).unwrap_or_default();
+                host_format(&mut out, &format!("{spec}s"), |f, b, n| unsafe { libc::snprintf(b, n, f, text.as_ptr()) });
             }
             b'c' => {
                 let value = args.i32();

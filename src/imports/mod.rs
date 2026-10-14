@@ -12,6 +12,7 @@ pub mod sles;
 pub mod gles;
 mod gles_generated;
 pub mod android;
+pub mod activity;
 pub mod egl;
 pub mod signals;
 pub mod sockets;
@@ -53,6 +54,9 @@ pub struct State {
     pub sound: sles::Sound,
     /// Blocks handed out by mmap: start -> length (page multiples).
     pub mappings: std::collections::BTreeMap<u32, u32>,
+    /// setitimer's three timers (ITIMER_REAL, _VIRTUAL, _PROF), as the guest's
+    /// struct itimerval words: interval seconds and microseconds, then value.
+    pub timers: [[u32; 4]; 3],
 }
 
 /// Wraps a closure body as a `Handler` with the right parameter types.
@@ -77,6 +81,7 @@ pub fn handler_for(name: &str) -> Option<Handler> {
         .or_else(|| math::handler(name))
         .or_else(|| gles::handler(name))
         .or_else(|| android::handler(name))
+        .or_else(|| activity::handler(name))
         .or_else(|| egl::handler(name))
         .or_else(|| sles::handler(name))
 }
@@ -108,7 +113,10 @@ pub fn missing_imports(paths: &[std::path::PathBuf]) -> Result<Vec<String>, Stri
 /// Whether the phone build of the bridge handles `name` (the PC build lacks
 /// the phone-only parts).
 pub fn phone_handles(name: &str) -> bool {
-    handler_for(name).is_some() || android::NAMES.contains(&name) || egl::NAMES.contains(&name)
+    handler_for(name).is_some()
+        || android::NAMES.contains(&name)
+        || egl::NAMES.contains(&name)
+        || activity::NAMES.contains(&name)
 }
 
 const BIONIC_FILE_SIZE: u32 = 84;
