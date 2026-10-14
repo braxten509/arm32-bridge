@@ -172,6 +172,42 @@ pub struct Stub {
     /// would make every thread calling the same function wait on one cache line).
     pub calls: AtomicU64,
     used: AtomicBool,
+    light: Light,
+}
+
+/// How a phone function may run when translated code calls it.
+#[derive(Clone, Copy, PartialEq)]
+enum Light {
+    /// The full hand-off (`call_stub`).
+    No,
+    /// In place, without leaving guest code (`call_light`).
+    Yes,
+    /// pthread_mutex_lock: in place when the mutex is free, else the full
+    /// hand-off (waiting must happen outside guest code).
+    MutexLock,
+}
+
+/// Phone functions that never block, sleep, call guest code, change code or
+/// jump. Games call them millions of times, so they skip the hand-off around
+/// a call (register parking, two SeqCst state stores, timing): the thread
+/// stays in guest code for the few microseconds they take, and a stopped
+/// world or a signal is handled at the next block exit as usual.
+const LIGHT: &[&str] = &[
+    "memcpy", "__aeabi_memcpy", "__aeabi_memcpy4", "__aeabi_memcpy8", "memmove", "__aeabi_memmove", "__aeabi_memmove4",
+    "__aeabi_memmove8", "__memcpy_chk", "__memmove_chk", "memset", "__memset_chk", "__aeabi_memset", "__aeabi_memset4",
+    "__aeabi_memset8", "bzero", "__aeabi_memclr", "__aeabi_memclr4", "__aeabi_memclr8", "memcmp", "memchr", "memrchr",
+    "strlen", "__strlen_chk", "strcmp", "strncmp", "strcasecmp", "strncasecmp", "strchr", "__strchr_chk", "strrchr",
+    "__strrchr_chk", "strstr", "malloc", "calloc", "realloc", "free", "memalign", "pthread_getspecific",
+    "pthread_setspecific", "pthread_self", "pthread_mutex_trylock", "pthread_mutex_unlock", "clock_gettime",
+];
+
+fn light_kind(name: &str, handler: Option<Handler>) -> Light {
+    match name {
+        _ if handler.is_none() => Light::No,
+        "pthread_mutex_lock" => Light::MutexLock,
+        _ if LIGHT.contains(&name) => Light::Yes,
+        _ => Light::No,
+    }
 }
 
 /// Phone function stand-ins by stub slot (`index - FIRST_STUB`); made once, never freed.
@@ -1300,7 +1336,9 @@ pub fn stub_for(name: &str) -> u32 {
     let index = FIRST_STUB + shared.stub_by_name.len() as u32;
     assert!(index * 8 < mem::STUB_SIZE, "too many stubs");
     let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
-    let stub = Stub { name: leaked, handler: crate::imports::handler_for(name), calls: AtomicU64::new(0), used: AtomicBool::new(false) };
+    let handler = crate::imports::handler_for(name);
+    let light = light_kind(name, handler);
+    let stub = Stub { name: leaked, handler, calls: AtomicU64::new(0), used: AtomicBool::new(false), light };
     // Published before its code is written, so a thread calling the code finds it.
     stub_table()[(index - FIRST_STUB) as usize].store(Box::into_raw(Box::new(stub)), Ordering::Release);
     shared.stub_by_name.insert(name.to_string(), index);
@@ -1502,6 +1540,33 @@ pub fn log_top_calls(count: usize) {
     calls.sort_unstable_by(|a, b| b.0.cmp(&a.0));
     let text: Vec<String> = calls.iter().take(count).map(|(calls, name)| format!("{name} {calls}")).collect();
     crate::log::line(&format!("[calls] {}", text.join(", ")));
+}
+
+/// Runs a light phone function (see `LIGHT`) in place for translated code.
+/// False: take the full hand-off instead (first call, tracing, sampling, one
+/// guest lock, or a mutex that is taken).
+pub fn call_light(uc: &mut Uc, index: u32) -> bool {
+    let Some(stub) = stub(index) else { return false };
+    if stub.light == Light::No || !parallel() || !stub.used.load(Ordering::Relaxed) || TRACE.load(Ordering::Relaxed) || sampling() {
+        return false;
+    }
+    let Some(handler) = stub.handler else { return false };
+    let mut args = Args::from_registers(uc);
+    let result = if stub.light == Light::MutexLock {
+        match crate::imports::threads::lock_if_free(uc, args.registers[0]) {
+            Some(result) => Ret::U32(result),
+            None => return false,
+        }
+    } else {
+        uc.get_data_mut().current_call = stub.name;
+        handler(uc, &mut args)
+    };
+    clear_exclusive(uc);
+    if counting_calls() {
+        stub.calls.fetch_add(1, Ordering::Relaxed);
+    }
+    write_result(uc, result);
+    true
 }
 
 pub fn call_stub(uc: &mut Uc, index: u32) {

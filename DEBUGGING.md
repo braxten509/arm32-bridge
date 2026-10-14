@@ -1453,3 +1453,77 @@ Not repairable by a barrier prefix: 2, 3, 4. Only 1 is closed by ishld (not ishs
 - Round 23 (a), the control (06c499c + new self-test): first try built the wrong tree (log shows the ~/dev path, cause unclear; cargo in the copy resolves correctly), retried as round23b.
 - Round 23b (control, 06c499c built in /tmp/a32k/head-src, new self-test, translator mode): "FAIL library code made writable (mprotect) ..." as predicted, so the test catches the missing gap 4. Also FAIL (expected, fixed earlier and not in that commit): signal frame on the thread's own stack, patched literal in made code. Shift and LDRD/STRD checks pass there (their values never changed; they guard correctness, not the dependency).
 - State at the end of this round: light barrier default (workaround, root cause open), gaps 1-4 closed, all checks green, phone crash-box setting restored. Card Wars speed with the barrier ~70 fps (target 115 not reached).
+
+# Debugging: Card Wars stutters during real play (2026-10-14)
+
+## Symptom
+Owner: fps is fine now, but actual play has lots of stutters ("it will be obvious"). Idle runs never showed it.
+Build a2abb57 (installed lib md5 = local build). Play sessions recorded with the owner playing:
+`~/dev/arm32-bridge-games/scripts/cw-play-capture.sh <tag> 180` (logcat -v epoch + simpleperf 1000 Hz all threads;
+`--trace-offcpu` is not available on this phone: no sched:sched_switch). Runs: runs/play1, play3 (play2 = sampler crashes).
+
+## Measurements
+- play1 (281 s after loading): 75 seconds with a frame > 50 ms; worst 250-400 ms. Grouped by "stops of every
+  thread" in that second: 0 stops -> median slowest 27 ms (9/121 s > 50 ms); 201+ stops -> median slowest 155 ms
+  (28/32 s > 50 ms). So freezes come with bursts of rewritten game-made code (Mono patching JIT code -> cacheflush).
+- But the stops are not what costs the time: UnityMain is on-CPU ~85% in both calm and freeze seconds, with the
+  same mix (translated ~45%, engine::run ~18-19%, park_registers ~9%, call_stub ~8%, kernel futex wake ~8-9%).
+  In freeze seconds: translation, membarrier (smp_call_function_many_cond 1.1%) and __clear_cache are ~1-2% only.
+  => freezes are bursts of the game's own work, made 2-3x longer by the bridge's general overhead.
+- Sampler (debug.arm32bridge.sample, logs stack every 500 ms at phone calls; symbolized with
+  scripts/sample-sym.py and the APK's 32-bit libs in ~/dev/arm32-bridge-games/cwlibs): freeze samples show Mono JIT
+  (mono_local_regalloc, mono_arch_emit_prolog, mono_spill_global_vars), GC_finish_collection, libz inflate
+  (asset unpacking), libunity work. Too coarse (2 samples/s, stale stack words) to rank them.
+- Sampler mode 2 (mono_pmip names) is NOT safe: from launch it crashes Mono startup at block 0x026cdb4c
+  (libmonobdwgc +0x4aeb4c, fault 0x70), 3/3; switched on after loading it froze the game within seconds
+  (UnityMain looping on sem_getvalue from libmonobdwgc +0x502374, likely a GC suspend wait). Mode 1 is fine.
+- Unity's public symbol server had no libunity symbols for build id 744f4cc8c578011d941fab6c30eec73d17a21a6e
+  (tried SSQP and Breakpad-style paths).
+- Phone-call counts (stats1.log, earlier): pthread_getspecific 4.1M, strcmp 2.1M, memset 1.4M, mutex unlock 1.3M,
+  lock 1.0M, memcpy 0.9M, free 0.7M, calloc 0.5M, __memmove_chk 0.4M, clock_gettime 0.4M, malloc 0.3M ...
+
+## Plan (owner chose A, 2026-10-14)
+A: light path for tiny phone functions (no register parking, no leave/enter guest, no slow-call timing).
+B (later, maybe): look up indirect jump targets inside translated code instead of the dispatcher.
+Pass checks: 3 baseline runs first; loading burst (launch->READY, load work, slow seconds) and steady game
+ms/frame must improve beyond noise; self-test 0 failures in six modes; three games run; PC saves unchanged.
+
+## Fix A results (light phone functions, 2026-10-14)
+- Change: runtime.rs `LIGHT` list + `call_light` (no parking / leave-enter / timing for memcpy-like, string,
+  heap, TLS key, mutex trylock/unlock, clock_gettime; pthread_mutex_lock in place only when free); engine.rs tries
+  `call_light` before `call_stub`; threads.rs `lock_if_free`. Only in parallel mode, never on a stub's first call,
+  never while tracing/sampling.
+- Checks: PC self-test default + forced fallback 0 failures; phone six modes 0 failures; CHECK=all 2,835,899 blocks,
+  0 differences.
+- Loading (cw-measure.sh 90 s, load-summary.py), 3 runs each:
+  before: READY 19.9/19.0/19.0 s, load work 28.5/28.3/28.2 s, slow (>100 ms) seconds 13/12/12, steady 14.06/14.00/14.32 ms
+  fix A:  READY 16.9/18.6/18.0 s, load work 27.0/28.7/28.2 s, slow seconds 11/12/12, steady 12.78/12.90/12.87 ms
+  => steady game time -9% (beyond noise); load work and slow seconds unchanged (fails that half of the pass check).
+  During loading, phone time fell 9.6 -> 7.8 s but own-code time stayed ~19-20 s; 2-3 s loading frames are 1.4-2.0 s own code.
+- Scripted play (scripts/cw-scripted-play.sh, same taps; both ended on the Card Forge screen), 225 s:
+  old 67.7 fps, >50 ms 60 s, >100 ms 6 s, >250 ms 1, worst 312 ms; fix A 74.5 fps, 56 / 8 / 1, worst 317 ms.
+  => more fps, same freezes.
+- My own play on the old build (runs/myplay-old): big freezes are first-time screens (menu 356 ms, quest map 370,
+  level popup 298, battle setup 232, lose screen 763); repeated battle actions stay smooth.
+- Loading profile with fix A (runs/loadprofA, 35 s from launch): UnityMain translated 50%, engine::run 17.8%,
+  kernel futex/IPI ~7%, smp_call_function_many_cond 3.2% (+__clear_cache 1%), host malloc ~3%.
+  Inside engine::run ~65% is the SLOW lookup (RwLock read lock/unlock atomics + HashMap probe): jump-table misses.
+  Cause: JUMP_TABLE_BITS = 12 (4096 entries indexed by pc bits 1-12), so targets 8 KiB apart collide; 18 MB of
+  libunity + Mono JIT code thrash it. Candidate next change: bigger table (one constant; emitter uses it).
+- Owner kept fix A (2026-10-14). Puzzle Craft with fix A: PC1 119.9 fps (min 119.5), PC2 119.7 (min 115.9), no
+  crashes. "Saves changed" was only SDK files rewritten on every launch (Crashlytics/Flurry/Fabric .tap/.cls,
+  AppEventsLogger, Chillingo-SharedData, FusePrefsFile); real save files unchanged. pc-check.sh now skips those.
+
+## Bigger jump table (owner approved, 2026-10-14)
+- Change: engine.rs JUMP_TABLE_BITS 12 -> 16 (65,536 entries, 512 KiB at the start of the 64 MiB code memory).
+  The emitter (thumb.rs emit_exit_to ubfx width), table init, set_jump/table_block all use the constant.
+- Checks: PC self-test default + forced fallback 0 failures; phone six modes 0 failures; CHECK=all 2,810,938 blocks,
+  0 differences.
+- Loading x3 (vs fix A alone): READY 15.4/15.6/15.5 s (16.9-18.6), load work 26.9/26.8/26.9 s (27.0-28.7),
+  slow seconds 10/11/11 (11-12), steady game 9.99/10.17/10.13 ms = 98.5-100.4 fps (12.8-12.9 ms, 78 fps).
+- Scripted play (same path, same Card Forge end screen), 224 s: 88.3 fps, game 11.54 ms, >50 ms 25 s, >100 ms 3 s,
+  >250 ms 1, worst 257 ms. (old 67.7 fps 60/6/1 worst 312; fix A 74.5 fps 56/8/1 worst 317.)
+- Puzzle Craft: PC1 119.9 fps (min 119.0), PC2 119.9 (min 118.7), no crashes, real saves unchanged.
+- Remaining: loading frames of 0.5-2.5 s still happen (own code); first-time screens still hitch, smaller.
+  Next leads: per-new-block membarrier (smp_call_function_many_cond ~3% + __clear_cache 1% while loading), the
+  rest of engine::run, translated code quality (~50% of the main thread).

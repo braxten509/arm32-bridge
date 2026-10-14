@@ -199,6 +199,12 @@ fn lock(uc: &Uc, mutex: u32, count: u32, try_only: bool) -> u32 {
     }
 }
 
+/// pthread_mutex_lock without waiting: Some(0) when it was taken now (free,
+/// or a recursive mutex this thread holds), None when the full lock is needed.
+pub fn lock_if_free(uc: &Uc, mutex: u32) -> Option<u32> {
+    (lock(uc, mutex, 1, true) == 0).then_some(0)
+}
+
 /// Unlocks fully when `all` (for condition waits); returns the old depth.
 fn unlock(uc: &Uc, mutex: u32, all: bool) -> Result<u32, u32> {
     let me = uc.get_data().id;

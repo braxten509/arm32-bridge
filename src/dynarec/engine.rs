@@ -243,7 +243,7 @@ type PcMap<V> = HashMap<u32, V, BuildHasherDefault<PcHasher>>;
 
 /// Jump table for computed jumps in translated code (`emit_exit_to`):
 /// 2^JUMP_TABLE_BITS entries indexed by guest pc bits 1 and up.
-pub(super) const JUMP_TABLE_BITS: u32 = 12;
+pub(super) const JUMP_TABLE_BITS: u32 = 16;
 
 /// Each entry is one 64-bit word, `(code - CODE_BASE) << 32 | guest pc`, so
 /// a thread never reads one block's pc with another block's code.
@@ -622,7 +622,9 @@ pub fn run(uc: &mut Uc, pc: u32, stop_at: u32) -> Result<(), String> {
             if index < runtime::FIRST_STUB {
                 return Err(format!("guest returned to a stale return trap at {address:#010x}"));
             }
-            runtime::call_stub(uc, index);
+            if !runtime::call_light(uc, index) {
+                runtime::call_stub(uc, index);
+            }
             let thread = uc.get_data();
             if let Some(fault) = &thread.fault {
                 return Err(fault.clone());
