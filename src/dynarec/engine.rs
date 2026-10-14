@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use unicorn_engine::RegisterARM;
@@ -286,8 +286,8 @@ static ENTER: AtomicUsize = AtomicUsize::new(0);
 static EXIT_STUB: AtomicUsize = AtomicUsize::new(0);
 
 /// The dispatcher's lock-free first look: the jump table entry for `pc`, if
-/// it holds that pc (blocks are only dropped with every other thread stopped,
-/// and their entries cleared then). The block end is not known here; it is
+/// it holds that pc (only published blocks get entries; blocks are only
+/// dropped with every other thread stopped, and their entries cleared then). The block end is not known here; it is
 /// only needed by the checker, which turns linking (and this table) off.
 fn table_block(pc: u32) -> Option<(usize, u32, usize, usize)> {
     if jump_table() == 0 {
@@ -330,6 +330,10 @@ struct Cache {
     /// (first guest address, pc) → guest address just past the block, so a
     /// cache flush can find the blocks it covers.
     made_blocks: std::collections::BTreeMap<(u32, u32), u32>,
+    /// Translated blocks not published yet (linking only), and when the
+    /// oldest of them was made.
+    unpublished: PcMap<()>,
+    batch_started: Option<std::time::Instant>,
     /// Fallback sites: guest pc → times run in Unicorn (ARM32_STATS=1 prints them).
     fallbacks: HashMap<u32, u64>,
     fallback_total: u64,
@@ -358,6 +362,8 @@ fn cache() -> &'static RwLock<Cache> {
             incoming: PcMap::with_capacity_and_hasher(1 << 16, Default::default()),
             made_blocks: std::collections::BTreeMap::new(),
             starts: Vec::with_capacity(1 << 19),
+            unpublished: PcMap::default(),
+            batch_started: None,
             fallbacks: HashMap::new(),
             fallback_total: 0,
         })
@@ -374,11 +380,10 @@ fn write_cache() -> RwLockWriteGuard<'static, Cache> {
 
 /// Translated code is visible to this core; make every other core running
 /// this process drop instructions it may have fetched early, before code
-/// that jumps there is published (parallel mode only).
-fn sync_other_cores() {
-    if !runtime::parallel() {
-        return;
-    }
+/// that jumps there is published. False if that could not be done (then new
+/// code stays unpublished: only `block_for`, which syncs its own core, hands
+/// it out).
+fn sync_other_cores() -> bool {
     const REGISTER_SYNC_CORE: libc::c_int = 64;
     const SYNC_CORE: libc::c_int = 32;
     static REGISTERED: OnceLock<bool> = OnceLock::new();
@@ -389,11 +394,36 @@ fn sync_other_cores() {
         }
         ok
     });
-    if registered {
-        unsafe { libc::syscall(libc::SYS_membarrier, SYNC_CORE, 0, 0) };
-        MEMBARRIERS.fetch_add(1, Ordering::Relaxed);
+    if !registered {
+        return false;
     }
+    let ok = unsafe { libc::syscall(libc::SYS_membarrier, SYNC_CORE, 0, 0) } == 0;
+    if ok {
+        MEMBARRIERS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| crate::log::line("[jit] membarrier sync-core failed; new code stays on the slow path"));
+    }
+    ok
 }
+
+/// Drops instructions this core fetched before code that `block_for` hands
+/// out was written: the writer's cache flush is complete (seen through the
+/// cache lock), and an ISB here is all another core still needs.
+fn sync_this_core() {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!("isb", options(nostack, preserves_flags))
+    };
+}
+
+/// New blocks are published (jump-table entry, waiting exits linked) in
+/// batches, behind one `sync_other_cores` for the batch instead of one per
+/// block; until then only `block_for` hands them out. A batch is published
+/// when it has this many blocks or the oldest is older than PUBLISH_AGE
+/// (checked whenever `block_for` meets an unpublished block or translates).
+const PUBLISH_BATCH: usize = 32;
+const PUBLISH_AGE: std::time::Duration = std::time::Duration::from_micros(500);
 
 /// Times other cores were synced after new code (shown with the stats).
 static MEMBARRIERS: AtomicU64 = AtomicU64::new(0);
@@ -582,6 +612,7 @@ fn drop_blocks(uc: &Uc, covered: impl Fn(&Cache) -> Vec<u32>) {
         for pc in dropped {
             cache.made_blocks.remove(&(pc & !1, pc));
             cache.blocks.remove(&pc);
+            cache.unpublished.remove(&pc);
             for site in cache.incoming.remove(&pc).unwrap_or_default() {
                 unpatch_link(site);
                 cache.pending.entry(pc).or_default().push(site);
@@ -593,6 +624,42 @@ fn drop_blocks(uc: &Uc, covered: impl Fn(&Cache) -> Vec<u32>) {
         }
         sync_other_cores();
     });
+}
+
+/// Set when a batch could not be published (the core sync failed): later
+/// batches don't retry under the write lock on every lookup; new code stays
+/// on the slow path, which is still correct.
+static PUBLISH_FAILED: AtomicBool = AtomicBool::new(false);
+
+fn publish_due(cache: &Cache) -> bool {
+    !cache.unpublished.is_empty()
+        && !PUBLISH_FAILED.load(Ordering::Relaxed)
+        && (cache.unpublished.len() >= PUBLISH_BATCH || cache.batch_started.is_some_and(|t| t.elapsed() >= PUBLISH_AGE))
+}
+
+/// Publishes every unpublished block at once, after syncing every core (a new
+/// block may already link to an older unpublished one, so all go together).
+fn publish(cache: &mut Cache) {
+    if cache.unpublished.is_empty() {
+        return;
+    }
+    if !sync_other_cores() {
+        PUBLISH_FAILED.store(true, Ordering::Relaxed);
+        return;
+    }
+    let batch: Vec<u32> = cache.unpublished.drain().map(|(pc, ())| pc).collect();
+    for pc in batch {
+        let Some(&(address, _)) = cache.blocks.get(&pc) else { continue };
+        let waiting = cache.pending.remove(&pc).unwrap_or_default();
+        for &site in &waiting {
+            patch_link(site, address);
+        }
+        if !waiting.is_empty() {
+            cache.incoming.entry(pc).or_default().extend(waiting);
+        }
+        set_jump(pc, address);
+    }
+    cache.batch_started = None;
 }
 
 /// Puts the `nop` back at a linked exit, so it leaves through the dispatcher.
@@ -643,22 +710,36 @@ fn note_block(address: usize, bytes: usize, pc: u32) {
 }
 
 /// The translated block for a guest pc (bit 0 = Thumb), translating it on
-/// first use: (code, block end, enter glue, exit stub).
+/// first use: (code, block end, enter glue, exit stub). This core is synced
+/// before the caller enters it (it may be unpublished).
 fn block_for(pc: u32) -> (usize, u32, usize, usize) {
+    let block = lookup_block(pc);
+    sync_this_core();
+    block
+}
+
+fn lookup_block(pc: u32) -> (usize, u32, usize, usize) {
+    // (block, whether it waits in a batch that is due for publishing)
     let found = |cache: &Cache| {
         let &(code, end) = cache.blocks.get(&pc)?;
-        if linking() {
+        let waiting = cache.unpublished.contains_key(&pc);
+        if linking() && !waiting {
             // A jump-table miss: the entry may belong to another pc with the same index.
             set_jump(pc, code);
         }
-        Some((code, end, cache.memory.enter, cache.memory.exit_stub))
+        Some(((code, end, cache.memory.enter, cache.memory.exit_stub), waiting && publish_due(cache)))
     };
-    if let Some(block) = found(&read_cache()) {
+    // The read guard is gone before the write lock is taken.
+    let hit = found(&read_cache());
+    if let Some((block, false)) = hit {
         return block;
     }
     let mut guard = write_cache();
-    if let Some(block) = found(&guard) {
-        return block; // another thread translated it meanwhile
+    if publish_due(&guard) {
+        publish(&mut guard);
+    }
+    if let Some((block, _)) = found(&guard) {
+        return block; // published above, or another thread translated it meanwhile
     }
     {
         let cache = &mut *guard;
@@ -691,18 +772,14 @@ fn block_for(pc: u32) -> (usize, u32, usize, usize) {
             snapshot_block(pc, block.end);
         }
         if linking() {
-            // Nothing jumps to the new code yet; other cores sync before anything does.
-            sync_other_cores();
-            let waiting = cache.pending.remove(&pc).unwrap_or_default();
-            for &site in &waiting {
-                patch_link(site, address);
+            // Nothing jumps to the new code until its batch is published.
+            if cache.unpublished.is_empty() {
+                cache.batch_started = Some(std::time::Instant::now());
             }
-            if !waiting.is_empty() {
-                cache.incoming.entry(pc).or_default().extend(waiting);
+            cache.unpublished.insert(pc, ());
+            if publish_due(cache) {
+                publish(cache);
             }
-            set_jump(pc, address);
-        } else {
-            sync_other_cores();
         }
         (address, block.end, enter, exit_stub)
     }

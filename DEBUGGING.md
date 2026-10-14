@@ -1827,3 +1827,50 @@ ms/frame must improve beyond noise; self-test 0 failures in six modes; three gam
   vs 16 MB table alone: jt21-t1 118.2 | 8.43 | 30/3/0 | 226;  jt21-t2 118.1 | 8.44 | 31/3/0 | 210 (jt16 controls 31-35).
   => KEPT: seconds with a frame >50 ms ~30 -> ~10, worst pause ~210-226 -> 181-191 ms, fps +1. (Owner rule: two runs
   pointing the same way is enough for a speed change.)
+- D implemented (engine.rs: sync_other_cores -> bool, no PARALLEL=0 skip; sync_this_core ISB at the end of every
+  block_for; unpublished set + publish/publish_due, batch 32 / 0.5 ms; found() no set_jump for unpublished; drops
+  remove from the set; linking off never publishes). Code review t5 (codex gpt-6.1-sol high, read-only): SHIP; all
+  four required points and the entry-path audit pass. Two perf notes, both fixed: after a failed sync stop retrying
+  on every lookup (PUBLISH_FAILED; new code stays on the safe slow path); drain the set instead of mem::take (keeps
+  its capacity). Inherited, unchanged: drop_blocks ignores a failed sync after unlinking.
+- B measurement flush1 (flush log on, A+B+C build; 118.6 fps, 26/4/0, worst 233 ms; logging slows it): 86,609 guest
+  cacheflush calls in ~4 min (sizes: 12 bytes 39k, 4 bytes 32k, 24 bytes 7.7k). 56,358 hit no translated block.
+  30,251 hit translated blocks (each = stop_world + drop + retranslate): in 19,200 of them (63%) the guest bytes
+  of every dropped block were UNCHANGED; in 11,051 they changed, and the first changed word was always BL -> BL
+  (Mono call-site patching confirmed). No flush mixed changed and unchanged blocks.
+  => Candidate fix E: before dropping, compare each covered made block's bytes with a stored copy; if none changed,
+  skip stop_world/drop/retranslate (the translation still matches memory; made blocks don't fold literals from
+  outside their range). Would remove ~63% of stop-the-worlds. Needs an exact copy per made block (no hash).
+- D test round (job 015): PC + phone builds clean; PC self-test 0 failures; phone modes default, FORCE_FALLBACK_SYNC,
+  CHECK=all (3,725,122 blocks, 0 differences), LSE=0, PARALLEL=0, ENGINE=unicorn: 0 failures. NEW mode ARM32_LINK=0:
+  1 failure, "four busy threads run at the same time" (timing test: four threads must take < 0.75 x 4 x one thread).
+  No baseline for LINK=0 yet (first time this mode ran). pc-check dpub: PC1 119.9 fps saves unchanged; PC2 120.0 fps
+  "CHANGED" = only the 0-byte stgs.atgsave again (pc2.atgsave still dated 2026-10-13). Counter run d-stats:
+  239,743 blocks (30,272 dropped), 42,169 core syncs (was 301,483: -86%), 30,276 stops (unchanged, as expected).
+- D play runs: d-t1 117.6 fps | 8.48 ms | 43/7/0 | 213 ms;  d-t2 117.5 | 8.48 | 43/5/0 | 240 ms.
+  vs abc-t1/t2 10/3/0 and 9/2/0. Phone cool (skin ~31 C). WORSE. Per-second view of d-t1 battle (60-230 s):
+  39 slow seconds vs 5 in abc-t1; the slow frames are 55-58 ms of OWN guest code with 0 stops that second, roughly
+  every 4 s (abc-t1 has the same kind at 45-51 ms, mostly under the line). Guest own-code ms/frame 6.34 vs 5.58
+  (+14%). So D slows steady guest code; not the first-visit bursts, not stops. Suspects: (1) the ISB now run at the
+  end of every block_for (jump-table misses take it every time); (2) something keeping blocks unpublished longer
+  than intended. Or the game state moved on since the abc runs: checking with the old build next (base-t1).
+- Fix E (owner said yes) drafted in a copy (/tmp/e/src-tree) while D tested. Review t6 (codex gpt-6.1-sol high,
+  read-only), round 1: FIX FIRST. (1) A->B->A while translating: a copy taken before translating and compared after
+  can still pair code made from B with a copy of A. (2) An unchanged native prefix doesn't prove an overlapping
+  flush is harmless to Unicorn (e.g. a fallback instruction just past block.end changed).
+  Revision: the translator now decodes instructions FROM the copy (Translator copy/fetch_u16/fetch_u32,
+  translate_copy / translate_arm_copy; a read past the copy reads memory and the copy isn't kept); a flush skips
+  the stop only when every overlapping made block matches its copy AND together they cover every flushed byte;
+  otherwise stop_world always runs (even with nothing to drop) and only changed / copy-less blocks are dropped.
+  Unit tests translates_from_the_copy (ARM, Thumb, movw halves, IT; copy cut inside) and covers_needs_every_
+  flushed_byte; guest self-test same_bytes_flushes_across_threads.
+  Round 2: (1) fixed; remaining P1: a runner between sync_unicorn_code and emu_start in fallback(). Round 3 after
+  my argument (the old stop also lets that already-started <= 5-instruction run execute stale code, it only waits
+  for it; ARM lets a core run already-fetched old instructions until its own ISB; the next fallback re-syncs):
+  SHIP, P1 retracted. Flush sizes from flush1: unchanged flushes were 12 bytes (9,613) and 4 bytes (9,587), so the
+  coverage rule may skip fewer than 63% (12-byte patches may run past a block); the stats counter
+  "flushes changed none" will show it.
+- Same-session control: old build c805592 (built in /tmp/base, installed with its own convert.sh) base-t1:
+  117.8 fps | 8.46 ms | 46/6/0 | 222 ms. Same as D (43/7, 43/5). => D did NOT cause the slower runs; the game/phone
+  state changed since abc-t1/t2 (same lesson as before: only compare against controls from the same session).
+  Within the session D is no worse (43, 43 vs 46). What changed is unknown (game progress? phone state?).
