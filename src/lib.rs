@@ -15,4 +15,6 @@ pub mod app;
 #[cfg(target_os = "android")]
 pub mod natives;
 #[cfg(target_os = "android")]
+pub mod perf_hint;
+#[cfg(target_os = "android")]
 pub mod sound_preload;

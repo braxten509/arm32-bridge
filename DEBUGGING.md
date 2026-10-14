@@ -1527,3 +1527,80 @@ ms/frame must improve beyond noise; self-test 0 failures in six modes; three gam
 - Remaining: loading frames of 0.5-2.5 s still happen (own code); first-time screens still hitch, smaller.
   Next leads: per-new-block membarrier (smp_call_function_many_cond ~3% + __clear_cache 1% while loading), the
   rest of engine::run, translated code quality (~50% of the main thread).
+
+## Owner: "still very noticeably laggy" (2026-10-14, after jump table)
+- Owner session (runs/ownerplay-jt16, 216 s after loading): median 87 fps, p10 68; 178 s had a frame >17 ms,
+  58 >25 ms, 31 >33 ms, 14 >50 ms, 5 >100 ms, 3 >250 ms.
+- Frame trace (Perfetto android.surfaceflinger.frametimeline, scripts/cw-trace-play.sh, runs/trace-jt16,
+  60 s inside the scripted battle tap loop). Gaps between frames reaching the screen (5363 frames):
+  <=9 ms 3841, ~17 ms 1364, ~25 ms 99, ~33 ms 26, ~50 ms 24, >50 ms 8.
+  => motion is uneven all the time: 8.3/16.7 ms mixed (example run: 8.3 8.3 8.4 16.7 8.3 8.3 8.4 8.3 33.4 ...),
+  ~23 doubled frames per second, plus ~2.6 gaps per second of 25 ms or longer. Long gaps are not on a 1 s clock.
+- Per-second [fps] lines in the battle loop: slowest frame p50 33.6 ms (own code 30.4, phone 3.3), p75 45 ms,
+  p90 52 ms. So in most seconds one frame takes 3-6x the median 10 ms, almost all of it translated code + engine.
+- Kernel has no trace events (/sys/kernel/tracing/events missing): no scheduler data from Perfetto or simpleperf.
+- Old play profile (play3) per-core: UnityMain ~88% on the big core (cpu7), ~12% on mid cores; render thread
+  (arm32-guest-108, GLES calls) on mid/little cores 0-6. Guest threads 102/103 burn ~1.1 cores in kernel
+  wakeups + a small guest loop (+0x...896c4ec0/4f38) + wait_until: looks like spin/wait churn.
+- Display offers 60 and 120 Hz only.
+- Correction: the "battle tap loop" in cw-scripted-play.sh does not reach a battle any more; it taps through menus
+  and ends on Card Forge (owner confirmed: menu actions, no battle). trace-jt16/trace2-jt16 are menu play.
+- trace2-jt16: Perfetto frames + simpleperf 2000 Hz together (60 s). Clocks lined up with /proc/uptime (boottime)
+  vs /proc/timer_list "now" (monotonic): offset 10930.24 s. Scripts: analysis/slow-frames.py, core-vs-gap.py.
+  * Slow gaps vs normal: UnityMain runs ~1650 samples/s in both (it is busy nearly all the time; CPU-bound).
+    What it runs is the same mix (translated ~64%, kernel wake ~12.5%, engine::run 6%, clock_gettime vdso 4%).
+    Difference is WHERE: in slow windows UnityMain is on the big core (cpu7) 52% of samples, normal 74%.
+  * Per frame gap, by UnityMain's big-core share in that frame (lag 8 ms; 0 and 16 ms give the same picture):
+      0-20%: 711 gaps, 10.8% slow (>24 ms), mean 15.1 ms | 20-40%: 190, 13.7%, 14.9 ms | 40-60%: 196, 8.7%, 13.3 ms
+      60-80%: 406, 3.7%, 11.2 ms | 80-100%: 3648, 2.1%, 10.7 ms
+    => about one frame in five runs mostly on a mid core (A725 3.05 GHz vs X4 3.78 GHz); those are 40% slower and
+    5x more likely to hitch. Roughly half the long gaps come from these frames.
+  * cpu7 clock while the game sat on Card Forge: 3.40, 2.94, 0.88 GHz in three 1 s reads (governor ramps down).
+    Thermal status 0 (no throttling).
+  * Mono GC (Boehm stop-the-world, signals 24/30 to ~5 threads): 261 collections in 193 s; seconds with 0 GCs still
+    have median slowest frame 33 ms, seconds with 4+ GCs 55-178 ms. => GC causes the biggest spikes only.
+  * Thread groups "arm32-guest-102"/"103" (comm is truncated: handles 0x102x/0x103x, 4 threads each, Unity worker
+    threads t9-t15) use ~1.5 cores together on a still menu: futex syscalls + kernel wake-ups + guest code.
+- No ADPF performance hint, uclamp or affinity use in the bridge (grep).
+- Sub-agent review (2026-10-14, codex gpt-6.1-sol, read-only): 
+  * My clock offset was 45 ms off: trace clock snapshots give BOOTTIME-MONOTONIC = 10930.285099031 s (use this).
+    Corrected, the association stays: UnityMain cpu7 share 0-20%: 688 gaps, 13.8% >24 ms, mean 16.14 ms;
+    80-100%: 3702 gaps, 2.0%, 10.63 ms. But a window 48 ms after the present shows it too, so it's a link
+    between busy stretches and placement, not proof that moving cores causes the slow frames.
+  * layer_name IS NULL rows are SurfaceFlinger display frames (all layers), not the game's own frames.
+  * Gap counts recomputed: trace-jt16 89.4 updates/s, 2.58 gaps >24 ms per s; trace2-jt16 86.3, 3.50 per s.
+  * Worker TIDs under names 102/103: 86.9 CPU-s in 60 s (~1.45 cores). UnityChoreographer 4.6 CPU-s.
+  * Ranking for what a player feels: B (real 60 fps pacing, not just setFrameRate: Android says setFrameRate
+    does not throttle) > A (performance hint) > C (honour affinity: cpu2-7 mask barely changes UnityMain,
+    which is on cpu0-1 only 0.47% of samples).
+  * Suggested: causality test with UnityMain held on cpu7 vs not (diagnostic only); real battle captures.
+- Core causality test (diagnostic only, no code change): scripts/cw-trace-play.sh with PIN=80 runs
+  `taskset -p 80 <UnityMain tid>` (cpu7 only) at READY+75 s, through the end; Perfetto 60 s frames, no sampler.
+  Alternated pin, normal, pin, normal (analysis/gaps.py):
+    pin7-1: 111.1 updates/s | 17 ms gaps 6.7/s | >24 ms 0.80/s | >33 ms 0.12/s | >50 ms 0.02/s | max 58 ms
+    ctl-1 :  92.8           | 20.0/s            | 2.55/s        | 0.40/s        | 0.13/s        | max 175 ms
+    pin7-2: 107.7           |  8.7/s            | 1.12/s        | 0.28/s        | 0.03/s        | max 150 ms
+    ctl-2 :  89.1           | 22.6/s            | 2.95/s        | 0.52/s        | 0.08/s        | max 175 ms
+    (earlier normal: trace-jt16 89.4 / 22.8 / 2.58; trace2-jt16 86.3 / 24.5 / 3.50)
+  Whole-session [fps] (pin covers the last ~150 of 225 s): pin 100.8 / 97.6 fps, normal 88.2 / 86.9 fps.
+  => CONFIRMED: keeping the main thread on the fastest core cuts doubled frames ~65% and long gaps ~65%.
+  Core placement is a cause, not just a side effect. Pinning itself is only a diagnostic (device-specific).
+
+## Fix: Android performance hint for the frame thread (owner chose A, 2026-10-14)
+- Change: new src/perf_hint.rs (Android only). On the first nativeRender frame it opens an APerformanceHint session
+  (looked up with dlopen/dlsym in libandroid.so) for the thread running the frame, target = 1/TARGET_REFRESH_RATE
+  (8.33 ms), and after each frame reports the frame's time minus time spent in eglSwapBuffers on that thread
+  (egl.rs times each swap). If frames move to another thread, the session follows. debug.arm32bridge.hint=0 = off.
+- Known limit: Unity swaps on its render thread, so UnityMain's report includes waits for that thread.
+- Pass check: 2 hint + 2 normal (hint=0) runs alternating with cw-trace-play.sh (menu path) + gaps.py; doubled
+  frames and >24 ms gaps clearly below every normal run so far (17 ms 20.0-24.5/s, >24 ms 2.55-3.50/s); self-test
+  0 failures (PC + six phone modes); Card Wars loading x3 not worse; Puzzle Craft 1/2 fps and real saves unchanged.
+- Result (owner kept it after one run, 2026-10-14; owner rule: two runs pointing to a gain is enough for speed
+  changes): hint-1 105.2 updates/s | 17 ms gaps 10.7/s | >24 ms 1.28/s | >33 ms 0.32/s | >50 ms 0.05/s | max 200 ms
+  (normal runs 86-93 / 20-24.5 / 2.55-3.50). Remaining comparison runs stopped at the owner's request.
+- Checks: PC self-test 0 failures; phone six modes 0 failures (CHECK=all 2,854,559 blocks, 0 differences);
+  Puzzle Craft 1 120.0 fps (min 119.8), PC2 119.9 (min 119.1), no crashes; PC1 saves unchanged.
+  PC2 "CHANGED" = SDK files (Flurry, AppEventsLogger, Crashlytics .cls, .tap, FusePrefsFile, WebViewChromiumPrefs)
+  plus files/stgs.atgsave, which PC2 rewrites as 0 bytes on every launch (not touched on Home/stop). Main save
+  pc2.atgsave unchanged (6516 bytes, last written 2026-10-13 23:36). OPEN: is a 0-byte stgs.atgsave normal for
+  PC2 or a bridge file-write bug? Not related to the hint (frame timing only).

@@ -393,7 +393,10 @@ mod host {
             "eglGetCurrentDisplay" => handler!(|uc, a| Ret::U32(guest(unsafe { eglGetCurrentDisplay() }))),
             "eglSwapBuffers" => handler!(|uc, a| {
                 let (display, surface) = (host(a.u32()), host(a.u32()));
-                Ret::U32(unsafe { eglSwapBuffers(display, surface) })
+                let started = std::time::Instant::now();
+                let done = unsafe { eglSwapBuffers(display, surface) };
+                crate::perf_hint::note_swap(started.elapsed());
+                Ret::U32(done)
             }),
             "eglSwapInterval" => handler!(|uc, a| {
                 let (display, interval) = (host(a.u32()), a.i32());

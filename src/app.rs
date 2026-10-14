@@ -368,6 +368,7 @@ pub fn forward(env: *mut JNIEnv, symbol: &str, address: &AtomicU32, args: &[Host
         _ => result & 0xFFFF_FFFF,
     };
     if is_frame {
+        crate::perf_hint::frame_done(started.elapsed(), Duration::from_secs_f32(1.0 / TARGET_REFRESH_RATE));
         count_frame(
             started.elapsed(),
             crate::runtime::phone_time(uc) - phone_before,
