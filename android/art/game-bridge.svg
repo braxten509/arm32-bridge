@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" fill="none" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="white-controls" x1="495" x2="525" y1="323" y2="368" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#fff" offset="0"/>
+      <stop stop-color="#D4E3FF" offset="1"/>
+    </linearGradient>
+  </defs>
+  <g id="background">
+    <rect width="1024" height="1024" fill="#14161C"/>
+  </g>
+  <g id="game-controller">
+    <path id="controller-under-edge" d="m419 385c-1 16 3 34 18 39 13 6 25-8 37-22 5-6 9-11 18-11h40c11 0 16 6 23 14 12 15 22 25 35 18 14-7 18-23 15-38h-186z" fill="#1F2230"/>
+    <path id="controller-body" d="m419 380c4-19 11-42 18-58 6-13 16-20 30-20 13 0 24 5 45 4 22 1 32-4 45-4 15 0 24 8 31 23 7 17 13 37 17 56 3 14-4 27-15 30-16 5-24-9-37-24-5-6-11-10-19-10h-44c-10 0-15 4-21 11-12 14-20 27-33 24-14-2-20-14-17-32z" fill="#5B7CFA" stroke="#1F2230" stroke-width="1.6"/>
+    <g id="direction-pad">
+      <path d="m468 323.5h1.5c3.5 0 5.5 2.3 5.5 5.5v9h8.5c3.9 0 6 2.1 6 5.4v1.9c0 3.2-2.2 5.2-5.5 5.2h-9v8.8c0 3.5-2.2 5.7-5.7 5.7h-1.5c-3.5 0-5.8-2.4-5.8-5.7v-8.8h-9c-3.4 0-5.6-2.1-5.6-5.5v-1.5c0-3.5 2.3-5.5 5.8-5.5h8.8v-8.9c0-3.3 2.3-5.6 6-5.6z" fill="#E8E8EE" stroke="#E8E8EE" stroke-opacity=".7" stroke-width="1.2"/>
+    </g>
+    <g id="controller-action-buttons" fill="url(#white-controls)" stroke="#F3F8FF" stroke-opacity=".7" stroke-width="1.2">
+      <circle cx="557.5" cy="330.1" r="6.5" fill="#E8E8EE" stroke="#E8E8EE"/>
+      <circle cx="543.5" cy="344.2" r="6.5" fill="#E8E8EE" stroke="#E8E8EE"/>
+      <circle cx="571.5" cy="344.2" r="6.5" fill="#E8E8EE" stroke="#E8E8EE"/>
+      <circle cx="557.5" cy="358.3" r="6.5" fill="#E8E8EE" stroke="#E8E8EE"/>
+    </g>
+  </g>
+</svg>

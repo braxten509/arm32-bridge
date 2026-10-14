@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Game controller from android/art/game-bridge.svg, centred and scaled 2.55x for the adaptive icon. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="1024"
+    android:viewportHeight="1024">
+    <group
+        android:pivotX="511"
+        android:pivotY="366"
+        android:scaleX="2.55"
+        android:scaleY="2.55"
+        android:translateX="1"
+        android:translateY="146">
+        <path
+            android:fillColor="#1F2230"
+            android:pathData="m419 385c-1 16 3 34 18 39 13 6 25-8 37-22 5-6 9-11 18-11h40c11 0 16 6 23 14 12 15 22 25 35 18 14-7 18-23 15-38h-186z" />
+        <path
+            android:fillColor="#5B7CFA"
+            android:strokeColor="#1F2230"
+            android:strokeWidth="1.6"
+            android:pathData="m419 380c4-19 11-42 18-58 6-13 16-20 30-20 13 0 24 5 45 4 22 1 32-4 45-4 15 0 24 8 31 23 7 17 13 37 17 56 3 14-4 27-15 30-16 5-24-9-37-24-5-6-11-10-19-10h-44c-10 0-15 4-21 11-12 14-20 27-33 24-14-2-20-14-17-32z" />
+        <path
+            android:fillColor="#E8E8EE"
+            android:strokeColor="#E8E8EE"
+            android:strokeAlpha="0.7"
+            android:strokeWidth="1.2"
+            android:pathData="m468 323.5h1.5c3.5 0 5.5 2.3 5.5 5.5v9h8.5c3.9 0 6 2.1 6 5.4v1.9c0 3.2-2.2 5.2-5.5 5.2h-9v8.8c0 3.5-2.2 5.7-5.7 5.7h-1.5c-3.5 0-5.8-2.4-5.8-5.7v-8.8h-9c-3.4 0-5.6-2.1-5.6-5.5v-1.5c0-3.5 2.3-5.5 5.8-5.5h8.8v-8.9c0-3.3 2.3-5.6 6-5.6z" />
+        <path
+            android:fillColor="#E8E8EE"
+            android:strokeColor="#E8E8EE"
+            android:strokeAlpha="0.7"
+            android:strokeWidth="1.2"
+            android:pathData="M551,330.1 a6.5,6.5 0 1,0 13,0 a6.5,6.5 0 1,0 -13,0 z M537,344.2 a6.5,6.5 0 1,0 13,0 a6.5,6.5 0 1,0 -13,0 z M565,344.2 a6.5,6.5 0 1,0 13,0 a6.5,6.5 0 1,0 -13,0 z M551,358.3 a6.5,6.5 0 1,0 13,0 a6.5,6.5 0 1,0 -13,0 z" />
+    </group>
+</vector>
