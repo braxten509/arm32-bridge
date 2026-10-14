@@ -663,6 +663,7 @@ fn stop_and_drop(uc: &Uc, covered: impl Fn(&Cache) -> Vec<u32>) {
     runtime::stop_world(uc, || {
         let mut cache = write_cache();
         let dropped = covered(&cache);
+        let dropped_none = dropped.is_empty();
         DROPPED.fetch_add(dropped.len() as u64, std::sync::atomic::Ordering::Relaxed);
         for pc in dropped {
             cache.made_blocks.remove(&(pc & !1, pc));
@@ -676,6 +677,10 @@ fn stop_and_drop(uc: &Uc, covered: impl Fn(&Cache) -> Vec<u32>) {
             if entry.load(Ordering::Relaxed) as u32 == pc {
                 entry.store(EMPTY_JUMP, Ordering::Relaxed);
             }
+        }
+        if !dropped_none {
+            // Unlinked exits were rewritten in place: the next lookup syncs.
+            CODE_WRITTEN.fetch_add(1, Ordering::Release);
         }
         sync_other_cores();
     });
@@ -769,8 +774,24 @@ fn note_block(address: usize, bytes: usize, pc: u32) {
 /// before the caller enters it (it may be unpublished).
 fn block_for(pc: u32) -> (usize, u32, usize, usize) {
     let block = lookup_block(pc);
-    sync_this_core();
+    // Only code written since this thread last synced can be stale here.
+    let placed = CODE_WRITTEN.load(Ordering::Acquire);
+    SYNCED_AT.with(|synced| {
+        if synced.get() != placed {
+            sync_this_core();
+            synced.set(placed);
+        }
+    });
     block
+}
+
+/// Code writes so far (bumped under the cache lock once a new block is
+/// placed, before it can be found, and once dropped blocks' links are undone),
+/// and the count each thread last ran `sync_this_core` at (none yet: it syncs
+/// on its first lookup).
+static CODE_WRITTEN: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    static SYNCED_AT: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
 }
 
 fn lookup_block(pc: u32) -> (usize, u32, usize, usize) {
@@ -823,6 +844,7 @@ fn lookup_block(pc: u32) -> (usize, u32, usize, usize) {
         }
         let placed = cache.memory.place(&block.code);
         debug_assert_eq!(placed, address);
+        CODE_WRITTEN.fetch_add(1, Ordering::Release);
         note_block(address, block.code.len() * 4, pc);
         cache.blocks.insert(pc, (address, block.end));
         cache.starts.push((address, pc));
