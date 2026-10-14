@@ -1874,3 +1874,31 @@ ms/frame must improve beyond noise; self-test 0 failures in six modes; three gam
   117.8 fps | 8.46 ms | 46/6/0 | 222 ms. Same as D (43/7, 43/5). => D did NOT cause the slower runs; the game/phone
   state changed since abc-t1/t2 (same lesson as before: only compare against controls from the same session).
   Within the session D is no worse (43, 43 vs 46). What changed is unknown (game progress? phone state?).
+- LINK=0 "four busy threads" timing (every block exit goes through block_for in this mode):
+  old build c805592: one 2224 ms, four 41864 ms (fails too: pre-existing, four threads ~19x one);
+  D (c57e0c8): one 4166 ms, four 49941 ms. => the failure is not D's, but D's ISB at the end of every block_for
+  nearly doubles single-thread time when every exit takes that path. In linking mode block_for is rare (Card Wars
+  same-session runs no worse), but the ISB is only needed when code was placed since this thread last synced.
+  Planned D follow-up: a global "code placed" counter (bumped under the write lock before a new block is visible)
+  and a per-thread last-synced value; ISB only when they differ.
+- Fix E applied to the project after D was committed (files: dynarec/{engine,thumb,arm,neon}.rs, selftest.cpp);
+  full round job 021 running (builds clean, 7 unit tests pass).
+- LINK=0 round 2: old one 2597 / four 46427 ms; D one 3969 / four 53628 ms (both fail the overlap check).
+  Confirms: four-thread failure pre-existing; D's per-call ISB costs ~1.5-1.9x single-thread time in this mode.
+  Follow-up drafted in /tmp/f (CODE_PLACED counter + per-thread SYNCED_AT); review t7 running.
+- Review t7 (codex gpt-6.1-sol high) of the ISB follow-up: round 1 FIX FIRST: with a failed membarrier, a drop
+  unpatches links without placing a block, so a thread could skip the ISB and follow a stale branch into a
+  dropped block (the per-call ISB covered that). Fix: counter renamed CODE_WRITTEN, also bumped in stop_and_drop
+  after the unlink loop when anything was dropped. Round 2: SHIP. Still open (inherited, unchanged): a failed
+  drop sync on paths that bypass block_for (table/linked code).
+- Fix E round (job 021): PC/phone builds clean, 7 unit tests pass, PC self-test 0 failures; phone modes default,
+  FORCE_FALLBACK_SYNC, CHECK=all (3,750,914 blocks, 0 differences), LSE=0, PARALLEL=0, ENGINE=unicorn 0 failures;
+  LINK=0 only the pre-existing four-thread timing failure. New self-test same_bytes_flushes_across_threads passes.
+  pc-check epub: PC1 120.0 fps saves unchanged; PC2 119.9 fps, only stgs.atgsave (pc2.atgsave still 2026-10-13).
+  Counter run e-stats: 249,444 blocks, 10,957 dropped (D: 30,272), 19,322 flushes changed none (skipped),
+  33,604 core syncs, 20,690 stops (D: 30,276; -32%). Stops minus drops ~9.7k = flushes forced to stop by the
+  coverage rule (unchanged but not fully inside saved copies, likely the 12-byte patches running past a block).
+- Fix E play runs: e-t1 117.9 fps | 8.46 ms | 42/5/0 | 220 ms;  e-t2 117.4 | 8.48 | 43/5/0 | 208 ms.
+  Same session: D 43/7/0 213 ms, 43/5/0 240 ms; old build 46/6/0 222 ms. >100 ms seconds and worst pause lean
+  slightly better; >50 ms count unchanged (dominated by today's ~56 ms game frames). KEPT (stops -32%, no
+  correctness cost found).

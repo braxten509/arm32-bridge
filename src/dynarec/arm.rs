@@ -2,12 +2,17 @@
 //! Every ARM instruction has a condition; a conditional one is wrapped in a
 //! branch over it, like an instruction in a Thumb IT block.
 
-use super::{cond, emit_exit, emit_exit_to, exit, host, offsets, shift, sign_extend, Asm, Block, Flow, GuestMem, Reg, Result, Translator};
+use super::{cond, emit_exit, emit_exit_to, exit, host, offsets, shift, sign_extend, Block, Flow, GuestMem, Reg, Result, Translator};
 use super::{LR, MAX_INSTRUCTIONS, PC, SP, T0, T1, T2, T3, T4, T5, T6};
 
 /// Translates the ARM block starting at `start` (4-byte aligned).
 pub fn translate(mem: GuestMem, start: u32) -> Block {
-    let mut t = Translator { a: Asm::new(), mem, pc: start, size: 4, count: 0, in_it: false, thumb: false, neon_fp: false };
+    translate_copy(mem, start, Vec::new()).0
+}
+
+/// Like `translate`, reading instructions from `copy` (see `thumb::translate_copy`).
+pub fn translate_copy(mem: GuestMem, start: u32, copy: Vec<u8>) -> (Block, Vec<u8>, bool) {
+    let mut t = Translator::new(mem, start, false, copy);
     if let Some(word) = super::fence_prefix() {
         t.a.emit(word);
     }
@@ -19,7 +24,7 @@ pub fn translate(mem: GuestMem, start: u32) -> Block {
             break;
         }
         let checkpoint = t.a.checkpoint();
-        let word = mem.read_u32(t.pc);
+        let word = t.fetch_u32(t.pc);
         match t.arm_instruction(word) {
             Ok(Flow::Next) => {
                 t.pc += 4;
@@ -38,7 +43,7 @@ pub fn translate(mem: GuestMem, start: u32) -> Block {
         }
     }
     t.a.finish();
-    Block { code: t.a.code, end, links: t.a.links }
+    (Block { code: t.a.code, end, links: t.a.links }, t.copy, t.read_outside)
 }
 
 /// The ARM data-processing opcodes in the Thumb-2 numbering `data_processing` uses.

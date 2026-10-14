@@ -16,7 +16,7 @@ mod arm;
 mod neon;
 #[path = "vfp.rs"]
 mod vfp;
-pub use arm::translate as translate_arm;
+pub use arm::{translate as translate_arm, translate_copy as translate_arm_copy};
 
 const MAX_INSTRUCTIONS: u32 = 64;
 
@@ -117,6 +117,44 @@ struct Translator {
     thumb: bool,
     /// Host FPCR is in NEON's standard mode (see neon.rs); blocks start in the guest's FPSCR mode.
     neon_fp: bool,
+    /// Instructions are read from this copy of guest memory from `copy_start`
+    /// on (see `translate_copy`); `read_outside` notes a read past it.
+    copy: Vec<u8>,
+    copy_start: u32,
+    read_outside: bool,
+}
+
+impl Translator {
+    fn new(mem: GuestMem, start: u32, thumb: bool, copy: Vec<u8>) -> Translator {
+        let size = if thumb { 2 } else { 4 };
+        Translator { a: Asm::new(), mem, pc: start, size, count: 0, in_it: false, thumb, neon_fp: false, copy, copy_start: start, read_outside: false }
+    }
+
+    fn copied(&self, address: u32, length: usize) -> Option<&[u8]> {
+        let offset = address.wrapping_sub(self.copy_start) as usize;
+        self.copy.get(offset..offset.checked_add(length)?)
+    }
+
+    /// An instruction halfword or word (from the copy when it holds it).
+    fn fetch_u16(&mut self, address: u32) -> u16 {
+        match self.copied(address, 2) {
+            Some(bytes) => u16::from_le_bytes([bytes[0], bytes[1]]),
+            None => {
+                self.read_outside = true;
+                self.mem.read_u16(address)
+            }
+        }
+    }
+
+    pub(super) fn fetch_u32(&mut self, address: u32) -> u32 {
+        match self.copied(address, 4) {
+            Some(bytes) => u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            None => {
+                self.read_outside = true;
+                self.mem.read_u32(address)
+            }
+        }
+    }
 }
 
 /// A translated block: code, the guest address just past its last
@@ -129,7 +167,15 @@ pub struct Block {
 
 /// Translates the block starting at `start` (a Thumb address without bit 0).
 pub fn translate(mem: GuestMem, start: u32) -> Block {
-    let mut t = Translator { a: Asm::new(), mem, pc: start, size: 2, count: 0, in_it: false, thumb: true, neon_fp: false };
+    translate_copy(mem, start, Vec::new()).0
+}
+
+/// Like `translate`, reading instructions from `copy` (guest bytes from
+/// `start` on) instead of guest memory, so the block is made from exactly
+/// those bytes even if another thread rewrites them meanwhile. Also returns
+/// the copy and whether an instruction was read past its end.
+pub fn translate_copy(mem: GuestMem, start: u32, copy: Vec<u8>) -> (Block, Vec<u8>, bool) {
+    let mut t = Translator::new(mem, start, true, copy);
     if let Some(word) = fence_prefix() {
         t.a.emit(word);
     }
@@ -141,7 +187,7 @@ pub fn translate(mem: GuestMem, start: u32) -> Block {
             break;
         }
         let checkpoint = t.a.checkpoint();
-        let first = mem.read_u16(t.pc) as u32;
+        let first = t.fetch_u16(t.pc) as u32;
         if first & 0xFF00 == 0xBF00 && first & 0xF != 0 {
             // IT: translate the whole block or fall back for all of it.
             match t.it_block(first) {
@@ -176,7 +222,7 @@ pub fn translate(mem: GuestMem, start: u32) -> Block {
         }
     }
     t.a.finish();
-    Block { code: t.a.code, end, links: t.a.links }
+    (Block { code: t.a.code, end, links: t.a.links }, t.copy, t.read_outside)
 }
 
 /// Decodes a modified immediate (ThumbExpandImm): the value and, for
@@ -695,7 +741,7 @@ impl Translator {
         self.in_it = true;
         let mut ended = false;
         for (i, &condition) in conditions.iter().enumerate() {
-            let first_half = self.mem.read_u16(self.pc) as u32;
+            let first_half = self.fetch_u16(self.pc) as u32;
             if first_half & 0xFF00 == 0xBF00 && first_half & 0xF != 0 {
                 break; // nested IT: invalid
             }
@@ -743,10 +789,10 @@ impl Translator {
     // ---- decoding ----
 
     fn instruction(&mut self, _condition: u32) -> Result<Flow> {
-        let first = self.mem.read_u16(self.pc) as u32;
+        let first = self.fetch_u16(self.pc) as u32;
         if first >> 11 >= 0b11101 {
             self.size = 4;
-            let second = self.mem.read_u16(self.pc + 2) as u32;
+            let second = self.fetch_u16(self.pc + 2) as u32;
             self.thumb32(first, second)
         } else {
             self.size = 2;
@@ -2032,6 +2078,44 @@ impl Translator {
             4 => self.a.dsb_ish(),
             5 => self.a.dmb_ish(),
             _ => self.a.isb(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod copy_tests {
+    use crate::mem::{GuestMem, HEAP_BASE};
+
+    fn bytes(words: &[u32], size: usize) -> Vec<u8> {
+        words.iter().flat_map(|word| word.to_le_bytes()[..size].to_vec()).collect()
+    }
+
+    /// A block is made from the copy it's given, not from guest memory (another
+    /// thread may rewrite that meanwhile); a read past a short copy is noted.
+    #[test]
+    fn translates_from_the_copy() {
+        let mem = GuestMem::reserve();
+        let at = HEAP_BASE;
+        let arm = |value: u32| bytes(&[0xE3A0_0000 | value, 0xE12F_FF1E], 4); // mov r0, #value; bx lr
+        let thumb = |value: u32| bytes(&[0x2000 | value, 0x4770], 2); // movs r0, #value; bx lr
+        let wide = |value: u32| bytes(&[0xF240, value, 0x4770], 2); // movw r0, #value (two halves); bx lr
+        let it = |value: u32| bytes(&[0x4280, 0xBF08, 0x2000 | value, 0x4770], 2); // cmp r0, r0; it eq; moveq r0, #value; bx lr
+        let cases = [(false, arm(1), arm(2)), (true, thumb(1), thumb(2)), (true, wide(1), wide(2)), (true, it(1), it(2))];
+        for (thumb_code, one, two) in cases {
+            let translate = |copy: Vec<u8>| if thumb_code { super::translate_copy(mem, at, copy) } else { super::translate_arm_copy(mem, at, copy) };
+            mem.write_bytes(at, &two);
+            let (from_memory, _, outside) = translate(Vec::new());
+            assert!(outside);
+            mem.write_bytes(at, &one);
+            let (from_copy, copy, outside) = translate(two.clone());
+            assert_eq!(from_copy.code, from_memory.code, "{two:02x?}");
+            assert_eq!(from_copy.end, at + two.len() as u32);
+            assert!(!outside);
+            assert_eq!(copy, two);
+            // Cut inside the block: in its first instruction (ARM, movw between its
+            // two halves) or its second.
+            let (_, _, outside) = translate(two[..3].to_vec());
+            assert!(outside);
         }
     }
 }

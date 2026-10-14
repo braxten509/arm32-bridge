@@ -748,7 +748,7 @@ mod tests {
         ];
         let mem = GuestMem::reserve();
         let translate = |word: u32| {
-            let mut t = Translator { a: Asm::new(), mem, pc: 0, size: 4, count: 0, in_it: false, thumb: false, neon_fp: true };
+            let mut t = Translator { a: Asm::new(), mem, pc: 0, size: 4, count: 0, in_it: false, thumb: false, neon_fp: true, copy: Vec::new(), copy_start: 0, read_outside: false };
             t.neon_data(word).map(|_| t.a.code)
         };
         for &(word, host) in cases {

@@ -327,9 +327,11 @@ struct Cache {
     /// Guest pc → exits linked straight to its block (undone if it's dropped).
     incoming: PcMap<Vec<usize>>,
     /// Blocks outside the libraries (code a game made while running), by
-    /// (first guest address, pc) → guest address just past the block, so a
-    /// cache flush can find the blocks it covers.
-    made_blocks: std::collections::BTreeMap<(u32, u32), u32>,
+    /// (first guest address, pc) → (guest address just past the block, a copy
+    /// of the guest bytes it was made from), so a cache flush can find the
+    /// blocks it covers and keep the ones whose bytes didn't change. No copy:
+    /// the bytes changed while it was made (dropped on any flush over it).
+    made_blocks: std::collections::BTreeMap<(u32, u32), (u32, Option<Box<[u8]>>)>,
     /// Translated blocks not published yet (linking only), and when the
     /// oldest of them was made.
     unpublished: PcMap<()>,
@@ -507,21 +509,52 @@ const MAX_BLOCK_SPAN: u32 = 4096;
 /// Drops translations of guest code in [start, end) that the game made while
 /// running (it rewrote that memory and flushed the CPU cache). Exits linked
 /// to dropped blocks go back to the dispatcher and relink on retranslation.
-/// Other threads are stopped first (outside translated code), since the
-/// dropped code may be running on them.
+/// Other threads are stopped first (outside translated code and Unicorn),
+/// since the dropped code may be running on them. Blocks still holding the
+/// bytes they were made from are kept. When every flushed byte lies in such
+/// a block, nothing changed for either engine (a JIT often rewrites a call
+/// to the target it already had), so no thread is stopped.
 pub fn invalidate(uc: &Uc, start: u32, end: u32) {
-    let covered = |cache: &Cache| -> Vec<u32> {
+    // (pc, first, end, whether it still holds the bytes it was made from)
+    let overlapping = |cache: &Cache| -> Vec<(u32, u32, u32, bool)> {
         cache
             .made_blocks
             .range((start.saturating_sub(MAX_BLOCK_SPAN), 0)..(end, 0))
-            .filter(|&(&(first, _), &block_end)| block_end > start && first < end)
-            .map(|(&(_, pc), _)| pc)
+            .filter(|&(&(first, _), &(block_end, _))| block_end > start && first < end)
+            .map(|(&(first, pc), &(block_end, ref made_from))| {
+                let unchanged = made_from.as_deref().is_some_and(|bytes| *bytes == *guest_mem().bytes(first, (block_end - first) as usize));
+                (pc, first, block_end, unchanged)
+            })
             .collect()
     };
-    if flush_log().is_some() && CACHE.get().is_some() {
-        note_flush(start, end, &covered(&read_cache()));
+    if CACHE.get().is_none() {
+        return;
     }
-    drop_blocks(uc, covered);
+    let blocks = overlapping(&read_cache());
+    if flush_log().is_some() {
+        note_flush(start, end, &blocks.iter().map(|&(pc, ..)| pc).collect::<Vec<_>>());
+    }
+    if blocks.is_empty() {
+        return;
+    }
+    if blocks.iter().all(|&(.., unchanged)| unchanged) && covers(&blocks, start, end) {
+        UNCHANGED_FLUSHES.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    stop_and_drop(uc, |cache| overlapping(cache).into_iter().filter(|&(.., unchanged)| !unchanged).map(|(pc, ..)| pc).collect());
+}
+
+/// Whether the blocks (pc, first, end, _), ordered by first address, together
+/// cover [start, end).
+fn covers(blocks: &[(u32, u32, u32, bool)], start: u32, end: u32) -> bool {
+    let mut reached = start;
+    for &(_, first, block_end, _) in blocks {
+        if first > reached {
+            break;
+        }
+        reached = reached.max(block_end);
+    }
+    reached >= end
 }
 
 /// ARM32_FLUSHLOG=<file> (or debug.arm32bridge.flushlog=<file>, for testing):
@@ -544,6 +577,21 @@ fn flush_log() -> Option<&'static std::sync::Mutex<(std::fs::File, HashMap<u32, 
 /// The guest bytes [first, end) as they are now.
 fn guest_bytes(first: u32, end: u32) -> Vec<u8> {
     (first..end).map(|address| unsafe { *guest_mem().host(address) }).collect()
+}
+
+/// Guest bytes a block starting at `first` can be made from (blocks stop
+/// after `MAX_INSTRUCTIONS`, well inside this), cut at the end of its mapped
+/// region (beyond it the host faults; the translator then reads guest memory
+/// and the copy isn't kept).
+const COPY_AHEAD: u32 = 512;
+
+fn copy_ahead(first: u32) -> Vec<u8> {
+    let region_end = mem::MAPPED_REGIONS
+        .iter()
+        .find(|&&(start, end, _)| (start..end).contains(&first))
+        .map_or(first, |&(_, end, _)| end);
+    let end = region_end.min(first.saturating_add(COPY_AHEAD));
+    guest_mem().bytes(first, (end - first) as usize).to_vec()
 }
 
 /// Keeps a copy of a made block's guest bytes (flush log only).
@@ -605,6 +653,13 @@ fn drop_blocks(uc: &Uc, covered: impl Fn(&Cache) -> Vec<u32>) {
     if CACHE.get().is_none() || covered(&read_cache()).is_empty() {
         return;
     }
+    stop_and_drop(uc, covered);
+}
+
+/// Stops every other thread (even with nothing to drop: they then pick up a
+/// code change in Unicorn too), drops the blocks `covered` names, and lets
+/// them go again.
+fn stop_and_drop(uc: &Uc, covered: impl Fn(&Cache) -> Vec<u32>) {
     runtime::stop_world(uc, || {
         let mut cache = write_cache();
         let dropped = covered(&cache);
@@ -744,7 +799,13 @@ fn lookup_block(pc: u32) -> (usize, u32, usize, usize) {
     {
         let cache = &mut *guard;
         let (enter, exit_stub) = (cache.memory.enter, cache.memory.exit_stub);
-        let mut block = if pc & 1 == 1 { thumb::translate(guest_mem(), pc & !1) } else { thumb::translate_arm(guest_mem(), pc) };
+        // Code the game made is translated from a copy, which is kept: the
+        // block is made from exactly those bytes, even if another thread
+        // rewrites them meanwhile (the next flush over them then drops it).
+        let first = pc & !1;
+        let copy = if mem::fixed(first) { Vec::new() } else { copy_ahead(first) };
+        let (mut block, copy, read_outside) =
+            if pc & 1 == 1 { thumb::translate_copy(guest_mem(), first, copy) } else { thumb::translate_arm_copy(guest_mem(), pc, copy) };
         // Exits to blocks that already exist (or to this one) are linked in
         // the copy before it's placed, so one cache flush covers them.
         let address = cache.memory.next_address();
@@ -767,8 +828,10 @@ fn lookup_block(pc: u32) -> (usize, u32, usize, usize) {
         cache.starts.push((address, pc));
         // Watched unless all of it is fixed: a block may run on into a page
         // the game made writable (`mem::unfix`).
-        if !mem::fixed_range(pc & !1, block.end) {
-            cache.made_blocks.insert((pc & !1, pc), block.end);
+        if !mem::fixed_range(first, block.end) {
+            let length = (block.end - first) as usize;
+            let made_from = (!read_outside && copy.len() >= length).then(|| Box::<[u8]>::from(&copy[..length]));
+            cache.made_blocks.insert((first, pc), (block.end, made_from));
             snapshot_block(pc, block.end);
         }
         if linking() {
@@ -899,6 +962,9 @@ const CPSR_IT: u32 = 0x0600_FC00;
 pub(super) static STALE_IT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Blocks dropped because the game rewrote their code (shown with the stats).
 static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Flushes over made blocks that changed none of their bytes (nothing dropped,
+/// no thread stopped; shown with the stats).
+static UNCHANGED_FLUSHES: AtomicU64 = AtomicU64::new(0);
 
 /// Copies guest state into Unicorn. Only NZCV, Q and GE move between engines;
 /// Unicorn keeps its mode bits, and the Thumb bit comes from the start address.
@@ -1049,9 +1115,10 @@ pub fn print_stats() {
         sites.sort_by(|a, b| b.1.cmp(a.1));
         let total: u64 = cache.fallbacks.values().sum();
         crate::log::line(&format!(
-            "[jit] {} blocks ({} dropped after code changes), {} fallbacks at {} sites, {} starts with leftover IT state",
+            "[jit] {} blocks ({} dropped after code changes, {} flushes changed none), {} fallbacks at {} sites, {} starts with leftover IT state",
             cache.blocks.len(),
             DROPPED.load(std::sync::atomic::Ordering::Relaxed),
+            UNCHANGED_FLUSHES.load(Ordering::Relaxed),
             total,
             sites.len(),
             STALE_IT.load(std::sync::atomic::Ordering::Relaxed)
@@ -1076,5 +1143,18 @@ pub fn print_stats() {
     crate::runtime::log_top_calls(20);
     if check::enabled() {
         check::print_summary();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn covers_needs_every_flushed_byte() {
+        let block = |first: u32, end: u32| (0, first, end, true);
+        assert!(super::covers(&[block(0x100, 0x120)], 0x104, 0x108));
+        assert!(!super::covers(&[block(0x100, 0x108)], 0x104, 0x10C)); // runs past the block
+        assert!(super::covers(&[block(0x100, 0x108), block(0x108, 0x110)], 0x104, 0x10C));
+        assert!(!super::covers(&[block(0x100, 0x104), block(0x108, 0x110)], 0x100, 0x110)); // a gap
+        assert!(!super::covers(&[block(0x104, 0x110)], 0x100, 0x108)); // starts before the block
     }
 }

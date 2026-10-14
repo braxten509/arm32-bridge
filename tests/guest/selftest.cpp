@@ -585,6 +585,41 @@ static bool code_rewrite_across_threads(void) {
     return first && seen;
 }
 
+// A JIT flushes code it rewrote with the very same bytes many times while
+// other threads run it (nothing changed), then really changes it, then
+// changes it back: every caller sees the code as last written.
+static bool same_bytes_flushes_across_threads(void) {
+    unsigned *code = (unsigned *)mmap(nullptr, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (code == MAP_FAILED) return false;
+    write_made_code(code, 1);
+    made_code = (made_function)code;
+    made_stop = 0;
+    made_seen_new[0] = made_seen_new[1] = 0;
+    pthread_t threads[2];
+    for (long i = 0; i < 2; i++)
+        if (pthread_create(&threads[i], nullptr, call_made_code, (void *)i) != 0) return false;
+    bool same = true;
+    for (int i = 0; i < 200; i++) {
+        write_made_code(code, 1);
+        same = same && made_code() == 1;
+        usleep(100);
+    }
+    same = same && !made_seen_new[0] && !made_seen_new[1];
+    write_made_code(code, 2);
+    double started = seconds_now();
+    while (!(made_seen_new[0] && made_seen_new[1]) && seconds_now() - started < 2.0) usleep(1000);
+    bool changed = made_seen_new[0] && made_seen_new[1] && made_code() == 2;
+    made_stop = 1;
+    for (int i = 0; i < 2; i++) pthread_join(threads[i], nullptr);
+    write_made_code(code, 1);
+    bool back = made_code() == 1;
+    write_made_code(code, 1);
+    back = back && made_code() == 1;
+    munmap(code, 4096);
+    if (!(same && changed && back)) __android_log_print(ANDROID_LOG_INFO, TAG, "same-bytes flushes: same %d, changed %d, back %d", same, changed, back);
+    return same && changed && back;
+}
+
 // A JIT patches a literal right after a block's last instruction and flushes
 // only those 4 bytes: the next run must see the new value (a constant, and a
 // call target loaded straight into pc).
@@ -2397,6 +2432,7 @@ extern "C" int run_all() {
             check(small_counters_exact(), "four threads on 8- and 16-bit atomics, exact per round, neighbours untouched");
             check(once_from_four_threads(), "pthread_once from four threads at once runs once");
             check(code_rewrite_across_threads(), "code rewritten while other threads run it (calls and a spinning thread)");
+            check(same_bytes_flushes_across_threads(), "code flushed unchanged while other threads run it, then changed and changed back");
             check(signals_during_phone_calls(), "1000 signals to a thread making phone calls, each handled once");
             check(signal_reaches_spinning_thread(), "a signal reaches a thread busy in a loop without calls");
             check(signal_reaches_callback(), "a signal reaches a thread spinning in a qsort callback");
