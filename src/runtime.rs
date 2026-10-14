@@ -825,6 +825,48 @@ pub fn preempt_requested() -> bool {
     PREEMPT.load(Ordering::Relaxed) != 0
 }
 
+extern "C" {
+    fn uc_emu_stop(engine: *mut std::ffi::c_void) -> i32;
+}
+
+/// The host thread that took the guest lock last (the holder while it is held).
+static GIL_HOLDER: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
+
+/// Each thread's innermost Unicorn run (its engine handle), while one is going.
+/// Game code that spins without calling a phone function (waiting for another
+/// thread to change a word) never reaches a point where it would hand over the
+/// lock, so the ticker stops the holder's run instead (`call_guest_with`
+/// resumes it after sharing the lock). Translated code checks PREEMPT itself.
+static UNICORN_RUNS: Mutex<Vec<(std::thread::ThreadId, usize)>> = Mutex::new(Vec::new());
+
+/// Marks this thread's run of `engine` (the previous one, when nested, is returned).
+fn unicorn_run_started(engine: usize) -> Option<usize> {
+    let me = std::thread::current().id();
+    let mut runs = UNICORN_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+    let previous = runs.iter().position(|(thread, _)| *thread == me).map(|index| runs.swap_remove(index).1);
+    runs.push((me, engine));
+    previous
+}
+
+fn unicorn_run_ended(previous: Option<usize>) {
+    let me = std::thread::current().id();
+    let mut runs = UNICORN_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+    runs.retain(|(thread, _)| *thread != me);
+    if let Some(engine) = previous {
+        runs.push((me, engine));
+    }
+}
+
+/// Stops the lock holder's Unicorn run, if it is in one (the ticker, after a full time slice).
+fn stop_holder_run() {
+    let holder = *GIL_HOLDER.lock().unwrap_or_else(|e| e.into_inner());
+    let runs = UNICORN_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, engine)) = runs.iter().find(|(thread, _)| Some(*thread) == holder) {
+        // Held under the list lock: the run can't end and its engine be freed meanwhile.
+        unsafe { uc_emu_stop(engine as *mut std::ffi::c_void) };
+    }
+}
+
 /// Started the first time a thread has to wait for the lock: sets PREEMPT when
 /// the holder has had the lock for a whole time slice while others wait.
 fn start_preempt_ticker() {
@@ -837,7 +879,9 @@ fn start_preempt_ticker() {
             }
             let held = ticks().wrapping_sub(HELD_SINCE_ANY.load(Ordering::Relaxed));
             if held >= TIME_SLICE_MS * ticks_per_ms() {
-                PREEMPT.store(1, Ordering::Relaxed);
+                if PREEMPT.swap(1, Ordering::Relaxed) == 0 {
+                    stop_holder_run();
+                }
             }
             std::thread::sleep(Duration::from_millis(1));
         });
@@ -861,6 +905,7 @@ fn take_gil() {
         }
     };
     LOCKS_TAKEN.fetch_add(1, Ordering::Relaxed);
+    *GIL_HOLDER.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::thread::current().id());
     let now = ticks();
     HELD_SINCE.with(|since| since.set(now));
     HELD_SINCE_ANY.store(now, Ordering::Relaxed);
@@ -1869,7 +1914,23 @@ pub fn call_guest_with(uc: &mut Uc, address: u32, args: &[Arg]) -> Result<u64, S
 
     uc.get_data_mut().depth = depth + 1;
     sync_unicorn_code(uc);
-    let result = uc.emu_start(address as u64, trap as u64, 0, 0);
+    let mut start = address;
+    let result = loop {
+        let previous = unicorn_run_started(uc.get_handle() as usize);
+        let result = uc.emu_start(start as u64, trap as u64, 0, 0);
+        unicorn_run_ended(previous);
+        // Stopped early with no fault or exit: the time slice ran out (every
+        // other stop records one). Let the waiting threads in, then go on.
+        let pc = uc.pc_read().unwrap() as u32;
+        let (fault, exit) = (uc.get_data().fault.is_some(), uc.get_data().exit_code.is_some());
+        if result.is_ok() && pc != trap && !fault && !exit {
+            let thumb = (uc.reg_read(RegisterARM::CPSR).unwrap() as u32 >> 5) & 1;
+            start = pc | thumb;
+            share_gil(uc, start);
+            continue;
+        }
+        break result;
+    };
     uc.get_data_mut().depth = depth;
 
     let pc = uc.pc_read().unwrap() as u32;

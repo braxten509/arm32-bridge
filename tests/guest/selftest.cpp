@@ -2140,6 +2140,11 @@ extern "C" int pthread_cond_timedwait_monotonic_np(pthread_cond_t *, pthread_mut
 extern "C" int pthread_cond_timedwait_relative_np(pthread_cond_t *, pthread_mutex_t *, const struct timespec *);
 extern "C" size_t dlmalloc_usable_size(const void *);
 extern "C" int __isfinitef(float);
+static volatile int spin_flag;
+static void *set_spin_flag(void *) {
+    spin_flag = 1;
+    return nullptr;
+}
 static int wide_print(wchar_t *buffer, size_t count, const wchar_t *format, ...) {
     va_list list;
     va_start(list, format);
@@ -2739,6 +2744,16 @@ extern "C" int run_all() {
         pthread_mutex_unlock(&lock);
         double took = seconds_now() - before;
         check(waited == ETIMEDOUT && took >= 0.015 && took < 2.0, "pthread_cond_timedwait_relative_np");
+
+        // Waiting for another thread in a plain loop, with no phone function
+        // calls: the other thread must still get to run (Unicorn mode once froze here).
+        pthread_t setter;
+        spin_flag = 0;
+        pthread_create(&setter, nullptr, set_spin_flag, nullptr);
+        unsigned spins = 0;
+        while (!spin_flag && spins < 2000000000u) spins++;
+        check(spin_flag == 1, "spinning thread lets others run");
+        pthread_join(setter, nullptr);
     }
 
     __android_log_print(ANDROID_LOG_INFO, TAG, "%d failures", failures);
