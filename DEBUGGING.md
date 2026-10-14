@@ -1660,3 +1660,57 @@ ms/frame must improve beyond noise; self-test 0 failures in six modes; three gam
 - Safety checks (spin 50 us): PC self-test 0 failures; phone self-test all six modes 0 failures (checker 3438442
   blocks, 0 differences); pc-check spin50: PC1 120.0 fps, saves unchanged; PC2 119.9 fps, pc2.atgsave unchanged
   (only the 0-byte stgs.atgsave rewritten at launch, same open question as before); no crash lines.
+
+## Bridge overhead inside pauses (owner chose "cut the bridge's extra work in pauses", 2026-10-14)
+- runs/named2 (spin + hint, menu path, BLOCKMAP=1 CG=1: cw-trace-play.sh now takes CG=1 for --call-graph fp;
+  analysis/gap-callers.py groups host samples by call chain). Only 2 gaps >45 ms in the 60 s window, so used
+  >25 ms (25 gaps, 1526 samples). Bridge/host share inside gaps 30.9% vs 29.4% overall: the pauses are more game
+  work paying the usual bridge costs, not a pause-only bridge problem.
+- Biggest piece: engine::run self time 8.2% of UnityMain inside gaps (6.4% overall). Hot lines (llvm-addr2line on
+  the phone .so): ~55% hashbrown probe (vceq/likely) + ~12% RwLock read/unlock + block_for closure (engine.rs:568)
+  = the dispatcher's slow path: jump-table miss -> read_cache() RwLock (a counter every thread bounces) -> HashMap
+  get -> set_jump. table_block hit check itself only ~4%.
+- Why it misses: 253713 distinct block pcs (blockmap), direct-mapped table of 2^16 slots indexed by pc bits 1..16.
+  Share of blocks whose slot is shared with another block: 16 bits 95% | 17 88% | 18 71% | 19 47% | 20 28%.
+  So hot targets 128 KiB apart keep evicting each other.
+- Code memory: 64 MB with the table at the start; translated code 25.6 MB at 30 s, 27.0 MB from 120 s on (menu path).
+- Other pieces (inside gaps): guest futex syscalls 2.7%, guest clock_gettime via light call 2.2% (game's own
+  time reads), spin wait clock reads 1.3% (waiting time anyway), call_light/Args/write_result ~2.7%, check_in 1.7%,
+  malloc ~1%, __clear_cache 0.4%, block-map writes 0.7% (test switch only).
+- Fix (owner: "even 32 MB, I have 12 GB"): JUMP_TABLE_BITS 16 -> 22 (table 0.5 -> 32 MB), CODE_SIZE 128 MB (owner: "as
+  large as you can without exceeding 128 MB") = 96 MB for code
+  (block-to-block B reaches +-128 MB). Predicted: engine::run self time on UnityMain drops from ~6.4% toward
+  ~2%, RwLock/hash lines mostly gone; frame numbers same or better.
+- jt22-1 (32 MB table, 128 MB code space, spin + hint, menu path, CG=1): engine::run samples on UnityMain 6318 -> 2153
+  (same 60 s window). Hot lines now table_block's entry load (engine.rs:291, 22% of the rest = cache/TLB miss on
+  the big table); hash probe ~4%. engine::run self share inside >25 ms gaps 8.2% -> 2.4% (overall 6.4 -> 2.1);
+  bridge/host share inside gaps 30.9% -> 24.7% (overall 29.4 -> 24.6). Frames (gaps.py): 116.4 updates/s | 17 ms
+  1.8/s | >24 0.62/s | >33 0.12/s | >50 0.03/s | max 92 ms (spin50-t1 117.0 | 1.1 | 0.52 | 0.08 | 0.05 | 175;
+  named2 117.3 | 1.3 | 0.43 | 0.07 | 0.02 | 83) = same range; steady frames were already near 120.
+- jt22-t2 (clean, NOPERF): gaps.py 116.2 updates/s | 17 ms 1.5/s | >24 0.57/s | >33 0.17/s | >50 0.08/s | max 184 ms.
+  play-summary (fps | game ms | seconds with frame >50/>100/>250 | worst):
+    before: spin50-t1 118.4 | 8.42 | 22/6/1 | 269 ms; named2 (profiled) 118.1 | 8.45 | 27/5/1 | 322 ms
+    32 MB:  jt22-1 (profiled) 117.7 | 8.48 | 33/4/0 | 214 ms; jt22-t2 118.2 | 8.45 | 29/4/0 | 207 ms
+  => MIXED: worst pauses shorter (no >250, fewer >100, worst ~210 vs 270-320) but more 50-100 ms seconds in both
+  runs; game ms/frame unchanged despite ~4% less dispatcher time. Possible cost: the 32 MB table's entries miss the
+  cache/TLB on every lookup (table_block's load is now the top line). Not kept yet: owner decides.
+- Safety (32 MB): PC self-test 0 failures; phone six modes 0 failures (checker 3727354 blocks, 0 differences);
+  pc-check jt22: PC1 119.8 fps saves unchanged, PC2 119.7 fps (stgs.atgsave only), no crash lines.
+- Owner: "Try 8 and 16". Clean runs (NOPERF), CODE_SIZE 128 MB (play-summary fps | game ms | >50/>100/>250 | worst;
+  gaps.py >33/>50/max):
+    8 MB (20 bits):  jt20-t1 118.2 | 8.43 | 29/4/0 | 217 ms; >33 0.07 >50 0.02 max 58
+                     jt20-t2 118.1 | 8.44 | 33/4/0 | 213 ms; >33 0.20 >50 0.07 max 117
+    16 MB (21 bits): jt21-t1 118.2 | 8.43 | 30/3/0 | 226 ms; >33 0.10 >50 0.07 max 125
+                     jt21-t2 118.1 | 8.44 | 31/3/0 | 210 ms; >33 0.07 >50 0.05 max 175
+  => 8/16/32 MB all alike. Same-session control with the old 16-bit table running (jt16-ctl1/2) to tell table
+  effect from phone state (the "before" runs were ~1 h earlier).
+- Same-session control, old 16-bit (0.5 MB) table, CODE_SIZE 128 MB:
+    jt16-ctl1 116.9 | 8.54 | 31/5/0 | 241 ms; 114.2 updates/s, 17 ms 3.3/s, >33 0.13, >50 0.07, max 242
+    jt16-ctl2 117.9 | 8.46 | 35/4/0 | 235 ms; 115.7 updates/s, 17 ms 2.0/s, >33 0.20, >50 0.07, max 175
+  => The extra 50 ms seconds vs the morning runs were phone state (the old table shows them too). Against the
+  same-session control every bigger table is better: updates/s 116.2-117.3 vs 114.2-115.7, doubled frames
+  1.3-1.8/s vs 2.0-3.3/s, >100 ms seconds 3-4 vs 4-5, worst 207-226 vs 235-241 ms. KEPT; 8/16/32 MB alike.
+  Chose 16 MB (21 bits): 15% slot sharing, 112 MB left for code, fewest >100 ms seconds (3, 3).
+- Safety (16 MB, final): PC self-test 0 failures; phone six modes 0 failures (checker 3716843 blocks, 0 differences);
+  pc-check jt21: PC1 119.9 fps saves unchanged, PC2 120.0 fps (stgs.atgsave only, emptied on launch as before;
+  pc2.atgsave untouched), no crash lines. Card Wars reinstalled with this build.

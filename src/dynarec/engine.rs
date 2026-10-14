@@ -13,7 +13,11 @@ use super::{check, exit, host, offsets, thumb, CpuState, FPSCR_CONTROL, FPSCR_CU
 use crate::mem;
 use crate::runtime::{self, mem as guest_mem, GuestCpu, Uc, LR};
 
-const CODE_SIZE: usize = 64 << 20;
+/// The jump table plus translated code (112 MB of code next to the 16 MB table).
+/// Blocks branch to each other directly (B, +-128 MB), so this must stay at
+/// or below 128 MB. Pages the game never fills cost no memory.
+const CODE_SIZE: usize = 128 << 20;
+const _: () = assert!(CODE_SIZE <= 128 << 20 && CODE_SIZE > TABLE_BYTES + (32 << 20));
 
 /// Per-thread translator state, kept in the thread's `Thread` data.
 pub struct Native {
@@ -242,8 +246,11 @@ impl Hasher for PcHasher {
 type PcMap<V> = HashMap<u32, V, BuildHasherDefault<PcHasher>>;
 
 /// Jump table for computed jumps in translated code (`emit_exit_to`):
-/// 2^JUMP_TABLE_BITS entries indexed by guest pc bits 1 and up.
-pub(super) const JUMP_TABLE_BITS: u32 = 16;
+/// 2^JUMP_TABLE_BITS entries indexed by guest pc bits 1 and up. Card Wars has
+/// ~254,000 blocks: at 16 bits 95% of them shared a slot with another block and
+/// misses went to the locked lookup in `block_for`; at 21 bits (16 MB) 15% do.
+/// 8, 16 and 32 MB tables played alike and all beat 0.5 MB (DEBUGGING.md).
+pub(super) const JUMP_TABLE_BITS: u32 = 21;
 
 /// Each entry is one 64-bit word, `(code - CODE_BASE) << 32 | guest pc`, so
 /// a thread never reads one block's pc with another block's code.
