@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::handler;
 use crate::runtime::{mem, shared, ArgSource, Handler, Ret};
+use super::s3tc;
 
 const GL_ARRAY_BUFFER: u32 = 0x8892;
 const GL_ELEMENT_ARRAY_BUFFER: u32 = 0x8893;
@@ -359,6 +360,109 @@ fn unmap(target: u32) -> u32 {
     1
 }
 
+/// For debug.arm32bridge.glcheck=1: logs a GL error right after the call that
+/// made it, with the call's first arguments (the first 300 errors).
+pub fn check_error(name: &str, registers: &[u32]) {
+    // A shader the driver refuses doesn't raise a GL error; it just draws nothing.
+    if name == "glCompileShader" || name == "glLinkProgram" {
+        let object = registers[0];
+        let (status_name, log_name) = if name == "glCompileShader" { (0x8B81, 0x8B84) } else { (0x8B82, 0x8B84) };
+        let mut status = 1i32;
+        let mut length = 0i32;
+        unsafe {
+            if name == "glCompileShader" {
+                host!("glGetShaderiv", fn(u32, u32, *mut i32))(object, status_name, &mut status);
+                host!("glGetShaderiv", fn(u32, u32, *mut i32))(object, log_name, &mut length);
+            } else {
+                host!("glGetProgramiv", fn(u32, u32, *mut i32))(object, status_name, &mut status);
+                host!("glGetProgramiv", fn(u32, u32, *mut i32))(object, log_name, &mut length);
+            }
+        }
+        if status == 0 {
+            let mut text = vec![0u8; length.clamp(1, 4096) as usize];
+            unsafe {
+                if name == "glCompileShader" {
+                    host!("glGetShaderInfoLog", fn(u32, i32, *mut i32, *mut u8))(object, text.len() as i32, std::ptr::null_mut(), text.as_mut_ptr());
+                } else {
+                    host!("glGetProgramInfoLog", fn(u32, i32, *mut i32, *mut u8))(object, text.len() as i32, std::ptr::null_mut(), text.as_mut_ptr());
+                }
+            }
+            let text = String::from_utf8_lossy(&text).trim_end_matches('\0').trim().to_string();
+            crate::log::line(&format!("[gl error] {name}({object}) failed: {text}"));
+        }
+    }
+    let error = unsafe { host!("glGetError", fn() -> u32)() };
+    if error == 0 {
+        return;
+    }
+    static REPORTED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if REPORTED.fetch_add(1, Ordering::Relaxed) < 300 {
+        let shown: Vec<String> = registers.iter().take(4).map(|r| format!("{r:#x}")).collect();
+        crate::log::line(&format!("[gl error] {error:#x} after {name}({})", shown.join(", ")));
+    }
+}
+
+/// Whether the driver takes S3TC `format` itself; if not, the bridge decodes
+/// it to RGBA8 (see `s3tc`). Asked once a context is current.
+fn driver_takes(format: u32) -> bool {
+    const ASKED: u8 = 1;
+    const S3TC: u8 = 2;
+    const DXT1: u8 = 4;
+    const SRGB: u8 = 8;
+    static SUPPORT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    let mut support = SUPPORT.load(Ordering::Relaxed);
+    if support & ASKED == 0 {
+        let text = unsafe { host!("glGetString", fn(u32) -> *const libc::c_char)(0x1F03) }; // GL_EXTENSIONS
+        if text.is_null() {
+            return true;
+        }
+        let text = unsafe { std::ffi::CStr::from_ptr(text) }.to_string_lossy();
+        let has = |name: &str| text.split_whitespace().any(|extension| extension == name);
+        support = ASKED;
+        if has("GL_EXT_texture_compression_s3tc") || has("GL_NV_texture_compression_s3tc") {
+            support |= S3TC;
+        }
+        if has("GL_EXT_texture_compression_dxt1") {
+            support |= DXT1;
+        }
+        if has("GL_EXT_texture_compression_s3tc_srgb") || has("GL_NV_sRGB_formats") {
+            support |= SRGB;
+        }
+        SUPPORT.store(support, Ordering::Relaxed);
+        if support & S3TC == 0 {
+            crate::log::line("[gles] driver lacks S3TC (DXT3/DXT5) textures: the bridge decodes them to RGBA8");
+        }
+    }
+    if s3tc::is_srgb(format) {
+        support & SRGB != 0
+    } else if matches!(format, s3tc::DXT1_RGB | s3tc::DXT1_RGBA) {
+        support & (S3TC | DXT1) != 0
+    } else {
+        support & S3TC != 0
+    }
+}
+
+/// An uncompressed format to store S3TC `format` as.
+fn decoded_format(format: u32) -> u32 {
+    if s3tc::is_srgb(format) { 0x8C43 } else { 0x8058 } // GL_SRGB8_ALPHA8 / GL_RGBA8
+}
+
+/// S3TC data from the game that the driver can't take, decoded to RGBA8.
+/// None: pass the call through unchanged (the driver takes the format, the
+/// data sits in a pixel unpack buffer, or it is short).
+fn decode_upload(format: u32, width: i32, height: i32, size: i32, data: u32) -> Option<Vec<u8>> {
+    if !s3tc::is_s3tc(format) || driver_takes(format) || bound(GL_PIXEL_UNPACK_BUFFER) != 0 || width <= 0 || height <= 0 {
+        return None;
+    }
+    let pointer = guest_pointer(data) as *const u8;
+    if pointer.is_null() {
+        return None;
+    }
+    let length = (size.max(0) as usize).min(s3tc::data_size(format, width as u32, height as u32));
+    let bytes = unsafe { std::slice::from_raw_parts(pointer, length) };
+    s3tc::decode(format, bytes, width as u32, height as u32)
+}
+
 pub fn handler(name: &str) -> Option<Handler> {
     if let Some(found) = special(name) {
         return Some(found);
@@ -486,6 +590,65 @@ fn special(name: &str) -> Option<Handler> {
             unsafe { host!("glDrawElements", fn(u32, i32, u32, *mut c_void))(mode, count, kind, host_indices) };
             Ret::Void
         }),
+        "glCompressedTexImage2D" => handler!(|uc, a| {
+            let (target, level, format, width, height, border, size, data) =
+                (a.u32(), a.i32(), a.u32(), a.i32(), a.i32(), a.i32(), a.i32(), a.u32());
+            unsafe {
+                match decode_upload(format, width, height, size, data) {
+                    // Unsized GL_RGBA works on GLES2 and 3 contexts; sRGB needs the sized one.
+                    Some(pixels) => host!("glTexImage2D", fn(u32, i32, i32, i32, i32, i32, u32, u32, *const u8))(
+                        target,
+                        level,
+                        if s3tc::is_srgb(format) { 0x8C43 } else { 0x1908 } as i32,
+                        width,
+                        height,
+                        border,
+                        0x1908,
+                        0x1401,
+                        pixels.as_ptr(),
+                    ),
+                    None => host!("glCompressedTexImage2D", fn(u32, i32, u32, i32, i32, i32, i32, *mut c_void))(
+                        target, level, format, width, height, border, size, unpack_pointer(data),
+                    ),
+                }
+            }
+            Ret::Void
+        }),
+        "glCompressedTexSubImage2D" => handler!(|uc, a| {
+            let (target, level, x, y, width, height, format, size, data) =
+                (a.u32(), a.i32(), a.i32(), a.i32(), a.i32(), a.i32(), a.u32(), a.i32(), a.u32());
+            unsafe {
+                match decode_upload(format, width, height, size, data) {
+                    Some(pixels) => host!("glTexSubImage2D", fn(u32, i32, i32, i32, i32, i32, u32, u32, *const u8))(
+                        target, level, x, y, width, height, 0x1908, 0x1401, pixels.as_ptr(),
+                    ),
+                    None => host!("glCompressedTexSubImage2D", fn(u32, i32, i32, i32, i32, i32, u32, i32, *mut c_void))(
+                        target, level, x, y, width, height, format, size, unpack_pointer(data),
+                    ),
+                }
+            }
+            Ret::Void
+        }),
+        "glTexStorage2D" | "glTexStorage2DEXT" => {
+            fn storage(name: &'static str, a: &mut crate::runtime::Args) {
+                let (target, levels, mut format, width, height) = (a.u32(), a.i32(), a.u32(), a.i32(), a.i32());
+                if s3tc::is_s3tc(format) && !driver_takes(format) {
+                    format = decoded_format(format);
+                }
+                unsafe {
+                    if name == "glTexStorage2D" {
+                        host!("glTexStorage2D", fn(u32, i32, u32, i32, i32))(target, levels, format, width, height)
+                    } else {
+                        host!("glTexStorage2DEXT", fn(u32, i32, u32, i32, i32))(target, levels, format, width, height)
+                    }
+                }
+            }
+            if name == "glTexStorage2D" {
+                handler!(|uc, a| { storage("glTexStorage2D", a); Ret::Void })
+            } else {
+                handler!(|uc, a| { storage("glTexStorage2DEXT", a); Ret::Void })
+            }
+        }
         "glShaderSource" => handler!(|uc, a| {
             let (shader, count, strings, lengths) = (a.u32(), a.i32(), a.u32(), a.u32());
             let pointers = string_array(strings, count);

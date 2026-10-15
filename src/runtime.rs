@@ -241,6 +241,8 @@ fn counting_calls() -> bool {
 }
 
 static TRACE: AtomicBool = AtomicBool::new(false);
+/// debug.arm32bridge.glcheck=1: every GL call is followed by glGetError, and errors are logged.
+static GL_CHECK: AtomicBool = AtomicBool::new(false);
 
 /// Return traps: one per nesting depth, so a host→guest call made from
 /// inside a handler stops at its own return address.
@@ -492,6 +494,7 @@ fn set_up(trace: bool) {
         memory.write_u32(trap_address(depth) + 4, UDF);
     }
     TRACE.store(trace, Ordering::Relaxed);
+    GL_CHECK.store(crate::dynarec::property("debug.arm32bridge.glcheck").as_deref() == Some("1"), Ordering::Relaxed);
     *HEAP.lock().unwrap_or_else(|e| e.into_inner()) = Some(GuestHeap::new(memory));
     *SHARED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Shared {
         misc: Bump::new(mem::MISC_BASE, mem::MISC_END),
@@ -1642,7 +1645,7 @@ pub fn log_top_calls(count: usize) {
 /// guest lock, or a mutex that is taken).
 pub fn call_light(uc: &mut Uc, index: u32) -> bool {
     let Some(stub) = stub(index) else { return false };
-    if stub.light == Light::No || !parallel() || !stub.used.load(Ordering::Relaxed) || TRACE.load(Ordering::Relaxed) || sampling() {
+    if stub.light == Light::No || !parallel() || !stub.used.load(Ordering::Relaxed) || TRACE.load(Ordering::Relaxed) || GL_CHECK.load(Ordering::Relaxed) || sampling() {
         return false;
     }
     let Some(handler) = stub.handler else { return false };
@@ -1702,7 +1705,11 @@ pub fn call_stub(uc: &mut Uc, index: u32) {
     let result = match handler {
         Some(handler) => {
             uc.get_data_mut().phone_depth += 1;
+            let registers = args.registers;
             let result = handler(uc, &mut args);
+            if GL_CHECK.load(Ordering::Relaxed) && name.starts_with("gl") && name != "glGetError" {
+                crate::imports::gles::check_error(name, &registers);
+            }
             // Calls this slow show up as stutters at 120 Hz (8.3 ms per frame).
             let spent = ticks().wrapping_sub(started);
             let thread = uc.get_data_mut();

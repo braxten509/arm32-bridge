@@ -10,6 +10,7 @@ pub mod printf;
 pub mod scanf;
 pub mod sles;
 pub mod gles;
+pub mod s3tc;
 mod gles_generated;
 pub mod android;
 pub mod activity;
