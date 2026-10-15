@@ -349,7 +349,7 @@ fn rewrite<R: Read + Seek>(
                 }
                 if let Some(minimum) = options.min_target_sdk {
                     match manifest::raise_target_sdk(&mut bytes, minimum) {
-                        Ok(Some((old, new))) => println!("fix {name}: target Android version (this phone refuses older games without root): {old} -> {new}"),
+                        Ok(Some((old, new))) => println!("fix {name}: target Android version (Android refuses games made for older versions): {old} -> {new}"),
                         Ok(None) => {}
                         Err(reason) => println!("warn {name}: can't raise the target Android version: {reason}"),
                     }

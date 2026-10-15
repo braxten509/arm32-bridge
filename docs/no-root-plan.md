@@ -82,3 +82,5 @@ need that game uninstalled first (saves lost); the app says so in its Remove/Abo
 Phone test (forced no-root): Puzzle Craft 1 refused at target 21, converted again at 24, installed with one
 confirmation, opened without a crash. The owner chose to drop the root path: Root.kt, RootInstaller, Installers and
 debug.gamebridge.noroot are gone; `Installer` (was SessionInstaller) is the only installer.
+Broken Age (target 22 -> 24, `tools/convert.sh --min-target-sdk 24`, installed as an update): loaded and played about
+a minute on the Pixel; no crash, no permission errors; Android later removed it from the background as usual.
