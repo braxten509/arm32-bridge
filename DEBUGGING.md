@@ -2034,3 +2034,12 @@ AndroidConfiguration. Regression test: selftest "dlsym finds OpenSL ES interface
    FlagM (Pixel 10 has it) `mrs; tst; rmif` instead of 6-7 instructions; ARM32_FLAGM=0 / debug.arm32bridge.flagm=0
    uses the old sequence; the log says which. qemu: checker 2,576,585 blocks 0 differences with rmif; default and
    FLAGM=0 pass; Lua test Thumb and ARM under the checker 0 differences.
+
+## Away mode (owner away, 2026-10-14 evening): decisions
+- Stopped the job that would run the phone checks when the phone came back (away mode: no phone use). Phone checks,
+  push and game reinstall are left for the owner's return.
+- Return-address prediction (shadow return stack + host bl/ret) not started: bigger possible gain on Lua's calls and
+  returns, but the checker turns linking off, so it could not be verified without the phone.
+- Waiting for the owner: run scripts/wait-phone-then-test.sh (or phone-selftest.sh + bench-compare.sh with
+  ~/.cache/a32-baseline/arm32-bridge vs the new build), then push e752ed2/0238af3/8d4ad74 and reinstall the games
+  (scripts/reinstall-all.sh; Pirates first needs bridge-swap.sh --undo).
