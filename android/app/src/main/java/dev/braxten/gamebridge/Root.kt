@@ -17,6 +17,22 @@ object Root {
     /** Lets this app read every file in shared storage (the Downloads folder), without a trip to Settings. */
     fun grantFileAccess(packageName: String): Boolean =
         run("appops set $packageName MANAGE_EXTERNAL_STORAGE allow").code == 0
+
+    /** Uninstalls a game; Android deletes its saved progress and game data with it. Null on success, else a plain reason. */
+    fun uninstall(packageName: String): String? {
+        if (!Regex("[A-Za-z0-9_.]+").matches(packageName)) return "That game has an odd name, so it wasn't removed."
+        val result = run("pm uninstall '$packageName'")
+        return if (result.output.contains("Success")) null
+        else "Android didn't remove it: ${result.output.lines().lastOrNull().orEmpty()}"
+    }
+
+    /** Deletes a game file from shared storage. Null on success, else a plain reason. */
+    fun delete(file: File): String? {
+        if (file.delete() || !file.exists()) return null
+        // The file access grant can lag right after the app starts; root can always delete it.
+        val result = run("rm -f '${file.absolutePath.replace("'", "'\\''")}'")
+        return if (result.code == 0) null else "Couldn't delete ${file.name}: ${result.output}"
+    }
 }
 
 /**
