@@ -306,6 +306,13 @@ fn call_method(name: &str, target: u32, class: u32, method: u32, a: &mut Args) -
     } else {
         Source::Variadic(a)
     };
+    let is_static = name.starts_with("CallStatic");
+    let rememberable = super::java_cache::eligible(is_static, &parameters, return_type);
+    if rememberable {
+        if let Some(answer) = super::java_cache::answer(member.host, return_type) {
+            return answer;
+        }
+    }
     let values = host_arguments(&parameters, source);
     let env = env();
     #[cfg(target_os = "android")]
@@ -314,10 +321,9 @@ fn call_method(name: &str, target: u32, class: u32, method: u32, a: &mut Args) -
     let target_object = to_host(target);
     let class_object = to_host(class);
     let arguments = values.as_ptr();
-    let is_static = name.starts_with("CallStatic");
     let is_nonvirtual = name.starts_with("CallNonvirtual");
     // Java can block or call back into the game, so let other guest threads run.
-    without_gil(|| unsafe {
+    let result = without_gil(|| unsafe {
         macro_rules! pick {
             ($virtual:ident, $nonvirtual:ident, $static_call:ident) => {
                 if is_static {
@@ -345,7 +351,13 @@ fn call_method(name: &str, target: u32, class: u32, method: u32, a: &mut Args) -
             _ => HostResult::Object(pick!(CallObjectMethodA, CallNonvirtualObjectMethodA, CallStaticObjectMethodA) as usize),
         }
     })
-    .into_ret()
+    .into_ret();
+    if rememberable {
+        let threw = jcall!(env, ExceptionCheck) != 0;
+        let full_name = format!("{}{}", member.name, member.signature);
+        super::java_cache::observe(env, member.host, target_object, return_type, &result, threw, &full_name);
+    }
+    result
 }
 
 enum HostResult {

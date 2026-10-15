@@ -2058,3 +2058,12 @@ AndroidConfiguration. Regression test: selftest "dlsym finds OpenSL ES interface
   the last 8 frames, capped at half a frame.
 - Recording pirates-pace60 (owner playing, 3 min, gameplay samples 20-90 fps): mean 55.5 fps (was 40.0 / 44.4 for
   fast60 / cap60); 17 ms frames 71.5% (was 18.4%), 25 ms 15.1% (was 69.6%), 33 ms+ 3.8% (was 10.1%). Skin 36.9 C.
+
+## Remembered Java checks (2026-10-15, owner's choice)
+- Pirates asked DeviceJava.HeadphonesDisconnected() (AudioManager.isWiredHeadsetOn, a call into the audio service)
+  every frame; twice it took ~0.85 s while music changed, freezing the game (frame timeline + bridge log + CPU
+  samples agree; details in arm32-bridge-games/acpirates/DEBUGGING.md).
+- src/imports/java_cache.rs: static, no-argument Java methods with a plain-value result that answer the same 60 times
+  within 3 s are answered from memory; a helper thread re-asks 4 times a second; stops after 2 s without asks or on
+  an exception. ARM32_JAVA_CACHE=0 / debug.arm32bridge.javacache=0 turns it off.
+- Phone: self-test 6 modes 0 failures; Pirates freezes over 100 ms 968 -> max 217 ms (a setVolume call).

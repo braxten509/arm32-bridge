@@ -17,6 +17,7 @@ pub mod activity;
 pub mod egl;
 pub mod signals;
 pub mod sockets;
+pub mod java_cache;
 
 use std::collections::HashMap;
 
