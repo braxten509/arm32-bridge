@@ -1,57 +1,76 @@
-# arm32-bridge
+> [!NOTE]
+> **This project was made with AI.** The code, the docs and this README were written by an AI coding assistant
+> (Anthropic's Claude), directed and tested on a real phone by Braxten Chenay. Expect rough edges.
 
-Proof of concept: run 32-bit ARM Android game code on the 64-bit-only Pixel 10.
+# Game Bridge (arm32-bridge)
 
-The Pixel 10's CPU has no 32-bit mode, so 32-bit-only APKs (like Puzzle Craft 2) won't install. This program
-loads a game's 32-bit native library into a 64-bit process. It runs the library's instructions with the
-[Unicorn](https://www.unicorn-engine.org/) ARM32 engine and answers the library's calls to the phone (libc,
-libm, liblog, libdl, JNI) with 64-bit host code.
+Play old 32-bit Android games on new phones that can only run 64-bit apps.
 
-## How it works
+Newer phones like the Pixel 10 have processors without a 32-bit mode, so many older games (made before 2019 or
+so) won't install at all ("App not compatible"). Game Bridge converts such a game on the phone itself: it swaps
+the game's 32-bit code for a bridge that translates it to 64-bit while the game runs, then installs the result.
+The game keeps its own look, sound and save files.
 
-- `src/mem.rs`: the whole 32-bit address space is one 4 GiB host reservation, so guest address `g` is host
-  address `base + g`, and Unicorn shares the same pages. The guest's malloc is dlmalloc running over the guest
-  heap region.
-- `src/elf.rs`: loads ELF32 ARM shared libraries: copies segments, applies `R_ARM_RELATIVE/ABS32/GLOB_DAT/
-  JUMP_SLOT` relocations, runs `DT_INIT` and `DT_INIT_ARRAY`.
-- `src/runtime.rs`: each imported phone function gets an 8-byte stand-in (`svc #n; bx lr`). The `svc` traps into
-  Rust, which reads arguments the ARM32 softfp way (r0-r3, then the stack; 64-bit values in even register pairs),
-  runs the handler and writes r0/r1. `call_guest` calls guest code from Rust and can be nested, which qsort,
-  pthread_once and the start-up code need.
-- `src/imports/`: the handlers. They convert sizes and struct layouts where 32-bit and 64-bit differ (`long`,
-  `time_t`, `struct stat`, `struct tm`, `open()` flags, va_list). `jni.rs` is a pretend Java side that logs every
-  class lookup and Java call.
+## Download
 
-## Build and run
+Get `GameBridge-<version>.apk` from the [Releases page](https://github.com/braxten509/arm32-bridge/releases)
+and open it on your phone. No root needed.
+
+**Needs:** a 64-bit ARM Android phone with Android 12 or newer. Only tested on a Pixel 10 with Android 17
+(GrapheneOS). If your phone still runs 32-bit apps, you don't need this; install the game normally.
+
+## How to use it
+
+1. Download the game you own as an APK file (or a bundle: `.xapk`, `.apkm`, `.apks`) onto the phone.
+2. Open Game Bridge. The first time, it asks for two things in Android's settings:
+   - **All files access**, so it can find game files in Downloads and your other folders.
+   - **Install unknown apps**, so it can install the converted game. (Game Bridge restarts itself once after
+     this.)
+3. Your 32-bit games show up as cards. Tap **Convert**, wait, then tap **Install** on Android's screen.
+4. Tap **Open** and play. Press and hold a card for more (Convert again, Remove, Delete file).
+
+## Games tested so far
+
+| Game | State |
+|---|---|
+| Card Wars: Adventure Time | plays |
+| Puzzle Craft, Puzzle Craft 2 | play |
+| Assassin's Creed Pirates | plays, some stutter |
+| Broken Age | plays |
+| Angry Birds Classic 8.0.3 | plays |
+
+Other games may work, partly work, or not start. When a game uses phone functions the bridge doesn't know yet,
+the converter lists them; the game may then fail when it reaches them.
+
+## Good to know
+
+- **No games are included.** Bring your own copies of games you own. This project is not connected to any game
+  maker or store.
+- **Converted games are signed by Game Bridge, not by their maker.** If the original game is still installed
+  (for example from the Play Store), uninstall it first; that deletes its saved progress.
+- **Old games get a small label change.** Android 17 refuses games made for Android 6 or older, so Game Bridge
+  marks them as made for Android 7. Most games don't notice; a very old game could act differently.
+- **Each phone has its own key.** Game Bridge makes a signing key for games on the phone and keeps it there. If
+  you uninstall Game Bridge, later updates of a converted game need that game uninstalled first.
+- Online features, store purchases and license checks inside games may not work.
+- Speed depends on the game. Most run at full speed; heavy 3D games can stutter during loading.
+
+## For developers
+
+The bridge loads the game's 32-bit ARM libraries into a 64-bit process, translates their code to ARM64 as it runs
+(`src/dynarec/`, see [docs/translator.md](docs/translator.md)) with [Unicorn](https://www.unicorn-engine.org/)
+as a fallback, and answers the game's calls to the phone (libc, OpenGL ES, OpenSL ES, JNI and more) with 64-bit
+code. `converter/` (apk-convert) rewrites an APK or bundle to load the bridge.
 
 ```sh
-cargo build --release                 # PC (x86_64) build, for quick testing
-./build-phone.sh                      # phone (arm64 Android) build, needs NDK 30
-tests/guest/build.sh                  # 32-bit test libraries + native speed test
-
-./target/release/arm32-bridge call tests/guest/build/selftest.so run_all
-./target/release/arm32-bridge load path/to/libcocos2dcpp.so --jni-onload
-./target/release/arm32-bridge bench tests/guest/build/bench.so bench 20000
+./build-phone.sh                      # bridge for the phone (arm64 Android), needs NDK 30
+tools/convert.sh game.apk             # convert on the PC and install over adb
+tools/build-app.sh [--install]        # build the Game Bridge app (owner build, PC debug key)
+tools/build-app.sh --public           # release build, signed with the release key (tools/release-key.sh)
+cargo build --release                 # PC build, for quick tests with tests/guest
 ```
 
-Flags: `--trace` prints every phone call, `--verbose` prints each start-up function.
-
-## Results (2026-10-12, Pixel 10, Termux)
-
-- Self-test (`tests/guest/selftest.cpp`): 15/15 checks pass on the PC and on the Pixel. Covers a C++ static
-  constructor, strings, printf sizes, double/float math, mixed argument passing, qsort calling back into 32-bit
-  code, pthread_once, thread-specific data, setjmp/longjmp, a C++ exception caught through the unwinder, file
-  reading, and strtol's 32-bit clamping.
-- Puzzle Craft 2 (`libcocos2dcpp.so`, 15 MB, ARMv7 Thumb-2): all 154 start-up functions run and `JNI_OnLoad`
-  returns `0x10004` (JNI 1.4). It used 19 phone functions, all handled, in 0.38 s.
-- Speed: `bench(20000)` takes about 1,830 ms through the bridge vs about 145 ms as native 64-bit, so the bridge is
-  about 12.5x slower for pure CPU work. Both builds give the same result.
-
-## Not done yet
-
-Drawing (GLES/EGL), sound (OpenSL ES), touch, assets (AAssetManager), real threads (`pthread_create` returns
-EAGAIN, and mutexes are no-ops with one guest thread) and running inside an Android app (the Java side is
-pretend). Phone functions with no handler return 0 and are listed in the report.
+More notes: [docs/no-root-plan.md](docs/no-root-plan.md) (how the app installs without root).
 
 ## License
 
