@@ -118,6 +118,9 @@ pub struct Asm {
     /// Host FPCR is in NEON mode: linked exits put the guest's VFP mode back first
     /// (the next block expects it).
     pub vfp_restore: bool,
+    /// Guest address of the block's first instruction (`emit_exit` skips the
+    /// preempt check on exits to higher addresses).
+    pub block_start: u32,
 }
 
 impl Asm {

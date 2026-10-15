@@ -2027,3 +2027,6 @@ AndroidConfiguration. Regression test: selftest "dlsym finds OpenSL ES interface
   checker (786,432+ blocks each, 0 differences, same result as native).
 - Step 4: self-test default, LSE=0, FORCE_FALLBACK_SYNC=1, PARALLEL=0 pass; Lua and crossbench results match.
   qemu timing (rough): bench_strlen 2M calls 1050 ms old, 1010 ms steps 1-3, 650 ms with the fast lane.
+5. Exits to a higher guest address than the block's start skip the preempt check (emit_exit, Asm::block_start):
+   every loop of linked blocks still has one checked exit (the one into its lowest block); computed jumps always
+   check. qemu: self-test default, PARALLEL=0 (the guest lock relies on these checks), LSE=0 pass; Lua results same.

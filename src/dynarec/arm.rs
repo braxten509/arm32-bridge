@@ -13,6 +13,7 @@ pub fn translate(mem: GuestMem, start: u32) -> Block {
 /// Like `translate`, reading instructions from `copy` (see `thumb::translate_copy`).
 pub fn translate_copy(mem: GuestMem, start: u32, copy: Vec<u8>) -> (Block, Vec<u8>, bool) {
     let mut t = Translator::new(mem, start, false, copy);
+    t.a.block_start = start;
     if let Some(word) = super::fence_prefix() {
         t.a.emit(word);
     }

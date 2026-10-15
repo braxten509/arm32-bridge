@@ -37,10 +37,16 @@ const SP: u32 = 13;
 pub fn emit_exit(a: &mut Asm, pc: u32, reason: u32) {
     if reason == exit::JUMP && !a.no_link {
         // While another guest thread waits for its turn, leave through the
-        // dispatcher instead of jumping straight on (runtime::PREEMPT).
+        // dispatcher instead of jumping straight on (runtime::PREEMPT). Only
+        // exits to an address at or below this block's start check: every loop
+        // of linked blocks has one (the exit into its lowest block), so a
+        // waiting thread, a stopped world or a signal still gets its turn
+        // within one pass (computed jumps always check).
         let unlinked = a.label();
         restore_vfp_mode(a);
-        preempt_check(a, unlinked);
+        if pc & !1 <= a.block_start {
+            preempt_check(a, unlinked);
+        }
         // Becomes `b <block>` once the block at `pc` is translated (engine.rs).
         a.links.push((a.len(), pc));
         a.nop();
@@ -226,6 +232,7 @@ pub fn translate(mem: GuestMem, start: u32) -> Block {
 /// the copy and whether an instruction was read past its end.
 pub fn translate_copy(mem: GuestMem, start: u32, copy: Vec<u8>) -> (Block, Vec<u8>, bool) {
     let mut t = Translator::new(mem, start, true, copy);
+    t.a.block_start = start;
     if let Some(word) = fence_prefix() {
         t.a.emit(word);
     }
