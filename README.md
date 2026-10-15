@@ -52,3 +52,15 @@ Flags: `--trace` prints every phone call, `--verbose` prints each start-up funct
 Drawing (GLES/EGL), sound (OpenSL ES), touch, assets (AAssetManager), real threads (`pthread_create` returns
 EAGAIN, and mutexes are no-ops with one guest thread) and running inside an Android app (the Java side is
 pretend). Phone functions with no handler return 0 and are listed in the report.
+
+## License
+
+Copyright (C) 2026 Braxten Chenay
+
+This program is free software; you can redistribute it and/or modify it under the terms of the GNU General
+Public License as published by the Free Software Foundation; either version 2 of the License, or (at your
+option) any later version. See [LICENSE](LICENSE).
+
+The bridge and the converter are built with [Unicorn](https://www.unicorn-engine.org/) (GPL version 2, patched
+copy in `vendor/unicorn-engine-sys`, changes listed in its ARM32-BRIDGE.md), so those programs as built are
+shared under GPL version 2.

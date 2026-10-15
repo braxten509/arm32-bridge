@@ -3,6 +3,7 @@ name = "apk-convert"
 version = "0.1.0"
 edition = "2021"
 description = "Converts a 32-bit-only Android game APK to run on 64-bit-only phones through arm32-bridge"
+license = "GPL-2.0-or-later"
 
 [dependencies]
 arm32-bridge = { path = ".." }
