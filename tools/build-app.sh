@@ -3,8 +3,10 @@
 # and the converter (apk-convert) go into its library folder, the PC's debug
 # signing key into its assets (so phone and PC conversions replace each other),
 # then Gradle builds the APK. With --install it is installed over ADB.
-# --public leaves the PC's key out: that build makes its own key on each phone
-# (Android's key store), for sharing the app with other people.
+# --public is the build for other people: the PC's key is left out (the app makes
+# its own key for games on each phone, in Android's key store) and the app is
+# signed with Game Bridge's release key (tools/release-key.sh; password from KDE
+# Wallet). It is copied to android/GameBridge-<version>.apk.
 #
 # usage: tools/build-app.sh [--public] [--install]
 set -euo pipefail
@@ -33,6 +35,10 @@ cp "$OUT/libarm32_bridge.so" "$LIBS/libarm32_bridge.so"
     "$ROOT/tools/standin/standin.c" -llog -ldl
 if [ $PUBLIC = 1 ]; then
     rm -f "$ASSETS/debug.keystore"
+    export GAMEBRIDGE_KEYSTORE=$HOME/dev/game-bridge-key/gamebridge-release.p12
+    [ -f "$GAMEBRIDGE_KEYSTORE" ] || { echo "No release key; run tools/release-key.sh first." >&2; exit 1; }
+    GAMEBRIDGE_KEY_PASSWORD=$(kwallet-query -f GameBridge -r release-key kdewallet)
+    export GAMEBRIDGE_KEY_PASSWORD
 else
     cp "$HOME/.android/debug.keystore" "$ASSETS/debug.keystore"
 fi
@@ -40,6 +46,11 @@ fi
 echo "== app"
 (cd "$ROOT/android" && ./gradlew -q assembleRelease)
 APK=$ROOT/android/app/build/outputs/apk/release/app-release.apk
+if [ $PUBLIC = 1 ]; then
+    VERSION=$(sed -n 's/.*versionName = "\(.*\)".*/\1/p' "$ROOT/android/app/build.gradle.kts")
+    cp "$APK" "$ROOT/android/GameBridge-$VERSION.apk"
+    APK=$ROOT/android/GameBridge-$VERSION.apk
+fi
 ls -la "$APK"
 if [ $INSTALL = 1 ]; then
     adb install -r "$APK"

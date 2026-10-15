@@ -84,3 +84,10 @@ confirmation, opened without a crash. The owner chose to drop the root path: Roo
 debug.gamebridge.noroot are gone; `Installer` (was SessionInstaller) is the only installer.
 Broken Age (target 22 -> 24, `tools/convert.sh --min-target-sdk 24`, installed as an update): loaded and played about
 a minute on the Pixel; no crash, no permission errors; Android later removed it from the background as usual.
+
+## Release signing (2026-10-15)
+`tools/release-key.sh` made Game Bridge's release key once: ~/dev/game-bridge-key/gamebridge-release.p12 (RSA 4096,
+10000 days, alias gamebridge, SHA-256 22:9F:A8:62:D0:B3:B7:C1:0C:4E:19:DC:7F:32:F8:35:7E:2E:DE:9A:2E:1F:EE:C2:48:6E:2E:77:20:C3:1D:49),
+random password in KDE Wallet (folder GameBridge, entry release-key). Both are in the daily Kopia backup.
+`tools/build-app.sh --public` signs with it and writes android/GameBridge-<version>.apk. A phone with an owner build
+(debug key) must uninstall Game Bridge before installing a public build.

@@ -7,3 +7,5 @@
 # Filled by tools/build-app.sh (built files and the debug signing key).
 /android/app/src/main/jniLibs
 /android/app/src/main/assets
+# Public builds (tools/build-app.sh --public).
+/android/GameBridge-*.apk

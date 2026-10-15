@@ -1,6 +1,7 @@
 // Game Bridge: converts 32-bit-only games from Downloads on the phone itself.
 // tools/build-app.sh puts the bridge, the stand-in and the converter into
-// src/main/jniLibs/arm64-v8a and the signing key into src/main/assets first.
+// src/main/jniLibs/arm64-v8a and (except for --public builds) the PC's debug key into
+// src/main/assets first.
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.plugin.compose")
@@ -19,10 +20,23 @@ android {
         ndk.abiFilters += "arm64-v8a"
     }
 
+    signingConfigs {
+        // tools/build-app.sh --public: Game Bridge's own release key (tools/release-key.sh),
+        // its password read from KDE Wallet. Other builds use the PC's debug key.
+        System.getenv("GAMEBRIDGE_KEYSTORE")?.let { keystore ->
+            create("release") {
+                storeFile = file(keystore)
+                storePassword = System.getenv("GAMEBRIDGE_KEY_PASSWORD")
+                keyAlias = "gamebridge"
+                keyPassword = System.getenv("GAMEBRIDGE_KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
         }
     }
 
