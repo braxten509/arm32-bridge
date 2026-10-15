@@ -337,6 +337,10 @@ impl Translator {
         let a = &mut self.a;
         a.mrs_nzcv(T0);
         a.tst_w(result, result);
+        if use_flagm() {
+            a.rmif(T0, 28, 0b0011); // C and V back from the saved flags
+            return;
+        }
         a.mrs_nzcv(T1);
         a.lsr_w_imm(T0, T0, 28);
         a.bfi_w(T1, T0, 28, 2);
@@ -348,6 +352,11 @@ impl Translator {
         let a = &mut self.a;
         a.mrs_nzcv(T0);
         a.tst_w(result, result);
+        if use_flagm() {
+            a.rmif(T0, 28, 0b0001); // V back from the saved flags
+            a.rmif(carry, 63, 0b0010); // C = bit 0 of `carry`
+            return;
+        }
         a.mrs_nzcv(T1);
         a.lsr_w_imm(T0, T0, 28);
         a.bfi_w(T1, T0, 28, 1);
@@ -2061,6 +2070,23 @@ pub fn force_sync_fallback() -> bool {
     *FORCE.get_or_init(|| {
         let setting = std::env::var("ARM32_FORCE_FALLBACK_SYNC").ok().or_else(|| super::property("debug.arm32bridge.fallback_sync"));
         setting.as_deref() == Some("1")
+    })
+}
+
+/// Whether the host has FlagM (RMIF sets single flags: N/Z updates that keep
+/// C and V take 3 instructions instead of 6). ARM32_FLAGM=0 /
+/// debug.arm32bridge.flagm=0 (testing): the plain sequence.
+fn use_flagm() -> bool {
+    static FLAGM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAGM.get_or_init(|| {
+        #[cfg(target_arch = "aarch64")]
+        let present = std::arch::is_aarch64_feature_detected!("flagm");
+        #[cfg(not(target_arch = "aarch64"))]
+        let present = false;
+        let setting = std::env::var("ARM32_FLAGM").ok().or_else(|| super::property("debug.arm32bridge.flagm"));
+        let used = present && setting.as_deref() != Some("0");
+        crate::log::line(&format!("[bridge] N/Z flag updates: {}", if used { "rmif (FlagM)" } else { "plain" }));
+        used
     })
 }
 

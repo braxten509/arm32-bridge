@@ -2030,3 +2030,7 @@ AndroidConfiguration. Regression test: selftest "dlsym finds OpenSL ES interface
 5. Exits to a higher guest address than the block's start skip the preempt check (emit_exit, Asm::block_start):
    every loop of linked blocks still has one checked exit (the one into its lowest block); computed jumps always
    check. qemu: self-test default, PARALLEL=0 (the guest lock relies on these checks), LSE=0 pass; Lua results same.
+6. N/Z flag updates that keep C/V (set_nz, set_nz_carry: every flag-setting logical op, MOVS, LSLS ...): with
+   FlagM (Pixel 10 has it) `mrs; tst; rmif` instead of 6-7 instructions; ARM32_FLAGM=0 / debug.arm32bridge.flagm=0
+   uses the old sequence; the log says which. qemu: checker 2,576,585 blocks 0 differences with rmif; default and
+   FLAGM=0 pass; Lua test Thumb and ARM under the checker 0 differences.

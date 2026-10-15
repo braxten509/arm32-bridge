@@ -670,6 +670,12 @@ impl Asm {
     pub fn msr_nzcv(&mut self, rt: Reg) {
         self.emit(0xD51B_4200 | rt);
     }
+    /// rmif xn, #shift, #mask (FlagM): flag bits N Z C V (mask bits 3-0) from
+    /// bits 3-0 of xn rotated right by `shift`.
+    pub fn rmif(&mut self, rn: Reg, shift: u32, mask: u32) {
+        debug_assert!(shift < 64 && mask < 16);
+        self.emit(0xBA00_0400 | (shift << 15) | (rn << 5) | mask);
+    }
 
     /// mrs xt, fpcr / msr fpcr, xt / mrs xt, fpsr / msr fpsr, xt
     pub fn mrs_fpcr(&mut self, rt: Reg) {
