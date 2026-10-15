@@ -117,11 +117,14 @@ if [ -z "$DEVICE" ] && ! "${ADB[@]}" get-state >/dev/null 2>&1; then
 fi
 if ! "${ADB[@]}" get-state >/dev/null 2>&1; then
     echo "No phone found. Turn on Wireless debugging on the phone (same Wi-Fi), then run:" >&2
-    echo "  adb install -r --bypass-low-target-sdk-block '$OUT'" >&2
+    echo "  adb install -r --no-incremental --bypass-low-target-sdk-block '$OUT'" >&2
     exit 1
 fi
-INSTALL_COMMAND=(install -r --bypass-low-target-sdk-block "$OUT")
-[ $BUNDLE = 0 ] || INSTALL_COMMAND=(install-multiple -r --bypass-low-target-sdk-block "$OUT"/*.apk)
+# Not streamed: an incremental install lets the game start before all of it has
+# arrived, and every read of a missing part waits for the cable (Broken Age's
+# start-up script took 9 s instead of 0.1 s and Android called it not responding).
+INSTALL_COMMAND=(install -r --no-incremental --bypass-low-target-sdk-block "$OUT")
+[ $BUNDLE = 0 ] || INSTALL_COMMAND=(install-multiple -r --no-incremental --bypass-low-target-sdk-block "$OUT"/*.apk)
 if ! result=$("${ADB[@]}" "${INSTALL_COMMAND[@]}" 2>&1); then
     if grep -q "UPDATE_INCOMPATIBLE" <<<"$result"; then
         echo "The phone already has this game signed by someone else, so it can't be replaced in place." >&2
