@@ -51,6 +51,48 @@ pub fn emit_exit(a: &mut Asm, pc: u32, reason: u32) {
     a.br(host::EXIT_STUB);
 }
 
+/// The fast lane for the light phone function in stub slot `index` at `pc`
+/// (engine.rs `make_lane`): saves the guest registers, NZCV and q0-q15 in
+/// CpuState (the host call may change them), calls `call(index)`, reloads them
+/// (r0/r1 then hold the result) and jumps on to the return address. When the
+/// call didn't run (it returned 0), it leaves through the dispatcher at the
+/// stub instead, which runs the function the usual way. The host code runs in
+/// the guest's FPCR mode; light functions do no floating-point math.
+pub fn light_lane(pc: u32, index: u32, call: usize) -> Vec<u32> {
+    let mut a = Asm::new();
+    for pair in 0..7 {
+        a.stp_w_off(pair * 2, pair * 2 + 1, host::STATE, offsets::R + pair * 8);
+    }
+    a.str_w_off(LR, host::STATE, offsets::R + LR * 4);
+    a.mrs_nzcv(T0);
+    a.str_x_off(T0, host::STATE, offsets::NZCV);
+    for pair in 0..8 {
+        a.stp_q_off(pair * 2, pair * 2 + 1, host::STATE, offsets::Q + pair * 32);
+    }
+    a.mov_w_imm(0, index);
+    a.mov_x_imm(T0, call as u64);
+    a.blr(T0);
+    a.mov_w(T2, 0); // T2 is callee-saved
+    for pair in 0..8 {
+        a.ldp_q_off(pair * 2, pair * 2 + 1, host::STATE, offsets::Q + pair * 32);
+    }
+    a.ldr_x_off(T0, host::STATE, offsets::NZCV);
+    a.msr_nzcv(T0);
+    for pair in 0..7 {
+        a.ldp_w_off(pair * 2, pair * 2 + 1, host::STATE, offsets::R + pair * 8);
+    }
+    a.ldr_w_off(LR, host::STATE, offsets::R + LR * 4);
+    let slow = a.label();
+    a.cbz_w_to(T2, slow);
+    emit_exit_to(&mut a, LR);
+    a.bind(slow);
+    a.mov_w_imm(host::EXIT_PC, pc);
+    a.mov_w_imm(host::EXIT_REASON, exit::JUMP);
+    a.br(host::EXIT_STUB);
+    a.finish();
+    a.code
+}
+
 /// Puts host FPCR back in the guest's VFP mode before a linked exit from NEON mode (uses T0, T1).
 fn restore_vfp_mode(a: &mut Asm) {
     if a.vfp_restore {
@@ -62,8 +104,7 @@ fn restore_vfp_mode(a: &mut Asm) {
 
 /// Branches to `to` when the shared preempt flag is set (uses T0; flags untouched).
 fn preempt_check(a: &mut Asm, to: super::emit::Label) {
-    a.ldr_x_off(T0, host::STATE, offsets::PREEMPT_FLAG);
-    a.ldr_w_off(T0, T0, 0);
+    a.ldr_w_off(T0, host::PREEMPT_FLAG, 0);
     a.cbnz_w_to(T0, to);
 }
 
@@ -78,19 +119,28 @@ fn emit_exit_to(a: &mut Asm, target: Reg) {
         restore_vfp_mode(a);
         preempt_check(a, miss);
         // One 64-bit entry: (code - table) << 32 | guest pc; the table is at the start of code memory.
-        a.mov_x_imm(T0, table as u64);
         a.ubfx_w(T1, target, 1, super::engine::JUMP_TABLE_BITS);
-        a.add_x_lsl(T1, T0, T1, 3);
-        a.ldr_x_off(T1, T1, 0);
+        a.ldr_x_lsl3(T1, host::JUMP_TABLE, T1);
         a.eor_w(T2, T1, target, shift::LSL, 0); // no compare: the guest flags live in NZCV
         a.cbnz_w_to(T2, miss);
-        a.add_x_asr(T0, T0, T1, 32);
+        a.add_x_asr(T0, host::JUMP_TABLE, T1, 32);
         a.br(T0);
         a.bind(miss);
     }
     a.mov_w(host::EXIT_PC, target);
     a.mov_w_imm(host::EXIT_REASON, exit::JUMP);
     a.br(host::EXIT_STUB);
+}
+
+/// The second operand of a data-processing op.
+#[derive(Clone, Copy)]
+enum Operand {
+    /// A host register.
+    Reg(Reg),
+    /// A host register shifted by a constant 1-31 (LSL LSR ASR ROR); no shifter carry wanted.
+    Shifted(Reg, u32, u32),
+    /// A constant.
+    Imm(u32),
 }
 
 #[derive(PartialEq)]
@@ -370,6 +420,21 @@ impl Translator {
         a.and_w_imm(T2, rs, 0xFF, T5); // amount
         let done = a.label();
         match kind {
+            shift::LSL | shift::LSR if !carry_out => {
+                // 64-bit shift of the zero-extended value covers 0-63; 64+ gives 0:
+                // the result is masked with (amount >> 6) - 1 >> 31 (all ones below
+                // 64), arithmetic instead of a branch or a flag test (the guest
+                // flags live in NZCV), and still computed from the shifted value.
+                a.mov_w(T6, rm); // zero-extends into x
+                if kind == shift::LSL {
+                    a.lslv_x(T5, T6, T2);
+                } else {
+                    a.lsrv_x(T5, T6, T2);
+                }
+                a.lsr_w_imm(T4, T2, 6);
+                a.sub_w_imm(T4, T4, 1);
+                a.and_w(result, T5, T4, shift::ASR, 31);
+            }
             shift::LSL | shift::LSR => {
                 // 64-bit shift of the zero-extended value covers 0-63; 64+ gives 0.
                 a.mov_w(T6, rm); // zero-extends into x
@@ -445,13 +510,45 @@ impl Translator {
 
     // ---- data processing ----
 
+    /// The operand as a plain register (a shifted register or a constant is
+    /// computed into T2).
+    fn operand_register(&mut self, operand: Operand) -> Reg {
+        match operand {
+            Operand::Reg(r) => r,
+            Operand::Shifted(rm, kind, amount) => {
+                self.shift_immediate(T2, rm, kind, amount, false);
+                T2
+            }
+            Operand::Imm(value) => {
+                self.a.mov_w_imm(T2, value);
+                T2
+            }
+        }
+    }
+
     /// Data-processing ops shared by the 32-bit immediate and shifted-register
-    /// forms. `operand` holds the second operand; `carry` says where the
-    /// shifter carry is (None = keep C).
+    /// forms. `operand` is the second operand; `carry` says where the shifter
+    /// carry is (None = keep C). Shifted registers and constants go straight
+    /// into the ARM64 instruction where it has a form for them.
     #[allow(clippy::too_many_arguments)]
-    fn data_processing(&mut self, op: u32, set_flags: bool, rd: u32, rn: u32, operand: Reg, carry: Option<Reg>) -> Result<Flow> {
-        let n = if rn == PC { self.read(PC, T1) } else { rn };
+    fn data_processing(&mut self, op: u32, set_flags: bool, rd: u32, rn: u32, operand: Operand, carry: Option<Reg>) -> Result<Flow> {
+        // ORR/ORN with rn = PC are MOV/MVN: they don't read it.
+        let moves = matches!(op, 0b0010 | 0b0011) && rn == PC;
         let d = if rd == PC { T6 } else { rd };
+        if let (Operand::Imm(value), 0b1000 | 0b1101, PC, false) = (operand, op, rn, set_flags) {
+            // PC plus or minus a constant (ARM's ADR) is a constant.
+            let pc = self.pc_value();
+            self.a.mov_w_imm(d, if op == 0b1000 { pc.wrapping_add(value) } else { pc.wrapping_sub(value) });
+            if rd == PC {
+                if self.thumb {
+                    return Err(()); // as below
+                }
+                emit_exit_to(&mut self.a, T6);
+                return Ok(Flow::End);
+            }
+            return Ok(Flow::Next);
+        }
+        let n = if rn == PC && !moves { self.read(PC, T1) } else { rn };
         let logical_flags = |t: &mut Translator, result: Reg| {
             if set_flags {
                 match carry {
@@ -460,62 +557,93 @@ impl Translator {
                 }
             }
         };
+        // Logical ops (`op` AND BIC ORR ORN EOR = 0-4): ARM64 has every shift
+        // (ROR too) and bitmask constants; BIC/ORN take the inverted constant.
+        let logical = |t: &mut Translator, op: u32, d: Reg, n: Reg, operand: Operand| {
+            let a = &mut t.a;
+            let (rm, kind, amount) = match operand {
+                Operand::Imm(value) => {
+                    match op {
+                        0 => a.and_w_imm(d, n, value, T2),
+                        1 => a.and_w_imm(d, n, !value, T2),
+                        2 => a.orr_w_imm(d, n, value, T2),
+                        3 => a.orr_w_imm(d, n, !value, T2),
+                        _ => a.eor_w_imm(d, n, value, T2),
+                    }
+                    return;
+                }
+                Operand::Shifted(rm, kind, amount) => (rm, kind, amount),
+                Operand::Reg(rm) => (rm, shift::LSL, 0),
+            };
+            match op {
+                0 => a.and_w(d, n, rm, kind, amount),
+                1 => a.bic_w(d, n, rm, kind, amount),
+                2 => a.orr_w(d, n, rm, kind, amount),
+                3 => a.orn_w(d, n, rm, kind, amount),
+                _ => a.eor_w(d, n, rm, kind, amount),
+            }
+        };
         match op {
-            0b0000 => {
-                // AND / TST
+            0b0000 | 0b0100 if rd == PC && set_flags => {
+                // TST / TEQ
+                logical(self, op, T6, n, operand);
+                logical_flags(self, T6);
+                return Ok(Flow::Next);
+            }
+            0b0000 | 0b0001 | 0b0100 => {
+                logical(self, op, d, n, operand);
+                logical_flags(self, d);
+            }
+            0b0010 | 0b0011 if moves => {
+                // MOV / MVN
+                match operand {
+                    Operand::Imm(value) => self.a.mov_w_imm(d, if op == 0b0011 { !value } else { value }),
+                    Operand::Reg(rm) if op == 0b0010 => self.a.mov_w(d, rm),
+                    Operand::Reg(rm) => self.a.mvn_w(d, rm),
+                    Operand::Shifted(..) => logical(self, op, d, ZR, operand),
+                }
+                logical_flags(self, d);
+            }
+            0b0010 | 0b0011 => {
+                // ORR / ORN
+                logical(self, op, d, n, operand);
+                logical_flags(self, d);
+            }
+            0b1000 | 0b1101 => {
+                // ADD / CMN, SUB / CMP (rd = PC with flags: compare only)
+                let subtract = op == 0b1101;
+                let d = if rd == PC && set_flags { ZR } else { d };
+                match operand {
+                    Operand::Imm(value) if set_flags && value < 4096 => {
+                        if subtract {
+                            self.a.subs_w_imm(d, n, value);
+                        } else {
+                            self.a.adds_w_imm(d, n, value);
+                        }
+                    }
+                    Operand::Imm(value) if !set_flags => {
+                        self.a.add_w_any(d, n, if subtract { value.wrapping_neg() } else { value }, T2);
+                    }
+                    _ => {
+                        let (rm, kind, amount) = match operand {
+                            Operand::Shifted(rm, kind, amount) if kind != shift::ROR => (rm, kind, amount),
+                            Operand::Reg(rm) => (rm, shift::LSL, 0),
+                            _ => (self.operand_register(operand), shift::LSL, 0),
+                        };
+                        match (subtract, set_flags) {
+                            (false, false) => self.a.add_w(d, n, rm, kind, amount),
+                            (false, true) => self.a.adds_w(d, n, rm, kind, amount),
+                            (true, false) => self.a.sub_w(d, n, rm, kind, amount),
+                            (true, true) => self.a.subs_w(d, n, rm, kind, amount),
+                        }
+                    }
+                }
                 if rd == PC && set_flags {
-                    self.a.and_w(T6, n, operand, shift::LSL, 0);
-                    logical_flags(self, T6);
                     return Ok(Flow::Next);
-                }
-                self.a.and_w(d, n, operand, shift::LSL, 0);
-                logical_flags(self, d);
-            }
-            0b0001 => {
-                self.a.bic_w(d, n, operand, shift::LSL, 0);
-                logical_flags(self, d);
-            }
-            0b0010 => {
-                // ORR / MOV
-                if rn == PC {
-                    self.a.mov_w(d, operand);
-                } else {
-                    self.a.orr_w(d, n, operand, shift::LSL, 0);
-                }
-                logical_flags(self, d);
-            }
-            0b0011 => {
-                // ORN / MVN
-                if rn == PC {
-                    self.a.mvn_w(d, operand);
-                } else {
-                    self.a.orn_w(d, n, operand, shift::LSL, 0);
-                }
-                logical_flags(self, d);
-            }
-            0b0100 => {
-                // EOR / TEQ
-                if rd == PC && set_flags {
-                    self.a.eor_w(T6, n, operand, shift::LSL, 0);
-                    logical_flags(self, T6);
-                    return Ok(Flow::Next);
-                }
-                self.a.eor_w(d, n, operand, shift::LSL, 0);
-                logical_flags(self, d);
-            }
-            0b1000 => {
-                // ADD / CMN
-                if rd == PC && set_flags {
-                    self.a.adds_w(ZR, n, operand, shift::LSL, 0);
-                    return Ok(Flow::Next);
-                }
-                if set_flags {
-                    self.a.adds_w(d, n, operand, shift::LSL, 0);
-                } else {
-                    self.a.add_w(d, n, operand, shift::LSL, 0);
                 }
             }
             0b1010 => {
+                let operand = self.operand_register(operand);
                 if set_flags {
                     self.a.adcs_w(d, n, operand);
                 } else {
@@ -523,25 +651,16 @@ impl Translator {
                 }
             }
             0b1011 => {
+                let operand = self.operand_register(operand);
                 if set_flags {
                     self.a.sbcs_w(d, n, operand);
                 } else {
                     self.a.sbc_w(d, n, operand);
                 }
             }
-            0b1101 => {
-                // SUB / CMP
-                if rd == PC && set_flags {
-                    self.a.subs_w(ZR, n, operand, shift::LSL, 0);
-                    return Ok(Flow::Next);
-                }
-                if set_flags {
-                    self.a.subs_w(d, n, operand, shift::LSL, 0);
-                } else {
-                    self.a.sub_w(d, n, operand, shift::LSL, 0);
-                }
-            }
             0b1110 => {
+                // RSB: operand - n
+                let operand = if matches!(operand, Operand::Imm(0)) { ZR } else { self.operand_register(operand) };
                 if set_flags {
                     self.a.subs_w(d, operand, n, shift::LSL, 0);
                 } else {
@@ -1323,9 +1442,13 @@ impl Translator {
             return Err(());
         }
         let logical = matches!(op, 0b0000..=0b0100);
+        if (1..32).contains(&amount) && !(set_flags && logical) {
+            // No shifter carry wanted: ARM64 shifts the operand inside the op.
+            return self.data_processing(op, set_flags, rd, rn, Operand::Shifted(rm, kind, amount), None);
+        }
         let carry = self.shift_immediate(T2, rm, kind, amount, set_flags && logical);
         let carry = if carry && set_flags && logical { Some(T3) } else { None };
-        self.data_processing(op, set_flags, rd, rn, T2, carry)
+        self.data_processing(op, set_flags, rd, rn, Operand::Reg(T2), carry)
     }
 
     /// PKHBT: rd = rn bottom | (rm << amount) top; PKHTB: rd = rn top | (rm asr amount) bottom
@@ -1353,7 +1476,6 @@ impl Translator {
         if rd == PC && !(set_flags && matches!(op, 0b0000 | 0b0100 | 0b1000 | 0b1101)) {
             return Err(());
         }
-        self.a.mov_w_imm(T2, value);
         let logical = matches!(op, 0b0000..=0b0100);
         let carry = match carry {
             Some(c) if set_flags && logical => {
@@ -1362,7 +1484,7 @@ impl Translator {
             }
             _ => None,
         };
-        self.data_processing(op, set_flags, rd, rn, T2, carry)
+        self.data_processing(op, set_flags, rd, rn, Operand::Imm(value), carry)
     }
 
     fn data_plain_immediate(&mut self, h1: u32, h2: u32) -> Result<Flow> {

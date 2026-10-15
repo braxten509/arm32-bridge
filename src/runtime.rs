@@ -1669,6 +1669,19 @@ pub fn call_light(uc: &mut Uc, index: u32) -> bool {
     true
 }
 
+/// `call_light` from translated code's fast lane (thumb::light_lane), with the
+/// guest registers saved in the thread's CpuState: 1 when it ran, 0 when it
+/// has to take the usual way (the lane then leaves through the dispatcher).
+/// Light functions never set `fault` or `exit_code`, which the dispatcher
+/// would check after a call.
+pub extern "C" fn call_light_from_lane(index: u32) -> u32 {
+    let engine = ENGINE.with(|e| e.get());
+    if engine.is_null() {
+        return 0;
+    }
+    call_light(unsafe { &mut *engine }, index) as u32
+}
+
 pub fn call_stub(uc: &mut Uc, index: u32) {
     let Some(stub) = stub(index) else {
         stop_with_fault(uc, format!("called phone function slot {index}, which was never made"));

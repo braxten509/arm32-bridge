@@ -148,6 +148,8 @@ fn enter_code() -> Vec<u32> {
     a.push_pair_d(14, 15);
     a.mov_x(host::STATE, 0);
     a.mov_x(host::MEMORY, 1);
+    a.ldr_x_off(host::PREEMPT_FLAG, host::STATE, offsets::PREEMPT_FLAG);
+    a.mov_x_imm(host::JUMP_TABLE, CODE_BASE.load(Ordering::Relaxed) as u64);
     // Guest FPSCR: control bits into FPCR (only written when they differ from
     // the host's, which is slow), cumulative flags into FPSR.
     a.mrs_fpcr(16);
@@ -870,6 +872,42 @@ fn lookup_block(pc: u32) -> (usize, u32, usize, usize) {
     }
 }
 
+/// A light phone function (`runtime::call_light`) that has run gets a fast
+/// lane at its stub address (thumb::light_lane): translated code then calls
+/// it in place, without the dispatcher or the full exit and enter. Published
+/// like a block (jump table, links); also puts its jump-table entry back if
+/// another pc with the same index took it.
+fn make_lane(pc: u32, index: u32) {
+    let made = |cache: &Cache| {
+        let &(code, _) = cache.blocks.get(&pc)?;
+        if !cache.unpublished.contains_key(&pc) {
+            set_jump(pc, code);
+        }
+        Some(())
+    };
+    if made(&read_cache()).is_some() {
+        return;
+    }
+    let mut guard = write_cache();
+    let cache = &mut *guard;
+    if made(cache).is_some() {
+        return;
+    }
+    let code = thumb::light_lane(pc, index, runtime::call_light_from_lane as *const () as usize);
+    let address = cache.memory.place(&code);
+    CODE_WRITTEN.fetch_add(1, Ordering::Release);
+    note_block(address, code.len() * 4, pc);
+    cache.blocks.insert(pc, (address, pc + 8));
+    cache.starts.push((address, pc));
+    if cache.unpublished.is_empty() {
+        cache.batch_started = Some(std::time::Instant::now());
+    }
+    cache.unpublished.insert(pc, ());
+    if publish_due(cache) {
+        publish(cache);
+    }
+}
+
 type EnterFn = unsafe extern "C" fn(*mut CpuState, *mut u8, usize, usize) -> u32;
 
 /// Runs guest code from `pc` (bit 0 = Thumb) until it reaches `stop_at`.
@@ -900,6 +938,8 @@ pub fn run(uc: &mut Uc, pc: u32, stop_at: u32) -> Result<(), String> {
             }
             if !runtime::call_light(uc, index) {
                 runtime::call_stub(uc, index);
+            } else if linking() {
+                make_lane(address, index);
             }
             let thread = uc.get_data();
             if let Some(fault) = &thread.fault {

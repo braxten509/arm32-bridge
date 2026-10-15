@@ -2,7 +2,7 @@
 //! Every ARM instruction has a condition; a conditional one is wrapped in a
 //! branch over it, like an instruction in a Thumb IT block.
 
-use super::{cond, emit_exit, emit_exit_to, exit, host, offsets, shift, sign_extend, Block, Flow, GuestMem, Reg, Result, Translator};
+use super::{cond, emit_exit, emit_exit_to, exit, host, offsets, shift, sign_extend, Block, Flow, GuestMem, Operand, Reg, Result, Translator};
 use super::{LR, MAX_INSTRUCTIONS, PC, T0, T1, T2, T3, T4, T5, T6};
 
 /// Translates the ARM block starting at `start` (4-byte aligned).
@@ -194,24 +194,26 @@ impl Translator {
         let (op, rd, rn) = if reverse_carry { (0b1011, rd, rn) } else { data_opcode(op, rd, rn).ok_or(())? };
         let logical = matches!(op, 0b0000..=0b0100);
         let want_carry = set_flags && logical;
-        let (operand, carry): (Reg, Option<Reg>) = if immediate {
+        let (operand, carry): (Operand, Option<Reg>) = if immediate {
             let rotation = ((word >> 8) & 0xF) * 2;
             let value = (word & 0xFF).rotate_right(rotation);
-            self.a.mov_w_imm(T2, value);
             if want_carry && rotation != 0 {
                 self.a.mov_w_imm(T3, value >> 31);
-                (T2, Some(T3))
+                (Operand::Imm(value), Some(T3))
             } else {
-                (T2, None)
+                (Operand::Imm(value), None)
             }
         } else if (word >> 4) & 1 == 0 {
             let (rm, kind, amount) = (word & 0xF, (word >> 5) & 3, (word >> 7) & 0x1F);
             let m = self.read(rm, T0);
             if kind == shift::LSL && amount == 0 {
-                (m, None)
+                (Operand::Reg(m), None)
+            } else if amount != 0 && !want_carry {
+                // No shifter carry wanted: ARM64 shifts the operand inside the op.
+                (Operand::Shifted(m, kind, amount), None)
             } else {
                 let has_carry = self.shift_immediate(T2, m, kind, amount, want_carry);
-                (T2, if has_carry && want_carry { Some(T3) } else { None })
+                (Operand::Reg(T2), if has_carry && want_carry { Some(T3) } else { None })
             }
         } else {
             let (rm, rs) = (word & 0xF, (word >> 8) & 0xF);
@@ -227,14 +229,15 @@ impl Translator {
                 self.a.mrs_nzcv(T5);
                 self.a.ubfx_w(T3, T5, 29, 1);
                 self.a.bind(shifted);
-                (T6, Some(T3))
+                (Operand::Reg(T6), Some(T3))
             } else {
-                (T6, None)
+                (Operand::Reg(T6), None)
             }
         };
         if reverse_carry {
             let n = self.read(rn, T1);
-            return self.data_processing(op, set_flags, rd, operand, n, None);
+            let operand = self.operand_register(operand);
+            return self.data_processing(op, set_flags, rd, operand, Operand::Reg(n), None);
         }
         self.data_processing(op, set_flags, rd, rn, operand, carry)
     }
@@ -476,19 +479,21 @@ impl Translator {
         if rm == PC || (writeback && (rn == PC || rn == rm)) || (!load && rt == PC) || (load && writeback && rt == rn) {
             return Err(());
         }
+        // Without write-back, LSL/LSR/ASR by 1-31 go inside the add (ARM64 has those forms).
+        let folded = !writeback && index && kind != shift::ROR && (1..32).contains(&amount);
         // T2 = the shifted offset (a copy, so a load into rm cannot change the write-back).
-        let offset = if kind == shift::LSL && amount == 0 && !writeback {
-            rm
+        let (offset, kind, amount) = if folded || (kind == shift::LSL && amount == 0 && !writeback) {
+            (rm, kind, amount)
         } else {
             self.shift_immediate(T2, rm, kind, amount, false);
-            T2
+            (T2, shift::LSL, 0)
         };
         let base = self.read(rn, T1);
         let address = if index {
             if up {
-                self.a.add_w(T0, base, offset, shift::LSL, 0);
+                self.a.add_w(T0, base, offset, kind, amount);
             } else {
-                self.a.sub_w(T0, base, offset, shift::LSL, 0);
+                self.a.sub_w(T0, base, offset, kind, amount);
             }
             T0
         } else {

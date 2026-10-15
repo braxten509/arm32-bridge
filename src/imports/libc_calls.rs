@@ -465,17 +465,15 @@ extern "C" {
 }
 
 /// A free or realloc of something that isn't a live heap block would corrupt
-/// the heap; log who did it (first few times) and leave the heap alone.
-fn refuse_bad_block(uc: &mut Uc, call: &str, pointer: u32) -> bool {
+/// the heap: log who did it (first few times); the heap is left alone.
+fn report_bad_block(uc: &Uc, call: &str, pointer: u32, reason: &str) {
     static REPORTED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let Some(reason) = crate::runtime::heap().not_owned(pointer) else { return false };
     if REPORTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 30 {
         crate::log::line(&format!(
             "[heap] refused {call}({pointer:#x}): {reason}; called from lr {:#x}",
             uc.reg(14)
         ));
     }
-    true
 }
 
 pub fn handler(name: &str) -> Option<Handler> {
@@ -501,20 +499,30 @@ pub fn handler(name: &str) -> Option<Handler> {
             mem().write_u32(out + 28, arena);
             Ret::U32(out)
         }),
+        // The check and the work under one heap lock.
         "realloc" => handler!(|uc, a| {
             let pointer = a.u32();
             let size = a.u32();
-            if pointer != 0 && refuse_bad_block(uc, "realloc", pointer) {
+            let mut heap = crate::runtime::heap();
+            if let Some(reason) = (pointer != 0).then(|| heap.not_owned(pointer)).flatten() {
+                drop(heap);
+                report_bad_block(uc, "realloc", pointer, reason);
                 return Ret::U32(0);
             }
-            Ret::U32(crate::runtime::heap().realloc(pointer, size))
+            Ret::U32(heap.realloc(pointer, size))
         }),
         "free" | "_ZdlPv" => handler!(|uc, a| {
             let pointer = a.u32();
-            if pointer != 0 && refuse_bad_block(uc, "free", pointer) {
+            if pointer == 0 {
                 return Ret::Void;
             }
-            crate::runtime::heap().free(pointer);
+            let mut heap = crate::runtime::heap();
+            if let Some(reason) = heap.not_owned(pointer) {
+                drop(heap);
+                report_bad_block(uc, "free", pointer, reason);
+                return Ret::Void;
+            }
+            heap.free(pointer);
             Ret::Void
         }),
         "memalign" => handler!(|uc, a| {

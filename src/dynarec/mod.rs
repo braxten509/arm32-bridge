@@ -130,4 +130,10 @@ pub mod host {
     pub const EXIT_PC: Reg = 21;
     pub const EXIT_REASON: Reg = 22;
     pub const EXIT_STUB: Reg = 23;
+    /// Until a block exit writes EXIT_PC and EXIT_REASON, those registers hold
+    /// the address of the flag linked exits check (`CpuState::preempt_flag`)
+    /// and of the jump table (the enter glue loads both), so an exit reads
+    /// the flag with one load and finds the table without building its address.
+    pub const PREEMPT_FLAG: Reg = EXIT_PC;
+    pub const JUMP_TABLE: Reg = EXIT_REASON;
 }

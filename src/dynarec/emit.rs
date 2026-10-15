@@ -910,6 +910,10 @@ impl Asm {
     pub fn ldr_x_reg(&mut self, rt: Reg, rn: Reg, rm: Reg) {
         self.emit(0xF860_6800 | (rm << 16) | (rn << 5) | rt);
     }
+    /// ldr x, [xn, xm, lsl #3] (entry xm of a table of 64-bit words)
+    pub fn ldr_x_lsl3(&mut self, rt: Reg, rn: Reg, rm: Reg) {
+        self.emit(0xF860_7800 | (rm << 16) | (rn << 5) | rt);
+    }
 
     // ---- memory: host structures at [xn, #offset] ----
 

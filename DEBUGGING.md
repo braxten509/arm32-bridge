@@ -1989,3 +1989,41 @@ Root cause: FMOD (Unity 2022) reaches OpenSL ES only through dlopen/dlsym. The b
 functions, so dlsym("SL_IID_ENGINE") was 0 (error 19); after that, the player's AndroidConfiguration interface was
 not bridged (error 33). Fixed by (1) run-time lookup returning known data imports and (2) bridging
 AndroidConfiguration. Regression test: selftest "dlsym finds OpenSL ES interface IDs".
+
+# Speed: translated code for Lua-heavy games (2026-10-14, owner's choice after the Pirates stutter work)
+
+## Measuring
+- Lua speed test: ~/dev/arm32-bridge-games/luabench (Lua 5.1.5, the version in Pirates' libSparkApp; game-style
+  objects, method calls, strings, garbage). luabench.so (Thumb, like the games) / luabench-arm.so for
+  `arm32-bridge bench <lib> bench N`, native luabench64 for comparison. scripts/bench-compare.sh times binaries
+  alternately; scripts/bench-capture.sh + analysis/bench-profile.py / show-block.sh profile a run and show guest code
+  next to its translation (code memory dumped from /proc/<pid>/mem with su).
+- crossbench.so (same folder): bench = malloc+free+strlen, bench_strlen = calls only, bench_none = no calls.
+- Before (2dbfc82, phone): ARM build 570 ms vs native 240 ms for 200 rounds; one call into the bridge ~49 ns.
+- Profile (Thumb): 53% translated code, the rest the bridge (calls: exit glue with FPSR/FPCR, dispatcher, call_light,
+  heap lock twice per free/realloc). In translated code ~40% of samples sit around block ends (exit check: two
+  dependent loads; jump-table address built with 3 movs; indirect branches) and 6% on the dmb ishst prefix.
+- Tried and dropped: LSE atomics (+lse) and fat LTO for the bridge build: 742 / 732 / 755 ms, noise.
+
+## Changes
+1. Data-processing operands (thumb.rs data_processing, `Operand`): a shifted register (LSL/LSR/ASR/ROR #1-31, no
+   shifter carry wanted) or a constant goes straight into the ARM64 instruction (add w5, w9, w6, lsl #4; cmp/add/sub
+   immediates; bitmask constants); MOV/MVN no longer build the PC in a scratch register; PC +/- constant (ARM ADR) is
+   one constant. ARM register-offset loads fold LSL/LSR/ASR into the address add.
+2. Register-amount LSL/LSR without the carry: masked arithmetically instead of a branch.
+3. Block exits: x21/x22 hold the preempt-flag address and the jump table until an exit writes EXIT_PC/EXIT_REASON
+   (enter glue loads them): one load per exit check, table entry with one `ldr x, [x22, x17, lsl #3]`.
+4. Fast lane for light phone functions (malloc/free/realloc/memcpy/strlen/... = runtime LIGHT): after a light call
+   ran once, the stub address gets a translated block (thumb::light_lane, engine::make_lane) that saves r0-r14,
+   NZCV and q0-q15, calls runtime::call_light_from_lane and jumps on through the jump table; 0 from the call
+   (can't run light now) leaves through the dispatcher at the stub as before. free/realloc check and work under
+   one heap lock.
+
+## Testing without the phone (it was offline)
+- ARM64 Linux build under qemu-aarch64 on the PC: ~/.cache/aarch64-cross (build.sh, selftest.sh, luacheck.sh;
+  sysroot ~/.cache/aarch64-sysroot from the arm64 buildpack-deps:bookworm image, absolute links made relative).
+  The old build fails the same 2 network checks there (socketpair/poll/recv timeout, gethostbyname): environment.
+- Steps 1-3: self-test default + ARM32_CHECK=all (2,547,330 blocks, 0 differences); Lua test Thumb and ARM under the
+  checker (786,432+ blocks each, 0 differences, same result as native).
+- Step 4: self-test default, LSE=0, FORCE_FALLBACK_SYNC=1, PARALLEL=0 pass; Lua and crossbench results match.
+  qemu timing (rough): bench_strlen 2M calls 1050 ms old, 1010 ms steps 1-3, 650 ms with the fast lane.
