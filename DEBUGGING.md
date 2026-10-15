@@ -2043,3 +2043,9 @@ AndroidConfiguration. Regression test: selftest "dlsym finds OpenSL ES interface
 - Waiting for the owner: run scripts/wait-phone-then-test.sh (or phone-selftest.sh + bench-compare.sh with
   ~/.cache/a32-baseline/arm32-bridge vs the new build), then push e752ed2/0238af3/8d4ad74 and reinstall the games
   (scripts/reinstall-all.sh; Pirates first needs bridge-swap.sh --undo).
+
+## Phone results (2026-10-14 23:10, owner back)
+- Self-test on the Pixel, all 6 modes: 0 failures; checker 2,522,968 blocks, 0 differences.
+- Timing, pinned to one 3.05 GHz core (taskset 40), 5 alternating runs, median old -> new: Lua test 475 -> 415 ms
+  (-13%), bench_strlen 3M calls 209 -> 175 ms (-16%), malloc+free+strlen 1M 247 -> 190 ms (-23%). Native Lua 233 ms.
+  Unpinned runs swing 360-550 ms for one build (core migration): always pin for timing.
