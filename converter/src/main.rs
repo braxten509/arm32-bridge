@@ -16,9 +16,10 @@
 //!   Pieces made only for other kinds of phones (x86) are left out.
 //!
 //! usage: apk-convert <game.apk|bundle> <out.apk|out folder> --bridge <libarm32_bridge.so> --standin <libstandin.so>
-//!                    [--work <scratch dir>] [--abi <output ABI, default arm64-v8a>]
+//!                    [--work <scratch dir>] [--abi <output ABI, default arm64-v8a>] [--min-target-sdk <N>]
 //!        apk-convert --inspect <game.apk|bundle> [--base <out.apk>] [--work <scratch dir>]
 //! (`--abi x86_64` makes a copy for the PC's Android emulator, with an x86_64 bridge and stand-in.)
+//! (`--min-target-sdk N` raises the game's target Android version to N: phones without root refuse older ones.)
 //! `--inspect` only looks: it prints `kind apk|bundle` and `bits 32|64|none`
 //! (what native code the game has), and with --base copies a bundle's base
 //! APK (the piece with the Java code) out, for reading its name and icon.
@@ -59,6 +60,8 @@ struct Options {
     work: PathBuf,
     /// The ABI folder the bridge, stand-ins and originals go in.
     abi: String,
+    /// Raise the game's target Android version to at least this (phones without root refuse older ones).
+    min_target_sdk: Option<u32>,
 }
 
 enum Command {
@@ -70,6 +73,7 @@ fn parse() -> Result<Command, String> {
     let mut arguments = std::env::args().skip(1);
     let mut positional = Vec::new();
     let (mut bridge, mut standin, mut work, mut abi, mut base) = (None, None, None, None, None);
+    let mut min_target_sdk = None;
     let mut inspect = false;
     while let Some(argument) = arguments.next() {
         let mut value = || arguments.next().ok_or(format!("{argument} needs a value"));
@@ -79,6 +83,10 @@ fn parse() -> Result<Command, String> {
             "--work" => work = Some(PathBuf::from(value()?)),
             "--abi" => abi = Some(value()?),
             "--base" => base = Some(PathBuf::from(value()?)),
+            "--min-target-sdk" => {
+                let text = value()?;
+                min_target_sdk = Some(text.parse().map_err(|_| format!("--min-target-sdk needs a number, not {text}"))?);
+            }
             "--inspect" => inspect = true,
             _ if argument.starts_with("--") => return Err(format!("unknown option {argument}")),
             _ => positional.push(PathBuf::from(argument)),
@@ -97,6 +105,7 @@ fn parse() -> Result<Command, String> {
         standin: standin.ok_or("--standin is required")?,
         work,
         abi: abi.unwrap_or_else(|| "arm64-v8a".into()),
+        min_target_sdk,
     }))
 }
 
@@ -337,6 +346,13 @@ fn rewrite<R: Read + Seek>(
             if is_manifest {
                 if manifest::extract_native_libs(&mut bytes) == Some(true) {
                     println!("fix {name}: extractNativeLibs (the bridge reads the 32-bit parts as files): false -> true");
+                }
+                if let Some(minimum) = options.min_target_sdk {
+                    match manifest::raise_target_sdk(&mut bytes, minimum) {
+                        Ok(Some((old, new))) => println!("fix {name}: target Android version (this phone refuses older games without root): {old} -> {new}"),
+                        Ok(None) => {}
+                        Err(reason) => println!("warn {name}: can't raise the target Android version: {reason}"),
+                    }
                 }
                 if !was_stored {
                     entry_options = deflated;

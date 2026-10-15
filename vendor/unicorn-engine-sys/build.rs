@@ -366,30 +366,7 @@ fn main() {
 
     generate_bindings();
 
-    match pkg_config::Config::new()
-        .atleast_version("2")
-        .cargo_metadata(false)
-        .probe("unicorn")
-    {
-        Ok(lib) => {
-            for dir in lib.link_paths {
-                println!("cargo:rustc-link-search=native={}", dir.to_str().unwrap());
-            }
-            if cfg!(feature = "dynamic_linkage") {
-                if cc::Build::new().get_compiler().is_like_msvc() {
-                    println!("cargo:rustc-link-lib=dylib=unicorn-import");
-                } else {
-                    println!("cargo:rustc-link-lib=dylib=unicorn");
-                }
-            } else {
-                println!("cargo:rustc-link-arg=-Wl,-allow-multiple-definition");
-                println!("cargo:rustc-link-lib=static=unicorn");
-                println!("cargo:rustc-link-lib=pthread");
-                println!("cargo:rustc-link-lib=m");
-            }
-        }
-        Err(_) => {
-            build_with_cmake();
-        }
-    }
+    // arm32-bridge: always the patched copy here (see ARM32-BRIDGE.md), never a
+    // Unicorn installed on the system, which lacks the fixes.
+    build_with_cmake();
 }

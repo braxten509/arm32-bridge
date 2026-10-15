@@ -61,3 +61,7 @@ Copied from crates.io; speed patches and one fix for arm32-bridge:
     register). Formats 3614/3616/3617 and DUP now use the scalar encoding for
     that case, as upstream QEMU does. Also I3617_CMLE0 had CMLT0's opcode with
     U set (0x2e20a800, unallocated); it is 0x2e209800, as upstream fixed.
+12. `build.rs`: no longer asks pkg-config for a Unicorn installed on the system
+    (an Arch `unicorn` 2.1.4 package made it link `/usr/lib` without a static
+    library, and would have dropped the fixes above): the patched copy here is
+    always built with CMake.
