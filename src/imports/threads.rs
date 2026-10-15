@@ -549,11 +549,13 @@ struct Pacing {
     sleep_end: Option<std::time::Instant>,
     /// Stats mode: (work before the limiter sleep, time after it) per frame, newest last.
     split: std::collections::VecDeque<(Duration, Duration)>,
+    /// Game work after the limiter sleep until the frame was shown, last 8 frames.
+    after: std::collections::VecDeque<Duration>,
 }
 
 thread_local! {
     static PACING: RefCell<Pacing> = const {
-        RefCell::new(Pacing { last: None, sleep_start: None, sleep_end: None, split: std::collections::VecDeque::new() })
+        RefCell::new(Pacing { last: None, sleep_start: None, sleep_end: None, split: std::collections::VecDeque::new(), after: std::collections::VecDeque::new() })
     };
 }
 
@@ -566,6 +568,12 @@ pub fn frame_shown() {
     PACING.with(|pacing| {
         let pacing = &mut *pacing.borrow_mut();
         if let Some(last) = pacing.last.filter(|last| now - *last < PACING_NEAR) {
+            if let Some(end) = pacing.sleep_end {
+                if pacing.after.len() == 8 {
+                    pacing.after.pop_front();
+                }
+                pacing.after.push_back(now.saturating_duration_since(end));
+            }
             if crate::runtime::stats_enabled() {
                 note_frame_split(pacing, last, now);
             }
@@ -646,13 +654,29 @@ fn frame_limit(wait: Duration) -> Duration {
         if now - last > PACING_NEAR {
             return wait;
         }
-        let sleep = (last + frame).saturating_duration_since(now).min(wait);
+        // The game still works after its sleep (Pirates: 3-7 ms) before the frame
+        // is shown, so the sleep ends that much before the frame is due: ending it
+        // at the due time made 60 fps caps run at 40 (16.7 ms + the work after it
+        // missed a refresh). Work after the sleep: 2nd longest of the last 8 frames,
+        // at most half a frame (it may include waiting for work the sleep let run).
+        let ahead = after_estimate(&pacing.after).min(frame / 2);
+        let sleep = (last + frame - ahead).saturating_duration_since(now).min(wait);
         if pacing.sleep_start.is_none() {
             pacing.sleep_start = Some(now);
         }
         pacing.sleep_end = Some(now + sleep);
         sleep
     })
+}
+
+/// A high estimate of the game's work after its limiter sleep (zero until 3 frames are known).
+fn after_estimate(after: &std::collections::VecDeque<Duration>) -> Duration {
+    if after.len() < 3 {
+        return Duration::ZERO;
+    }
+    let mut sorted: Vec<Duration> = after.iter().copied().collect();
+    sorted.sort_unstable();
+    sorted[sorted.len() * 3 / 4]
 }
 
 /// Stats mode: which guest code sleeps, and for how long (finds frame limiters).

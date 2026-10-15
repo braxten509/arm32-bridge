@@ -2049,3 +2049,12 @@ AndroidConfiguration. Regression test: selftest "dlsym finds OpenSL ES interface
 - Timing, pinned to one 3.05 GHz core (taskset 40), 5 alternating runs, median old -> new: Lua test 475 -> 415 ms
   (-13%), bench_strlen 3M calls 209 -> 175 ms (-16%), malloc+free+strlen 1M 247 -> 190 ms (-23%). Native Lua 233 ms.
   Unpinned runs swing 360-550 ms for one build (core migration): always pin for timing.
+
+## Pirates 60 fps cap ran at ~40 fps: limiter ignored the work after its sleep (2026-10-14 23:20)
+- Recording pirates-fast60 (new translator, cap 60): mean 40.0 fps, 70% of frames 25 ms. [pacing] split: work before the
+  sleep 5-25 ms, work after it 3-7 ms. frame_limit ended the sleep at last + 16.7 ms, so the frame was handed over
+  3-7 ms late, missed the refresh and showed at 25 ms.
+- Fix (src/imports/threads.rs frame_limit): end the sleep early by the after-sleep work, estimated as the 2nd longest of
+  the last 8 frames, capped at half a frame.
+- Recording pirates-pace60 (owner playing, 3 min, gameplay samples 20-90 fps): mean 55.5 fps (was 40.0 / 44.4 for
+  fast60 / cap60); 17 ms frames 71.5% (was 18.4%), 25 ms 15.1% (was 69.6%), 33 ms+ 3.8% (was 10.1%). Skin 36.9 C.
