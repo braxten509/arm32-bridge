@@ -21,6 +21,13 @@
 //! with expansion files, which therefore must carry their data themselves:
 //! every `const-class` of the download screen outside the screen itself
 //! becomes the screen the download screen opens when it's done (the game).
+//!
+//! Fix 5 - text-to-number helpers that call themselves: a method taking one
+//! String and returning a number whose first call is to itself with the same
+//! arguments can only end in StackOverflowError (Assassin's Creed Pirates'
+//! AlarmService.SafeParseInt, run at every start once the game has saved
+//! reminders). The call becomes Java's own parser for that number type
+//! (Integer.parseInt and so on), when the dex already refers to it.
 
 use std::collections::HashMap;
 
@@ -87,6 +94,10 @@ impl<'a> Dex<'a> {
         let at = self.u32(0x54) as usize + index as usize * 8;
         let (class, kind, name) = (self.u16(at), self.u16(at + 2), self.u32(at + 4));
         format!("{}.{}:{}", self.type_name(class.into()), self.string(name), self.type_name(kind.into()))
+    }
+    /// The index of the method reference printed as `Lclass;.name:(params)return`.
+    fn method_index(&self, full_name: &str) -> Option<u32> {
+        (0..self.u32(0x58)).find(|&index| self.method(index).0 == full_name)
     }
     /// (`Lclass;.name:(params)return`, name, signature) of a method reference.
     fn method(&self, index: u32) -> (String, String, String) {
@@ -225,6 +236,9 @@ pub fn find_fixes(data: &[u8], carries_game_data: bool) -> Vec<Fix> {
             if seen_code.insert(code) {
                 let (_, name, signature) = dex.method(method_index);
                 scan_code(&dex, code, &name, &signature, &mut fixes);
+                if let Some(fix) = self_calling_parser(&dex, code, method_index, &signature) {
+                    fixes.push(fix);
+                }
                 for (offset, units) in instructions(&dex, code) {
                     let Some(&target) = skipped_screens.get(&u32::from(units.get(1).copied().unwrap_or(0))) else { continue };
                     if units[0] & 0xFF == 0x1C && u32::from(units[1]) != own_type {
@@ -240,6 +254,53 @@ pub fn find_fixes(data: &[u8], carries_game_data: bool) -> Vec<Fix> {
         }
     }
     fixes
+}
+
+/// Java's parser for each number type a String can be turned into.
+fn number_parser(signature: &str) -> Option<&'static str> {
+    Some(match signature {
+        "(Ljava/lang/String;)I" => "Ljava/lang/Integer;.parseInt:(Ljava/lang/String;)I",
+        "(Ljava/lang/String;)J" => "Ljava/lang/Long;.parseLong:(Ljava/lang/String;)J",
+        "(Ljava/lang/String;)F" => "Ljava/lang/Float;.parseFloat:(Ljava/lang/String;)F",
+        "(Ljava/lang/String;)D" => "Ljava/lang/Double;.parseDouble:(Ljava/lang/String;)D",
+        "(Ljava/lang/String;)Z" => "Ljava/lang/Boolean;.parseBoolean:(Ljava/lang/String;)Z",
+        _ => return None,
+    })
+}
+
+/// The 35c argument registers of an invoke instruction.
+fn invoke_arguments(units: &[u16]) -> Vec<u32> {
+    let count = (units[0] >> 12) as usize;
+    let packed = [units[2] & 0xF, (units[2] >> 4) & 0xF, (units[2] >> 8) & 0xF, units[2] >> 12, (units[0] >> 8) & 0xF];
+    packed[..count.min(5)].iter().map(|&r| u32::from(r)).collect()
+}
+
+/// Fix 5: the method's first call is to itself with its own arguments, after nothing but
+/// constants into other registers, so it recurses until the stack runs out.
+fn self_calling_parser(dex: &Dex, code: usize, method_index: u32, signature: &str) -> Option<Fix> {
+    let parser = number_parser(signature)?;
+    let (registers, ins) = (u32::from(dex.u16(code)), u32::from(dex.u16(code + 2)));
+    let incoming: Vec<u32> = (registers - ins..registers).collect();
+    for (offset, units) in instructions(dex, code) {
+        let opcode = units[0] & 0xFF;
+        if (0x12..=0x19).contains(&opcode) && !incoming.contains(&u32::from((units[0] >> 8) & if opcode == 0x12 { 0xF } else { 0xFF })) {
+            continue; // a constant into a scratch register
+        }
+        let self_call = matches!(opcode, 0x6E | 0x70 | 0x71)
+            && units.len() == 3
+            && u32::from(units[1]) == method_index
+            && invoke_arguments(&units) == incoming;
+        if !self_call || dex.method_index(parser).is_none() {
+            return None;
+        }
+        return Some(Fix {
+            offset,
+            reason: "text-to-number helper calling itself forever",
+            old: dex.method(method_index).0,
+            new: parser.into(),
+        });
+    }
+    None
 }
 
 fn scan_code(dex: &Dex, code: usize, method_name: &str, method_signature: &str, fixes: &mut Vec<Fix>) {
@@ -310,8 +371,18 @@ fn scan_code(dex: &Dex, code: usize, method_name: &str, method_signature: &str, 
 pub fn patch(data: &mut [u8], carries_game_data: bool) -> Vec<Fix> {
     let fixes = find_fixes(data, carries_game_data);
     let new_types: Vec<Option<u32>> = fixes.iter().map(|fix| Dex { data }.type_index(&fix.new)).collect();
-    for (fix, new_type) in fixes.iter().zip(new_types) {
+    let new_methods: Vec<Option<u32>> = fixes.iter().map(|fix| number_parser_name(&fix.new).and_then(|name| Dex { data }.method_index(name))).collect();
+    for ((fix, new_type), new_method) in fixes.iter().zip(new_types).zip(new_methods) {
         let at = fix.offset;
+        if let Some(method) = new_method {
+            // invoke-static {vString}, parser: the String is the call's last argument.
+            let units = [u16::from_le_bytes([data[at], data[at + 1]]), 0, u16::from_le_bytes([data[at + 4], data[at + 5]])];
+            let string = *invoke_arguments(&units).last().unwrap() as u16;
+            for (i, unit) in [0x1071, method as u16, string].iter().enumerate() {
+                data[at + i * 2..at + i * 2 + 2].copy_from_slice(&unit.to_le_bytes());
+            }
+            continue;
+        }
         match data[at] {
             0x71 | 0x77 => data[at..at + 6].fill(0),
             0x13 => {
@@ -338,6 +409,11 @@ pub fn patch(data: &mut [u8], carries_game_data: bool) -> Vec<Fix> {
         data[8..12].copy_from_slice(&checksum.to_le_bytes());
     }
     fixes
+}
+
+/// `name` if it is one of Java's number parsers (a fix 5 target).
+fn number_parser_name(name: &str) -> Option<&str> {
+    ["I", "J", "F", "D", "Z"].iter().any(|kind| number_parser(&format!("(Ljava/lang/String;){kind}")) == Some(name)).then_some(name)
 }
 
 fn adler32(data: &[u8]) -> u32 {
