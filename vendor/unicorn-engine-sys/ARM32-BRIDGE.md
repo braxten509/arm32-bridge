@@ -54,3 +54,10 @@ Copied from crates.io; speed patches and one fix for arm32-bridge:
     store from another thread could land in between and be lost (a SWP spinlock
     stayed locked for good). xchg now uses `atomic_xchg__nocheck` and the min/max
     loops `atomic_cmpxchg__nocheck`, as upstream QEMU; MSVC keeps the old code.
+11. `qemu/tcg/aarch64/tcg-target.inc.c`: one 64-bit element in a 64-bit vector
+    (TCG_TYPE_V64 with MO_64) was emitted in the vector form, which AArch64
+    reserves (Q = 0 with size 3 or immh 1xxx): the phone stopped with SIGILL
+    in Unicorn's own code (Assassin's Creed Pirates, VSHL.U64 by register on a D
+    register). Formats 3614/3616/3617 and DUP now use the scalar encoding for
+    that case, as upstream QEMU does. Also I3617_CMLE0 had CMLT0's opcode with
+    U set (0x2e20a800, unallocated); it is 0x2e209800, as upstream fixed.

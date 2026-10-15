@@ -594,7 +594,7 @@ typedef enum {
     I3617_CMEQ0     = 0x0e209800,
     I3617_CMLT0     = 0x0e20a800,
     I3617_CMGE0     = 0x2e208800,
-    I3617_CMLE0     = 0x2e20a800,
+    I3617_CMLE0     = 0x2e209800,
     I3617_NOT       = 0x2e205800,
     I3617_ABS       = 0x0e20b800,
     I3617_NEG       = 0x2e20b800,
@@ -768,9 +768,18 @@ static void tcg_out_insn_3606(TCGContext *s, AArch64Insn insn, bool q,
               | (imm8 & 0xe0) << (16 - 5) | (imm8 & 0x1f) << 5);
 }
 
+/* arm32-bridge: AArch64 has no vector form for one 64-bit element (Q = 0 with
+   size 3 / immh 1xxx is reserved, SIGILL); the scalar form (bits 30 and 28 set)
+   does the same on the low 64 bits and clears the rest, as the 64-bit vector
+   form would.  Upstream QEMU switched to the scalar forms the same way.  */
+#define AARCH64_SCALAR_FORM  0x50000000
+
 static void tcg_out_insn_3614(TCGContext *s, AArch64Insn insn, bool q,
                               TCGReg rd, TCGReg rn, unsigned immhb)
 {
+    if (!q && immhb >= 64) {
+        insn |= AARCH64_SCALAR_FORM;
+    }
     tcg_out32(s, insn | q << 30 | immhb << 16
               | (rn & 0x1f) << 5 | (rd & 0x1f));
 }
@@ -778,6 +787,9 @@ static void tcg_out_insn_3614(TCGContext *s, AArch64Insn insn, bool q,
 static void tcg_out_insn_3616(TCGContext *s, AArch64Insn insn, bool q,
                               unsigned size, TCGReg rd, TCGReg rn, TCGReg rm)
 {
+    if (!q && size == MO_64) {
+        insn |= AARCH64_SCALAR_FORM;
+    }
     tcg_out32(s, insn | q << 30 | (size << 22) | (rm & 0x1f) << 16
               | (rn & 0x1f) << 5 | (rd & 0x1f));
 }
@@ -785,6 +797,9 @@ static void tcg_out_insn_3616(TCGContext *s, AArch64Insn insn, bool q,
 static void tcg_out_insn_3617(TCGContext *s, AArch64Insn insn, bool q,
                               unsigned size, TCGReg rd, TCGReg rn)
 {
+    if (!q && size == MO_64) {
+        insn |= AARCH64_SCALAR_FORM;
+    }
     tcg_out32(s, insn | q << 30 | (size << 22)
               | (rn & 0x1f) << 5 | (rd & 0x1f));
 }
@@ -966,6 +981,16 @@ static bool tcg_out_dup_vec(TCGContext *s, TCGType type, unsigned vece,
                             TCGReg rd, TCGReg rs)
 {
     int is_q = type - TCG_TYPE_V64;
+    if (!is_q && vece == MO_64) {
+        /* arm32-bridge: DUP Vd.1D is reserved (see AARCH64_SCALAR_FORM).  */
+        if (rs < TCG_REG_V0) {
+            tcg_out32(s, 0x9e670000 | (rs & 0x1f) << 5 | (rd & 0x1f)); /* FMOV Dd, Xn */
+        } else {
+            tcg_out32(s, I3605_DUP | AARCH64_SCALAR_FORM | 8 << 16     /* DUP Dd, Vn.D[0] */
+                      | (rs & 0x1f) << 5 | (rd & 0x1f));
+        }
+        return true;
+    }
     tcg_out_insn(s, 3605, DUP, is_q, rd, rs, 1 << vece, 0);
     return true;
 }

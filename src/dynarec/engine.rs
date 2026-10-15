@@ -1093,12 +1093,24 @@ pub fn seed_from_unicorn(uc: &mut Uc) {
 /// Runs `count` instructions at `pc` in Unicorn and returns where it stopped.
 fn fallback(uc: &mut Uc, pc: u32, count: u32, stop_at: u32) -> Result<u32, String> {
     if crate::runtime::stats_enabled() {
-        let total = {
+        let (total, first) = {
             let mut cache = write_cache();
-            *cache.fallbacks.entry(pc).or_default() += 1;
+            let count = cache.fallbacks.entry(pc).or_default();
+            *count += 1;
+            let first = *count == 1;
             cache.fallback_total += 1;
-            cache.fallback_total
+            (cache.fallback_total, first)
         };
+        if first {
+            // Every site shows up, even in a game with too few fallbacks for the periodic list.
+            let address = pc & !1;
+            let text = if pc & 1 == 1 {
+                format!("T {:04x} {:04x}", guest_mem().read_u16(address), guest_mem().read_u16(address + 2))
+            } else {
+                format!("A {:08x}", guest_mem().read_u32(address))
+            };
+            crate::log::line(&format!("[jit] new fallback site {address:#010x} {text}"));
+        }
         static LAST_PRINT: AtomicU64 = AtomicU64::new(0);
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
         if total % 4096 == 0 && now >= LAST_PRINT.load(Ordering::Relaxed) + 10 {

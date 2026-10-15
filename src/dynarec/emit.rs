@@ -743,8 +743,10 @@ impl Asm {
         self.emit(op | Self::fp_type(double) | (rn << 5) | rd);
     }
     /// Three-register vector operation (`simd::ADD` and so on); `q` = 128 bits, `size` = element size code.
+    /// 64-bit elements without `q` (no 1D vector form) use the scalar encoding (ADD, SQADD, USHL, ...).
     pub fn simd3(&mut self, op: u32, q: bool, size: u32, rd: Reg, rn: Reg, rm: Reg) {
-        self.emit(op | ((q as u32) << 30) | (size << 22) | (rm << 16) | (rn << 5) | rd);
+        let form = if !q && size == 3 { 0x5000_0000 } else { (q as u32) << 30 };
+        self.emit(op | form | (size << 22) | (rm << 16) | (rn << 5) | rd);
     }
     /// fmul vd.4s/2s, vn.4s/2s, vm.s[index]
     pub fn fmul_element(&mut self, q: bool, rd: Reg, rn: Reg, rm: Reg, index: u32) {

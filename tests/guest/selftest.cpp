@@ -1360,6 +1360,50 @@ static void neon_permute_expected(unsigned char *want) {
 NEON_TESTS(arm)
 NEON_TESTS(thumb)
 
+// 64-bit lanes in D registers: VSHL/VRSHL/VQSHL by register, VQADD/VQSUB, VADD/VSUB.
+// ARM64 has no 2-lane-of-64 "vector" form on 64 bits, only the scalar one (Unicorn's
+// back end used the reserved vector form and the phone stopped with SIGILL: AC Pirates).
+#define NEON_D64_TESTS(mode)                                                                         \
+    __attribute__((target(#mode), noinline)) static void neon_d64_##mode(const unsigned long long *in, unsigned long long *out) { \
+        __asm__ volatile(".fpu neon\n"                                                               \
+                         "vld1.64 {d16, d17, d18, d19}, [%[in]]\n"                                   \
+                         "vshl.u64 d20, d16, d18\n"                                                  \
+                         "vshl.s64 d21, d16, d18\n"                                                  \
+                         "vshl.u64 d22, d16, d19\n"                                                  \
+                         "vrshl.s64 d23, d16, d18\n"                                                 \
+                         "vqshl.u64 d24, d16, d19\n"                                                 \
+                         "vqadd.s64 d25, d16, d16\n"                                                 \
+                         "vqadd.u64 d26, d16, d16\n"                                                 \
+                         "vqsub.s64 d27, d16, d17\n"                                                 \
+                         "vadd.i64 d28, d16, d17\n"                                                  \
+                         "vsub.i64 d29, d17, d16\n"                                                  \
+                         "vst1.64 {d20, d21, d22, d23}, [%[out]]!\n"                                 \
+                         "vst1.64 {d24, d25, d26, d27}, [%[out]]!\n"                                 \
+                         "vst1.64 {d28, d29}, [%[out]]\n"                                            \
+                         : [out] "+r"(out)                                                           \
+                         : [in] "r"(in)                                                              \
+                         : "d16", "d17", "d18", "d19", "d20", "d21", "d22", "d23", "d24", "d25",    \
+                           "d26", "d27", "d28", "d29", "memory");                                    \
+    }                                                                                                \
+    static bool neon_d64_ok_##mode(void) {                                                           \
+        static const unsigned long long in[4] = {0x8000000000000128ull, 0x7FFFFFFFFFFFFFF0ull,       \
+                                                 (unsigned long long)-4, 8};                         \
+        static const unsigned long long want[10] = {                                                 \
+            0x0800000000000012ull, 0xF800000000000012ull, 0x0000000000012800ull, 0xF800000000000013ull, \
+            0xFFFFFFFFFFFFFFFFull, 0x8000000000000000ull, 0xFFFFFFFFFFFFFFFFull, 0x8000000000000000ull, \
+            0x0000000000000118ull, 0xFFFFFFFFFFFFFEC8ull};                                           \
+        unsigned long long got[10];                                                                  \
+        neon_d64_##mode(in, got);                                                                    \
+        for (int i = 0; i < 10; i++)                                                                 \
+            if (got[i] != want[i]) {                                                                 \
+                __android_log_print(ANDROID_LOG_INFO, TAG, #mode " neon d64 result %d: %llx want %llx", i, got[i], want[i]); \
+                return false;                                                                        \
+            }                                                                                        \
+        return true;                                                                                 \
+    }
+NEON_D64_TESTS(arm)
+NEON_D64_TESTS(thumb)
+
 // Inputs d16-d21 for the shift and long/narrow tests (results worked out by hand per lane).
 static const unsigned long long neon_shift_in[6] = {0x800000017FFFFFFFull, 0xFFFF000100F08000ull, 0x0123456789ABCDEFull,
                                                     0xFEDCBA9876543210ull, 0x807F01FF10203040ull, 0x3ull};
@@ -2445,6 +2489,8 @@ extern "C" int run_all() {
         check(saturates_arm() && saturates_asr32_arm() && saturates_thumb(),
               "USAT / SSAT / USAT16 / SSAT16: every width, LSL / ASR, Q flag, conditional, Rd = Rn (ARM and Thumb)");
         check(neon_extras_arm() && neon_extras_thumb(), "NEON lanes, VMOVL/VSHLL, VCVT, VMAX/VMIN, immediates, permutes (ARM and Thumb)");
+        check(neon_d64_ok_arm() && neon_d64_ok_thumb(),
+              "NEON 64-bit lanes in D registers: VSHL/VRSHL/VQSHL by register, VQADD/VQSUB, VADD/VSUB (ARM and Thumb)");
         check(neon_shift_long_arm() && neon_shift_long_thumb(),
               "NEON shifts by immediate, narrowing shifts, VCVT fixed point, long/wide/narrow forms, FPSCR.QC (ARM and Thumb)");
         check(stored_pc_offset() == 4, "STM storing PC (ARM)");

@@ -392,8 +392,8 @@ impl Translator {
             return Err(()); // F16 / reserved
         }
         let sixty_four_ok = matches!((a, b), (0b0000, true) | (0b0010, true) | (0b0100, _) | (0b0101, _) | (0b1000, false));
-        if !is_float && a != 0b0001 && size == 3 && (!q || !sixty_four_ok) {
-            return Err(()); // 64-bit lanes (not logic, where size picks the op): only add/sub, saturating add/sub and shifts, in Q
+        if !is_float && a != 0b0001 && size == 3 && !sixty_four_ok {
+            return Err(()); // 64-bit lanes (not logic, where size picks the op): only add/sub, saturating add/sub and shifts
         }
         let pairwise = matches!((a, b, u), (0b1010, _, _) | (0b1011, true, 0)) || (a == 0b1101 && !b && u == 1 && high == 0) || (a == 0b1111 && !b && u == 1);
         if pairwise && q {
