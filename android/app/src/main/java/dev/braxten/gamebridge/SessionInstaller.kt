@@ -12,6 +12,7 @@ import android.os.Environment
 import java.io.File
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Installs and removes games through Android's own installer, for phones without root. Android
@@ -117,7 +118,7 @@ class SessionInstaller(context: Context) : Installer {
      * Starts an install or removal and waits for Android's final answer. When Android first needs
      * the user to confirm, it sends its confirmation screen, which is shown here; the answer that
      * matters comes after. Android doesn't let an app open screens while it is in the background,
-     * so the screen is also kept in Confirmation for MainActivity to show when the user comes back.
+     * so then the screen is kept in Confirmation for MainActivity to show when the user comes back.
      */
     private fun waitForAnswer(tag: String, start: (IntentSender) -> Unit): Answer {
         val action = "${context.packageName}.STATUS.$tag"
@@ -130,12 +131,13 @@ class SessionInstaller(context: Context) : Installer {
                     else @Suppress("DEPRECATION") intent.getParcelableExtra(Intent.EXTRA_INTENT)
                     if (confirm != null) {
                         confirm.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        Confirmation.waiting = confirm
-                        runCatching { context.startActivity(confirm) }
+                        // Shown once only: a second copy for the same install, answered with
+                        // Cancel, would make Android report a cancel for an install the first approved.
+                        if (Confirmation.appVisible) context.startActivity(confirm) else Confirmation.waiting.set(confirm)
                         return
                     }
                 }
-                Confirmation.waiting = null
+                Confirmation.waiting.set(null)
                 answers.put(Answer(status, intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE)))
             }
         }
@@ -154,14 +156,17 @@ class SessionInstaller(context: Context) : Installer {
             start(pending.intentSender)
             return answers.poll(30, TimeUnit.MINUTES) ?: Answer(NO_ANSWER, null)
         } finally {
-            Confirmation.waiting = null
+            Confirmation.waiting.set(null)
             context.unregisterReceiver(receiver)
         }
     }
 }
 
-/** Android's confirmation screen for the install or removal waiting on the user, if any. */
+/** Android's confirmation screen for an install or removal that came while Game Bridge wasn't on screen. */
 object Confirmation {
+    val waiting = AtomicReference<Intent?>(null)
+
+    /** Whether Game Bridge is on screen (MainActivity between onStart and onStop). */
     @Volatile
-    var waiting: Intent? = null
+    var appVisible = false
 }

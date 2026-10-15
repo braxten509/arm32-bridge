@@ -72,7 +72,6 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -109,6 +108,16 @@ class MainActivity : ComponentActivity() {
     private fun restart() {
         startActivity(Intent.makeRestartActivityTask(ComponentName(this, MainActivity::class.java)))
         Runtime.getRuntime().exit(0)
+    }
+
+    override fun onStart() {
+        super.onStart()
+        Confirmation.appVisible = true
+    }
+
+    override fun onStop() {
+        Confirmation.appVisible = false
+        super.onStop()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -198,12 +207,8 @@ class MainActivity : ComponentActivity() {
         LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
             if (setup != null) refresh()
             // An install or removal that finished converting while the app was in the background:
-            // Android wouldn't show its confirmation then. A moment's wait lets an answer that is
-            // already on its way arrive first.
-            scope.launch {
-                delay(800)
-                Confirmation.waiting?.let { runCatching { startActivity(it) } }
-            }
+            // Android wouldn't show its confirmation then, so it shows now (once).
+            Confirmation.waiting.getAndSet(null)?.let { runCatching { startActivity(it) } }
         }
 
         Column(Modifier.fillMaxSize().background(Background).safeDrawingPadding()) {
@@ -352,13 +357,24 @@ class MainActivity : ComponentActivity() {
     private fun GameCard(game: Game, state: CardState, busy: Boolean, onConvert: () -> Unit, onRemove: () -> Unit, onOpen: () -> Unit) {
         // Press and hold a card for its menu; a running conversion can't be removed under itself.
         var menu by remember { mutableStateOf(false) }
+        // A failed card shows a short line; tapping the card shows the whole reason.
+        var why by remember { mutableStateOf(false) }
+        if (why && state is CardState.Failed) {
+            AlertDialog(
+                onDismissRequest = { why = false },
+                containerColor = CardColor,
+                title = { Text("${game.label} didn't install", color = Color(0xFFE8E8EE)) },
+                text = { Text(state.reason, color = Muted, fontSize = 14.sp) },
+                confirmButton = { TextButton(onClick = { why = false }) { Text("OK", color = AccentText) } },
+            )
+        }
         Box {
             Column(
                 Modifier.clip(RoundedCornerShape(16.dp)).background(CardColor)
                     .combinedClickable(
                         interactionSource = remember { MutableInteractionSource() },
                         indication = null,
-                        onClick = {},
+                        onClick = { if (state is CardState.Failed) why = true },
                         onLongClick = { if (state !is CardState.Working) menu = true },
                     )
                     .padding(14.dp).fillMaxWidth(),
@@ -399,7 +415,15 @@ class MainActivity : ComponentActivity() {
                 overflow = TextOverflow.Ellipsis,
                 textAlign = TextAlign.Center,
             )
-            Text(game.place, color = Muted, fontSize = 11.sp, maxLines = 1, modifier = Modifier.padding(top = 3.dp))
+            // Same line in every state, so a failure doesn't make the card taller than its neighbour.
+            if (state is CardState.Failed) {
+                Text("Didn't install · tap for why", color = ErrorText, fontSize = 11.sp, maxLines = 1,
+                    overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 3.dp))
+            } else {
+                // Where the game file is until it is installed.
+                Text(if (state == CardState.Done) "Installed" else game.place, color = Muted, fontSize = 11.sp, maxLines = 1,
+                    modifier = Modifier.padding(top = 3.dp))
+            }
             Spacer(Modifier.height(10.dp))
             // Every state uses the same 36dp slot, so cards keep their height while converting.
             Box(Modifier.fillMaxWidth().height(36.dp), contentAlignment = Alignment.Center) {
@@ -448,15 +472,6 @@ class MainActivity : ComponentActivity() {
                             .clickable(enabled = !busy, onClick = onConvert).padding(horizontal = 8.dp, vertical = 4.dp),
                     )
                 }
-            }
-            val note = when (state) {
-                is CardState.Failed -> state.reason
-                else -> null
-            }
-            if (note != null) {
-                Spacer(Modifier.height(8.dp))
-                Text(note, color = if (state is CardState.Failed) ErrorText else Muted, fontSize = 11.sp,
-                    textAlign = TextAlign.Center, maxLines = 4, overflow = TextOverflow.Ellipsis)
             }
         }
     }
