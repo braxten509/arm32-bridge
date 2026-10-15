@@ -32,7 +32,7 @@ object Conversions {
         val appContext = context.applicationContext
         scope.launch {
             val outcome = withContext(Dispatchers.IO) {
-                Converter(appContext).convert(game) { progress ->
+                Converter(appContext, Installers.current(appContext)).convert(game) { progress ->
                     scope.launch { states[game.packageName] = CardState.Working(progress) }
                 }
             }

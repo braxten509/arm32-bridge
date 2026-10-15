@@ -61,3 +61,18 @@ need that game uninstalled first (saves lost); the app says so in its Remove/Abo
   itself (build.gradle signs release with the debug key): owner decision when publishing.
 - Tests: the app is ARM64-only, so the x86_64 emulator can't run it as is. Test on the Pixel (Android 17) with a
   debug setting that forces the no-root path (owner's OK needed for phone use); converter checks on the PC.
+
+## Built (2026-10-15)
+- `Installer` (Root.kt) with `RootInstaller` (today's path) and `SessionInstaller` (Android's installer, one session
+  per game, confirm screen, uninstall through PackageInstaller, plain-file OBB copy). `Installers.current` picks root
+  when Magisk allows it; `adb shell setprop debug.gamebridge.noroot 1` forces the no-root path (restart the app).
+- Converter.kt: when Android refuses an old game, the number it asks for is saved and the game converted again with
+  `--min-target-sdk`, once; later games get it up front. As-is bundles can't be raised (their own signature).
+- Signing.kt: the assets debug key when present, else an AndroidKeyStore key (alias `gamebridge-games`).
+- Setup screen (sketch A): "All files access" and "Install unknown apps", checked again on return from Settings.
+- `tools/build-app.sh --public` builds without the PC key. tools/convert.sh keeps `adb install --bypass-low-target-sdk-block`
+  (adb's shell may use that flag without root), so it needs no change.
+- Code review (codex gpt-6.1-sol): fixed API 31/32 intent getter; app restarts itself once after "Install unknown
+  apps" is turned on (Android/obb opens only at process start); a confirmation Android wouldn't show in the
+  background is shown when the app comes back (Confirmation); a confirmation left unanswered for 30 minutes
+  abandons the session. Silent updates only apply to games targeting 35+, so old games always ask.

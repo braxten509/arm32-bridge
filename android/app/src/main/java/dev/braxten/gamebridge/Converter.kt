@@ -1,11 +1,7 @@
 package dev.braxten.gamebridge
 
 import android.content.Context
-import com.android.apksig.ApkSigner
 import java.io.File
-import java.security.KeyStore
-import java.security.PrivateKey
-import java.security.cert.X509Certificate
 import java.util.zip.ZipFile
 
 /** Progress of one conversion: 0-100 and what is happening. */
@@ -19,13 +15,14 @@ sealed class Outcome {
 }
 
 /**
- * Converts a game with apk-convert (the same program tools/convert.sh uses), signs it with the
- * PC's debug key, and installs it. A bundle's pieces are all signed and installed together, and
+ * Converts a game with apk-convert (the same program tools/convert.sh uses), signs it (Signing),
+ * and installs it. A bundle's pieces are all signed and installed together, and
  * its game data (OBB files) copied where the game looks for it. A bundle that already runs here
  * is installed as it is.
  */
-class Converter(private val context: Context, private val installer: Installer = RootInstaller) {
+class Converter(private val context: Context, private val installer: Installer) {
     private val libraries = File(context.applicationInfo.nativeLibraryDir)
+    private val settings = context.getSharedPreferences("converter", Context.MODE_PRIVATE)
 
     // The converter's own step lines, in order, and how far along each one is.
     private val stepPercent = mapOf(
@@ -47,7 +44,26 @@ class Converter(private val context: Context, private val installer: Installer =
         }
     }
 
+    /**
+     * Without root, Android refuses games made for versions older than it supports. The oldest
+     * version it takes is learned from its own refusal and remembered: later games are raised to
+     * it up front, and a refused one is converted again with it, once.
+     */
     private fun convert(game: Game, work: File, report: (Progress) -> Unit): Outcome {
+        val known = settings.getInt(OLDEST_TARGET, 0).takeIf { it > 0 && !installer.keepsOldTargets }
+        val first = convert(game, work, report, known)
+        if (first !is Attempt.Refused || (known != null && first.sdk <= known)) return first.outcome
+        settings.edit().putInt(OLDEST_TARGET, first.sdk).apply()
+        work.listFiles()?.forEach { it.deleteRecursively() }
+        return convert(game, work, report, first.sdk).outcome
+    }
+
+    private sealed class Attempt(val outcome: Outcome) {
+        class Ended(outcome: Outcome) : Attempt(outcome)
+        class Refused(val sdk: Int) : Attempt(Outcome.Failed("Android refuses this game: it is made for an Android version older than $sdk."))
+    }
+
+    private fun convert(game: Game, work: File, report: (Progress) -> Unit, minimumTarget: Int?): Attempt {
         // A bundle converts into a folder of pieces (plus obb/ with its game data).
         val unsigned = File(work, if (game.isBundle) "unsigned" else "unsigned.apk")
         val missing = mutableListOf<String>()
@@ -60,6 +76,7 @@ class Converter(private val context: Context, private val installer: Installer =
             "--bridge", File(libraries, "libarm32_bridge.so").path,
             "--standin", File(libraries, "libstandin.so").path,
             "--work", work.path,
+            *(minimumTarget?.let { arrayOf("--min-target-sdk", it.toString()) } ?: emptyArray()),
         ).redirectErrorStream(true).start()
         process.inputStream.bufferedReader().forEachLine { line ->
             val (kind, text) = line.split(' ', limit = 2).let { it[0] to it.getOrElse(1) { "" } }
@@ -70,24 +87,28 @@ class Converter(private val context: Context, private val installer: Installer =
             }
         }
         val code = process.waitFor()
-        if (code != 0) return Outcome.Failed(error ?: "The converter stopped (code $code).")
+        if (code != 0) return Attempt.Ended(Outcome.Failed(error ?: "The converter stopped (code $code)."))
 
         report(Progress(75, "Signing"))
         val pieces = if (game.isBundle) unsigned.listFiles { file -> file.name.endsWith(".apk") }!!.sorted() else listOf(unsigned)
         // Numbered names: piece names come from the bundle and shouldn't reach a shell.
         val signed = pieces.mapIndexed { index, piece ->
-            File(work, "signed-$index.apk").also { sign(piece, it); piece.delete() }
+            File(work, "signed-$index.apk").also { Signing.sign(context, piece, it); piece.delete() }
         }
 
         report(Progress(88, "Installing"))
-        installer.install(signed)?.let { return Outcome.Failed(it) }
+        when (val result = installer.install(signed)) {
+            is InstallResult.Done -> {}
+            is InstallResult.NeedsTarget -> return Attempt.Refused(result.sdk)
+            is InstallResult.Failed -> return Attempt.Ended(Outcome.Failed(result.reason))
+        }
         val gameData = File(unsigned, "obb")
         if (gameData.isDirectory) {
             report(Progress(95, "Copying game data"))
-            installer.copyGameData(gameData)?.let { return Outcome.Failed(it) }
+            installer.copyGameData(gameData)?.let { return Attempt.Ended(Outcome.Failed(it)) }
         }
         report(Progress(100, "Installed"))
-        return Outcome.Installed(missing)
+        return Attempt.Ended(Outcome.Installed(missing))
     }
 
     /**
@@ -125,7 +146,12 @@ class Converter(private val context: Context, private val installer: Installer =
         if (pieces.isEmpty()) return Outcome.Failed("The bundle has no APKs in it.")
 
         report(Progress(85, "Installing"))
-        installer.install(pieces)?.let { return Outcome.Failed(it) }
+        when (val result = installer.install(pieces)) {
+            is InstallResult.Done -> {}
+            // Its own signature can't survive a change, so it can't be raised the way a conversion is.
+            is InstallResult.NeedsTarget -> return Outcome.Failed("Android refuses this game: it is made for an Android version older than ${result.sdk}.")
+            is InstallResult.Failed -> return Outcome.Failed(result.reason)
+        }
         if (gameData.isDirectory) {
             report(Progress(95, "Copying game data"))
             installer.copyGameData(gameData)?.let { return Outcome.Failed(it) }
@@ -135,6 +161,8 @@ class Converter(private val context: Context, private val installer: Installer =
     }
 
     companion object {
+        private const val OLDEST_TARGET = "oldest_target_sdk"
+
         /**
          * apk-convert --inspect: its `kind` and `bits` lines (bits is 32, 64 or none), and for a
          * bundle its base APK copied to `base`. Empty when the file can't be read.
@@ -147,22 +175,5 @@ class Converter(private val context: Context, private val installer: Installer =
             if (process.waitFor() != 0) return emptyMap()
             return lines.mapNotNull { line -> line.split(' ', limit = 2).takeIf { it.size == 2 }?.let { it[0] to it[1] } }.toMap()
         }
-    }
-
-    /** Signs with the debug key tools/build-app.sh copied from the PC, so PC and phone builds replace each other. */
-    private fun sign(input: File, output: File) {
-        val password = "android".toCharArray()
-        val store = KeyStore.getInstance("PKCS12")
-        context.assets.open("debug.keystore").use { store.load(it, password) }
-        val key = store.getKey("androiddebugkey", password) as PrivateKey
-        val certificates = store.getCertificateChain("androiddebugkey").map { it as X509Certificate }
-        val signer = ApkSigner.SignerConfig.Builder("CERT", key, certificates).build()
-        ApkSigner.Builder(listOf(signer))
-            .setInputApk(input)
-            .setOutputApk(output)
-            .setV1SigningEnabled(true)
-            .setV2SigningEnabled(true)
-            .build()
-            .sign()
     }
 }

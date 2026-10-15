@@ -1,6 +1,11 @@
 package dev.braxten.gamebridge
 
+import android.content.ComponentName
+import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
+import android.os.Environment
+import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -64,7 +69,10 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -84,9 +92,28 @@ sealed class CardState {
     class Failed(val reason: String) : CardState()
 }
 
+/** What the setup screen shows: which of Android's two permissions the user has given (no-root phones only). */
+private class Setup(val files: Boolean, val installs: Boolean)
+
 class MainActivity : ComponentActivity() {
+    companion object {
+        /**
+         * Whether "Install unknown apps" was on when this process started. Android opens other apps'
+         * Android/obb folders (for game data) to an installer only at process start, so turning it
+         * on later needs a restart.
+         */
+        private var installsAtStart: Boolean? = null
+    }
+
+    /** Starts the app again in a new process (Android's settings changes take effect then). */
+    private fun restart() {
+        startActivity(Intent.makeRestartActivityTask(ComponentName(this, MainActivity::class.java)))
+        Runtime.getRuntime().exit(0)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (installsAtStart == null) installsAtStart = packageManager.canRequestPackageInstalls()
         enableEdgeToEdge()
         setContent {
             MaterialTheme(colorScheme = darkColorScheme(primary = Accent, background = Background, surface = CardColor)) {
@@ -99,7 +126,8 @@ class MainActivity : ComponentActivity() {
     private fun Screen() {
         val scope = rememberCoroutineScope()
         var games by remember { mutableStateOf<List<Game>?>(null) }
-        var problem by remember { mutableStateOf<String?>(null) }
+        // Shown instead of the games until both permissions are given.
+        var setup by remember { mutableStateOf<Setup?>(null) }
         // True while the phone is being searched (the refresh button waits).
         var searching by remember { mutableStateOf(false) }
         val states = Conversions.states
@@ -110,9 +138,12 @@ class MainActivity : ComponentActivity() {
             searching = true
             scope.launch {
                 val result = withContext(Dispatchers.IO) {
-                    if (!Root.available()) return@withContext null to
-                        "Game Bridge needs root (Magisk) to find games and install them. Allow it in Magisk, then reopen."
-                    Root.grantFileAccess(packageName)
+                    if (Installers.current(this@MainActivity) is RootInstaller) {
+                        Root.grantFileAccess(packageName)
+                    } else {
+                        val needed = Setup(Environment.isExternalStorageManager(), packageManager.canRequestPackageInstalls())
+                        if (!needed.files || !needed.installs) return@withContext null to needed
+                    }
                     val found = Games.scan(this@MainActivity)
                     for (game in found) {
                         val state = states[game.packageName]
@@ -126,9 +157,11 @@ class MainActivity : ComponentActivity() {
                     }
                     found to null
                 }
-                games = result.first
-                problem = result.second
+                result.first?.let { games = it }
+                setup = result.second
                 searching = false
+                // Without root, Android/obb opens up only in a process started with the switch on.
+                if (setup == null && installsAtStart == false && Installers.current(this@MainActivity) !is RootInstaller) restart()
             }
         }
 
@@ -142,8 +175,8 @@ class MainActivity : ComponentActivity() {
             scope.launch {
                 val problems = withContext(Dispatchers.IO) {
                     listOfNotNull(
-                        if (uninstall) Root.uninstall(game.packageName) else null,
-                        if (deleteFile) game.file?.let(Root::delete) else null,
+                        if (uninstall) Installers.current(this@MainActivity).uninstall(game.packageName) else null,
+                        if (deleteFile) game.file?.let(Installers.current(this@MainActivity)::delete) else null,
                     )
                 }
                 problems.firstOrNull()?.let { Toast.makeText(this@MainActivity, it, Toast.LENGTH_LONG).show() }
@@ -161,6 +194,17 @@ class MainActivity : ComponentActivity() {
 
         // Searching the whole phone takes a moment, so only when the app opens and on the refresh button.
         LaunchedEffect(Unit) { refresh() }
+        // Back from Android's settings: check the permissions again.
+        LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
+            if (setup != null) refresh()
+            // An install or removal that finished converting while the app was in the background:
+            // Android wouldn't show its confirmation then. A moment's wait lets an answer that is
+            // already on its way arrive first.
+            scope.launch {
+                delay(800)
+                Confirmation.waiting?.let { runCatching { startActivity(it) } }
+            }
+        }
 
         Column(Modifier.fillMaxSize().background(Background).safeDrawingPadding()) {
             Row(Modifier.fillMaxWidth().padding(end = 14.dp), verticalAlignment = Alignment.Bottom) {
@@ -171,7 +215,7 @@ class MainActivity : ComponentActivity() {
                     fontWeight = FontWeight.SemiBold,
                     modifier = Modifier.weight(1f).padding(start = 18.dp, top = 22.dp, bottom = 4.dp),
                 )
-                RefreshButton(enabled = !searching && problem == null, onClick = ::refresh)
+                RefreshButton(enabled = !searching && setup == null, onClick = ::refresh)
             }
             Text(
                 "32-bit games and game bundles on this phone",
@@ -180,7 +224,7 @@ class MainActivity : ComponentActivity() {
                 modifier = Modifier.padding(start = 18.dp, bottom = 14.dp),
             )
             when {
-                problem != null -> Message(problem!!)
+                setup != null -> SetupSteps(setup!!)
                 games == null -> Message("Looking for games…")
                 games!!.isEmpty() -> Message("No 32-bit games or game bundles on this phone. Download a game's APK, XAPK, APKM or APKS file, then tap ↻.")
                 else -> LazyVerticalGrid(
@@ -195,6 +239,61 @@ class MainActivity : ComponentActivity() {
                         })
                     }
                 }
+            }
+        }
+    }
+
+    /**
+     * The two permissions a phone without root needs, each with a button to its page in Android's
+     * settings. The screen checks again when the user comes back.
+     */
+    @Composable
+    private fun SetupSteps(setup: Setup) {
+        Column(Modifier.padding(horizontal = 12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text(
+                "Two quick steps before your first game",
+                color = Color(0xFFE8E8EE),
+                fontSize = 17.sp,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.padding(start = 6.dp, top = 4.dp),
+            )
+            SetupStep(1, "Find games", "Lets Game Bridge see game files in Downloads and your other folders.", setup.files) {
+                startActivity(Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:$packageName")))
+            }
+            SetupStep(2, "Install games", "Lets Game Bridge install the games it converts, and copy their game data.", setup.installs) {
+                startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName")))
+            }
+            Text(
+                "Android asks you to confirm each game install.",
+                color = Muted,
+                fontSize = 12.sp,
+                modifier = Modifier.padding(start = 6.dp),
+            )
+        }
+    }
+
+    @Composable
+    private fun SetupStep(number: Int, title: String, text: String, done: Boolean, onAllow: () -> Unit) {
+        Row(
+            Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(CardColor).padding(14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(Modifier.size(28.dp).clip(CircleShape).background(if (done) Track else Accent), contentAlignment = Alignment.Center) {
+                Text("$number", color = if (done) Muted else Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+            }
+            Column(Modifier.weight(1f).padding(horizontal = 12.dp)) {
+                Text(title, color = Color(0xFFE8E8EE), fontSize = 15.sp)
+                Text(text, color = Muted, fontSize = 12.sp, modifier = Modifier.padding(top = 2.dp))
+            }
+            if (done) {
+                Text("✓ Done", color = AccentText, fontSize = 13.sp)
+            } else {
+                Button(
+                    onClick = onAllow,
+                    colors = ButtonDefaults.buttonColors(containerColor = Accent),
+                    contentPadding = PaddingValues(horizontal = 16.dp),
+                    modifier = Modifier.height(36.dp),
+                ) { Text("Allow", fontSize = 13.sp) }
             }
         }
     }
