@@ -23,7 +23,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::handler;
 use crate::runtime::{
     call_guest, drop_engine, engine, hold_gil, mem, shared, stop_with_fault, wait_until, wake_on, wake_on_count, without_gil,
-    ArgSource, Handler, Ret, Uc, Wait,
+    ArgSource, GuestCpu, Handler, Ret, Uc, Wait,
 };
 
 const TYPE_MASK: u32 = 0xC000;
@@ -506,6 +506,179 @@ fn run_key_destructors(uc: &mut Uc, me: &Identity) {
     }
 }
 
+/// sched_yield, with a rest for threads that only yield: a wait loop of
+/// "yield, check the clock" (Pirates' IdleCurThread waits 16 ms that way after
+/// every input poll) kept a whole core busy, since a yield with nothing else
+/// to run returns at once. After 16 yields in a row, each under 1 ms after
+/// the last, the thread sleeps 500 us per yield instead; short spins (a lock
+/// that frees quickly) never get that far and stay as fast as before.
+fn yield_or_rest() {
+    const STREAK: u32 = 16;
+    const GAP: Duration = Duration::from_millis(1);
+    const REST: Duration = Duration::from_micros(500);
+    thread_local! {
+        static LAST: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+        static RUN: Cell<u32> = const { Cell::new(0) };
+    }
+    let now = std::time::Instant::now();
+    let close = LAST.with(|last| last.replace(Some(now))).is_some_and(|last| now - last < GAP);
+    let run = RUN.with(|run| {
+        let value = if close { run.get().saturating_add(1) } else { 0 };
+        run.set(value);
+        value
+    });
+    if run >= STREAK {
+        without_gil(|| std::thread::sleep(REST));
+        // The sleep itself must not end the streak.
+        LAST.with(|last| last.set(Some(std::time::Instant::now())));
+    } else {
+        without_gil(std::thread::yield_now);
+    }
+}
+
+/// The refresh rate asked for on game surfaces, and the frame rate frame
+/// limiters are raised to.
+pub const TARGET_REFRESH_RATE: f32 = 120.0;
+
+/// Frame timing on the thread that shows frames (see `frame_limit`).
+struct Pacing {
+    /// When the last frame was shown (eglSwapBuffers returned).
+    last: Option<std::time::Instant>,
+    /// Stats mode: when this frame's first limiter sleep started and its last ended.
+    sleep_start: Option<std::time::Instant>,
+    sleep_end: Option<std::time::Instant>,
+    /// Stats mode: (work before the limiter sleep, time after it) per frame, newest last.
+    split: std::collections::VecDeque<(Duration, Duration)>,
+}
+
+thread_local! {
+    static PACING: RefCell<Pacing> = const {
+        RefCell::new(Pacing { last: None, sleep_start: None, sleep_end: None, split: std::collections::VecDeque::new() })
+    };
+}
+
+/// Frames further apart than this are not one running game loop.
+const PACING_NEAR: Duration = Duration::from_millis(100);
+
+/// Called by eglSwapBuffers on the thread that showed the frame.
+pub fn frame_shown() {
+    let now = std::time::Instant::now();
+    PACING.with(|pacing| {
+        let pacing = &mut *pacing.borrow_mut();
+        if let Some(last) = pacing.last.filter(|last| now - *last < PACING_NEAR) {
+            if crate::runtime::stats_enabled() {
+                note_frame_split(pacing, last, now);
+            }
+        }
+        pacing.last = Some(now);
+        pacing.sleep_start = None;
+        pacing.sleep_end = None;
+    });
+}
+
+/// Stats mode: every 2 s, the last 16 frames as (work before the limiter
+/// sleep, time after it) in ms. Long "before" = slow game work; long "after" =
+/// waiting on something the game started before sleeping.
+fn note_frame_split(pacing: &mut Pacing, last: std::time::Instant, now: std::time::Instant) {
+    static FRAMES: AtomicU64 = AtomicU64::new(0);
+    let split = match (pacing.sleep_start, pacing.sleep_end) {
+        (Some(start), Some(end)) => (start - last, now.saturating_duration_since(end)),
+        _ => (now - last, Duration::ZERO),
+    };
+    if pacing.split.len() == 16 {
+        pacing.split.pop_front();
+    }
+    pacing.split.push_back(split);
+    if FRAMES.fetch_add(1, Ordering::Relaxed) % 120 == 0 {
+        let frames: Vec<_> = pacing.split.iter().map(|(before, after)| (before.as_millis(), after.as_millis())).collect();
+        crate::log::line(&format!("[pacing] last frames (ms before/after the limiter sleep): {frames:?}"));
+    }
+}
+
+/// Frame limiters: many old games sleep after each frame until a fixed frame
+/// time has passed (Pirates' script sleeps up to 33 ms, so 30 fps). A sleep of
+/// at most 100 ms on the thread that shows frames, within 100 ms of its last
+/// frame, ends instead one screen refresh after that frame, so the limit
+/// becomes the screen's: every game is uncapped by default. The game's own
+/// sleep is never made longer. Only a per-game setting changes that:
+/// debug.arm32bridge.unlock.<package>=0 keeps the game's limit, =<fps> sets a
+/// cap (rounded to whole screen refreshes; Pirates feels smoother at 60). Measuring frame work and pacing to it
+/// was tried and dropped: games that step their world in fixed time slices do
+/// more work per frame when frames get longer, so the pace kept slowing down.
+fn frame_limit(wait: Duration) -> Duration {
+    static FRAME: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    let frame = *FRAME.get_or_init(|| {
+        let refresh = Duration::from_secs_f32(1.0 / TARGET_REFRESH_RATE);
+        // Only a per-game setting changes it (debug.arm32bridge.unlock.<package>); there is no global cap.
+        let package = std::fs::read("/proc/self/cmdline")
+            .ok()
+            .and_then(|line| line.split(|&byte| byte == 0).next().map(|name| String::from_utf8_lossy(name).into_owned()))
+            .unwrap_or_default();
+        let setting = format!("debug.arm32bridge.unlock.{package}");
+        let value = crate::dynarec::property(&setting).filter(|value| !value.trim().is_empty());
+        let frame = match value.as_deref().map(str::trim) {
+            Some("0") => None,
+            Some(fps) => match fps.parse::<f64>() {
+                Ok(fps) if fps > 1.0 => {
+                    let refreshes = (1.0 / fps / refresh.as_secs_f64() - 0.01).ceil().max(1.0);
+                    Some(refresh.mul_f64(refreshes))
+                }
+                _ => Some(refresh),
+            },
+            None => Some(refresh),
+        };
+        crate::log::line(&match frame {
+            None => format!("[bridge] game frame limiters kept ({setting}=0)"),
+            Some(frame) => {
+                format!("[bridge] game frame limiters raised to {:.0} fps ({setting}=0 keeps them, =<fps> caps)", 1.0 / frame.as_secs_f64())
+            }
+        });
+        frame
+    });
+    let Some(frame) = frame else { return wait };
+    if wait > PACING_NEAR {
+        return wait;
+    }
+    PACING.with(|pacing| {
+        let pacing = &mut *pacing.borrow_mut();
+        let Some(last) = pacing.last else { return wait };
+        let now = std::time::Instant::now();
+        if now - last > PACING_NEAR {
+            return wait;
+        }
+        let sleep = (last + frame).saturating_duration_since(now).min(wait);
+        if pacing.sleep_start.is_none() {
+            pacing.sleep_start = Some(now);
+        }
+        pacing.sleep_end = Some(now + sleep);
+        sleep
+    })
+}
+
+/// Stats mode: which guest code sleeps, and for how long (finds frame limiters).
+/// Logs each caller's first three sleeps and then every 500th.
+fn note_sleep(uc: &Uc, wait: Duration) {
+    if !crate::runtime::stats_enabled() {
+        return;
+    }
+    static CALLERS: Mutex<Option<HashMap<u32, u64>>> = Mutex::new(None);
+    let caller = uc.reg(14);
+    let count = {
+        let mut callers = CALLERS.lock().unwrap();
+        let count = callers.get_or_insert_with(HashMap::new).entry(caller).or_insert(0);
+        *count += 1;
+        *count
+    };
+    if count <= 3 || count % 500 == 0 {
+        let thread = std::thread::current();
+        crate::log::line(&format!(
+            "[sleep] {} us from {caller:#010x} on {} (call {count})",
+            wait.as_micros(),
+            thread.name().unwrap_or("?")
+        ));
+    }
+}
+
 fn guest_sleep(duration: Duration) {
     let deadline = std::time::Instant::now() + duration;
     loop {
@@ -891,7 +1064,7 @@ pub fn handler(name: &str) -> Option<Handler> {
             Ret::U32(0)
         }),
         "sched_yield" => handler!(|uc, a| {
-            without_gil(std::thread::yield_now);
+            yield_or_rest();
             Ret::U32(0)
         }),
         "nanosleep" => handler!(|uc, a| {
@@ -899,7 +1072,8 @@ pub fn handler(name: &str) -> Option<Handler> {
             let seconds = mem().read_u32(request) as i32 as i64;
             let nanoseconds = mem().read_u32(request + 4) as i32 as i64;
             let wait = Duration::from_secs(seconds.max(0) as u64) + Duration::from_nanos(nanoseconds.max(0) as u64);
-            guest_sleep(wait);
+            note_sleep(uc, wait);
+            guest_sleep(frame_limit(wait));
             Ret::U32(0)
         }),
         "clock_nanosleep" => handler!(|uc, a| {
@@ -913,12 +1087,14 @@ pub fn handler(name: &str) -> Option<Handler> {
                 let now = Duration::from_secs(now.tv_sec.max(0) as u64) + Duration::from_nanos(now.tv_nsec.max(0) as u64);
                 wait = wait.saturating_sub(now);
             }
-            guest_sleep(wait);
+            note_sleep(uc, wait);
+            guest_sleep(frame_limit(wait));
             Ret::U32(0)
         }),
         "usleep" => handler!(|uc, a| {
             let microseconds = a.u32();
-            guest_sleep(Duration::from_micros(microseconds as u64));
+            note_sleep(uc, Duration::from_micros(microseconds as u64));
+            guest_sleep(frame_limit(Duration::from_micros(microseconds as u64)));
             Ret::U32(0)
         }),
         "sleep" => handler!(|uc, a| {

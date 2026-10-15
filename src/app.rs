@@ -20,7 +20,7 @@ use jni_sys::*;
 use crate::imports::{jni, jni_host};
 use crate::runtime::{call_guest, call_guest_with, engine, hold_gil, shared, Arg};
 
-const TARGET_REFRESH_RATE: f32 = 120.0;
+use crate::imports::threads::TARGET_REFRESH_RATE;
 
 pub enum HostArg {
     Object(jobject),

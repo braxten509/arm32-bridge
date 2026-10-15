@@ -419,6 +419,7 @@ mod host {
                 let started = std::time::Instant::now();
                 let done = unsafe { eglSwapBuffers(display, surface) };
                 crate::perf_hint::note_swap(started.elapsed());
+                crate::imports::threads::frame_shown();
                 Ret::U32(done)
             }),
             "eglSwapInterval" => handler!(|uc, a| {
@@ -586,13 +587,15 @@ mod host {
             }),
             "ASensorManager_createEventQueue" => handler!(|uc, a| {
                 let (manager, looper, ident, callback, data) = (a.u32(), a.u32(), a.i32(), a.u32(), a.u32());
-                if callback != 0 {
-                    // The host looper would call this guest address as host code.
-                    crate::log::line("[bridge] ASensorManager_createEventQueue with a callback: not supported, events come by ident only");
-                }
-                let queue = unsafe {
-                    ASensorManager_createEventQueue(host(manager), host(looper), ident, std::ptr::null_mut(), data as usize as Pointer)
-                };
+                // A guest callback runs through the same host trampoline as ALooper_addFd's.
+                // Dropping it left the queue's fd readable forever: ALooper_pollAll(0) then
+                // returned the ident nonstop and the game's loop spun a whole core (Pirates).
+                // Each queue gets its own key (the fd is hidden inside the queue).
+                static NEXT_KEY: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(i32::MIN);
+                let key = NEXT_KEY.fetch_add(1, Ordering::Relaxed);
+                let (host_callback, host_data) = crate::imports::activity::looper_callback_for(looper, key, callback, data);
+                let queue =
+                    unsafe { ASensorManager_createEventQueue(host(manager), host(looper), ident, host_callback, host_data) };
                 Ret::U32(guest(queue))
             }),
             "ASensorManager_destroyEventQueue" => handler!(|uc, a| {
