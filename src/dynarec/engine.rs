@@ -57,8 +57,15 @@ pub fn enabled() -> bool {
     })
 }
 
+/// A phone setting (`adb shell setprop`), else the same setting from the
+/// game's built-in settings (crate::app::game_setting): the phone wins.
 #[cfg(target_os = "android")]
 pub fn property(name: &str) -> Option<String> {
+    system_property(name).or_else(|| crate::app::game_setting(name))
+}
+
+#[cfg(target_os = "android")]
+fn system_property(name: &str) -> Option<String> {
     extern "C" {
         fn __system_property_get(name: *const libc::c_char, value: *mut libc::c_char) -> libc::c_int;
     }

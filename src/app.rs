@@ -76,6 +76,34 @@ fn library_directory() -> &'static PathBuf {
     DIRECTORY.get_or_init(|| library_path().parent().map(PathBuf::from).unwrap_or_default())
 }
 
+/// The settings file the converter puts in a known game (converter/src/fixes.rs):
+/// `name=value` lines named like the phone settings, e.g.
+/// `debug.arm32bridge.unlock.<package>=60`. Named lib*.so so Android unpacks it
+/// next to the bridge.
+pub const SETTINGS_FILE: &str = "libarm32_bridge_settings.so";
+
+/// A setting from the game's built-in settings file, if it has one.
+pub fn game_setting(name: &str) -> Option<String> {
+    static SETTINGS: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
+    SETTINGS
+        .get_or_init(|| {
+            let text = std::fs::read_to_string(library_directory().join(SETTINGS_FILE)).unwrap_or_default();
+            let settings: Vec<(String, String)> = text
+                .lines()
+                .filter_map(|line| line.split_once('='))
+                .map(|(name, value)| (name.trim().to_string(), value.trim().to_string()))
+                .filter(|(name, value)| !name.is_empty() && !value.is_empty())
+                .collect();
+            if !settings.is_empty() {
+                crate::log::line(&format!("[bridge] game settings: {settings:?}"));
+            }
+            settings
+        })
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.clone())
+}
+
 /// Whether a native method named *_nativeInit has returned (see `forward`).
 static NATIVE_INIT_DONE: AtomicBool = AtomicBool::new(false);
 

@@ -29,6 +29,14 @@ and open it on your phone. No root needed.
 3. Your 32-bit games show up as cards. Tap **Convert**, wait, then tap **Install** on Android's screen.
 4. Tap **Open** and play. Press and hold a card for more (Convert again, Remove, Delete file).
 
+**Games with a game data file.** Some bigger games (Assassin's Creed Pirates, for example) come as an APK plus a
+second, big file with their pictures, sounds and levels. Download sites call it the "cache", "OBB" or "data" file;
+it ends in `.obb` (like `main.253.com.ubisoft.assassin.pirates.obb`) and often comes in a `.zip` with the APK. The
+game won't start without it. Put the file, or the `.zip` it came in, in Downloads (or get the game as a bundle,
+which includes it), and Game Bridge copies it into place when it installs the game. For games it knows (Pirates),
+it also checks that it's the right, undamaged file. If a game needs one and Game Bridge can't find it, the card
+says **Needs game data**; tap it for what to do.
+
 ## Games that have worked so far
 
 > [!WARNING]
@@ -42,7 +50,7 @@ and open it on your phone. No root needed.
 | Card Wars | 1.12.9 | plays |
 | Puzzle Craft | 1.1.3 | plays |
 | Puzzle Craft 2 | 1.5.2 | plays |
-| Assassin's Creed Pirates | 2.9.1 | plays, with some stutter |
+| Assassin's Creed Pirates | 2.9.1 | plays (needs its game data file; Game Bridge adds a smoothness fix and a 60 fps cap) |
 | Broken Age | 2.2.2 | plays |
 | Angry Birds Classic | 8.0.3 | plays |
 
@@ -59,6 +67,8 @@ when it reaches them.
   marks them as made for Android 7. Most games don't notice; a very old game could act differently.
 - **Each phone has its own key.** Game Bridge makes a signing key for games on the phone and keeps it there. If
   you uninstall Game Bridge, later updates of a converted game need that game uninstalled first.
+- **Full-size icons.** Phones draw app icons in one shape (a circle on Pixels) and shrink old games' square
+  icons into a white circle. Converted games get a modern icon made from their own picture, so it fills the shape.
 - Online features, store purchases and license checks inside games may not work.
 - Speed depends on the game. Most run at full speed; heavy 3D games can stutter during loading.
 

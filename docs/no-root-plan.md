@@ -35,7 +35,6 @@ Owner build: unchanged. Risk: uninstalling Game Bridge loses its key, so later u
 need that game uninstalled first (saves lost); the app says so in its Remove/About text.
 
 ## Not covered (later)
-- Per-game settings that today need `adb setprop debug.arm32bridge.*` (e.g. Pirates' 60 fps cap).
 - Publishing the app (GitHub release): ask the owner first.
 
 ## Tests
@@ -91,3 +90,28 @@ a minute on the Pixel; no crash, no permission errors; Android later removed it 
 random password in KDE Wallet (folder GameBridge, entry release-key). Both are in the daily Kopia backup.
 `tools/build-app.sh --public` signs with it and writes android/GameBridge-<version>.apk. A phone with an owner build
 (debug key) must uninstall Game Bridge before installing a public build.
+
+## Known game fixes and game data files (2026-10-15)
+`converter/src/fixes.rs` lists fixes for particular games, each tied to one library by its SHA-256 (another version
+of the game is left alone). Original bytes are checked before patching; the converter prints `fix ...` lines.
+A fix can also carry bridge settings: they go into `lib/<abi>/libarm32_bridge_settings.so` (`name=value` lines,
+same names as the `debug.arm32bridge.*` phone settings) and the bridge reads it at start (`src/app.rs`
+game_setting); a phone setting still wins. Pirates 2.9.1: the gc4 Lua clean-up patch (0x6bf40e 5b00 -> 5b08) and
+a 60 fps cap.
+The app spots games that need a Google Play game data file (an APK of 100 MB or less with the expansion
+downloader kit, whose own code starts the download: `apk-convert --inspect` prints `download yes` when
+something outside the kit and outside a broadcast receiver calls startDownloadServiceIfRequired; Puzzle Craft 2
+ships the kit unused; measured without lib/ so a converted copy measures the same; a bundle only when it carries
+no data itself): it looks for `main.<N>.<package>.obb` with N up to the game's versionCode (a new version may keep
+an older data file), loose or inside any .zip it scans, copies it to Android/obb/<package>/ when installing (via a
+.part file; a file already in place counts only at the found copy's size), and otherwise shows "Needs its game
+data file · tap for why" on the card. `Games.knownData` holds size and SHA-256 of known files (Pirates' 817 MB
+main.253 OBB): a different size is ignored at scan, a different fingerprint is turned down when copying.
+
+## Full-size home-screen icons (2026-10-15)
+`converter/src/icon.rs`: an old game's bitmap icon gets a new resource entry (same type, config anydpi-v26)
+holding an adaptive icon (`converter/src/round_icon.xml`, compiled by aapt2) whose background is the bitmap inset
+by 1/6, i.e. exactly the part the launcher's shape shows. android:icon points at the new entry; the bitmap entry
+itself is unchanged. Skipped when an icon isn't a plain bitmap in every configuration or already has an Android 8+
+value. Checked: aapt2 reads converted Pirates, Angry Birds and Card Wars; the Pixel launcher shows them filling
+the circle. Game Bridge's cards draw adaptive icons unmasked (layers at 1.5x), so they stay square.

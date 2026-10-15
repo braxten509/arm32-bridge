@@ -221,6 +221,32 @@ fn download_screens(dex: &Dex) -> HashMap<u32, u32> {
         .collect()
 }
 
+/// True when the game's own code starts Google Play's expansion-file download: a call to the
+/// kit's `startDownloadServiceIfRequired` from outside the kit and outside a broadcast receiver.
+/// The kit's sample alarm receiver only restarts a download that was already running, and games
+/// that ship the kit unused (Puzzle Craft 2) have nothing else calling it; games that need their
+/// data file (Assassin's Creed Pirates) call it from their loading screen.
+pub fn starts_expansion_download(data: &[u8]) -> bool {
+    let dex = Dex { data };
+    let (class_count, class_defs) = (dex.u32(0x60) as usize, dex.u32(0x64) as usize);
+    (0..class_count).any(|class| {
+        let class_def = class_defs + class * 32;
+        if dex.type_name(dex.u32(class_def)).starts_with("Lcom/google/android/vending/") {
+            return false;
+        }
+        methods(&dex, class_def).into_iter().any(|(method_index, code)| {
+            dex.method(method_index).1 != "onReceive"
+                && instructions(&dex, code).iter().any(|(_, units)| {
+                    matches!(units[0] & 0xFF, 0x6E..=0x72 | 0x74..=0x78) && units.len() > 1 && {
+                        let called = dex.method(units[1].into()).0;
+                        called.starts_with("Lcom/google/android/vending/expansion/downloader/")
+                            && called.contains(".startDownloadServiceIfRequired:")
+                    }
+                })
+        })
+    })
+}
+
 /// Finds every fix to make in a dex file. `carries_game_data`: the APK is too big to rely on
 /// expansion files, so their download screen can be skipped (fix 4).
 pub fn find_fixes(data: &[u8], carries_game_data: bool) -> Vec<Fix> {

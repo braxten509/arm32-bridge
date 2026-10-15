@@ -6,6 +6,8 @@
 //!   kept next to it as lib<name>-arm32.so. The bridge is added once as
 //!   libarm32_bridge.so; each stand-in hands its original to it when Java
 //!   loads the stand-in.
+//! - Known fixes for particular games (fixes.rs) are applied to their exact
+//!   libraries, and their bridge settings go in a settings file next to the bridge.
 //! - Known Java-side problems are fixed in the dex files (dex.rs), and
 //!   android:extractNativeLibs is turned on so the parts are files (manifest.rs).
 //! - Phone functions the libraries import that the bridge lacks are listed.
@@ -20,7 +22,8 @@
 //!        apk-convert --inspect <game.apk|bundle> [--base <out.apk>] [--work <scratch dir>]
 //! (`--abi x86_64` makes a copy for the PC's Android emulator, with an x86_64 bridge and stand-in.)
 //! (`--min-target-sdk N` raises the game's target Android version to N: phones without root refuse older ones.)
-//! `--inspect` only looks: it prints `kind apk|bundle` and `bits 32|64|none`
+//! `--inspect` only looks: it prints `kind apk|bundle`, `data yes|no` for a bundle (carries game data),
+//! `download yes|no` (the game's own code starts Google Play's expansion-file download) and `bits 32|64|none`
 //! (what native code the game has), and with --base copies a bundle's base
 //! APK (the piece with the Java code) out, for reading its name and icon.
 //!
@@ -31,6 +34,8 @@
 
 mod bundle;
 mod dex;
+mod fixes;
+mod icon;
 mod manifest;
 
 use std::fs::File;
@@ -226,15 +231,17 @@ fn convert(options: &Options) -> Result<(), Failure> {
         Bits::None => return Err(Failure::No32),
         Bits::ThirtyTwo(abi) => abi,
     };
-    let libraries = read_libraries(&mut archive, abi)?;
+    let mut libraries = read_libraries(&mut archive, abi)?;
     println!("abi {abi}");
 
     println!("step Checking which phone functions the game needs");
     report_missing(&options.work, &libraries)?;
 
+    let applied = known_fixes(&mut libraries);
     println!("step Swapping in the bridge");
     let parts = Parts::read(options)?;
-    rewrite(&mut archive, &options.output, options, carries_game_data, Some(&parts.bridge), &parts.standin, &libraries)
+    let bridge = Bridge { library: &parts.bridge, settings: &applied.settings };
+    rewrite(&mut archive, &options.output, options, carries_game_data, Some(bridge), &parts.standin, &libraries, &[])
 }
 
 fn convert_bundle(options: &Options, mut bundle: bundle::Bundle) -> Result<(), Failure> {
@@ -266,16 +273,25 @@ fn convert_bundle(options: &Options, mut bundle: bundle::Bundle) -> Result<(), F
     println!("step Checking which phone functions the game needs");
     report_missing(&options.work, &libraries.concat())?;
 
+    let mut settings = String::new();
+    for libraries in &mut libraries {
+        settings.push_str(&known_fixes(libraries).settings);
+    }
     println!("step Swapping in the bridge");
     let parts = Parts::read(options)?;
     std::fs::create_dir_all(&options.output)?;
+    let tables: Vec<Vec<u8>> = bundle.pieces.iter_mut().filter_map(|piece| {
+        let mut bytes = Vec::new();
+        piece.archive.by_name("resources.arsc").ok()?.read_to_end(&mut bytes).ok()?;
+        Some(bytes)
+    }).collect();
     let mut bridge_added = false;
     for (piece, libraries) in bundle.pieces.iter_mut().zip(&libraries) {
         let output = options.output.join(&piece.name);
         // The bridge goes in once, with the first 32-bit libraries; all pieces' libraries end up in one folder.
-        let bridge = (!bridge_added && !libraries.is_empty()).then_some(parts.bridge.as_slice());
+        let bridge = (!bridge_added && !libraries.is_empty()).then_some(Bridge { library: &parts.bridge, settings: &settings });
         bridge_added |= bridge.is_some();
-        rewrite(&mut piece.archive, &output, options, carries_game_data, bridge, &parts.standin, libraries)?;
+        rewrite(&mut piece.archive, &output, options, carries_game_data, bridge, &parts.standin, libraries, &tables)?;
         println!("piece {}", piece.name);
     }
 
@@ -295,23 +311,54 @@ fn convert_bundle(options: &Options, mut bundle: bundle::Bundle) -> Result<(), F
     Ok(())
 }
 
+/// Applies the known fixes for particular games (fixes.rs) and reports them.
+fn known_fixes(libraries: &mut [(String, Vec<u8>)]) -> fixes::Applied {
+    let applied = fixes::apply(libraries);
+    if !applied.report.is_empty() {
+        println!("step Applying known fixes for this game");
+    }
+    for line in &applied.report {
+        println!("{line}");
+    }
+    applied
+}
+
+/// The bridge library, and the settings file text to put next to it (empty for none).
+#[derive(Clone, Copy)]
+struct Bridge<'a> {
+    library: &'a [u8],
+    settings: &'a str,
+}
+
 /// Writes `archive` to `output` without its old signature, with the dex and
 /// manifest fixes, its libraries swapped for stand-ins (originals kept as
-/// lib<name>-arm32.so) and, when given, the bridge.
+/// lib<name>-arm32.so) and, when given, the bridge (with the game's settings file).
 fn rewrite<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     output: &Path,
     options: &Options,
     carries_game_data: bool,
-    bridge: Option<&[u8]>,
+    bridge: Option<Bridge>,
     standin: &[u8],
     libraries: &[(String, Vec<u8>)],
+    // A bundle's pieces' resource tables (for the icon: its pictures may be in another piece).
+    tables: &[Vec<u8>],
 ) -> Result<(), Failure> {
     let mut writer = ZipWriter::new(File::create(output)?);
     let stored = |alignment: u16| {
         SimpleFileOptions::default().compression_method(CompressionMethod::Stored).with_alignment(alignment)
     };
     let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    // Full-size home-screen icon (icon.rs): needs the manifest and the resource table together.
+    let read = |archive: &mut ZipArchive<R>, name: &str| -> Option<Vec<u8>> {
+        let mut bytes = Vec::new();
+        archive.by_name(name).ok()?.read_to_end(&mut bytes).ok()?;
+        Some(bytes)
+    };
+    let round_icons = match (read(archive, "AndroidManifest.xml"), read(archive, "resources.arsc")) {
+        (Some(manifest), Some(table)) => icon::round_icons(&manifest, &table, tables),
+        _ => None,
+    };
     for index in 0..archive.len() {
         let entry = archive.by_index_raw(index)?;
         let name = entry.name().to_string();
@@ -323,6 +370,13 @@ fn rewrite<R: Read + Seek>(
         }
         let is_dex = name.starts_with("classes") && name.ends_with(".dex") && !name.contains('/');
         let is_manifest = name == "AndroidManifest.xml";
+        if let (Some(icons), "resources.arsc") = (&round_icons, name.as_str()) {
+            drop(entry);
+            // Android maps the table straight from the APK: stored, 4-byte aligned.
+            writer.start_file(name.as_str(), stored(4))?;
+            writer.write_all(&icons.table)?;
+            continue;
+        }
         if is_dex || is_manifest || entry.compression() == CompressionMethod::Stored {
             let was_stored = entry.compression() == CompressionMethod::Stored;
             drop(entry);
@@ -354,6 +408,11 @@ fn rewrite<R: Read + Seek>(
                         Err(reason) => println!("warn {name}: can't raise the target Android version: {reason}"),
                     }
                 }
+                if let Some(icons) = &round_icons {
+                    if icon::switch_icons(&mut bytes, &icons.switched) > 0 {
+                        println!("fix {name}: full-size home-screen icon (the game's own picture filling the phone's icon shape)");
+                    }
+                }
                 if !was_stored {
                     entry_options = deflated;
                 }
@@ -364,10 +423,18 @@ fn rewrite<R: Read + Seek>(
             writer.raw_copy_file(entry)?;
         }
     }
+    for (path, xml) in round_icons.iter().flat_map(|icons| &icons.files) {
+        writer.start_file(path.as_str(), deflated)?;
+        writer.write_all(xml)?;
+    }
     let target = |file: &str| format!("lib/{}/{file}", options.abi);
     if let Some(bridge) = bridge {
         writer.start_file(target(BRIDGE_FILE), stored(LIBRARY_ALIGNMENT))?;
-        writer.write_all(bridge)?;
+        writer.write_all(bridge.library)?;
+        if !bridge.settings.is_empty() {
+            writer.start_file(target(fixes::SETTINGS_FILE), stored(LIBRARY_ALIGNMENT))?;
+            writer.write_all(bridge.settings.as_bytes())?;
+        }
     }
     for (file, bytes) in libraries {
         let stem = file.strip_suffix(".so").unwrap();
@@ -388,14 +455,17 @@ fn inspect(input: &Path, base: Option<&Path>, work: &Path) -> Result<(), String>
     let result = (|| {
         let names: Vec<String> = match bundle::open(input, &scratch)? {
             None => {
-                let archive = ZipArchive::new(File::open(input).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+                let mut archive = ZipArchive::new(File::open(input).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
                 println!("kind apk");
+                println!("download {}", yes_no(starts_download(&mut archive)));
                 archive.file_names().map(String::from).collect()
             }
             Some(mut bundle) => {
                 println!("kind bundle");
+                println!("data {}", yes_no(!bundle.game_data.is_empty()));
+                let piece = bundle.pieces.iter_mut().find(|piece| piece.has_code()).ok_or("the bundle has no base APK")?;
+                println!("download {}", yes_no(starts_download(&mut piece.archive)));
                 if let Some(base) = base {
-                    let piece = bundle.pieces.iter_mut().find(|piece| piece.has_code()).ok_or("the bundle has no base APK")?;
                     bundle::save(piece, base).map_err(|e| format!("copy out {}: {e}", piece.name))?;
                 }
                 bundle.pieces.iter().flat_map(|piece| piece.names()).collect()
@@ -413,6 +483,23 @@ fn inspect(input: &Path, base: Option<&Path>, work: &Path) -> Result<(), String>
     result
 }
 
+
+fn yes_no(answer: bool) -> &'static str {
+    if answer { "yes" } else { "no" }
+}
+
+/// Whether the game's own code starts Google Play's expansion-file download (dex::starts_expansion_download).
+fn starts_download<R: Read + Seek>(archive: &mut ZipArchive<R>) -> bool {
+    let dex_files: Vec<String> = archive.file_names()
+        .filter(|name| name.starts_with("classes") && name.ends_with(".dex") && !name.contains('/'))
+        .map(String::from)
+        .collect();
+    dex_files.iter().any(|name| {
+        let mut bytes = Vec::new();
+        archive.by_name(name).ok().and_then(|mut file| file.read_to_end(&mut bytes).ok()).is_some()
+            && dex::starts_expansion_download(&bytes)
+    })
+}
 
 /// Lists (`missing <name>`) the phone functions the libraries import that the
 /// bridge has no handler for. The libraries are written to a scratch folder

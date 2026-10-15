@@ -82,6 +82,7 @@ private val AccentText = Color(0xFF9FB2FF)
 private val Muted = Color(0xFF9AA0AD)
 private val Track = Color(0xFF2B2F3F)
 private val ErrorText = Color(0xFFFF8A80)
+private val NoticeText = Color(0xFFFFCC80)
 
 /** What a game's card shows. */
 sealed class CardState {
@@ -219,7 +220,7 @@ class MainActivity : ComponentActivity() {
                 RefreshButton(enabled = !searching && setup == null, onClick = ::refresh)
             }
             Text(
-                "32-bit games and game bundles on this phone",
+                "32-bit game APKs, XAPKs and data files on this phone.",
                 color = Muted,
                 fontSize = 13.sp,
                 modifier = Modifier.padding(start = 18.dp, bottom = 14.dp),
@@ -355,6 +356,9 @@ class MainActivity : ComponentActivity() {
         var menu by remember { mutableStateOf(false) }
         // A failed card shows a short line; tapping the card shows the whole reason.
         var why by remember { mutableStateOf(false) }
+        // Likewise for a game whose data file isn't in place.
+        var dataWhy by remember { mutableStateOf(false) }
+        if (dataWhy) DataDialog(game, onDismiss = { dataWhy = false })
         if (why && state is CardState.Failed) {
             AlertDialog(
                 onDismissRequest = { why = false },
@@ -370,7 +374,12 @@ class MainActivity : ComponentActivity() {
                     .combinedClickable(
                         interactionSource = remember { MutableInteractionSource() },
                         indication = null,
-                        onClick = { if (state is CardState.Failed) why = true },
+                        onClick = {
+                            when {
+                                state is CardState.Failed -> why = true
+                                needsDataNotice(game, state) -> dataWhy = true
+                            }
+                        },
                         onLongClick = { if (state !is CardState.Working) menu = true },
                     )
                     .padding(14.dp).fillMaxWidth(),
@@ -415,6 +424,9 @@ class MainActivity : ComponentActivity() {
             if (state is CardState.Failed) {
                 Text("Didn't install · tap for why", color = ErrorText, fontSize = 11.sp, maxLines = 1,
                     overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 3.dp))
+            } else if (needsDataNotice(game, state)) {
+                Text("Needs game data · tap", color = NoticeText, fontSize = 11.sp, maxLines = 1,
+                    overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 3.dp))
             } else {
                 // Where the game file is until it is installed.
                 Text(if (state == CardState.Done) "Installed" else game.place, color = Muted, fontSize = 11.sp, maxLines = 1,
@@ -455,21 +467,43 @@ class MainActivity : ComponentActivity() {
                     ) { Text("Try again", color = AccentText, fontSize = 13.sp) }
                 }
             }
-            // The same space on every card, so cards in a row stay the same height.
-            Box(Modifier.padding(top = 6.dp).height(28.dp), contentAlignment = Alignment.Center) {
-                // Needs the original game file, so not for games found only as installed; nothing to redo for as-is installs.
-                if (state == CardState.Done && game.file != null && game.action == Action.Convert) {
-                    // For when the bridge has been updated: replaces the installed copy and keeps its saves.
-                    Text(
-                        "Convert again",
-                        color = if (busy) Muted else AccentText,
-                        fontSize = 12.sp,
-                        modifier = Modifier.clip(RoundedCornerShape(8.dp))
-                            .clickable(enabled = !busy, onClick = onConvert).padding(horizontal = 8.dp, vertical = 4.dp),
-                    )
-                }
-            }
         }
+    }
+
+    /**
+     * A game that needs a separate data file shows a notice when the file isn't in place: before
+     * converting only when it isn't on the phone at all (else it is copied on install), after
+     * installing whenever it is still missing.
+     */
+    private fun needsDataNotice(game: Game, state: CardState): Boolean =
+        state !is CardState.Working && !game.dataInPlace && (game.looseData == null || state == CardState.Done)
+
+    /** What the game data file is and what to do about it. */
+    @Composable
+    private fun DataDialog(game: Game, onDismiss: () -> Unit) {
+        val known = Games.knownData[game.dataFile]
+        val size = known?.let { " For this game it's about ${it.size / 1_000_000} MB." } ?: " It is usually a few hundred MB."
+        val next = when (val found = game.looseData) {
+            null -> "Get it from the same place you got the game. Put the file, or the .zip it came in, in Downloads. " +
+                "Then tap ↻ and Convert: Game Bridge finds it, checks it and puts it where the game looks for it."
+            else -> "Found it in ${found.where}. Press and hold the card, tap Convert again, and Game Bridge puts it where the game looks for it."
+        }
+        AlertDialog(
+            onDismissRequest = onDismiss,
+            containerColor = CardColor,
+            title = { Text("${game.label} needs its game data", color = Color(0xFFE8E8EE)) },
+            text = {
+                Column {
+                    Text("Besides the APK, this game comes with a second, big file holding its pictures, sounds and levels. " +
+                        "Download sites call it the \"cache\", \"OBB\" or \"data\" file; it ends in .obb and often comes " +
+                        "in a .zip together with the APK.$size Without it the game stops while loading.",
+                        color = Muted, fontSize = 14.sp)
+                    Text(next, color = Color(0xFFE8E8EE), fontSize = 14.sp, modifier = Modifier.padding(vertical = 10.dp))
+                    Text("Its exact name: ${game.dataFile.orEmpty()}", color = Muted, fontSize = 12.sp)
+                }
+            },
+            confirmButton = { TextButton(onClick = onDismiss) { Text("OK", color = AccentText) } },
+        )
     }
 
     /**

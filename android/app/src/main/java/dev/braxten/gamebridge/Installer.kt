@@ -10,6 +10,8 @@ import android.content.pm.PackageInstaller
 import android.os.Build
 import android.os.Environment
 import java.io.File
+import java.security.DigestInputStream
+import java.security.MessageDigest
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
@@ -105,6 +107,33 @@ class Installer(context: Context) {
             null
         } catch (failure: Exception) {
             "Installed, but the game data couldn't be copied (is \"Install unknown apps\" still on for Game Bridge?): ${failure.message}"
+        }
+    }
+
+    /**
+     * Copies one game data file (loose or from a .zip) into the game's Android/obb folder, keeping its
+     * name. A file whose right copy is known (Games.knownData) must match it. Null on success, else a plain reason.
+     */
+    fun copyDataFile(source: DataSource, packageName: String): String? {
+        val folder = Games.obbFolder(packageName)
+        val partial = File(folder, "${source.name}.part")
+        return try {
+            folder.mkdirs()
+            val digest = MessageDigest.getInstance("SHA-256")
+            source.read { input -> partial.outputStream().use { DigestInputStream(input, digest).copyTo(it) } }
+            val known = Games.knownData[source.name]
+            val fingerprint = digest.digest().joinToString("") { "%02x".format(it) }
+            when {
+                partial.length() != source.size -> "Installed, but its game data didn't copy completely. Tap Convert again."
+                known != null && fingerprint != known.sha256 ->
+                    "Installed, but the game data file in ${source.where} isn't the right one: it is damaged or from another version " +
+                        "(the right one is ${known.size / 1_000_000} MB). Get it again from where you got the game."
+                !partial.renameTo(File(folder, source.name)) -> "Installed, but its game data couldn't be put in place. Tap Convert again."
+                else -> null
+            }.also { if (it != null) partial.delete() }
+        } catch (failure: Exception) {
+            partial.delete()
+            "Installed, but its game data couldn't be copied (is there room on the phone?): ${failure.message}"
         }
     }
 

@@ -28,6 +28,7 @@ class Converter(private val context: Context, private val installer: Installer) 
     private val stepPercent = mapOf(
         "Reading the game" to 5,
         "Checking which phone functions the game needs" to 15,
+        "Applying known fixes for this game" to 25,
         "Swapping in the bridge" to 30,
         "Fixing known Java problems" to 55,
         "Copying game data" to 70,
@@ -107,6 +108,12 @@ class Converter(private val context: Context, private val installer: Installer) 
             report(Progress(95, "Copying game data"))
             installer.copyGameData(gameData)?.let { return Attempt.Ended(Outcome.Failed(it)) }
         }
+        // A separate data file found on the phone (Downloads and the like) goes where the game looks for it.
+        val loose = game.looseData
+        if (game.dataFile != null && loose != null && !game.dataInPlace) {
+            report(Progress(95, "Copying game data"))
+            installer.copyDataFile(loose, game.packageName)?.let { return Attempt.Ended(Outcome.Failed(it)) }
+        }
         report(Progress(100, "Installed"))
         return Attempt.Ended(Outcome.Installed(missing))
     }
@@ -156,6 +163,11 @@ class Converter(private val context: Context, private val installer: Installer) 
             report(Progress(95, "Copying game data"))
             installer.copyGameData(gameData)?.let { return Outcome.Failed(it) }
         }
+        val loose = game.looseData
+        if (game.dataFile != null && loose != null && !game.dataInPlace) {
+            report(Progress(95, "Copying game data"))
+            installer.copyDataFile(loose, game.packageName)?.let { return Outcome.Failed(it) }
+        }
         report(Progress(100, "Installed"))
         return Outcome.Installed(emptyList())
     }
@@ -164,8 +176,8 @@ class Converter(private val context: Context, private val installer: Installer) 
         private const val OLDEST_TARGET = "oldest_target_sdk"
 
         /**
-         * apk-convert --inspect: its `kind` and `bits` lines (bits is 32, 64 or none), and for a
-         * bundle its base APK copied to `base`. Empty when the file can't be read.
+         * apk-convert --inspect: its `kind` and `bits` lines (bits is 32, 64 or none; a bundle also
+         * has `data yes|no`, whether it carries game data), and for a bundle its base APK copied to `base`. Empty when the file can't be read.
          */
         fun inspect(context: Context, file: File, base: File, work: File): Map<String, String> {
             val converter = File(context.applicationInfo.nativeLibraryDir, "libapkconvert.so")
