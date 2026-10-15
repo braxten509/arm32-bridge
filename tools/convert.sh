@@ -15,25 +15,28 @@
 #   the same key and installed together; its game data (OBB) is copied to
 #   /sdcard/Android/obb/.
 #
-# usage: tools/convert.sh <game.apk|bundle> [--out <converted.apk|folder>] [--no-install] [--abi x86_64] [--device <serial>]
+# usage: tools/convert.sh <game.apk|bundle> [--out <converted.apk|folder>] [--no-install] [--abi x86_64] [--device <serial>] [--min-target-sdk N]
 #   --abi x86_64: a copy for the PC's Android emulator (x86_64 bridge, Unicorn only)
 #   --device: install on this adb device (e.g. emulator-5554) instead of the phone
+#   --min-target-sdk: raise an old game's target Android version to N, as the phone app does
+#     (Android refuses old targets from installers other than adb)
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 NDK=${NDK:-$HOME/Android/Sdk/ndk/30.0.16248370}
 BUILD_TOOLS=${BUILD_TOOLS:-$HOME/Android/Sdk/build-tools/37.0.0}
 
 usage() {
-    echo "usage: tools/convert.sh <game.apk|bundle> [--out <converted.apk|folder>] [--no-install] [--abi x86_64] [--device <serial>]" >&2
+    echo "usage: tools/convert.sh <game.apk|bundle> [--out <converted.apk|folder>] [--no-install] [--abi x86_64] [--device <serial>] [--min-target-sdk N]" >&2
     exit 2
 }
-APK="" OUT="" INSTALL=1 ABI=arm64-v8a DEVICE=""
+APK="" OUT="" INSTALL=1 ABI=arm64-v8a DEVICE="" MIN_TARGET=()
 while [ $# -gt 0 ]; do
     case $1 in
         --out) OUT=$2; shift 2 ;;
         --no-install) INSTALL=0; shift ;;
         --abi) ABI=$2; shift 2 ;;
         --device) DEVICE=$2; shift 2 ;;
+        --min-target-sdk) MIN_TARGET=(--min-target-sdk "$2"); shift 2 ;;
         -*) usage ;;
         *) [ -z "$APK" ] || usage; APK=$1; shift ;;
     esac
@@ -73,7 +76,7 @@ UNSIGNED=$WORK/unsigned.apk
 [ $BUNDLE = 0 ] || UNSIGNED=$WORK/unsigned
 "$ROOT/target/release/apk-convert" "$APK" "$UNSIGNED" \
     --bridge "$ROOT/target/$TARGET/release/libarm32_bridge.so" --standin "$WORK/libstandin.so" \
-    --work "$WORK" --abi "$ABI" > "$WORK/convert.log"
+    --work "$WORK" --abi "$ABI" "${MIN_TARGET[@]}" > "$WORK/convert.log"
 STATUS=$?
 set -e
 grep -v -e '^missing ' -e '^piece ' -e '^obb ' "$WORK/convert.log" | sed -e 's/^step /  /' -e 's/^error /  /' -e 's/^warn /  warning: /'

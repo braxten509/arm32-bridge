@@ -45,12 +45,12 @@ class Converter(private val context: Context, private val installer: Installer) 
     }
 
     /**
-     * Without root, Android refuses games made for versions older than it supports. The oldest
+     * Android refuses games made for versions older than it supports. The oldest
      * version it takes is learned from its own refusal and remembered: later games are raised to
      * it up front, and a refused one is converted again with it, once.
      */
     private fun convert(game: Game, work: File, report: (Progress) -> Unit): Outcome {
-        val known = settings.getInt(OLDEST_TARGET, 0).takeIf { it > 0 && !installer.keepsOldTargets }
+        val known = settings.getInt(OLDEST_TARGET, 0).takeIf { it > 0 }
         val first = convert(game, work, report, known)
         if (first !is Attempt.Refused || (known != null && first.sdk <= known)) return first.outcome
         settings.edit().putInt(OLDEST_TARGET, first.sdk).apply()

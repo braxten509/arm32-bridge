@@ -1,12 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
-    <!-- Reads game APKs in Downloads and wherever the user adds them from. With root it is granted
-         through appops; without, the user turns on "All files access" in the setup screen. -->
+    <!-- Reads game APKs in Downloads and wherever the user adds them from; the user turns on
+         "All files access" in the setup screen. -->
     <uses-permission
         android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
         tools:ignore="ScopedStorage" />
-    <!-- Without root: installs games through Android's installer (the user turns on "Install unknown
+    <!-- Installs games through Android's installer (the user turns on "Install unknown
          apps", which also opens Android/obb for game data), updates them without asking again, and
          removes them. -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />

@@ -1,7 +1,8 @@
 # Game Bridge without root: plan (2026-10-15)
 
 Goal: other people (no Magisk) can convert and install 32-bit games with the Game Bridge app.
-Root stays supported: when `su` works, the app keeps today's path (no dialogs, original target SDK).
+Update 2026-10-15: after the phone test passed, the root path was removed from the app (owner's choice); every phone
+uses Android's installer. Sections below describe the plan as it was, root path included.
 
 ## Where root is used today (android/app/src/main/java/dev/braxten/gamebridge)
 | Use | Today (root) | Without root |
@@ -76,3 +77,8 @@ need that game uninstalled first (saves lost); the app says so in its Remove/Abo
   apps" is turned on (Android/obb opens only at process start); a confirmation Android wouldn't show in the
   background is shown when the app comes back (Confirmation); a confirmation left unanswered for 30 minutes
   abandons the session. Silent updates only apply to games targeting 35+, so old games always ask.
+
+## Root path removed (2026-10-15)
+Phone test (forced no-root): Puzzle Craft 1 refused at target 21, converted again at 24, installed with one
+confirmation, opened without a crash. The owner chose to drop the root path: Root.kt, RootInstaller, Installers and
+debug.gamebridge.noroot are gone; `Installer` (was SessionInstaller) is the only installer.

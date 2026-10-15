@@ -91,7 +91,7 @@ sealed class CardState {
     class Failed(val reason: String) : CardState()
 }
 
-/** What the setup screen shows: which of Android's two permissions the user has given (no-root phones only). */
+/** What the setup screen shows: which of Android's two permissions the user has given. */
 private class Setup(val files: Boolean, val installs: Boolean)
 
 class MainActivity : ComponentActivity() {
@@ -147,12 +147,8 @@ class MainActivity : ComponentActivity() {
             searching = true
             scope.launch {
                 val result = withContext(Dispatchers.IO) {
-                    if (Installers.current(this@MainActivity) is RootInstaller) {
-                        Root.grantFileAccess(packageName)
-                    } else {
-                        val needed = Setup(Environment.isExternalStorageManager(), packageManager.canRequestPackageInstalls())
-                        if (!needed.files || !needed.installs) return@withContext null to needed
-                    }
+                    val needed = Setup(Environment.isExternalStorageManager(), packageManager.canRequestPackageInstalls())
+                    if (!needed.files || !needed.installs) return@withContext null to needed
                     val found = Games.scan(this@MainActivity)
                     for (game in found) {
                         val state = states[game.packageName]
@@ -169,8 +165,8 @@ class MainActivity : ComponentActivity() {
                 result.first?.let { games = it }
                 setup = result.second
                 searching = false
-                // Without root, Android/obb opens up only in a process started with the switch on.
-                if (setup == null && installsAtStart == false && Installers.current(this@MainActivity) !is RootInstaller) restart()
+                // Android/obb opens up only in a process started with the switch on.
+                if (setup == null && installsAtStart == false) restart()
             }
         }
 
@@ -184,8 +180,8 @@ class MainActivity : ComponentActivity() {
             scope.launch {
                 val problems = withContext(Dispatchers.IO) {
                     listOfNotNull(
-                        if (uninstall) Installers.current(this@MainActivity).uninstall(game.packageName) else null,
-                        if (deleteFile) game.file?.let(Installers.current(this@MainActivity)::delete) else null,
+                        if (uninstall) Installer(this@MainActivity).uninstall(game.packageName) else null,
+                        if (deleteFile) game.file?.let(Installer(this@MainActivity)::delete) else null,
                     )
                 }
                 problems.firstOrNull()?.let { Toast.makeText(this@MainActivity, it, Toast.LENGTH_LONG).show() }
@@ -249,7 +245,7 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * The two permissions a phone without root needs, each with a button to its page in Android's
+     * The two permissions Game Bridge needs, each with a button to its page in Android's
      * settings. The screen checks again when the user comes back.
      */
     @Composable

@@ -14,16 +14,30 @@ import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
-/**
- * Installs and removes games through Android's own installer, for phones without root. Android
- * shows its confirmation for each install and removal; the user has turned on "Install unknown
- * apps" for Game Bridge in the setup screen, which also lets it copy game data into Android/obb.
- */
-class SessionInstaller(context: Context) : Installer {
-    private val context = context.applicationContext
-    override val keepsOldTargets = false
+/** How an install ended. */
+sealed class InstallResult {
+    object Done : InstallResult()
 
-    override fun install(apks: List<File>): InstallResult {
+    /** Android refuses games made for older versions than `sdk`. */
+    class NeedsTarget(val sdk: Int) : InstallResult()
+
+    class Failed(val reason: String) : InstallResult()
+}
+
+/** Message shown when the game is installed with another key (from the Play Store or another phone's Game Bridge). */
+const val OTHER_KEY = "This game is already installed from somewhere else. Uninstall it first " +
+    "(that deletes its saved progress), then try again."
+
+/**
+ * Installs and removes games through Android's own installer. Android shows its confirmation for
+ * each install and removal; the user has turned on "Install unknown apps" for Game Bridge in the
+ * setup screen, which also lets it copy game data into Android/obb.
+ */
+class Installer(context: Context) {
+    private val context = context.applicationContext
+
+    /** Installs one APK, or a bundle's pieces together. */
+    fun install(apks: List<File>): InstallResult {
         val installer = context.packageManager.packageInstaller
         val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL)
         // Updates of games this app installed go through without asking again, but only for games
@@ -78,7 +92,8 @@ class SessionInstaller(context: Context) : Installer {
         return number?.takeIf { it in 1..Build.VERSION.SDK_INT }
     }
 
-    override fun copyGameData(folder: File): String? {
+    /** Copies a folder of game data (one folder per package inside) into /sdcard/Android/obb. Null on success, else a plain reason. */
+    fun copyGameData(folder: File): String? {
         val obb = File(Environment.getExternalStorageDirectory(), "Android/obb")
         return try {
             for (source in folder.walkTopDown().filter { it.isFile }) {
@@ -93,7 +108,8 @@ class SessionInstaller(context: Context) : Installer {
         }
     }
 
-    override fun uninstall(packageName: String): String? {
+    /** Uninstalls a game; Android deletes its saved progress and game data with it. Null on success, else a plain reason. */
+    fun uninstall(packageName: String): String? {
         val answer = waitForAnswer("uninstall-$packageName") { sender ->
             context.packageManager.packageInstaller.uninstall(packageName, sender)
         }
@@ -104,7 +120,8 @@ class SessionInstaller(context: Context) : Installer {
         }
     }
 
-    override fun delete(file: File): String? =
+    /** Deletes a game file from shared storage. Null on success, else a plain reason. */
+    fun delete(file: File): String? =
         if (file.delete() || !file.exists()) null else "Couldn't delete ${file.name}. Is \"All files access\" still on for Game Bridge?"
 
     private class Answer(val status: Int, val message: String?)
