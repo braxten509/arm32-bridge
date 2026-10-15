@@ -29,18 +29,25 @@ and open it on your phone. No root needed.
 3. Your 32-bit games show up as cards. Tap **Convert**, wait, then tap **Install** on Android's screen.
 4. Tap **Open** and play. Press and hold a card for more (Convert again, Remove, Delete file).
 
-## Games tested so far
+## Games that have worked so far
 
-| Game | State |
-|---|---|
-| Card Wars: Adventure Time | plays |
-| Puzzle Craft, Puzzle Craft 2 | play |
-| Assassin's Creed Pirates | plays, some stutter |
-| Broken Age | plays |
-| Angry Birds Classic 8.0.3 | plays |
+> [!WARNING]
+> **Most games have never been tried.** Only the games below have been tested, all on one phone (Pixel 10,
+> Android 17). Any other game may not start, may crash partway through, may have missing sound or graphics, or
+> may run much slower than it would on a phone with 32-bit support. Even the games below can behave differently
+> on other phones or other versions of the game. Treat everything else as an experiment.
 
-Other games may work, partly work, or not start. When a game uses phone functions the bridge doesn't know yet,
-the converter lists them; the game may then fail when it reaches them.
+| Game | Version tested | How it runs |
+|---|---|---|
+| Card Wars | 1.12.9 | plays |
+| Puzzle Craft | 1.1.3 | plays |
+| Puzzle Craft 2 | 1.5.2 | plays |
+| Assassin's Creed Pirates | 2.9.1 | plays, with some stutter |
+| Broken Age | 2.2.2 | plays |
+| Angry Birds Classic | 8.0.3 | plays |
+
+When a game uses phone functions the bridge doesn't know yet, the converter lists them; the game may then fail
+when it reaches them.
 
 ## Good to know
 
