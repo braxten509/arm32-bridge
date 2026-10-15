@@ -652,8 +652,8 @@ impl Translator {
     /// LDM/STM in any of the four modes: `up` = increment, `before` = adjust before each access.
     fn load_store_multiple_at(&mut self, load: bool, rn: u32, list: u32, up: bool, before: bool, writeback: bool) -> Result<Flow> {
         let count = list.count_ones();
-        if count == 0 || rn == PC || (list & (1 << SP) != 0 && rn != SP && load) {
-            return Err(());
+        if count == 0 || rn == PC || (list & (1 << SP) != 0 && load && self.thumb && rn != SP) {
+            return Err(()); // Thumb can't load SP with LDM (unpredictable); ARM can (Mono's context restore)
         }
         if !load && list & (1 << PC) != 0 {
             // Only ARM code can store PC (Mono's trampolines push it); it reads as the instruction + 8.
@@ -1490,6 +1490,12 @@ impl Translator {
         if h1 == 0xF3AF && h2 == 0x8000 {
             return Ok(Flow::Next);
         }
+        if h1 & 0xFFF0 == 0xF380 && h2 & 0xF0FF == 0x8000 {
+            return self.write_apsr(h1 & 0xF, (h2 >> 8) & 0xF); // MSR APSR_<mask>, Rn
+        }
+        if h1 == 0xF3EF && h2 & 0xF0FF == 0x8000 {
+            return self.read_apsr((h2 >> 8) & 0xF); // MRS Rd, APSR
+        }
         Err(())
     }
 
@@ -1966,7 +1972,9 @@ impl Translator {
 
     /// LDREX{B,H,D}: `rt2` is only used for doublewords.
     fn load_exclusive(&mut self, size: u32, rt: Reg, rt2: Reg, rn: Reg, offset: u32) -> Result<Flow> {
-        if self.in_it || rn == PC || rt == PC || (size == 3 && (rt2 == PC || rt2 == rt)) || force_sync_fallback() {
+        // Inside an IT block too: the only exit is the alignment fault's, taken when the
+        // instruction runs, and the fault ends the block either way.
+        if rn == PC || rt == PC || (size == 3 && (rt2 == PC || rt2 == rt)) || force_sync_fallback() {
             return Err(());
         }
         self.exclusive_address(size, rn, offset);
@@ -1992,7 +2000,7 @@ impl Translator {
 
     /// STREX{B,H,D} Rd, Rt(, Rt2), [Rn, #offset]: Rd = 0 if stored, 1 if not.
     fn store_exclusive(&mut self, size: u32, rd: Reg, rt: Reg, rt2: Reg, rn: Reg, offset: u32) -> Result<Flow> {
-        if self.in_it || rn == PC || rt == PC || rd == PC || rd == rn || rd == rt || force_sync_fallback() {
+        if rn == PC || rt == PC || rd == PC || rd == rn || rd == rt || force_sync_fallback() {
             return Err(());
         }
         if size == 3 && (rt2 == PC || rd == rt2) {
@@ -2042,6 +2050,42 @@ impl Translator {
         self.a.bind(fail);
         self.a.mov_w_imm(rd, 1);
         self.a.bind(done);
+        Ok(Flow::Next)
+    }
+
+    /// MRS Rd, APSR: NZCV, Q and GE, with the other bits as Unicorn reads them.
+    pub(super) fn read_apsr(&mut self, rd: Reg) -> Result<Flow> {
+        if rd == PC {
+            return Err(());
+        }
+        self.a.mrs_nzcv(T0);
+        self.a.ldr_w_off(T1, host::STATE, offsets::CPSR_OTHER);
+        self.a.orr_w(T0, T0, T1, shift::LSL, 0);
+        self.a.mov_w_imm(T1, super::CPSR_FIXED.load(std::sync::atomic::Ordering::Relaxed));
+        self.a.orr_w(rd, T0, T1, shift::LSL, 0);
+        Ok(Flow::Next)
+    }
+
+    /// MSR APSR_<mask>, Rn: mask bit 3 writes NZCV and Q, bit 2 the GE bits. The
+    /// control fields (bits 1-0) are left to the fallback.
+    pub(super) fn write_apsr(&mut self, rn: Reg, mask: u32) -> Result<Flow> {
+        if rn == PC || mask & 0b0011 != 0 || mask == 0 {
+            return Err(());
+        }
+        let mut written = 0;
+        if mask & 0b1000 != 0 {
+            self.a.and_w_imm(T0, rn, 0xF000_0000, T1);
+            self.a.msr_nzcv(T0);
+            written |= 1 << 27;
+        }
+        if mask & 0b0100 != 0 {
+            written |= 0x000F_0000;
+        }
+        self.a.ldr_w_off(T0, host::STATE, offsets::CPSR_OTHER);
+        self.a.and_w_imm(T0, T0, !written, T1);
+        self.a.and_w_imm(T2, rn, written, T1);
+        self.a.orr_w(T0, T0, T2, shift::LSL, 0);
+        self.a.str_w_off(T0, host::STATE, offsets::CPSR_OTHER);
         Ok(Flow::Next)
     }
 

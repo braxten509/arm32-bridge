@@ -737,6 +737,16 @@ impl Asm {
         let op = if signed { 0x1E22_0000 } else { 0x1E23_0000 };
         self.emit(op | Self::fp_type(double) | (rn << 5) | rd);
     }
+    /// scvtf / ucvtf sd/dd, wn, #fbits (1..=32): wn read as a fixed-point number
+    pub fn fixed_to_float(&mut self, signed: bool, double: bool, rd: Reg, rn: Reg, fbits: u32) {
+        let op = if signed { 0x1E02_0000 } else { 0x1E03_0000 };
+        self.emit(op | Self::fp_type(double) | ((64 - fbits) << 10) | (rn << 5) | rd);
+    }
+    /// fcvtzs / fcvtzu wd, sn/dn, #fbits (1..=32): to fixed point, toward zero, saturating
+    pub fn float_to_fixed(&mut self, signed: bool, double: bool, rd: Reg, rn: Reg, fbits: u32) {
+        let op = if signed { 0x1E18_0000 } else { 0x1E19_0000 };
+        self.emit(op | Self::fp_type(double) | ((64 - fbits) << 10) | (rn << 5) | rd);
+    }
     /// fcvtzs / fcvtzu wd, sn/dn
     pub fn float_to_int(&mut self, signed: bool, double: bool, rd: Reg, rn: Reg) {
         let op = if signed { 0x1E38_0000 } else { 0x1E39_0000 };
@@ -751,6 +761,12 @@ impl Asm {
     /// fmul vd.4s/2s, vn.4s/2s, vm.s[index]
     pub fn fmul_element(&mut self, q: bool, rd: Reg, rn: Reg, rm: Reg, index: u32) {
         self.emit(0x0F80_9000 | ((q as u32) << 30) | ((index & 1) << 21) | ((index >> 1) << 11) | (rm << 16) | (rn << 5) | rd);
+    }
+    /// mul / mla / mls vd.<T>, vn.<T>, vm.<Ts>[index] (`op` 0x0F00_8000 / 0x2F00_0000 / 0x2F00_4000);
+    /// `size` 1 (16-bit lanes, vm below v16) or 2 (32-bit lanes).
+    pub fn int_element(&mut self, op: u32, q: bool, size: u32, rd: Reg, rn: Reg, rm: Reg, index: u32) {
+        let (h, l, m) = if size == 1 { (index >> 2, (index >> 1) & 1, index & 1) } else { (index >> 1, index & 1, 0) };
+        self.emit(op | ((q as u32) << 30) | (size << 22) | (l << 21) | (m << 20) | (rm << 16) | (h << 11) | (rn << 5) | rd);
     }
     /// mov vd.16b, vn.16b
     pub fn mov_vector(&mut self, rd: Reg, rn: Reg) {

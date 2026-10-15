@@ -195,7 +195,43 @@ impl Translator {
                 self.a.float_to_int(opc2 & 1 == 1, double, T0, vm);
                 self.a.ins_general(false, d.host(), d.lane(), T0);
             }
-            _ => return Err(()), // VCVTR, half precision, fixed point
+            (0b1010 | 0b1011 | 0b1110 | 0b1111, _) => {
+                // VCVT between float and fixed point, in place in Vd: opc2 bit 2 = to fixed,
+                // bit 0 = unsigned; op7 (sx) = 32-bit fixed value, else 16; fbits = size - imm4:i.
+                // The fixed value sits in the low 32 bits (a double register: sign/zero extended).
+                let (to_fixed, signed) = (opc2 & 0b0100 != 0, opc2 & 1 == 0);
+                let size = if op7 { 32 } else { 16 };
+                let imm = ((word & 0xF) << 1) | ((word >> 5) & 1);
+                if imm > size || (to_fixed && size == 16) {
+                    return Err(()); // unpredictable; 16-bit results saturate to 16 bits (left to the fallback)
+                }
+                let fbits = size - imm;
+                if to_fixed {
+                    let vd = self.fp_read(d, V1);
+                    self.a.float_to_fixed(signed, double, T0, vd, fbits);
+                    if double && signed {
+                        self.a.sxtw_x(T0, T0);
+                    }
+                    self.a.ins_general(double, d.host(), d.lane(), T0);
+                } else {
+                    let low = Fp { double: false, n: if double { d.n * 2 } else { d.n } };
+                    self.a.umov(false, T0, low.host(), low.lane());
+                    if size == 16 {
+                        if signed {
+                            self.a.sxth_w(T0, T0);
+                        } else {
+                            self.a.uxth_w(T0, T0);
+                        }
+                    }
+                    if fbits == 0 {
+                        self.a.int_to_float(signed, double, V0, T0);
+                    } else {
+                        self.a.fixed_to_float(signed, double, V0, T0, fbits);
+                    }
+                    self.fp_write(d, V0);
+                }
+            }
+            _ => return Err(()), // VCVTR, half precision
         }
         Ok(Flow::Next)
     }

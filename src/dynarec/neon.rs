@@ -263,6 +263,15 @@ impl Translator {
         if opc1 == 0b10 && opc2 <= 0b0011 {
             return self.neon_permute(q, size, opc2, d, m);
         }
+        if opc1 == 0b10 && opc2 == 0b0110 && !q {
+            // VSHLL #esize (shift by the whole element size): ARM64 SHLL, a Q register from a D register.
+            if d & 1 == 1 || size == 3 {
+                return Err(());
+            }
+            let vm = self.vector_read(false, m, V1);
+            self.a.simd2_sized(0x2E21_3800, false, size, d / 2, vm);
+            return Ok(Flow::Next);
+        }
         let int = |u: u32, opcode: u32| 0x0E20_0800 | (u << 29) | (opcode << 12);
         let float = |u: u32, opcode: u32| 0x0E20_0800 | (u << 29) | (1 << 23) | (opcode << 12);
         // (instruction, sized, reads Vd, floating point)
@@ -515,14 +524,43 @@ impl Translator {
         Ok(Flow::Next)
     }
 
-    /// Two registers and a scalar: VMUL, VMLA, VMLS (.F32) by an element.
+    /// Two registers and a scalar: VMUL, VMLA, VMLS (.F32 and .I16 / .I32) by an element.
     fn neon_by_scalar(&mut self, word: u32) -> Result<Flow> {
         let bit = |i: u32| (word >> i) & 1;
         let q = bit(24) == 1;
         let d = (bit(22) << 4) | ((word >> 12) & 0xF);
         let n = (bit(7) << 4) | ((word >> 16) & 0xF);
-        if (word >> 20) & 3 != 2 || (q && (d | n) & 1 == 1) {
-            return Err(()); // only 32-bit elements
+        let size = (word >> 20) & 3;
+        if q && (d | n) & 1 == 1 {
+            return Err(()); // undefined
+        }
+        let integer = match (word >> 8) & 0xF {
+            0b1000 => Some((0x0F00_8000, false)), // MUL
+            0b0000 => Some((0x2F00_0000, true)),  // MLA
+            0b0100 => Some((0x2F00_4000, true)),  // MLS
+            _ => None,
+        };
+        if let Some((op, accumulate)) = integer {
+            if size != 1 && size != 2 {
+                return Err(());
+            }
+            // The scalar is d(Vm)[x]: 32-bit lanes Vm = bits 3-0, x = M; 16-bit lanes Vm = bits 2-0, x = M:bit 3.
+            let (m, index) = if size == 2 { (word & 0xF, bit(5)) } else { (word & 7, (bit(5) << 1) | bit(3)) };
+            let element = (m % 2) * (8 >> size) + index;
+            let vn = self.vector_read(q, n, V1);
+            let target = Self::vector_target(q, d);
+            if accumulate && !q {
+                let vd = self.vector_read(false, d, V0);
+                if vd != V0 {
+                    self.a.mov_vector(V0, vd);
+                }
+            }
+            self.a.int_element(op, q, size, target, vn, m / 2, element);
+            self.vector_write(q, d, target);
+            return Ok(Flow::Next);
+        }
+        if size != 2 {
+            return Err(()); // F32 only
         }
         // 32-bit elements: the scalar is d(Vm)[M].
         let m = word & 0xF;

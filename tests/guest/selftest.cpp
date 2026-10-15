@@ -1404,6 +1404,234 @@ NEON_TESTS(thumb)
 NEON_D64_TESTS(arm)
 NEON_D64_TESTS(thumb)
 
+// VCVT between float and fixed point (VFP, in place) and VSHLL by the whole element size
+// (Assassin's Creed Pirates; the translator handed both to Unicorn).
+#define FIXED_TESTS(mode)                                                                            \
+    __attribute__((target(#mode), noinline)) static void vfp_fixed_##mode(const float *f, const double *dbl, unsigned i, unsigned h, unsigned *out) { \
+        __asm__ volatile(".fpu neon-vfpv4\n"                                                         \
+                         "vldr s0, [%[f]]\n"                                                         \
+                         "vcvt.s32.f32 s0, s0, #16\n"                                                \
+                         "vldr s1, [%[f], #4]\n"                                                     \
+                         "vcvt.s32.f32 s1, s1, #1\n"                                                 \
+                         "vldr s2, [%[f], #8]\n"                                                     \
+                         "vcvt.u32.f32 s2, s2, #1\n"                                                 \
+                         "vmov s3, %[i]\n"                                                           \
+                         "vcvt.f32.s32 s3, s3, #16\n"                                                \
+                         "vmov s4, %[h]\n"                                                           \
+                         "vcvt.f32.s16 s4, s4, #8\n"                                                 \
+                         "vmov s5, %[h]\n"                                                           \
+                         "vcvt.f32.u16 s5, s5, #8\n"                                                 \
+                         "vldr d3, [%[dbl]]\n"                                                       \
+                         "vcvt.s32.f64 d3, d3, #4\n"                                                 \
+                         "vmov d4, %[i], %[h]\n"                                                     \
+                         "vcvt.f64.u32 d4, d4, #16\n"                                                \
+                         "vldr s10, [%[f], #12]\n"                                                   \
+                         "vcvt.u32.f32 s10, s10, #32\n"                                              \
+                         "vstmia %[out], {s0-s10}\n"                                                 \
+                         :                                                                           \
+                         : [f] "r"(f), [dbl] "r"(dbl), [i] "r"(i), [h] "r"(h), [out] "r"(out)        \
+                         : "d0", "d1", "d2", "d3", "d4", "d5", "memory");                            \
+    }                                                                                                \
+    __attribute__((target(#mode), noinline)) static void neon_shll_##mode(const unsigned char *in, unsigned char *out) { \
+        __asm__ volatile(".fpu neon\n"                                                               \
+                         "vld1.8 {d16}, [%[in]]\n"                                                   \
+                         "vshll.i8 q9, d16, #8\n"                                                    \
+                         "vshll.i16 q10, d16, #16\n"                                                 \
+                         "vshll.i32 q11, d16, #32\n"                                                 \
+                         "vst1.8 {d18, d19, d20, d21}, [%[out]]!\n"                                  \
+                         "vst1.8 {d22, d23}, [%[out]]\n"                                             \
+                         : [out] "+r"(out)                                                           \
+                         : [in] "r"(in)                                                              \
+                         : "d16", "d18", "d19", "d20", "d21", "d22", "d23", "memory");               \
+    }                                                                                                \
+    static bool fixed_ok_##mode(void) {                                                              \
+        static const float f[4] = {2.75f, -1.5f, 3e9f, 0.25f};                                       \
+        static const double dbl[1] = {-2.5};                                                         \
+        unsigned got[11];                                                                            \
+        vfp_fixed_##mode(f, dbl, 0x00030000, 0xFFFF8000, got);                                       \
+        static const unsigned want[11] = {180224, (unsigned)-3, 0xFFFFFFFF, 0x40400000, 0xC3000000,    \
+                                          0x43000000, 0xFFFFFFD8, 0xFFFFFFFF, 0, 0x40080000, 0x40000000}; \
+        for (int k = 0; k < 11; k++)                                                                 \
+            if (got[k] != want[k]) {                                                                 \
+                __android_log_print(ANDROID_LOG_INFO, TAG, #mode " vcvt fixed %d: %x want %x", k, got[k], want[k]); \
+                return false;                                                                        \
+            }                                                                                        \
+        static const unsigned char in[8] = {0x81, 0x02, 0xFF, 0x40, 0x7F, 0x80, 0x01, 0xC3};        \
+        unsigned char wide[48];                                                                      \
+        neon_shll_##mode(in, wide);                                                                  \
+        unsigned short h8[8];                                                                        \
+        unsigned w16[4];                                                                             \
+        unsigned long long d32[2];                                                                   \
+        memcpy(h8, wide, 16);                                                                        \
+        memcpy(w16, wide + 16, 16);                                                                  \
+        memcpy(d32, wide + 32, 16);                                                                  \
+        for (int k = 0; k < 8; k++)                                                                  \
+            if (h8[k] != (unsigned short)(in[k] << 8)) {                                             \
+                __android_log_print(ANDROID_LOG_INFO, TAG, #mode " vshll.i8 lane %d: %x", k, h8[k]);  \
+                return false;                                                                        \
+            }                                                                                        \
+        for (int k = 0; k < 4; k++) {                                                                \
+            unsigned short half = (unsigned short)(in[2 * k] | in[2 * k + 1] << 8);                  \
+            if (w16[k] != (unsigned)half << 16) {                                                    \
+                __android_log_print(ANDROID_LOG_INFO, TAG, #mode " vshll.i16 lane %d: %x", k, w16[k]); \
+                return false;                                                                        \
+            }                                                                                        \
+        }                                                                                            \
+        for (int k = 0; k < 2; k++) {                                                                \
+            unsigned word;                                                                           \
+            memcpy(&word, in + 4 * k, 4);                                                            \
+            if (d32[k] != (unsigned long long)word << 32) {                                          \
+                __android_log_print(ANDROID_LOG_INFO, TAG, #mode " vshll.i32 lane %d: %llx", k, d32[k]); \
+                return false;                                                                        \
+            }                                                                                        \
+        }                                                                                            \
+        return true;                                                                                 \
+    }
+FIXED_TESTS(arm)
+FIXED_TESTS(thumb)
+
+// Card Wars: LDREXD/STREX inside an IT block (Thumb), VMUL/VMLA/VMLS by a scalar (integer), and
+// Mono's context restores, LDM of every register and LDM SP with SP and PC in the list (ARM).
+__attribute__((target("thumb"), noinline)) static void exclusive_in_it(unsigned long long *p, unsigned *word, int take, unsigned *out) {
+    __asm__ volatile("mov r2, #0\n"
+                     "mov r3, #0\n"
+                     "cmp %[take], #0\n"
+                     "ite ne\n"
+                     "ldrexdne r2, r3, [%[p]]\n"
+                     "moveq r2, #5\n"
+                     "clrex\n"
+                     "str r2, [%[out]]\n"
+                     "str r3, [%[out], #4]\n"
+                     "1: ldrex r2, [%[word]]\n"
+                     "add r2, r2, #1\n"
+                     "mov r3, #1\n"
+                     "cmp %[take], #0\n"
+                     "it ne\n"
+                     "strexne r3, r2, [%[word]]\n"
+                     "cmp %[take], #0\n"
+                     "it ne\n"
+                     "cmpne r3, #0\n"
+                     "bne 1b\n"
+                     "clrex\n"
+                     "str r3, [%[out], #8]\n"
+                     :
+                     : [p] "r"(p), [word] "r"(word), [take] "r"(take), [out] "r"(out)
+                     : "r2", "r3", "cc", "memory");
+}
+#define SCALAR_TESTS(mode)                                                                           \
+    __attribute__((target(#mode), noinline)) static void neon_int_scalar_##mode(const unsigned *in, unsigned *out) { \
+        __asm__ volatile(".fpu neon\n"                                                               \
+                         "vld1.32 {d0, d1, d2, d3}, [%[in]]\n"                                       \
+                         "vmov.i32 q3, #0\n"                                                         \
+                         "vmul.i32 q10, q0, d3[1]\n"                                                 \
+                         "vmov q11, q0\n"                                                            \
+                         "vmla.i32 q11, q1, d0[0]\n"                                                 \
+                         "vmov d24, d1\n"                                                            \
+                         "vmls.i32 d24, d2, d3[0]\n"                                                 \
+                         "vmov d25, d0\n"                                                            \
+                         "vmla.i16 d25, d1, d7[3]\n"                                                 \
+                         "vmul.i16 q13, q1, d6[1]\n"                                                 \
+                         "vst1.32 {d20, d21, d22, d23}, [%[out]]!\n"                                 \
+                         "vst1.32 {d24, d25, d26, d27}, [%[out]]\n"                                  \
+                         : [out] "+r"(out)                                                           \
+                         : [in] "r"(in)                                                              \
+                         : "d0", "d1", "d2", "d3", "d6", "d7", "d20", "d21", "d22", "d23", "d24",   \
+                           "d25", "d26", "d27", "memory");                                           \
+    }
+SCALAR_TESTS(arm)
+SCALAR_TESTS(thumb)
+// r0 = frame of r0-r15 values (r1 slot gets `out`, sp and pc slots are filled in), r1 = out.
+extern "C" __attribute__((target("arm"), naked, noinline)) void ldm_every_register(unsigned *frame, unsigned *out) {
+    __asm__ volatile("push {r4-r11, lr}\n"
+                     "str sp, [r0, #52]\n"
+                     "adr r2, 1f\n"
+                     "str r2, [r0, #60]\n"
+                     "str r1, [r0, #4]\n"
+                     "mov r12, r0\n"
+                     ".word 0xe89cffff\n" // ldm r12, {r0-r15}
+                     "1: stm r1, {r0, r2-r12, lr}\n"
+                     "pop {r4-r11, pc}\n");
+}
+// r0 = frame of r4-r11 values (sp and pc slots are filled in), r1 = out.
+extern "C" __attribute__((target("arm"), naked, noinline)) void ldm_sp_and_pc(unsigned *frame, unsigned *out) {
+    __asm__ volatile("push {r4-r11, lr}\n"
+                     "str sp, [r0, #32]\n"
+                     "adr r2, 2f\n"
+                     "str r2, [r0, #36]\n"
+                     "mov sp, r0\n"
+                     ".word 0xe89daff0\n" // ldmia sp, {r4-r11, sp, pc}
+                     "2: stm r1, {r4-r11}\n"
+                     "pop {r4-r11, pc}\n");
+}
+// MSR APSR_nzcvq / APSR_g and MRS APSR (Puzzle Craft 2 saves and restores the flags around calls).
+#define APSR_TESTS(mode)                                                                             \
+    __attribute__((target(#mode), noinline)) static void apsr_round_trip_##mode(unsigned in, unsigned *out) { \
+        __asm__ volatile("msr APSR_nzcvqg, %[in]\n"                                                  \
+                         "mrs r2, APSR\n"                                                            \
+                         "str r2, [%[out]]\n"                                                        \
+                         "msr APSR_g, %[zero]\n"                                                     \
+                         "mrs r2, APSR\n"                                                            \
+                         "str r2, [%[out], #4]\n"                                                    \
+                         "msr APSR_nzcvq, %[zero]\n"                                                 \
+                         "mrs r2, APSR\n"                                                            \
+                         "str r2, [%[out], #8]\n"                                                    \
+                         "msr APSR_g, %[in]\n"                                                       \
+                         "cmp %[in], %[in]\n"                                                        \
+                         "mrs r2, APSR\n"                                                            \
+                         "str r2, [%[out], #12]\n"                                                   \
+                         :                                                                           \
+                         : [in] "r"(in), [zero] "r"(0), [out] "r"(out)                               \
+                         : "r2", "cc", "memory");                                                    \
+    }
+APSR_TESTS(arm)
+APSR_TESTS(thumb)
+static bool apsr_ok(void) {
+    bool ok = true;
+    for (int arm = 0; arm < 2; arm++) {
+        unsigned got[4];
+        if (arm) apsr_round_trip_arm(0xF80F0000, got); else apsr_round_trip_thumb(0xF80F0000, got);
+        const unsigned flags = 0xF80F0000;
+        ok &= (got[0] & flags) == 0xF80F0000 && (got[1] & flags) == 0xF8000000 && (got[2] & flags) == 0 &&
+              (got[3] & flags) == 0x600F0000; // cmp equal: Z and C; GE back
+        if (!ok) __android_log_print(ANDROID_LOG_INFO, TAG, "apsr (%s): %x %x %x %x", arm ? "arm" : "thumb", got[0], got[1], got[2], got[3]);
+    }
+    return ok;
+}
+static bool card_wars_extras(void) {
+    unsigned long long pair = 0x1122334455667788ull;
+    unsigned word = 41, got[3];
+    exclusive_in_it(&pair, &word, 1, got);
+    bool taken = got[0] == 0x55667788 && got[1] == 0x11223344 && got[2] == 0 && word == 42;
+    exclusive_in_it(&pair, &word, 0, got);
+    bool skipped = got[0] == 5 && got[1] == 0 && got[2] == 1 && word == 42;
+    unsigned in[8] = {3, 0xFFFFFFFF, 5, 0x00020001, 7, 11, 13, 1000};
+    bool scalar = true;
+    for (int arm = 0; arm < 2; arm++) {
+        unsigned r[16];
+        if (arm) neon_int_scalar_arm(in, r); else neon_int_scalar_thumb(in, r);
+        // q0 = in[0..3], q1 = in[4..7]; d3[1] = 1000, d0[0] = 3, d3[0] = 13.
+        for (int k = 0; k < 4; k++) scalar &= r[k] == in[k] * 1000u;
+        for (int k = 0; k < 4; k++) scalar &= r[4 + k] == in[k] + in[4 + k] * 3u;
+        for (int k = 0; k < 2; k++) scalar &= r[8 + k] == in[2 + k] - in[4 + k] * 13u;
+        // d6 and d7 are zero: the 16-bit forms add / give nothing.
+        scalar &= r[10] == in[0] && r[11] == in[1] && r[12] == 0 && r[13] == 0 && r[14] == 0 && r[15] == 0;
+        if (!scalar) __android_log_print(ANDROID_LOG_INFO, TAG, "integer by scalar (%s): %x %x %x %x %x", arm ? "arm" : "thumb", r[0], r[4], r[8], r[10], r[12]);
+    }
+    unsigned frame[16], out[13];
+    for (int k = 0; k < 16; k++) frame[k] = 0x100 * (k + 1);
+    ldm_every_register(frame, out);
+    bool every = out[0] == 0x100 && out[12] == 0xF00;
+    for (int k = 2; k <= 12; k++) every &= out[k - 1] == 0x100u * (k + 1);
+    unsigned saved[10], rest[8];
+    for (int k = 0; k < 8; k++) saved[k] = 0x40 + k;
+    ldm_sp_and_pc(saved, rest);
+    bool sp_pc = true;
+    for (int k = 0; k < 8; k++) sp_pc &= rest[k] == 0x40u + k;
+    if (!(taken && skipped && scalar && every && sp_pc))
+        __android_log_print(ANDROID_LOG_INFO, TAG, "card wars extras: it-exclusive %d/%d scalar %d ldm-all %d ldm-sp %d", taken, skipped, scalar, every, sp_pc);
+    return taken && skipped && scalar && every && sp_pc;
+}
+
 // Inputs d16-d21 for the shift and long/narrow tests (results worked out by hand per lane).
 static const unsigned long long neon_shift_in[6] = {0x800000017FFFFFFFull, 0xFFFF000100F08000ull, 0x0123456789ABCDEFull,
                                                     0xFEDCBA9876543210ull, 0x807F01FF10203040ull, 0x3ull};
@@ -2489,6 +2717,10 @@ extern "C" int run_all() {
         check(saturates_arm() && saturates_asr32_arm() && saturates_thumb(),
               "USAT / SSAT / USAT16 / SSAT16: every width, LSL / ASR, Q flag, conditional, Rd = Rn (ARM and Thumb)");
         check(neon_extras_arm() && neon_extras_thumb(), "NEON lanes, VMOVL/VSHLL, VCVT, VMAX/VMIN, immediates, permutes (ARM and Thumb)");
+        check(apsr_ok(), "MSR APSR_nzcvq / APSR_g and MRS APSR round trip (ARM and Thumb)");
+        check(card_wars_extras(), "LDREXD/STREX in an IT block, VMUL/VMLA/VMLS.I16/I32 by a scalar, LDM of every register and of SP+PC (ARM)");
+        check(fixed_ok_arm() && fixed_ok_thumb(),
+              "VCVT float <-> fixed point (F32/F64, S32/U32/S16/U16) and VSHLL by the element size (ARM and Thumb)");
         check(neon_d64_ok_arm() && neon_d64_ok_thumb(),
               "NEON 64-bit lanes in D registers: VSHL/VRSHL/VQSHL by register, VQADD/VQSUB, VADD/VSUB (ARM and Thumb)");
         check(neon_shift_long_arm() && neon_shift_long_thumb(),

@@ -3,7 +3,7 @@
 //! branch over it, like an instruction in a Thumb IT block.
 
 use super::{cond, emit_exit, emit_exit_to, exit, host, offsets, shift, sign_extend, Block, Flow, GuestMem, Reg, Result, Translator};
-use super::{LR, MAX_INSTRUCTIONS, PC, SP, T0, T1, T2, T3, T4, T5, T6};
+use super::{LR, MAX_INSTRUCTIONS, PC, T0, T1, T2, T3, T4, T5, T6};
 
 /// Translates the ARM block starting at `start` (4-byte aligned).
 pub fn translate(mem: GuestMem, start: u32) -> Block {
@@ -350,6 +350,12 @@ impl Translator {
             emit_exit_to(&mut self.a, T6);
             return Ok(Flow::End);
         }
+        if word & 0x0FFF_0FFF == 0x010F_0000 {
+            return self.read_apsr((word >> 12) & 0xF); // MRS Rd, APSR
+        }
+        if word & 0x0FF0_FFF0 == 0x0120_F000 {
+            return self.write_apsr(rm, (word >> 16) & 0xF); // MSR APSR_<mask>, Rn
+        }
         if word & 0x0FFF_0FF0 == 0x016F_0F10 {
             // CLZ
             let rd = (word >> 12) & 0xF;
@@ -627,7 +633,7 @@ impl Translator {
     fn arm_multiple(&mut self, word: u32) -> Result<Flow> {
         let (before, up, user, writeback, load) = ((word >> 24) & 1 == 1, (word >> 23) & 1 == 1, (word >> 22) & 1 == 1, (word >> 21) & 1 == 1, (word >> 20) & 1 == 1);
         let (rn, list) = ((word >> 16) & 0xF, word & 0xFFFF);
-        if user || (load && rn == SP && list & (1 << SP) != 0) {
+        if user {
             return Err(());
         }
         self.load_store_multiple_at(load, rn, list, up, before, writeback)

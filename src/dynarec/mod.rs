@@ -12,6 +12,10 @@ pub mod thumb;
 mod engine;
 pub use engine::{enabled, invalidate, invalidate_library, print_stats, property, run, seed_from_unicorn, Native};
 
+/// The CPSR bits MRS reads besides the flags (mode, A/I/F masks, E), as Unicorn
+/// has them: translated MRS returns what Unicorn's did. Set when an engine is made.
+pub static CPSR_FIXED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x10);
+
 /// Guest register state while (or between) running translated code.
 /// Offsets are used by the generated code; keep them in sync with `offsets`.
 #[repr(C, align(16))]

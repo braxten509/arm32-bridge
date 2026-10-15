@@ -1356,6 +1356,8 @@ fn build_engine() -> Uc {
     }
     uc.add_intr_hook(on_interrupt).expect("add stub hook");
     uc.add_mem_hook(HookType::MEM_INVALID, 0, u64::MAX, on_bad_memory).expect("add fault hook");
+    let cpsr = uc.reg_read(RegisterARM::CPSR).unwrap() as u32;
+    crate::dynarec::CPSR_FIXED.store(cpsr & 0x3DF, Ordering::Relaxed); // E, A, I, F, mode (not T)
     let mut clean = uc.context_alloc().expect("Unicorn context");
     uc.context_save(&mut clean).expect("save Unicorn context");
     uc.get_data_mut().clean = Some(clean);
