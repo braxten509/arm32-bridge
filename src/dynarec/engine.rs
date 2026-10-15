@@ -1124,7 +1124,9 @@ fn fallback(uc: &mut Uc, pc: u32, count: u32, stop_at: u32) -> Result<u32, Strin
         return Err(format!("guest called exit({code})"));
     }
     if let Err(error) = result {
-        return Err(format!("CPU stopped with {error:?} at pc {:#010x} (fallback from {pc:#010x})", new_pc & !1));
+        // The registers say where a bad jump came from (lr) and what it was handed.
+        let registers: Vec<String> = (0..15).map(|i| format!("r{i}={:#x}", state.r[i])).collect();
+        return Err(format!("CPU stopped with {error:?} at pc {:#010x} (fallback from {pc:#010x}); {}", new_pc & !1, registers.join(" ")));
     }
     Ok(new_pc)
 }

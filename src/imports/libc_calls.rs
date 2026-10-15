@@ -402,12 +402,21 @@ const PHONE_HANDLE: u32 = 1;
 /// dlopen handle of the shared loader's first game library.
 const FIRST_LIBRARY_HANDLE: u32 = 0x100;
 
-/// Address for a symbol looked up at run time (dlsym, eglGetProcAddress):
+/// Address for a symbol looked up at run time (dlsym):
 /// a loaded game library's export, or a stand-in or data object if the bridge has one.
 fn lookup_symbol(name: &str) -> u32 {
     if let Some(&address) = shared().guest_exports.get(name) {
         return address;
     }
+    lookup_phone_symbol(name)
+}
+
+/// The phone's side of `lookup_symbol`: a stand-in or data object, never a
+/// game export. eglGetProcAddress answers only for the graphics driver, and
+/// games keep variables named after the functions they fetch (Broken Age's
+/// `glGenVertexArraysOES` pointer): handing back the variable makes the game
+/// call into its own data.
+fn lookup_phone_symbol(name: &str) -> u32 {
     if crate::imports::handler_for(name).is_some() {
         return stub_for(name);
     }
@@ -2073,7 +2082,7 @@ pub fn handler(name: &str) -> Option<Handler> {
         }),
         "eglGetProcAddress" => handler!(|uc, a| {
             let name = mem().string(a.u32());
-            Ret::U32(lookup_symbol(&name))
+            Ret::U32(lookup_phone_symbol(&name))
         }),
         "getpagesize" => handler!(|uc, a| Ret::U32(crate::mem::PAGE)),
         // A 32-bit sigset_t is one word: bit n-1 for signal n.

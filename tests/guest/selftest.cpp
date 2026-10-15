@@ -47,6 +47,9 @@
 #include <string>
 #include <vector>
 
+// Broken Age's libpollen exports function pointers named after the GL functions it fetches.
+extern "C" __attribute__((visibility("default"))) void *glGenVertexArraysOES = nullptr;
+
 #define TAG "selftest"
 static int failures = 0;
 static void check(bool ok, const char *what) {
@@ -2379,6 +2382,13 @@ extern "C" int run_all() {
         check(dlopen("libsecond.so", RTLD_NOW) == second, "dlopen of an open library returns the same handle");
         void *phone = dlopen("libGLESv2.so", RTLD_NOW);
         check(phone && dlsym(phone, "glClear"), "dlopen of a phone library still finds its functions");
+    }
+
+    {
+        // Broken Age keeps a pointer variable named after the function it fetches into it.
+        void *fetched = (void *)eglGetProcAddress("glGenVertexArraysOES");
+        check(fetched && fetched != (void *)&glGenVertexArraysOES,
+              "eglGetProcAddress gives the graphics function, not a game variable of the same name");
     }
 
     {

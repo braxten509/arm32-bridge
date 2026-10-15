@@ -1936,6 +1936,14 @@ pub fn call_guest_with(uc: &mut Uc, address: u32, args: &[Arg]) -> Result<u64, S
     let pc = uc.pc_read().unwrap() as u32;
     let r0 = uc.reg_read(RegisterARM::R0).unwrap();
     let r1 = uc.reg_read(RegisterARM::R1).unwrap();
+    // For the crash report: where a bad jump came from (lr) and what it was handed.
+    let registers = if result.is_err() {
+        use RegisterARM::*;
+        let names = [R0, R1, R2, R3, R4, R5, R6, R7, R8, R9, R10, R11, R12, SP, LR];
+        names.iter().enumerate().map(|(i, &name)| format!("r{i}={:#x}", uc.reg_read(name).unwrap_or(0))).collect::<Vec<_>>().join(" ")
+    } else {
+        String::new()
+    };
     if let Some(context) = saved {
         uc.context_restore(&context).map_err(|e| format!("{e:?}"))?;
         clear_exclusive(uc);
@@ -1947,7 +1955,7 @@ pub fn call_guest_with(uc: &mut Uc, address: u32, args: &[Arg]) -> Result<u64, S
         return Err(format!("guest called exit({code})"));
     }
     if let Err(error) = result {
-        let message = format!("CPU stopped with {error:?} at pc {pc:#010x}");
+        let message = format!("CPU stopped with {error:?} at pc {pc:#010x}; {registers}");
         uc.get_data_mut().fault = Some(message.clone());
         return Err(message);
     }
