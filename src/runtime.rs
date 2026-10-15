@@ -1475,7 +1475,11 @@ fn on_interrupt(uc: &mut Unicorn<'_, Thread>, interrupt: u32) {
     if interrupt == EXCP_YIELD {
         let thumb = (uc.reg_read(RegisterARM::CPSR).unwrap() as u32 >> 5) & 1;
         let resume = uc.pc_read().unwrap() as u32 | thumb;
-        share_gil(uc, resume);
+        // Not while the checker replays a block: another thread could change
+        // memory between the replay and the real run (or have its write undone).
+        if !crate::dynarec::check::replaying() {
+            share_gil(uc, resume);
+        }
         return;
     }
     let pc = uc.pc_read().unwrap() as u32;

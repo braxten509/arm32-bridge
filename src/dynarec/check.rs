@@ -118,6 +118,11 @@ fn install_hook(uc: &mut Uc) {
     uc.ctl_flush_tb().expect("flush Unicorn's translated code");
 }
 
+/// Whether this thread is running a reference copy of a block in Unicorn.
+pub fn replaying() -> bool {
+    RECORDING.with(|recording| recording.get())
+}
+
 /// Runs the block at `pc` (bit 0 = Thumb; instructions up to `end`) in Unicorn
 /// and undoes its memory writes. None when the block cannot be checked.
 pub fn reference(uc: &mut Uc, pc: u32, end: u32, stop_at: u32) -> Option<Reference> {
