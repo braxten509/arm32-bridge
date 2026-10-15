@@ -854,6 +854,14 @@ impl Asm {
         self.emit(0x0C00_0000 | ((q as u32) << 30) | ((load as u32) << 22) | (opcode << 12) | (size << 10) | (rn << 5) | rt);
     }
     /// ext vd, vn, vm, #bytes: bytes from the pair vm:vn starting at `bytes`.
+    /// tbl / tbx vd.8b, {vn.16b - vn+count-1.16b}, vm.8b
+    pub fn table_lookup(&mut self, extend: bool, rd: Reg, rn: Reg, count: u32, rm: Reg) {
+        self.emit(0x0E00_0000 | (rm << 16) | ((count - 1) << 13) | ((extend as u32) << 12) | (rn << 5) | rd);
+    }
+    /// movi vd.8b/16b, #imm8
+    pub fn movi_bytes(&mut self, q: bool, rd: Reg, imm8: u32) {
+        self.emit(0x0F00_E400 | ((q as u32) << 30) | (((imm8 >> 5) & 7) << 16) | ((imm8 & 0x1F) << 5) | rd);
+    }
     pub fn ext(&mut self, q: bool, rd: Reg, rn: Reg, rm: Reg, bytes: u32) {
         self.emit(0x2E00_0000 | ((q as u32) << 30) | (rm << 16) | (bytes << 11) | (rn << 5) | rd);
     }

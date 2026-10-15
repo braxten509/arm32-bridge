@@ -90,11 +90,47 @@ impl Translator {
             self.neon_extract(word)
         } else if (word >> 20) & 3 == 3 && bit(11) == 0 {
             self.neon_two_misc(word)
+        } else if (word >> 20) & 3 == 3 && (word >> 10) & 3 == 0b10 {
+            self.neon_table(word)
         } else if (word >> 20) & 3 == 3 && (word >> 8) & 0xF == 0b1100 && bit(7) == 0 {
             self.neon_duplicate(word)
         } else {
             Err(())
         }
+    }
+
+    /// VTBL / VTBX Dd, {Dn - Dn+len}, Dm: ARM64 TBL / TBX over a copy of the table in
+    /// V2-V3 (TBL takes whole 16-byte registers in a row).
+    fn neon_table(&mut self, word: u32) -> Result<Flow> {
+        let bit = |i: u32| (word >> i) & 1;
+        let d = (bit(22) << 4) | ((word >> 12) & 0xF);
+        let n = (bit(7) << 4) | ((word >> 16) & 0xF);
+        let m = (bit(5) << 4) | (word & 0xF);
+        let (count, extend) = (((word >> 8) & 3) + 1, bit(6) == 1);
+        if n + count > 32 {
+            return Err(()); // unpredictable
+        }
+        for i in 0..count {
+            self.a.ins_element(true, V2 + i / 2, i % 2, (n + i) / 2, (n + i) % 2);
+        }
+        let mut index = self.vector_read(false, m, V1);
+        if count % 2 == 1 {
+            // The copy has 8 more bytes than the table: indexes past the table must stay
+            // out of range (0 for VTBL, Dd's byte for VTBX), so they become 0xFF.
+            self.a.movi_bytes(false, V0, 8 * count);
+            self.a.simd3(0x2E20_3C00, false, 0, V0, index, V0); // cmhs: index >= table size
+            self.a.simd3(simd::ORR, false, 0, V1, index, V0);
+            index = V1;
+        }
+        if extend {
+            let vd = self.vector_read(false, d, V0);
+            if vd != V0 {
+                self.a.mov_vector(V0, vd);
+            }
+        }
+        self.a.table_lookup(extend, V0, V2, count.div_ceil(2), index);
+        self.vector_write(false, d, V0);
+        Ok(Flow::Next)
     }
 
     /// VEXT: bytes from the pair Vm:Vn starting at byte imm4.
@@ -531,6 +567,27 @@ impl Translator {
         let d = (bit(22) << 4) | ((word >> 12) & 0xF);
         let n = (bit(7) << 4) | ((word >> 16) & 0xF);
         let size = (word >> 20) & 3;
+        let long = match (word >> 8) & 0xF {
+            0b0010 => Some((0x0F00_2000, true)),  // VMLAL: SMLAL / UMLAL
+            0b0110 => Some((0x0F00_6000, true)),  // VMLSL: SMLSL / UMLSL
+            0b1010 => Some((0x0F00_A000, true)),  // VMULL: SMULL / UMULL
+            0b0011 => Some((0x0F00_3000, false)), // VQDMLAL: SQDMLAL
+            0b0111 => Some((0x0F00_7000, false)), // VQDMLSL: SQDMLSL
+            0b1011 => Some((0x0F00_B000, false)), // VQDMULL: SQDMULL
+            _ => None,
+        };
+        if let Some((op, has_unsigned)) = long {
+            // Bit 24 is U here (signedness), not Q: a D register widened into the Q register Vd.
+            let unsigned = bit(24);
+            if (size != 1 && size != 2) || d & 1 == 1 || (unsigned == 1 && !has_unsigned) {
+                return Err(());
+            }
+            let (m, index) = if size == 2 { (word & 0xF, bit(5)) } else { (word & 7, (bit(5) << 1) | bit(3)) };
+            let element = (m % 2) * (8 >> size) + index;
+            let vn = self.vector_read(false, n, V1);
+            self.a.int_element(op | (unsigned << 29), false, size, d / 2, vn, m / 2, element);
+            return Ok(Flow::Next);
+        }
         if q && (d | n) & 1 == 1 {
             return Err(()); // undefined
         }
@@ -538,6 +595,8 @@ impl Translator {
             0b1000 => Some((0x0F00_8000, false)), // MUL
             0b0000 => Some((0x2F00_0000, true)),  // MLA
             0b0100 => Some((0x2F00_4000, true)),  // MLS
+            0b1100 => Some((0x0F00_C000, false)), // VQDMULH: SQDMULH
+            0b1101 => Some((0x0F00_D000, false)), // VQRDMULH: SQRDMULH
             _ => None,
         };
         if let Some((op, accumulate)) = integer {

@@ -1597,6 +1597,95 @@ static bool apsr_ok(void) {
     }
     return ok;
 }
+// Angry Birds: VMULL/VMLAL/VMLSL/VQDMULL/VQDMULH by a scalar and VTBL/VTBX.
+#define AB_TESTS(mode)                                                                               \
+    __attribute__((target(#mode), noinline)) static void neon_long_scalar_##mode(const unsigned *in, unsigned long long *out) { \
+        __asm__ volatile(".fpu neon\n"                                                               \
+                         "vld1.32 {d0, d1}, [%[in]]\n"                                               \
+                         "vmull.u32 q8, d1, d0[1]\n"                                                 \
+                         "vmov q9, q8\n"                                                             \
+                         "vmlal.u32 q9, d0, d1[0]\n"                                                 \
+                         "vmov q10, q8\n"                                                            \
+                         "vmlsl.s32 q10, d0, d0[0]\n"                                                \
+                         "vqdmull.s16 q11, d1, d0[3]\n"                                              \
+                         "vqdmulh.s16 d24, d1, d0[2]\n"                                              \
+                         "vst1.64 {d16, d17, d18, d19}, [%[out]]!\n"                                 \
+                         "vst1.64 {d20, d21, d22, d23}, [%[out]]!\n"                                 \
+                         "vst1.64 {d24}, [%[out]]\n"                                                 \
+                         : [out] "+r"(out)                                                           \
+                         : [in] "r"(in)                                                              \
+                         : "d0", "d1", "d16", "d17", "d18", "d19", "d20", "d21", "d22", "d23", "d24", \
+                           "memory");                                                                \
+    }                                                                                                \
+    __attribute__((target(#mode), noinline)) static void neon_table_##mode(const unsigned char *tab, const unsigned char *idx, unsigned char *out) { \
+        __asm__ volatile(".fpu neon\n"                                                               \
+                         "vld1.8 {d0, d1, d2, d3}, [%[tab]]\n"                                       \
+                         "vld1.8 {d4}, [%[idx]]\n"                                                   \
+                         "vmov.i8 d5, #0xAA\n"                                                       \
+                         "vtbl.8 d6, {d0}, d4\n"                                                     \
+                         "vtbl.8 d7, {d0, d1}, d4\n"                                                 \
+                         "vtbl.8 d16, {d1, d2, d3}, d4\n"                                            \
+                         "vtbl.8 d17, {d0, d1, d2, d3}, d4\n"                                        \
+                         "vmov d18, d5\n"                                                            \
+                         "vtbx.8 d18, {d1}, d4\n"                                                    \
+                         "vmov d19, d5\n"                                                            \
+                         "vtbx.8 d19, {d1, d2, d3}, d4\n"                                            \
+                         "vst1.8 {d6, d7}, [%[out]]!\n"                                              \
+                         "vst1.8 {d16, d17, d18, d19}, [%[out]]\n"                                   \
+                         : [out] "+r"(out)                                                           \
+                         : [tab] "r"(tab), [idx] "r"(idx)                                            \
+                         : "d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7", "d16", "d17", "d18", "d19", \
+                           "memory");                                                                \
+    }
+AB_TESTS(arm)
+AB_TESTS(thumb)
+static int sat32(long long v) { return v > 0x7FFFFFFFll ? 0x7FFFFFFF : v < -0x80000000ll ? (int)0x80000000 : (int)v; }
+static short sat16(int v) { return v > 32767 ? 32767 : v < -32768 ? -32768 : (short)v; }
+static bool angry_birds_extras(void) {
+    static const unsigned in[4] = {0x9ABCDEF1, 0x8000F00D, 0xFFFFFFFF, 0x80008000};
+    static const unsigned char idx[8] = {0, 7, 8, 15, 23, 24, 31, 200};
+    unsigned char tab[32];
+    for (int k = 0; k < 32; k++) tab[k] = (unsigned char)(0x40 + k);
+    unsigned long long w[9];
+    w[0] = (unsigned long long)in[2] * in[1];
+    w[1] = (unsigned long long)in[3] * in[1];
+    w[2] = w[0] + (unsigned long long)in[0] * in[2];
+    w[3] = w[1] + (unsigned long long)in[1] * in[2];
+    w[4] = w[0] - (unsigned long long)((long long)(int)in[0] * (int)in[0]);
+    w[5] = w[1] - (unsigned long long)((long long)(int)in[1] * (int)in[0]);
+    short h[4] = {(short)in[2], (short)(in[2] >> 16), (short)in[3], (short)(in[3] >> 16)};
+    short top = (short)(in[1] >> 16), low = (short)in[1];
+    unsigned q[4];
+    for (int k = 0; k < 4; k++) q[k] = (unsigned)sat32(2ll * h[k] * top);
+    memcpy(&w[6], q, 16);
+    unsigned short m[4];
+    for (int k = 0; k < 4; k++) m[k] = (unsigned short)sat16((int)((2ll * h[k] * low) >> 16));
+    memcpy(&w[8], m, 8);
+    bool ok = true;
+    for (int arm = 0; arm < 2; arm++) {
+        unsigned long long got[9];
+        if (arm) neon_long_scalar_arm(in, got); else neon_long_scalar_thumb(in, got);
+        for (int k = 0; k < 9; k++)
+            if (got[k] != w[k]) {
+                __android_log_print(ANDROID_LOG_INFO, TAG, "long by scalar (%s) %d: %llx want %llx", arm ? "arm" : "thumb", k, got[k], w[k]);
+                ok = false;
+            }
+        unsigned char t[48];
+        if (arm) neon_table_arm(tab, idx, t); else neon_table_thumb(tab, idx, t);
+        // (first table register, count, extend) for d6, d7, d16, d17, d18, d19.
+        static const int forms[6][3] = {{0, 1, 0}, {0, 2, 0}, {1, 3, 0}, {0, 4, 0}, {1, 1, 1}, {1, 3, 1}};
+        for (int f = 0; f < 6; f++)
+            for (int k = 0; k < 8; k++) {
+                int first = forms[f][0], count = forms[f][1];
+                unsigned char want = idx[k] < 8 * count ? tab[8 * first + idx[k]] : forms[f][2] ? 0xAA : 0;
+                if (t[8 * f + k] != want) {
+                    __android_log_print(ANDROID_LOG_INFO, TAG, "vtbl (%s) form %d byte %d: %x want %x", arm ? "arm" : "thumb", f, k, t[8 * f + k], want);
+                    ok = false;
+                }
+            }
+    }
+    return ok;
+}
 static bool card_wars_extras(void) {
     unsigned long long pair = 0x1122334455667788ull;
     unsigned word = 41, got[3];
@@ -2717,6 +2806,7 @@ extern "C" int run_all() {
         check(saturates_arm() && saturates_asr32_arm() && saturates_thumb(),
               "USAT / SSAT / USAT16 / SSAT16: every width, LSL / ASR, Q flag, conditional, Rd = Rn (ARM and Thumb)");
         check(neon_extras_arm() && neon_extras_thumb(), "NEON lanes, VMOVL/VSHLL, VCVT, VMAX/VMIN, immediates, permutes (ARM and Thumb)");
+        check(angry_birds_extras(), "VMULL/VMLAL/VMLSL/VQDMULL/VQDMULH by a scalar, VTBL/VTBX with 1-4 registers (ARM and Thumb)");
         check(apsr_ok(), "MSR APSR_nzcvq / APSR_g and MRS APSR round trip (ARM and Thumb)");
         check(card_wars_extras(), "LDREXD/STREX in an IT block, VMUL/VMLA/VMLS.I16/I32 by a scalar, LDM of every register and of SP+PC (ARM)");
         check(fixed_ok_arm() && fixed_ok_thumb(),
