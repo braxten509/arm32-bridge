@@ -196,6 +196,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "gamebridge-pacer"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "libc",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

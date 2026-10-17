@@ -220,7 +220,7 @@ class MainActivity : ComponentActivity() {
                 RefreshButton(enabled = !searching && setup == null, onClick = ::refresh)
             }
             Text(
-                "32-bit game APKs, XAPKs and data files on this phone.",
+                "Game APKs, XAPKs and data files on this phone.",
                 color = Muted,
                 fontSize = 13.sp,
                 modifier = Modifier.padding(start = 18.dp, bottom = 14.dp),
@@ -228,7 +228,7 @@ class MainActivity : ComponentActivity() {
             when {
                 setup != null -> SetupSteps(setup!!)
                 games == null -> Message("Looking for games…")
-                games!!.isEmpty() -> Message("No 32-bit games or game bundles on this phone. Download a game's APK, XAPK, APKM or APKS file, then tap ↻.")
+                games!!.isEmpty() -> Message("No games or game bundles on this phone. Download a game's APK, XAPK, APKM or APKS file, then tap ↻.")
                 else -> LazyVerticalGrid(
                     columns = GridCells.Fixed(2),
                     contentPadding = PaddingValues(start = 12.dp, end = 12.dp, bottom = 24.dp),

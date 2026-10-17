@@ -61,6 +61,17 @@ impl Piece {
     pub fn has_code(&self) -> bool {
         self.archive.file_names().any(|name| name.starts_with("classes") && name.ends_with(".dex") && !name.contains('/'))
     }
+
+    /// Whether it is the base APK: it has Java code and its manifest names no
+    /// split (feature pieces have code too, but say which split they are).
+    pub fn is_base(&mut self) -> bool {
+        if !self.has_code() {
+            return false;
+        }
+        let mut manifest = Vec::new();
+        let read = self.archive.by_name("AndroidManifest.xml").ok().and_then(|mut file| std::io::Read::read_to_end(&mut file, &mut manifest).ok());
+        read.is_some() && crate::manifest::split_name(&manifest).is_none()
+    }
 }
 
 pub struct Bundle {

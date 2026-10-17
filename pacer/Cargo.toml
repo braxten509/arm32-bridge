@@ -1,0 +1,16 @@
+[package]
+name = "gamebridge-pacer"
+version = "0.1.0"
+edition = "2021"
+description = "Game Bridge's frame helper for 64-bit games: lifts frame caps from inside the game"
+license = "GPL-2.0-or-later"
+
+[lib]
+name = "gamebridge_pacer"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+libc = "0.2.190"
+
+[build-dependencies]
+cc = "1.8"

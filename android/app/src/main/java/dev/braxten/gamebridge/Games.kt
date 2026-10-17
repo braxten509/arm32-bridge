@@ -25,16 +25,17 @@ class DataSource(val file: File, val entry: String?, val name: String, val size:
 
 /** What the card's button does. */
 enum class Action {
-    /** 32-bit code: convert it, then install. */
+    /** 32-bit code: convert it, then install. 64-bit game: add the frame helper, then install. */
     Convert,
     /** A bundle that already runs on this phone: install its pieces as they are. */
     Install,
 }
 
 /**
- * A game: an APK or bundle found on the phone with 32-bit ARM code and no 64-bit code, a bundle
- * that already runs here (Android's own installer can't install bundles), or an already converted
- * game that is installed (then `file` is null when no file of it was found).
+ * A game: an APK or bundle found on the phone with 32-bit ARM code (converted to run through the
+ * bridge) or a 64-bit game (converted to get the frame helper, which lifts its frame caps), a bundle
+ * that already runs here and isn't a game (Android's own installer can't install bundles), or an
+ * already converted game that is installed (then `file` is null when no file of it was found).
  */
 class Game(
     val file: File?,
@@ -67,8 +68,9 @@ object Games {
     fun isBundle(file: File) = bundleEndings.any { file.name.endsWith(it, ignoreCase = true) }
 
     /**
-     * Every 32-bit-only game APK or bundle in the phone's storage and on SD cards, bundles that
-     * already run here, plus converted games that are installed without a file on the phone, by name.
+     * Every game APK or bundle with ARM code in the phone's storage and on SD cards (32-bit and
+     * 64-bit), other bundles that run here as they are, plus converted games that are installed
+     * without a file on the phone, by name.
      * Only each APK's file list and manifest are read (for a bundle, its base APK is copied out to read them).
      */
     fun scan(context: Context): List<Game> {
@@ -215,7 +217,9 @@ object Games {
     private fun installed(context: Context, loose: List<File>): List<Game> {
         val packages = context.packageManager
         return packages.getInstalledApplications(PackageManager.ApplicationInfoFlags.of(0))
-            .filter { isConverted(it) && packages.getLaunchIntentForPackage(it.packageName) != null }
+            // Game Bridge carries the frame helper itself, so it would look converted.
+            .filter { it.packageName != context.packageName }
+            .filter { (isConverted(it) || hasPacer(context, it.packageName)) && packages.getLaunchIntentForPackage(it.packageName) != null }
             .map { application ->
                 val info = packages.getPackageInfo(application.packageName, PackageManager.PackageInfoFlags.of(0))
                 val game = Game(null, "Installed", application.loadLabel(packages).toString(), application.packageName,
@@ -226,7 +230,9 @@ object Games {
 
     private fun read(context: Context, file: File, place: String, loose: List<File>): Game? {
         if (isBundle(file)) return readBundle(context, file, place, loose)
-        if (!isThirtyTwoBitOnly(file)) return null
+        val bits = nativeBits(file) ?: return null
+        // Plenty of ordinary apps are 64-bit too; only games are listed.
+        if (bits == 64 && !isGame(context, file) && !builtWithEngine(context, file)) return null
         val game = fromApk(context, file, file, place, Action.Convert) ?: return null
         return withData(context, game, file, loose)
     }
@@ -239,8 +245,10 @@ object Games {
             val facts = Converter.inspect(context, file, base, work)
             val action = when (facts["bits"]) {
                 "32" -> Action.Convert
-                // Already 64-bit, or no native code at all: both run here as they are.
-                "64", "none" -> Action.Install
+                // A 64-bit game gets the frame helper; other 64-bit bundles, and those without
+                // native code, run here as they are.
+                "64" -> if (isGame(context, base) || facts["engine"] == "yes") Action.Convert else Action.Install
+                "none" -> Action.Install
                 else -> return null
             }
             val game = fromApk(context, base, file, place, action) ?: return null
@@ -284,26 +292,58 @@ object Games {
         }
     }
 
-    private fun isThirtyTwoBitOnly(file: File): Boolean = ZipFile(file).use { zip ->
+    /** 64 for any 64-bit ARM library, 32 for 32-bit ARM ones only, null for no ARM code. */
+    private fun nativeBits(file: File): Int? = ZipFile(file).use { zip ->
         var thirtyTwo = false
         for (entry in zip.entries()) {
             val name = entry.name
             if (!name.startsWith("lib/") || !name.endsWith(".so")) continue
-            if (name.startsWith("lib/arm64-v8a/")) return false
+            if (name.startsWith("lib/arm64-v8a/")) return 64
             if (name.startsWith("lib/armeabi-v7a/") || name.startsWith("lib/armeabi/")) thirtyTwo = true
         }
-        thirtyTwo
+        if (thirtyTwo) 32 else null
+    }
+
+    /** Whether an app tells Android it is a game (its category, or the older isGame flag in `apk`'s manifest). */
+    private fun isGame(context: Context, apk: File): Boolean {
+        val application = context.packageManager.getPackageArchiveInfo(apk.path, 0)?.applicationInfo ?: return false
+        @Suppress("DEPRECATION")
+        return application.category == ApplicationInfo.CATEGORY_GAME || application.flags and ApplicationInfo.FLAG_IS_GAME != 0
+    }
+
+    /** Whether an APK is built with a known game engine (the converter's `engine` answer). */
+    private fun builtWithEngine(context: Context, apk: File): Boolean {
+        val work = File(context.cacheDir, "inspect-engine").apply { deleteRecursively(); mkdirs() }
+        try {
+            return Converter.inspect(context, apk, File(work, "unused.apk"), work)["engine"] == "yes"
+        } finally {
+            work.deleteRecursively()
+        }
     }
 
     fun isInstalled(context: Context, packageName: String): Boolean = runCatching {
         context.packageManager.getPackageInfo(packageName, PackageManager.PackageInfoFlags.of(0))
     }.isSuccess
 
-    /** True when a converted copy of this game is installed (its library folder holds a kept 32-bit original). */
+    /**
+     * True when a converted copy of this game is installed: its library folder holds a kept 32-bit
+     * original, or the 64-bit frame helper.
+     */
     fun isConverted(context: Context, packageName: String): Boolean = runCatching {
-        isConverted(context.packageManager.getApplicationInfo(packageName, PackageManager.ApplicationInfoFlags.of(0)))
+        isConverted(context.packageManager.getApplicationInfo(packageName, PackageManager.ApplicationInfoFlags.of(0))) ||
+            hasPacer(context, packageName)
+    }.getOrDefault(false)
+
+    /** The frame helper's loader is listed in the installed game (also when its libraries stay inside the APK). */
+    private fun hasPacer(context: Context, packageName: String): Boolean = runCatching {
+        context.packageManager.getPackageInfo(packageName, PackageManager.PackageInfoFlags.of(PackageManager.GET_PROVIDERS.toLong()))
+            .providers.orEmpty().any { it.name == PACER_CLASS }
     }.getOrDefault(false)
 
     private fun isConverted(application: ApplicationInfo): Boolean =
-        File(application.nativeLibraryDir ?: return false).list()?.any { it.endsWith("-arm32.so") } == true
+        File(application.nativeLibraryDir ?: return false).list()?.any { it.endsWith("-arm32.so") || it == PACER_FILE } == true
+
+    /** The frame helper's file name in a converted 64-bit game, and the class that loads it. */
+    const val PACER_FILE = "libgamebridge_pacer.so"
+    private const val PACER_CLASS = "dev.braxten.gamebridge.Pacer"
 }

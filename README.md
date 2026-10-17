@@ -37,6 +37,14 @@ which includes it), and Game Bridge copies it into place when it installs the ga
 it also checks that it's the right, undamaged file. If a game needs one and Game Bridge can't find it, the card
 says **Needs game data**; tap it for what to do.
 
+**64-bit games: lifting their frame limit.** Downloaded 64-bit games show up too (apps that say they are games,
+or are built with a known game engine like Unity or Unreal). **Convert** keeps the game's own code and adds a small
+helper that lifts its frame limit, the way the bridge does for 32-bit games: it asks the phone for 120 Hz,
+shortens the game's waits between frames, and for Unity games raises Unity's frame rate setting (30 by default) to
+120. The game is signed again, so a copy installed from the Play Store has to be removed first (its progress may
+be lost unless it saves online), and the Play Store won't update it. Only tested so far with Taverns & Quests
+(Unity) on the PC's Android emulator; Unreal games get only the general part for now.
+
 ## Games that have worked so far
 
 > [!WARNING]

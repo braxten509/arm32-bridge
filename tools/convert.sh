@@ -1,6 +1,8 @@
 #!/bin/bash
 # Converts a 32-bit-only Android game APK so it runs on 64-bit-only phones,
-# then installs it on the phone (over Wi-Fi ADB).
+# then installs it on the phone (over Wi-Fi ADB). A 64-bit game instead keeps
+# its own code and gets Game Bridge's frame helper (pacer/), which lifts its
+# frame caps.
 #
 # - Every 32-bit library lib<name>.so is replaced by the shared stand-in
 #   (tools/standin) and kept next to it as lib<name>-arm32.so. The bridge (the
@@ -67,7 +69,9 @@ mkdir -p "$WORK"
 
 echo "== building the bridge"
 systemd-run --user --wait --pipe -q -p AllowedCPUs=6-11,18-23 -d -E TARGET=$TARGET bash -c \
-    "cd '$ROOT' && ./build-phone.sh --lib -q && cargo build --release -q -p apk-convert" >&2
+    "cd '$ROOT' && ./build-phone.sh --lib -q && TARGET=aarch64-linux-android ./build-phone.sh --lib -q -p gamebridge-pacer && cargo build --release -q -p apk-convert" >&2
+# The frame helper for 64-bit games is always the ARM build (the emulator translates ARM games).
+"$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" -o "$WORK/libgamebridge_pacer.so" "$ROOT/target/aarch64-linux-android/release/libgamebridge_pacer.so"
 "$CLANG" -O2 -shared -fPIC -Wl,--build-id=none -o "$WORK/libstandin.so" "$ROOT/tools/standin/standin.c" -llog -ldl
 
 echo "== converting"
@@ -76,6 +80,7 @@ UNSIGNED=$WORK/unsigned.apk
 [ $BUNDLE = 0 ] || UNSIGNED=$WORK/unsigned
 "$ROOT/target/release/apk-convert" "$APK" "$UNSIGNED" \
     --bridge "$ROOT/target/$TARGET/release/libarm32_bridge.so" --standin "$WORK/libstandin.so" \
+    --pacer "$WORK/libgamebridge_pacer.so" \
     --work "$WORK" --abi "$ABI" "${MIN_TARGET[@]}" > "$WORK/convert.log"
 STATUS=$?
 set -e

@@ -2067,3 +2067,38 @@ AndroidConfiguration. Regression test: selftest "dlsym finds OpenSL ES interface
   within 3 s are answered from memory; a helper thread re-asks 4 times a second; stops after 2 s without asks or on
   an exception. ARM32_JAVA_CACHE=0 / debug.arm32bridge.javacache=0 turns it off.
 - Phone: self-test 6 modes 0 failures; Pirates freezes over 100 ms 968 -> max 217 ms (a setVolume call).
+
+## 64-bit games: listed in Game Bridge, frame caps lifted (2026-10-17)
+
+Owner asked for downloaded 64-bit games to show in Game Bridge with their frame rate uncapped like 32-bit ones.
+Owner's choices: downloaded files only (no Play Store installs), general steps plus Unity/Unreal, no phone tests
+(emulator only), test game Taverns & Quests 3.0.10 (Unity 2022.3.62f3 IL2CPP, xapk). Plan: docs/64bit-uncap-plan.md.
+
+- Design: the converter keeps a 64-bit game's code and adds pacer/ (libgamebridge_pacer.so), loaded by a Java
+  content provider in a new classesN.dex (manifest.rs add_provider; initOrder max). The helper rewrites the game
+  libraries' import slots (GOT): limiter sleeps on the frame thread end one refresh after the last frame (copy of
+  threads.rs frame_limit), eglSwapInterval > 1 -> 1, ANativeWindow_setFrameRate(window, 120) on new windows, game
+  setFrameRate votes below 120 raised. Same per-game setting as the bridge: debug.arm32bridge.unlock.<package>.
+- Unity: targetFrameRate is -1 (30 fps on phones) and the C# setter is stripped in T&Q. libunity's getter
+  (registered as the get_targetFrameRate internal call, caught through the dlsym hook on il2cpp_add_internal_call)
+  is `adrp; ldr w0; ret` and the engine setter is the next function (`adrp; str w0; b apply`), apply re-reads the
+  value and updates frame pacing. The helper checks the pattern strictly and calls it on UnityMain.
+- bytehook was tried first: 1.0.10 fails to start under the emulator's ARM translator (status 3, linker
+  internals), 1.1+ needs shadowhook. Plain GOT patching via dl_iterate_phdr works there (scratch fixture).
+- Emulator facts: System.loadLibrary under ndk_translation doesn't go through ARM code, so libmain/libunity are
+  caught by the helper's watcher thread (load counter, 1 ms for 30 s); on the phone libnativeloader's
+  android_dlopen_ext hook catches them. ANativeWindow_setFrameRate is in libnativewindow (the translator's libandroid
+  lacks it; RTLD_DEFAULT doesn't see either).
+- Results on the emulator (arm32_bridge_test, x86_64 + ndk_translation): helper loads before game code; libmain,
+  libunity, libil2cpp hooked; `Unity: targetFrameRate -1 -> 120 (thread UnityMain)`; `asked for 120 Hz ... (result
+  0)`; frames shown on UnityGfxDeviceW; no crash, setting held. fps 23-24 before and after: the emulator itself is
+  the limit (software drawing + ARM translation), so real fps needs the phone (not tested, owner's choice).
+- 32-bit conversions unchanged: Puzzle Craft 2 converted by the old and new converter is byte-identical.
+- Game Bridge app on the emulator: lists the T&Q xapk from Download with Convert, converts + installs it, card
+  then says Installed; the game runs with the helper.
+- Codex review (7 findings, all fixed): patch inside the loader lock (unload race), loader only in the true base
+  piece (feature splits), Unity setter only on its main thread, reloaded libraries re-patched, converted games
+  with packed libraries found by their provider, engine detection by the converter (`--inspect` prints `engine`),
+  game's own setter used first.
+- Not done: Unreal-specific steps (no test game; config paths and pacing differ by version), Mono Unity's
+  il2cpp_resolve_icall fallback (Mono needs the registration to be caught).

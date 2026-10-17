@@ -1,6 +1,6 @@
 #!/bin/bash
-# Builds the Game Bridge phone app (android/): the bridge, the shared stand-in
-# and the converter (apk-convert) go into its library folder, the PC's debug
+# Builds the Game Bridge phone app (android/): the bridge, the shared stand-in,
+# the 64-bit frame helper and the converter (apk-convert) go into its library folder, the PC's debug
 # signing key into its assets (so phone and PC conversions replace each other),
 # then Gradle builds the APK. With --install it is installed over ADB.
 # --public is the build for other people: the PC's key is left out (the app makes
@@ -26,9 +26,11 @@ ASSETS=$ROOT/android/app/src/main/assets
 mkdir -p "$LIBS" "$ASSETS"
 
 echo "== bridge and converter"
-(cd "$ROOT" && ./build-phone.sh -q --lib -p arm32-bridge && ./build-phone.sh -q -p apk-convert)
+(cd "$ROOT" && ./build-phone.sh -q --lib -p arm32-bridge && ./build-phone.sh -q -p apk-convert && ./build-phone.sh -q --lib -p gamebridge-pacer)
 OUT=$ROOT/target/aarch64-linux-android/release
 cp "$OUT/libarm32_bridge.so" "$LIBS/libarm32_bridge.so"
+# The frame helper for 64-bit games: the converter copies it into each one, so it travels small.
+"$BIN/llvm-strip" -o "$LIBS/libgamebridge_pacer.so" "$OUT/libgamebridge_pacer.so"
 # Android only unpacks lib*.so files, so the converter program travels under that name.
 "$BIN/llvm-strip" -o "$LIBS/libapkconvert.so" "$OUT/apk-convert"
 "$BIN/aarch64-linux-android30-clang" -O2 -shared -fPIC -Wl,--build-id=none -o "$LIBS/libstandin.so" \

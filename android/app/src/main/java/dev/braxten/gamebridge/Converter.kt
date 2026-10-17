@@ -15,7 +15,8 @@ sealed class Outcome {
 }
 
 /**
- * Converts a game with apk-convert (the same program tools/convert.sh uses), signs it (Signing),
+ * Converts a game with apk-convert (the same program tools/convert.sh uses): a 32-bit game runs
+ * through the bridge, a 64-bit game gets the frame helper. Then signs it (Signing)
  * and installs it. A bundle's pieces are all signed and installed together, and
  * its game data (OBB files) copied where the game looks for it. A bundle that already runs here
  * is installed as it is.
@@ -30,6 +31,7 @@ class Converter(private val context: Context, private val installer: Installer) 
         "Checking which phone functions the game needs" to 15,
         "Applying known fixes for this game" to 25,
         "Swapping in the bridge" to 30,
+        "Adding the frame helper" to 30,
         "Fixing known Java problems" to 55,
         "Copying game data" to 70,
     )
@@ -76,6 +78,7 @@ class Converter(private val context: Context, private val installer: Installer) 
             unsigned.path,
             "--bridge", File(libraries, "libarm32_bridge.so").path,
             "--standin", File(libraries, "libstandin.so").path,
+            "--pacer", File(libraries, Games.PACER_FILE).path,
             "--work", work.path,
             *(minimumTarget?.let { arrayOf("--min-target-sdk", it.toString()) } ?: emptyArray()),
         ).redirectErrorStream(true).start()

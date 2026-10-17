@@ -11,6 +11,11 @@
 //! - Known Java-side problems are fixed in the dex files (dex.rs), and
 //!   android:extractNativeLibs is turned on so the parts are files (manifest.rs).
 //! - Phone functions the libraries import that the bridge lacks are listed.
+//! - A 64-bit game (with --pacer) keeps its own libraries and gets Game
+//!   Bridge's frame helper instead (pacer/): libgamebridge_pacer.so next to its
+//!   libraries, the Java class that loads it as the next classesN.dex, and that
+//!   class listed in the manifest as a content provider (manifest.rs). The dex
+//!   fixes apply too (the onDrawFrame frame limiter one matters here).
 //! - A bundle (.xapk, .apkm, .apks: one game split over several APKs, see
 //!   bundle.rs) becomes a folder instead: every piece, converted or copied, as
 //!   its own APK (sign them all with the same key and install them together),
@@ -18,19 +23,19 @@
 //!   Pieces made only for other kinds of phones (x86) are left out.
 //!
 //! usage: apk-convert <game.apk|bundle> <out.apk|out folder> --bridge <libarm32_bridge.so> --standin <libstandin.so>
-//!                    [--work <scratch dir>] [--abi <output ABI, default arm64-v8a>] [--min-target-sdk <N>]
+//!                    [--pacer <libgamebridge_pacer.so>] [--work <scratch dir>] [--abi <output ABI, default arm64-v8a>] [--min-target-sdk <N>]
 //!        apk-convert --inspect <game.apk|bundle> [--base <out.apk>] [--work <scratch dir>]
 //! (`--abi x86_64` makes a copy for the PC's Android emulator, with an x86_64 bridge and stand-in.)
 //! (`--min-target-sdk N` raises the game's target Android version to N: phones without root refuse older ones.)
 //! `--inspect` only looks: it prints `kind apk|bundle`, `data yes|no` for a bundle (carries game data),
-//! `download yes|no` (the game's own code starts Google Play's expansion-file download) and `bits 32|64|none`
-//! (what native code the game has), and with --base copies a bundle's base
+//! `download yes|no` (the game's own code starts Google Play's expansion-file download), `bits 32|64|none`
+//! (what native code the game has) and `engine yes|no` (built with a known game engine), and with --base copies a bundle's base
 //! APK (the piece with the Java code) out, for reading its name and icon.
 //!
 //! Progress goes to stdout, one line each: `step <text>`, `abi <abi>`,
 //! `fix <file>: <what>`, `warn <text>`, `missing <name>`, `piece <file>`,
 //! `obb <path>`, `done <out>`, or `error <text>`.
-//! Exit codes: 0 converted, 2 usage, 3 already 64-bit, 4 no 32-bit ARM code, 1 other failure.
+//! Exit codes: 0 converted, 2 usage, 3 already 64-bit (and no --pacer given), 4 no ARM code, 1 other failure.
 
 mod bundle;
 mod dex;
@@ -54,6 +59,13 @@ const ENTRY_ALIGNMENT: u16 = 4;
 const CRITICAL_NATIVE: &[u8] = b"Ldalvik/annotation/optimization/CriticalNative;";
 /// The bridge's file name in the converted APK; the stand-in looks for it.
 const BRIDGE_FILE: &str = "libarm32_bridge.so";
+/// The 64-bit frame helper's file name in a converted 64-bit game.
+const PACER_FILE: &str = "libgamebridge_pacer.so";
+/// The Java class that loads it (pacer/java, built by tools/build-pacer-dex.sh).
+const PACER_DEX: &[u8] = include_bytes!("../assets/pacer.dex");
+const PACER_CLASS: &str = "dev.braxten.gamebridge.Pacer";
+/// 64-bit games' libraries are kept 16 KB aligned: phones with 16 KB memory pages need it.
+const LIBRARY_ALIGNMENT_64: u16 = 16384;
 /// 32-bit ARM library folders, the better one first.
 const ARM32_ABIS: [&str; 2] = ["armeabi-v7a", "armeabi"];
 
@@ -62,6 +74,8 @@ struct Options {
     output: PathBuf,
     bridge: PathBuf,
     standin: PathBuf,
+    /// The 64-bit frame helper; without it 64-bit games are refused.
+    pacer: Option<PathBuf>,
     work: PathBuf,
     /// The ABI folder the bridge, stand-ins and originals go in.
     abi: String,
@@ -77,7 +91,7 @@ enum Command {
 fn parse() -> Result<Command, String> {
     let mut arguments = std::env::args().skip(1);
     let mut positional = Vec::new();
-    let (mut bridge, mut standin, mut work, mut abi, mut base) = (None, None, None, None, None);
+    let (mut bridge, mut standin, mut work, mut abi, mut base, mut pacer) = (None, None, None, None, None, None);
     let mut min_target_sdk = None;
     let mut inspect = false;
     while let Some(argument) = arguments.next() {
@@ -85,6 +99,7 @@ fn parse() -> Result<Command, String> {
         match argument.as_str() {
             "--bridge" => bridge = Some(PathBuf::from(value()?)),
             "--standin" => standin = Some(PathBuf::from(value()?)),
+            "--pacer" => pacer = Some(PathBuf::from(value()?)),
             "--work" => work = Some(PathBuf::from(value()?)),
             "--abi" => abi = Some(value()?),
             "--base" => base = Some(PathBuf::from(value()?)),
@@ -108,6 +123,7 @@ fn parse() -> Result<Command, String> {
         output,
         bridge: bridge.ok_or("--bridge is required")?,
         standin: standin.ok_or("--standin is required")?,
+        pacer,
         work,
         abi: abi.unwrap_or_else(|| "arm64-v8a".into()),
         min_target_sdk,
@@ -150,7 +166,7 @@ fn main() -> ExitCode {
             ExitCode::from(3)
         }
         Err(Failure::No32) => {
-            println!("error This app has no 32-bit ARM code, so there is nothing to convert.");
+            println!("error This app has no ARM code, so there is nothing to convert.");
             ExitCode::from(4)
         }
         Err(Failure::Other(error)) => {
@@ -227,7 +243,13 @@ fn convert(options: &Options) -> Result<(), Failure> {
     let carries_game_data = std::fs::metadata(&options.input)?.len() > dex::PLAY_EXPANSION_APK_LIMIT;
     let names: Vec<String> = archive.file_names().map(String::from).collect();
     let abi = match bits(names.iter()) {
-        Bits::SixtyFour => return Err(Failure::Already64),
+        Bits::SixtyFour => {
+            let helper = read_pacer(options)?;
+            println!("abi arm64-v8a");
+            println!("step Adding the frame helper");
+            let native = Native::Paced { helper: Some(&helper), loader: true };
+            return rewrite(&mut archive, &options.output, options, carries_game_data, native, &[]);
+        }
         Bits::None => return Err(Failure::No32),
         Bits::ThirtyTwo(abi) => abi,
     };
@@ -241,17 +263,24 @@ fn convert(options: &Options) -> Result<(), Failure> {
     println!("step Swapping in the bridge");
     let parts = Parts::read(options)?;
     let bridge = Bridge { library: &parts.bridge, settings: &applied.settings };
-    rewrite(&mut archive, &options.output, options, carries_game_data, Some(bridge), &parts.standin, &libraries, &[])
+    let native = Native::Bridged { bridge: Some(bridge), standin: &parts.standin, libraries: &libraries };
+    rewrite(&mut archive, &options.output, options, carries_game_data, native, &[])
+}
+
+/// The 64-bit frame helper, or Already64 when none was given.
+fn read_pacer(options: &Options) -> Result<Vec<u8>, Failure> {
+    let path = options.pacer.as_ref().ok_or(Failure::Already64)?;
+    std::fs::read(path).map_err(|e| Failure::Other(format!("read {}: {e}", path.display())))
 }
 
 fn convert_bundle(options: &Options, mut bundle: bundle::Bundle) -> Result<(), Failure> {
     println!("step Reading the game");
     let carries_game_data = std::fs::metadata(&options.input)?.len() > dex::PLAY_EXPANSION_APK_LIMIT;
     let every_name: Vec<String> = bundle.pieces.iter().flat_map(|piece| piece.names()).collect();
-    let abi = match bits(every_name.iter()) {
-        Bits::SixtyFour => return Err(Failure::Already64),
+    let (abi, helper) = match bits(every_name.iter()) {
+        Bits::SixtyFour => ("arm64-v8a", Some(read_pacer(options)?)),
         Bits::None => return Err(Failure::No32),
-        Bits::ThirtyTwo(abi) => abi,
+        Bits::ThirtyTwo(abi) => (abi, None),
     };
     println!("abi {abi}");
     // A piece of only libraries for other phones (config.x86.apk, or the old
@@ -265,6 +294,21 @@ fn convert_bundle(options: &Options, mut bundle: bundle::Bundle) -> Result<(), F
         }
         keep
     });
+    if let Some(helper) = &helper {
+        println!("step Adding the frame helper");
+        std::fs::create_dir_all(&options.output)?;
+        let tables = resource_tables(&mut bundle);
+        // The helper goes with the game's first 64-bit libraries, the loader with its Java code.
+        let mut helper_added = false;
+        for piece in bundle.pieces.iter_mut() {
+            let has_libraries = piece.names().iter().any(|name| library_in(abi, name).is_some());
+            let native = Native::Paced { helper: (!helper_added && has_libraries).then_some(helper.as_slice()), loader: piece.is_base() };
+            helper_added |= has_libraries;
+            rewrite(&mut piece.archive, &options.output.join(&piece.name), options, carries_game_data, native, &tables)?;
+            println!("piece {}", piece.name);
+        }
+        return copy_game_data(options, &bundle);
+    }
     let mut libraries = Vec::new();
     for piece in &mut bundle.pieces {
         libraries.push(read_libraries(&mut piece.archive, abi)?);
@@ -280,21 +324,31 @@ fn convert_bundle(options: &Options, mut bundle: bundle::Bundle) -> Result<(), F
     println!("step Swapping in the bridge");
     let parts = Parts::read(options)?;
     std::fs::create_dir_all(&options.output)?;
-    let tables: Vec<Vec<u8>> = bundle.pieces.iter_mut().filter_map(|piece| {
-        let mut bytes = Vec::new();
-        piece.archive.by_name("resources.arsc").ok()?.read_to_end(&mut bytes).ok()?;
-        Some(bytes)
-    }).collect();
+    let tables = resource_tables(&mut bundle);
     let mut bridge_added = false;
     for (piece, libraries) in bundle.pieces.iter_mut().zip(&libraries) {
         let output = options.output.join(&piece.name);
         // The bridge goes in once, with the first 32-bit libraries; all pieces' libraries end up in one folder.
         let bridge = (!bridge_added && !libraries.is_empty()).then_some(Bridge { library: &parts.bridge, settings: &settings });
         bridge_added |= bridge.is_some();
-        rewrite(&mut piece.archive, &output, options, carries_game_data, bridge, &parts.standin, libraries, &tables)?;
+        let native = Native::Bridged { bridge, standin: &parts.standin, libraries };
+        rewrite(&mut piece.archive, &output, options, carries_game_data, native, &tables)?;
         println!("piece {}", piece.name);
     }
+    copy_game_data(options, &bundle)
+}
 
+/// Every piece's resource table (for the icon: its pictures may be in another piece).
+fn resource_tables(bundle: &mut bundle::Bundle) -> Vec<Vec<u8>> {
+    bundle.pieces.iter_mut().filter_map(|piece| {
+        let mut bytes = Vec::new();
+        piece.archive.by_name("resources.arsc").ok()?.read_to_end(&mut bytes).ok()?;
+        Some(bytes)
+    }).collect()
+}
+
+/// A bundle's game data, copied to obb/ in the output folder.
+fn copy_game_data(options: &Options, bundle: &bundle::Bundle) -> Result<(), Failure> {
     if !bundle.game_data.is_empty() {
         println!("step Copying game data");
         let mut outer = ZipArchive::new(File::open(&options.input)?)?;
@@ -330,20 +384,29 @@ struct Bridge<'a> {
     settings: &'a str,
 }
 
+/// What happens to a piece's native libraries.
+enum Native<'a> {
+    /// 32-bit: `libraries` swapped for the stand-in (originals kept as
+    /// lib<name>-arm32.so) and, when given, the bridge added (with the game's settings file).
+    Bridged { bridge: Option<Bridge<'a>>, standin: &'a [u8], libraries: &'a [(String, Vec<u8>)] },
+    /// 64-bit: libraries kept; the frame helper added when given, and when
+    /// `loader`, the Java class that loads it (with its manifest entry).
+    Paced { helper: Option<&'a [u8]>, loader: bool },
+}
+
 /// Writes `archive` to `output` without its old signature, with the dex and
-/// manifest fixes, its libraries swapped for stand-ins (originals kept as
-/// lib<name>-arm32.so) and, when given, the bridge (with the game's settings file).
+/// manifest fixes and its native libraries handled as `native` says.
 fn rewrite<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     output: &Path,
     options: &Options,
     carries_game_data: bool,
-    bridge: Option<Bridge>,
-    standin: &[u8],
-    libraries: &[(String, Vec<u8>)],
+    native: Native,
     // A bundle's pieces' resource tables (for the icon: its pictures may be in another piece).
     tables: &[Vec<u8>],
 ) -> Result<(), Failure> {
+    let paced = matches!(native, Native::Paced { .. });
+    let adds_loader = matches!(native, Native::Paced { loader: true, .. });
     let mut writer = ZipWriter::new(File::create(output)?);
     let stored = |alignment: u16| {
         SimpleFileOptions::default().compression_method(CompressionMethod::Stored).with_alignment(alignment)
@@ -365,7 +428,20 @@ fn rewrite<R: Read + Seek>(
         let signature_file = name.starts_with("META-INF/")
             && (name == "META-INF/MANIFEST.MF"
                 || [".SF", ".RSA", ".DSA", ".EC"].iter().any(|ending| name.ends_with(ending)));
-        if name.starts_with("lib/") || signature_file || entry.is_dir() {
+        if signature_file || entry.is_dir() || (name.starts_with("lib/") && !paced) {
+            continue;
+        }
+        if name.starts_with("lib/") {
+            // A 64-bit game keeps its libraries; stored ones stay page-aligned (Android maps them straight from the APK).
+            if entry.compression() == CompressionMethod::Stored {
+                drop(entry);
+                let mut bytes = Vec::new();
+                archive.by_index(index)?.read_to_end(&mut bytes)?;
+                writer.start_file(name.as_str(), stored(LIBRARY_ALIGNMENT_64))?;
+                writer.write_all(&bytes)?;
+            } else {
+                writer.raw_copy_file(entry)?;
+            }
             continue;
         }
         let is_dex = name.starts_with("classes") && name.ends_with(".dex") && !name.contains('/');
@@ -397,8 +473,16 @@ fn rewrite<R: Read + Seek>(
                 }
                 entry_options = deflated;
             }
+            if is_manifest && adds_loader {
+                let package = manifest::package_name(&bytes).ok_or("the manifest has no package name")?;
+                let changed = manifest::add_provider(&bytes, PACER_CLASS, &format!("{package}.gamebridge.pacer"))?;
+                if changed != bytes {
+                    println!("fix {name}: frame helper loader ({PACER_CLASS}) added");
+                }
+                bytes = changed;
+            }
             if is_manifest {
-                if manifest::extract_native_libs(&mut bytes) == Some(true) {
+                if !paced && manifest::extract_native_libs(&mut bytes) == Some(true) {
                     println!("fix {name}: extractNativeLibs (the bridge reads the 32-bit parts as files): false -> true");
                 }
                 if let Some(minimum) = options.min_target_sdk {
@@ -428,6 +512,23 @@ fn rewrite<R: Read + Seek>(
         writer.write_all(xml)?;
     }
     let target = |file: &str| format!("lib/{}/{file}", options.abi);
+    let (bridge, standin, libraries): (Option<Bridge>, &[u8], &[(String, Vec<u8>)]) = match native {
+        Native::Bridged { bridge, standin, libraries } => (bridge, standin, libraries),
+        Native::Paced { helper, loader } => {
+            if let Some(helper) = helper {
+                // Always next to the game's ARM libraries (the emulator runs those through its translator).
+                writer.start_file(format!("lib/arm64-v8a/{PACER_FILE}"), stored(LIBRARY_ALIGNMENT_64))?;
+                writer.write_all(helper)?;
+            }
+            if loader {
+                let file = next_dex_name(archive.file_names());
+                writer.start_file(file.as_str(), deflated)?;
+                writer.write_all(PACER_DEX)?;
+                println!("fix {file}: frame helper loader added");
+            }
+            (None, &[], &[])
+        }
+    };
     if let Some(bridge) = bridge {
         writer.start_file(target(BRIDGE_FILE), stored(LIBRARY_ALIGNMENT))?;
         writer.write_all(bridge.library)?;
@@ -448,6 +549,18 @@ fn rewrite<R: Read + Seek>(
     Ok(())
 }
 
+/// The next free dex file name: classes.dex, classes2.dex, classes3.dex …
+fn next_dex_name<'a>(names: impl Iterator<Item = &'a str>) -> String {
+    let highest = names
+        .filter_map(|name| name.strip_prefix("classes")?.strip_suffix(".dex"))
+        .filter_map(|number| if number.is_empty() { Some(1) } else { number.parse::<u32>().ok() })
+        .max();
+    match highest {
+        None => "classes.dex".into(),
+        Some(number) => format!("classes{}.dex", number + 1),
+    }
+}
+
 /// `--inspect`: what kind of file it is and what native code it has, and for
 /// a bundle optionally its base APK copied out.
 fn inspect(input: &Path, base: Option<&Path>, work: &Path) -> Result<(), String> {
@@ -463,7 +576,14 @@ fn inspect(input: &Path, base: Option<&Path>, work: &Path) -> Result<(), String>
             Some(mut bundle) => {
                 println!("kind bundle");
                 println!("data {}", yes_no(!bundle.game_data.is_empty()));
-                let piece = bundle.pieces.iter_mut().find(|piece| piece.has_code()).ok_or("the bundle has no base APK")?;
+                let piece = match bundle.pieces.iter().position(|piece| piece.has_code()) {
+                    // The base, else (an unusual bundle) the first piece with code.
+                    Some(first) => {
+                        let base = (0..bundle.pieces.len()).find(|&index| bundle.pieces[index].is_base()).unwrap_or(first);
+                        &mut bundle.pieces[base]
+                    }
+                    None => return Err("the bundle has no base APK".into()),
+                };
                 println!("download {}", yes_no(starts_download(&mut piece.archive)));
                 if let Some(base) = base {
                     bundle::save(piece, base).map_err(|e| format!("copy out {}: {e}", piece.name))?;
@@ -477,12 +597,23 @@ fn inspect(input: &Path, base: Option<&Path>, work: &Path) -> Result<(), String>
             Bits::None => "none",
         };
         println!("bits {bits}");
+        println!("engine {}", yes_no(names.iter().any(|name| is_engine_library(name))));
         Ok(())
     })();
     let _ = std::fs::remove_dir_all(&scratch);
     result
 }
 
+
+/// Libraries of game engines: an app built with one is a game even when its
+/// manifest doesn't say so (Unity, Unreal, Godot, cocos2d-x, libGDX, Defold,
+/// GameMaker, Solar2D, LÖVE). Only file names in lib/<abi>/ count.
+fn is_engine_library(path: &str) -> bool {
+    let Some(file) = path.strip_prefix("lib/").and_then(|rest| rest.split_once('/')).map(|(_, file)| file) else { return false };
+    let Some(stem) = file.strip_prefix("lib").and_then(|rest| rest.strip_suffix(".so")) else { return false };
+    matches!(stem, "unity" | "il2cpp" | "UE4" | "Unreal" | "godot_android" | "gdx" | "dmengine" | "yoyo" | "corona" | "love")
+        || stem.starts_with("cocos2d")
+}
 
 fn yes_no(answer: bool) -> &'static str {
     if answer { "yes" } else { "no" }
@@ -517,4 +648,26 @@ fn report_missing(work: &Path, libraries: &[(String, Vec<u8>)]) -> Result<(), Fa
         println!("missing {name}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn engine_libraries() {
+        assert!(is_engine_library("lib/arm64-v8a/libunity.so"));
+        assert!(is_engine_library("lib/arm64-v8a/libcocos2dcpp.so"));
+        assert!(is_engine_library("lib/armeabi-v7a/libUE4.so"));
+        assert!(!is_engine_library("lib/arm64-v8a/libunityads.so"));
+        assert!(!is_engine_library("assets/libunity.so"));
+        assert!(!is_engine_library("lib/arm64-v8a/libc++_shared.so"));
+    }
+
+    #[test]
+    fn next_dex_names() {
+        assert_eq!(next_dex_name(["classes.dex", "res/a.xml"].into_iter()), "classes2.dex");
+        assert_eq!(next_dex_name(["classes.dex", "classes2.dex", "classes10.dex"].into_iter()), "classes11.dex");
+        assert_eq!(next_dex_name(["AndroidManifest.xml"].into_iter()), "classes.dex");
+    }
 }
