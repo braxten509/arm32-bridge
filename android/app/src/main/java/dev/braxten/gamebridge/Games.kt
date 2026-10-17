@@ -11,6 +11,7 @@ import android.os.Environment
 import android.os.storage.StorageManager
 import java.io.File
 import java.io.InputStream
+import java.util.concurrent.ConcurrentHashMap
 import java.util.zip.ZipFile
 
 /** A game data file found on the phone: a loose .obb file, or one inside a .zip (`entry`). */
@@ -81,11 +82,38 @@ object Games {
         val loose = dataFiles.map { (file, _) -> file }
         // The same game and version found twice shows once.
         val games = gameFiles
-            .mapNotNull { (file, place) -> runCatching { read(context, file, place, loose) }.getOrNull() }
+            .mapNotNull { (file, place) -> remembered(file) { read(context, file, place) }?.let { withLooseData(it, loose) } }
             .distinctBy { it.packageName to it.versionCode }
         val withFiles = games.map { it.packageName }.toSet()
-        return (games + installed(context, loose).filter { it.packageName !in withFiles }).sortedBy { it.label.lowercase() }
+        val installed = installed(context, loose)
+        // Files that are gone (deleted, or a game's old APK after an update) are forgotten.
+        seen.keys.retainAll((gameFiles.map { (file, _) -> file.path } + installed.map { it.second }).toSet())
+        return (games + installed.map { it.first }.filter { it.packageName !in withFiles }).sortedBy { it.label.lowercase() }
     }
+
+    /** What reading a file found, kept while the app runs. */
+    private class Seen(val length: Long, val modified: Long, val game: Game?)
+
+    /** By path. Reading every file takes a while, so searching again only reads new and changed ones. */
+    private val seen = ConcurrentHashMap<String, Seen>()
+
+    /** `read`'s answer for `file`, read again only when the file changed. A failed read is tried again next time. */
+    private fun remembered(file: File, read: () -> Game?): Game? {
+        val (length, modified) = file.length() to file.lastModified()
+        seen[file.path]?.takeIf { it.length == length && it.modified == modified }?.let { return it.game }
+        val game = try {
+            read()
+        } catch (unsure: Unsure) {
+            return unsure.game
+        } catch (_: Exception) {
+            return null
+        }
+        seen[file.path] = Seen(length, modified, game)
+        return game
+    }
+
+    /** A card read only in part (whether it needs a data file couldn't be checked): shown, not remembered. */
+    private class Unsure(val game: Game) : Exception()
 
     private fun isZip(file: File) = file.name.endsWith(".zip", ignoreCase = true)
 
@@ -122,7 +150,7 @@ object Games {
         val starts = startsDownload ?: run {
             val work = File(context.cacheDir, "inspect-data").apply { deleteRecursively(); mkdirs() }
             try {
-                Converter.inspect(context, apk, File(work, "unused.apk"), work)["download"] == "yes"
+                inspect(context, apk, File(work, "unused.apk"), work)["download"] == "yes"
             } finally {
                 work.deleteRecursively()
             }
@@ -131,12 +159,16 @@ object Games {
         return if (starts) "main.$versionCode.$packageName.obb" else null
     }
 
-    /**
-     * `game` with the data file it needs (read from `apk`, its APK or a bundle's base) and a copy of
-     * it found on the phone, if any: a loose .obb file first, else one inside a .zip.
-     */
-    private fun withData(context: Context, game: Game, apk: File, found: List<File>, startsDownload: Boolean? = null): Game {
-        val data = runCatching { dataFile(context, apk, game.packageName, game.versionCode, startsDownload) }.getOrNull() ?: return game
+    /** `game` with the data file it needs, read from `apk` (its APK or a bundle's base). */
+    private fun needingData(context: Context, game: Game, apk: File, startsDownload: Boolean? = null): Game {
+        val data = runCatching { dataFile(context, apk, game.packageName, game.versionCode, startsDownload) }
+            .getOrElse { throw Unsure(game) } ?: return game
+        return Game(game.file, game.place, game.label, game.packageName, game.versionCode, game.icon, game.action, data)
+    }
+
+    /** `game` with a copy of its data file found on the phone, if any: a loose .obb file first, else one inside a .zip. */
+    private fun withLooseData(game: Game, found: List<File>): Game {
+        val data = game.dataFile ?: return game
         val (zips, loose) = found.partition(::isZip)
         // A known file of the wrong size is damaged or another one: as good as missing.
         fun usable(source: DataSource) = fits(source.name, game) && knownData[source.name]?.let { it.size == source.size } ?: true
@@ -213,36 +245,41 @@ object Games {
         }
     }
 
-    /** Converted games that are installed, shown with their installed name and icon. */
-    private fun installed(context: Context, loose: List<File>): List<Game> {
+    /** Converted games that are installed, shown with their installed name and icon, each with its APK's path. */
+    private fun installed(context: Context, loose: List<File>): List<Pair<Game, String>> {
         val packages = context.packageManager
         return packages.getInstalledApplications(PackageManager.ApplicationInfoFlags.of(0))
             // Game Bridge carries the frame helper itself, so it would look converted.
             .filter { it.packageName != context.packageName }
             .filter { (isConverted(it) || hasPacer(context, it.packageName)) && packages.getLaunchIntentForPackage(it.packageName) != null }
-            .map { application ->
-                val info = packages.getPackageInfo(application.packageName, PackageManager.PackageInfoFlags.of(0))
-                val game = Game(null, "Installed", application.loadLabel(packages).toString(), application.packageName,
-                    info.longVersionCode, iconBitmap(runCatching { application.loadIcon(packages) }.getOrNull()))
-                withData(context, game, File(application.sourceDir), loose)
+            .mapNotNull { application ->
+                val apk = File(application.sourceDir)
+                val game = remembered(apk) {
+                    val info = packages.getPackageInfo(application.packageName, PackageManager.PackageInfoFlags.of(0))
+                    val game = Game(null, "Installed", application.loadLabel(packages).toString(), application.packageName,
+                        info.longVersionCode, iconBitmap(runCatching { application.loadIcon(packages) }.getOrNull()))
+                    needingData(context, game, apk)
+                } ?: return@mapNotNull null
+                withLooseData(game, loose) to apk.path
             }
     }
 
-    private fun read(context: Context, file: File, place: String, loose: List<File>): Game? {
-        if (isBundle(file)) return readBundle(context, file, place, loose)
+    /** The card for a game file, with the data file it needs (not yet looked for on the phone). */
+    private fun read(context: Context, file: File, place: String): Game? {
+        if (isBundle(file)) return readBundle(context, file, place)
         val bits = nativeBits(file) ?: return null
         // Plenty of ordinary apps are 64-bit too; only games are listed.
         if (bits == 64 && !isGame(context, file) && !builtWithEngine(context, file)) return null
         val game = fromApk(context, file, file, place, Action.Convert) ?: return null
-        return withData(context, game, file, loose)
+        return needingData(context, game, file)
     }
 
     /** The converter looks inside (the pieces' file lists) and copies the base APK out for its name and icon. */
-    private fun readBundle(context: Context, file: File, place: String, loose: List<File>): Game? {
+    private fun readBundle(context: Context, file: File, place: String): Game? {
         val work = File(context.cacheDir, "inspect").apply { deleteRecursively(); mkdirs() }
         try {
             val base = File(work, "base.apk")
-            val facts = Converter.inspect(context, file, base, work)
+            val facts = inspect(context, file, base, work)
             val action = when (facts["bits"]) {
                 "32" -> Action.Convert
                 // A 64-bit game gets the frame helper; other 64-bit bundles, and those without
@@ -253,7 +290,7 @@ object Games {
             }
             val game = fromApk(context, base, file, place, action) ?: return null
             // A bundle usually carries its data file; one that doesn't needs it like a lone APK.
-            return if (facts["data"] == "yes") game else withData(context, game, base, loose, facts["download"] == "yes")
+            return if (facts["data"] == "yes") game else needingData(context, game, base, facts["download"] == "yes")
         } finally {
             work.deleteRecursively()
         }
@@ -311,11 +348,15 @@ object Games {
         return application.category == ApplicationInfo.CATEGORY_GAME || application.flags and ApplicationInfo.FLAG_IS_GAME != 0
     }
 
+    /** The converter's facts about a file; an empty answer means it failed to read it. */
+    private fun inspect(context: Context, input: File, base: File, work: File): Map<String, String> =
+        Converter.inspect(context, input, base, work).ifEmpty { throw java.io.IOException("the converter couldn't read ${input.name}") }
+
     /** Whether an APK is built with a game engine, a known one or its own (the converter's `engine` answer). */
     private fun builtWithEngine(context: Context, apk: File): Boolean {
         val work = File(context.cacheDir, "inspect-engine").apply { deleteRecursively(); mkdirs() }
         try {
-            return Converter.inspect(context, apk, File(work, "unused.apk"), work)["engine"] == "yes"
+            return inspect(context, apk, File(work, "unused.apk"), work)["engine"] == "yes"
         } finally {
             work.deleteRecursively()
         }

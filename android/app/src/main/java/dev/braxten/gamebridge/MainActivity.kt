@@ -144,12 +144,18 @@ class MainActivity : ComponentActivity() {
         var setup by remember { mutableStateOf<Setup?>(null) }
         // True while the phone is being searched (the refresh button waits).
         var searching by remember { mutableStateOf(false) }
+        // Something changed during a search (a removal): search once more when it ends.
+        var searchAgain by remember { mutableStateOf(false) }
         val states = Conversions.states
         val busy = Conversions.busy
 
         fun refresh() {
-            if (searching) return
+            if (searching) {
+                searchAgain = true
+                return
+            }
             searching = true
+            searchAgain = false
             scope.launch {
                 val result = withContext(Dispatchers.IO) {
                     val needed = Setup(Environment.isExternalStorageManager(), packageManager.canRequestPackageInstalls())
@@ -173,6 +179,7 @@ class MainActivity : ComponentActivity() {
                 result.first?.let { games = it }
                 setup = result.second
                 searching = false
+                if (searchAgain) refresh()
                 // Android/obb opens up only in a process started with the switch on.
                 if (setup == null && installsAtStart == false) restart()
             }
@@ -204,6 +211,11 @@ class MainActivity : ComponentActivity() {
                 }
                 problems.firstOrNull()?.let { Toast.makeText(this@MainActivity, it, Toast.LENGTH_LONG).show() }
                 states.remove(game.packageName)
+                // Gone from the phone: the card goes now, not when the search below ends.
+                val fileGone = game.file?.exists() != true
+                if (fileGone && !Games.isInstalled(this@MainActivity, game.packageName)) {
+                    games = games?.filterNot { it.packageName == game.packageName && it.file == game.file }
+                }
                 refresh()
             }
         }
