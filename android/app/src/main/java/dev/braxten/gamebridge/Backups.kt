@@ -66,6 +66,7 @@ object Backups {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private const val PREFERENCES = "backups"
     private const val FOLDER = "folder"
+    private const val FOLDER_NAME = "folder_name"
     private const val ORIGINALS = "originals"
     private const val LAST = "last"
     private const val TOP = "Game Bridge"
@@ -82,15 +83,25 @@ object Backups {
     /** Keeps the folder the picker returned, with lasting access to it. */
     fun setFolder(context: Context, tree: Uri) {
         context.contentResolver.takePersistableUriPermission(tree, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
-        preferences(context).edit().putString(FOLDER, tree.toString()).apply()
+        preferences(context).edit().putString(FOLDER, tree.toString()).remove(FOLDER_NAME).apply()
     }
 
     /** "DAVx5 › Game backups": the app that keeps the folder, then the folder's name. */
+    /** The folder's name from the last [folderName] call, read without asking the folder's app. */
+    fun savedFolderName(context: Context): String? = preferences(context).getString(FOLDER_NAME, null)
+
+    /**
+     * The folder's app and name, like "RSAF › backups", and saves it for [savedFolderName].
+     * Asks the folder's app, which can take many seconds for a cloud folder, so never call it on the main thread.
+     */
     fun folderName(context: Context, tree: Uri): String {
         val app = context.packageManager.resolveContentProvider(tree.authority ?: "", PackageManager.ComponentInfoFlags.of(0))
             ?.applicationInfo?.loadLabel(context.packageManager)?.toString()
         val name = runCatching { displayName(context, DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree))) }.getOrNull()
-        return listOfNotNull(app, name).joinToString(" › ").ifEmpty { "the picked folder" }
+        val full = listOfNotNull(app, name).joinToString(" › ").ifEmpty { "the picked folder" }
+        // Only a name the folder's app gave is kept, so a cloud folder that is offline doesn't replace a good one.
+        if (name != null) preferences(context).edit().putString(FOLDER_NAME, full).apply()
+        return full
     }
 
     var keepOriginals: Boolean = false

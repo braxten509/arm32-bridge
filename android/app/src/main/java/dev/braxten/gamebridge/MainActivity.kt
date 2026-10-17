@@ -690,10 +690,12 @@ class MainActivity : ComponentActivity() {
         var originals by remember { mutableStateOf(Backups.run { loadChoices(context); keepOriginals }) }
         var converted by remember { mutableStateOf<List<Pair<String, java.io.File?>>?>(null) }
         LaunchedEffect(Unit) { converted = withContext(Dispatchers.IO) { Backups.convertedGames(context, games) } }
-        val folderName = remember(folder) { folder?.let { Backups.folderName(context, it) } }
+        var folderName by remember { mutableStateOf(Backups.savedFolderName(context)) }
+        LaunchedEffect(folder) { folder?.let { folderName = withContext(Dispatchers.IO) { Backups.folderName(context, it) } } }
         val pick = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { tree ->
             if (tree != null) {
                 Backups.setFolder(context, tree)
+                folderName = null
                 folder = Backups.folder(context)
             }
         }
@@ -721,7 +723,7 @@ class MainActivity : ComponentActivity() {
                     }
                     Text(what, color = Muted, fontSize = 14.sp)
                     Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Text(folderName ?: "No folder chosen", color = Color(0xFFE8E8EE), fontSize = 14.sp, maxLines = 2,
+                        Text(if (folder == null) "No folder chosen" else folderName ?: "Loading…", color = Color(0xFFE8E8EE), fontSize = 14.sp, maxLines = 2,
                             overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
                         TextButton(onClick = { pick.launch(null) }, modifier = Modifier.bleed(end = TextButtonInset)) { Text(if (folder == null) "Choose" else "Change", color = AccentText) }
                     }
