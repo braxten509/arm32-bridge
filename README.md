@@ -41,8 +41,7 @@ says **Needs game data**; tap it for what to do.
 or are built with a known game engine like Unity or Unreal). **Convert** keeps the game's own code and adds a small
 helper that lifts its frame limit, the way the bridge does for 32-bit games: it asks the phone for 120 Hz,
 shortens the game's waits between frames, and for Unity games raises Unity's frame rate setting (30 by default) to
-120. The game is signed again, so a copy installed from the Play Store has to be removed first (its progress may
-be lost unless it saves online), and the Play Store won't update it. Only tested so far with Taverns & Quests
+120. The game is signed again, so the Play Store won't update it. Only tested so far with Taverns & Quests
 (Unity) on the PC's Android emulator; Unreal games get only the general part for now.
 
 ## Games that have worked so far
@@ -70,7 +69,9 @@ when it reaches them.
 - **No games are included.** Bring your own copies of games you own. This project is not connected to any game
   maker or store.
 - **Converted games are signed by Game Bridge, not by their maker.** If the original game is still installed
-  (for example from the Play Store), uninstall it first; that deletes its saved progress.
+  (for example from the Play Store), its card says **Already installed · tap to replace**. Replace removes the
+  installed copy (Android asks first), then installs the converted one. Its saved progress is lost unless the game
+  saves online.
 - **Old games get a small label change.** Android 17 refuses games made for Android 6 or older, so Game Bridge
   marks them as made for Android 7. Most games don't notice; a very old game could act differently.
 - **Each phone has its own key.** Game Bridge makes a signing key for games on the phone and keeps it there. If

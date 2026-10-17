@@ -26,19 +26,21 @@ object Conversions {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
-    fun convert(context: Context, game: Game) {
+    /** `replace`: remove a copy of the game signed by someone else (Android asks), then install this one. */
+    fun convert(context: Context, game: Game, replace: Boolean = false) {
         if (busy || game.file == null) return
         busy = true
         val appContext = context.applicationContext
         scope.launch {
             val outcome = withContext(Dispatchers.IO) {
-                Converter(appContext, Installer(appContext)).convert(game) { progress ->
+                Converter(appContext, Installer(appContext)).convert(game, replace) { progress ->
                     scope.launch { states[game.packageName] = CardState.Working(progress) }
                 }
             }
             states[game.packageName] = when (outcome) {
                 is Outcome.Installed -> CardState.Done
-                is Outcome.Failed -> CardState.Failed(outcome.reason)
+                is Outcome.Failed -> CardState.Failed(outcome.reason, replace)
+                is Outcome.OtherCopy -> CardState.OtherCopy
             }
             busy = false
         }

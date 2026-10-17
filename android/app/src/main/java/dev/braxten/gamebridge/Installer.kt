@@ -23,12 +23,11 @@ sealed class InstallResult {
     /** Android refuses games made for older versions than `sdk`. */
     class NeedsTarget(val sdk: Int) : InstallResult()
 
+    /** Another copy of the game, signed by someone else, is installed. */
+    object OtherCopy : InstallResult()
+
     class Failed(val reason: String) : InstallResult()
 }
-
-/** Message shown when the game is installed with another key (from the Play Store or another phone's Game Bridge). */
-const val OTHER_KEY = "This game is already installed from somewhere else. Uninstall it first " +
-    "(that deletes its saved progress), then try again."
 
 /**
  * Installs and removes games through Android's own installer. Android shows its confirmation for
@@ -75,7 +74,7 @@ class Installer(context: Context) {
             answer.status == PackageInstaller.STATUS_SUCCESS -> InstallResult.Done
             answer.status == PackageInstaller.STATUS_FAILURE_ABORTED -> InstallResult.Failed("The install was cancelled.")
             answer.status == NO_ANSWER -> InstallResult.Failed("Android's install screen got no answer, so the install was cancelled.")
-            answer.status == PackageInstaller.STATUS_FAILURE_CONFLICT -> InstallResult.Failed(OTHER_KEY)
+            answer.status == PackageInstaller.STATUS_FAILURE_CONFLICT -> InstallResult.OtherCopy
             answer.status == PackageInstaller.STATUS_FAILURE_BLOCKED ->
                 InstallResult.Failed("This phone doesn't allow installing apps from Game Bridge (a phone policy or restriction).")
             answer.status == PackageInstaller.STATUS_FAILURE_STORAGE -> InstallResult.Failed("Not enough free space on the phone to install it.")

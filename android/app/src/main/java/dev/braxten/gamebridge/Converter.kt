@@ -1,6 +1,7 @@
 package dev.braxten.gamebridge
 
 import android.content.Context
+import android.content.pm.PackageManager
 import java.io.File
 import java.util.zip.ZipFile
 
@@ -12,6 +13,9 @@ sealed class Outcome {
     /** Installed. `missing` lists phone functions the bridge lacks (the game may fail if it uses them). */
     class Installed(val missing: List<String>) : Outcome()
     class Failed(val reason: String) : Outcome()
+
+    /** Another copy of the game, signed by someone else, is installed; `replace` would remove it. */
+    object OtherCopy : Outcome()
 }
 
 /**
@@ -36,10 +40,14 @@ class Converter(private val context: Context, private val installer: Installer) 
         "Copying game data" to 70,
     )
 
-    fun convert(game: Game, report: (Progress) -> Unit): Outcome {
+    /**
+     * `replace`: when another copy of the game is installed (signed by someone else, so Android won't
+     * put this one over it), remove it, after this copy is ready, and install this one.
+     */
+    fun convert(game: Game, replace: Boolean, report: (Progress) -> Unit): Outcome {
         val work = File(context.cacheDir, "convert").apply { deleteRecursively(); mkdirs() }
         try {
-            return if (game.action == Action.Install) installAsIs(game, work, report) else convert(game, work, report)
+            return if (game.action == Action.Install) installAsIs(game, work, replace, report) else convert(game, work, replace, report)
         } catch (failure: Exception) {
             return Outcome.Failed(failure.message ?: failure.toString())
         } finally {
@@ -52,13 +60,45 @@ class Converter(private val context: Context, private val installer: Installer) 
      * version it takes is learned from its own refusal and remembered: later games are raised to
      * it up front, and a refused one is converted again with it, once.
      */
-    private fun convert(game: Game, work: File, report: (Progress) -> Unit): Outcome {
+    private fun convert(game: Game, work: File, replace: Boolean, report: (Progress) -> Unit): Outcome {
         val known = settings.getInt(OLDEST_TARGET, 0).takeIf { it > 0 }
-        val first = convert(game, work, report, known)
+        val first = convert(game, work, replace, report, known)
         if (first !is Attempt.Refused || (known != null && first.sdk <= known)) return first.outcome
         settings.edit().putInt(OLDEST_TARGET, first.sdk).apply()
         work.listFiles()?.forEach { it.deleteRecursively() }
-        return convert(game, work, report, first.sdk).outcome
+        return convert(game, work, replace, report, first.sdk).outcome
+    }
+
+    /**
+     * Installs `apks`; with `replace`, a copy signed by someone else is removed first (Android asks).
+     * The signatures are compared up front: Android would otherwise first offer an "update" that
+     * can only fail.
+     */
+    private fun install(apks: List<File>, game: Game, replace: Boolean, report: (Progress) -> Unit): InstallResult {
+        val otherCopy = replace && signedByOthers(game.packageName, apks)
+        if (!otherCopy) {
+            val result = installer.install(apks)
+            if (result != InstallResult.OtherCopy || !replace) return result
+        }
+        report(Progress(90, "Removing the installed copy"))
+        installer.uninstall(game.packageName)?.let { return InstallResult.Failed("The installed copy wasn't removed, so nothing changed. ($it)") }
+        report(Progress(92, "Installing"))
+        return installer.install(apks)
+    }
+
+    /**
+     * True when `packageName` is installed and signed with other keys than `apks` (all signed alike;
+     * the first one Android can read on its own counts: an asset pack, say, can't be).
+     */
+    private fun signedByOthers(packageName: String, apks: List<File>): Boolean {
+        val packages = context.packageManager
+        val flags = PackageManager.PackageInfoFlags.of(PackageManager.GET_SIGNING_CERTIFICATES.toLong())
+        val installed = runCatching { packages.getPackageInfo(packageName, flags) }.getOrNull() ?: return false
+        val ours = apks.firstNotNullOfOrNull { apk ->
+            runCatching { packages.getPackageArchiveInfo(apk.path, flags) }.getOrNull()?.takeIf { it.signingInfo != null }
+        } ?: return false
+        fun keys(info: android.content.pm.PackageInfo) = info.signingInfo?.apkContentsSigners.orEmpty().map { it.toCharsString() }.toSet()
+        return (keys(installed) != keys(ours)).also { android.util.Log.i("gamebridge", "$packageName installed copy signed by others: $it") }
     }
 
     private sealed class Attempt(val outcome: Outcome) {
@@ -66,7 +106,7 @@ class Converter(private val context: Context, private val installer: Installer) 
         class Refused(val sdk: Int) : Attempt(Outcome.Failed("Android refuses this game: it is made for an Android version older than $sdk."))
     }
 
-    private fun convert(game: Game, work: File, report: (Progress) -> Unit, minimumTarget: Int?): Attempt {
+    private fun convert(game: Game, work: File, replace: Boolean, report: (Progress) -> Unit, minimumTarget: Int?): Attempt {
         // A bundle converts into a folder of pieces (plus obb/ with its game data).
         val unsigned = File(work, if (game.isBundle) "unsigned" else "unsigned.apk")
         val missing = mutableListOf<String>()
@@ -101,9 +141,10 @@ class Converter(private val context: Context, private val installer: Installer) 
         }
 
         report(Progress(88, "Installing"))
-        when (val result = installer.install(signed)) {
+        when (val result = install(signed, game, replace, report)) {
             is InstallResult.Done -> {}
             is InstallResult.NeedsTarget -> return Attempt.Refused(result.sdk)
+            is InstallResult.OtherCopy -> return Attempt.Ended(Outcome.OtherCopy)
             is InstallResult.Failed -> return Attempt.Ended(Outcome.Failed(result.reason))
         }
         val gameData = File(unsigned, "obb")
@@ -125,7 +166,7 @@ class Converter(private val context: Context, private val installer: Installer) 
      * A bundle that already runs on this phone: its pieces (keeping their own signature) installed
      * together and its game data copied, the way the site's own installer app would.
      */
-    private fun installAsIs(game: Game, work: File, report: (Progress) -> Unit): Outcome {
+    private fun installAsIs(game: Game, work: File, replace: Boolean, report: (Progress) -> Unit): Outcome {
         report(Progress(0, "Unpacking"))
         val pieces = mutableListOf<File>()
         val gameData = File(work, "obb")
@@ -156,10 +197,11 @@ class Converter(private val context: Context, private val installer: Installer) 
         if (pieces.isEmpty()) return Outcome.Failed("The bundle has no APKs in it.")
 
         report(Progress(85, "Installing"))
-        when (val result = installer.install(pieces)) {
+        when (val result = install(pieces, game, replace, report)) {
             is InstallResult.Done -> {}
             // Its own signature can't survive a change, so it can't be raised the way a conversion is.
             is InstallResult.NeedsTarget -> return Outcome.Failed("Android refuses this game: it is made for an Android version older than ${result.sdk}.")
+            is InstallResult.OtherCopy -> return Outcome.OtherCopy
             is InstallResult.Failed -> return Outcome.Failed(result.reason)
         }
         if (gameData.isDirectory) {

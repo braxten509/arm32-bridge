@@ -89,7 +89,11 @@ sealed class CardState {
     object Ready : CardState()
     class Working(val progress: Progress) : CardState()
     object Done : CardState()
-    class Failed(val reason: String) : CardState()
+    /** `replace`: it was a replace, so trying again replaces again. */
+    class Failed(val reason: String, val replace: Boolean = false) : CardState()
+
+    /** Another copy of the game, signed by someone else, is installed: Android won't install over it. */
+    object OtherCopy : CardState()
 }
 
 /** What the setup screen shows: which of Android's two permissions the user has given. */
@@ -154,11 +158,14 @@ class MainActivity : ComponentActivity() {
                     for (game in found) {
                         val state = states[game.packageName]
                         if (state !is CardState.Working && state !is CardState.Failed) {
-                            val installed = when (game.action) {
-                                Action.Convert -> Games.isConverted(this@MainActivity, game.packageName)
-                                Action.Install -> Games.isInstalled(this@MainActivity, game.packageName)
+                            states[game.packageName] = when {
+                                game.action == Action.Install && Games.isInstalled(this@MainActivity, game.packageName) -> CardState.Done
+                                game.action == Action.Install -> CardState.Ready
+                                Games.isConverted(this@MainActivity, game.packageName) -> CardState.Done
+                                // Installed but not by Game Bridge: the original from elsewhere.
+                                Games.isInstalled(this@MainActivity, game.packageName) -> CardState.OtherCopy
+                                else -> CardState.Ready
                             }
-                            states[game.packageName] = if (installed) CardState.Done else CardState.Ready
                         }
                     }
                     found to null
@@ -171,7 +178,17 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        fun convert(game: Game) = Conversions.convert(this@MainActivity, game)
+        fun convert(game: Game) =
+            Conversions.convert(this@MainActivity, game, replace = (states[game.packageName] as? CardState.Failed)?.replace == true)
+
+        // The game whose Replace dialog is showing.
+        var replacing by remember { mutableStateOf<Game?>(null) }
+        replacing?.let { game ->
+            ReplaceDialog(game, onDismiss = { replacing = null }) {
+                replacing = null
+                Conversions.convert(this@MainActivity, game, replace = true)
+            }
+        }
 
         // The game whose Remove dialog is showing.
         var removing by remember { mutableStateOf<Game?>(null) }
@@ -236,7 +253,7 @@ class MainActivity : ComponentActivity() {
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
                     items(games!!, key = { it.file?.path ?: it.packageName }) { game ->
-                        GameCard(game, states[game.packageName] ?: CardState.Ready, busy, onConvert = { convert(game) }, onRemove = { removing = game }, onOpen = {
+                        GameCard(game, states[game.packageName] ?: CardState.Ready, busy, onConvert = { convert(game) }, onReplace = { replacing = game }, onRemove = { removing = game }, onOpen = {
                             packageManager.getLaunchIntentForPackage(game.packageName)?.let(::startActivity)
                         })
                     }
@@ -351,7 +368,7 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun GameCard(game: Game, state: CardState, busy: Boolean, onConvert: () -> Unit, onRemove: () -> Unit, onOpen: () -> Unit) {
+    private fun GameCard(game: Game, state: CardState, busy: Boolean, onConvert: () -> Unit, onReplace: () -> Unit, onRemove: () -> Unit, onOpen: () -> Unit) {
         // Press and hold a card for its menu; a running conversion can't be removed under itself.
         var menu by remember { mutableStateOf(false) }
         // A failed card shows a short line; tapping the card shows the whole reason.
@@ -377,6 +394,7 @@ class MainActivity : ComponentActivity() {
                         onClick = {
                             when {
                                 state is CardState.Failed -> why = true
+                                state == CardState.OtherCopy && !busy -> onReplace()
                                 needsDataNotice(game, state) -> dataWhy = true
                             }
                         },
@@ -384,7 +402,7 @@ class MainActivity : ComponentActivity() {
                     )
                     .padding(14.dp).fillMaxWidth(),
                 horizontalAlignment = Alignment.CenterHorizontally,
-            ) { CardContent(game, state, busy, onConvert, onOpen) }
+            ) { CardContent(game, state, busy, onConvert, onReplace, onOpen) }
             DropdownMenu(expanded = menu, onDismissRequest = { menu = false }, containerColor = Track) {
                 val close = { menu = false }
                 if (state == CardState.Done) MenuItem("Open") { close(); onOpen() }
@@ -392,6 +410,7 @@ class MainActivity : ComponentActivity() {
                     CardState.Ready -> MenuItem(if (game.action == Action.Install) "Install" else "Convert") { close(); onConvert() }
                     CardState.Done -> if (game.action == Action.Convert) MenuItem("Convert again") { close(); onConvert() }
                     is CardState.Failed -> MenuItem("Try again") { close(); onConvert() }
+                    CardState.OtherCopy -> MenuItem("Replace") { close(); onReplace() }
                     is CardState.Working -> {}
                 }
                 val installed = Games.isInstalled(this@MainActivity, game.packageName)
@@ -406,7 +425,7 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun CardContent(game: Game, state: CardState, busy: Boolean, onConvert: () -> Unit, onOpen: () -> Unit) {
+    private fun CardContent(game: Game, state: CardState, busy: Boolean, onConvert: () -> Unit, onReplace: () -> Unit, onOpen: () -> Unit) {
         Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
             Box(Modifier.size(72.dp).clip(RoundedCornerShape(18.dp)).background(Track)) {
                 game.icon?.let { Image(it.asImageBitmap(), contentDescription = null, modifier = Modifier.fillMaxSize()) }
@@ -423,6 +442,9 @@ class MainActivity : ComponentActivity() {
             // Same line in every state, so a failure doesn't make the card taller than its neighbour.
             if (state is CardState.Failed) {
                 Text("Didn't install · tap for why", color = ErrorText, fontSize = 11.sp, maxLines = 1,
+                    overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 3.dp))
+            } else if (state == CardState.OtherCopy) {
+                Text("Already installed · tap to replace", color = NoticeText, fontSize = 11.sp, maxLines = 1,
                     overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 3.dp))
             } else if (needsDataNotice(game, state)) {
                 Text("Needs game data · tap", color = NoticeText, fontSize = 11.sp, maxLines = 1,
@@ -459,6 +481,13 @@ class MainActivity : ComponentActivity() {
                         contentPadding = PaddingValues(0.dp),
                         modifier = Modifier.fillMaxSize(),
                     ) { Text("Open", color = AccentText, fontSize = 13.sp) }
+                    CardState.OtherCopy -> Button(
+                        onClick = onReplace,
+                        enabled = !busy,
+                        colors = ButtonDefaults.buttonColors(containerColor = Accent),
+                        contentPadding = PaddingValues(0.dp),
+                        modifier = Modifier.fillMaxSize(),
+                    ) { Text("Replace", fontSize = 13.sp) }
                     is CardState.Failed -> OutlinedButton(
                         onClick = onConvert,
                         enabled = !busy,
@@ -503,6 +532,30 @@ class MainActivity : ComponentActivity() {
                 }
             },
             confirmButton = { TextButton(onClick = onDismiss) { Text("OK", color = AccentText) } },
+        )
+    }
+
+    /**
+     * Asks before replacing a copy of the game that came from elsewhere: Android won't install a
+     * copy signed by Game Bridge over it, so it has to go, and its saved progress with it.
+     */
+    @Composable
+    private fun ReplaceDialog(game: Game, onDismiss: () -> Unit, onConfirm: () -> Unit) {
+        AlertDialog(
+            onDismissRequest = onDismiss,
+            containerColor = CardColor,
+            title = { Text("Replace ${game.label}?", color = Color(0xFFE8E8EE)) },
+            text = {
+                Text(
+                    "${game.label} is already installed from somewhere else, and Android only lets one copy in. " +
+                        "Game Bridge first makes its copy, then removes the installed one (Android asks you) and installs " +
+                        "its copy. Saved progress is deleted with the old copy, unless the game saves it online. " +
+                        "Updates from the Play Store stop for this game.",
+                    color = Muted, fontSize = 14.sp,
+                )
+            },
+            confirmButton = { TextButton(onClick = onConfirm) { Text("Replace", color = ErrorText) } },
+            dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel", color = AccentText) } },
         )
     }
 
