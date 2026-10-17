@@ -5,6 +5,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
+import android.provider.DocumentsContract
 import android.provider.Settings
 import android.text.format.DateUtils
 import android.view.WindowManager
@@ -104,6 +105,12 @@ private val CheckboxInset = 14.dp
 
 /** The space between a text button's edge and its text. */
 private val TextButtonInset = 12.dp
+
+/**
+ * Where the folder picker opens. Left to itself it opens the last folder used, and a cloud
+ * folder whose app is busy uploading leaves the picker blank until the upload ends.
+ */
+private val PHONE_STORAGE = DocumentsContract.buildDocumentUri("com.android.externalstorage.documents", "primary:")
 
 /** One turn of the refresh arrow while a search runs. */
 private const val SPIN_MILLIS = 900
@@ -755,7 +762,7 @@ class MainActivity : ComponentActivity() {
                     Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                         Text(if (folder == null) "No folder chosen" else folderName ?: "Loading…", color = Color(0xFFE8E8EE), fontSize = 14.sp, maxLines = 2,
                             overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
-                        TextButton(onClick = { pick.launch(null) }, modifier = Modifier.bleed(end = TextButtonInset)) { Text(if (folder == null) "Choose" else "Change", color = AccentText) }
+                        TextButton(onClick = { pick.launch(PHONE_STORAGE) }, modifier = Modifier.bleed(end = TextButtonInset)) { Text(if (folder == null) "Choose" else "Change", color = AccentText) }
                     }
                     Row(
                         Modifier.padding(top = 4.dp).bleed(start = CheckboxInset).clip(RoundedCornerShape(8.dp)).clickable {
