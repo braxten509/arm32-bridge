@@ -85,7 +85,7 @@ import androidx.compose.ui.unit.offset
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
-import kotlin.math.ceil
+import kotlin.math.floor
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -379,14 +379,15 @@ class MainActivity : ComponentActivity() {
     /** The round "search the phone again" button next to the title; dimmed while a search runs. */
     @Composable
     private fun RefreshButton(enabled: Boolean, spinning: Boolean, onClick: () -> Unit) {
-        // Turns while a search runs; when it ends, the turn finishes instead of jumping back.
+        // Turns while a search runs, counterclockwise like the arrow points; when it ends, the turn
+        // finishes instead of jumping back.
         val turn = remember { Animatable(0f) }
         LaunchedEffect(spinning) {
             if (spinning) {
-                while (true) turn.animateTo(turn.value + 360f, tween(SPIN_MILLIS, easing = LinearEasing))
+                while (true) turn.animateTo(turn.value - 360f, tween(SPIN_MILLIS, easing = LinearEasing))
             } else {
-                val end = ceil(turn.value / 360f) * 360f
-                turn.animateTo(end, tween(((end - turn.value) / 360f * SPIN_MILLIS).toInt(), easing = LinearEasing))
+                val end = floor(turn.value / 360f) * 360f
+                turn.animateTo(end, tween(((turn.value - end) / 360f * SPIN_MILLIS).toInt(), easing = LinearEasing))
                 turn.snapTo(0f)
             }
         }
