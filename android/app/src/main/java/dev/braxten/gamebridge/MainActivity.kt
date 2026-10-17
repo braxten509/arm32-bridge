@@ -4,11 +4,15 @@ import android.content.ComponentName
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.text.format.DateUtils
+import android.view.WindowManager
 import android.os.Environment
 import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
@@ -28,6 +32,9 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
@@ -227,6 +234,17 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        // The backup window, and the restore window opened from it.
+        var backingUp by remember { mutableStateOf(false) }
+        var restoring by remember { mutableStateOf(false) }
+        // A long backup stops if the phone sleeps and closes the app, so the screen stays on meanwhile.
+        LaunchedEffect(Backups.status != null) {
+            if (Backups.status != null) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+        if (backingUp) BackupDialog(games.orEmpty(), onDismiss = { backingUp = false }, onRestore = { backingUp = false; restoring = true })
+        if (restoring) RestoreDialog(onDismiss = { restoring = false }, onRestored = ::refresh)
+
         // Searching the whole phone takes a moment, so only when the app opens and on the refresh button.
         LaunchedEffect(Unit) { refresh() }
         // Back from Android's settings: check the permissions again.
@@ -246,6 +264,8 @@ class MainActivity : ComponentActivity() {
                     fontWeight = FontWeight.SemiBold,
                     modifier = Modifier.weight(1f).padding(start = 18.dp, top = 22.dp, bottom = 4.dp),
                 )
+                BackupButton(enabled = setup == null) { backingUp = true }
+                Spacer(Modifier.width(8.dp))
                 RefreshButton(enabled = !searching && setup == null, onClick = ::refresh)
             }
             Text(
@@ -612,6 +632,176 @@ class MainActivity : ComponentActivity() {
                 }
             },
             dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel", color = AccentText) } },
+        )
+    }
+
+    /** The round backup button next to refresh: an arrow going up out of a tray. */
+    @Composable
+    private fun BackupButton(enabled: Boolean, onClick: () -> Unit) {
+        Box(
+            Modifier.size(40.dp).clip(CircleShape).background(CardColor).clickable(enabled = enabled, onClick = onClick),
+            contentAlignment = Alignment.Center,
+        ) {
+            val color = if (enabled) AccentText else Muted
+            Canvas(Modifier.size(24.dp)) {
+                val stroke = 2.6.dp.toPx()
+                val style = Stroke(stroke, cap = StrokeCap.Round, join = androidx.compose.ui.graphics.StrokeJoin.Round)
+                val left = size.width * 0.2f
+                val right = size.width * 0.8f
+                val bottom = size.height * 0.82f
+                // The tray.
+                drawPath(Path().apply {
+                    moveTo(left, size.height * 0.6f)
+                    lineTo(left, bottom)
+                    lineTo(right, bottom)
+                    lineTo(right, size.height * 0.6f)
+                }, color, style = style)
+                // The arrow.
+                val top = size.height * 0.16f
+                drawLine(color, Offset(center.x, size.height * 0.64f), Offset(center.x, top), stroke, StrokeCap.Round)
+                drawPath(Path().apply {
+                    moveTo(center.x - size.width * 0.2f, top + size.height * 0.2f)
+                    lineTo(center.x, top)
+                    lineTo(center.x + size.width * 0.2f, top + size.height * 0.2f)
+                }, color, style = style)
+            }
+        }
+    }
+
+    /**
+     * Backs up every converted game with its game data files to the folder picked with Android's
+     * folder picker; the box adds the original downloaded files. Restore… opens the restore window.
+     */
+    @Composable
+    private fun BackupDialog(games: List<Game>, onDismiss: () -> Unit, onRestore: () -> Unit) {
+        val context = this@MainActivity
+        var folder by remember { mutableStateOf(Backups.folder(context)) }
+        var originals by remember { mutableStateOf(Backups.run { loadChoices(context); keepOriginals }) }
+        var converted by remember { mutableStateOf<List<Pair<String, java.io.File?>>?>(null) }
+        LaunchedEffect(Unit) { converted = withContext(Dispatchers.IO) { Backups.convertedGames(context, games) } }
+        val folderName = remember(folder) { folder?.let { Backups.folderName(context, it) } }
+        val pick = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { tree ->
+            if (tree != null) {
+                Backups.setFolder(context, tree)
+                folder = Backups.folder(context)
+            }
+        }
+        val status = Backups.status
+        val count = converted?.size
+        AlertDialog(
+            onDismissRequest = onDismiss,
+            containerColor = CardColor,
+            title = { Text("Back up games", color = Color(0xFFE8E8EE)) },
+            text = {
+                Column {
+                    if (status != null) {
+                        Text(status, color = Color(0xFFE8E8EE), fontSize = 14.sp)
+                        Text("Keep Game Bridge open until it finishes.", color = Muted, fontSize = 12.sp, modifier = Modifier.padding(top = 6.dp))
+                        return@Column
+                    }
+                    val what = when (count) {
+                        null -> "Looking for converted games…"
+                        0 -> "No converted games are installed yet."
+                        1 -> "1 converted game and its data files go to:"
+                        else -> "$count converted games and their data files go to:"
+                    }
+                    Text(what, color = Muted, fontSize = 14.sp)
+                    Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Text(folderName ?: "No folder chosen", color = Color(0xFFE8E8EE), fontSize = 14.sp, maxLines = 2,
+                            overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                        TextButton(onClick = { pick.launch(null) }) { Text(if (folder == null) "Choose" else "Change", color = AccentText) }
+                    }
+                    Row(
+                        Modifier.padding(top = 4.dp).clip(RoundedCornerShape(8.dp)).clickable {
+                            originals = !originals
+                            Backups.setKeepOriginals(context, originals)
+                        }.padding(end = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Checkbox(originals, onCheckedChange = { originals = it; Backups.setKeepOriginals(context, it) },
+                            colors = CheckboxDefaults.colors(checkedColor = Accent, uncheckedColor = AccentText))
+                        Text("Also back up the original files", color = Color(0xFFE8E8EE), fontSize = 14.sp)
+                    }
+                    val last = Backups.lastBackup(context)
+                    if (last > 0) {
+                        Text("Last backup: ${DateUtils.getRelativeTimeSpanString(last)}", color = Muted, fontSize = 12.sp, modifier = Modifier.padding(top = 6.dp))
+                    }
+                    Backups.problem?.let { Text(it, color = ErrorText, fontSize = 13.sp, modifier = Modifier.padding(top = 8.dp)) }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = status == null && folder != null && (count ?: 0) > 0,
+                    onClick = { Backups.backUp(context, converted.orEmpty(), originals) },
+                ) { Text("Back up", color = if (status == null && folder != null && (count ?: 0) > 0) AccentText else Muted) }
+            },
+            dismissButton = {
+                Row {
+                    TextButton(enabled = status == null && folder != null, onClick = onRestore) {
+                        Text("Restore…", color = if (status == null && folder != null) AccentText else Muted)
+                    }
+                    TextButton(onClick = onDismiss) { Text(if (status == null) "Cancel" else "Hide", color = AccentText) }
+                }
+            },
+        )
+    }
+
+    /** The games in the backup folder, each with Restore (or "Installed" when that version is). */
+    @Composable
+    private fun RestoreDialog(onDismiss: () -> Unit, onRestored: () -> Unit) {
+        val context = this@MainActivity
+        val scope = rememberCoroutineScope()
+        var saved by remember { mutableStateOf<List<SavedGame>?>(null) }
+        // The game being restored and how far it is, or its problem afterwards.
+        var working by remember { mutableStateOf<String?>(null) }
+        var progress by remember { mutableStateOf("") }
+        var problem by remember { mutableStateOf<String?>(null) }
+        LaunchedEffect(Unit) { saved = withContext(Dispatchers.IO) { runCatching { Backups.list(context) }.getOrDefault(emptyList()) } }
+        AlertDialog(
+            onDismissRequest = { if (working == null) onDismiss() },
+            containerColor = CardColor,
+            title = { Text("Restore games", color = Color(0xFFE8E8EE)) },
+            text = {
+                Column(Modifier.verticalScroll(rememberScrollState())) {
+                    val list = saved
+                    when {
+                        list == null -> Text("Reading the backup…", color = Muted, fontSize = 14.sp)
+                        list.isEmpty() -> Text("No finished backups in this folder.", color = Muted, fontSize = 14.sp)
+                    }
+                    problem?.let { Text(it, color = ErrorText, fontSize = 13.sp, modifier = Modifier.padding(bottom = 8.dp)) }
+                    list.orEmpty().forEach { game ->
+                        val current = remember(game, working) { game.inPlace(context) }
+                        Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Box(Modifier.size(36.dp).clip(RoundedCornerShape(8.dp)).background(Track)) {
+                                game.icon?.let { Image(it.asImageBitmap(), contentDescription = null, modifier = Modifier.fillMaxSize()) }
+                            }
+                            Column(Modifier.weight(1f).padding(horizontal = 10.dp)) {
+                                Text(game.label, color = Color(0xFFE8E8EE), fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                val detail = if (working == game.packageName) progress
+                                    else listOf(game.versionName.takeIf { it.isNotEmpty() }?.let { "v$it" }, android.text.format.Formatter.formatShortFileSize(context, game.size))
+                                        .filterNotNull().joinToString(" · ")
+                                Text(detail, color = Muted, fontSize = 11.sp, maxLines = 1)
+                            }
+                            TextButton(
+                                enabled = working == null && !current,
+                                onClick = {
+                                    working = game.packageName
+                                    problem = null
+                                    progress = "Starting…"
+                                    scope.launch {
+                                        problem = withContext(Dispatchers.IO) {
+                                            Backups.restore(context, game) { text -> scope.launch { progress = text } }
+                                        }
+                                        working = null
+                                        onRestored()
+                                    }
+                                },
+                            ) { Text(if (current) "Installed" else "Restore", color = if (working == null && !current) AccentText else Muted) }
+                        }
+                    }
+                }
+            },
+            confirmButton = { TextButton(enabled = working == null, onClick = onDismiss) { Text("Close", color = AccentText) } },
         )
     }
 }

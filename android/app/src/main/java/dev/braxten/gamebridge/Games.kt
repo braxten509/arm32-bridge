@@ -312,7 +312,7 @@ object Games {
      * icon.rs) is drawn without the phone's shape mask: its layers are 1.5 times the icon, so the
      * middle two thirds show, which for a converted game is exactly its original picture.
      */
-    private fun iconBitmap(drawable: Drawable?): Bitmap? = drawable?.let {
+    fun iconBitmap(drawable: Drawable?): Bitmap? = drawable?.let {
         val size = 192
         Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888).also { bitmap ->
             val canvas = Canvas(bitmap)
