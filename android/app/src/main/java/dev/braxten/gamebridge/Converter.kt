@@ -72,23 +72,30 @@ class Converter(private val context: Context, private val installer: Installer) 
     /**
      * Installs `apks`; with `replace`, a copy signed by someone else is removed first (Android asks).
      * The signatures are compared up front: Android would otherwise first offer an "update" that
-     * can only fail.
+     * can only fail. Only a copy known to be signed by others is ever removed.
      */
     private fun install(apks: List<File>, game: Game, replace: Boolean, report: (Progress) -> Unit): InstallResult {
-        val otherCopy = replace && signedByOthers(game.packageName, apks)
-        if (!otherCopy) {
+        if (!replace || !signedByOthers(game.packageName, apks)) {
             val result = installer.install(apks)
-            if (result != InstallResult.OtherCopy || !replace) return result
+            if (result !is InstallResult.Conflict) return result
+            // Android's conflict also covers clashes with other apps; only another signer can be replaced.
+            return if (signedByOthers(game.packageName, apks)) InstallResult.OtherCopy
+            else InstallResult.Failed("Android didn't install it: ${result.message ?: "it clashes with an installed app"}")
         }
         report(Progress(90, "Removing the installed copy"))
-        installer.uninstall(game.packageName)?.let { return InstallResult.Failed("The installed copy wasn't removed, so nothing changed. ($it)") }
+        installer.uninstall(game.packageName)?.let { return InstallResult.Failed("The installed copy wasn't replaced. $it") }
         report(Progress(92, "Installing"))
-        return installer.install(apks)
+        return when (val result = installer.install(apks)) {
+            is InstallResult.Failed -> InstallResult.Failed("The installed copy was removed, but the converted game wasn't installed: ${result.reason} Tap Convert to try again.")
+            is InstallResult.Conflict -> InstallResult.Failed("The installed copy was removed, but the converted game wasn't installed: ${result.message ?: "it clashes with an installed app"}")
+            else -> result
+        }
     }
 
     /**
-     * True when `packageName` is installed and signed with other keys than `apks` (all signed alike;
-     * the first one Android can read on its own counts: an asset pack, say, can't be).
+     * True only when `packageName` is installed and surely signed by others: no key of the installed
+     * copy (its signers and their past keys) is a key of `apks` (all signed alike; the first one
+     * Android can read on its own counts: an asset pack, say, can't be). Unknown counts as false.
      */
     private fun signedByOthers(packageName: String, apks: List<File>): Boolean {
         val packages = context.packageManager
@@ -97,8 +104,14 @@ class Converter(private val context: Context, private val installer: Installer) 
         val ours = apks.firstNotNullOfOrNull { apk ->
             runCatching { packages.getPackageArchiveInfo(apk.path, flags) }.getOrNull()?.takeIf { it.signingInfo != null }
         } ?: return false
-        fun keys(info: android.content.pm.PackageInfo) = info.signingInfo?.apkContentsSigners.orEmpty().map { it.toCharsString() }.toSet()
-        return (keys(installed) != keys(ours)).also { android.util.Log.i("gamebridge", "$packageName installed copy signed by others: $it") }
+        fun keys(info: android.content.pm.PackageInfo): Set<String> {
+            val signing = info.signingInfo ?: return emptySet()
+            val past = if (signing.hasMultipleSigners()) emptyList() else signing.signingCertificateHistory.orEmpty().toList()
+            return (signing.apkContentsSigners.orEmpty().toList() + past).map { it.toCharsString() }.toSet()
+        }
+        val theirs = keys(installed)
+        return (theirs.isNotEmpty() && theirs.intersect(keys(ours)).isEmpty())
+            .also { android.util.Log.i("gamebridge", "$packageName installed copy signed by others: $it") }
     }
 
     private sealed class Attempt(val outcome: Outcome) {
@@ -145,6 +158,7 @@ class Converter(private val context: Context, private val installer: Installer) 
             is InstallResult.Done -> {}
             is InstallResult.NeedsTarget -> return Attempt.Refused(result.sdk)
             is InstallResult.OtherCopy -> return Attempt.Ended(Outcome.OtherCopy)
+            is InstallResult.Conflict -> return Attempt.Ended(Outcome.Failed("Android didn't install it: ${result.message}"))
             is InstallResult.Failed -> return Attempt.Ended(Outcome.Failed(result.reason))
         }
         val gameData = File(unsigned, "obb")
@@ -202,6 +216,7 @@ class Converter(private val context: Context, private val installer: Installer) 
             // Its own signature can't survive a change, so it can't be raised the way a conversion is.
             is InstallResult.NeedsTarget -> return Outcome.Failed("Android refuses this game: it is made for an Android version older than ${result.sdk}.")
             is InstallResult.OtherCopy -> return Outcome.OtherCopy
+            is InstallResult.Conflict -> return Outcome.Failed("Android didn't install it: ${result.message}")
             is InstallResult.Failed -> return Outcome.Failed(result.reason)
         }
         if (gameData.isDirectory) {

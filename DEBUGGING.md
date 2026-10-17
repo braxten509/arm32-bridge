@@ -2102,3 +2102,10 @@ Owner's choices: downloaded files only (no Play Store installs), general steps p
   game's own setter used first.
 - Not done: Unreal-specific steps (no test game; config paths and pacing differ by version), Mono Unity's
   il2cpp_resolve_icall fallback (Mono needs the registration to be caught).
+- Replace (2026-10-17, commits f411cf0 + next): a card for a game installed from elsewhere says "Already installed ·
+  tap to replace". Replace compares signers up front (installed copy vs the first piece Android can parse; an asset
+  pack can't be) including past keys; only a copy surely signed by others is removed, then the converted one is
+  installed, so Android's misleading "update?" screen is skipped. Android's CONFLICT status alone never removes
+  anything (it also covers provider/permission clashes). After removal, a failed install says the old copy is gone.
+  Codex review: 3 findings, all fixed. Emulator test: ~/dev/scratch-bhook/replace-test.sh (original T&Q pieces ->
+  Replace -> OK -> Install -> Installed + provider).

@@ -26,6 +26,9 @@ sealed class InstallResult {
     /** Another copy of the game, signed by someone else, is installed. */
     object OtherCopy : InstallResult()
 
+    /** Android's "conflict": a copy signed by someone else, or a clash with another app (`message` says which). */
+    class Conflict(val message: String?) : InstallResult()
+
     class Failed(val reason: String) : InstallResult()
 }
 
@@ -74,7 +77,7 @@ class Installer(context: Context) {
             answer.status == PackageInstaller.STATUS_SUCCESS -> InstallResult.Done
             answer.status == PackageInstaller.STATUS_FAILURE_ABORTED -> InstallResult.Failed("The install was cancelled.")
             answer.status == NO_ANSWER -> InstallResult.Failed("Android's install screen got no answer, so the install was cancelled.")
-            answer.status == PackageInstaller.STATUS_FAILURE_CONFLICT -> InstallResult.OtherCopy
+            answer.status == PackageInstaller.STATUS_FAILURE_CONFLICT -> InstallResult.Conflict(answer.message)
             answer.status == PackageInstaller.STATUS_FAILURE_BLOCKED ->
                 InstallResult.Failed("This phone doesn't allow installing apps from Game Bridge (a phone policy or restriction).")
             answer.status == PackageInstaller.STATUS_FAILURE_STORAGE -> InstallResult.Failed("Not enough free space on the phone to install it.")
@@ -143,7 +146,9 @@ class Installer(context: Context) {
         }
         return when (answer.status) {
             PackageInstaller.STATUS_SUCCESS -> null
-            PackageInstaller.STATUS_FAILURE_ABORTED, NO_ANSWER -> "Not removed."
+            PackageInstaller.STATUS_FAILURE_ABORTED -> "Not removed."
+            // Android's removal screen can't be withdrawn: approving it later still removes the game.
+            NO_ANSWER -> "Android's removal screen got no answer in time. If it is still open, approving it still removes the game."
             else -> "Android didn't remove it: ${answer.message ?: "no reason given"}"
         }
     }
