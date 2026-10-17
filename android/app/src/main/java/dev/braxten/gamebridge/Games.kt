@@ -311,7 +311,7 @@ object Games {
         return application.category == ApplicationInfo.CATEGORY_GAME || application.flags and ApplicationInfo.FLAG_IS_GAME != 0
     }
 
-    /** Whether an APK is built with a known game engine (the converter's `engine` answer). */
+    /** Whether an APK is built with a game engine, a known one or its own (the converter's `engine` answer). */
     private fun builtWithEngine(context: Context, apk: File): Boolean {
         val work = File(context.cacheDir, "inspect-engine").apply { deleteRecursively(); mkdirs() }
         try {

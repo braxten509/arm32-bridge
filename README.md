@@ -38,7 +38,8 @@ it also checks that it's the right, undamaged file. If a game needs one and Game
 says **Needs game data**; tap it for what to do.
 
 **64-bit games: lifting their frame limit.** Downloaded 64-bit games show up too (apps that say they are games,
-or are built with a known game engine like Unity or Unreal). **Convert** keeps the game's own code and adds a small
+are built with a known game engine like Unity or Unreal, or have code of their own that both draws and plays
+sound, like Plants vs. Zombies 2 and its mods). **Convert** keeps the game's own code and adds a small
 helper that lifts its frame limit, the way the bridge does for 32-bit games: it asks the phone for 120 Hz,
 shortens the game's waits between frames, and for Unity games raises Unity's frame rate setting (30 by default) to
 120. The game is signed again, so the Play Store won't update it. Only tested so far with Taverns & Quests

@@ -29,7 +29,8 @@
 //! (`--min-target-sdk N` raises the game's target Android version to N: phones without root refuse older ones.)
 //! `--inspect` only looks: it prints `kind apk|bundle`, `data yes|no` for a bundle (carries game data),
 //! `download yes|no` (the game's own code starts Google Play's expansion-file download), `bits 32|64|none`
-//! (what native code the game has) and `engine yes|no` (built with a known game engine), and with --base copies a bundle's base
+//! (what native code the game has) and `engine yes|no` (built with a known game engine, or with its own: a library that
+//! draws and plays sound itself and is bigger than the Java code, see own_engine), and with --base copies a bundle's base
 //! APK (the piece with the Java code) out, for reading its name and icon.
 //!
 //! Progress goes to stdout, one line each: `step <text>`, `abi <abi>`,
@@ -42,6 +43,7 @@ mod dex;
 mod fixes;
 mod icon;
 mod manifest;
+mod needed;
 
 use std::fs::File;
 use std::io::{Read, Seek, Write};
@@ -566,12 +568,13 @@ fn next_dex_name<'a>(names: impl Iterator<Item = &'a str>) -> String {
 fn inspect(input: &Path, base: Option<&Path>, work: &Path) -> Result<(), String> {
     let scratch = work.join(format!("apk-convert-pieces-{}", std::process::id()));
     let result = (|| {
-        let names: Vec<String> = match bundle::open(input, &scratch)? {
+        match bundle::open(input, &scratch)? {
             None => {
                 let mut archive = ZipArchive::new(File::open(input).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
                 println!("kind apk");
                 println!("download {}", yes_no(starts_download(&mut archive)));
-                archive.file_names().map(String::from).collect()
+                let names: Vec<String> = archive.file_names().map(String::from).collect();
+                report_code(&names, |abi| own_engine(&mut archive, abi) > java_size(&mut archive));
             }
             Some(mut bundle) => {
                 println!("kind bundle");
@@ -588,16 +591,13 @@ fn inspect(input: &Path, base: Option<&Path>, work: &Path) -> Result<(), String>
                 if let Some(base) = base {
                     bundle::save(piece, base).map_err(|e| format!("copy out {}: {e}", piece.name))?;
                 }
-                bundle.pieces.iter().flat_map(|piece| piece.names()).collect()
+                let names: Vec<String> = bundle.pieces.iter().flat_map(|piece| piece.names()).collect();
+                report_code(&names, |abi| {
+                    let engine = bundle.pieces.iter_mut().map(|piece| own_engine(&mut piece.archive, abi)).max().unwrap_or(0);
+                    engine > bundle.pieces.iter_mut().map(|piece| java_size(&mut piece.archive)).sum()
+                });
             }
-        };
-        let bits = match bits(names.iter()) {
-            Bits::SixtyFour => "64",
-            Bits::ThirtyTwo(_) => "32",
-            Bits::None => "none",
-        };
-        println!("bits {bits}");
-        println!("engine {}", yes_no(names.iter().any(|name| is_engine_library(name))));
+        }
         Ok(())
     })();
     let _ = std::fs::remove_dir_all(&scratch);
@@ -613,6 +613,56 @@ fn is_engine_library(path: &str) -> bool {
     let Some(stem) = file.strip_prefix("lib").and_then(|rest| rest.strip_suffix(".so")) else { return false };
     matches!(stem, "unity" | "il2cpp" | "UE4" | "Unreal" | "godot_android" | "gdx" | "dmengine" | "yoyo" | "corona" | "love")
         || stem.starts_with("cocos2d")
+}
+
+/// Prints `bits` and `engine` for an APK's or a bundle's file names. `own_engine`
+/// says whether the libraries of one ABI folder hold an engine of the app's own; it only runs
+/// when no known engine is there.
+fn report_code(names: &[String], own_engine: impl FnOnce(&str) -> bool) {
+    let (bits, abi) = match bits(names.iter()) {
+        Bits::SixtyFour => ("64", Some("arm64-v8a")),
+        Bits::ThirtyTwo(abi) => ("32", Some(abi)),
+        Bits::None => ("none", None),
+    };
+    println!("bits {bits}");
+    let engine = names.iter().any(|name| is_engine_library(name)) || abi.is_some_and(own_engine);
+    println!("engine {}", yes_no(engine));
+}
+
+/// Libraries a game's own engine draws with and plays sound through.
+const GRAPHICS_LIBRARIES: [&str; 4] = ["libGLESv1_CM.so", "libGLESv2.so", "libGLESv3.so", "libvulkan.so"];
+const SOUND_LIBRARIES: [&str; 2] = ["libOpenSLES.so", "libaaudio.so"];
+
+/// The size of the biggest library in lib/<abi>/ that looks like a game engine of the
+/// app's own (PvZ 2's libPVZ2.so, for one): it asks for a graphics library and a sound
+/// library itself. 0 if there is none. Most ordinary apps leave drawing to Android's views or a
+/// web page and the sound to Android's players; those that do it themselves (video calls) do
+/// it in a part smaller than their Java code, while a game's engine is most of the game.
+fn own_engine<R: Read + Seek>(archive: &mut ZipArchive<R>, abi: &str) -> u64 {
+    let names: Vec<String> = archive.file_names().filter(|name| library_in(abi, name).is_some()).map(String::from).collect();
+    names.iter()
+        .filter_map(|name| {
+            let mut file = archive.by_name(name).ok()?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).ok()?;
+            needed::needed(&bytes).filter(|needed| draws_and_plays(needed)).map(|_| bytes.len() as u64)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// The size of the app's Java code (its classes*.dex files, unpacked).
+fn java_size<R: Read + Seek>(archive: &mut ZipArchive<R>) -> u64 {
+    let dex_files: Vec<String> = archive.file_names()
+        .filter(|name| name.starts_with("classes") && name.ends_with(".dex") && !name.contains('/'))
+        .map(String::from)
+        .collect();
+    dex_files.iter().filter_map(|name| archive.by_name(name).ok().map(|file| file.size())).sum()
+}
+
+fn draws_and_plays(needed: &[String]) -> bool {
+    needed.iter().any(|name| GRAPHICS_LIBRARIES.contains(&name.as_str()))
+        && needed.iter().any(|name| SOUND_LIBRARIES.contains(&name.as_str()))
 }
 
 fn yes_no(answer: bool) -> &'static str {
@@ -662,6 +712,15 @@ mod tests {
         assert!(!is_engine_library("lib/arm64-v8a/libunityads.so"));
         assert!(!is_engine_library("assets/libunity.so"));
         assert!(!is_engine_library("lib/arm64-v8a/libc++_shared.so"));
+    }
+
+    #[test]
+    fn own_engines() {
+        let names = |list: &[&str]| list.iter().map(|name| name.to_string()).collect::<Vec<_>>();
+        assert!(draws_and_plays(&names(&["libz.so", "libGLESv2.so", "libOpenSLES.so", "libc.so"])));
+        assert!(draws_and_plays(&names(&["libvulkan.so", "libaaudio.so"])));
+        assert!(!draws_and_plays(&names(&["libGLESv2.so", "libEGL.so", "libc.so"])));
+        assert!(!draws_and_plays(&names(&["libOpenSLES.so", "libc.so"])));
     }
 
     #[test]
