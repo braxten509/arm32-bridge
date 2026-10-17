@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.drawable.AdaptiveIconDrawable
 import android.graphics.drawable.Drawable
@@ -11,8 +12,11 @@ import android.os.Environment
 import android.os.storage.StorageManager
 import java.io.File
 import java.io.InputStream
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.zip.ZipFile
+import org.json.JSONArray
+import org.json.JSONObject
 
 /** A game data file found on the phone: a loose .obb file, or one inside a .zip (`entry`). */
 class DataSource(val file: File, val entry: String?, val name: String, val size: Long) {
@@ -75,6 +79,8 @@ object Games {
      * Only each APK's file list and manifest are read (for a bundle, its base APK is copied out to read them).
      */
     fun scan(context: Context): List<Game> {
+        val started = System.currentTimeMillis()
+        val readBefore = reads
         val found = storageRoots(context).flatMap { (root, name) ->
             files(root).sortedBy { it.path.lowercase() }.map { it to place(root, name, it) }
         }
@@ -88,7 +94,88 @@ object Games {
         val installed = installed(context, loose)
         // Files that are gone (deleted, or a game's old APK after an update) are forgotten.
         seen.keys.retainAll((gameFiles.map { (file, _) -> file.path } + installed.map { it.second }).toSet())
-        return (games + installed.map { it.first }.filter { it.packageName !in withFiles }).sortedBy { it.label.lowercase() }
+        val list = (games + installed.map { it.first }.filter { it.packageName !in withFiles }).sortedBy { it.label.lowercase() }
+        runCatching { save(context, list) }
+        android.util.Log.i("GameBridge", "Search: ${list.size} games, ${found.size} files (${reads - readBefore} read) in ${System.currentTimeMillis() - started} ms")
+        return list
+    }
+
+    /**
+     * The list the last search found, saved on disk, so the app shows it at once while it searches
+     * again. Also fills in what was read about each file, so that search reads only new and
+     * changed files. Null before the first search finishes.
+     */
+    fun saved(context: Context): List<Game>? = runCatching {
+        val saved = JSONObject(savedFile(context).readText())
+        val icons = iconFolder(context)
+        val files = saved.getJSONArray("seen")
+        for (index in 0 until files.length()) {
+            val entry = files.getJSONObject(index)
+            val path = entry.getString("path")
+            seen.putIfAbsent(path, Seen(entry.getLong("length"), entry.getLong("modified"), entry.optJSONObject("game")?.let { gameFrom(it, icons) }))
+        }
+        val games = saved.getJSONArray("games")
+        // A file deleted while the app was closed shows no card, not even until the search ends.
+        (0 until games.length()).map { gameFrom(games.getJSONObject(it), icons) }.filter { it.file?.exists() != false }
+    }.getOrNull()
+
+    private fun savedFile(context: Context) = File(context.filesDir, "games.json")
+    private fun iconFolder(context: Context) = File(context.filesDir, "icons")
+
+    /** Keeps `games` and `seen` for [saved]. Each icon is a picture file of its own, written once. */
+    private fun save(context: Context, games: List<Game>) {
+        val icons = iconFolder(context).apply { mkdirs() }
+        val kept = mutableSetOf<String>()
+        fun json(game: Game) = jsonOf(game, icons)?.also { (_, icon) -> icon?.let(kept::add) }?.first
+        val seenJson = JSONArray()
+        for ((path, entry) in seen) {
+            seenJson.put(JSONObject().put("path", path).put("length", entry.length).put("modified", entry.modified)
+                .put("game", entry.game?.let(::json) ?: JSONObject.NULL))
+        }
+        val saved = JSONObject().put("games", JSONArray(games.mapNotNull(::json))).put("seen", seenJson)
+        val file = savedFile(context)
+        val part = File(file.path + ".part")
+        part.writeText(saved.toString())
+        part.renameTo(file)
+        icons.listFiles()?.filter { it.name !in kept }?.forEach(File::delete)
+    }
+
+    /** `game` for the saved file, with its icon's file name (the icon written if it isn't yet). */
+    private fun jsonOf(game: Game, icons: File): Pair<JSONObject, String?>? {
+        val icon = game.icon?.let { bitmap ->
+            val name = UUID.nameUUIDFromBytes("${game.file?.path ?: game.packageName}:${game.versionCode}".toByteArray()).toString() + ".png"
+            val file = File(icons, name)
+            if (!file.exists()) {
+                val part = File(icons, "$name.part")
+                part.outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                part.renameTo(file)
+            }
+            name
+        }
+        val json = JSONObject()
+            .put("file", game.file?.path ?: JSONObject.NULL)
+            .put("place", game.place)
+            .put("label", game.label)
+            .put("package", game.packageName)
+            .put("version", game.versionCode)
+            .put("icon", icon ?: JSONObject.NULL)
+            .put("action", game.action.name)
+            .put("data", game.dataFile ?: JSONObject.NULL)
+            .put("loose", game.looseData?.let {
+                JSONObject().put("file", it.file.path).put("entry", it.entry ?: JSONObject.NULL).put("name", it.name).put("size", it.size)
+            } ?: JSONObject.NULL)
+        return json to icon
+    }
+
+    private fun gameFrom(json: JSONObject, icons: File): Game {
+        fun text(name: String) = if (json.isNull(name)) null else json.getString(name)
+        val loose = json.optJSONObject("loose")?.let {
+            DataSource(File(it.getString("file")), if (it.isNull("entry")) null else it.getString("entry"), it.getString("name"), it.getLong("size"))
+        }
+        return Game(
+            text("file")?.let(::File), json.getString("place"), json.getString("label"), json.getString("package"), json.getLong("version"),
+            text("icon")?.let { BitmapFactory.decodeFile(File(icons, it).path) }, Action.valueOf(json.getString("action")), text("data"), loose,
+        )
     }
 
     /** What reading a file found, kept while the app runs. */
@@ -97,10 +184,14 @@ object Games {
     /** By path. Reading every file takes a while, so searching again only reads new and changed ones. */
     private val seen = ConcurrentHashMap<String, Seen>()
 
+    /** Files read so far (not answered from `seen`), for the search's line in the log. */
+    @Volatile private var reads = 0
+
     /** `read`'s answer for `file`, read again only when the file changed. A failed read is tried again next time. */
     private fun remembered(file: File, read: () -> Game?): Game? {
         val (length, modified) = file.length() to file.lastModified()
         seen[file.path]?.takeIf { it.length == length && it.modified == modified }?.let { return it.game }
+        reads++
         val game = try {
             read()
         } catch (unsure: Unsure) {

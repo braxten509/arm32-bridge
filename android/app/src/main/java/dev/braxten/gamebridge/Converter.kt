@@ -234,6 +234,7 @@ class Converter(private val context: Context, private val installer: Installer) 
 
     companion object {
         private const val OLDEST_TARGET = "oldest_target_sdk"
+        private const val INSPECT_LIMIT_SECONDS = 120L
 
         /**
          * apk-convert --inspect: its `kind` and `bits` lines (bits is 32, 64 or none; a bundle also
@@ -241,10 +242,16 @@ class Converter(private val context: Context, private val installer: Installer) 
          */
         fun inspect(context: Context, file: File, base: File, work: File): Map<String, String> {
             val converter = File(context.applicationInfo.nativeLibraryDir, "libapkconvert.so")
+            val output = File(work, "inspect.txt")
             val process = ProcessBuilder(converter.path, "--inspect", file.path, "--base", base.path, "--work", work.path)
-                .redirectErrorStream(true).start()
-            val lines = process.inputStream.bufferedReader().readLines()
-            if (process.waitFor() != 0) return emptyMap()
+                .redirectErrorStream(true).redirectOutput(output).start()
+            // It takes a second or two; one stuck on a strange file must not hold up the search forever.
+            if (!process.waitFor(INSPECT_LIMIT_SECONDS, java.util.concurrent.TimeUnit.SECONDS)) {
+                process.destroyForcibly()
+                return emptyMap()
+            }
+            if (process.exitValue() != 0) return emptyMap()
+            val lines = output.readLines().also { output.delete() }
             return lines.mapNotNull { line -> line.split(' ', limit = 2).takeIf { it.size == 2 }?.let { it[0] to it[1] } }.toMap()
         }
     }

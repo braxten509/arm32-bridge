@@ -4,16 +4,19 @@ import android.content.ComponentName
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
-import android.text.format.DateUtils
-import android.view.WindowManager
 import android.os.Environment
 import android.provider.Settings
+import android.text.format.DateUtils
+import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -23,8 +26,8 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -33,13 +36,13 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -63,24 +66,26 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.layout.layout
-import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.translate
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.layout.layout
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.offset
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
+import kotlin.math.ceil
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -99,6 +104,9 @@ private val CheckboxInset = 14.dp
 
 /** The space between a text button's edge and its text. */
 private val TextButtonInset = 12.dp
+
+/** One turn of the refresh arrow while a search runs. */
+private const val SPIN_MILLIS = 900
 
 /** What a game's card shows. */
 sealed class CardState {
@@ -152,6 +160,24 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /** Each card's button for the games in `found`, from what is installed now (a card that is converting or failed keeps its state). */
+    private fun updateStates(found: List<Game>) {
+        val states = Conversions.states
+        for (game in found) {
+            val state = states[game.packageName]
+            if (state !is CardState.Working && state !is CardState.Failed) {
+                states[game.packageName] = when {
+                    game.action == Action.Install && Games.isInstalled(this, game.packageName) -> CardState.Done
+                    game.action == Action.Install -> CardState.Ready
+                    Games.isConverted(this, game.packageName) -> CardState.Done
+                    // Installed but not by Game Bridge: the original from elsewhere.
+                    Games.isInstalled(this, game.packageName) -> CardState.OtherCopy
+                    else -> CardState.Ready
+                }
+            }
+        }
+    }
+
     @Composable
     private fun Screen() {
         val scope = rememberCoroutineScope()
@@ -176,21 +202,7 @@ class MainActivity : ComponentActivity() {
                 val result = withContext(Dispatchers.IO) {
                     val needed = Setup(Environment.isExternalStorageManager(), packageManager.canRequestPackageInstalls())
                     if (!needed.files || !needed.installs) return@withContext null to needed
-                    val found = Games.scan(this@MainActivity)
-                    for (game in found) {
-                        val state = states[game.packageName]
-                        if (state !is CardState.Working && state !is CardState.Failed) {
-                            states[game.packageName] = when {
-                                game.action == Action.Install && Games.isInstalled(this@MainActivity, game.packageName) -> CardState.Done
-                                game.action == Action.Install -> CardState.Ready
-                                Games.isConverted(this@MainActivity, game.packageName) -> CardState.Done
-                                // Installed but not by Game Bridge: the original from elsewhere.
-                                Games.isInstalled(this@MainActivity, game.packageName) -> CardState.OtherCopy
-                                else -> CardState.Ready
-                            }
-                        }
-                    }
-                    found to null
+                    Games.scan(this@MainActivity).also(::updateStates) to null
                 }
                 result.first?.let { games = it }
                 setup = result.second
@@ -199,6 +211,13 @@ class MainActivity : ComponentActivity() {
                 // Android/obb opens up only in a process started with the switch on.
                 if (setup == null && installsAtStart == false) restart()
             }
+        }
+
+        // The list the last search found shows at once; the search below then adds and removes cards.
+        LaunchedEffect(Unit) {
+            val saved = withContext(Dispatchers.IO) { Games.saved(this@MainActivity)?.also(::updateStates) }
+            if (games == null && saved != null) games = saved
+            refresh()
         }
 
         fun convert(game: Game) =
@@ -254,8 +273,7 @@ class MainActivity : ComponentActivity() {
         if (backingUp) BackupDialog(games.orEmpty(), onDismiss = { backingUp = false }, onRestore = { backingUp = false; restoring = true })
         if (restoring) RestoreDialog(onDismiss = { restoring = false }, onRestored = ::refresh)
 
-        // Searching the whole phone takes a moment, so only when the app opens and on the refresh button.
-        LaunchedEffect(Unit) { refresh() }
+        // Searching the whole phone takes a moment, so only when the app opens (above) and on the refresh button.
         // Back from Android's settings: check the permissions again.
         LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
             if (setup != null) refresh()
@@ -275,7 +293,7 @@ class MainActivity : ComponentActivity() {
                 )
                 BackupButton(enabled = setup == null) { backingUp = true }
                 Spacer(Modifier.width(8.dp))
-                RefreshButton(enabled = !searching && setup == null, onClick = ::refresh)
+                RefreshButton(enabled = !searching && setup == null, spinning = searching && setup == null, onClick = ::refresh)
             }
             Text(
                 "Game APKs, XAPKs and data files on this phone.",
@@ -360,12 +378,23 @@ class MainActivity : ComponentActivity() {
 
     /** The round "search the phone again" button next to the title; dimmed while a search runs. */
     @Composable
-    private fun RefreshButton(enabled: Boolean, onClick: () -> Unit) {
+    private fun RefreshButton(enabled: Boolean, spinning: Boolean, onClick: () -> Unit) {
+        // Turns while a search runs; when it ends, the turn finishes instead of jumping back.
+        val turn = remember { Animatable(0f) }
+        LaunchedEffect(spinning) {
+            if (spinning) {
+                while (true) turn.animateTo(turn.value + 360f, tween(SPIN_MILLIS, easing = LinearEasing))
+            } else {
+                val end = ceil(turn.value / 360f) * 360f
+                turn.animateTo(end, tween(((end - turn.value) / 360f * SPIN_MILLIS).toInt(), easing = LinearEasing))
+                turn.snapTo(0f)
+            }
+        }
         Box(
             Modifier.size(40.dp).clip(CircleShape).background(CardColor).clickable(enabled = enabled, onClick = onClick),
             contentAlignment = Alignment.Center,
         ) {
-            RefreshIcon(if (enabled) AccentText else Muted)
+            Box(Modifier.rotate(turn.value)) { RefreshIcon(if (enabled || spinning) AccentText else Muted) }
         }
     }
 
