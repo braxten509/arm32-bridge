@@ -698,6 +698,9 @@ class MainActivity : ComponentActivity() {
             }
         }
         val status = Backups.status
+        // Whether a backup ran while this window was open, so the button that closes it says Done afterwards.
+        var ran by remember { mutableStateOf(status != null) }
+        LaunchedEffect(status) { if (status != null) ran = true }
         val count = converted?.size
         AlertDialog(
             onDismissRequest = onDismiss,
@@ -713,8 +716,8 @@ class MainActivity : ComponentActivity() {
                     val what = when (count) {
                         null -> "Looking for converted games…"
                         0 -> "No converted games are installed yet."
-                        1 -> "1 converted game and its data files go to:"
-                        else -> "$count converted games and their data files go to:"
+                        1 -> "1 game and its data files go to:"
+                        else -> "$count games and their data files go to:"
                     }
                     Text(what, color = Muted, fontSize = 14.sp)
                     Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -741,13 +744,18 @@ class MainActivity : ComponentActivity() {
                 }
             },
             // All three spread over the full width: Restore's text starts where the text above
-            // starts and Back up's ends where it ends (EdgeToEdge undoes the buttons' inner padding).
+            // starts and Back up's ends where it ends (bleed undoes the buttons' inner padding).
             confirmButton = {
                 val canBackUp = status == null && folder != null && (count ?: 0) > 0
                 val canRestore = status == null && folder != null
+                val close = when {
+                    status != null -> "Hide"
+                    ran && Backups.problem == null -> "Done"
+                    else -> "Cancel"
+                }
                 Row(Modifier.bleed(TextButtonInset, TextButtonInset).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                     TextButton(enabled = canRestore, onClick = onRestore) { Text("Restore", color = if (canRestore) AccentText else Muted) }
-                    TextButton(onClick = onDismiss) { Text(if (status == null) "Cancel" else "Hide", color = AccentText) }
+                    TextButton(onClick = onDismiss) { Text(close, color = AccentText) }
                     TextButton(enabled = canBackUp, onClick = { Backups.backUp(context, converted.orEmpty(), originals) }) {
                         Text("Back up", color = if (canBackUp) AccentText else Muted)
                     }
