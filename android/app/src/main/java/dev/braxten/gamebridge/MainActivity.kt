@@ -63,6 +63,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.layout.layout
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
@@ -75,6 +77,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.offset
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
@@ -90,6 +93,12 @@ private val Muted = Color(0xFF9AA0AD)
 private val Track = Color(0xFF2B2F3F)
 private val ErrorText = Color(0xFFFF8A80)
 private val NoticeText = Color(0xFFFFCC80)
+
+/** The space around a checkbox's box inside its 48 dp touch area: a checkbox row moves left by it, so the box lines up with the text above. */
+private val CheckboxInset = 14.dp
+
+/** The space between a text button's edge and its text. */
+private val TextButtonInset = 12.dp
 
 /** What a game's card shows. */
 sealed class CardState {
@@ -612,7 +621,7 @@ class MainActivity : ComponentActivity() {
                     )
                     if (installed && fileName != null) {
                         Row(
-                            Modifier.padding(top = 14.dp).clip(RoundedCornerShape(8.dp)).clickable { deleteFile = !deleteFile }
+                            Modifier.padding(top = 14.dp).bleed(start = CheckboxInset).clip(RoundedCornerShape(8.dp)).clickable { deleteFile = !deleteFile }
                                 .padding(end = 8.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
@@ -627,11 +636,13 @@ class MainActivity : ComponentActivity() {
                 }
             },
             confirmButton = {
-                TextButton(onClick = { onConfirm(installed, !installed || deleteFile) }) {
-                    Text(if (installed) "Remove" else "Delete", color = ErrorText)
+                Row(Modifier.bleed(end = TextButtonInset), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(onClick = onDismiss) { Text("Cancel", color = AccentText) }
+                    TextButton(onClick = { onConfirm(installed, !installed || deleteFile) }) {
+                        Text(if (installed) "Remove" else "Delete", color = ErrorText)
+                    }
                 }
             },
-            dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel", color = AccentText) } },
         )
     }
 
@@ -670,7 +681,7 @@ class MainActivity : ComponentActivity() {
 
     /**
      * Backs up every converted game with its game data files to the folder picked with Android's
-     * folder picker; the box adds the original downloaded files. Restore… opens the restore window.
+     * folder picker; the box adds the original downloaded files. Restore opens the restore window.
      */
     @Composable
     private fun BackupDialog(games: List<Game>, onDismiss: () -> Unit, onRestore: () -> Unit) {
@@ -709,10 +720,10 @@ class MainActivity : ComponentActivity() {
                     Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                         Text(folderName ?: "No folder chosen", color = Color(0xFFE8E8EE), fontSize = 14.sp, maxLines = 2,
                             overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
-                        TextButton(onClick = { pick.launch(null) }) { Text(if (folder == null) "Choose" else "Change", color = AccentText) }
+                        TextButton(onClick = { pick.launch(null) }, modifier = Modifier.bleed(end = TextButtonInset)) { Text(if (folder == null) "Choose" else "Change", color = AccentText) }
                     }
                     Row(
-                        Modifier.padding(top = 4.dp).clip(RoundedCornerShape(8.dp)).clickable {
+                        Modifier.padding(top = 4.dp).bleed(start = CheckboxInset).clip(RoundedCornerShape(8.dp)).clickable {
                             originals = !originals
                             Backups.setKeepOriginals(context, originals)
                         }.padding(end = 8.dp),
@@ -729,21 +740,30 @@ class MainActivity : ComponentActivity() {
                     Backups.problem?.let { Text(it, color = ErrorText, fontSize = 13.sp, modifier = Modifier.padding(top = 8.dp)) }
                 }
             },
+            // All three spread over the full width: Restore's text starts where the text above
+            // starts and Back up's ends where it ends (EdgeToEdge undoes the buttons' inner padding).
             confirmButton = {
-                TextButton(
-                    enabled = status == null && folder != null && (count ?: 0) > 0,
-                    onClick = { Backups.backUp(context, converted.orEmpty(), originals) },
-                ) { Text("Back up", color = if (status == null && folder != null && (count ?: 0) > 0) AccentText else Muted) }
-            },
-            dismissButton = {
-                Row {
-                    TextButton(enabled = status == null && folder != null, onClick = onRestore) {
-                        Text("Restore…", color = if (status == null && folder != null) AccentText else Muted)
-                    }
+                val canBackUp = status == null && folder != null && (count ?: 0) > 0
+                val canRestore = status == null && folder != null
+                Row(Modifier.bleed(TextButtonInset, TextButtonInset).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    TextButton(enabled = canRestore, onClick = onRestore) { Text("Restore", color = if (canRestore) AccentText else Muted) }
                     TextButton(onClick = onDismiss) { Text(if (status == null) "Cancel" else "Hide", color = AccentText) }
+                    TextButton(enabled = canBackUp, onClick = { Backups.backUp(context, converted.orEmpty(), originals) }) {
+                        Text("Back up", color = if (canBackUp) AccentText else Muted)
+                    }
                 }
             },
         )
+    }
+
+    /**
+     * Lets a control reach out past its slot by its own see-through padding, so the visible part
+     * (a button's text, a checkbox's box) lines up with the dialog's text edges.
+     */
+    private fun Modifier.bleed(start: Dp = 0.dp, end: Dp = 0.dp) = layout { measurable, constraints ->
+        val (left, extra) = start.roundToPx() to (start + end).roundToPx()
+        val placeable = measurable.measure(constraints.offset(horizontal = extra))
+        layout(placeable.width - extra, placeable.height) { placeable.place(-left, 0) }
     }
 
     /** The games in the backup folder, each with Restore (or "Installed" when that version is). */

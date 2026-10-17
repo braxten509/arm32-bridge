@@ -40,7 +40,7 @@ says **Needs game data**; tap it for what to do.
 **Backups.** The round button next to refresh backs up every converted game with its game data files
 to a folder you pick with Android's folder picker: a WebDAV folder through DAVx5, Google Drive, or any other
 storage app that offers folders there. Tick "Also back up the original files" to save the downloaded files too.
-Backing up again only sends what changed. Restore… lists the games in the backup and puts one back with a tap
+Backing up again only sends what changed. Restore lists the games in the backup and puts one back with a tap
 (the game, its data files, and its original file in Download). Keep Game Bridge open while a backup runs.
 
 **64-bit games: lifting their frame limit.** Downloaded 64-bit games show up too (apps that say they are games,
