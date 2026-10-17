@@ -28,7 +28,8 @@
 //! (`--abi x86_64` makes a copy for the PC's Android emulator, with an x86_64 bridge and stand-in.)
 //! (`--min-target-sdk N` raises the game's target Android version to N: phones without root refuse older ones.)
 //! `--inspect` only looks: it prints `kind apk|bundle`, `data yes|no` for a bundle (carries game data),
-//! `download yes|no` (the game's own code starts Google Play's expansion-file download), `bits 32|64|none`
+//! `download yes|no` (the game's own code starts Google Play's expansion-file download, and doesn't download
+//! its data file itself from a web address in its code), `bits 32|64|none`
 //! (what native code the game has) and `engine yes|no` (built with a known game engine, or with its own: a library that
 //! draws and plays sound itself and is bigger than the Java code, see own_engine), and with --base copies a bundle's base
 //! APK (the piece with the Java code) out, for reading its name and icon.
@@ -669,17 +670,22 @@ fn yes_no(answer: bool) -> &'static str {
     if answer { "yes" } else { "no" }
 }
 
-/// Whether the game's own code starts Google Play's expansion-file download (dex::starts_expansion_download).
+/// Whether the game's own code starts Google Play's expansion-file download
+/// (dex::starts_expansion_download) and doesn't fetch its data file itself (dex::fetches_own_data).
 fn starts_download<R: Read + Seek>(archive: &mut ZipArchive<R>) -> bool {
     let dex_files: Vec<String> = archive.file_names()
         .filter(|name| name.starts_with("classes") && name.ends_with(".dex") && !name.contains('/'))
         .map(String::from)
         .collect();
-    dex_files.iter().any(|name| {
+    let (mut starts, mut fetches) = (false, false);
+    for name in &dex_files {
         let mut bytes = Vec::new();
-        archive.by_name(name).ok().and_then(|mut file| file.read_to_end(&mut bytes).ok()).is_some()
-            && dex::starts_expansion_download(&bytes)
-    })
+        if archive.by_name(name).ok().and_then(|mut file| file.read_to_end(&mut bytes).ok()).is_some() {
+            starts = starts || dex::starts_expansion_download(&bytes);
+            fetches = fetches || dex::fetches_own_data(&bytes);
+        }
+    }
+    starts && !fetches
 }
 
 /// Lists (`missing <name>`) the phone functions the libraries import that the

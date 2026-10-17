@@ -247,6 +247,17 @@ pub fn starts_expansion_download(data: &[u8]) -> bool {
     })
 }
 
+/// True when the game's code holds the web address of a game data file (`http…/….obb`): it
+/// downloads its data file itself (PvZ 2 mods fetch theirs from GitHub on first start), so it
+/// doesn't need the one Google Play used to deliver, even when it also calls the download kit.
+pub fn fetches_own_data(data: &[u8]) -> bool {
+    let dex = Dex { data };
+    (0..dex.u32(0x38)).any(|index| {
+        let text = dex.string(index);
+        (text.starts_with("http://") || text.starts_with("https://")) && text.ends_with(".obb")
+    })
+}
+
 /// Finds every fix to make in a dex file. `carries_game_data`: the APK is too big to rely on
 /// expansion files, so their download screen can be skipped (fix 4).
 pub fn find_fixes(data: &[u8], carries_game_data: bool) -> Vec<Fix> {
@@ -457,6 +468,30 @@ fn adler32(data: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    /// A dex file holding only a string table (short ASCII strings).
+    fn strings_only(strings: &[&str]) -> Vec<u8> {
+        let mut data = vec![0u8; 0x70];
+        data[0x38..0x3C].copy_from_slice(&(strings.len() as u32).to_le_bytes());
+        data[0x3C..0x40].copy_from_slice(&0x70u32.to_le_bytes());
+        let mut bodies = Vec::new();
+        let first_body = 0x70 + strings.len() * 4;
+        for text in strings {
+            data.extend_from_slice(&((first_body + bodies.len()) as u32).to_le_bytes());
+            bodies.push(text.len() as u8);
+            bodies.extend_from_slice(text.as_bytes());
+            bodies.push(0);
+        }
+        data.extend(bodies);
+        data
+    }
+
+    #[test]
+    fn own_data_download() {
+        let mod_dex = strings_only(&["main.702.com.ea.game.pvz2_rqm.obb", "https://github.com/x/y/releases/download/v1/main.702.com.ea.game.pvz2_rqm.obb"]);
+        assert!(super::fetches_own_data(&mod_dex));
+        assert!(!super::fetches_own_data(&strings_only(&["main.obb", "https://example.com/news", "getObbDir"])));
+    }
+
     #[test]
     fn adler32_known_value() {
         assert_eq!(super::adler32(b"Wikipedia"), 0x11E6_0398);
