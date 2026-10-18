@@ -97,6 +97,49 @@ extern "C" fn ui_application_main(_argc: i32, _argv: usize, principal: Id, deleg
     crate::report::finish(0);
 }
 
+/// UIApplicationState: 0 active, 1 inactive, 2 background.
+pub static STATE: AtomicUsize = AtomicUsize::new(0);
+
+/// Tells the game what iOS tells an app on the way out (to the background)
+/// or back in, on the main thread like iOS, then waits for it (up to 2 s).
+pub fn change_state(to_background: bool) {
+    let steps: &[(&str, &str, usize)] = if to_background {
+        &[
+            ("applicationWillResignActive:", "UIApplicationWillResignActiveNotification", 1),
+            ("applicationDidEnterBackground:", "UIApplicationDidEnterBackgroundNotification", 2),
+        ]
+    } else {
+        &[
+            ("applicationWillEnterForeground:", "UIApplicationWillEnterForegroundNotification", 1),
+            ("applicationDidBecomeActive:", "UIApplicationDidBecomeActiveNotification", 0),
+        ]
+    };
+    let done = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let signal = done.clone();
+    crate::fw::runloop::post(crate::fw::runloop::Work::Native(Box::new(move || {
+        let app = APPLICATION.load(Ordering::Relaxed);
+        let delegate_object = DELEGATE.load(Ordering::Relaxed);
+        for &(method, notification, state) in steps {
+            // iOS changes the state just before "did" messages and just
+            // after "will" ones.
+            if method.contains("Did") {
+                STATE.store(state, Ordering::SeqCst);
+            }
+            if delegate_object != 0 && runtime::responds(delegate_object, method) {
+                crate::log!("calling {method}");
+                runtime::send(delegate_object, method, &[app]);
+            }
+            crate::fw::foundation::post(notification, app, 0);
+            STATE.store(state, Ordering::SeqCst);
+        }
+        *signal.0.lock().unwrap() = true;
+        signal.1.notify_all();
+    })));
+    let (finished, wake) = &*done;
+    let guard = finished.lock().unwrap();
+    let _ = wake.wait_timeout_while(guard, std::time::Duration::from_secs(2), |finished| !*finished);
+}
+
 pub fn register(r: &mut Registry) {
     let responder = define_class("UIResponder", "NSObject", 8);
     let application = define_class("UIApplication", "UIResponder", 8);

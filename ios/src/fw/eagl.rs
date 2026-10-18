@@ -36,6 +36,7 @@ system! {
     eglGetError() -> i32;
     eglGetCurrentSurface(which: i32) -> Surface;
     eglSwapInterval(display: Display, interval: i32) -> u32;
+    eglDestroySurface(display: Display, surface: Surface) -> u32;
 }
 
 const EGL_NONE: i32 = 0x3038;
@@ -61,13 +62,51 @@ const EGL_DRAW: i32 = 0x3059;
 struct Egl {
     display: Display,
     config: Config,
-    /// The window to show frames in (phone), or 0 (PC tests: no window).
-    window: Surface,
+    /// Started with a window (phone) rather than none (PC and hidden tests).
+    has_window: bool,
     /// Contexts can be current without a surface.
     surfaceless: bool,
 }
 
 static WINDOW: AtomicUsize = AtomicUsize::new(0);
+/// The window surface frames are shown in; 0 while the app is away.
+static WINDOW_SURFACE: AtomicUsize = AtomicUsize::new(0);
+/// The surface the window's context last drew with (to know when it let go).
+static SHOWN_SURFACE: AtomicUsize = AtomicUsize::new(0);
+
+/// The app is going away: the game's frames stop going to the window, and
+/// its context moves to a hidden surface at its next frame (waited for up
+/// to half a second, the window must be free when this returns).
+pub fn release_window() {
+    let old = WINDOW_SURFACE.swap(0, Ordering::SeqCst);
+    if old == 0 {
+        return;
+    }
+    for _ in 0..50 {
+        if SHOWN_SURFACE.load(Ordering::SeqCst) != old {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // Freed now, or (if still current on the drawing thread) once it moves.
+    unsafe { eglDestroySurface(egl().display, old) };
+    crate::log!("graphics: window let go");
+}
+
+/// The app is back with a (new) window: frames go there from the next one.
+pub fn attach_window(window: usize) {
+    let egl = egl();
+    if !egl.has_window || window == 0 {
+        return;
+    }
+    let surface = unsafe { eglCreateWindowSurface(egl.display, egl.config, window, [EGL_NONE].as_ptr()) };
+    if surface == 0 {
+        crate::log!("graphics: the new window can't be drawn into (error {:#x})", unsafe { eglGetError() });
+        return;
+    }
+    WINDOW_SURFACE.store(surface, Ordering::SeqCst);
+    crate::log!("graphics: window back");
+}
 
 /// The Android app hands over its window (an ANativeWindow) before the game starts.
 pub fn set_native_window(window: usize) {
@@ -122,7 +161,8 @@ fn egl() -> &'static Egl {
             }
         }
         crate::log!("graphics: EGL {major}.{minor} ready ({})", if window != 0 { "window" } else { "no window" });
-        Egl { display, config: if count == 0 { 0 } else { config }, window: surface, surfaceless }
+        WINDOW_SURFACE.store(surface, Ordering::SeqCst);
+        Egl { display, config: if count == 0 { 0 } else { config }, has_window: window != 0, surfaceless }
     })
 }
 
@@ -149,13 +189,14 @@ static WINDOW_OWNER: AtomicUsize = AtomicUsize::new(0);
 
 /// The surface a context is made current with.
 fn surface_for(egl: &Egl, context: Id, state: &mut State) -> Surface {
-    if egl.window != 0 {
+    if egl.has_window {
         let owner = match WINDOW_OWNER.compare_exchange(0, context, Ordering::SeqCst, Ordering::SeqCst) {
             Ok(_) => context,
             Err(existing) => existing,
         };
-        if owner == context {
-            return egl.window;
+        let window = WINDOW_SURFACE.load(Ordering::SeqCst);
+        if owner == context && window != 0 {
+            return window;
         }
     }
     if egl.surfaceless {
@@ -387,14 +428,31 @@ extern "C" fn present(this: Id, _: Sel, _target: Enum) -> bool {
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     let mut state = state_of(this).lock().unwrap();
     let (width, height) = state.size;
-    if egl.window != 0 && unsafe { eglGetCurrentSurface(EGL_DRAW) } != egl.window {
+    let window = WINDOW_SURFACE.load(Ordering::SeqCst);
+    let current = unsafe { eglGetCurrentSurface(EGL_DRAW) };
+    if window != 0 && current != window {
         // A context without the window shows a frame: it takes the window
-        // over (rare: games show frames from their screen context).
+        // over (rare: games show frames from their screen context), or the
+        // app came back with a new window.
         WINDOW_OWNER.store(this, Ordering::SeqCst);
-        if unsafe { eglMakeCurrent(egl.display, egl.window, egl.window, state.egl) } == 0 {
+        if unsafe { eglMakeCurrent(egl.display, window, window, state.egl) } == 0 {
             crate::log!("graphics: frame {frame} can't be shown: the window is in use (EGL error {:#x})", unsafe { eglGetError() });
             return false;
         }
+    } else if egl.has_window && window == 0 && WINDOW_OWNER.load(Ordering::SeqCst) == this && current != 0 && current != state.pbuffer {
+        // The app went away: let go of the old window.
+        let hidden = if egl.surfaceless {
+            0
+        } else {
+            if state.pbuffer == 0 {
+                state.pbuffer = unsafe { eglCreatePbufferSurface(egl.display, egl.config, [EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE].as_ptr()) };
+            }
+            state.pbuffer
+        };
+        unsafe { eglMakeCurrent(egl.display, hidden, hidden, state.egl) };
+    }
+    if WINDOW_OWNER.load(Ordering::SeqCst) == this {
+        SHOWN_SURFACE.store(unsafe { eglGetCurrentSurface(EGL_DRAW) }, Ordering::SeqCst);
     }
     if frame <= 3 {
         let status = unsafe { gl::glCheckFramebufferStatus(gl::DRAW_FRAMEBUFFER) };
@@ -416,7 +474,7 @@ extern "C" fn present(this: Id, _: Sel, _target: Enum) -> bool {
             gl::glFramebufferRenderbuffer(gl::READ_FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::RENDERBUFFER, renderbuffer as u32);
             state.present_source = renderbuffer as u32;
         }
-        if egl.window != 0 {
+        if window != 0 {
             let scissor = gl::glIsEnabled(gl::SCISSOR_TEST);
             let discard = gl::glIsEnabled(gl::RASTERIZER_DISCARD);
             let mut mask = [0u8; 4];
@@ -425,8 +483,8 @@ extern "C" fn present(this: Id, _: Sel, _target: Enum) -> bool {
             gl::glDisable(gl::RASTERIZER_DISCARD);
             gl::glColorMask(1, 1, 1, 1);
             let (mut window_width, mut window_height) = (0, 0);
-            eglQuerySurface(egl.display, egl.window, EGL_WIDTH, &mut window_width);
-            eglQuerySurface(egl.display, egl.window, EGL_HEIGHT, &mut window_height);
+            eglQuerySurface(egl.display, window, EGL_WIDTH, &mut window_width);
+            eglQuerySurface(egl.display, window, EGL_HEIGHT, &mut window_height);
             gl::glBindFramebuffer(gl::DRAW_FRAMEBUFFER, 0);
             let mut clear = [0f32; 4];
             gl::glGetFloatv(gl::COLOR_CLEAR_VALUE, clear.as_mut_ptr());
@@ -446,8 +504,8 @@ extern "C" fn present(this: Id, _: Sel, _target: Enum) -> bool {
             if discard != 0 {
                 gl::glEnable(gl::RASTERIZER_DISCARD);
             }
-            eglSwapBuffers(egl.display, egl.window);
-        } else {
+            eglSwapBuffers(egl.display, window);
+        } else if !egl.has_window {
             save_frame_if_asked(frame, width, height);
         }
         gl::glBindFramebuffer(gl::READ_FRAMEBUFFER, read as u32);

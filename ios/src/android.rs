@@ -7,7 +7,8 @@ use std::ffi::{c_char, CStr};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// The Java side, for calls back into the game screen: (JavaVM, activity).
-static JAVA: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+/// (JavaVM, game screen); the screen is replaced when a new one opens.
+static JAVA: std::sync::Mutex<Option<(usize, usize)>> = std::sync::Mutex::new(None);
 
 static WINDOW_WIDTH: AtomicU32 = AtomicU32::new(1);
 static WINDOW_HEIGHT: AtomicU32 = AtomicU32::new(1);
@@ -73,11 +74,12 @@ pub unsafe extern "C" fn Java_dev_braxten_gamebridge_IosGameActivity_nativeStart
         return JNI_FALSE;
     }
     crate::fw::eagl::set_native_window(window);
+    NATIVE_WINDOW.store(window, Ordering::SeqCst);
     let functions = &**env;
     let mut vm: *mut JavaVM = std::ptr::null_mut();
     if (functions.GetJavaVM.unwrap())(env, &mut vm) == 0 {
         let activity = (functions.NewGlobalRef.unwrap())(env, this);
-        let _ = JAVA.set((vm as usize, activity as usize));
+        *JAVA.lock().unwrap() = Some((vm as usize, activity as usize));
         crate::fw::media::set_video_screen(crate::fw::media::VideoScreen { show: show_video, pause: pause_video, resume: resume_video, stop: stop_video });
     }
     crate::log!("phone app: starting {app} ({width}x{height} window)");
@@ -88,6 +90,58 @@ pub unsafe extern "C" fn Java_dev_braxten_gamebridge_IosGameActivity_nativeStart
         }
     });
     if started.is_ok() { JNI_TRUE } else { JNI_FALSE }
+}
+
+/// The Android window the game's frames go to (to hand back when it goes).
+static NATIVE_WINDOW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// ANativeWindow_release, from Android's own library.
+unsafe fn release_native_window(window: usize) {
+    let library = libc::dlopen(c"libandroid.so".as_ptr(), libc::RTLD_NOW);
+    let function = libc::dlsym(library, c"ANativeWindow_release".as_ptr());
+    if window != 0 && !function.is_null() {
+        let release: unsafe extern "C" fn(usize) = std::mem::transmute(function);
+        release(window);
+    }
+}
+
+/// nativePause(): the window is going (the player left the game). The
+/// game lets go of it before this returns, then is told it is in the
+/// background, like on iOS; its sound stops.
+#[no_mangle]
+pub unsafe extern "C" fn Java_dev_braxten_gamebridge_IosGameActivity_nativePause(_env: *mut JNIEnv, _this: jobject) {
+    crate::log!("phone app: left the game");
+    crate::fw::eagl::release_window();
+    release_native_window(NATIVE_WINDOW.swap(0, Ordering::SeqCst));
+    crate::fw::sound::set_away(true);
+    crate::fw::app::change_state(true);
+}
+
+/// nativeResume(surface, width, height): the player came back with a new window.
+#[no_mangle]
+pub unsafe extern "C" fn Java_dev_braxten_gamebridge_IosGameActivity_nativeResume(
+    env: *mut JNIEnv,
+    this: jobject,
+    surface: jobject,
+    width: jint,
+    height: jint,
+) {
+    crate::log!("phone app: back in the game ({width}x{height} window)");
+    WINDOW_WIDTH.store(width.max(1) as u32, Ordering::Relaxed);
+    WINDOW_HEIGHT.store(height.max(1) as u32, Ordering::Relaxed);
+    // The game screen may be a new one (the old one was closed): calls
+    // back into Java (videos) go to this one. The old reference is kept.
+    let mut java = JAVA.lock().unwrap();
+    if let Some((vm, _)) = *java {
+        let activity = ((**env).NewGlobalRef.unwrap())(env, this);
+        *java = Some((vm, activity as usize));
+    }
+    drop(java);
+    let window = native_window(env, surface);
+    NATIVE_WINDOW.store(window, Ordering::SeqCst);
+    crate::fw::eagl::attach_window(window);
+    crate::fw::sound::set_away(false);
+    crate::fw::app::change_state(false);
 }
 
 /// nativeResize(width, height): the window changed size (touches map through it).
@@ -134,7 +188,7 @@ thread_local! {
 /// This thread's JNI environment (attached the first time if needed, and
 /// detached again when the thread ends).
 unsafe fn java_env() -> Option<(*mut JNIEnv, jobject)> {
-    let &(vm, activity) = JAVA.get()?;
+    let (vm, activity) = (*JAVA.lock().unwrap())?;
     let vm = vm as *mut JavaVM;
     let mut env: *mut JNIEnv = std::ptr::null_mut();
     let env_out = &mut env as *mut *mut JNIEnv as *mut *mut std::ffi::c_void;

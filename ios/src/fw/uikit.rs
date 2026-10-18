@@ -827,7 +827,7 @@ extern "C" fn app_windows(_this: Id, _: Sel) -> Id {
 }
 
 extern "C" fn app_state(_this: Id, _: Sel) -> isize {
-    0
+    crate::fw::app::STATE.load(std::sync::atomic::Ordering::SeqCst) as isize
 }
 
 extern "C" fn app_status_bar_orientation(_this: Id, _: Sel) -> isize {

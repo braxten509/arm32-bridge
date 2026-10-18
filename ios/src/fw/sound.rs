@@ -1144,6 +1144,20 @@ pub fn start() {
     std::thread::Builder::new().name("ios-sound".into()).spawn(silent_device).expect("sound thread");
 }
 
+/// The app went to the background (true) or came back: the sound output
+/// is closed while away, like iOS stopping an app's sound.
+pub fn set_away(away: bool) {
+    #[cfg(target_os = "android")]
+    if STARTED.load(Ordering::SeqCst) && std::env::var_os("IOS_SOUND_FILE").is_none() {
+        if away {
+            aaudio::close();
+        } else if !aaudio::is_open() {
+            aaudio::open();
+        }
+    }
+    let _ = away;
+}
+
 fn silent_device() {
     const FRAMES: usize = 512;
     let rate = OUT_RATE.load(Ordering::Relaxed);
@@ -1302,6 +1316,21 @@ mod aaudio {
                 }
             }
         });
+    }
+
+    pub fn is_open() -> bool {
+        CURRENT.load(Ordering::SeqCst) != 0
+    }
+
+    /// Stops and closes the output (no reopening: that's for device changes).
+    pub fn close() {
+        let stream = CURRENT.swap(0, Ordering::SeqCst);
+        if stream != 0 {
+            if let Some(api) = api() {
+                (api.close)(stream);
+            }
+            crate::log!("sound: output closed while the app is away");
+        }
     }
 
     /// Opens and starts the output; false if this phone can't.

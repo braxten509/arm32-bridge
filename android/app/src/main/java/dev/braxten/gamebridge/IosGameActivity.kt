@@ -21,7 +21,13 @@ import java.io.File
  * take Game Bridge down with it.
  */
 class IosGameActivity : Activity(), SurfaceHolder.Callback {
-    private var started = false
+    companion object {
+        /** The game running in this process (one per process), or null. */
+        private var startedApp: String? = null
+        /** The player left and the game let go of its window; it waits for a new one. */
+        private var away = false
+    }
+    private val started get() = startedApp != null
     private lateinit var root: FrameLayout
     /** The game's video on screen (over the game, black around it), or null. */
     private var video: FrameLayout? = null
@@ -31,6 +37,7 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (switchingGames(intent)) return
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         val view = SurfaceView(this)
         view.holder.addCallback(this)
@@ -43,23 +50,46 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
         }
     }
 
+    override fun onNewIntent(intent: android.content.Intent) {
+        super.onNewIntent(intent)
+        switchingGames(intent)
+    }
+
+    /** Another game asked for while one runs here: start this process over for it. */
+    private fun switchingGames(intent: android.content.Intent): Boolean {
+        val app = intent.getStringExtra("app") ?: return false
+        if (startedApp == null || startedApp == app) return false
+        startActivity(intent)
+        android.os.Process.killProcess(android.os.Process.myPid())
+        return true
+    }
+
     override fun surfaceCreated(holder: SurfaceHolder) {}
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
         if (started) {
-            nativeResize(width, height)
+            if (away) {
+                away = false
+                nativeResume(holder.surface, width, height)
+            } else {
+                nativeResize(width, height)
+            }
             return
         }
         val app = intent.getStringExtra("app") ?: run { finish(); return }
         val home = File(filesDir, "ios/" + File(app).nameWithoutExtension).path
         System.loadLibrary("gamebridge_ios")
-        started = nativeStart(holder.surface, app, home, width, height)
-        if (!started) finish()
+        if (nativeStart(holder.surface, app, home, width, height)) startedApp = app else finish()
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
-        // The game can't yet carry on without its window: end this process.
-        if (started) android.os.Process.killProcess(android.os.Process.myPid())
+        // The game pauses (told it is in the background, like on iOS) and
+        // lets go of the window before this returns; it carries on when the
+        // player comes back. Android may still close it while away.
+        if (started && !away) {
+            away = true
+            nativePause()
+        }
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
@@ -146,4 +176,6 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
     private external fun nativeStart(surface: android.view.Surface, app: String, home: String, width: Int, height: Int): Boolean
     private external fun nativeTouch(finger: Int, phase: Int, x: Float, y: Float)
     private external fun nativeResize(width: Int, height: Int)
+    private external fun nativePause()
+    private external fun nativeResume(surface: android.view.Surface, width: Int, height: Int)
 }
