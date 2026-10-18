@@ -27,6 +27,9 @@ struct Touch {
 
 static TOUCHES: Mutex<Option<HashMap<i32, Touch>>> = Mutex::new(None);
 
+/// UITouchPhaseStationary.
+const STATIONARY: u64 = 2;
+
 fn now() -> f64 {
     let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
@@ -181,6 +184,10 @@ fn deliver_now(finger: i32, phase: Phase, point: Point) {
     set_point(object, "x", point);
     property_set(object, "phase", phase as u64);
     property_set(object, "timestamp", stamp.to_bits());
+    // Fingers that didn't change in this event are "stationary", as on iPhone.
+    for other in touches.values().filter(|t| t.object != object) {
+        property_set(other.object, "phase", STATIONARY);
+    }
     let active: Vec<Id> = touches.values().map(|t| t.object).collect();
     if matches!(phase, Phase::Ended | Phase::Cancelled) {
         touches.remove(&finger);

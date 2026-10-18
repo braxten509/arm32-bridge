@@ -34,7 +34,10 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
     override fun surfaceCreated(holder: SurfaceHolder) {}
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-        if (started) return
+        if (started) {
+            nativeResize(width, height)
+            return
+        }
         val app = intent.getStringExtra("app") ?: run { finish(); return }
         val home = File(filesDir, "ios/" + File(app).nameWithoutExtension).path
         System.loadLibrary("gamebridge_ios")
@@ -72,4 +75,5 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
 
     private external fun nativeStart(surface: android.view.Surface, app: String, home: String, width: Int, height: Int): Boolean
     private external fun nativeTouch(finger: Int, phase: Int, x: Float, y: Float)
+    private external fun nativeResize(width: Int, height: Int)
 }

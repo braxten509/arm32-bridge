@@ -34,6 +34,7 @@ system! {
     eglQuerySurface(display: Display, surface: Surface, name: i32, value: *mut i32) -> u32;
     eglQueryString(display: Display, name: i32) -> *const libc::c_char;
     eglGetError() -> i32;
+    eglGetCurrentSurface(which: i32) -> Surface;
     eglSwapInterval(display: Display, interval: i32) -> u32;
 }
 
@@ -53,6 +54,7 @@ const EGL_HEIGHT: i32 = 0x3056;
 const EGL_OPENGL_ES_API: Enum = 0x30A0;
 const EGL_PLATFORM_SURFACELESS_MESA: Enum = 0x31DD;
 const EGL_EXTENSIONS: i32 = 0x3055;
+const EGL_DRAW: i32 = 0x3059;
 
 // ----- the display, chosen once -----
 
@@ -92,14 +94,21 @@ fn egl() -> &'static Egl {
         eglBindAPI(EGL_OPENGL_ES_API);
         let extensions = std::ffi::CStr::from_ptr(eglQueryString(display, EGL_EXTENSIONS)).to_string_lossy().into_owned();
         let surfaceless = extensions.split_whitespace().any(|e| e == "EGL_KHR_surfaceless_context");
-        let surface_type = if window != 0 { EGL_WINDOW_BIT } else { EGL_PBUFFER_BIT };
-        let attributes = [
-            EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
-            EGL_SURFACE_TYPE, surface_type, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT, EGL_NONE,
-        ];
+        // With a window, contexts that don't show anything (loading threads)
+        // get a small private surface, so the same setting must allow both.
+        let choices: &[i32] = if window != 0 { &[EGL_WINDOW_BIT | EGL_PBUFFER_BIT, EGL_WINDOW_BIT] } else { &[EGL_PBUFFER_BIT] };
         let mut config = 0;
         let mut count = 0;
-        eglChooseConfig(display, attributes.as_ptr(), &mut config, 1, &mut count);
+        for &surface_type in choices {
+            let attributes = [
+                EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+                EGL_SURFACE_TYPE, surface_type, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT, EGL_NONE,
+            ];
+            eglChooseConfig(display, attributes.as_ptr(), &mut config, 1, &mut count);
+            if count > 0 {
+                break;
+            }
+        }
         if count == 0 && !(window == 0 && surfaceless && extensions.contains("EGL_KHR_no_config_context")) {
             crate::log!("STOP: graphics: no OpenGL ES 3 setting fits (EGL {major}.{minor})");
             crate::report::finish(1);
@@ -130,6 +139,23 @@ struct State {
     size: (i32, i32),
     /// The thread the context is current on (0 = none).
     owner: u64,
+    /// This context draws the screen (renderbufferStorage:fromDrawable:);
+    /// only it uses the window surface, others get a private one.
+    on_window: bool,
+}
+
+/// The surface a context is made current with.
+fn surface_for(egl: &Egl, state: &mut State) -> Surface {
+    if egl.window != 0 && state.on_window {
+        return egl.window;
+    }
+    if egl.surfaceless {
+        return 0;
+    }
+    if state.pbuffer == 0 {
+        state.pbuffer = unsafe { eglCreatePbufferSurface(egl.display, egl.config, [EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE].as_ptr()) };
+    }
+    state.pbuffer
 }
 
 fn this_thread() -> u64 {
@@ -191,11 +217,14 @@ extern "C" fn set_current(_: Class, _: Sel, context: Id) -> bool {
         let holder = if context == 0 { 0 } else { state_of(context).lock().unwrap().owner };
         crate::log!("graphics: setCurrentContext {context:#x} (this thread had {previous:#x}; context held by {holder:#x}, this thread is {me:#x})");
     }
-    if previous != 0 && previous != context {
-        state_of(previous).lock().unwrap().owner = 0;
-    }
     if context == 0 {
-        unsafe { eglMakeCurrent(egl.display, 0, 0, 0) };
+        if unsafe { eglMakeCurrent(egl.display, 0, 0, 0) } == 0 {
+            crate::log!("graphics: this thread's context can't be let go (EGL error {:#x})", unsafe { eglGetError() });
+            return false;
+        }
+        if previous != 0 {
+            state_of(previous).lock().unwrap().owner = 0;
+        }
         CURRENT.with(|c| c.set(0));
         return true;
     }
@@ -206,16 +235,7 @@ extern "C" fn set_current(_: Class, _: Sel, context: Id) -> bool {
     }
     let ok = unsafe {
         let mut state = state_of(context).lock().unwrap();
-        let surface = if egl.window != 0 {
-            egl.window
-        } else if egl.surfaceless {
-            0
-        } else {
-            if state.pbuffer == 0 {
-                state.pbuffer = eglCreatePbufferSurface(egl.display, egl.config, [EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE].as_ptr());
-            }
-            state.pbuffer
-        };
+        let surface = surface_for(egl, &mut state);
         let ok = eglMakeCurrent(egl.display, surface, surface, state.egl);
         if ok != 0 {
             state.owner = me;
@@ -226,8 +246,20 @@ extern "C" fn set_current(_: Class, _: Sel, context: Id) -> bool {
         crate::log!("graphics: context {context:#x} can't be made current on this thread (EGL error {:#x})", unsafe { eglGetError() });
         return false;
     }
+    if previous != 0 && previous != context {
+        state_of(previous).lock().unwrap().owner = 0;
+    }
     CURRENT.with(|c| c.set(context));
     true
+}
+
+/// A request to the main thread to let go of a context. If the asking
+/// thread gives up waiting, the main thread must no longer act on it.
+#[derive(PartialEq)]
+enum Handoff {
+    Waiting,
+    Done,
+    GivenUp,
 }
 
 /// iPhone games often set a context up on the main thread and then draw
@@ -237,26 +269,42 @@ fn take_from_main_thread(context: Id, holder: u64) -> bool {
     if !crate::fw::runloop::is_main_thread_id(holder) {
         return false;
     }
-    let done = std::sync::Arc::new((Mutex::new(false), std::sync::Condvar::new()));
-    let signal = done.clone();
+    let handoff = std::sync::Arc::new((Mutex::new(Handoff::Waiting), std::sync::Condvar::new()));
+    let signal = handoff.clone();
     crate::fw::runloop::post(crate::fw::runloop::Work::Native(Box::new(move || {
-        if CURRENT.with(|c| c.get()) == context {
-            unsafe { eglMakeCurrent(egl().display, 0, 0, 0) };
-            CURRENT.with(|c| c.set(0));
-            state_of(context).lock().unwrap().owner = 0;
+        let mut status = signal.0.lock().unwrap();
+        if *status == Handoff::GivenUp {
+            return;
         }
-        *signal.0.lock().unwrap() = true;
+        if CURRENT.with(|c| c.get()) == context {
+            if unsafe { eglMakeCurrent(egl().display, 0, 0, 0) } != 0 {
+                CURRENT.with(|c| c.set(0));
+                state_of(context).lock().unwrap().owner = 0;
+            }
+        } else {
+            // Not really current here any more: the record was out of date.
+            let mut state = state_of(context).lock().unwrap();
+            if state.owner == holder {
+                state.owner = 0;
+            }
+        }
+        *status = Handoff::Done;
         signal.1.notify_all();
     })));
-    let mut finished = done.0.lock().unwrap();
+    let mut status = handoff.0.lock().unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while !*finished {
+    while *status == Handoff::Waiting {
         let now = std::time::Instant::now();
         if now >= deadline {
+            *status = Handoff::GivenUp;
             crate::log!("graphics: the main thread did not let go of context {context:#x} within 10 s");
             return false;
         }
-        finished = done.1.wait_timeout(finished, deadline - now).unwrap().0;
+        status = handoff.1.wait_timeout(status, deadline - now).unwrap().0;
+    }
+    drop(status);
+    if state_of(context).lock().unwrap().owner != 0 {
+        return false;
     }
     crate::log!("graphics: context {context:#x} handed from the main thread to this thread");
     true
@@ -302,7 +350,16 @@ extern "C" fn storage_from_drawable(this: Id, _: Sel, target: Enum, layer: Id) -
     let color = crate::fw::collections::dictionary_get(properties, crate::fw::string::make("EAGLDrawablePropertyColorFormat"));
     let format = if color != 0 && crate::fw::string::get(color) == "EAGLColorFormatRGB565" { gl::RGB565 } else { gl::RGBA8 };
     unsafe { gl::glRenderbufferStorage(target, format, width, height) };
-    state_of(this).lock().unwrap().size = (width, height);
+    let egl = egl();
+    let mut state = state_of(this).lock().unwrap();
+    state.size = (width, height);
+    if egl.window != 0 && !state.on_window {
+        state.on_window = true;
+        if CURRENT.with(|c| c.get()) == this && unsafe { eglMakeCurrent(egl.display, egl.window, egl.window, state.egl) } == 0 {
+            crate::log!("graphics: the screen's window can't be attached to context {this:#x} (EGL error {:#x})", unsafe { eglGetError() });
+        }
+    }
+    drop(state);
     crate::log!("graphics: screen memory {width}x{height} ({})", if format == gl::RGB565 { "16-bit" } else { "32-bit" });
     gl::check_errors("after giving the screen memory");
     true
@@ -330,6 +387,14 @@ extern "C" fn present(this: Id, _: Sel, _target: Enum) -> bool {
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     let mut state = state_of(this).lock().unwrap();
     let (width, height) = state.size;
+    if egl.window != 0 && unsafe { eglGetCurrentSurface(EGL_DRAW) } != egl.window {
+        // A context that never got the screen's memory still shows frames.
+        state.on_window = true;
+        if unsafe { eglMakeCurrent(egl.display, egl.window, egl.window, state.egl) } == 0 {
+            crate::log!("graphics: frame {frame} can't be shown: the window is in use (EGL error {:#x})", unsafe { eglGetError() });
+            return false;
+        }
+    }
     if frame <= 3 {
         let status = unsafe { gl::glCheckFramebufferStatus(gl::DRAW_FRAMEBUFFER) };
         let mut bound = 0;
@@ -413,12 +478,20 @@ fn save_frame_if_asked(frame: usize, width: i32, height: i32) {
     unsafe {
         let mut pack_buffer = 0;
         gl::glGetIntegerv(gl::PIXEL_PACK_BUFFER_BINDING, &mut pack_buffer);
-        let mut alignment = 0;
-        gl::glGetIntegerv(gl::PACK_ALIGNMENT, &mut alignment);
+        // Tightly packed rows into our buffer, whatever the game had set.
+        let settings = [gl::PACK_ALIGNMENT, gl::PACK_ROW_LENGTH, gl::PACK_SKIP_ROWS, gl::PACK_SKIP_PIXELS];
+        let mut saved = [0i32; 4];
+        for (name, value) in settings.iter().zip(saved.iter_mut()) {
+            gl::glGetIntegerv(*name, value);
+        }
         gl::glBindBuffer(gl::PIXEL_PACK_BUFFER, 0);
-        gl::glPixelStorei(gl::PACK_ALIGNMENT, 4);
+        for (name, value) in settings.iter().zip([4, 0, 0, 0]) {
+            gl::glPixelStorei(*name, value);
+        }
         gl::glReadPixels(0, 0, width, height, gl::RGBA, gl::UNSIGNED_BYTE, pixels.as_mut_ptr());
-        gl::glPixelStorei(gl::PACK_ALIGNMENT, alignment);
+        for (name, value) in settings.iter().zip(saved) {
+            gl::glPixelStorei(*name, value);
+        }
         gl::glBindBuffer(gl::PIXEL_PACK_BUFFER, pack_buffer as u32);
     }
     // The iPhone screen ignores alpha; games often leave it at 0.

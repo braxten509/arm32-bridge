@@ -135,7 +135,18 @@ Test switches: `IOS_FRAMES_DIR` (save frames), `IOS_FRAME_EVERY` (default
 at that time). On the phone: `ios/tools/run-phone.sh <App>.app` (no window;
 frames and log copied back).
 
-Still to do in step 3: run on the Pixel, then inside the app's window.
+A second-model review found 11 problems; all are fixed: texture uploads
+now follow the game's row layout and pixel buffers, frame saving can't
+overrun its memory, loading contexts get their own surface instead of the
+window's, context hand-overs can't go stale, keyed archives use Apple's
+real format (Apple-made archives read correctly), JSON is checked as
+strictly as Apple does, unchanged fingers report "stationary", the game
+screen follows window size changes, and the game screen is private to
+Game Bridge (other apps can't start it with a folder of their choosing).
+
+Still to do in step 3: run on the Pixel, then inside the app's window
+(the game screen opens only from Game Bridge itself, so that needs a
+small start path in the app; step 7 makes the real one).
 
 ## Later steps
 

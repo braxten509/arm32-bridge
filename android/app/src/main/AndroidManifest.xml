@@ -30,11 +30,12 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-        <!-- iPhone games (64-bit): own process, landscape, full screen. Opened with the
-             unpacked game folder in the "app" extra. -->
+        <!-- iPhone games (64-bit): own process, landscape, full screen. Opened by Game
+             Bridge itself with the unpacked game folder in the "app" extra. Not exported:
+             it runs the folder's program as this app, so other apps must not choose it. -->
         <activity
             android:name=".IosGameActivity"
-            android:exported="true"
+            android:exported="false"
             android:process=":ios"
             android:screenOrientation="sensorLandscape"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode|density"

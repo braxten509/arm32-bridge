@@ -10,17 +10,202 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 // ----- NSKeyedArchiver / NSKeyedUnarchiver -----
-// Objects made of property-list parts (dictionaries, arrays, strings, numbers,
-// data, dates) are saved as a property list and read back the same way.
-// Game classes with their own saving code are not supported yet: saving
-// reports failure and reading finds nothing, so nothing is half-saved.
+// Apple's keyed archive format: a property list whose "$objects" list holds
+// every object once, linked by object numbers, with "$top" naming the root.
+// Objects made of property-list parts (dictionaries, arrays, sets, strings,
+// numbers, data) are written and read in that format. Game classes with
+// their own saving code are not supported yet: saving reports failure and
+// reading finds nothing, so nothing is half-saved or misread.
+
+use crate::fw::plist::Value;
+
+struct Archive {
+    objects: Vec<Value>,
+    classes: HashMap<&'static str, u64>,
+}
+
+impl Archive {
+    fn add(&mut self, value: Value) -> u64 {
+        self.objects.push(value);
+        (self.objects.len() - 1) as u64
+    }
+
+    fn class(&mut self, name: &'static str, parents: &[&'static str]) -> u64 {
+        if let Some(&number) = self.classes.get(name) {
+            return number;
+        }
+        let mut chain = vec![Value::String(name.into())];
+        chain.extend(parents.iter().map(|p| Value::String((*p).into())));
+        chain.push(Value::String("NSObject".into()));
+        let number = self.add(Value::Dict(vec![("$classes".into(), Value::Array(chain)), ("$classname".into(), Value::String(name.into()))]));
+        self.classes.insert(name, number);
+        number
+    }
+
+    /// Adds `object` (and everything in it); its object number, or None
+    /// for something this archiver can't write.
+    fn encode(&mut self, object: Id, depth: usize) -> Option<u64> {
+        if object == 0 {
+            return Some(0);
+        }
+        if depth > 64 {
+            return None;
+        }
+        if string::is_string(object) {
+            return Some(self.add(Value::String(string::get(object))));
+        }
+        if collections::is_number(object) {
+            let value = if collections::number_is_bool(object) {
+                Value::Bool(collections::number_as_f64(object) != 0.0)
+            } else {
+                let number = collections::number_as_f64(object);
+                if number.fract() == 0.0 && number.abs() < 9.0e18 { Value::Integer(collections::number_as_i64(object)) } else { Value::Real(number) }
+            };
+            return Some(self.add(value));
+        }
+        if crate::fw::data::is_data(object) {
+            let at = self.add(Value::Data(Vec::new()));
+            let class = self.class("NSMutableData", &["NSData"]);
+            self.objects[at as usize] = Value::Dict(vec![
+                ("NS.data".into(), Value::Data(crate::fw::data::bytes(object))),
+                ("$class".into(), Value::Uid(class)),
+            ]);
+            return Some(at);
+        }
+        if is_kind(object, "NSDate") {
+            let class = self.class("NSDate", &[]);
+            let seconds = crate::fw::misc::date_value(object);
+            return Some(self.add(Value::Dict(vec![("NS.time".into(), Value::Real(seconds)), ("$class".into(), Value::Uid(class))])));
+        }
+        let at = self.add(Value::String(String::new()));
+        let entries = if collections::is_dictionary(object) {
+            let mut keys = Vec::new();
+            let mut values = Vec::new();
+            for (key, value) in collections::dictionary_pairs(object) {
+                keys.push(Value::Uid(self.encode(key, depth + 1)?));
+                values.push(Value::Uid(self.encode(value, depth + 1)?));
+            }
+            let class = self.class("NSMutableDictionary", &["NSDictionary"]);
+            vec![("NS.keys".into(), Value::Array(keys)), ("NS.objects".into(), Value::Array(values)), ("$class".into(), Value::Uid(class))]
+        } else if collections::is_array(object) || is_set(object) {
+            let set = is_set(object);
+            let items = if set { collections::array_items(runtime::send(object, "allObjects", &[])) } else { collections::array_items(object) };
+            let mut list = Vec::new();
+            for item in items {
+                list.push(Value::Uid(self.encode(item, depth + 1)?));
+            }
+            let class = if set { self.class("NSMutableSet", &["NSSet"]) } else { self.class("NSMutableArray", &["NSArray"]) };
+            vec![("NS.objects".into(), Value::Array(list)), ("$class".into(), Value::Uid(class))]
+        } else {
+            crate::log!("NSKeyedArchiver: a {} can't be saved yet (only property-list objects)", string::describe_class_of(object));
+            return None;
+        };
+        self.objects[at as usize] = Value::Dict(entries);
+        Some(at)
+    }
+}
+
+fn is_kind(object: Id, class: &str) -> bool {
+    let class = runtime::class_named(class);
+    class != 0 && runtime::send(object, "isKindOfClass:", &[class]) != 0
+}
+
+fn is_set(object: Id) -> bool {
+    is_kind(object, "NSSet")
+}
+
+/// The keyed archive for `object`, or None if it holds something we can't write.
+fn archive(object: Id) -> Option<Value> {
+    let mut archive = Archive { objects: vec![Value::String("$null".into())], classes: HashMap::new() };
+    let root = archive.encode(object, 0)?;
+    Some(Value::Dict(vec![
+        ("$archiver".into(), Value::String("NSKeyedArchiver".into())),
+        ("$objects".into(), Value::Array(archive.objects)),
+        ("$top".into(), Value::Dict(vec![("root".into(), Value::Uid(root))])),
+        ("$version".into(), Value::Integer(100000)),
+    ]))
+}
+
+/// The root object of a keyed archive, or None if it isn't one or holds a
+/// class this layer can't make.
+fn unarchive(value: &Value) -> Option<Id> {
+    let Some(Value::Array(objects)) = value.get("$objects") else {
+        crate::log!("NSKeyedUnarchiver: not a keyed archive");
+        return None;
+    };
+    let top = value.get("$top")?;
+    let root = top.get("root").or_else(|| match top {
+        Value::Dict(entries) => entries.first().map(|(_, v)| v),
+        _ => None,
+    })?;
+    decode(objects, root.as_uid()?, 0)
+}
+
+fn decode(objects: &[Value], number: u64, depth: usize) -> Option<Id> {
+    if depth > 64 {
+        return None;
+    }
+    let value = objects.get(number as usize)?;
+    let reference = |v: &Value| -> Option<Id> { decode(objects, v.as_uid()?, depth + 1) };
+    let list = |key: &str| -> Option<Vec<Id>> {
+        match value.get(key) {
+            Some(Value::Array(items)) => items.iter().map(reference).collect(),
+            None => Some(Vec::new()),
+            _ => None,
+        }
+    };
+    Some(match value {
+        Value::String(text) if number == 0 && text == "$null" => 0,
+        Value::String(text) => string::make(text),
+        Value::Integer(n) => collections::number_int(*n),
+        Value::Real(f) => collections::number_float(*f),
+        Value::Bool(b) => collections::number_bool(*b),
+        Value::Data(bytes) => crate::fw::data::make(bytes),
+        Value::Dict(_) => {
+            let class = objects.get(value.get("$class")?.as_uid()? as usize)?;
+            let Some(Value::String(name)) = class.get("$classname") else { return None };
+            let mutable = name.starts_with("NSMutable");
+            let made = match name.trim_start_matches("NSMutable").trim_start_matches("NS") {
+                "Dictionary" => {
+                    let keys = list("NS.keys")?;
+                    let values = list("NS.objects")?;
+                    if keys.len() != values.len() {
+                        return None;
+                    }
+                    collections::dictionary_from(&keys.into_iter().zip(values).collect::<Vec<_>>())
+                }
+                "Array" => collections::array_from(&list("NS.objects")?),
+                "Set" => crate::fw::misc::set_from(&list("NS.objects")?),
+                "String" => match value.get("NS.string") {
+                    Some(Value::String(text)) => string::make(text),
+                    _ => return None,
+                },
+                "Date" => match value.get("NS.time") {
+                    Some(Value::Real(seconds)) => crate::fw::misc::date(*seconds),
+                    Some(Value::Integer(seconds)) => crate::fw::misc::date(*seconds as f64),
+                    _ => return None,
+                },
+                "Data" => match value.get("NS.data") {
+                    Some(Value::Data(bytes)) => crate::fw::data::make(bytes),
+                    _ => return None,
+                },
+                _ => {
+                    crate::log!("NSKeyedUnarchiver: a {name} can't be read yet (only property-list objects)");
+                    return None;
+                }
+            };
+            if mutable { runtime::send(made, "mutableCopy", &[]) } else { made }
+        }
+        _ => return None,
+    })
+}
 
 extern "C" fn archive_root_object(_: Class, _: Sel, object: Id, path: Id) -> bool {
     let path = string::get(path);
-    match plist::from_object(object) {
+    match archive(object) {
         Some(value) => std::fs::write(&path, plist::to_xml(&value)).is_ok(),
         None => {
-            crate::log!("NSKeyedArchiver: a {} can't be saved yet (only property-list objects); {path} not written", string::describe_class_of(object));
+            crate::log!("NSKeyedArchiver: {path} not written");
             false
         }
     }
@@ -28,27 +213,18 @@ extern "C" fn archive_root_object(_: Class, _: Sel, object: Id, path: Id) -> boo
 
 extern "C" fn unarchive_object_with_file(_: Class, _: Sel, path: Id) -> Id {
     let path = string::get(path);
-    match std::fs::read(&path).ok().and_then(|bytes| plist::parse(&bytes)) {
-        Some(value) => plist::to_object(&value),
-        None => 0,
-    }
+    std::fs::read(&path).ok().and_then(|bytes| plist::parse(&bytes)).and_then(|value| unarchive(&value)).unwrap_or(0)
 }
 
 extern "C" fn archived_data_with_root_object(_: Class, _: Sel, object: Id) -> Id {
-    match plist::from_object(object) {
+    match archive(object) {
         Some(value) => crate::fw::data::make(plist::to_xml(&value).as_bytes()),
-        None => {
-            crate::log!("NSKeyedArchiver: a {} can't be saved yet (only property-list objects)", string::describe_class_of(object));
-            0
-        }
+        None => 0,
     }
 }
 
 extern "C" fn unarchive_object_with_data(_: Class, _: Sel, data: Id) -> Id {
-    match plist::parse(&crate::fw::data::bytes(data)) {
-        Some(value) => plist::to_object(&value),
-        None => 0,
-    }
+    plist::parse(&crate::fw::data::bytes(data)).and_then(|value| unarchive(&value)).unwrap_or(0)
 }
 
 // ----- NSTimeZone: the phone's own time zone -----
@@ -401,4 +577,60 @@ pub fn register(_: &mut Registry) {
         list.push((name, ignore as usize));
     }
     methods(motion, &list);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ready() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+    }
+
+    fn hex(text: &str) -> Vec<u8> {
+        (0..text.len()).step_by(2).map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap()).collect()
+    }
+
+    /// A binary keyed archive as Apple writes it: {"score": 42, "names": ["Siris"]}.
+    const APPLE_ARCHIVE: &str = "62706c6973743030d4010203040506070a59246172636869766572582476657273696f6e5424746f7058246f626a656374735f100f4e534b65796564417263686976657212000186a0d1080954726f6f748001a90b0c1718191a1e1f2555246e756c6cd30d0e0f101316574e532e6b6579735a4e532e6f626a656374735624636c617373a2111280028003a214158004800580075573636f7265556e616d6573102ad20e0f1b1da11c80068008555369726973d2202122235a24636c6173736e616d655824636c61737365735c4e5344696374696f6e617279a22224584e534f626a656374d220212627574e534172726179a2262408111b24293244494c51535d636a727d8487898b8e9092949aa0a2a7a9abadb3b8c3ccd9dce5eaf200000000000001010000000000000028000000000000000000000000000000f5";
+
+    #[test]
+    fn apple_keyed_archive_reads_as_its_objects() {
+        ready();
+        let root = unarchive(&plist::parse(&hex(APPLE_ARCHIVE)).unwrap()).unwrap();
+        assert!(collections::is_dictionary(root));
+        assert_eq!(collections::number_as_i64(collections::dictionary_get(root, string::make("score"))), 42);
+        let names = collections::array_items(collections::dictionary_get(root, string::make("names")));
+        assert_eq!(names.len(), 1);
+        assert_eq!(string::get(names[0]), "Siris");
+    }
+
+    #[test]
+    fn keyed_archive_round_trip() {
+        ready();
+        let list = collections::array_from(&[string::make("a"), collections::number_int(7), collections::number_bool(true), collections::number_float(1.5)]);
+        let object = collections::dictionary_from(&[
+            (string::make("list"), list),
+            (string::make("blob"), crate::fw::data::make(b"xyz")),
+            (string::make("when"), crate::fw::misc::date(12345.5)),
+        ]);
+        let text = plist::to_xml(&archive(object).unwrap());
+        assert!(text.contains("NSKeyedArchiver") && text.contains("CF$UID"));
+        let back = unarchive(&plist::parse(text.as_bytes()).unwrap()).unwrap();
+        let items = collections::array_items(collections::dictionary_get(back, string::make("list")));
+        assert_eq!(string::get(items[0]), "a");
+        assert_eq!(collections::number_as_i64(items[1]), 7);
+        assert!(collections::number_is_bool(items[2]));
+        assert_eq!(collections::number_as_f64(items[3]), 1.5);
+        assert_eq!(crate::fw::data::bytes(collections::dictionary_get(back, string::make("blob"))), b"xyz");
+        assert_eq!(crate::fw::misc::date_value(collections::dictionary_get(back, string::make("when"))), 12345.5);
+    }
+
+    #[test]
+    fn plain_property_lists_are_not_archives() {
+        ready();
+        let value = plist::Value::Dict(vec![("score".into(), plist::Value::Integer(1))]);
+        assert!(unarchive(&value).is_none());
+    }
 }

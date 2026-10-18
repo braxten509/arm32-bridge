@@ -292,13 +292,13 @@ pub fn now_since_2001() -> f64 {
     t.tv_sec as f64 + t.tv_nsec as f64 / 1e9 - SINCE_1970
 }
 
-fn date(seconds: f64) -> Id {
+pub fn date(seconds: f64) -> Id {
     let object = runtime::alloc_instance(runtime::class_named("NSDate"));
     unsafe { *((object + 8) as *mut f64) = seconds };
     object
 }
 
-fn date_value(object: Id) -> f64 {
+pub fn date_value(object: Id) -> f64 {
     unsafe { *((object + 8) as *const f64) }
 }
 

@@ -64,6 +64,13 @@ pub unsafe extern "C" fn Java_dev_braxten_gamebridge_IosGameActivity_nativeStart
     if started.is_ok() { JNI_TRUE } else { JNI_FALSE }
 }
 
+/// nativeResize(width, height): the window changed size (touches map through it).
+#[no_mangle]
+pub extern "C" fn Java_dev_braxten_gamebridge_IosGameActivity_nativeResize(_env: *mut JNIEnv, _this: jobject, width: jint, height: jint) {
+    WINDOW_WIDTH.store(width.max(1) as u32, Ordering::Relaxed);
+    WINDOW_HEIGHT.store(height.max(1) as u32, Ordering::Relaxed);
+}
+
 /// nativeTouch(finger, phase 0 began / 1 moved / 3 ended / 4 cancelled, x, y) in window pixels.
 #[no_mangle]
 pub extern "C" fn Java_dev_braxten_gamebridge_IosGameActivity_nativeTouch(

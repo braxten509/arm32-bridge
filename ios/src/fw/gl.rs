@@ -176,6 +176,16 @@ const TEXTURE_WIDTH: Enum = 0x1000;
 const TEXTURE_HEIGHT: Enum = 0x1001;
 const BUFFER_SIZE: Enum = 0x8764;
 const MAP_WRITE_BIT: u32 = 0x2;
+const MAP_READ_BIT: u32 = 0x1;
+pub const PIXEL_UNPACK_BUFFER: Enum = 0x88EC;
+pub const PIXEL_UNPACK_BUFFER_BINDING: Enum = 0x88EF;
+pub const UNPACK_ALIGNMENT: Enum = 0x0CF5;
+pub const UNPACK_ROW_LENGTH: Enum = 0x0CF2;
+pub const UNPACK_SKIP_ROWS: Enum = 0x0CF3;
+pub const UNPACK_SKIP_PIXELS: Enum = 0x0CF4;
+pub const PACK_ROW_LENGTH: Enum = 0x0D02;
+pub const PACK_SKIP_ROWS: Enum = 0x0D03;
+pub const PACK_SKIP_PIXELS: Enum = 0x0D04;
 const EXTENSIONS: Enum = 0x1F03;
 const BGRA: Enum = 0x80E1;
 const HALF_FLOAT_OES: Enum = 0x8D61;
@@ -434,16 +444,94 @@ extern "C" fn map_buffer_oes(target: Enum, _access: Enum) -> usize {
     }
 }
 
+/// How the game laid out the pixels it hands over (glPixelStorei), and
+/// whether "pixels" is really an offset into a bound buffer.
+struct Unpack {
+    buffer: i32,
+    row_length: i32,
+    skip_rows: i32,
+    skip_pixels: i32,
+    alignment: i32,
+}
+
+fn unpack_state() -> Unpack {
+    let get = |name| {
+        let mut value = 0;
+        unsafe { glGetIntegerv(name, &mut value) };
+        value
+    };
+    Unpack {
+        buffer: get(PIXEL_UNPACK_BUFFER_BINDING),
+        row_length: get(UNPACK_ROW_LENGTH),
+        skip_rows: get(UNPACK_SKIP_ROWS),
+        skip_pixels: get(UNPACK_SKIP_PIXELS),
+        alignment: get(UNPACK_ALIGNMENT).max(1),
+    }
+}
+
+/// Copies `length` bytes starting at `data`, which is an offset when a
+/// pixel buffer is bound.
+fn read_source(unpack: &Unpack, data: *const u8, length: usize) -> Option<Vec<u8>> {
+    if unpack.buffer == 0 {
+        if data.is_null() {
+            return None;
+        }
+        return Some(unsafe { std::slice::from_raw_parts(data, length) }.to_vec());
+    }
+    unsafe {
+        let mut size = 0;
+        glGetBufferParameteriv(PIXEL_UNPACK_BUFFER, BUFFER_SIZE, &mut size);
+        let offset = data as usize;
+        if offset.checked_add(length).is_none_or(|end| end > size.max(0) as usize) {
+            return None;
+        }
+        let mapped = glMapBufferRange(PIXEL_UNPACK_BUFFER, offset as isize, length as isize, MAP_READ_BIT);
+        if mapped == 0 {
+            return None;
+        }
+        let copy = std::slice::from_raw_parts(mapped as *const u8, length).to_vec();
+        glUnmapBuffer(PIXEL_UNPACK_BUFFER);
+        Some(copy)
+    }
+}
+
+/// Runs an upload from our own tightly packed memory: no bound pixel
+/// buffer, no row length or skips; the game's settings come back after.
+fn upload_plain(unpack: &Unpack, upload: impl FnOnce()) {
+    unsafe {
+        glBindBuffer(PIXEL_UNPACK_BUFFER, 0);
+        glPixelStorei(UNPACK_ROW_LENGTH, 0);
+        glPixelStorei(UNPACK_SKIP_ROWS, 0);
+        glPixelStorei(UNPACK_SKIP_PIXELS, 0);
+        glPixelStorei(UNPACK_ALIGNMENT, 4);
+        upload();
+        glPixelStorei(UNPACK_ROW_LENGTH, unpack.row_length);
+        glPixelStorei(UNPACK_SKIP_ROWS, unpack.skip_rows);
+        glPixelStorei(UNPACK_SKIP_PIXELS, unpack.skip_pixels);
+        glPixelStorei(UNPACK_ALIGNMENT, unpack.alignment);
+        glBindBuffer(PIXEL_UNPACK_BUFFER, unpack.buffer as u32);
+    }
+}
+
 /// Apple's BGRA textures say "RGBA" inside and "BGRA" outside; the standard
-/// way can't, so the pixels are reordered to RGBA here.
-fn bgra_to_rgba(width: i32, height: i32, data: *const u8) -> Option<Vec<u8>> {
-    if data.is_null() || width <= 0 || height <= 0 {
+/// way can't, so the pixels are reordered to tightly packed RGBA here,
+/// read with the game's row layout.
+fn bgra_to_rgba(unpack: &Unpack, width: i32, height: i32, data: *const u8) -> Option<Vec<u8>> {
+    if width <= 0 || height <= 0 {
         return None;
     }
-    let size = width as usize * height as usize * 4;
-    let mut pixels = unsafe { std::slice::from_raw_parts(data, size) }.to_vec();
-    for pixel in pixels.chunks_exact_mut(4) {
-        pixel.swap(0, 2);
+    let (width, height) = (width as usize, height as usize);
+    let row_pixels = if unpack.row_length > 0 { unpack.row_length as usize } else { width };
+    let alignment = unpack.alignment as usize;
+    let stride = (row_pixels * 4).div_ceil(alignment) * alignment;
+    let start = unpack.skip_rows.max(0) as usize * stride + unpack.skip_pixels.max(0) as usize * 4;
+    let source = read_source(unpack, data, start + (height - 1) * stride + width * 4)?;
+    let mut pixels = Vec::with_capacity(width * height * 4);
+    for row in 0..height {
+        let line = &source[start + row * stride..start + row * stride + width * 4];
+        for pixel in line.chunks_exact(4) {
+            pixels.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+        }
     }
     Some(pixels)
 }
@@ -456,9 +544,10 @@ extern "C" fn tex_image_2d(target: Enum, level: i32, internal: i32, width: i32, 
     let kind = standard_type(kind);
     unsafe {
         if format == BGRA && kind == UNSIGNED_BYTE {
-            let pixels = bgra_to_rgba(width, height, data);
+            let unpack = unpack_state();
+            let pixels = if data.is_null() && unpack.buffer == 0 { None } else { bgra_to_rgba(&unpack, width, height, data) };
             let pointer = pixels.as_ref().map(|p| p.as_ptr()).unwrap_or(std::ptr::null());
-            glTexImage2D(target, level, RGBA as i32, width, height, border, RGBA, kind, pointer);
+            upload_plain(&unpack, || glTexImage2D(target, level, RGBA as i32, width, height, border, RGBA, kind, pointer));
         } else {
             glTexImage2D(target, level, internal, width, height, border, format, kind, data);
         }
@@ -469,9 +558,11 @@ extern "C" fn tex_sub_image_2d(target: Enum, level: i32, x: i32, y: i32, width: 
     let kind = standard_type(kind);
     unsafe {
         if format == BGRA && kind == UNSIGNED_BYTE {
-            let pixels = bgra_to_rgba(width, height, data);
-            let pointer = pixels.as_ref().map(|p| p.as_ptr()).unwrap_or(std::ptr::null());
-            glTexSubImage2D(target, level, x, y, width, height, RGBA, kind, pointer);
+            let unpack = unpack_state();
+            match bgra_to_rgba(&unpack, width, height, data) {
+                Some(pixels) => upload_plain(&unpack, || glTexSubImage2D(target, level, x, y, width, height, RGBA, kind, pixels.as_ptr())),
+                None => crate::log!("graphics: a BGRA texture update ({width}x{height}) could not be read; skipped"),
+            }
         } else {
             glTexSubImage2D(target, level, x, y, width, height, format, kind, data);
         }
@@ -485,14 +576,14 @@ extern "C" fn compressed_tex_image_2d(target: Enum, level: i32, internal: Enum, 
         // 0x8C00/0x8C02 are 4 bits per pixel, 0x8C01/0x8C03 are 2.
         let two_bits = internal & 1 == 1;
         let needed = crate::fw::pvrtc::size(width.max(0) as u32, height.max(0) as u32, two_bits);
-        let pixels = if data.is_null() || (size as usize) < needed {
+        let unpack = unpack_state();
+        let pixels = if (size as usize) < needed {
             None
         } else {
-            let bytes = unsafe { std::slice::from_raw_parts(data, needed) };
-            crate::fw::pvrtc::decode(bytes, width as u32, height as u32, two_bits)
+            read_source(&unpack, data, needed).and_then(|bytes| crate::fw::pvrtc::decode(&bytes, width as u32, height as u32, two_bits))
         };
         match pixels {
-            Some(rgba) => unsafe { glTexImage2D(target, level, RGBA as i32, width, height, border, RGBA, UNSIGNED_BYTE, rgba.as_ptr()) },
+            Some(rgba) => upload_plain(&unpack, || unsafe { glTexImage2D(target, level, RGBA as i32, width, height, border, RGBA, UNSIGNED_BYTE, rgba.as_ptr()) }),
             None => {
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| crate::log!("graphics: a PVRTC texture ({width}x{height}, {size} bytes) could not be decoded; it stays empty"));

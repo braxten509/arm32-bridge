@@ -65,27 +65,60 @@ impl Reader<'_> {
         }
     }
 
+    /// JSON's number rule: -?(0|[1-9][0-9]*)(.[0-9]+)?([eE][+-]?[0-9]+)?
     fn number(&mut self) -> Result<Id, String> {
         let start = self.at;
-        while self.at < self.text.len() && matches!(self.text[self.at], b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9') {
+        let bad = || format!("bad number at {start}");
+        let digits = |reader: &mut Self| {
+            let first = reader.at;
+            while reader.text.get(reader.at).is_some_and(u8::is_ascii_digit) {
+                reader.at += 1;
+            }
+            reader.at - first
+        };
+        if self.text.get(self.at) == Some(&b'-') {
             self.at += 1;
         }
-        let text = std::str::from_utf8(&self.text[start..self.at]).unwrap_or("");
-        if !text.contains(['.', 'e', 'E']) {
+        let leading_zero = self.text.get(self.at) == Some(&b'0');
+        let whole = digits(self);
+        if whole == 0 || (leading_zero && whole > 1) {
+            return Err(bad());
+        }
+        let mut fraction = false;
+        if self.text.get(self.at) == Some(&b'.') {
+            self.at += 1;
+            fraction = true;
+            if digits(self) == 0 {
+                return Err(bad());
+            }
+        }
+        if matches!(self.text.get(self.at), Some(b'e' | b'E')) {
+            self.at += 1;
+            fraction = true;
+            if matches!(self.text.get(self.at), Some(b'+' | b'-')) {
+                self.at += 1;
+            }
+            if digits(self) == 0 {
+                return Err(bad());
+            }
+        }
+        let text = std::str::from_utf8(&self.text[start..self.at]).map_err(|_| bad())?;
+        if !fraction {
             if let Ok(whole) = text.parse::<i64>() {
                 return Ok(collections::number_int(whole));
             }
         }
-        text.parse::<f64>().map(collections::number_float).map_err(|_| format!("bad number at {start}"))
+        text.parse::<f64>().map(collections::number_float).map_err(|_| bad())
     }
 
     fn string(&mut self) -> Result<String, String> {
         self.take(b'"')?;
         let mut units: Vec<u16> = Vec::new();
         let mut plain = Vec::new();
-        let flush = |plain: &mut Vec<u8>, units: &mut Vec<u16>| {
-            units.extend(String::from_utf8_lossy(plain).encode_utf16());
+        let flush = |plain: &mut Vec<u8>, units: &mut Vec<u16>| -> Result<(), String> {
+            units.extend(std::str::from_utf8(plain).map_err(|_| "text is not valid UTF-8".to_string())?.encode_utf16());
             plain.clear();
+            Ok(())
         };
         loop {
             let Some(&c) = self.text.get(self.at) else { return Err("text ends inside a string".into()) };
@@ -93,7 +126,7 @@ impl Reader<'_> {
             match c {
                 b'"' => break,
                 b'\\' => {
-                    flush(&mut plain, &mut units);
+                    flush(&mut plain, &mut units)?;
                     let Some(&e) = self.text.get(self.at) else { return Err("text ends inside a string".into()) };
                     self.at += 1;
                     match e {
@@ -104,17 +137,22 @@ impl Reader<'_> {
                         b'f' => units.push(12),
                         b'u' => {
                             let hex = self.text.get(self.at..self.at + 4).ok_or("short \\u escape")?;
+                            if !hex.iter().all(u8::is_ascii_hexdigit) {
+                                return Err("bad \\u escape".into());
+                            }
                             let value = u16::from_str_radix(std::str::from_utf8(hex).unwrap_or(""), 16).map_err(|_| "bad \\u escape")?;
                             units.push(value);
                             self.at += 4;
                         }
-                        other => units.push(other as u16),
+                        b'"' | b'\\' | b'/' => units.push(e as u16),
+                        _ => return Err(format!("bad escape at {}", self.at - 1)),
                     }
                 }
+                0..=0x1F => return Err(format!("control character inside a string at {}", self.at - 1)),
                 _ => plain.push(c),
             }
         }
-        flush(&mut plain, &mut units);
+        flush(&mut plain, &mut units)?;
         Ok(String::from_utf16_lossy(&units))
     }
 
@@ -305,4 +343,33 @@ pub fn register(_: &mut Registry) {
             ("isValidJSONObject:", is_valid_json_object as usize),
         ],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn read(text: &str) -> Result<Id, String> {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let mut reader = Reader { text: text.as_bytes(), at: 0, options: ALLOW_FRAGMENTS };
+        let value = reader.value()?;
+        reader.space();
+        if reader.at != reader.text.len() {
+            return Err("extra text".into());
+        }
+        Ok(value)
+    }
+
+    #[test]
+    fn json_grammar_is_enforced() {
+        for good in ["0", "-0", "12", "1.5", "-2e10", "3E+2", "1.25e-3", r#""a\/b\"\\""#, r#""\u00e9""#, "[1,{\"k\":null}]"] {
+            assert!(read(good).is_ok(), "{good} should be read");
+        }
+        for bad in ["01", "1.", ".5", "-", "1e", "+1", r#""\q""#, "\"a\tb\"", r#""\u12G4""#] {
+            assert!(read(bad).is_err(), "{bad} should be refused");
+        }
+        assert_eq!(collections::number_as_i64(read("42").unwrap()), 42);
+        assert_eq!(string::get(read(r#""\u00e9x""#).unwrap()), "éx");
+    }
 }

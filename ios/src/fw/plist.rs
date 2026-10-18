@@ -14,6 +14,30 @@ pub enum Value {
     Bool(bool),
     Data(Vec<u8>),
     Date(f64),
+    /// An object number inside a keyed archive (binary lists only; XML
+    /// ones write it as a dictionary with the key "CF$UID").
+    Uid(u64),
+}
+
+impl Value {
+    /// The object number this value stands for in a keyed archive.
+    pub fn as_uid(&self) -> Option<u64> {
+        match self {
+            Value::Uid(n) => Some(*n),
+            Value::Dict(entries) if entries.len() == 1 && entries[0].0 == "CF$UID" => match entries[0].1 {
+                Value::Integer(n) if n >= 0 => Some(n as u64),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    pub fn get(&self, key: &str) -> Option<&Value> {
+        match self {
+            Value::Dict(entries) => entries.iter().find(|(k, _)| k == key).map(|(_, v)| v),
+            _ => None,
+        }
+    }
 }
 
 pub fn parse(bytes: &[u8]) -> Option<Value> {
@@ -223,6 +247,7 @@ fn parse_binary(bytes: &[u8]) -> Option<Value> {
                     f64::from_be_bytes(raw.try_into().ok()?)
                 })
             }
+            0x8 => Value::Uid(read_n(at + 1, info + 1)? as u64),
             0x3 => Value::Date(f64::from_be_bytes(bytes.get(at + 1..at + 9)?.try_into().ok()?)),
             0x4 => {
                 let (n, start) = length(at)?;
@@ -286,6 +311,7 @@ pub fn to_object(value: &Value) -> Id {
         Value::Bool(b) => collections::number_bool(*b),
         Value::Data(bytes) => crate::fw::data::make(bytes),
         Value::Date(_) => collections::number_float(0.0),
+        Value::Uid(n) => collections::number_int(*n as i64),
     }
 }
 
@@ -343,6 +369,7 @@ pub fn to_xml(value: &Value) -> String {
             Value::Bool(false) => out.push_str(&format!("{pad}<false/>\n")),
             Value::Data(bytes) => out.push_str(&format!("{pad}<data>{}</data>\n", base64_encode(bytes))),
             Value::Date(_) => out.push_str(&format!("{pad}<date>2001-01-01T00:00:00Z</date>\n")),
+            Value::Uid(n) => out.push_str(&format!("{pad}<dict>\n{pad}\t<key>CF$UID</key>\n{pad}\t<integer>{n}</integer>\n{pad}</dict>\n")),
         }
     }
     let mut out = String::from(
