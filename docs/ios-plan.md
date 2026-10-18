@@ -168,9 +168,47 @@ renderbuffer on the emulator, so the game read a 0x0 screen and never
 drew); small PVRTC mipmap levels; `-[NSFileManager
 stringWithFileSystemRepresentation:length:]`.
 
-Still to do in step 3: the same on the Pixel itself. The cutscene skip
-button doesn't skip yet (taps reach the game; unclear if this intro is
-skippable).
+Still to do in step 3: the same on the Pixel itself.
+
+## Step 4 result (2026-10-18): sound and videos
+
+Sound (`src/fw/sound.rs`): the game's audio graph (3D and multichannel
+mixers whose inputs ask the game for samples) and its music players
+(`AVAudioPlayer`, MP3 and WAV) are mixed into one stereo stream played
+through Android's low-latency output (AAudio). PC and no-window phone runs
+pull the stream in real time instead; `IOS_SOUND_FILE` (or `IOS_SOUND=1`
+for `run-phone.sh`) saves it as a WAV file.
+
+- Music is decoded by one worker thread per player into a short queue
+  (0.75 s). The sound thread never reads files, decodes, or waits for a
+  player: a busy player is skipped for one turn.
+- Stopping or disposing a graph waits until no game callback is running,
+  so the game can free its sound data right after.
+- 3D mixer: direction, distance (Apple's default inverse curve), gain,
+  playback rate, on/off. Multichannel mixer: volume, pan, on/off. Reading
+  a setting back gives what was set. A muted input keeps playing silently,
+  so it keeps its place.
+- Input formats this layer can't read (big-endian, signed 8-bit, unsigned
+  16-bit, more than 8 channels) are refused when set instead of playing
+  noise. Buffers the game hands back are checked against their real size.
+- `currentTime`, looping and seeking follow what is actually heard.
+- If the sound device goes away (headphones), it is reopened, retrying
+  until it works.
+
+Videos (`src/fw/media.rs`, `IosGameActivity`): `AVPlayer` videos play in
+Android's own video player over the game, black around them. Touches
+still reach the game, so its own skip handling runs. Pause holds the
+picture and play goes on from there. The video goes away when the game
+removes the view showing it, changes the player's item or layer, or the
+video ends (then the game gets its "played to the end" message). Without
+the phone app (PC and no-window tests) videos are skipped: the game is
+told at once that they ended.
+
+On the emulator the startup movie and the opening cine play with picture
+and sound, and the game carries on when each ends. The cine's skip button
+works when held (a quick tap doesn't skip, as in the game itself). A second-model review
+found 15 problems; all are fixed. Unit tests: the mixer (pan, resampling,
+on/off) and the music player (time, loops, seeking, end).
 
 ## Later steps
 

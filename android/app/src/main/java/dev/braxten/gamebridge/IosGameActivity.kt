@@ -2,12 +2,16 @@ package dev.braxten.gamebridge
 
 import android.app.Activity
 import android.os.Bundle
+import android.graphics.Color
+import android.view.Gravity
 import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.WindowManager
+import android.widget.FrameLayout
+import android.widget.VideoView
 import java.io.File
 
 /**
@@ -18,13 +22,21 @@ import java.io.File
  */
 class IosGameActivity : Activity(), SurfaceHolder.Callback {
     private var started = false
+    private lateinit var root: FrameLayout
+    /** The game's video on screen (over the game, black around it), or null. */
+    private var video: FrameLayout? = null
+    private var videoPlayer: VideoView? = null
+    /** The game's number for the video on screen (0: none). */
+    private var videoToken = 0L
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         val view = SurfaceView(this)
         view.holder.addCallback(this)
-        setContentView(view)
+        root = FrameLayout(this)
+        root.addView(view)
+        setContentView(root)
         window.insetsController?.let {
             it.hide(WindowInsets.Type.systemBars())
             it.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
@@ -72,6 +84,64 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
         }
         return true
     }
+
+    /** Called by the game (any thread): show a video file over the game. */
+    @Suppress("unused")
+    fun playVideo(path: String, token: Long) {
+        runOnUiThread {
+            closeVideo()
+            // Touches pass through to onTouchEvent, so the game can skip it.
+            val frame = FrameLayout(this)
+            frame.setBackgroundColor(Color.BLACK)
+            val player = VideoView(this)
+            player.setZOrderMediaOverlay(true)
+            val ended = {
+                if (videoToken == token) closeVideo()
+                nativeVideoEnded(token)
+            }
+            player.setOnCompletionListener { ended() }
+            player.setOnErrorListener { _, _, _ ->
+                ended()
+                true
+            }
+            frame.addView(player, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT, Gravity.CENTER))
+            root.addView(frame)
+            video = frame
+            videoPlayer = player
+            videoToken = token
+            player.setVideoPath(path)
+            player.start()
+        }
+    }
+
+    /** Called by the game (any thread): hold the video where it is. */
+    @Suppress("unused")
+    fun pauseVideo(token: Long) {
+        runOnUiThread { if (videoToken == token) videoPlayer?.pause() }
+    }
+
+    /** Called by the game (any thread): go on from where it was held. */
+    @Suppress("unused")
+    fun resumeVideo(token: Long) {
+        runOnUiThread { if (videoToken == token) videoPlayer?.start() }
+    }
+
+    /** Called by the game (any thread): take the video off the screen. */
+    @Suppress("unused")
+    fun stopVideo(token: Long) {
+        runOnUiThread { if (videoToken == token) closeVideo() }
+    }
+
+    private fun closeVideo() {
+        videoPlayer?.stopPlayback()
+        video?.let { root.removeView(it) }
+        video = null
+        videoPlayer = null
+        videoToken = 0
+    }
+
+    private external fun nativeVideoEnded(token: Long)
 
     private external fun nativeStart(surface: android.view.Surface, app: String, home: String, width: Int, height: Int): Boolean
     private external fun nativeTouch(finger: Int, phase: Int, x: Float, y: Float)

@@ -399,6 +399,7 @@ extern "C" fn view_insert_below(this: Id, _: Sel, view: Id, sibling: Id) {
 
 extern "C" fn view_remove_from_superview(this: Id, _: Sel) {
     detach(this);
+    crate::fw::media::view_removed(this);
 }
 
 extern "C" fn view_bring_to_front(this: Id, _: Sel, view: Id) {

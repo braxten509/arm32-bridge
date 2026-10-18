@@ -1,6 +1,5 @@
 //! Sound session (C and AVAudioSession) and the video player.
-//! Video is not shown yet (step 4): a started video ends right away, so the
-//! game moves on as if it had played.
+//! Videos play in the phone app's own player, over the game.
 
 use crate::fw::object::{class_methods, define_class, methods};
 use crate::fw::uikit::{property_get, property_set};
@@ -163,15 +162,96 @@ extern "C" fn player_item(this: Id, _: Sel) -> Id {
 }
 
 extern "C" fn player_replace_item(this: Id, _: Sel, item: Id) {
+    if player_item(this, 0) != item {
+        close_video_of(this);
+    }
     property_set(this, "item", item as u64);
 }
 
-extern "C" fn player_play(this: Id, _: Sel) {
-    let item = player_item(this, 0);
-    let asset = property_get(item, "asset").unwrap_or(0) as Id;
-    let url = property_get(asset, "url").unwrap_or(0) as Id;
-    crate::log!("video {} not shown yet (step 4); telling the game it ended", string::describe(url));
-    property_set(this, "rate", 0);
+// Videos are shown by the phone app (over the game, with their own sound);
+// without it (PC and phone tests) they are skipped: the game is told at
+// once that they ended. Every call carries the video's token, so a late
+// call about an older video never touches a newer one.
+
+/// The phone app's video player.
+pub struct VideoScreen {
+    /// Shows a video from its start; false if it can't.
+    pub show: fn(&str, u64) -> bool,
+    pub pause: fn(u64),
+    pub resume: fn(u64),
+    /// Takes the video off the screen.
+    pub stop: fn(u64),
+}
+
+static VIDEO_SCREEN: std::sync::OnceLock<VideoScreen> = std::sync::OnceLock::new();
+
+pub fn set_video_screen(screen: VideoScreen) {
+    let _ = VIDEO_SCREEN.set(screen);
+}
+
+#[derive(Clone, Copy)]
+struct Showing {
+    token: u64,
+    player: Id,
+    item: Id,
+    paused: bool,
+}
+
+/// The video on screen. Held while calling the phone app, so its calls
+/// arrive in the same order as the changes here.
+static SHOWING: std::sync::Mutex<Option<Showing>> = std::sync::Mutex::new(None);
+
+fn showing() -> std::sync::MutexGuard<'static, Option<Showing>> {
+    SHOWING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The phone app: the video with this token played to its end (or failed).
+pub fn video_ended(token: u64) {
+    let finished = {
+        let mut showing = showing();
+        match *showing {
+            Some(s) if s.token == token => {
+                *showing = None;
+                Some((s.player, s.item))
+            }
+            _ => None,
+        }
+    };
+    if let Some((player, item)) = finished {
+        tell_ended(player, item);
+    }
+}
+
+/// Takes `player`'s video off the screen (the game let go of it).
+fn close_video_of(player: Id) {
+    let mut showing = showing();
+    if let Some(s) = *showing {
+        if s.player == player {
+            *showing = None;
+            if let Some(screen) = VIDEO_SCREEN.get() {
+                (screen.stop)(s.token);
+            }
+            crate::log!("video closed");
+        }
+    }
+}
+
+/// UIView removeFromSuperview: a view showing a player's picture is gone.
+pub fn view_removed(view: Id) {
+    if showing().is_none() || !runtime::responds(view, "layer") {
+        return;
+    }
+    let layer = runtime::send(view, "layer", &[]);
+    if layer != 0 && runtime::send(layer, "isKindOfClass:", &[runtime::class_named("AVPlayerLayer") as Id]) & 0xFF != 0 {
+        let player = property_get(layer, "player").unwrap_or(0) as Id;
+        if player != 0 {
+            close_video_of(player);
+        }
+    }
+}
+
+fn tell_ended(player: Id, item: Id) {
+    property_set(player, "rate", 0);
     struct Ended(Id);
     let ended = Box::into_raw(Box::new(Ended(item))) as usize;
     let block = make_callback(ended, |data| {
@@ -179,6 +259,46 @@ extern "C" fn player_play(this: Id, _: Sel) {
         crate::fw::foundation::post("AVPlayerItemDidPlayToEndTimeNotification", item, 0);
     });
     crate::fw::runloop::post(crate::fw::runloop::Work::Block(block));
+}
+
+extern "C" fn player_play(this: Id, _: Sel) {
+    let item = player_item(this, 0);
+    if let Some(screen) = VIDEO_SCREEN.get() {
+        let mut showing = showing();
+        // Already this player's video: carry on where it is.
+        if let Some(s) = showing.as_mut() {
+            if s.player == this && s.item == item {
+                if s.paused {
+                    s.paused = false;
+                    (screen.resume)(s.token);
+                }
+                property_set(this, "rate", 1f32.to_bits() as u64);
+                return;
+            }
+        }
+        let asset = property_get(item, "asset").unwrap_or(0) as Id;
+        let url = property_get(asset, "url").unwrap_or(0) as Id;
+        let path = string::get(runtime::send(url, "path", &[]));
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let token = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(old) = showing.take() {
+            (screen.stop)(old.token);
+        }
+        if (screen.show)(&path, token) {
+            *showing = Some(Showing { token, player: this, item, paused: false });
+            property_set(this, "rate", 1f32.to_bits() as u64);
+            crate::log!("video {path} playing");
+            return;
+        }
+        drop(showing);
+        crate::log!("video {path} could not be shown; telling the game it ended");
+        tell_ended(this, item);
+        return;
+    }
+    let asset = property_get(item, "asset").unwrap_or(0) as Id;
+    let url = property_get(asset, "url").unwrap_or(0) as Id;
+    crate::log!("video {} skipped (no screen for videos here); telling the game it ended", string::get(runtime::send(url, "path", &[])));
+    tell_ended(this, item);
 }
 
 /// A tiny block (Apple's closure object) that calls a Rust function once.
@@ -210,6 +330,15 @@ pub fn make_callback(data: usize, f: fn(usize)) -> usize {
 
 extern "C" fn player_pause(this: Id, _: Sel) {
     property_set(this, "rate", 0);
+    let mut showing = showing();
+    if let Some(s) = showing.as_mut() {
+        if s.player == this && !s.paused {
+            s.paused = true;
+            if let Some(screen) = VIDEO_SCREEN.get() {
+                (screen.pause)(s.token);
+            }
+        }
+    }
 }
 
 extern "C" fn player_rate(this: Id, _: Sel) -> f32 {
@@ -219,6 +348,8 @@ extern "C" fn player_rate(this: Id, _: Sel) -> f32 {
 extern "C" fn player_set_rate(this: Id, _: Sel, rate: f32) {
     if rate != 0.0 {
         player_play(this, 0);
+    } else {
+        player_pause(this, 0);
     }
 }
 
@@ -239,6 +370,10 @@ extern "C" fn zero_time(_this: Id, _: Sel) -> CmTime {
 }
 
 extern "C" fn layer_set_player(this: Id, _: Sel, player: Id) {
+    let old = property_get(this, "player").unwrap_or(0) as Id;
+    if old != 0 && old != player {
+        close_video_of(old);
+    }
     property_set(this, "player", player as u64);
 }
 

@@ -38,10 +38,15 @@ struct Input {
     channels: u32,
     bits: u32,
     flags: u32,
+    /// Bytes from one frame to the next (in one buffer).
+    stride: u32,
     enabled: bool,
     /// Linear volume.
     gain: f32,
-    /// -1 (left) .. 1 (right).
+    /// 3D mixer: direction in degrees (0 ahead, 90 right) and distance.
+    azimuth: f32,
+    distance: f32,
+    /// Multichannel mixer: -1 (left) .. 1 (right).
     pan: f32,
     /// Playback speed (3D mixer's playback rate).
     speed: f32,
@@ -52,12 +57,43 @@ struct Input {
 
 impl Default for Input {
     fn default() -> Self {
-        Input { callback: 0, data: 0, rate: 44100.0, channels: 2, bits: 16, flags: 0xC, enabled: true, gain: 1.0, pan: 0.0, speed: 1.0, generation: 0 }
+        Input {
+            callback: 0,
+            data: 0,
+            rate: 44100.0,
+            channels: 2,
+            bits: 16,
+            flags: 0xC,
+            stride: 4,
+            enabled: true,
+            gain: 1.0,
+            azimuth: 0.0,
+            distance: 0.0,
+            pan: 0.0,
+            speed: 1.0,
+            generation: 0,
+        }
+    }
+}
+
+impl Input {
+    /// Left/right placement (-1 .. 1) and volume, as the mixer kind does it.
+    fn placement(&self, kind: Kind) -> (f32, f32) {
+        match kind {
+            Kind::Mixer3D => {
+                // Apple's default "inverse" distance curve, reference distance 1.
+                let distance = if self.distance > 1.0 { 1.0 / self.distance } else { 1.0 };
+                (self.azimuth.to_radians().sin().clamp(-1.0, 1.0), self.gain * distance)
+            }
+            Kind::MixerMulti => (self.pan, self.gain),
+            _ => (0.0, self.gain),
+        }
     }
 }
 
 struct Unit {
     kind: Kind,
+    graph: usize,
     description: [u32; 5],
     inputs: BTreeMap<u32, Input>,
     master: f32,
@@ -67,7 +103,8 @@ struct Unit {
 struct Graph {
     units: HashMap<usize, Unit>,
     nodes: HashMap<i32, usize>,
-    running: bool,
+    /// Graphs (by their handle) and whether each is running.
+    running: HashMap<usize, bool>,
 }
 
 static GRAPH: Mutex<Option<Graph>> = Mutex::new(None);
@@ -87,14 +124,29 @@ fn next_generation() -> u64 {
     GENERATION.fetch_add(1, Ordering::Relaxed)
 }
 
-extern "C" fn new_graph(graph: *mut usize) -> i32 {
-    if !graph.is_null() {
-        unsafe { *graph = leak([0usize; 8]) };
+/// Held by the sound thread while it calls into the game. Stopping or
+/// disposing a graph waits for it, so no callback runs after they return.
+static RENDERING: Mutex<()> = Mutex::new(());
+static RENDER_THREAD: AtomicU32 = AtomicU32::new(0);
+
+fn wait_for_render() {
+    let me = unsafe { libc::gettid() } as u32;
+    if RENDER_THREAD.load(Ordering::Relaxed) != me {
+        drop(RENDERING.lock().unwrap_or_else(|e| e.into_inner()));
     }
+}
+
+extern "C" fn new_graph(graph: *mut usize) -> i32 {
+    if graph.is_null() {
+        return -50;
+    }
+    let handle = leak([0usize; 8]);
+    with_graph(|g| g.running.insert(handle, false));
+    unsafe { *graph = handle };
     0
 }
 
-extern "C" fn graph_add_node(_graph: usize, description: *const u32, node: *mut i32) -> i32 {
+extern "C" fn graph_add_node(graph: usize, description: *const u32, node: *mut i32) -> i32 {
     static NEXT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
     if node.is_null() || description.is_null() {
         return -50;
@@ -110,7 +162,7 @@ extern "C" fn graph_add_node(_graph: usize, description: *const u32, node: *mut 
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     let unit = leak([0usize; 4]);
     with_graph(|g| {
-        g.units.insert(unit, Unit { kind, description: d, inputs: BTreeMap::new(), master: 1.0 });
+        g.units.insert(unit, Unit { kind, graph, description: d, inputs: BTreeMap::new(), master: 1.0 });
         g.nodes.insert(id, unit);
     });
     if kind == Kind::Other {
@@ -144,23 +196,53 @@ extern "C" fn graph_set_node_input_callback(_graph: usize, node: i32, bus: u32, 
     0
 }
 
-extern "C" fn graph_start(_graph: usize) -> i32 {
-    with_graph(|g| g.running = true);
+extern "C" fn graph_start(graph: usize) -> i32 {
+    with_graph(|g| g.running.insert(graph, true));
     crate::log!("audio: graph started");
     start();
     0
 }
 
-extern "C" fn graph_stop(_graph: usize) -> i32 {
-    with_graph(|g| g.running = false);
+extern "C" fn graph_stop(graph: usize) -> i32 {
+    with_graph(|g| g.running.insert(graph, false));
+    wait_for_render();
     0
 }
 
-extern "C" fn graph_is_running(_graph: usize, running: *mut u8) -> i32 {
+extern "C" fn graph_is_running(graph: usize, running: *mut u8) -> i32 {
     if !running.is_null() {
-        unsafe { *running = with_graph(|g| g.running) as u8 };
+        unsafe { *running = with_graph(|g| g.running.get(&graph).copied().unwrap_or(false)) as u8 };
     }
     0
+}
+
+/// DisposeAUGraph: its units go away; no callback runs after this returns.
+extern "C" fn graph_dispose(graph: usize) -> i32 {
+    let gone: Vec<usize> = with_graph(|g| {
+        g.running.remove(&graph);
+        let gone: Vec<usize> = g.units.iter().filter(|(_, u)| u.graph == graph).map(|(&k, _)| k).collect();
+        for unit in &gone {
+            g.units.remove(unit);
+        }
+        g.nodes.retain(|_, unit| !gone.contains(unit));
+        gone
+    });
+    wait_for_render();
+    if let Some(mixer) = MIXER.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        mixer.streams.retain(|(unit, _), _| !gone.contains(unit));
+    }
+    0
+}
+
+/// AudioOutputUnitStart/Stop on a unit used without a graph.
+extern "C" fn unit_start(unit: usize) -> i32 {
+    let graph = with_graph(|g| g.units.get(&unit).map(|u| u.graph)).unwrap_or(0);
+    graph_start(graph)
+}
+
+extern "C" fn unit_stop(unit: usize) -> i32 {
+    let graph = with_graph(|g| g.units.get(&unit).map(|u| u.graph)).unwrap_or(0);
+    graph_stop(graph)
 }
 
 extern "C" fn ok_1(_a: usize) -> i32 {
@@ -176,6 +258,27 @@ const ELEMENT_COUNT: u32 = 11;
 const SET_RENDER_CALLBACK: u32 = 23;
 const INPUT_SCOPE: u32 = 1;
 const OUTPUT_SCOPE: u32 = 2;
+const FORMAT_NOT_SUPPORTED: i32 = -10868;
+
+const FLAG_FLOAT: u32 = 0x1;
+const FLAG_BIG_ENDIAN: u32 = 0x2;
+const FLAG_SIGNED: u32 = 0x4;
+const FLAG_NON_INTERLEAVED: u32 = 0x20;
+
+/// Linear PCM layouts this layer reads: native-endian float (32/64 bit),
+/// signed 16 or 32 bit (32 may be fixed point, like Apple's 8.24), or
+/// unsigned 8 bit.
+fn readable(flags: u32, bits: u32) -> bool {
+    if flags & FLAG_BIG_ENDIAN != 0 {
+        return false;
+    }
+    match (flags & FLAG_FLOAT != 0, flags & FLAG_SIGNED != 0, bits) {
+        (true, _, 32 | 64) => true,
+        (false, true, 16 | 32) => true,
+        (false, false, 8) => true,
+        _ => false,
+    }
+}
 
 /// AudioUnitSetProperty(unit, id, scope, element, data, size).
 extern "C" fn unit_set_property(unit: usize, id: u32, scope: u32, element: u32, data: *const u8, size: u32) -> i32 {
@@ -183,16 +286,19 @@ extern "C" fn unit_set_property(unit: usize, id: u32, scope: u32, element: u32, 
         STREAM_FORMAT if scope == INPUT_SCOPE && !data.is_null() && size >= 40 => {
             let rate = unsafe { *(data as *const f64) };
             let w = unsafe { std::slice::from_raw_parts(data.add(8) as *const u32, 7) };
-            let (format, flags, channels, bits) = (w[0], w[1], w[5], w[6]);
-            if four_cc(format) != "lpcm" {
-                crate::log!("audio: input format {} isn't supported", four_cc(format));
-                return -10868;
+            let (format, flags, bytes_per_frame, channels, bits) = (w[0], w[1], w[4], w[5], w[6]);
+            if four_cc(format) != "lpcm" || !readable(flags, bits) || channels == 0 || channels as usize > MAX_CHANNELS {
+                crate::log!("audio: input format {} flags {flags:#x} {bits} bits isn't supported", four_cc(format));
+                return FORMAT_NOT_SUPPORTED;
             }
+            let sample = bits / 8;
+            let packed = if flags & FLAG_NON_INTERLEAVED != 0 { sample } else { sample * channels };
             with_input(unit, element, |input| {
                 input.rate = if rate > 0.0 { rate } else { 44100.0 };
                 input.flags = flags;
-                input.channels = channels.max(1);
+                input.channels = channels;
                 input.bits = bits;
+                input.stride = bytes_per_frame.max(packed);
                 input.generation = next_generation();
             });
             0
@@ -217,14 +323,15 @@ extern "C" fn unit_get_property(unit: usize, id: u32, scope: u32, element: u32, 
     }
     match id {
         STREAM_FORMAT if unsafe { *size } >= 40 => {
-            let input = if scope == INPUT_SCOPE { with_input(unit, element, |i| i.clone()).unwrap_or_default() } else { Input { bits: 32, flags: 0x9, ..Input::default() } };
-            let bytes_per_sample = input.bits / 8;
-            let non_interleaved = input.flags & 0x20 != 0;
-            let frame = if non_interleaved { bytes_per_sample } else { bytes_per_sample * input.channels };
+            let input = if scope == INPUT_SCOPE {
+                with_input(unit, element, |i| i.clone()).unwrap_or_default()
+            } else {
+                Input { bits: 32, flags: FLAG_FLOAT | 0x8, stride: 8, ..Input::default() }
+            };
             unsafe {
                 *(data as *mut f64) = input.rate;
                 let w = std::slice::from_raw_parts_mut(data.add(8) as *mut u32, 8);
-                w.copy_from_slice(&[u32::from_be_bytes(*b"lpcm"), input.flags, frame, 1, frame, input.channels, input.bits, 0]);
+                w.copy_from_slice(&[u32::from_be_bytes(*b"lpcm"), input.flags, input.stride, 1, input.stride, input.channels, input.bits, 0]);
                 *size = 40;
             }
             0
@@ -237,10 +344,17 @@ extern "C" fn unit_get_property(unit: usize, id: u32, scope: u32, element: u32, 
     }
 }
 
+fn db(value: f32) -> f32 {
+    10f32.powf(value / 20.0)
+}
+
+fn to_db(value: f32) -> f32 {
+    20.0 * value.max(1e-6).log10()
+}
+
 /// AudioUnitSetParameter(unit, id, scope, element, value, frames).
 extern "C" fn unit_set_parameter(unit: usize, id: u32, scope: u32, element: u32, value: f32, _frames: u32) -> i32 {
     let Some(kind) = with_graph(|g| g.units.get(&unit).map(|u| u.kind)) else { return -10879 };
-    let db = |v: f32| 10f32.powf(v / 20.0);
     if scope == OUTPUT_SCOPE {
         let master = match (kind, id) {
             (Kind::Mixer3D, 3) => Some(db(value)),
@@ -253,8 +367,9 @@ extern "C" fn unit_set_parameter(unit: usize, id: u32, scope: u32, element: u32,
         return 0;
     }
     with_input(unit, element, |input| match (kind, id) {
-        // 3D mixer: azimuth (degrees), gain (dB), playback rate, enable.
-        (Kind::Mixer3D, 0) => input.pan = value.to_radians().sin().clamp(-1.0, 1.0),
+        // 3D mixer: azimuth (degrees), distance, gain (dB), playback rate, enable.
+        (Kind::Mixer3D, 0) => input.azimuth = value,
+        (Kind::Mixer3D, 2) => input.distance = value.max(0.0),
         (Kind::Mixer3D, 3) => input.gain = db(value),
         (Kind::Mixer3D, 4) => input.speed = value.clamp(0.25, 4.0),
         (Kind::Mixer3D, 5) | (Kind::MixerMulti, 1) => {
@@ -273,16 +388,31 @@ extern "C" fn unit_set_parameter(unit: usize, id: u32, scope: u32, element: u32,
 }
 
 /// AudioUnitGetParameter(unit, id, scope, element, *value).
-extern "C" fn unit_get_parameter(unit: usize, id: u32, _scope: u32, element: u32, value: *mut f32) -> i32 {
+extern "C" fn unit_get_parameter(unit: usize, id: u32, scope: u32, element: u32, value: *mut f32) -> i32 {
     if value.is_null() {
         return -50;
     }
-    let found = with_input(unit, element, |input| match id {
-        3 => 20.0 * input.gain.max(1e-6).log10(),
-        5 | 1 => input.enabled as u32 as f32,
-        _ => 0.0,
-    });
-    unsafe { *value = found.unwrap_or(0.0) };
+    let Some((kind, master)) = with_graph(|g| g.units.get(&unit).map(|u| (u.kind, u.master))) else { return -10879 };
+    let found = if scope == OUTPUT_SCOPE {
+        match (kind, id) {
+            (Kind::Mixer3D, 3) => to_db(master),
+            (Kind::MixerMulti, 0) => master,
+            _ => 0.0,
+        }
+    } else {
+        with_input(unit, element, |input| match (kind, id) {
+            (Kind::Mixer3D, 0) => input.azimuth,
+            (Kind::Mixer3D, 2) => input.distance,
+            (Kind::Mixer3D, 3) => to_db(input.gain),
+            (Kind::Mixer3D, 4) => input.speed,
+            (Kind::Mixer3D, 5) | (Kind::MixerMulti, 1) => input.enabled as u32 as f32,
+            (Kind::MixerMulti, 0) => input.gain,
+            (Kind::MixerMulti, 2) => input.pan,
+            _ => 0.0,
+        })
+        .unwrap_or(0.0)
+    };
+    unsafe { *value = found };
     0
 }
 
@@ -291,19 +421,26 @@ extern "C" fn unit_get_parameter(unit: usize, id: u32, _scope: u32, element: u32
 type RenderCallback = extern "C" fn(usize, *mut u32, *const u8, u32, u32, *mut u8) -> i32;
 
 const OUTPUT_IS_SILENCE: u32 = 1 << 4;
+const MAX_CHANNELS: usize = 8;
 
-/// Asks one input's callback for `frames` frames; returns them as stereo
-/// floats (left, right, left, ...), or None if the game reported an error.
-fn pull(input: &Input, bus: u32, frames: usize, sample_time: f64) -> Option<Vec<f32>> {
+/// Asks one input's callback for `frames` frames and appends them to `out`
+/// as stereo floats (left, right, ...). Anything the game doesn't give
+/// (an error, a short buffer) is silence, so timing stays right.
+fn pull(input: &Input, bus: u32, frames: usize, sample_time: f64, scratch: &mut Vec<u8>, out: &mut Vec<f32>) {
+    let start = out.len();
+    out.resize(start + frames * 2, 0.0);
     let callback: RenderCallback = unsafe { std::mem::transmute(input.callback) };
     let channels = input.channels.max(1) as usize;
-    let bytes = (input.bits / 8).max(1) as usize;
-    let separate = input.flags & 0x20 != 0;
+    let sample = (input.bits / 8).max(1) as usize;
+    let separate = input.flags & FLAG_NON_INTERLEAVED != 0;
     let buffers = if separate { channels } else { 1 };
-    let per_buffer = if separate { frames * bytes } else { frames * bytes * channels };
-    let mut memory = vec![0u8; per_buffer * buffers];
+    let stride = if separate { sample } else { (input.stride as usize).max(sample * channels) };
+    let per_buffer = frames * stride;
+    let list_size = 8 + 16 * buffers;
+    scratch.clear();
+    scratch.resize(list_size + per_buffer * buffers, 0);
+    let (list, memory) = scratch.split_at_mut(list_size);
     // AudioBufferList: count, then {channels, byte size, data} per buffer.
-    let mut list = vec![0u8; 8 + 16 * buffers];
     unsafe {
         *(list.as_mut_ptr() as *mut u32) = buffers as u32;
         for b in 0..buffers {
@@ -318,41 +455,53 @@ fn pull(input: &Input, bus: u32, frames: usize, sample_time: f64) -> Option<Vec<
     stamp[..8].copy_from_slice(&sample_time.to_ne_bytes());
     stamp[56..60].copy_from_slice(&1u32.to_ne_bytes());
     let mut action = 0u32;
-    if callback(input.data, &mut action, stamp.as_ptr(), bus, frames as u32, list.as_mut_ptr()) != 0 {
-        return None;
+    if callback(input.data, &mut action, stamp.as_ptr(), bus, frames as u32, list.as_mut_ptr()) != 0 || action & OUTPUT_IS_SILENCE != 0 {
+        return;
     }
-    let mut out = vec![0f32; frames * 2];
-    if action & OUTPUT_IS_SILENCE != 0 {
-        return Some(out);
+    // The game may have pointed the buffers at its own memory and size.
+    if unsafe { *(list.as_ptr() as *const u32) } as usize != buffers {
+        return;
     }
-    let float = input.flags & 1 != 0;
+    let mut pointers = [std::ptr::null::<u8>(); MAX_CHANNELS];
+    let mut available = frames;
+    for (b, slot) in pointers.iter_mut().enumerate().take(buffers) {
+        let entry = unsafe { list.as_ptr().add(8 + 16 * b) };
+        let size = unsafe { *(entry.add(4) as *const u32) } as usize;
+        let pointer = unsafe { *(entry.add(8) as *const usize) } as *const u8;
+        if pointer.is_null() {
+            return;
+        }
+        available = available.min(size / stride);
+        *slot = pointer;
+    }
+    let float = input.flags & FLAG_FLOAT != 0;
     let fraction = (input.flags >> 7) & 0x3F;
-    let read = |pointer: *const u8, index: usize| -> f32 {
+    let read = |pointer: *const u8| -> f32 {
         unsafe {
-            match (float, bytes) {
-                (true, 4) => *(pointer as *const f32).add(index),
-                (true, 8) => *(pointer as *const f64).add(index) as f32,
-                (false, 2) => *(pointer as *const i16).add(index) as f32 / 32768.0,
-                (false, 4) if fraction > 0 => *(pointer as *const i32).add(index) as f32 / (1u64 << fraction) as f32,
-                (false, 4) => *(pointer as *const i32).add(index) as f32 / 2147483648.0,
-                (false, 1) => (*pointer.add(index) as f32 - 128.0) / 128.0,
+            match (float, sample) {
+                (true, 4) => (pointer as *const f32).read_unaligned(),
+                (true, 8) => (pointer as *const f64).read_unaligned() as f32,
+                (false, 2) => (pointer as *const i16).read_unaligned() as f32 / 32768.0,
+                (false, 4) if fraction > 0 => (pointer as *const i32).read_unaligned() as f32 / (1u64 << fraction) as f32,
+                (false, 4) => (pointer as *const i32).read_unaligned() as f32 / 2147483648.0,
+                (false, 1) => (*pointer as f32 - 128.0) / 128.0,
                 _ => 0.0,
             }
         }
     };
-    // The game may have pointed the buffers at its own memory.
-    let pointers: Vec<*const u8> = (0..buffers).map(|b| unsafe { *(list.as_ptr().add(8 + 16 * b + 8) as *const usize) as *const u8 }).collect();
-    if pointers.iter().any(|p| p.is_null()) {
-        return Some(out);
+    for frame in 0..available {
+        let at = |channel: usize| unsafe {
+            if separate {
+                read(pointers[channel].add(frame * stride))
+            } else {
+                read(pointers[0].add(frame * stride + channel * sample))
+            }
+        };
+        let left = at(0);
+        let right = if channels > 1 { at(1) } else { left };
+        out[start + frame * 2] = left;
+        out[start + frame * 2 + 1] = right;
     }
-    for frame in 0..frames {
-        let sample = |channel: usize| if separate { read(pointers[channel], frame) } else { read(pointers[0], frame * channels + channel) };
-        let left = sample(0);
-        let right = if channels > 1 { sample(1) } else { left };
-        out[frame * 2] = left;
-        out[frame * 2 + 1] = right;
-    }
-    Some(out)
 }
 
 /// A source's samples waiting to be played, and where playback is in them.
@@ -369,33 +518,38 @@ impl Stream {
         self.pending.len() / 2
     }
 
-    /// Adds `frames` output frames to `out`, reading at `step` source frames
-    /// per output frame (linear interpolation), with left/right volumes.
-    fn mix_into(&mut self, out: &mut [f32], frames: usize, step: f64, left: f32, right: f32) {
-        for i in 0..frames {
-            let at = self.position + i as f64 * step;
-            let index = at as usize;
-            let part = (at - index as f64) as f32;
-            if index + 1 >= self.frames() {
-                break;
-            }
-            let (a, b) = (index * 2, index * 2 + 2);
-            out[i * 2] += (self.pending[a] + (self.pending[b] - self.pending[a]) * part) * left;
-            out[i * 2 + 1] += (self.pending[a + 1] + (self.pending[b + 1] - self.pending[a + 1]) * part) * right;
-        }
-        let end = self.position + frames as f64 * step;
-        let used = (end as usize).min(self.frames());
-        self.pending.drain(..used * 2);
-        self.position = end - used as f64;
-    }
-
     /// Source frames needed to produce `frames` output frames.
     fn needed(&self, frames: usize, step: f64) -> usize {
         (self.position + frames as f64 * step) as usize + 2
     }
+
+    /// Adds up to `frames` output frames to `out`, reading at `step` source
+    /// frames per output frame (linear interpolation). Returns the source
+    /// frames played (never past the samples there are).
+    fn mix_into(&mut self, out: &mut [f32], frames: usize, step: f64, left: f32, right: f32) -> f64 {
+        let start = self.position;
+        let mut made = 0;
+        while made < frames {
+            let at = self.position + made as f64 * step;
+            let index = at as usize;
+            if index + 1 >= self.frames() {
+                break;
+            }
+            let part = (at - index as f64) as f32;
+            let (a, b) = (index * 2, index * 2 + 2);
+            out[made * 2] += (self.pending[a] + (self.pending[b] - self.pending[a]) * part) * left;
+            out[made * 2 + 1] += (self.pending[a + 1] + (self.pending[b + 1] - self.pending[a + 1]) * part) * right;
+            made += 1;
+        }
+        let end = self.position + made as f64 * step;
+        let used = (end as usize).min(self.frames());
+        self.pending.drain(..used * 2);
+        self.position = end - used as f64;
+        end - start
+    }
 }
 
-/// Left/right volumes for a pan of -1 .. 1 (equal power, centre = full).
+/// Left/right volumes for a placement of -1 .. 1 (equal power, centre = full).
 fn pan_gains(pan: f32, volume: f32, stereo_source: bool) -> (f32, f32) {
     if stereo_source || pan == 0.0 {
         return (volume, volume);
@@ -405,46 +559,54 @@ fn pan_gains(pan: f32, volume: f32, stereo_source: bool) -> (f32, f32) {
     ((angle.cos() * boost).min(1.0) * volume, (angle.sin() * boost).min(1.0) * volume)
 }
 
-/// Kept by the sound thread only.
-static STREAMS: Mutex<Option<HashMap<(usize, u32), Stream>>> = Mutex::new(None);
+/// The sound thread's own state, kept between turns so it doesn't allocate.
+#[derive(Default)]
+struct Mixer {
+    streams: HashMap<(usize, u32), Stream>,
+    scratch: Vec<u8>,
+    sources: Vec<(usize, u32, Input, Kind, f32)>,
+}
+
+static MIXER: Mutex<Option<Mixer>> = Mutex::new(None);
 
 fn mix_graph(out: &mut [f32], frames: usize, out_rate: f64) {
-    let sources: Vec<(usize, u32, Input, f32)> = with_graph(|g| {
-        if !g.running {
-            return Vec::new();
-        }
-        g.units
-            .iter()
-            .filter(|(_, u)| matches!(u.kind, Kind::Mixer3D | Kind::MixerMulti | Kind::Output))
-            .flat_map(|(&unit, u)| {
-                u.inputs.iter().filter(|(_, i)| i.enabled && i.callback != 0 && i.gain > 0.0001).map(move |(&bus, i)| (unit, bus, i.clone(), u.master))
-            })
-            .collect()
+    let _rendering = RENDERING.lock().unwrap_or_else(|e| e.into_inner());
+    RENDER_THREAD.store(unsafe { libc::gettid() } as u32, Ordering::Relaxed);
+    let mut guard = MIXER.lock().unwrap_or_else(|e| e.into_inner());
+    let Mixer { streams, scratch, sources } = guard.get_or_insert_with(Mixer::default);
+    sources.clear();
+    with_graph(|g| {
+        let running = &g.running;
+        sources.extend(
+            g.units
+                .iter()
+                .filter(|(_, u)| matches!(u.kind, Kind::Mixer3D | Kind::MixerMulti | Kind::Output) && running.get(&u.graph).copied().unwrap_or(false))
+                .flat_map(|(&unit, u)| u.inputs.iter().filter(|(_, i)| i.enabled && i.callback != 0).map(move |(&bus, i)| (unit, bus, i.clone(), u.kind, u.master))),
+        )
     });
-    let mut guard = STREAMS.lock().unwrap_or_else(|e| e.into_inner());
-    let streams = guard.get_or_insert_with(HashMap::new);
-    for (unit, bus, input, master) in sources {
+    for (unit, bus, input, kind, master) in sources.drain(..) {
         let stream = streams.entry((unit, bus)).or_default();
         if stream.generation != input.generation {
             *stream = Stream { generation: input.generation, ..Stream::default() };
         }
         let step = input.rate * input.speed as f64 / out_rate;
-        while stream.frames() < stream.needed(frames, step) {
-            let want = (stream.needed(frames, step) - stream.frames()).clamp(64, 4096);
-            match pull(&input, bus, want, stream.sample_time) {
-                Some(samples) => {
-                    stream.sample_time += want as f64;
-                    stream.pending.extend_from_slice(&samples);
-                }
-                None => break,
-            }
+        let want = stream.needed(frames, step).saturating_sub(stream.frames());
+        if want > 0 {
+            let want = want.max(64);
+            pull(&input, bus, want, stream.sample_time, scratch, &mut stream.pending);
+            stream.sample_time += want as f64;
         }
-        let (left, right) = pan_gains(input.pan, input.gain * master, input.channels > 1);
+        let (pan, volume) = input.placement(kind);
+        let (left, right) = pan_gains(pan, volume * master, input.channels > 1);
         stream.mix_into(out, frames, step, left, right);
     }
+    RENDER_THREAD.store(0, Ordering::Relaxed);
 }
 
 // ----- music: AVAudioPlayer -----
+// Each player decodes on its own worker thread into a short queue; the
+// sound thread only takes ready samples (and skips a player for one turn
+// rather than wait for it), so file reading and decoding never hold it up.
 
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{Decoder, DecoderOptions};
@@ -491,113 +653,245 @@ fn open(source: &Source) -> Result<(Opened, f64), String> {
     Ok((Opened { reader, decoder, track }, rate))
 }
 
-struct Music {
-    source: Source,
-    opened: Option<Opened>,
-    rate: f64,
-    stream: Stream,
-    playing: bool,
-    volume: f32,
-    pan: f32,
-    /// Times to play again after this one; -1 = forever.
-    loops: isize,
-    /// Source frames played so far in this pass (for currentTime).
-    played: f64,
-    duration: Option<f64>,
+/// The next packet as stereo floats, or None at the end of the file.
+fn decode_packet(opened: &mut Opened) -> Option<Vec<f32>> {
+    loop {
+        let packet = opened.reader.next_packet().ok()?;
+        if packet.track_id() != opened.track {
+            continue;
+        }
+        let Ok(decoded) = opened.decoder.decode(&packet) else { continue };
+        let spec = *decoded.spec();
+        let channels = spec.channels.count().max(1);
+        let mut samples = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
+        samples.copy_interleaved_ref(decoded);
+        let mut out = Vec::with_capacity(samples.samples().len() / channels * 2);
+        for frame in samples.samples().chunks_exact(channels) {
+            out.push(frame[0]);
+            out.push(if channels > 1 { frame[1] } else { frame[0] });
+        }
+        return Some(out);
+    }
 }
 
-impl Music {
-    /// Decodes the next packet into the stream; false at the end.
-    fn decode_more(&mut self) -> bool {
-        if self.opened.is_none() {
-            match open(&self.source) {
-                Ok((opened, rate)) => {
-                    self.opened = Some(opened);
-                    self.rate = rate;
-                }
-                Err(e) => {
-                    crate::log!("music: {e}");
-                    return false;
-                }
-            }
-        }
-        let opened = self.opened.as_mut().unwrap();
+/// Seconds of decoded sound kept ready per player.
+const READY_SECONDS: f64 = 0.75;
+
+/// Shared by the game (controls), the worker (fills) and the sound thread (plays).
+#[derive(Default)]
+struct Queue {
+    stream: Stream,
+    rate: f64,
+    /// Source frames put in / played since the last seek.
+    pushed: f64,
+    played: f64,
+    /// `played` where the pass being heard started, and its time then.
+    pass_start: f64,
+    pass_seconds: f64,
+    /// `pushed` values where a new pass (a loop) begins.
+    boundaries: std::collections::VecDeque<f64>,
+    /// The file has no more to give (no loops left).
+    ended: bool,
+    loops: isize,
+    loops_left: isize,
+    /// Asked to move to this time (seconds).
+    seek: Option<f64>,
+    /// Changes on every seek; the worker drops work done for an older one.
+    epoch: u64,
+    quit: bool,
+}
+
+struct Player {
+    source: Source,
+    queue: Mutex<Queue>,
+    wake: std::sync::Condvar,
+    playing: AtomicBool,
+    volume: AtomicU32,
+    pan: AtomicU32,
+    duration: Mutex<Option<f64>>,
+    worker: std::sync::Once,
+}
+
+impl Player {
+    fn new(source: Source, rate: f64) -> Arc<Player> {
+        Arc::new(Player {
+            source,
+            queue: Mutex::new(Queue { rate, ..Queue::default() }),
+            wake: std::sync::Condvar::new(),
+            playing: AtomicBool::new(false),
+            volume: AtomicU32::new(1f32.to_bits()),
+            pan: AtomicU32::new(0f32.to_bits()),
+            duration: Mutex::new(None),
+            worker: std::sync::Once::new(),
+        })
+    }
+
+    fn queue(&self) -> std::sync::MutexGuard<'_, Queue> {
+        self.queue.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn ensure_worker(self: &Arc<Self>) {
+        let me = self.clone();
+        self.worker.call_once(move || {
+            std::thread::Builder::new().name("ios-music".into()).spawn(move || me.work()).expect("music thread");
+        });
+    }
+
+    fn work(&self) {
+        let mut opened: Option<Opened> = None;
+        let mut skip = 0usize;
         loop {
-            let packet = match opened.reader.next_packet() {
-                Ok(packet) => packet,
-                Err(_) => return false,
+            let (epoch, seek) = {
+                let mut q = self.queue();
+                loop {
+                    if q.quit {
+                        return;
+                    }
+                    let hungry = q.seek.is_some() || (!q.ended && (q.stream.frames() as f64) < q.rate.max(8000.0) * READY_SECONDS);
+                    if hungry {
+                        break;
+                    }
+                    q = self.wake.wait_timeout(q, std::time::Duration::from_millis(200)).unwrap_or_else(|e| e.into_inner()).0;
+                }
+                (q.epoch, q.seek.take())
             };
-            if packet.track_id() != opened.track {
+            if let Some(seconds) = seek {
+                opened = None;
+                skip = 0;
+                let mut actual = 0.0;
+                if let Ok((mut fresh, rate)) = open(&self.source) {
+                    if seconds > 0.0 {
+                        let to = SeekTo::Time { time: symphonia::core::units::Time::from(seconds), track_id: Some(fresh.track) };
+                        if let Ok(seeked) = fresh.reader.seek(SeekMode::Coarse, to) {
+                            fresh.decoder.reset();
+                            actual = seeked.actual_ts as f64 / rate;
+                            skip = ((seconds - actual).max(0.0) * rate) as usize;
+                        }
+                    }
+                    let mut q = self.queue();
+                    if q.epoch == epoch {
+                        q.rate = rate;
+                        q.pass_seconds = actual + skip as f64 / rate;
+                    }
+                    opened = Some(fresh);
+                }
                 continue;
             }
-            let Ok(decoded) = opened.decoder.decode(&packet) else { continue };
-            let spec = *decoded.spec();
-            let channels = spec.channels.count().max(1);
-            let mut samples = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
-            samples.copy_interleaved_ref(decoded);
-            for frame in samples.samples().chunks_exact(channels) {
-                let left = frame[0];
-                let right = if channels > 1 { frame[1] } else { left };
-                self.stream.pending.push(left);
-                self.stream.pending.push(right);
+            if opened.is_none() {
+                match open(&self.source) {
+                    Ok((fresh, rate)) => {
+                        self.queue().rate = rate;
+                        opened = Some(fresh);
+                    }
+                    Err(e) => {
+                        crate::log!("music: {e}");
+                        let mut q = self.queue();
+                        if q.epoch == epoch {
+                            q.ended = true;
+                        }
+                        continue;
+                    }
+                }
             }
-            return true;
+            let decoded = decode_packet(opened.as_mut().unwrap());
+            let mut q = self.queue();
+            if q.epoch != epoch {
+                continue;
+            }
+            match decoded {
+                Some(mut samples) => {
+                    if skip > 0 {
+                        let drop = (skip * 2).min(samples.len());
+                        samples.drain(..drop);
+                        skip -= drop / 2;
+                    }
+                    q.pushed += (samples.len() / 2) as f64;
+                    q.stream.pending.extend_from_slice(&samples);
+                }
+                None if q.loops_left != 0 => {
+                    if q.loops_left > 0 {
+                        q.loops_left -= 1;
+                    }
+                    let at = q.pushed;
+                    q.boundaries.push_back(at);
+                    opened = None;
+                }
+                None => q.ended = true,
+            }
         }
     }
 
-    fn mix_into(&mut self, out: &mut [f32], frames: usize, out_rate: f64) -> bool {
-        let mut finished = false;
-        let step = self.rate / out_rate;
-        while self.stream.frames() < self.stream.needed(frames, step) {
-            if !self.decode_more() {
-                if self.loops != 0 && self.opened.is_some() {
-                    if self.loops > 0 {
-                        self.loops -= 1;
-                    }
-                    self.opened = None;
-                    self.played = 0.0;
-                    continue;
-                }
-                finished = true;
+    fn current_time(&self) -> f64 {
+        let q = self.queue();
+        if q.rate <= 0.0 {
+            return 0.0;
+        }
+        q.pass_seconds + (q.played - q.pass_start) / q.rate
+    }
+
+    fn seek(&self, seconds: f64) {
+        let mut q = self.queue();
+        q.epoch += 1;
+        q.seek = Some(seconds.max(0.0));
+        q.stream = Stream::default();
+        q.pushed = 0.0;
+        q.played = 0.0;
+        q.pass_start = 0.0;
+        q.pass_seconds = seconds.max(0.0);
+        q.boundaries.clear();
+        q.ended = false;
+        q.loops_left = q.loops;
+        drop(q);
+        self.wake.notify_all();
+    }
+
+    /// Plays into `out`; true when the sound just reached its end.
+    fn mix_into(&self, out: &mut [f32], frames: usize, out_rate: f64) -> bool {
+        let Ok(mut q) = self.queue.try_lock() else { return false };
+        if q.rate <= 0.0 {
+            return false;
+        }
+        let step = q.rate / out_rate;
+        let (left, right) = pan_gains(f32::from_bits(self.pan.load(Ordering::Relaxed)), f32::from_bits(self.volume.load(Ordering::Relaxed)), false);
+        let advanced = q.stream.mix_into(out, frames, step, left, right);
+        q.played += advanced;
+        while let Some(&boundary) = q.boundaries.front() {
+            if q.played < boundary {
                 break;
             }
+            q.boundaries.pop_front();
+            q.pass_start = boundary;
+            q.pass_seconds = 0.0;
         }
-        let step = self.rate / out_rate;
-        let (left, right) = pan_gains(self.pan, self.volume, false);
-        let before = self.stream.position + self.stream.frames() as f64;
-        self.stream.mix_into(out, frames, step, left, right);
-        self.played += before - (self.stream.position + self.stream.frames() as f64);
-        if finished && self.stream.frames() < 2 {
-            self.playing = false;
-            self.opened = None;
-            self.stream = Stream::default();
-            self.played = 0.0;
+        let low = (q.stream.frames() as f64) < q.rate * READY_SECONDS / 2.0;
+        if q.ended && q.stream.frames() < 2 {
+            // As on iPhone: stopped, back at the start, loops as set.
+            q.epoch += 1;
+            q.seek = Some(0.0);
+            q.stream = Stream::default();
+            q.pushed = 0.0;
+            q.played = 0.0;
+            q.pass_start = 0.0;
+            q.pass_seconds = 0.0;
+            q.boundaries.clear();
+            q.ended = false;
+            q.loops_left = q.loops;
+            drop(q);
+            self.playing.store(false, Ordering::Relaxed);
+            self.wake.notify_all();
             return true;
+        }
+        drop(q);
+        if low {
+            self.wake.notify_all();
         }
         false
     }
 
-    fn seek(&mut self, seconds: f64) {
-        self.stream = Stream::default();
-        self.opened = None;
-        self.played = 0.0;
-        if seconds <= 0.0 {
-            return;
-        }
-        if let Ok((mut opened, rate)) = open(&self.source) {
-            let to = SeekTo::Time { time: symphonia::core::units::Time::from(seconds), track_id: Some(opened.track) };
-            if opened.reader.seek(SeekMode::Coarse, to).is_ok() {
-                opened.decoder.reset();
-                self.played = seconds * rate;
-            }
-            self.rate = rate;
-            self.opened = Some(opened);
-        }
-    }
-
-    fn duration(&mut self) -> f64 {
-        if let Some(d) = self.duration {
-            return d;
+    fn duration(&self) -> f64 {
+        let mut known = self.duration.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(seconds) = *known {
+            return seconds;
         }
         let mut total = 0u64;
         let mut rate = 44100.0;
@@ -609,32 +903,21 @@ impl Music {
                 }
             }
         }
-        let d = total as f64 / rate;
-        self.duration = Some(d);
-        d
+        let seconds = total as f64 / rate;
+        *known = Some(seconds);
+        seconds
     }
 }
 
-static PLAYERS: Mutex<Option<HashMap<Id, Arc<Mutex<Music>>>>> = Mutex::new(None);
+static PLAYERS: Mutex<Option<HashMap<Id, Arc<Player>>>> = Mutex::new(None);
 
-fn music_of(player: Id) -> Option<Arc<Mutex<Music>>> {
+fn player_of(player: Id) -> Option<Arc<Player>> {
     PLAYERS.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&player).cloned()
 }
 
-fn with_music<R: Default>(player: Id, f: impl FnOnce(&mut Music) -> R) -> R {
-    match music_of(player) {
-        Some(music) => f(&mut music.lock().unwrap_or_else(|e| e.into_inner())),
-        None => R::default(),
-    }
-}
-
 fn add_player(player: Id, source: Source, error: *mut Id) -> Id {
-    let mut music = Music { source, opened: None, rate: 44100.0, stream: Stream::default(), playing: false, volume: 1.0, pan: 0.0, loops: 0, played: 0.0, duration: None };
-    match open(&music.source) {
-        Ok((opened, rate)) => {
-            music.opened = Some(opened);
-            music.rate = rate;
-        }
+    let rate = match open(&source) {
+        Ok((_, rate)) => rate,
         Err(e) => {
             crate::log!("music: {e}");
             if !error.is_null() {
@@ -642,8 +925,9 @@ fn add_player(player: Id, source: Source, error: *mut Id) -> Id {
             }
             return 0;
         }
-    }
-    PLAYERS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(player, Arc::new(Mutex::new(music)));
+    };
+    let made = Player::new(source, rate);
+    PLAYERS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(player, made);
     player
 }
 
@@ -658,59 +942,79 @@ extern "C" fn player_init_with_data(this: Id, _: Sel, data: Id, error: *mut Id) 
 }
 
 extern "C" fn player_play(this: Id, _: Sel) -> bool {
+    let Some(player) = player_of(this) else { return false };
     start();
-    with_music(this, |m| {
-        m.playing = true;
-        true
-    })
+    player.ensure_worker();
+    player.playing.store(true, Ordering::Relaxed);
+    player.wake.notify_all();
+    true
 }
 
 extern "C" fn player_pause(this: Id, _: Sel) {
-    with_music(this, |m| m.playing = false);
+    if let Some(player) = player_of(this) {
+        player.playing.store(false, Ordering::Relaxed);
+    }
 }
 
 extern "C" fn player_prepare(this: Id, _: Sel) -> bool {
-    music_of(this).is_some()
+    match player_of(this) {
+        Some(player) => {
+            player.ensure_worker();
+            true
+        }
+        None => false,
+    }
 }
 
 extern "C" fn player_is_playing(this: Id, _: Sel) -> bool {
-    with_music(this, |m| m.playing)
+    player_of(this).is_some_and(|p| p.playing.load(Ordering::Relaxed))
 }
 
 extern "C" fn player_set_volume(this: Id, _: Sel, volume: f32) {
-    with_music(this, |m| m.volume = volume.clamp(0.0, 1.0));
+    if let Some(player) = player_of(this) {
+        player.volume.store(volume.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+    }
 }
 
 extern "C" fn player_volume(this: Id, _: Sel) -> f32 {
-    with_music(this, |m| m.volume)
+    player_of(this).map(|p| f32::from_bits(p.volume.load(Ordering::Relaxed))).unwrap_or(0.0)
 }
 
 extern "C" fn player_set_pan(this: Id, _: Sel, pan: f32) {
-    with_music(this, |m| m.pan = pan.clamp(-1.0, 1.0));
+    if let Some(player) = player_of(this) {
+        player.pan.store(pan.clamp(-1.0, 1.0).to_bits(), Ordering::Relaxed);
+    }
 }
 
 extern "C" fn player_pan(this: Id, _: Sel) -> f32 {
-    with_music(this, |m| m.pan)
+    player_of(this).map(|p| f32::from_bits(p.pan.load(Ordering::Relaxed))).unwrap_or(0.0)
 }
 
 extern "C" fn player_set_loops(this: Id, _: Sel, loops: isize) {
-    with_music(this, |m| m.loops = loops);
+    if let Some(player) = player_of(this) {
+        let mut q = player.queue();
+        q.loops = loops;
+        q.loops_left = loops;
+    }
 }
 
 extern "C" fn player_loops(this: Id, _: Sel) -> isize {
-    with_music(this, |m| m.loops)
+    player_of(this).map(|p| p.queue().loops).unwrap_or(0)
 }
 
 extern "C" fn player_current_time(this: Id, _: Sel) -> f64 {
-    with_music(this, |m| m.played / m.rate)
+    player_of(this).map(|p| p.current_time()).unwrap_or(0.0)
 }
 
 extern "C" fn player_set_current_time(this: Id, _: Sel, seconds: f64) {
-    with_music(this, |m| m.seek(seconds));
+    if let Some(player) = player_of(this) {
+        player.ensure_worker();
+        player.seek(seconds);
+    }
 }
 
 extern "C" fn player_duration(this: Id, _: Sel) -> f64 {
-    with_music(this, |m| m.duration())
+    player_of(this).map(|p| p.duration()).unwrap_or(0.0)
 }
 
 extern "C" fn player_channels(_this: Id, _: Sel) -> usize {
@@ -730,8 +1034,10 @@ extern "C" fn player_url(this: Id, _: Sel) -> Id {
 }
 
 extern "C" fn player_dealloc(this: Id, _: Sel) {
-    if let Some(players) = PLAYERS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-        players.remove(&this);
+    let removed = PLAYERS.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|players| players.remove(&this));
+    if let Some(player) = removed {
+        player.queue().quit = true;
+        player.wake.notify_all();
     }
 }
 
@@ -748,14 +1054,15 @@ fn finished(player: Id) {
 }
 
 fn mix_music(out: &mut [f32], frames: usize, out_rate: f64) {
-    let playing: Vec<(Id, Arc<Mutex<Music>>)> = match PLAYERS.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-        Some(players) => players.iter().map(|(&id, m)| (id, m.clone())).collect(),
+    let Ok(guard) = PLAYERS.try_lock() else { return };
+    let playing: Vec<(Id, Arc<Player>)> = match guard.as_ref() {
+        Some(players) => players.iter().filter(|(_, p)| p.playing.load(Ordering::Relaxed)).map(|(&id, p)| (id, p.clone())).collect(),
         None => return,
     };
-    for (player, music) in playing {
-        let mut music = music.lock().unwrap_or_else(|e| e.into_inner());
-        if music.playing && music.mix_into(out, frames, out_rate) {
-            finished(player);
+    drop(guard);
+    for (id, player) in playing {
+        if player.mix_into(out, frames, out_rate) {
+            finished(id);
         }
     }
 }
@@ -849,7 +1156,11 @@ fn wav_header(rate: u32, data_bytes: u32) -> Vec<u8> {
 mod aaudio {
     //! Android's low-latency sound output, loaded by name.
     use super::{mix, OUT_RATE};
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// The stream playing now (0 while none), and whether a reopen is under way.
+    static CURRENT: AtomicUsize = AtomicUsize::new(0);
+    static RECOVERING: AtomicBool = AtomicBool::new(false);
 
     type Builder = usize;
     type Stream = usize;
@@ -907,15 +1218,36 @@ mod aaudio {
     }
 
     /// The device changed (headphones in or out): open a new stream, from
-    /// another thread as AAudio asks.
+    /// another thread as AAudio asks. Keeps trying until one opens, so
+    /// sound comes back once the device is ready again.
     extern "C" fn on_error(stream: Stream, _user: usize, error: i32) {
+        if CURRENT.compare_exchange(stream, 0, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+            return;
+        }
         crate::log!("sound: output stopped (AAudio {error}); opening it again");
-        std::thread::spawn(move || {
+        let _ = std::thread::Builder::new().name("ios-sound-reopen".into()).spawn(move || {
             if let Some(api) = api() {
                 (api.close)(stream);
             }
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            open();
+            if RECOVERING.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            loop {
+                let mut wait = 200;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(wait));
+                    if open() {
+                        break;
+                    }
+                    wait = (wait * 2).min(2000);
+                }
+                RECOVERING.store(false, Ordering::SeqCst);
+                // A new stream that already failed while this one finished
+                // would have found a reopen running and left it to us.
+                if CURRENT.load(Ordering::SeqCst) != 0 || RECOVERING.swap(true, Ordering::SeqCst) {
+                    break;
+                }
+            }
         });
     }
 
@@ -948,7 +1280,9 @@ mod aaudio {
         if rate > 0 {
             OUT_RATE.store(rate as u32, Ordering::Relaxed);
         }
+        CURRENT.store(stream, Ordering::SeqCst);
         if (api.start)(stream) != 0 {
+            CURRENT.store(0, Ordering::SeqCst);
             (api.close)(stream);
             crate::log!("sound: AAudio would not start");
             return false;
@@ -970,7 +1304,7 @@ pub fn register(r: &mut Registry) {
     r.function("AUGraphIsRunning", graph_is_running as usize);
     r.function("AUGraphUninitialize", ok_1 as usize);
     r.function("AUGraphClose", ok_1 as usize);
-    r.function("DisposeAUGraph", ok_1 as usize);
+    r.function("DisposeAUGraph", graph_dispose as usize);
     r.function("AUGraphConnectNodeInput", graph_connect as usize);
     r.function("AUGraphSetNodeInputCallback", graph_set_node_input_callback as usize);
     r.function("AudioUnitSetProperty", unit_set_property as usize);
@@ -978,8 +1312,8 @@ pub fn register(r: &mut Registry) {
     r.function("AudioUnitSetParameter", unit_set_parameter as usize);
     r.function("AudioUnitGetParameter", unit_get_parameter as usize);
     r.function("AudioUnitInitialize", ok_1 as usize);
-    r.function("AudioOutputUnitStart", graph_start as usize);
-    r.function("AudioOutputUnitStop", graph_stop as usize);
+    r.function("AudioOutputUnitStart", unit_start as usize);
+    r.function("AudioOutputUnitStop", unit_stop as usize);
     r.function("CAShow", ok_1 as usize);
 
     let player = define_class("AVAudioPlayer", "NSObject", 8);
@@ -1051,7 +1385,7 @@ mod tests {
         unit_set_property(unit, STREAM_FORMAT, INPUT_SCOPE, 3, format.as_ptr(), 40);
         unit_set_parameter(unit, 5, INPUT_SCOPE, 3, 1.0, 0);
         unit_set_parameter(unit, 3, INPUT_SCOPE, 3, 0.0, 0);
-        with_graph(|g| g.running = true);
+        with_graph(|g| g.running.insert(0, true));
         let mut out = vec![0f32; 4410 * 2];
         mix(&mut out, 44100);
         let (left, right) = (energy(&out, 0), energy(&out, 1));
@@ -1067,6 +1401,67 @@ mod tests {
         unit_set_parameter(unit, 5, INPUT_SCOPE, 3, 0.0, 0);
         mix(&mut out, 44100);
         assert_eq!(energy(&out, 1), 0.0);
+    }
+
+    /// A WAV file in memory: `seconds` of a quiet tone, 16-bit stereo.
+    fn wav(rate: u32, seconds: f64) -> Vec<u8> {
+        let frames = (rate as f64 * seconds) as u32;
+        let mut file = wav_header(rate, frames * 4);
+        for i in 0..frames {
+            let v = ((i as f64 / rate as f64 * 440.0 * std::f64::consts::TAU).sin() * 8000.0) as i16;
+            file.extend_from_slice(&v.to_le_bytes());
+            file.extend_from_slice(&v.to_le_bytes());
+        }
+        file
+    }
+
+    /// Plays `player` for about `seconds` (at 44100 Hz), waiting for its
+    /// worker as needed. True if it reached its end.
+    fn play_for(player: &Arc<Player>, seconds: f64) -> bool {
+        let mut out = vec![0f32; 512 * 2];
+        for _ in 0..(seconds * 44100.0 / 512.0).round() as usize {
+            for _ in 0..2000 {
+                let q = player.queue();
+                if q.ended || q.seek.is_none() && q.stream.frames() >= 1200 {
+                    break;
+                }
+                drop(q);
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            if player.mix_into(&mut out, 512, 44100.0) {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn music_player_keeps_time_loops_and_seeks() {
+        let player = Player::new(Source::Bytes(Arc::new(wav(22050, 1.0))), 22050.0);
+        player.queue().loops = 1;
+        player.queue().loops_left = 1;
+        player.ensure_worker();
+        player.playing.store(true, Ordering::Relaxed);
+        assert!(!play_for(&player, 0.5));
+        let time = player.current_time();
+        assert!((time - 0.5).abs() < 0.03, "half way: {time}");
+        assert_eq!(player.queue().loops, 1, "the loop setting doesn't change while playing");
+        // Into the second pass: time starts again from zero.
+        assert!(!play_for(&player, 0.75));
+        let time = player.current_time();
+        assert!((time - 0.25).abs() < 0.03, "second pass: {time}");
+        // Then the end: stopped and back at the start.
+        assert!(play_for(&player, 1.0));
+        assert!(!player.playing.load(Ordering::Relaxed));
+        // Seeking reports the place the sound plays from.
+        player.seek(0.6);
+        player.playing.store(true, Ordering::Relaxed);
+        assert!(!play_for(&player, 0.2));
+        let time = player.current_time();
+        assert!((time - 0.8).abs() < 0.03, "after a seek to 0.6 and 0.2 s: {time}");
+        assert!((player.duration() - 1.0).abs() < 0.01);
+        player.queue().quit = true;
+        player.wake.notify_all();
     }
 
     #[test]
