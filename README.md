@@ -42,6 +42,9 @@ to a folder you pick with Android's folder picker: a WebDAV folder through DAVx5
 storage app that offers folders there. Tick "Also back up the original files" to save the downloaded files too.
 Backing up again only sends what changed. Restore lists the games in the backup and puts one back with a tap
 (the game, its data files, and its original file in Download). Keep Game Bridge open while a backup runs.
+iPhone games' saves go in the same backup (Game Bridge/ios/<game>/), and with the box ticked the game folder
+too. Restoring one closes the game, puts its saves back (the replaced ones stay in the app's ios-replaced
+folder until the next restore) and copies the game folder back if it is no longer on the phone.
 
 **64-bit games: lifting their frame limit.** Downloaded 64-bit games show up too (apps that say they are games,
 are built with a known game engine like Unity or Unreal, or have code of their own that both draws and plays

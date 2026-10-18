@@ -738,7 +738,13 @@ class MainActivity : ComponentActivity() {
         var folder by remember { mutableStateOf(Backups.folder(context)) }
         var originals by remember { mutableStateOf(Backups.run { loadChoices(context); keepOriginals }) }
         var converted by remember { mutableStateOf<List<Pair<String, java.io.File?>>?>(null) }
-        LaunchedEffect(Unit) { converted = withContext(Dispatchers.IO) { Backups.convertedGames(context, games) } }
+        var iphone by remember { mutableStateOf<List<Backups.IphoneSave>>(emptyList()) }
+        LaunchedEffect(Unit) {
+            withContext(Dispatchers.IO) {
+                iphone = Backups.iphoneGames(context, games)
+                converted = Backups.convertedGames(context, games)
+            }
+        }
         var folderName by remember { mutableStateOf(Backups.savedFolderName(context)) }
         LaunchedEffect(folder) { folder?.let { folderName = withContext(Dispatchers.IO) { Backups.folderName(context, it) } } }
         val pick = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { tree ->
@@ -752,7 +758,7 @@ class MainActivity : ComponentActivity() {
         // Whether a backup ran while this window was open, so the button that closes it says Done afterwards.
         var ran by remember { mutableStateOf(status != null) }
         LaunchedEffect(status) { if (status != null) ran = true }
-        val count = converted?.size
+        val count = converted?.let { it.size + iphone.size }
         AlertDialog(
             onDismissRequest = onDismiss,
             containerColor = CardColor,
@@ -766,9 +772,9 @@ class MainActivity : ComponentActivity() {
                     }
                     val what = when (count) {
                         null -> "Looking for converted games…"
-                        0 -> "No converted games are installed yet."
-                        1 -> "1 game and its data files go to:"
-                        else -> "$count games and their data files go to:"
+                        0 -> "No converted games or iPhone game saves yet."
+                        1 -> "1 game and its data files or saves go to:"
+                        else -> "$count games and their data files and saves go to:"
                     }
                     Text(what, color = Muted, fontSize = 14.sp)
                     Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -807,7 +813,7 @@ class MainActivity : ComponentActivity() {
                 Row(Modifier.bleed(TextButtonInset, TextButtonInset).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                     TextButton(enabled = canRestore, onClick = onRestore) { Text("Restore", color = if (canRestore) AccentText else Muted) }
                     TextButton(onClick = onDismiss) { Text(close, color = AccentText) }
-                    TextButton(enabled = canBackUp, onClick = { Backups.backUp(context, converted.orEmpty(), originals) }) {
+                    TextButton(enabled = canBackUp, onClick = { Backups.backUp(context, converted.orEmpty(), iphone, originals) }) {
                         Text("Back up", color = if (canBackUp) AccentText else Muted)
                     }
                 }
@@ -857,7 +863,8 @@ class MainActivity : ComponentActivity() {
                             Column(Modifier.weight(1f).padding(horizontal = 10.dp)) {
                                 Text(game.label, color = Color(0xFFE8E8EE), fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                 val detail = if (working == game.packageName) progress
-                                    else listOf(game.versionName.takeIf { it.isNotEmpty() }?.let { "v$it" }, android.text.format.Formatter.formatShortFileSize(context, game.size))
+                                    else listOf(game.versionName.takeIf { it.isNotEmpty() }?.let { "v$it" }, android.text.format.Formatter.formatShortFileSize(context, game.size),
+                                        game.savesFrom?.let { "saved " + DateUtils.getRelativeTimeSpanString(it, System.currentTimeMillis(), DateUtils.MINUTE_IN_MILLIS, DateUtils.FORMAT_ABBREV_RELATIVE) })
                                         .filterNotNull().joinToString(" · ")
                                 Text(detail, color = Muted, fontSize = 11.sp, maxLines = 1)
                             }
