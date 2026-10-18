@@ -139,15 +139,24 @@ struct State {
     size: (i32, i32),
     /// The thread the context is current on (0 = none).
     owner: u64,
-    /// This context draws the screen (renderbufferStorage:fromDrawable:);
-    /// only it uses the window surface, others get a private one.
-    on_window: bool,
 }
 
+/// The context that uses the window surface: the first one made current
+/// (the game's screen context); others (loading threads) get a private
+/// surface. Moving a context to another surface later is avoided: on some
+/// drivers (the Android emulator's) it loses the bound renderbuffer.
+static WINDOW_OWNER: AtomicUsize = AtomicUsize::new(0);
+
 /// The surface a context is made current with.
-fn surface_for(egl: &Egl, state: &mut State) -> Surface {
-    if egl.window != 0 && state.on_window {
-        return egl.window;
+fn surface_for(egl: &Egl, context: Id, state: &mut State) -> Surface {
+    if egl.window != 0 {
+        let owner = match WINDOW_OWNER.compare_exchange(0, context, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => context,
+            Err(existing) => existing,
+        };
+        if owner == context {
+            return egl.window;
+        }
     }
     if egl.surfaceless {
         return 0;
@@ -235,7 +244,7 @@ extern "C" fn set_current(_: Class, _: Sel, context: Id) -> bool {
     }
     let ok = unsafe {
         let mut state = state_of(context).lock().unwrap();
-        let surface = surface_for(egl, &mut state);
+        let surface = surface_for(egl, context, &mut state);
         let ok = eglMakeCurrent(egl.display, surface, surface, state.egl);
         if ok != 0 {
             state.owner = me;
@@ -350,16 +359,7 @@ extern "C" fn storage_from_drawable(this: Id, _: Sel, target: Enum, layer: Id) -
     let color = crate::fw::collections::dictionary_get(properties, crate::fw::string::make("EAGLDrawablePropertyColorFormat"));
     let format = if color != 0 && crate::fw::string::get(color) == "EAGLColorFormatRGB565" { gl::RGB565 } else { gl::RGBA8 };
     unsafe { gl::glRenderbufferStorage(target, format, width, height) };
-    let egl = egl();
-    let mut state = state_of(this).lock().unwrap();
-    state.size = (width, height);
-    if egl.window != 0 && !state.on_window {
-        state.on_window = true;
-        if CURRENT.with(|c| c.get()) == this && unsafe { eglMakeCurrent(egl.display, egl.window, egl.window, state.egl) } == 0 {
-            crate::log!("graphics: the screen's window can't be attached to context {this:#x} (EGL error {:#x})", unsafe { eglGetError() });
-        }
-    }
-    drop(state);
+    state_of(this).lock().unwrap().size = (width, height);
     crate::log!("graphics: screen memory {width}x{height} ({})", if format == gl::RGB565 { "16-bit" } else { "32-bit" });
     gl::check_errors("after giving the screen memory");
     true
@@ -388,8 +388,9 @@ extern "C" fn present(this: Id, _: Sel, _target: Enum) -> bool {
     let mut state = state_of(this).lock().unwrap();
     let (width, height) = state.size;
     if egl.window != 0 && unsafe { eglGetCurrentSurface(EGL_DRAW) } != egl.window {
-        // A context that never got the screen's memory still shows frames.
-        state.on_window = true;
+        // A context without the window shows a frame: it takes the window
+        // over (rare: games show frames from their screen context).
+        WINDOW_OWNER.store(this, Ordering::SeqCst);
         if unsafe { eglMakeCurrent(egl.display, egl.window, egl.window, state.egl) } == 0 {
             crate::log!("graphics: frame {frame} can't be shown: the window is in use (EGL error {:#x})", unsafe { eglGetError() });
             return false;

@@ -41,6 +41,17 @@ pub unsafe extern "C" fn Java_dev_braxten_gamebridge_IosGameActivity_nativeStart
 ) -> jboolean {
     let app = text(env, app);
     let home = text(env, home);
+    // Test switches for the game screen (it has no command line):
+    // setprop debug.gamebridge.ios.env "IOS_STACKS_AT=40;IOS_TAPS=20:550,300"
+    let mut extra = [0u8; 128];
+    if libc::__system_property_get(c"debug.gamebridge.ios.env".as_ptr(), extra.as_mut_ptr() as *mut c_char) > 0 {
+        let extra = CStr::from_ptr(extra.as_ptr() as *const c_char).to_string_lossy().into_owned();
+        for pair in extra.split(';') {
+            if let Some((key, value)) = pair.split_once('=') {
+                std::env::set_var(key.trim(), value.trim());
+            }
+        }
+    }
     let _ = std::fs::create_dir_all(&home);
     std::env::set_var("IOS_HOME", &home);
     if std::env::var_os("IOS_LOG_FILE").is_none() {

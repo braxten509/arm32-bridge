@@ -230,6 +230,19 @@ extern "C" fn locale_object_for_key(_this: Id, _: Sel, key: Id) -> Id {
     string::make(value)
 }
 
+/// A path's bytes (UTF-8 here, as on iPhone) to a string.
+extern "C" fn string_with_file_system_representation(_this: Id, _: Sel, bytes: *const u8, length: usize) -> Id {
+    if bytes.is_null() {
+        return 0;
+    }
+    let raw = unsafe { std::slice::from_raw_parts(bytes, length) };
+    string::make(&String::from_utf8_lossy(raw))
+}
+
+extern "C" fn file_system_representation_with_path(_this: Id, _: Sel, path: Id) -> usize {
+    runtime::send(path, "fileSystemRepresentation", &[])
+}
+
 pub fn register(_: &mut Registry) {
     let manager = define_class("NSFileManager", "NSObject", 8);
     class_methods(manager, &[("defaultManager", default_manager as usize)]);
@@ -253,6 +266,8 @@ pub fn register(_: &mut Registry) {
             ("currentDirectoryPath", current_directory as usize),
             ("URLForUbiquityContainerIdentifier:", ubiquity_container as usize),
             ("enumeratorAtPath:", enumerator_at_path as usize),
+            ("stringWithFileSystemRepresentation:length:", string_with_file_system_representation as usize),
+            ("fileSystemRepresentationWithPath:", file_system_representation_with_path as usize),
         ],
     );
     let locale = define_class("NSLocale", "NSObject", 8);

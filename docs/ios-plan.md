@@ -144,9 +144,33 @@ strictly as Apple does, unchanged fingers report "stationary", the game
 screen follows window size changes, and the game screen is private to
 Game Bridge (other apps can't start it with a folder of their choosing).
 
-Still to do in step 3: run on the Pixel, then inside the app's window
-(the game screen opens only from Game Bridge itself, so that needs a
-small start path in the app; step 7 makes the real one).
+On the Android emulator (2026-10-18, x86_64 image running our ARM code
+through Android's own ARM translation, host graphics card): IB2 runs in
+Game Bridge's game screen at about 60 frames a second, plays its whole
+opening scene, and is playable: tapping the move circle walks the knight
+to the first fight, and holding the block button blocks. Frame 1 comes
+about 9 s after start.
+
+Emulator test recipe (AVD `ios_bridge_test`: android-36 x86_64, 16 GB
+data, 6 GB memory, port 5562, `-gpu host`):
+- No window: `ANDROID_SERIAL=emulator-5562 ios/tools/run-phone.sh <App>.app`
+  (the game folder is copied to /sdcard/Download/ios once).
+- In the window: `tools/build-app.sh`, `adb install -r`, `adb root`,
+  `appops set dev.braxten.gamebridge MANAGE_EXTERNAL_STORAGE allow`, then
+  `am start -n dev.braxten.gamebridge/.IosGameActivity --es app
+  /sdcard/Download/ios/SwordGame.app` (root can open the private screen).
+  Log: /data/data/dev.braxten.gamebridge/files/ios/<name>/ios-run.log.
+  Test switches: `setprop debug.gamebridge.ios.env "KEY=value;..."`.
+
+Fixed on the way: the window context must keep one surface (moving the
+screen context from a private surface to the window lost its bound
+renderbuffer on the emulator, so the game read a 0x0 screen and never
+drew); small PVRTC mipmap levels; `-[NSFileManager
+stringWithFileSystemRepresentation:length:]`.
+
+Still to do in step 3: the same on the Pixel itself. The cutscene skip
+button doesn't skip yet (taps reach the game; unclear if this intro is
+skippable).
 
 ## Later steps
 

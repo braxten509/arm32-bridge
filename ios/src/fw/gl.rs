@@ -338,9 +338,18 @@ extern "C" fn renderbuffer_storage(target: Enum, format: Enum, width: i32, heigh
 }
 
 extern "C" fn framebuffer_renderbuffer(target: Enum, attachment: Enum, rb_target: Enum, renderbuffer: u32) {
+    let earlier = unsafe { glGetError() };
+    if earlier != 0 {
+        crate::log!("graphics: GL error {earlier:#x} was already waiting before glFramebufferRenderbuffer");
+    }
     unsafe { glFramebufferRenderbuffer(target, attachment, rb_target, renderbuffer) };
     trace_setup(format_args!("framebuffer attachment {attachment:#x} = renderbuffer {renderbuffer}"));
-    after(format_args!("glFramebufferRenderbuffer"));
+    let error = unsafe { glGetError() };
+    if error != 0 {
+        let mut bound = 0;
+        unsafe { glGetIntegerv(DRAW_FRAMEBUFFER_BINDING, &mut bound) };
+        crate::log!("graphics: GL error {error:#x} after glFramebufferRenderbuffer (target {target:#x}, framebuffer {bound} bound, context {:#x})", unsafe { eglGetCurrentContext() });
+    }
 }
 
 extern "C" fn framebuffer_texture_2d(target: Enum, attachment: Enum, texture_target: Enum, texture: u32, level: i32) {
@@ -577,11 +586,13 @@ extern "C" fn compressed_tex_image_2d(target: Enum, level: i32, internal: Enum, 
         let two_bits = internal & 1 == 1;
         let needed = crate::fw::pvrtc::size(width.max(0) as u32, height.max(0) as u32, two_bits);
         let unpack = unpack_state();
-        let pixels = if (size as usize) < needed {
-            None
-        } else {
-            read_source(&unpack, data, needed).and_then(|bytes| crate::fw::pvrtc::decode(&bytes, width as u32, height as u32, two_bits))
-        };
+        // Small mipmap levels: Apple's tools write fewer bytes than the
+        // 8x8-block minimum the decoder reads; the rest is taken as zero.
+        let given = (size.max(0) as usize).min(needed);
+        let pixels = read_source(&unpack, data, given).and_then(|mut bytes| {
+            bytes.resize(needed, 0);
+            crate::fw::pvrtc::decode(&bytes, width as u32, height as u32, two_bits)
+        });
         match pixels {
             Some(rgba) => upload_plain(&unpack, || unsafe { glTexImage2D(target, level, RGBA as i32, width, height, border, RGBA, UNSIGNED_BYTE, rgba.as_ptr()) }),
             None => {
