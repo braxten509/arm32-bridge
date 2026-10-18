@@ -83,14 +83,103 @@ extern "C" fn return_self(this: Id, _: Sel) -> Id {
 // ----- screen and device -----
 
 /// The screen the game is told it has, in points, landscape, and its scale.
+/// IOS_SCREEN=568x320@2 sets it outright. Otherwise, with the real display
+/// known (IOS_DISPLAY=2424x1080, set by the phone app), the game gets the
+/// shape iOS would give it there, drawn at the display's real pixels.
+/// Neither: an iPhone 5s (568x320 points at 2x).
 pub fn screen_points() -> (f64, f64, f64) {
     static SCREEN: OnceLock<(f64, f64, f64)> = OnceLock::new();
     *SCREEN.get_or_init(|| {
-        let text = std::env::var("IOS_SCREEN").unwrap_or_else(|_| "568x320@2".into());
-        let (size, scale) = text.split_once('@').unwrap_or((&text, "2"));
-        let (w, h) = size.split_once('x').unwrap_or(("568", "320"));
-        (w.parse().unwrap_or(568.0), h.parse().unwrap_or(320.0), scale.parse().unwrap_or(2.0))
+        if let Ok(text) = std::env::var("IOS_SCREEN") {
+            let (size, scale) = text.split_once('@').unwrap_or((&text, "2"));
+            let (w, h) = size.split_once('x').unwrap_or(("568", "320"));
+            return (w.parse().unwrap_or(568.0), h.parse().unwrap_or(320.0), scale.parse().unwrap_or(2.0));
+        }
+        let display = std::env::var("IOS_DISPLAY").ok().and_then(|text| {
+            let (w, h) = text.split_once('x')?;
+            Some((w.trim().parse::<f64>().ok()?, h.trim().parse::<f64>().ok()?))
+        });
+        let Some(display) = display.filter(|&(w, h)| w >= 1.0 && h >= 1.0) else {
+            return (568.0, 320.0, SCALE);
+        };
+        let app_dir = crate::loader::loaded().app_dir.clone();
+        let info = std::fs::read(format!("{app_dir}/Info.plist")).ok().and_then(|bytes| crate::fw::plist::parse(&bytes));
+        let files: Vec<String> = std::fs::read_dir(&app_dir)
+            .map(|list| list.filter_map(|e| e.ok()?.file_name().into_string().ok()).collect())
+            .unwrap_or_default();
+        let aspect = app_aspect(display, info.as_ref(), &files);
+        let (w, h) = fit_points(display, aspect);
+        crate::log!("screen: display {}x{}, app shape {aspect:.3}, told {w}x{h} points at {SCALE}x", display.0, display.1);
+        (w, h, SCALE)
     })
+}
+
+/// The scale every screen is reported at (an iPhone 5s, the device the
+/// games are told they run on).
+const SCALE: f64 = 2.0;
+
+/// The widest landscape shape (long side / short side) this app said it
+/// can fill, as iOS decides it: an app with a launch storyboard fills any
+/// screen; otherwise it gets the tallest iPhone launch image it ships
+/// (Default-568h@2x.png, or a UILaunchImages size), and with none a 3:2
+/// screen (the 3.5-inch iPhones), with black bars around it.
+fn app_aspect(display: (f64, f64), info: Option<&crate::fw::plist::Value>, files: &[String]) -> f64 {
+    use crate::fw::plist::Value;
+    let display_aspect = display.0.max(display.1) / display.0.min(display.1);
+    let has = |key: &str| info.and_then(|i| i.get(key)).is_some();
+    if has("UILaunchStoryboardName") || has("UILaunchStoryboardName~iphone") {
+        return display_aspect;
+    }
+    let mut shapes: Vec<f64> = vec![1.5];
+    // Default-568h@2x.png style names: the long side in points, iPhones
+    // with that height have these short sides.
+    for name in files {
+        let Some(rest) = name.strip_prefix("Default-") else { continue };
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !rest[digits.len()..].starts_with('h') {
+            continue;
+        }
+        let long: f64 = digits.parse().unwrap_or(0.0);
+        let short = match long as u32 {
+            568 => 320.0,
+            667 | 812 => 375.0,
+            736 | 896 => 414.0,
+            _ => continue,
+        };
+        shapes.push(long / short);
+    }
+    // UILaunchImages: [{UILaunchImageSize: "{320, 568}", ...}, ...]
+    for key in ["UILaunchImages", "UILaunchImages~iphone"] {
+        let Some(Value::Array(images)) = info.and_then(|i| i.get(key)) else { continue };
+        for image in images {
+            let Some(Value::String(size)) = image.get("UILaunchImageSize") else { continue };
+            let numbers: Vec<f64> = size
+                .trim_matches(|c| c == '{' || c == '}')
+                .split(',')
+                .filter_map(|n| n.trim().parse().ok())
+                .collect();
+            if let [a, b] = numbers[..] {
+                if a > 0.0 && b > 0.0 {
+                    shapes.push(a.max(b) / a.min(b));
+                }
+            }
+        }
+    }
+    // The widest one that fits; on a squarer display, the narrowest one
+    // (fitted by width, bars above and below).
+    let fits = shapes.iter().copied().filter(|&s| s <= display_aspect + 0.001).fold(0.0, f64::max);
+    if fits > 0.0 { fits } else { shapes.into_iter().fold(f64::INFINITY, f64::min) }
+}
+
+/// The largest size of this shape that fits the display, in points at
+/// SCALE, so the game draws at the display's own pixels.
+fn fit_points(display: (f64, f64), aspect: f64) -> (f64, f64) {
+    let (long, short) = (display.0.max(display.1) / SCALE, display.0.min(display.1) / SCALE);
+    if long / short >= aspect {
+        ((short * aspect).floor(), short.floor())
+    } else {
+        (long.floor(), (long / aspect).floor())
+    }
 }
 
 fn screen_bounds() -> Rect {
@@ -1089,4 +1178,40 @@ extern "C" fn ignore_id_id(_this: Id, _: Sel, _a: Id, _b: Id) {}
 extern "C" fn ignore_bool_int(_this: Id, _: Sel, _a: u8, _b: isize) {}
 extern "C" fn screen_scale_one(_this: Id, _: Sel) -> f64 {
     1.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fw::plist::Value;
+
+    #[test]
+    fn old_app_keeps_its_launch_image_shape_at_the_display_height() {
+        let files = vec!["Default-568h@2x.png".to_string(), "Default.png".to_string()];
+        let aspect = app_aspect((2424.0, 1080.0), Some(&Value::Dict(vec![])), &files);
+        assert!((aspect - 568.0 / 320.0).abs() < 1e-9);
+        let (w, h) = fit_points((2424.0, 1080.0), aspect);
+        assert_eq!((w, h), (958.0, 540.0)); // 1916x1080 pixels, side bars
+        assert!(w / h > 1.7 && w / h < 1.8);
+    }
+
+    #[test]
+    fn storyboard_app_fills_the_display() {
+        let info = Value::Dict(vec![("UILaunchStoryboardName".into(), Value::String("Launch".into()))]);
+        let aspect = app_aspect((2424.0, 1080.0), Some(&info), &[]);
+        assert_eq!(fit_points((2424.0, 1080.0), aspect), (1212.0, 540.0));
+    }
+
+    #[test]
+    fn launch_image_list_and_no_images() {
+        let image = Value::Dict(vec![("UILaunchImageSize".into(), Value::String("{375, 667}".into()))]);
+        let info = Value::Dict(vec![("UILaunchImages".into(), Value::Array(vec![image]))]);
+        assert!((app_aspect((2424.0, 1080.0), Some(&info), &[]) - 667.0 / 375.0).abs() < 1e-9);
+        // Nothing declared: the 3:2 screen of the first iPhones.
+        assert_eq!(app_aspect((2424.0, 1080.0), None, &[]), 1.5);
+        // A 4:3 tablet is narrower than 16:9: the shape is fitted by width.
+        let aspect = app_aspect((2048.0, 1536.0), None, &["Default-568h@2x.png".into()]);
+        assert_eq!(aspect, 1.5);
+        assert_eq!(fit_points((2048.0, 1536.0), aspect), (1024.0, 682.0));
+    }
 }

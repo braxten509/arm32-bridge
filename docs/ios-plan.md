@@ -252,6 +252,16 @@ game only; anything that would be, the owner decides first.
    so ~21% less vertical view at 20:9), the same at a fraction with a
    smooth stretch, or 16:9 at full height (`960x540@2`, bars stay). Config
    also has bSmoothFrameRate=TRUE, MaxSmoothedFrameRate=30 (check).
+   HUD (2026-10-18, scripts read with ~/.cache/ios-debug/hud-research/
+   ubc.py; IB2 packages are uncompressed): `SwordPC.AdjustHUDRenderSize`
+   lays the HUD out full-screen only when 1.7 < width/height < 1.8 (or
+   exactly 1.5); otherwise it uses a 3:2 "iPad" box fitted to the width,
+   which on wider screens is taller than the screen, so health bars,
+   buttons and their tap areas go off the top and bottom. Measured on the
+   Pixel: 960x540@2 full HUD, 1000x540@2 already clipped, 2.24:1 none.
+   Recommended general rule (owner choosing): like iOS, an app with no launch storyboard keeps
+   the shape of its largest launch image (IB2: Default-568h = 16:9), drawn
+   at the phone's real height with side bars. All sizes ran ~57-59 fps.
 4. IB3: PC, then emulator, then Pixel (Game Center first), then steps 1-3
    for it. Done: the same checks as IB2.
 5. Second-model review of everything, all tests, docs, commit. Pushing is

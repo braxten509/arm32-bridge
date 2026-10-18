@@ -61,6 +61,10 @@ pub unsafe extern "C" fn Java_dev_braxten_gamebridge_IosGameActivity_nativeStart
             }
         }
     }
+    // The game's screen is sized from the real display (see screen_points).
+    if std::env::var_os("IOS_DISPLAY").is_none() && width > 0 && height > 0 {
+        std::env::set_var("IOS_DISPLAY", format!("{width}x{height}"));
+    }
     WINDOW_WIDTH.store(width.max(1) as u32, Ordering::Relaxed);
     WINDOW_HEIGHT.store(height.max(1) as u32, Ordering::Relaxed);
     let window = native_window(env, surface);

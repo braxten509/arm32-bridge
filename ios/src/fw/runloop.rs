@@ -174,11 +174,18 @@ extern "C" fn timer_fire(this: Id, _: Sel) {
     runtime::send(target, &name, &[this]);
 }
 
-// CADisplayLink: a timer at the screen's refresh rate.
-const REFRESH_SECONDS: f64 = 1.0 / 60.0;
+// CADisplayLink: a timer at the screen's refresh rate (60 Hz, like the
+// iPhones these games were made for; IOS_REFRESH_HZ=120 to try others).
+fn refresh_seconds() -> f64 {
+    static SECONDS: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *SECONDS.get_or_init(|| {
+        let hz = std::env::var("IOS_REFRESH_HZ").ok().and_then(|t| t.parse::<f64>().ok()).filter(|&hz| hz >= 1.0);
+        1.0 / hz.unwrap_or(60.0)
+    })
+}
 
 extern "C" fn display_link_with_target(class: Class, _: Sel, target: Id, selector: Sel) -> Id {
-    make_timer(class, REFRESH_SECONDS, target, selector, 0, true)
+    make_timer(class, refresh_seconds(), target, selector, 0, true)
 }
 
 extern "C" fn display_link_add_to_run_loop(this: Id, _: Sel, run_loop: Id, _mode: Id) {
@@ -186,11 +193,11 @@ extern "C" fn display_link_add_to_run_loop(this: Id, _: Sel, run_loop: Id, _mode
 }
 
 extern "C" fn display_link_set_frame_interval(this: Id, _: Sel, frames: isize) {
-    timer(this).interval = REFRESH_SECONDS * frames.max(1) as f64;
+    timer(this).interval = refresh_seconds() * frames.max(1) as f64;
 }
 
 extern "C" fn display_link_frame_interval(this: Id, _: Sel) -> isize {
-    (timer(this).interval / REFRESH_SECONDS).round() as isize
+    (timer(this).interval / refresh_seconds()).round() as isize
 }
 
 extern "C" fn display_link_set_paused(this: Id, _: Sel, paused: u8) {
@@ -206,7 +213,7 @@ extern "C" fn display_link_timestamp(_this: Id, _: Sel) -> f64 {
 }
 
 extern "C" fn display_link_duration(_this: Id, _: Sel) -> f64 {
-    REFRESH_SECONDS
+    refresh_seconds()
 }
 
 /// Fires this loop's due timers. Returns how many fired and when the next one is due.

@@ -134,6 +134,10 @@ pub fn load(app_dir: &str, program_path: &str) -> Result<&'static Loaded, String
         let to = (segment.vm_address - base) as usize;
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), (start + to) as *mut u8, size) };
     }
+    let strengthened = strengthen_store_barriers(&image, start, base, span);
+    if strengthened > 0 {
+        crate::log!("{strengthened} store-only memory barriers made full barriers");
+    }
     for &address in &image.rebases {
         let place = address.wrapping_add(slide) as *mut u64;
         unsafe { *place = (*place).wrapping_add(slide) };
@@ -196,6 +200,45 @@ pub fn load(app_dir: &str, program_path: &str) -> Result<&'static Loaded, String
     }
     *LOAD_REPORT.lock().unwrap() = Some(report);
     Ok(loaded)
+}
+
+/// Store-only memory barriers (`dsb st`, `dmb ishst`, ...) in the game's
+/// code become full barriers. Some games use them on the reading side of
+/// thread hand-offs too (Unreal Engine 3's render command queue: read the
+/// write position, `dsb st`, read the command). That only orders writes, so
+/// a phone core may read the command before it is fully written, which
+/// Apple's cores never showed; the game's drawing thread then runs a
+/// half-written command and crashes. A full barrier also orders reads and
+/// is never wrong in place of a weaker one, only a little slower.
+fn strengthen_store_barriers(image: &Image, start: usize, base: u64, span: usize) -> usize {
+    const PURE_INSTRUCTIONS: u32 = 0x8000_0000;
+    let mut count = 0;
+    for section in image.segments.iter().flat_map(|s| &s.sections).filter(|s| s.flags & PURE_INSTRUCTIONS != 0) {
+        // Only whole, aligned words inside the program's memory.
+        let Some(offset) = section.address.checked_sub(base) else { continue };
+        let (at, size) = (start + offset as usize, section.size as usize / 4 * 4);
+        if at % 4 != 0 || offset as usize + size > span {
+            continue;
+        }
+        let words = unsafe { std::slice::from_raw_parts_mut(at as *mut u32, size / 4) };
+        count += strengthen_barriers_in(words);
+    }
+    count
+}
+
+/// DSB/DMB with an ST option (OSHST, NSHST, ISHST, ST) become the same
+/// barrier with the full option (OSH, NSH, ISH, SY). Returns how many.
+fn strengthen_barriers_in(words: &mut [u32]) -> usize {
+    let mut count = 0;
+    for word in words.iter_mut() {
+        let kind = *word & 0xFFFF_F0FF;
+        let option = (*word >> 8) & 0xF;
+        if (kind == 0xD503_309F || kind == 0xD503_30BF) && option & 0b11 == 0b10 {
+            *word |= 1 << 8;
+            count += 1;
+        }
+    }
+    count
 }
 
 /// Apple libraries whose functions are the same on Linux and Android (same
@@ -283,4 +326,21 @@ fn resolve(
     report.data_missing.insert(pretty);
     // Zeroed room: reads see 0/null instead of crashing on a bad address.
     symbols::leak([0u64; 64])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strengthen_barriers_in;
+
+    #[test]
+    fn store_only_barriers_become_full_barriers() {
+        let dsb_st = 0xD503_3E9F;
+        let dmb_ishst = 0xD503_3ABF;
+        let dmb_ishld = 0xD503_39BF;
+        let dsb_sy = 0xD503_3F9F;
+        let nop = 0xD503_201F;
+        let mut code = [dsb_st, dmb_ishst, dmb_ishld, dsb_sy, nop, 0x9100_0400];
+        assert_eq!(strengthen_barriers_in(&mut code), 2);
+        assert_eq!(code, [0xD503_3F9F, 0xD503_3BBF, dmb_ishld, dsb_sy, nop, 0x9100_0400]);
+    }
 }
