@@ -1,0 +1,228 @@
+//! Places the game's 64-bit code in memory, applies its fix-ups and
+//! connects its imports to our stand-ins.
+
+use crate::macho::{BindKind, Image};
+use crate::symbols::{self, Kind};
+use crate::trap::StubPage;
+use std::collections::{BTreeSet, HashSet};
+use std::sync::{Mutex, OnceLock};
+
+pub struct Loaded {
+    pub image: Image,
+    pub slide: u64,
+    pub start: usize,
+    pub end: usize,
+    pub path: String,
+    pub app_dir: String,
+}
+
+static LOADED: OnceLock<Loaded> = OnceLock::new();
+static METHOD_NAMES: OnceLock<Vec<(usize, String)>> = OnceLock::new();
+
+pub fn loaded() -> &'static Loaded {
+    LOADED.get().expect("no game loaded")
+}
+
+pub fn try_loaded() -> Option<&'static Loaded> {
+    LOADED.get()
+}
+
+#[derive(Default)]
+pub struct LoadReport {
+    pub functions_found: usize,
+    pub functions_missing: BTreeSet<String>,
+    pub data_found: usize,
+    pub data_missing: BTreeSet<String>,
+    pub weak_left_empty: BTreeSet<String>,
+    pub classes_missing: BTreeSet<String>,
+}
+
+pub static LOAD_REPORT: Mutex<Option<LoadReport>> = Mutex::new(None);
+
+extern "C" {
+    fn __clear_cache(start: *mut libc::c_char, end: *mut libc::c_char);
+}
+
+pub fn clear_cache(start: usize, end: usize) {
+    unsafe { __clear_cache(start as *mut _, end as *mut _) }
+}
+
+/// Names a code address: "SwordGame!function+0x10", or a plain number.
+pub fn describe_address(address: usize) -> String {
+    let Some(loaded) = try_loaded() else {
+        return format!("{address:#x}");
+    };
+    if address < loaded.start || address >= loaded.end {
+        return format!("{address:#x} (outside the game)");
+    }
+    let original = (address as u64).wrapping_sub(loaded.slide);
+    let symbols = &loaded.image.symbols;
+    let index = symbols.partition_point(|s| s.address <= original);
+    let program = loaded.path.rsplit('/').next().unwrap_or("game");
+    let mut best: Option<(u64, String)> = (index > 0).then(|| (symbols[index - 1].address, symbols[index - 1].name.clone()));
+    let methods = METHOD_NAMES.get_or_init(crate::objc::runtime::game_method_names);
+    let method_index = methods.partition_point(|(imp, _)| *imp <= address);
+    if method_index > 0 {
+        let (imp, name) = &methods[method_index - 1];
+        let method_original = (*imp as u64).wrapping_sub(loaded.slide);
+        if best.as_ref().map(|(at, _)| method_original > *at).unwrap_or(true) {
+            best = Some((method_original, name.clone()));
+        }
+    }
+    match best {
+        Some((at, name)) => format!("{program}!{name}+{:#x} ({original:#x})", original - at),
+        None => format!("{program}+{original:#x}"),
+    }
+}
+
+pub fn load(app_dir: &str, program_path: &str) -> Result<&'static Loaded, String> {
+    let file = std::fs::read(program_path).map_err(|e| format!("can't read {program_path}: {e}"))?;
+    let image = Image::parse(&file).map_err(|e| e.to_string())?;
+    if image.encrypted {
+        return Err("this program is still encrypted by the App Store".into());
+    }
+    let base = image.base_address();
+    let top = image
+        .segments
+        .iter()
+        .filter(|s| s.name != "__PAGEZERO")
+        .map(|s| s.vm_address + s.vm_size)
+        .max()
+        .ok_or("program has no segments")?;
+    let span = (top - base) as usize;
+    let memory = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            span,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if memory == libc::MAP_FAILED {
+        return Err(format!("can't reserve {span} bytes for the program"));
+    }
+    let start = memory as usize;
+    let slide = (start as u64).wrapping_sub(base);
+    for segment in image.segments.iter().filter(|s| s.name != "__PAGEZERO") {
+        let from = segment.file_offset as usize;
+        let size = segment.file_size.min(segment.vm_size) as usize;
+        let bytes = image
+            .data
+            .get(from..from + size)
+            .ok_or_else(|| format!("segment {} lies outside the file", segment.name))?;
+        let to = (segment.vm_address - base) as usize;
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), (start + to) as *mut u8, size) };
+    }
+    for &address in &image.rebases {
+        let place = address.wrapping_add(slide) as *mut u64;
+        unsafe { *place = (*place).wrapping_add(slide) };
+    }
+
+    let lazy_names: HashSet<&str> = image
+        .binds
+        .iter()
+        .filter(|b| b.kind == BindKind::Lazy)
+        .map(|b| b.symbol.as_str())
+        .collect();
+    let mut stubs = StubPage::new(4096);
+    let mut report = LoadReport::default();
+    let mut resolved: std::collections::HashMap<String, usize> = Default::default();
+    for bind in image.binds.iter().filter(|b| b.kind != BindKind::Weak) {
+        let value = match resolved.get(&bind.symbol) {
+            Some(&value) => value,
+            None => {
+                let value = resolve(&image, slide, bind, &lazy_names, &mut stubs, &mut report);
+                resolved.insert(bind.symbol.clone(), value);
+                value
+            }
+        };
+        let place = bind.address.wrapping_add(slide) as *mut u64;
+        unsafe { *place = (value as u64).wrapping_add(bind.addend as u64) };
+    }
+    stubs.seal();
+
+    let loaded = Loaded {
+        image,
+        slide,
+        start,
+        end: start + span,
+        path: program_path.to_string(),
+        app_dir: app_dir.to_string(),
+    };
+    LOADED.set(loaded).map_err(|_| "a game is already loaded")?;
+    let loaded = self::loaded();
+
+    crate::objc::runtime::load_image(loaded)?;
+
+    for segment in loaded.image.segments.iter().filter(|s| s.name != "__PAGEZERO") {
+        let at = start + (segment.vm_address - base) as usize;
+        let size = segment.vm_size as usize;
+        let protection = segment.initial_protection as i32;
+        let mut flags = 0;
+        if protection & 1 != 0 {
+            flags |= libc::PROT_READ;
+        }
+        if protection & 2 != 0 {
+            flags |= libc::PROT_WRITE;
+        }
+        if protection & 4 != 0 {
+            flags |= libc::PROT_EXEC;
+            clear_cache(at, at + size);
+        }
+        if unsafe { libc::mprotect(at as *mut _, size, flags) } != 0 {
+            return Err(format!("can't set access for segment {}", segment.name));
+        }
+    }
+    *LOAD_REPORT.lock().unwrap() = Some(report);
+    Ok(loaded)
+}
+
+fn resolve(
+    image: &Image,
+    slide: u64,
+    bind: &crate::macho::Bind,
+    lazy_names: &HashSet<&str>,
+    stubs: &mut StubPage,
+    report: &mut LoadReport,
+) -> usize {
+    let name = bind.symbol.as_str();
+    if bind.library_ordinal == 0 || bind.library_ordinal == -1 {
+        if let Some(symbol) = image.symbols.iter().find(|s| s.name == name) {
+            return symbol.address.wrapping_add(slide) as usize;
+        }
+    }
+    if let Some((address, kind)) = symbols::lookup(name) {
+        match kind {
+            Kind::Function => report.functions_found += 1,
+            Kind::Data => report.data_found += 1,
+        }
+        return address;
+    }
+    let class_ref = name
+        .strip_prefix("_OBJC_CLASS_$_")
+        .map(|n| (n, false))
+        .or_else(|| name.strip_prefix("_OBJC_METACLASS_$_").map(|n| (n, true)));
+    if let Some((class_name, meta)) = class_ref {
+        match crate::objc::runtime::existing_class(class_name, meta) {
+            Some(_) => report.data_found += 1,
+            None => {
+                report.classes_missing.insert(class_name.to_string());
+            }
+        }
+        return crate::objc::runtime::placeholder_class(class_name, meta);
+    }
+    let pretty = name.strip_prefix('_').unwrap_or(name).to_string();
+    if bind.weak_import {
+        report.weak_left_empty.insert(pretty);
+        return 0;
+    }
+    if lazy_names.contains(name) || name == "dyld_stub_binder" {
+        report.functions_missing.insert(pretty.clone());
+        return stubs.stub(&pretty);
+    }
+    report.data_missing.insert(pretty);
+    // Zeroed room: reads see 0/null instead of crashing on a bad address.
+    symbols::leak([0u64; 64])
+}

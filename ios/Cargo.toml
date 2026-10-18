@@ -1,0 +1,17 @@
+[package]
+name = "gamebridge-ios"
+version = "0.1.0"
+edition = "2021"
+description = "Game Bridge's iPhone layer: runs the 64-bit ARM code of iPhone games on ARM64 Linux and Android"
+license = "GPL-2.0-or-later"
+
+[lib]
+name = "gamebridge_ios"
+crate-type = ["rlib"]
+
+[[bin]]
+name = "ios-run"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2.190"

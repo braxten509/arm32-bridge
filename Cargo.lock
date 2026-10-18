@@ -196,6 +196,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "gamebridge-ios"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "gamebridge-pacer"
 version = "0.1.0"
 dependencies = [
