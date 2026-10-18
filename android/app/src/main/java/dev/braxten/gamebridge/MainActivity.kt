@@ -174,6 +174,8 @@ class MainActivity : ComponentActivity() {
             val state = states[game.packageName]
             if (state !is CardState.Working && state !is CardState.Failed) {
                 states[game.packageName] = when {
+                    // Nothing to install: it plays from its folder.
+                    game.action == Action.PlayIphone -> CardState.Ready
                     game.action == Action.Install && Games.isInstalled(this, game.packageName) -> CardState.Done
                     game.action == Action.Install -> CardState.Ready
                     Games.isConverted(this, game.packageName) -> CardState.Done
@@ -319,7 +321,7 @@ class MainActivity : ComponentActivity() {
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
                     items(games!!, key = { it.file?.path ?: it.packageName }) { game ->
-                        GameCard(game, states[game.packageName] ?: CardState.Ready, busy, onConvert = { convert(game) }, onReplace = { replacing = game }, onRemove = { removing = game }, onOpen = {
+                        GameCard(game, states[game.packageName] ?: CardState.Ready, busy, onConvert = { if (game.action == Action.PlayIphone) IphoneGames.play(this@MainActivity, game) else convert(game) }, onReplace = { replacing = game }, onRemove = { removing = game }, onOpen = {
                             packageManager.getLaunchIntentForPackage(game.packageName)?.let(::startActivity)
                         })
                     }
@@ -484,7 +486,10 @@ class MainActivity : ComponentActivity() {
             DropdownMenu(expanded = menu, onDismissRequest = { menu = false }, containerColor = Track) {
                 val close = { menu = false }
                 if (state == CardState.Done) MenuItem("Open") { close(); onOpen() }
-                if (game.file != null && !busy) when (state) {
+                if (game.action == Action.PlayIphone) {
+                    MenuItem("Play") { close(); onConvert() }
+                    MenuItem("Add to home screen") { close(); IphoneGames.addToHomeScreen(this@MainActivity, game) }
+                } else if (game.file != null && !busy) when (state) {
                     CardState.Ready -> MenuItem(if (game.action == Action.Install) "Install" else "Convert") { close(); onConvert() }
                     CardState.Done -> if (game.action == Action.Convert) MenuItem("Convert again") { close(); onConvert() }
                     is CardState.Failed -> MenuItem("Try again") { close(); onConvert() }
@@ -492,7 +497,7 @@ class MainActivity : ComponentActivity() {
                     is CardState.Working -> {}
                 }
                 val installed = Games.isInstalled(this@MainActivity, game.packageName)
-                if (installed || game.file != null) MenuItem(if (installed) "Remove" else "Delete file", ErrorText) { close(); onRemove() }
+                if (game.action != Action.PlayIphone && (installed || game.file != null)) MenuItem(if (installed) "Remove" else "Delete file", ErrorText) { close(); onRemove() }
             }
         }
     }
@@ -529,7 +534,7 @@ class MainActivity : ComponentActivity() {
                     overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 3.dp))
             } else {
                 // Where the game file is until it is installed.
-                Text(if (state == CardState.Done) "Installed" else game.place, color = Muted, fontSize = 11.sp, maxLines = 1,
+                Text(if (game.action == Action.PlayIphone) "iPhone game" else if (state == CardState.Done) "Installed" else game.place, color = Muted, fontSize = 11.sp, maxLines = 1,
                     modifier = Modifier.padding(top = 3.dp))
             }
             Spacer(Modifier.height(10.dp))
@@ -538,11 +543,18 @@ class MainActivity : ComponentActivity() {
                 when (state) {
                     CardState.Ready -> Button(
                         onClick = onConvert,
-                        enabled = !busy,
+                        // Playing an iPhone game doesn't wait for a conversion.
+                        enabled = !busy || game.action == Action.PlayIphone,
                         colors = ButtonDefaults.buttonColors(containerColor = Accent),
                         contentPadding = PaddingValues(0.dp),
                         modifier = Modifier.fillMaxSize(),
-                    ) { Text(if (game.action == Action.Install) "Install" else "Convert", fontSize = 13.sp) }
+                    ) {
+                        Text(when (game.action) {
+                            Action.Install -> "Install"
+                            Action.PlayIphone -> "Play"
+                            Action.Convert -> "Convert"
+                        }, fontSize = 13.sp)
+                    }
                     is CardState.Working -> Column(Modifier.fillMaxWidth()) {
                         Text("${state.progress.percent}% · ${state.progress.text}", color = Muted, fontSize = 12.sp, maxLines = 1,
                             overflow = TextOverflow.Ellipsis, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())

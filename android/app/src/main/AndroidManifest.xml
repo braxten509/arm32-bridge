@@ -30,13 +30,16 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-        <!-- iPhone games (64-bit): own process, landscape, full screen. Opened by Game
-             Bridge itself with the unpacked game folder in the "app" extra. Not exported:
+        <!-- iPhone games (64-bit): own process and task, landscape, full screen. Opened by
+             Game Bridge itself (a game's card or its home-screen icon) with the unpacked game
+             folder in the "app" extra; opening it again goes back to the running game. Not exported:
              it runs the folder's program as this app, so other apps must not choose it. -->
         <activity
             android:name=".IosGameActivity"
             android:exported="false"
             android:process=":ios"
+            android:launchMode="singleTask"
+            android:taskAffinity="dev.braxten.gamebridge.ios"
             android:screenOrientation="sensorLandscape"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode|density"
             android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />

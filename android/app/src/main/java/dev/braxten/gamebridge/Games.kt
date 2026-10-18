@@ -34,6 +34,8 @@ enum class Action {
     Convert,
     /** A bundle that already runs on this phone: install its pieces as they are. */
     Install,
+    /** An unpacked iPhone game (a folder ending in .app with 64-bit code): played in Game Bridge's iPhone game screen. */
+    PlayIphone,
 }
 
 /**
@@ -314,6 +316,8 @@ object Games {
         return entries.flatMap { entry ->
             when {
                 entry.name.startsWith('.') -> emptyList()
+                // An unpacked iPhone game: the folder is the game.
+                entry.isDirectory && entry.name.endsWith(".app", ignoreCase = true) && File(entry, "Info.plist").isFile -> listOf(entry)
                 entry.isDirectory -> if (entry.name in skipped && isRoot(folder)) emptyList() else files(entry)
                 entry.name.endsWith(".apk", ignoreCase = true) || isBundle(entry) -> listOf(entry)
                 entry.name.endsWith(".obb", ignoreCase = true) || isZip(entry) -> listOf(entry)
@@ -357,12 +361,55 @@ object Games {
 
     /** The card for a game file, with the data file it needs (not yet looked for on the phone). */
     private fun read(context: Context, file: File, place: String): Game? {
+        if (file.isDirectory) return readIphone(file, place)
         if (isBundle(file)) return readBundle(context, file, place)
         val bits = nativeBits(file) ?: return null
         // Plenty of ordinary apps are 64-bit too; only games are listed.
         if (bits == 64 && !isGame(context, file) && !builtWithEngine(context, file)) return null
         val game = fromApk(context, file, file, place, Action.Convert) ?: return null
         return needingData(context, game, file)
+    }
+
+    /** An unpacked iPhone game: its name, id and icon from its Info.plist; null without 64-bit ARM code. */
+    private fun readIphone(folder: File, place: String): Game? {
+        val info = Plist.read(File(folder, "Info.plist")) as? Map<*, *> ?: return null
+        fun text(key: String) = (info[key] as? String)?.takeIf { it.isNotBlank() }
+        val program = File(folder, text("CFBundleExecutable") ?: return null)
+        if (!hasArm64(program)) return null
+        val label = text("CFBundleDisplayName") ?: text("CFBundleName") ?: folder.nameWithoutExtension
+        return Game(folder, place, label, text("CFBundleIdentifier") ?: folder.name, 0, iphoneIcon(folder, info), Action.PlayIphone)
+    }
+
+    /** CPU_TYPE_ARM64 in an Apple program: a 64-bit one, or one part of a universal file. */
+    private fun hasArm64(program: File): Boolean = runCatching {
+        val head = program.inputStream().use { it.readNBytes(4096) }
+        val buffer = java.nio.ByteBuffer.wrap(head)
+        when (buffer.getInt(0)) {
+            0xCAFEBABE.toInt() -> (0 until minOf(buffer.getInt(4), (head.size - 8) / 20)).any { buffer.getInt(8 + 20 * it) == 0x0100000C }
+            0xCFFAEDFE.toInt() -> buffer.order(java.nio.ByteOrder.LITTLE_ENDIAN).getInt(4) == 0x0100000C
+            else -> false
+        }
+    }.getOrDefault(false)
+
+    /** The largest icon the game lists (iPhone and iPad lists, with Apple's @2x/@3x names), or any Icon*.png. */
+    private fun iphoneIcon(folder: File, info: Map<*, *>): Bitmap? {
+        val names = mutableListOf<String>()
+        fun add(value: Any?) {
+            when (value) {
+                is String -> names.add(value)
+                is List<*> -> value.forEach(::add)
+                is Map<*, *> -> { add(value["CFBundleIconFiles"]); add(value["CFBundlePrimaryIcon"]) }
+            }
+        }
+        add(info["CFBundleIconFiles"]); add(info["CFBundleIconFile"]); add(info["CFBundleIcons"]); add(info["CFBundleIcons~ipad"])
+        val listed = names.flatMap { name ->
+            val base = name.removeSuffix(".png")
+            listOf("$base.png", "$base@2x.png", "$base@3x.png", "$base@2x~ipad.png", "$base~ipad.png")
+        }.map { File(folder, it) }.filter { it.isFile }
+        val files = listed.ifEmpty { folder.listFiles().orEmpty().filter { it.name.startsWith("Icon", true) && it.name.endsWith(".png", true) } }
+        fun width(file: File) = BitmapFactory.Options().apply { inJustDecodeBounds = true }.also { BitmapFactory.decodeFile(file.path, it) }.outWidth
+        // Apple's "crushed" PNGs don't decode here: they read as width -1 and are passed over.
+        return files.sortedByDescending(::width).firstNotNullOfOrNull { BitmapFactory.decodeFile(it.path) }
     }
 
     /** The converter looks inside (the pieces' file lists) and copies the base APK out for its name and icon. */

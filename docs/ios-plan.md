@@ -168,7 +168,16 @@ renderbuffer on the emulator, so the game read a 0x0 screen and never
 drew); small PVRTC mipmap levels; `-[NSFileManager
 stringWithFileSystemRepresentation:length:]`.
 
-Still to do in step 3: the same on the Pixel itself.
+On the Pixel 10 (2026-10-18, no window): IB2 starts, draws correctly with
+no OpenGL errors, first frame at 7.6 s, then about 55 frames a second.
+
+Starting a game on the phone: Game Bridge's search lists every unpacked
+iPhone game (a folder ending in `.app` with 64-bit code, for example
+`Download/ios/SwordGame.app`) as a card with its own name and icon and a
+Play button. Press and hold the card for "Add to home screen" (the game's
+own icon); after the first play the game also shows when you press and
+hold Game Bridge's icon. The game screen runs as its own task, and opening
+it again goes back to the running game.
 
 ## Step 4 result (2026-10-18): sound and videos
 
