@@ -109,6 +109,21 @@ pub fn describe(object: Id) -> String {
     format!("<{} {object:#x}>", rt.class_name(rt.class_of(object)))
 }
 
+/// The class name of an object (or the class itself) for logs.
+pub fn describe_class_of(object: Id) -> String {
+    if object == 0 {
+        return "nil".into();
+    }
+    let rt = lock();
+    let class = rt.class_of(object);
+    let name = rt.class_name(class);
+    if rt.classes.get(&class).map(|r| r.meta).unwrap_or(false) {
+        format!("class {name}")
+    } else {
+        name
+    }
+}
+
 fn make_in(class: Class, value: &str) -> Id {
     let object = runtime::alloc_instance(class);
     unsafe { *((object + 8) as *mut *mut Text) = Box::into_raw(Box::new(Text::new(value))) };
@@ -268,6 +283,93 @@ extern "C" fn string_with_c_string(class: Class, s: Sel, bytes: usize, encoding:
     init_with_c_string(object, s, bytes, encoding)
 }
 
+/// Reads a text file: UTF-16 or UTF-8 by its byte-order mark, else UTF-8
+/// (Latin-1 when it isn't valid UTF-8). Returns the text and its encoding.
+fn read_text_file(path: &str) -> Option<(Vec<u16>, usize)> {
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        return Some((decode(&bytes[2..], NS_UTF16_LE)?, NS_UTF16));
+    }
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        let units = bytes[2..].chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+        return Some((units, NS_UTF16));
+    }
+    let body = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(&bytes);
+    match std::str::from_utf8(body) {
+        Ok(text) => Some((text.encode_utf16().collect(), NS_UTF8)),
+        Err(_) => Some((body.iter().map(|&b| b as u16).collect(), NS_ISO_LATIN1)),
+    }
+}
+
+fn file_error(error: *mut Id, path: &str) {
+    if !error.is_null() {
+        unsafe { *error = crate::fw::misc::error("NSCocoaErrorDomain", 260, &format!("can't read {path}")) };
+    }
+}
+
+extern "C" fn init_with_contents_used(this: Id, _: Sel, path: Id, used: *mut usize, error: *mut Id) -> Id {
+    let path = get(path);
+    match read_text_file(&path) {
+        Some((value, encoding)) => {
+            if !used.is_null() {
+                unsafe { *used = encoding };
+            }
+            set(this, value);
+            this
+        }
+        None => {
+            file_error(error, &path);
+            0
+        }
+    }
+}
+
+extern "C" fn init_with_contents_encoding(this: Id, _: Sel, path: Id, encoding: usize, error: *mut Id) -> Id {
+    let path_text = get(path);
+    match std::fs::read(&path_text).ok().and_then(|bytes| decode(&bytes, encoding)) {
+        Some(value) => {
+            set(this, value);
+            this
+        }
+        None => {
+            file_error(error, &path_text);
+            0
+        }
+    }
+}
+
+extern "C" fn with_contents_used(class: Class, s: Sel, path: Id, used: *mut usize, error: *mut Id) -> Id {
+    init_with_contents_used(make_in(string_class_for(class), ""), s, path, used, error)
+}
+
+extern "C" fn with_contents_encoding(class: Class, s: Sel, path: Id, encoding: usize, error: *mut Id) -> Id {
+    init_with_contents_encoding(make_in(string_class_for(class), ""), s, path, encoding, error)
+}
+
+extern "C" fn with_contents(class: Class, s: Sel, path: Id) -> Id {
+    with_contents_used(class, s, path, std::ptr::null_mut(), std::ptr::null_mut())
+}
+
+extern "C" fn init_with_data_encoding(this: Id, _: Sel, data: Id, encoding: usize) -> Id {
+    match decode(&crate::fw::data::bytes(data), encoding) {
+        Some(value) => {
+            set(this, value);
+            this
+        }
+        None => 0,
+    }
+}
+
+extern "C" fn write_to_file_encoding(this: Id, _: Sel, path: Id, _atomically: u8, encoding: usize, _error: *mut Id) -> bool {
+    let path = get(path);
+    let temporary = format!("{path}.part");
+    std::fs::write(&temporary, encode(&units(this), encoding)).and_then(|_| std::fs::rename(&temporary, &path)).is_ok()
+}
+
+extern "C" fn write_to_file(this: Id, s: Sel, path: Id, atomically: u8) -> bool {
+    write_to_file_encoding(this, s, path, atomically, NS_UTF8, std::ptr::null_mut())
+}
+
 extern "C" fn utf8_string(this: Id, _: Sel) -> usize {
     unsafe {
         let text = text(this);
@@ -295,6 +397,14 @@ extern "C" fn get_c_string(this: Id, _: Sel, buffer: *mut u8, size: usize, encod
         *buffer.add(bytes.len()) = 0;
     }
     true
+}
+
+extern "C" fn data_using_encoding(this: Id, _: Sel, encoding: usize) -> Id {
+    crate::fw::data::make(&encode(&units(this), encoding))
+}
+
+extern "C" fn data_using_encoding_lossy(this: Id, s: Sel, encoding: usize, _lossy: u8) -> Id {
+    data_using_encoding(this, s, encoding)
 }
 
 extern "C" fn length(this: Id, _: Sel) -> usize {
@@ -662,10 +772,17 @@ pub fn register(r: &mut Registry) {
             ("initWithFormat:", ios_init_with_format as usize),
             ("initWithFormat:arguments:", init_with_format_arguments as usize),
             ("UTF8String", utf8_string as usize),
+            ("initWithContentsOfFile:usedEncoding:error:", init_with_contents_used as usize),
+            ("initWithContentsOfFile:encoding:error:", init_with_contents_encoding as usize),
+            ("initWithData:encoding:", init_with_data_encoding as usize),
+            ("writeToFile:atomically:encoding:error:", write_to_file_encoding as usize),
+            ("writeToFile:atomically:", write_to_file as usize),
             ("cStringUsingEncoding:", c_string_using as usize),
             ("getCString:maxLength:encoding:", get_c_string as usize),
             ("fileSystemRepresentation", file_system_representation as usize),
             ("length", length as usize),
+            ("dataUsingEncoding:", data_using_encoding as usize),
+            ("dataUsingEncoding:allowLossyConversion:", data_using_encoding_lossy as usize),
             ("lengthOfBytesUsingEncoding:", length_of_bytes as usize),
             ("characterAtIndex:", character_at as usize),
             ("getCharacters:range:", get_characters_range as usize),
@@ -718,6 +835,9 @@ pub fn register(r: &mut Registry) {
             ("stringWithCharacters:length:", string_with_characters as usize),
             ("stringWithCString:encoding:", string_with_c_string as usize),
             ("stringWithFormat:", ios_string_with_format as usize),
+            ("stringWithContentsOfFile:usedEncoding:error:", with_contents_used as usize),
+            ("stringWithContentsOfFile:encoding:error:", with_contents_encoding as usize),
+            ("stringWithContentsOfFile:", with_contents as usize),
         ],
     );
     methods(

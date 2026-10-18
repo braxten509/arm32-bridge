@@ -38,6 +38,7 @@ fn class_for_name(name: Id, fallback: &str) -> Class {
 
 /// UIApplicationMain(argc, argv, principal class name, delegate class name).
 extern "C" fn ui_application_main(_argc: i32, _argv: usize, principal: Id, delegate_name: Id) -> i32 {
+    crate::fw::runloop::mark_main_thread();
     let app_class = class_for_name(principal, "UIApplication");
     let app = runtime::send(runtime::send(app_class, "alloc", &[]), "init", &[]);
     APPLICATION.store(app, Ordering::Relaxed);
@@ -71,7 +72,27 @@ extern "C" fn ui_application_main(_argc: i32, _argv: usize, principal: Id, deleg
             runtime::send(delegate_object, "applicationDidFinishLaunching:", &[app]);
         }
     }
-    crate::log!("start-up finished; the run loop (step 2) is not written yet");
+    crate::fw::foundation::post("UIApplicationDidFinishLaunchingNotification", app, 0);
+    if runtime::responds(delegate_object, "applicationDidBecomeActive:") {
+        crate::log!("calling -[{class_name} applicationDidBecomeActive:]");
+        runtime::send(delegate_object, "applicationDidBecomeActive:", &[app]);
+    }
+    crate::fw::foundation::post("UIApplicationDidBecomeActiveNotification", app, 0);
+    let seconds: f64 = std::env::var("IOS_RUN_SECONDS").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    crate::report::reached_run_loop();
+    if seconds > 0.0 {
+        crate::log!("run loop running for {seconds} s");
+        let end = {
+            let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
+            t.tv_sec as f64 + t.tv_nsec as f64 / 1e9 + seconds
+        };
+        crate::fw::runloop::run_main_loop(Some(end));
+        crate::log!("run loop time is up ({} timer calls)", crate::fw::runloop::timers_fired());
+        crate::report::finish(0);
+    }
+    crate::log!("run loop running");
+    crate::fw::runloop::run_main_loop(None);
     crate::report::finish(0);
 }
 

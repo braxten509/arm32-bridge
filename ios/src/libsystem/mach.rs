@@ -275,9 +275,6 @@ pub unsafe fn call_block(block: usize) {
 
 // ----- dispatch -----
 
-/// Work waiting for the main thread's run loop (step 2 runs it).
-pub static MAIN_QUEUE: Mutex<Vec<usize>> = Mutex::new(Vec::new());
-
 static ONCE_WAIT: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
 /// Runs `work` once per predicate. Apple's predicate: 0 = not yet, ~0 = done.
@@ -334,7 +331,7 @@ extern "C" fn dispatch_queue_create(_label: usize, _attr: usize) -> usize {
 extern "C" fn dispatch_async(queue: usize, block: usize) {
     let copy = block_copy(block as *mut BlockHeader) as usize;
     if queue == main_queue() {
-        MAIN_QUEUE.lock().unwrap().push(copy);
+        crate::fw::runloop::post(crate::fw::runloop::Work::Block(copy));
     } else {
         std::thread::spawn(move || unsafe { call_block(copy) });
     }
@@ -344,8 +341,15 @@ extern "C" fn dispatch_sync(_queue: usize, block: usize) {
     unsafe { call_block(block) };
 }
 
-extern "C" fn dispatch_after(_when: u64, queue: usize, block: usize) {
-    dispatch_async(queue, block);
+extern "C" fn dispatch_after(when: u64, queue: usize, block: usize) {
+    let copy = block_copy(block as *mut BlockHeader) as usize;
+    std::thread::spawn(move || {
+        let now = now_nanos();
+        if when != !0 && when > now {
+            std::thread::sleep(std::time::Duration::from_nanos(when - now));
+        }
+        dispatch_async(queue, copy);
+    });
 }
 
 extern "C" fn dispatch_noop(_object: usize) {}

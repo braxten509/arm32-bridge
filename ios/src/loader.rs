@@ -34,6 +34,7 @@ pub struct LoadReport {
     pub data_found: usize,
     pub data_missing: BTreeSet<String>,
     pub weak_left_empty: BTreeSet<String>,
+    pub data_named: BTreeSet<String>,
     pub classes_missing: BTreeSet<String>,
 }
 
@@ -53,7 +54,7 @@ pub fn describe_address(address: usize) -> String {
         return format!("{address:#x}");
     };
     if address < loaded.start || address >= loaded.end {
-        return format!("{address:#x} (outside the game)");
+        return describe_host_address(address);
     }
     let original = (address as u64).wrapping_sub(loaded.slide);
     let symbols = &loaded.image.symbols;
@@ -73,6 +74,24 @@ pub fn describe_address(address: usize) -> String {
         Some((at, name)) => format!("{program}!{name}+{:#x} ({original:#x})", original - at),
         None => format!("{program}+{original:#x}"),
     }
+}
+
+/// Names an address in our own program or a system library ("file+offset"),
+/// so `llvm-symbolizer --obj=<file> <offset>` can find the line.
+fn describe_host_address(address: usize) -> String {
+    let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+    if address != 0 && unsafe { libc::dladdr(address as *const _, &mut info) } != 0 && !info.dli_fname.is_null() {
+        let file = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) }.to_string_lossy().into_owned();
+        let name = file.rsplit('/').next().unwrap_or(&file).to_string();
+        return format!("{name}+{:#x}", address - info.dli_fbase as usize);
+    }
+    format!("{address:#x}")
+}
+
+fn looks_like_string_constant(name: &str) -> bool {
+    const ENDINGS: &[&str] = &["Notification", "NotificationName", "Key", "Domain", "Mode", "Identifier", "Name", "Scope"];
+    name.chars().next().map(|c| c.is_ascii_uppercase() || c == 'k').unwrap_or(false)
+        && ENDINGS.iter().any(|ending| name.ends_with(ending))
 }
 
 pub fn load(app_dir: &str, program_path: &str) -> Result<&'static Loaded, String> {
@@ -214,11 +233,18 @@ fn resolve(
         return crate::objc::runtime::placeholder_class(class_name, meta);
     }
     let pretty = name.strip_prefix('_').unwrap_or(name).to_string();
+    let is_function = lazy_names.contains(name) || name == "dyld_stub_binder";
+    if !is_function && looks_like_string_constant(&pretty) {
+        // Apple's NSString constants (notification names, keys, domains)
+        // nearly always hold their own name as their text.
+        report.data_named.insert(pretty.clone());
+        return symbols::leak(crate::fw::string::make(&pretty));
+    }
     if bind.weak_import {
         report.weak_left_empty.insert(pretty);
         return 0;
     }
-    if lazy_names.contains(name) || name == "dyld_stub_binder" {
+    if is_function {
         report.functions_missing.insert(pretty.clone());
         return stubs.stub(&pretty);
     }

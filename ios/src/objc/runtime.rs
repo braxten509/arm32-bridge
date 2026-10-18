@@ -308,6 +308,7 @@ std::arch::global_asm!(
     "stp q2, q3, [sp, #128]",
     "stp q4, q5, [sp, #160]",
     "stp q6, q7, [sp, #192]",
+    "mov x2, x30",
     "bl ios_objc_lookup",
     "mov x16, x0",
     "ldp q6, q7, [sp, #192]",
@@ -351,6 +352,7 @@ std::arch::global_asm!(
     "stp q4, q5, [sp, #160]",
     "stp q6, q7, [sp, #192]",
     "mov x2, x9",
+    "mov x3, x30",
     "bl ios_objc_lookup_super",
     "mov x16, x0",
     "ldp q6, q7, [sp, #192]",
@@ -377,7 +379,7 @@ extern "C" fn missing_method_returns_zero() -> usize {
     0
 }
 
-fn missing_method(class: Class, receiver_is_class: bool, sel: Sel) -> Imp {
+fn missing_method(class: Class, receiver_is_class: bool, sel: Sel, caller: usize) -> Imp {
     let (text, first) = {
         let mut rt = lock();
         let class_name = rt.class_name(class);
@@ -391,18 +393,31 @@ fn missing_method(class: Class, receiver_is_class: bool, sel: Sel) -> Imp {
         *count += 1;
         (text, *count == 1)
     };
+    let place = if caller == 0 { "our own code".to_string() } else { crate::loader::describe_address(caller) };
     if crate::trap::KEEP_GOING.load(Ordering::Relaxed) {
         if first {
-            crate::log!("missing method {text}, returning 0");
+            crate::log!("missing method {text} (called from {place}), returning 0");
         }
         return missing_method_returns_zero as usize;
     }
-    crate::log!("STOP: missing method {text}");
+    crate::log!("STOP: missing method {text} (called from {place})");
     crate::report::finish(1);
 }
 
+/// Methods asked for that don't exist. Gives nothing if the runtime is busy
+/// (a crash report must not wait on a lock the crashed code held).
 pub fn missing_methods() -> Vec<(String, u64)> {
-    let mut list: Vec<_> = lock().missing_methods.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    let Some(rt) = (0..100).find_map(|_| match runtime().try_lock() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            None
+        }
+    }) else {
+        return Vec::new();
+    };
+    let mut list: Vec<_> = rt.missing_methods.iter().map(|(k, v)| (k.clone(), *v)).collect();
     list.sort();
     list
 }
@@ -457,7 +472,7 @@ fn ensure_initialized(class: Class) {
 }
 
 #[no_mangle]
-extern "C" fn ios_objc_lookup(receiver: Id, sel: Sel) -> Imp {
+extern "C" fn ios_objc_lookup(receiver: Id, sel: Sel, caller: usize) -> Imp {
     let (isa, is_class, known) = {
         let rt = lock();
         let isa = rt.class_of(receiver);
@@ -473,12 +488,12 @@ extern "C" fn ios_objc_lookup(receiver: Id, sel: Sel) -> Imp {
     let found = lock().lookup(isa, sel);
     match found {
         Some(imp) => imp,
-        None => missing_method(isa, is_class, sel),
+        None => missing_method(isa, is_class, sel, caller),
     }
 }
 
 #[no_mangle]
-extern "C" fn ios_objc_lookup_super(pair: *const [usize; 2], sel: Sel, second_form: usize) -> Imp {
+extern "C" fn ios_objc_lookup_super(pair: *const [usize; 2], sel: Sel, second_form: usize, caller: usize) -> Imp {
     let [receiver, current] = unsafe { *pair };
     let start = if second_form != 0 {
         lock().classes.get(&current).map(|r| r.superclass).unwrap_or(0)
@@ -489,7 +504,7 @@ extern "C" fn ios_objc_lookup_super(pair: *const [usize; 2], sel: Sel, second_fo
     let found = lock().lookup(start, sel);
     match found {
         Some(imp) => imp,
-        None => missing_method(start, is_class, sel),
+        None => missing_method(start, is_class, sel, caller),
     }
 }
 
@@ -523,7 +538,7 @@ pub fn send(receiver: Id, sel_name: &str, args: &[usize]) -> usize {
                 let rt = lock();
                 (rt.class_of(receiver), rt.is_class_object(receiver))
             };
-            missing_method(isa, is_class, s)
+            missing_method(isa, is_class, s, 0)
         }
     };
     unsafe {

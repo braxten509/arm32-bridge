@@ -57,7 +57,18 @@ fn first_hit(name: &str) -> bool {
 
 /// Every missing function reached so far, with call counts.
 pub fn hits() -> Vec<(String, u64)> {
-    MISSING.lock().unwrap().hits.iter().map(|(k, v)| (k.clone(), *v)).collect()
+    // Waits briefly only: a crash report must not hang on a lock the crashed code held.
+    let Some(missing) = (0..100).find_map(|_| match MISSING.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            None
+        }
+    }) else {
+        return Vec::new();
+    };
+    missing.hits.iter().map(|(k, v)| (k.clone(), *v)).collect()
 }
 
 /// Code region holding the stubs, filled at load time.

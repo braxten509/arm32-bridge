@@ -73,11 +73,24 @@ fn keys_equal(a: Id, b: Id) -> bool {
     a == b || (a != 0 && b != 0 && runtime::send(a, "isEqual:", &[b]) & 0xFF != 0)
 }
 
+/// Finds a key without holding on to the entry list while the game's isEqual: runs
+/// (that code may change this same dictionary).
+fn find_key(object: Id, key: Id) -> Option<Id> {
+    let keys: Vec<Id> = pairs(object).iter().map(|(k, _)| *k).collect();
+    if let Some(&same) = keys.iter().find(|&&k| k == key) {
+        return Some(same);
+    }
+    keys.into_iter().find(|&k| keys_equal(k, key))
+}
+
 pub fn dictionary_get(object: Id, key: Id) -> Id {
     if object == 0 {
         return 0;
     }
-    pairs(object).iter().find(|(k, _)| keys_equal(*k, key)).map(|(_, v)| *v).unwrap_or(0)
+    match find_key(object, key) {
+        Some(found) => pairs(object).iter().find(|(k, _)| *k == found).map(|(_, v)| *v).unwrap_or(0),
+        None => 0,
+    }
 }
 
 pub fn dictionary_pairs(object: Id) -> Vec<(Id, Id)> {
@@ -276,6 +289,163 @@ extern "C" fn array_description(this: Id, _: Sel) -> Id {
     crate::fw::string::make(&format!("({})", parts.join(", ")))
 }
 
+fn compare_with_selector(a: Id, b: Id, selector: Sel) -> std::cmp::Ordering {
+    let name = lock().sel_name(selector);
+    let result = runtime::send(a, &name, &[b]) as isize;
+    result.cmp(&0)
+}
+
+extern "C" fn array_sorted_selector(this: Id, _: Sel, selector: Sel) -> Id {
+    let mut list = array_items(this);
+    list.sort_by(|&a, &b| compare_with_selector(a, b, selector));
+    array_from(&list)
+}
+
+extern "C" fn array_sort_selector(this: Id, _: Sel, selector: Sel) {
+    items(this).sort_by(|&a, &b| compare_with_selector(a, b, selector));
+}
+
+fn compare_with_block(a: Id, b: Id, block: usize) -> std::cmp::Ordering {
+    let header = block as *const crate::libsystem::mach::BlockHeader;
+    let invoke: extern "C" fn(usize, Id, Id) -> isize = unsafe { std::mem::transmute((*header).invoke) };
+    invoke(block, a, b).cmp(&0)
+}
+
+extern "C" fn array_sorted_comparator(this: Id, _: Sel, block: usize) -> Id {
+    let mut list = array_items(this);
+    list.sort_by(|&a, &b| compare_with_block(a, b, block));
+    array_from(&list)
+}
+
+extern "C" fn array_sort_comparator(this: Id, _: Sel, block: usize) {
+    items(this).sort_by(|&a, &b| compare_with_block(a, b, block));
+}
+
+extern "C" fn array_sorted_function(this: Id, _: Sel, function: usize, context: usize) -> Id {
+    let f: extern "C" fn(Id, Id, usize) -> isize = unsafe { std::mem::transmute(function) };
+    let mut list = array_items(this);
+    list.sort_by(|&a, &b| f(a, b, context).cmp(&0));
+    array_from(&list)
+}
+
+extern "C" fn array_sort_function(this: Id, _: Sel, function: usize, context: usize) {
+    let f: extern "C" fn(Id, Id, usize) -> isize = unsafe { std::mem::transmute(function) };
+    items(this).sort_by(|&a, &b| f(a, b, context).cmp(&0));
+}
+
+extern "C" fn array_joined(this: Id, _: Sel, separator: Id) -> Id {
+    let parts: Vec<String> = array_items(this).into_iter().map(crate::fw::string::describe).collect();
+    crate::fw::string::make(&parts.join(&crate::fw::string::get(separator)))
+}
+
+extern "C" fn array_adding(this: Id, _: Sel, item: Id) -> Id {
+    let mut list = array_items(this);
+    list.push(item);
+    array_from(&list)
+}
+
+extern "C" fn array_adding_array(this: Id, _: Sel, other: Id) -> Id {
+    let mut list = array_items(this);
+    list.extend(array_items(other));
+    array_from(&list)
+}
+
+extern "C" fn array_subarray(this: Id, _: Sel, range: crate::fw::string::Range) -> Id {
+    let list = array_items(this);
+    let start = range.location.min(list.len());
+    let end = (range.location + range.length).min(list.len());
+    array_from(&list[start..end])
+}
+
+extern "C" fn array_index_identical(this: Id, _: Sel, item: Id) -> usize {
+    items(this).iter().position(|&i| i == item).unwrap_or(isize::MAX as usize)
+}
+
+extern "C" fn array_is_equal(this: Id, _: Sel, other: Id) -> bool {
+    if !is_array(other) {
+        return false;
+    }
+    let (a, b) = (array_items(this), array_items(other));
+    a.len() == b.len() && a.iter().zip(b.iter()).all(|(&x, &y)| keys_equal(x, y))
+}
+
+extern "C" fn array_make_perform(this: Id, _: Sel, selector: Sel) {
+    let name = lock().sel_name(selector);
+    for item in array_items(this) {
+        runtime::send(item, &name, &[]);
+    }
+}
+
+extern "C" fn array_make_perform_with(this: Id, _: Sel, selector: Sel, argument: Id) {
+    let name = lock().sel_name(selector);
+    for item in array_items(this) {
+        runtime::send(item, &name, &[argument]);
+    }
+}
+
+extern "C" fn array_enumerate_block(this: Id, _: Sel, block: usize) {
+    let header = block as *const crate::libsystem::mach::BlockHeader;
+    let invoke: extern "C" fn(usize, Id, usize, *mut u8) = unsafe { std::mem::transmute((*header).invoke) };
+    let mut stop = 0u8;
+    for (index, item) in array_items(this).into_iter().enumerate() {
+        invoke(block, item, index, &mut stop);
+        if stop != 0 {
+            break;
+        }
+    }
+}
+
+extern "C" fn array_remove_in(this: Id, _: Sel, other: Id) {
+    let remove = array_items(other);
+    items(this).retain(|&i| !remove.iter().any(|&r| keys_equal(i, r)));
+}
+
+extern "C" fn array_exchange(this: Id, _: Sel, a: usize, b: usize) {
+    let list = items(this);
+    if a < list.len() && b < list.len() {
+        list.swap(a, b);
+    }
+}
+
+extern "C" fn array_with_contents_of_file(_: Class, _: Sel, path: Id) -> Id {
+    match std::fs::read(crate::fw::string::get(path)).ok().and_then(|b| crate::fw::plist::parse(&b)) {
+        Some(value @ crate::fw::plist::Value::Array(_)) => crate::fw::plist::to_object(&value),
+        _ => 0,
+    }
+}
+
+extern "C" fn dict_with_contents_of_file(_: Class, _: Sel, path: Id) -> Id {
+    match std::fs::read(crate::fw::string::get(path)).ok().and_then(|b| crate::fw::plist::parse(&b)) {
+        Some(value @ crate::fw::plist::Value::Dict(_)) => crate::fw::plist::to_object(&value),
+        _ => 0,
+    }
+}
+
+extern "C" fn init_with_contents_of_file(this: Id, _: Sel, path: Id) -> Id {
+    let is_dictionary = is_dictionary(this);
+    let loaded = if is_dictionary { dict_with_contents_of_file(0, 0, path) } else { array_with_contents_of_file(0, 0, path) };
+    if loaded == 0 {
+        return 0;
+    }
+    if is_dictionary {
+        *pairs(this) = dictionary_pairs(loaded);
+    } else {
+        *items(this) = array_items(loaded);
+    }
+    this
+}
+
+extern "C" fn write_to_file(this: Id, _: Sel, path: Id, _atomically: u8) -> bool {
+    match crate::fw::plist::from_object(this) {
+        Some(value) => {
+            let path = crate::fw::string::get(path);
+            let temporary = format!("{path}.part");
+            std::fs::write(&temporary, crate::fw::plist::to_xml(&value)).and_then(|_| std::fs::rename(&temporary, &path)).is_ok()
+        }
+        None => false,
+    }
+}
+
 // ----- NSDictionary -----
 
 extern "C" fn dict_init(this: Id, _: Sel) -> Id {
@@ -367,16 +537,18 @@ extern "C" fn dict_all_values(this: Id, _: Sel) -> Id {
 
 extern "C" fn dict_set(this: Id, _: Sel, value: Id, key: Id) {
     let key = if crate::fw::string::is_string(key) { runtime::send(key, "copy", &[]) } else { key };
+    let found = find_key(this, key);
     let list = pairs(this);
-    if let Some(entry) = list.iter_mut().find(|(k, _)| keys_equal(*k, key)) {
-        entry.1 = value;
-    } else {
-        list.push((key, value));
+    match found.and_then(|f| list.iter_mut().find(|(k, _)| *k == f)) {
+        Some(entry) => entry.1 = value,
+        None => list.push((key, value)),
     }
 }
 
 extern "C" fn dict_remove(this: Id, _: Sel, key: Id) {
-    pairs(this).retain(|(k, _)| !keys_equal(*k, key));
+    if let Some(found) = find_key(this, key) {
+        pairs(this).retain(|(k, _)| *k != found);
+    }
 }
 
 extern "C" fn dict_remove_all(this: Id, _: Sel) {
@@ -417,6 +589,42 @@ extern "C" fn dict_enumerate(this: Id, _: Sel, state: *mut [usize; 8], buffer: *
     }
 }
 
+extern "C" fn dict_enumerate_block(this: Id, _: Sel, block: usize) {
+    let header = block as *const crate::libsystem::mach::BlockHeader;
+    let invoke: extern "C" fn(usize, Id, Id, *mut u8) = unsafe { std::mem::transmute((*header).invoke) };
+    let mut stop = 0u8;
+    for (key, value) in dictionary_pairs(this) {
+        invoke(block, key, value, &mut stop);
+        if stop != 0 {
+            break;
+        }
+    }
+}
+
+extern "C" fn dict_objects_for_keys(this: Id, _: Sel, keys: Id, marker: Id) -> Id {
+    let values: Vec<Id> = array_items(keys)
+        .into_iter()
+        .map(|k| {
+            let v = dictionary_get(this, k);
+            if v == 0 { marker } else { v }
+        })
+        .collect();
+    array_from(&values)
+}
+
+extern "C" fn dict_is_equal(this: Id, _: Sel, other: Id) -> bool {
+    if !is_dictionary(other) {
+        return false;
+    }
+    let (a, b) = (dictionary_pairs(this), dictionary_pairs(other));
+    a.len() == b.len() && a.iter().all(|&(k, v)| keys_equal(dictionary_get(other, k), v))
+}
+
+extern "C" fn dict_keys_for_object(this: Id, _: Sel, value: Id) -> Id {
+    let keys: Vec<Id> = dictionary_pairs(this).into_iter().filter(|&(_, v)| keys_equal(v, value)).map(|(k, _)| k).collect();
+    array_from(&keys)
+}
+
 extern "C" fn dict_description(this: Id, _: Sel) -> Id {
     let parts: Vec<String> = dictionary_pairs(this)
         .into_iter()
@@ -424,6 +632,39 @@ extern "C" fn dict_description(this: Id, _: Sel) -> Id {
         .collect();
     crate::fw::string::make(&format!("{{{}}}", parts.join("; ")))
 }
+
+// NSCache may be shared between threads; one lock covers every cache.
+// The same thread may take it again (a key's isEqual: can use a cache).
+static CACHE_LOCK: crate::libsystem::libc::parking::Reentrant = crate::libsystem::libc::parking::Reentrant::new();
+
+fn with_cache<T>(work: impl FnOnce() -> T) -> T {
+    CACHE_LOCK.enter();
+    let result = work();
+    CACHE_LOCK.exit();
+    result
+}
+
+extern "C" fn cache_object_for_key(this: Id, s: Sel, key: Id) -> Id {
+    with_cache(|| dict_object_for_key(this, s, key))
+}
+
+extern "C" fn cache_set(this: Id, s: Sel, value: Id, key: Id) {
+    with_cache(|| dict_set(this, s, value, key))
+}
+
+extern "C" fn cache_set_with_cost(this: Id, s: Sel, value: Id, key: Id, _cost: usize) {
+    cache_set(this, s, value, key)
+}
+
+extern "C" fn cache_remove(this: Id, s: Sel, key: Id) {
+    with_cache(|| dict_remove(this, s, key))
+}
+
+extern "C" fn cache_remove_all(this: Id, s: Sel) {
+    with_cache(|| dict_remove_all(this, s))
+}
+
+extern "C" fn ignore_value(_this: Id, _: Sel, _value: usize) {}
 
 // ----- NSEnumerator: { isa, *mut (items, next index) } -----
 
@@ -520,6 +761,11 @@ pub fn is_number(object: Id) -> bool {
 
 fn number_parts(object: Id) -> (usize, u64) {
     unsafe { (*((object + 8) as *const usize), *((object + 16) as *const u64)) }
+}
+
+/// Booleans (numberWithBool:, kCFBooleanTrue) are CFBoolean on Apple's side.
+pub fn number_is_bool(object: Id) -> bool {
+    number_parts(object).0 == KIND_BOOL
 }
 
 pub fn number_as_f64(object: Id) -> f64 {
@@ -622,6 +868,69 @@ pub fn register(_: &mut Registry) {
         ],
     );
     methods(array, &[("objectEnumerator", array_object_enumerator as usize), ("reverseObjectEnumerator", array_reverse_enumerator as usize)]);
+    methods(
+        array,
+        &[
+            ("sortedArrayUsingSelector:", array_sorted_selector as usize),
+            ("sortedArrayUsingComparator:", array_sorted_comparator as usize),
+            ("sortedArrayUsingFunction:context:", array_sorted_function as usize),
+            ("componentsJoinedByString:", array_joined as usize),
+            ("arrayByAddingObject:", array_adding as usize),
+            ("arrayByAddingObjectsFromArray:", array_adding_array as usize),
+            ("subarrayWithRange:", array_subarray as usize),
+            ("indexOfObjectIdenticalTo:", array_index_identical as usize),
+            ("isEqualToArray:", array_is_equal as usize),
+            ("isEqual:", array_is_equal as usize),
+            ("makeObjectsPerformSelector:", array_make_perform as usize),
+            ("makeObjectsPerformSelector:withObject:", array_make_perform_with as usize),
+            ("enumerateObjectsUsingBlock:", array_enumerate_block as usize),
+            ("initWithContentsOfFile:", init_with_contents_of_file as usize),
+            ("writeToFile:atomically:", write_to_file as usize),
+        ],
+    );
+    class_methods(array, &[("arrayWithContentsOfFile:", array_with_contents_of_file as usize)]);
+    methods(
+        mutable_array,
+        &[
+            ("sortUsingSelector:", array_sort_selector as usize),
+            ("sortUsingComparator:", array_sort_comparator as usize),
+            ("sortUsingFunction:context:", array_sort_function as usize),
+            ("removeObjectsInArray:", array_remove_in as usize),
+            ("exchangeObjectAtIndex:withObjectAtIndex:", array_exchange as usize),
+            ("removeObjectIdenticalTo:", array_remove_object as usize),
+        ],
+    );
+    methods(
+        dictionary,
+        &[
+            ("enumerateKeysAndObjectsUsingBlock:", dict_enumerate_block as usize),
+            ("objectsForKeys:notFoundMarker:", dict_objects_for_keys as usize),
+            ("isEqualToDictionary:", dict_is_equal as usize),
+            ("isEqual:", dict_is_equal as usize),
+            ("allKeysForObject:", dict_keys_for_object as usize),
+            ("initWithContentsOfFile:", init_with_contents_of_file as usize),
+            ("writeToFile:atomically:", write_to_file as usize),
+        ],
+    );
+    class_methods(dictionary, &[("dictionaryWithContentsOfFile:", dict_with_contents_of_file as usize)]);
+    // NSCache keeps its entries the same way (never evicts on its own).
+    let cache = define_class("NSCache", "NSObject", 16);
+    methods(
+        cache,
+        &[
+            ("init", dict_init as usize),
+            ("objectForKey:", cache_object_for_key as usize),
+            ("setObject:forKey:", cache_set as usize),
+            ("setObject:forKey:cost:", cache_set_with_cost as usize),
+            ("removeObjectForKey:", cache_remove as usize),
+            ("removeAllObjects", cache_remove_all as usize),
+            ("setDelegate:", ignore_value as usize),
+            ("setName:", ignore_value as usize),
+            ("setCountLimit:", ignore_value as usize),
+            ("setTotalCostLimit:", ignore_value as usize),
+            ("setEvictsObjectsWithDiscardedContent:", ignore_value as usize),
+        ],
+    );
     methods(dictionary, &[("keyEnumerator", dict_key_enumerator as usize), ("objectEnumerator", dict_object_enumerator as usize)]);
     methods(
         array,

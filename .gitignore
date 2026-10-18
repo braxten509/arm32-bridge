@@ -11,3 +11,5 @@
 /android/GameBridge-*.apk
 # Crush's chat database for this folder.
 /.crush
+# qemu crash dumps from PC test runs.
+*.core

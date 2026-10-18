@@ -35,6 +35,30 @@ extern "C" {
     fn wcsstr(a: usize, b: usize) -> usize;
     fn wcstod(a: usize, end: usize) -> f64;
     fn wcstoul(a: usize, end: usize, base: i32) -> u64;
+    fn wcstoull(a: usize, end: usize, base: i32) -> u64;
+    fn wcstol(a: usize, end: usize, base: i32) -> i64;
+    fn wcstoll(a: usize, end: usize, base: i32) -> i64;
+    fn wcstof(a: usize, end: usize) -> f32;
+    fn wcsncat(a: usize, b: usize, n: usize) -> usize;
+    fn wcsspn(a: usize, b: usize) -> usize;
+    fn wcscspn(a: usize, b: usize) -> usize;
+    fn wcspbrk(a: usize, b: usize) -> usize;
+    fn wcsnlen(a: usize, n: usize) -> usize;
+    fn wcscasecmp(a: usize, b: usize) -> i32;
+    fn wcsncasecmp(a: usize, b: usize, n: usize) -> i32;
+    fn towlower(c: u32) -> u32;
+    fn towupper(c: u32) -> u32;
+    fn iswspace(c: u32) -> i32;
+    fn iswalpha(c: u32) -> i32;
+    fn iswdigit(c: u32) -> i32;
+    fn iswalnum(c: u32) -> i32;
+    fn iswupper(c: u32) -> i32;
+    fn iswlower(c: u32) -> i32;
+    fn iswpunct(c: u32) -> i32;
+    fn wmemcpy(a: usize, b: usize, n: usize) -> usize;
+    fn wmemset(a: usize, c: u32, n: usize) -> usize;
+    fn wmemmove(a: usize, b: usize, n: usize) -> usize;
+    fn wmemcmp(a: usize, b: usize, n: usize) -> i32;
 }
 
 #[repr(C)]
@@ -93,7 +117,7 @@ extern "C" fn cxa_atexit(f: usize, arg: usize, dso: usize) -> i32 {
 // C++ one-time static set-up guards (64-bit guard word, first byte = done).
 static GUARD_HELD: parking::Reentrant = parking::Reentrant::new();
 
-mod parking {
+pub mod parking {
     use std::sync::{Condvar, Mutex};
     /// A lock the same thread may take again (C++ guards can nest).
     pub struct Reentrant {
@@ -408,6 +432,14 @@ pub fn register(r: &mut Registry) {
     r.function("wcsstr", wcsstr as usize);
     r.function("wcstod", wcstod as usize);
     r.function("wcstoul", wcstoul as usize);
+    macro_rules! wide {
+        ($($name:ident),* $(,)?) => { $( r.function(stringify!($name), $name as usize); )* };
+    }
+    wide!(
+        wcstoull, wcstol, wcstoll, wcstof, wcsncat, wcsspn, wcscspn, wcspbrk, wcsnlen, wcscasecmp, wcsncasecmp,
+        towlower, towupper, iswspace, iswalpha, iswdigit, iswalnum, iswupper, iswlower, iswpunct, wmemcpy, wmemset,
+        wmemmove, wmemcmp
+    );
     r.function("__sincosf_stret", sincosf_stret as usize);
     r.function("memset_pattern16", memset_pattern16 as usize);
     r.function("__strcat_chk", strcat_chk as usize);

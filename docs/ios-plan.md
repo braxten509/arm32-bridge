@@ -38,6 +38,14 @@ qemu-aarch64 -L ~/.cache/aarch64-sysroot \
 
 `IOS_LIST_MISSING=1` prints every missing import at the end.
 `IOS_DEVICE` sets the reported model (default `iPhone6,1`, iPhone 5s).
+`IOS_SCREEN` sets the screen (default `568x320@2`, landscape).
+`IOS_RUN_SECONDS` ends the run loop after that many seconds.
+
+Or build and run in one go (log in `~/.cache/ios-run.log`):
+
+```bash
+IOS_RUN_SECONDS=15 ios/tools/run-pc.sh <App>.app [--keep-going]
+```
 
 Check that our fix-up lists match Apple's tool exactly:
 
@@ -65,19 +73,30 @@ Known shortcuts in step 1 (to fix in later steps):
 - `__error` gives the right Apple error number right after a failed call;
   a value the game writes there itself is not kept.
 
-## Step 2 to-do: what IB2 still needs
+## Step 2 result (2026-10-18)
 
-From a `--keep-going` run, the pieces reached during `didFinishLaunching`:
+IB2 in strict mode: `didFinishLaunching` returns, `applicationDidBecomeActive:`
+runs, the main run loop fires timers and queued work, and the engine thread
+(`-[IPhoneAppDelegate MainUE3GameThread:]`) starts, logs
+`This device is [iPhone6,1] ... scale is 2.000000` and starts its own
+threads. The first stop is graphics: `glGenRenderbuffers` in
+`-[EAGLView CreateFramebuffer:]` (step 3).
 
-- UIKit: UIDevice, UIScreen (`mainScreen`, `screens`), UIWindow, UIView,
-  UIViewController (`view`), UIImage/UIImageView, UIApplication settings
-  (`setApplicationSupportsShakeToEdit:`, `setApplicationIconBadgeNumber:`).
-- Foundation: NSClassFromString, NSMutableSet, NSThread
-  (`detachNewThreadSelector:toTarget:withObject:`), NSTimer, run loop.
-- Sound session: AudioSessionInitialize/GetProperty/AddPropertyListener,
-  AVAudioSession.
-- Video: AVURLAsset, AVPlayerItem, AVPlayer (the intro movie).
-- Keychain: SecItemCopyMatching (save data may live there → store in a file).
+Added: UIKit basics (UIScreen, UIDevice, UIView/UIWindow/UIViewController,
+CALayer/CAEAGLLayer, UIImage, UIColor), geometry functions, run loop,
+NSTimer, CADisplayLink, NSThread, main-thread calls, locks and conditions,
+NSSet, NSURL, NSDate, NSError, NSFileManager, NSLocale, regular expressions,
+SQLite (built in), keychain kept in `<home>/Library/keychain.plist`, audio
+session, video and sound stand-ins (nothing shown or heard yet), network
+checks that always say "offline", web requests that fail as offline.
+
+IB3 also reaches its run loop; its first stop is Game Center
+(`+[GKLocalPlayer localPlayer]`), which belongs to step 5.
+
+Still shortcuts after step 2:
+- Videos are skipped (the game is told they finished). No sound.
+- Network is always offline.
+- Objects are still never freed.
 
 Every import the program has that we don't (IB2): 202 functions, 38 data
 symbols, 90 classes. Largest groups: OpenGL ES (`gl*`, passes almost

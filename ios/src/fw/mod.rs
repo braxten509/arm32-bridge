@@ -3,11 +3,24 @@
 pub mod app;
 pub mod collections;
 pub mod data;
+pub mod eagl;
+pub mod files;
 pub mod foundation;
+pub mod geometry;
+pub mod keychain;
+pub mod locks;
+pub mod media;
+pub mod misc;
 pub mod object;
 pub mod paths;
 pub mod plist;
+pub mod regex;
+pub mod runloop;
+pub mod sqlite;
+pub mod services;
 pub mod string;
+pub mod uikit;
+pub mod web;
 
 use crate::symbols::Registry;
 
@@ -16,6 +29,35 @@ pub fn register(r: &mut Registry) {
     string::register(r);
     collections::register(r);
     data::register(r);
+    misc::register(r);
     foundation::register(r);
     app::register(r);
+    uikit::register(r);
+    runloop::register(r);
+    media::register(r);
+    keychain::register(r);
+    eagl::register(r);
+    files::register(r);
+    services::register(r);
+    web::register(r);
+    sqlite::register(r);
+    regex::register(r);
+    locks::register(r);
+    immutable_copies();
+}
+
+/// Objects that never change hand back themselves when copied, as on Apple.
+fn immutable_copies() {
+    extern "C" fn same(this: crate::objc::runtime::Id, _: crate::objc::runtime::Sel, _zone: usize) -> crate::objc::runtime::Id {
+        this
+    }
+    for name in [
+        "NSRegularExpression", "NSTextCheckingResult", "NSDate", "NSURL", "NSUUID", "NSNull", "NSError", "NSLocale",
+        "UIColor", "UIImage", "NSURLRequest",
+    ] {
+        let class = crate::objc::runtime::class_named(name);
+        if class != 0 {
+            object::methods(class, &[("copyWithZone:", same as usize)]);
+        }
+    }
 }

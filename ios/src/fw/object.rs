@@ -129,6 +129,44 @@ extern "C" fn dealloc(this: Id, _: Sel) {
     let _ = this;
 }
 
+// ----- key-value observing: observers are kept; changes are sent by kvo_notify -----
+
+#[derive(Clone)]
+struct KeyObserver {
+    object: Id,
+    key: String,
+    observer: Id,
+    context: usize,
+}
+
+static KEY_OBSERVERS: std::sync::Mutex<Vec<KeyObserver>> = std::sync::Mutex::new(Vec::new());
+
+extern "C" fn add_key_observer(this: Id, _: Sel, observer: Id, key: Id, _options: usize, context: usize) {
+    let key = crate::fw::string::get(key);
+    KEY_OBSERVERS.lock().unwrap().push(KeyObserver { object: this, key, observer, context });
+}
+
+extern "C" fn remove_key_observer(this: Id, _: Sel, observer: Id, key: Id) {
+    let key = crate::fw::string::get(key);
+    KEY_OBSERVERS.lock().unwrap().retain(|o| !(o.object == this && o.observer == observer && o.key == key));
+}
+
+extern "C" fn remove_key_observer_context(this: Id, s: Sel, observer: Id, key: Id, _context: usize) {
+    remove_key_observer(this, s, observer, key);
+}
+
+/// Tells observers of `key` on `object` that it now holds `value`.
+pub fn kvo_notify(object: Id, key: &str, value: Id) {
+    let list: Vec<KeyObserver> = KEY_OBSERVERS.lock().unwrap().iter().filter(|o| o.object == object && o.key == key).cloned().collect();
+    for o in list {
+        let change = crate::fw::collections::dictionary_from(&[
+            (crate::fw::string::make("new"), value),
+            (crate::fw::string::make("kind"), crate::fw::collections::number_int(1)),
+        ]);
+        runtime::send(o.observer, "observeValueForKeyPath:ofObject:change:context:", &[crate::fw::string::make(key), object, change, o.context]);
+    }
+}
+
 pub fn define(_: &mut Registry) -> Class {
     let class = lock().define_class("NSObject", 0, 8);
     let m = |name: &str, imp: usize| {
@@ -159,6 +197,11 @@ pub fn define(_: &mut Registry) -> Class {
     m("performSelector:withObject:", perform_with as usize);
     m("performSelector:withObject:withObject:", perform_with_with as usize);
     m("zone", hash_zero as usize);
+    m("addObserver:forKeyPath:options:context:", add_key_observer as usize);
+    m("removeObserver:forKeyPath:", remove_key_observer as usize);
+    m("removeObserver:forKeyPath:context:", remove_key_observer_context as usize);
+    m("willChangeValueForKey:", ignore_one as usize);
+    m("didChangeValueForKey:", ignore_one as usize);
     let meta = lock().classes[&class].partner;
     let c = |name: &str, imp: usize| {
         let mut rt = lock();
@@ -179,6 +222,8 @@ pub fn define(_: &mut Registry) -> Class {
     c("copyWithZone:", return_self_with as usize);
     class
 }
+
+extern "C" fn ignore_one(_this: Id, _: Sel, _value: usize) {}
 
 extern "C" fn hash_zero(_this: Id, _: Sel) -> usize {
     0

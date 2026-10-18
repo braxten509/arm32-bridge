@@ -1,0 +1,171 @@
+//! Core Graphics geometry: rectangles, points, sizes and transforms, as the
+//! game passes them (groups of doubles in floating-point registers).
+
+use crate::symbols::{leak, Registry};
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Point {
+    pub x: f64,
+    pub y: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Size {
+    pub width: f64,
+    pub height: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Rect {
+    pub origin: Point,
+    pub size: Size,
+}
+
+impl Rect {
+    pub fn new(x: f64, y: f64, width: f64, height: f64) -> Rect {
+        Rect { origin: Point { x, y }, size: Size { width, height } }
+    }
+
+    fn standard(self) -> Rect {
+        let mut r = self;
+        if r.size.width < 0.0 {
+            r.origin.x += r.size.width;
+            r.size.width = -r.size.width;
+        }
+        if r.size.height < 0.0 {
+            r.origin.y += r.size.height;
+            r.size.height = -r.size.height;
+        }
+        r
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Transform {
+    pub a: f64,
+    pub b: f64,
+    pub c: f64,
+    pub d: f64,
+    pub tx: f64,
+    pub ty: f64,
+}
+
+pub const IDENTITY: Transform = Transform { a: 1.0, b: 0.0, c: 0.0, d: 1.0, tx: 0.0, ty: 0.0 };
+
+fn concat(t1: Transform, t2: Transform) -> Transform {
+    Transform {
+        a: t1.a * t2.a + t1.b * t2.c,
+        b: t1.a * t2.b + t1.b * t2.d,
+        c: t1.c * t2.a + t1.d * t2.c,
+        d: t1.c * t2.b + t1.d * t2.d,
+        tx: t1.tx * t2.a + t1.ty * t2.c + t2.tx,
+        ty: t1.tx * t2.b + t1.ty * t2.d + t2.ty,
+    }
+}
+
+extern "C" fn rect_get_width(r: Rect) -> f64 {
+    r.standard().size.width
+}
+extern "C" fn rect_get_height(r: Rect) -> f64 {
+    r.standard().size.height
+}
+extern "C" fn rect_get_min_x(r: Rect) -> f64 {
+    r.standard().origin.x
+}
+extern "C" fn rect_get_min_y(r: Rect) -> f64 {
+    r.standard().origin.y
+}
+extern "C" fn rect_get_max_x(r: Rect) -> f64 {
+    let r = r.standard();
+    r.origin.x + r.size.width
+}
+extern "C" fn rect_get_max_y(r: Rect) -> f64 {
+    let r = r.standard();
+    r.origin.y + r.size.height
+}
+extern "C" fn rect_get_mid_x(r: Rect) -> f64 {
+    let r = r.standard();
+    r.origin.x + r.size.width / 2.0
+}
+extern "C" fn rect_get_mid_y(r: Rect) -> f64 {
+    let r = r.standard();
+    r.origin.y + r.size.height / 2.0
+}
+extern "C" fn rect_contains_point(r: Rect, p: Point) -> bool {
+    let r = r.standard();
+    p.x >= r.origin.x && p.x < r.origin.x + r.size.width && p.y >= r.origin.y && p.y < r.origin.y + r.size.height
+}
+extern "C" fn rect_inset(r: Rect, dx: f64, dy: f64) -> Rect {
+    let r = r.standard();
+    Rect::new(r.origin.x + dx, r.origin.y + dy, r.size.width - 2.0 * dx, r.size.height - 2.0 * dy)
+}
+extern "C" fn rect_offset(r: Rect, dx: f64, dy: f64) -> Rect {
+    Rect::new(r.origin.x + dx, r.origin.y + dy, r.size.width, r.size.height)
+}
+extern "C" fn rect_equal(a: Rect, b: Rect) -> bool {
+    a.standard() == b.standard()
+}
+extern "C" fn rect_is_empty(r: Rect) -> bool {
+    r.size.width == 0.0 || r.size.height == 0.0
+}
+extern "C" fn rect_make(x: f64, y: f64, w: f64, h: f64) -> Rect {
+    Rect::new(x, y, w, h)
+}
+extern "C" fn transform_make_rotation(angle: f64) -> Transform {
+    let (s, c) = angle.sin_cos();
+    Transform { a: c, b: s, c: -s, d: c, tx: 0.0, ty: 0.0 }
+}
+extern "C" fn transform_make_scale(sx: f64, sy: f64) -> Transform {
+    Transform { a: sx, b: 0.0, c: 0.0, d: sy, tx: 0.0, ty: 0.0 }
+}
+extern "C" fn transform_make_translation(tx: f64, ty: f64) -> Transform {
+    Transform { a: 1.0, b: 0.0, c: 0.0, d: 1.0, tx, ty }
+}
+extern "C" fn transform_rotate(t: Transform, angle: f64) -> Transform {
+    concat(transform_make_rotation(angle), t)
+}
+extern "C" fn transform_scale(t: Transform, sx: f64, sy: f64) -> Transform {
+    concat(transform_make_scale(sx, sy), t)
+}
+extern "C" fn transform_translate(t: Transform, tx: f64, ty: f64) -> Transform {
+    concat(transform_make_translation(tx, ty), t)
+}
+extern "C" fn transform_concat(t1: Transform, t2: Transform) -> Transform {
+    concat(t1, t2)
+}
+extern "C" fn transform_is_identity(t: Transform) -> bool {
+    t == IDENTITY
+}
+
+pub fn register(r: &mut Registry) {
+    r.function("CGRectGetWidth", rect_get_width as usize);
+    r.function("CGRectGetHeight", rect_get_height as usize);
+    r.function("CGRectGetMinX", rect_get_min_x as usize);
+    r.function("CGRectGetMinY", rect_get_min_y as usize);
+    r.function("CGRectGetMaxX", rect_get_max_x as usize);
+    r.function("CGRectGetMaxY", rect_get_max_y as usize);
+    r.function("CGRectGetMidX", rect_get_mid_x as usize);
+    r.function("CGRectGetMidY", rect_get_mid_y as usize);
+    r.function("CGRectContainsPoint", rect_contains_point as usize);
+    r.function("CGRectInset", rect_inset as usize);
+    r.function("CGRectOffset", rect_offset as usize);
+    r.function("CGRectEqualToRect", rect_equal as usize);
+    r.function("CGRectIsEmpty", rect_is_empty as usize);
+    r.function("CGRectMake", rect_make as usize);
+    r.function("CGAffineTransformMakeRotation", transform_make_rotation as usize);
+    r.function("CGAffineTransformMakeScale", transform_make_scale as usize);
+    r.function("CGAffineTransformMakeTranslation", transform_make_translation as usize);
+    r.function("CGAffineTransformRotate", transform_rotate as usize);
+    r.function("CGAffineTransformScale", transform_scale as usize);
+    r.function("CGAffineTransformTranslate", transform_translate as usize);
+    r.function("CGAffineTransformConcat", transform_concat as usize);
+    r.function("CGAffineTransformIsIdentity", transform_is_identity as usize);
+    r.data("CGAffineTransformIdentity", leak(IDENTITY));
+    r.data("CGRectZero", leak(Rect::default()));
+    r.data("CGPointZero", leak(Point::default()));
+    r.data("CGSizeZero", leak(Size::default()));
+}
