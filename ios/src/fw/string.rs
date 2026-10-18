@@ -199,6 +199,23 @@ extern "C" fn init_empty(this: Id, _: Sel) -> Id {
     this
 }
 
+extern "C" fn init_with_capacity(this: Id, s: Sel, _capacity: usize) -> Id {
+    init_empty(this, s)
+}
+
+extern "C" fn string_with_capacity(class: Class, s: Sel, _capacity: usize) -> Id {
+    empty_string(class, s)
+}
+
+/// Takes the bytes over: copies them, then frees them if asked (as Apple would when done).
+extern "C" fn init_with_bytes_no_copy(this: Id, s: Sel, bytes: *mut u8, length: usize, encoding: usize, free_when_done: u8) -> Id {
+    let result = init_with_bytes(this, s, bytes, length, encoding);
+    if free_when_done != 0 && !bytes.is_null() {
+        unsafe { libc::free(bytes as *mut _) };
+    }
+    result
+}
+
 extern "C" fn init_with_characters(this: Id, _: Sel, characters: *const u16, length: usize) -> Id {
     let units = if characters.is_null() { Vec::new() } else { unsafe { std::slice::from_raw_parts(characters, length) }.to_vec() };
     set(this, units);
@@ -768,6 +785,7 @@ pub fn register(r: &mut Registry) {
             ("initWithString:", init_with_string as usize),
             ("initWithCharacters:length:", init_with_characters as usize),
             ("initWithBytes:length:encoding:", init_with_bytes as usize),
+            ("initWithBytesNoCopy:length:encoding:freeWhenDone:", init_with_bytes_no_copy as usize),
             ("initWithCString:encoding:", init_with_c_string as usize),
             ("initWithFormat:", ios_init_with_format as usize),
             ("initWithFormat:arguments:", init_with_format_arguments as usize),
@@ -840,9 +858,11 @@ pub fn register(r: &mut Registry) {
             ("stringWithContentsOfFile:", with_contents as usize),
         ],
     );
+    class_methods(mutable, &[("stringWithCapacity:", string_with_capacity as usize)]);
     methods(
         mutable,
         &[
+            ("initWithCapacity:", init_with_capacity as usize),
             ("appendString:", append_string as usize),
             ("appendFormat:", ios_append_format as usize),
             ("setString:", set_string as usize),

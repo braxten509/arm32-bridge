@@ -2,11 +2,14 @@
 
 pub mod app;
 pub mod collections;
+pub mod crypto;
 pub mod data;
 pub mod eagl;
 pub mod files;
 pub mod foundation;
 pub mod geometry;
+pub mod gl;
+pub mod json;
 pub mod keychain;
 pub mod locks;
 pub mod media;
@@ -14,11 +17,15 @@ pub mod misc;
 pub mod object;
 pub mod paths;
 pub mod plist;
+pub mod png;
+pub mod pvrtc;
 pub mod regex;
 pub mod runloop;
 pub mod sqlite;
 pub mod services;
 pub mod string;
+pub mod system;
+pub mod touch;
 pub mod uikit;
 pub mod web;
 
@@ -36,6 +43,7 @@ pub fn register(r: &mut Registry) {
     runloop::register(r);
     media::register(r);
     keychain::register(r);
+    gl::register(r);
     eagl::register(r);
     files::register(r);
     services::register(r);
@@ -43,6 +51,10 @@ pub fn register(r: &mut Registry) {
     sqlite::register(r);
     regex::register(r);
     locks::register(r);
+    crypto::register(r);
+    json::register(r);
+    system::register(r);
+    touch::register(r);
     immutable_copies();
 }
 

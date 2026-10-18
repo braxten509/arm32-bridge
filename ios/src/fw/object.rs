@@ -94,6 +94,15 @@ extern "C" fn class_description(this: Class, _: Sel) -> Id {
     crate::fw::string::make(&name)
 }
 
+/// Sends setValue:forKey: for each entry; NSNull stands for nil, as on Apple.
+extern "C" fn set_values_for_keys(this: Id, _: Sel, values: Id) {
+    let null = runtime::send(runtime::class_named("NSNull"), "null", &[]);
+    for (key, value) in crate::fw::collections::dictionary_pairs(values) {
+        let value = if value == null { 0 } else { value };
+        runtime::send(this, "setValue:forKey:", &[value, key]);
+    }
+}
+
 extern "C" fn copy(this: Id, _: Sel) -> Id {
     runtime::send(this, "copyWithZone:", &[0])
 }
@@ -192,6 +201,7 @@ pub fn define(_: &mut Registry) -> Class {
     m("description", description as usize);
     m("debugDescription", description as usize);
     m("copy", copy as usize);
+    m("setValuesForKeysWithDictionary:", set_values_for_keys as usize);
     m("mutableCopy", mutable_copy as usize);
     m("performSelector:", perform as usize);
     m("performSelector:withObject:", perform_with as usize);

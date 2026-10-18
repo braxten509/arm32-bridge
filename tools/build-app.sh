@@ -26,11 +26,13 @@ ASSETS=$ROOT/android/app/src/main/assets
 mkdir -p "$LIBS" "$ASSETS"
 
 echo "== bridge and converter"
-(cd "$ROOT" && ./build-phone.sh -q --lib -p arm32-bridge && ./build-phone.sh -q -p apk-convert && ./build-phone.sh -q --lib -p gamebridge-pacer)
+(cd "$ROOT" && ./build-phone.sh -q --lib -p arm32-bridge && ./build-phone.sh -q -p apk-convert && ./build-phone.sh -q --lib -p gamebridge-pacer && ./build-phone.sh -q --lib -p gamebridge-ios)
 OUT=$ROOT/target/aarch64-linux-android/release
 cp "$OUT/libarm32_bridge.so" "$LIBS/libarm32_bridge.so"
 # The frame helper for 64-bit games: the converter copies it into each one, so it travels small.
 "$BIN/llvm-strip" -o "$LIBS/libgamebridge_pacer.so" "$OUT/libgamebridge_pacer.so"
+# The iPhone layer (64-bit iPhone games), loaded by the iPhone game screen.
+"$BIN/llvm-strip" -o "$LIBS/libgamebridge_ios.so" "$OUT/libgamebridge_ios.so"
 # Android only unpacks lib*.so files, so the converter program travels under that name.
 "$BIN/llvm-strip" -o "$LIBS/libapkconvert.so" "$OUT/apk-convert"
 "$BIN/aarch64-linux-android30-clang" -O2 -shared -fPIC -Wl,--build-id=none -o "$LIBS/libstandin.so" \

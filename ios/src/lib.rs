@@ -24,3 +24,5 @@ pub mod symbols;
 pub mod trap;
 #[cfg(target_arch = "aarch64")]
 pub mod varargs;
+#[cfg(all(target_arch = "aarch64", target_os = "android"))]
+pub mod android;

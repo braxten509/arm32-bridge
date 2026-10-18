@@ -142,6 +142,17 @@ extern "C" fn data_with_length(class: Class, _: Sel, length: usize) -> Id {
     object
 }
 
+extern "C" fn data_with_data(class: Class, _: Sel, other: Id) -> Id {
+    let object = runtime::alloc_instance(class);
+    *store(object) = bytes(other);
+    object
+}
+
+extern "C" fn data_init_with_data(this: Id, _: Sel, other: Id) -> Id {
+    *store(this) = bytes(other);
+    this
+}
+
 pub fn register(_: &mut Registry) {
     let data = define_class("NSData", "NSObject", 16);
     let mutable = define_class("NSMutableData", "NSData", 16);
@@ -154,12 +165,14 @@ pub fn register(_: &mut Registry) {
             ("dataWithBytesNoCopy:length:", data_with_bytes_no_copy as usize),
             ("dataWithBytesNoCopy:length:freeWhenDone:", data_with_bytes_no_copy_free as usize),
             ("dataWithContentsOfFile:", data_with_contents_of_file as usize),
+            ("dataWithData:", data_with_data as usize),
         ],
     );
     methods(
         data,
         &[
             ("initWithBytes:length:", data_init_with_bytes as usize),
+            ("initWithData:", data_init_with_data as usize),
             ("initWithContentsOfFile:", data_init_with_contents_of_file as usize),
             ("bytes", data_bytes as usize),
             ("length", data_length as usize),

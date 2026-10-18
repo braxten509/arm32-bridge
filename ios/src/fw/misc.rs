@@ -23,6 +23,15 @@ fn same(a: Id, b: Id) -> bool {
     a == b || (a != 0 && b != 0 && runtime::send(a, "isEqual:", &[b]) & 0xFF != 0)
 }
 
+/// A new NSSet holding these objects.
+pub fn set_from(list: &[Id]) -> Id {
+    let set = runtime::alloc_instance(runtime::class_named("NSSet"));
+    for &item in list {
+        add(set, item);
+    }
+    set
+}
+
 fn add(set: Id, item: Id) {
     if item != 0 && !items(set).iter().any(|&i| same(i, item)) {
         items(set).push(item);
@@ -61,6 +70,11 @@ extern "C" fn set_with_array(class: Class, _: Sel, array: Id) -> Id {
         add(object, item);
     }
     object
+}
+
+extern "C" fn set_with_set(class: Class, s: Sel, other: Id) -> Id {
+    let all = if other == 0 { collections::array_from(&[]) } else { runtime::send(other, "allObjects", &[]) };
+    set_with_array(class, s, all)
 }
 
 extern "C" fn set_count(this: Id, _: Sel) -> usize {
@@ -591,6 +605,7 @@ pub fn register(r: &mut Registry) {
             ("set", set_empty as usize),
             ("setWithObject:", set_with_object as usize),
             ("setWithArray:", set_with_array as usize),
+            ("setWithSet:", set_with_set as usize),
             ("setWithObjects:", ios_set_with_objects as usize),
             ("setWithObjects:count:", set_with_objects_count as usize),
         ],
@@ -736,6 +751,40 @@ pub fn register(r: &mut Registry) {
     r.data("kCFBooleanTrue", leak(collections::number_bool(true)));
     r.data("kCFBooleanFalse", leak(collections::number_bool(false)));
     r.data("kCFAllocatorDefault", leak(0usize));
+    r.function("CFUUIDCreate", cf_uuid_create as usize);
+    r.function("CFUUIDCreateString", cf_uuid_create_string as usize);
+    r.function("CFUUIDCreateFromString", cf_uuid_create_from_string as usize);
+    r.function("CFUUIDGetUUIDBytes", cf_uuid_get_bytes as usize);
+}
+
+// CFUUID: the same object as NSUUID here (the game only uses CF functions on it).
+
+extern "C" fn cf_uuid_create(_allocator: usize) -> Id {
+    uuid_new(runtime::class_named("NSUUID"), 0)
+}
+
+extern "C" fn cf_uuid_create_string(_allocator: usize, uuid: Id) -> Id {
+    if uuid == 0 {
+        return 0;
+    }
+    uuid_string(uuid, 0)
+}
+
+extern "C" fn cf_uuid_create_from_string(_allocator: usize, text: Id) -> Id {
+    if text == 0 {
+        return 0;
+    }
+    uuid_from_string(&string::get(text))
+}
+
+#[repr(C)]
+pub struct UuidBytes([u8; 16]);
+
+extern "C" fn cf_uuid_get_bytes(uuid: Id) -> UuidBytes {
+    if uuid == 0 {
+        return UuidBytes([0; 16]);
+    }
+    UuidBytes(unsafe { *((uuid + 8) as *const [u8; 16]) })
 }
 
 extern "C" fn uuid_new(class: Class, _: Sel) -> Id {

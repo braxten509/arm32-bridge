@@ -501,6 +501,28 @@ extern "C" fn dict_init_with_dictionary(this: Id, _: Sel, other: Id) -> Id {
     this
 }
 
+extern "C" fn dict_init_with_dictionary_copy(this: Id, _: Sel, other: Id, copy_items: u8) -> Id {
+    let mut list = dictionary_pairs(other);
+    if copy_items != 0 {
+        for (_, value) in list.iter_mut() {
+            *value = runtime::send(*value, "copy", &[]);
+        }
+    }
+    *pairs(this) = list;
+    this
+}
+
+extern "C" fn dict_with_contents_of_url(class: Class, s: Sel, url: Id) -> Id {
+    if url == 0 {
+        return 0;
+    }
+    let path = runtime::send(url, "path", &[]);
+    if path == 0 {
+        return 0;
+    }
+    dict_with_contents_of_file(class, s, path)
+}
+
 crate::libsystem::libc::variadic!(ios_dict_with_objects_and_keys, 3, ios_dict_with_objects_and_keys_impl);
 
 #[no_mangle]
@@ -553,6 +575,15 @@ extern "C" fn dict_remove(this: Id, _: Sel, key: Id) {
 
 extern "C" fn dict_remove_all(this: Id, _: Sel) {
     pairs(this).clear();
+}
+
+/// setValue:forKey: on a dictionary: nil removes the key.
+extern "C" fn dict_set_value(this: Id, s: Sel, value: Id, key: Id) {
+    if value == 0 {
+        dict_remove(this, s, key);
+    } else {
+        dict_set(this, s, value, key);
+    }
 }
 
 extern "C" fn dict_add_entries(this: Id, s: Sel, other: Id) {
@@ -912,7 +943,13 @@ pub fn register(_: &mut Registry) {
             ("writeToFile:atomically:", write_to_file as usize),
         ],
     );
-    class_methods(dictionary, &[("dictionaryWithContentsOfFile:", dict_with_contents_of_file as usize)]);
+    class_methods(
+        dictionary,
+        &[
+            ("dictionaryWithContentsOfFile:", dict_with_contents_of_file as usize),
+            ("dictionaryWithContentsOfURL:", dict_with_contents_of_url as usize),
+        ],
+    );
     // NSCache keeps its entries the same way (never evicts on its own).
     let cache = define_class("NSCache", "NSObject", 16);
     methods(
@@ -984,6 +1021,7 @@ pub fn register(_: &mut Registry) {
             ("init", dict_init as usize),
             ("initWithObjects:forKeys:count:", dict_init_objects_keys_count as usize),
             ("initWithDictionary:", dict_init_with_dictionary as usize),
+            ("initWithDictionary:copyItems:", dict_init_with_dictionary_copy as usize),
             ("objectForKey:", dict_object_for_key as usize),
             ("objectForKeyedSubscript:", dict_object_for_key as usize),
             ("valueForKey:", dict_object_for_key as usize),
@@ -1011,7 +1049,7 @@ pub fn register(_: &mut Registry) {
         &[
             ("setObject:forKey:", dict_set as usize),
             ("setObject:forKeyedSubscript:", dict_set as usize),
-            ("setValue:forKey:", dict_set as usize),
+            ("setValue:forKey:", dict_set_value as usize),
             ("removeObjectForKey:", dict_remove as usize),
             ("removeAllObjects", dict_remove_all as usize),
             ("addEntriesFromDictionary:", dict_add_entries as usize),

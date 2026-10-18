@@ -609,18 +609,26 @@ pub fn register(r: &mut Registry) {
         "UIScreenDidDisconnectNotification",
         "NSInternalInconsistencyException",
         "NSInvalidArgumentException",
-        "NSLocalizedDescriptionKey",
-        "NSLocalizedFailureReasonErrorKey",
-        "NSUnderlyingErrorKey",
         "NSPOSIXErrorDomain",
         "NSMachErrorDomain",
         "NSURLErrorDomain",
         "NSFilePosixPermissions",
         "NSFileSystemFreeSize",
         "NSFileSystemSize",
-        "NSKeyValueChangeNewKey",
     ] {
         named_constant(r, name);
+    }
+    for (name, value) in [
+        ("NSLocalizedDescriptionKey", "NSLocalizedDescription"),
+        ("NSLocalizedFailureReasonErrorKey", "NSLocalizedFailureReason"),
+        ("NSUnderlyingErrorKey", "NSUnderlyingError"),
+        ("NSKeyValueChangeKindKey", "kind"),
+        ("NSKeyValueChangeNewKey", "new"),
+        ("NSKeyValueChangeOldKey", "old"),
+        ("NSKeyValueChangeIndexesKey", "indexes"),
+        ("NSKeyValueChangeNotificationIsPriorKey", "notificationIsPrior"),
+    ] {
+        r.data(name, leak(string::make(value)));
     }
     r.data("NSDefaultRunLoopMode", leak(string::make("kCFRunLoopDefaultMode")));
     r.data("kCFRunLoopDefaultMode", leak(string::make("kCFRunLoopDefaultMode")));

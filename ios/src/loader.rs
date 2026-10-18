@@ -198,6 +198,29 @@ pub fn load(app_dir: &str, program_path: &str) -> Result<&'static Loaded, String
     Ok(loaded)
 }
 
+/// Apple libraries whose functions are the same on Linux and Android (same
+/// layouts, no extra arguments), so the system's own copy is used.
+fn same_library_function(library: &str, name: &str) -> Option<usize> {
+    // gzprintf takes extra arguments, which Apple passes differently.
+    let (system_names, excluded): (&[&str], &[&str]) = match library.rsplit('/').next()? {
+        "libz.1.dylib" | "libz.dylib" => (&["libz.so", "libz.so.1"], &["gzprintf"]),
+        _ => return None,
+    };
+    if excluded.contains(&name) {
+        return None;
+    }
+    let symbol = std::ffi::CString::new(name).ok()?;
+    for system in system_names {
+        let file = std::ffi::CString::new(*system).unwrap();
+        let handle = unsafe { libc::dlopen(file.as_ptr(), libc::RTLD_NOW) };
+        if !handle.is_null() {
+            let found = unsafe { libc::dlsym(handle, symbol.as_ptr()) } as usize;
+            return (found != 0).then_some(found);
+        }
+    }
+    None
+}
+
 fn resolve(
     image: &Image,
     slide: u64,
@@ -217,6 +240,15 @@ fn resolve(
             Kind::Function => report.functions_found += 1,
             Kind::Data => report.data_found += 1,
         }
+        return address;
+    }
+    if let Some(address) = name.strip_prefix('_').and_then(crate::fw::gl::core_function) {
+        report.functions_found += 1;
+        return address;
+    }
+    let library = usize::try_from(bind.library_ordinal).ok().and_then(|n| image.libraries.get(n.wrapping_sub(1)));
+    if let Some(address) = library.and_then(|l| same_library_function(l, name.strip_prefix('_').unwrap_or(name))) {
+        report.functions_found += 1;
         return address;
     }
     let class_ref = name

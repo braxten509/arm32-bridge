@@ -8,6 +8,8 @@
 APP=$(realpath "$1"); shift
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 LOG=${LOG:-$HOME/.cache/ios-run.log}
+# PC tests draw with Mesa in software (no graphics card, no window).
+export LIBGL_ALWAYS_SOFTWARE=${LIBGL_ALWAYS_SOFTWARE:-1}
 BUILD_LOG=$(mktemp)
 trap 'rm -f "$BUILD_LOG"' EXIT
 (cd "$ROOT" && ~/.cache/aarch64-cross/build.sh -p gamebridge-ios) > "$BUILD_LOG" 2>&1

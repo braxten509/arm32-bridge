@@ -199,6 +199,69 @@ variadic!(ios_sprintf, 2, ios_sprintf_impl);
 variadic!(ios_snprintf_chk, 5, ios_snprintf_chk_impl);
 variadic!(ios_sprintf_chk, 4, ios_sprintf_chk_impl);
 variadic!(ios_wprintf, 1, ios_wprintf_impl);
+variadic!(ios_sscanf, 2, ios_sscanf_impl);
+variadic!(ios_swscanf, 2, ios_swscanf_impl);
+
+// ----- sscanf / swscanf: every extra argument is a pointer -----
+
+const SCAN_SLOTS: usize = 16;
+
+/// How many pointers a scanf format takes (`%%` and `%*...` take none).
+fn scan_targets(format: impl Iterator<Item = u32>) -> usize {
+    let mut count = 0;
+    let mut chars = format.peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' as u32 {
+            continue;
+        }
+        match chars.peek() {
+            Some(&next) if next == '%' as u32 => {
+                chars.next();
+            }
+            Some(&next) if next == '*' as u32 => {}
+            Some(_) => count += 1,
+            None => {}
+        }
+    }
+    count
+}
+
+unsafe fn scan_pointers(slots: *const u64, needed: usize, what: &str) -> [usize; SCAN_SLOTS] {
+    if needed > SCAN_SLOTS {
+        crate::log!("STOP: {what} with {needed} targets (up to {SCAN_SLOTS} handled)");
+        crate::report::finish(1);
+    }
+    let mut out = [0usize; SCAN_SLOTS];
+    for (i, slot) in out.iter_mut().enumerate().take(needed) {
+        *slot = slots.add(i).read_unaligned() as usize;
+    }
+    out
+}
+
+extern "C" {
+    #[link_name = "sscanf"]
+    fn host_sscanf(text: *const libc::c_char, format: *const libc::c_char, ...) -> i32;
+    #[link_name = "swscanf"]
+    fn host_swscanf(text: *const i32, format: *const i32, ...) -> i32;
+}
+
+#[no_mangle]
+unsafe extern "C" fn ios_sscanf_impl(text: *const libc::c_char, format: *const libc::c_char, slots: *const u64) -> i32 {
+    let bytes = std::ffi::CStr::from_ptr(format).to_bytes();
+    let p = scan_pointers(slots, scan_targets(bytes.iter().map(|&b| b as u32)), "sscanf");
+    host_sscanf(text, format, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15])
+}
+
+#[no_mangle]
+unsafe extern "C" fn ios_swscanf_impl(text: *const i32, format: *const i32, slots: *const u64) -> i32 {
+    let mut length = 0;
+    while *format.add(length) != 0 {
+        length += 1;
+    }
+    let wide = std::slice::from_raw_parts(format as *const u32, length);
+    let p = scan_pointers(slots, scan_targets(wide.iter().copied()), "swscanf");
+    host_swscanf(text, format, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15])
+}
 
 fn host_write(file: *mut libc::FILE, text: &[u8]) {
     unsafe { libc::fwrite(text.as_ptr() as *const _, 1, text.len(), file) };
@@ -399,10 +462,14 @@ pub fn register(r: &mut Registry) {
     same!(
         malloc, calloc, realloc, free, memcpy, memmove, memset, memcmp, strlen, strcmp, strncmp,
         strcpy, strncpy, strcat, strchr, strrchr, strdup, strcasecmp, strtod, strtol, strtoull, atoi,
-        qsort, rand, srand, abort, exit, getpid, usleep, sched_yield, time, difftime, mktime,
+        qsort, abort, exit, getpid, usleep, sched_yield, time, difftime, mktime,
         gmtime, gmtime_r, localtime_r, putchar, strerror, strstr, strncasecmp, strtoul, strtoll,
         atof, atol, memchr, posix_memalign, malloc_usable_size
     );
+    r.function("rand", crate::libsystem::host::rand as usize);
+    r.function("sscanf", ios_sscanf as usize);
+    r.function("swscanf", ios_swscanf as usize);
+    r.function("srand", crate::libsystem::host::srand as usize);
     r.function("bzero", libc_bzero as usize);
     r.function("acosf", acosf as usize);
     r.function("asinf", asinf as usize);

@@ -18,6 +18,8 @@ fn now() -> f64 {
 
 pub enum Work {
     Block(usize),
+    /// Our own work for the main thread.
+    Native(Box<dyn FnOnce() + Send>),
     Message { target: Id, selector: Sel, argument: Id, done: Option<Arc<(Mutex<bool>, Condvar)>> },
 }
 
@@ -51,6 +53,10 @@ pub fn is_main_thread() -> bool {
     main == 0 || main == unsafe { libc::pthread_self() } as u64
 }
 
+pub fn is_main_thread_id(thread: u64) -> bool {
+    MAIN_THREAD.load(Ordering::Relaxed) == thread
+}
+
 /// Queues work for the main thread's run loop.
 pub fn post(work: Work) {
     MAIN_LOOP.queue.lock().unwrap().push_back(work);
@@ -60,6 +66,7 @@ pub fn post(work: Work) {
 fn run_work(work: Work) {
     match work {
         Work::Block(block) => unsafe { crate::libsystem::mach::call_block(block) },
+        Work::Native(work) => work(),
         Work::Message { target, selector, argument, done } => {
             let name = lock().sel_name(selector);
             runtime::send(target, &name, &[argument]);
@@ -495,6 +502,7 @@ fn spawn(thread: Id, target: Id, selector: Sel, argument: Id, why: &str) {
     std::thread::Builder::new()
         .stack_size(THREAD_STACK)
         .spawn(move || {
+            crate::libsystem::threads::note_this_thread();
             CURRENT_THREAD.with(|cell| cell.set(thread));
             runtime::send(target, &name, &[argument]);
         })

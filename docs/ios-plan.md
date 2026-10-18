@@ -104,6 +104,39 @@ straight through), Core Graphics, CF/Foundation basics, AudioToolbox
 (AUGraph), sockets/reachability, CommonCrypto (MD5/SHA1/HMAC/AES), keychain,
 Game Center, StoreKit, iAd, Twitter, mail.
 
+## Step 3 progress (2026-10-18)
+
+On the PC (qemu with Mesa drawing in software, no window) IB2 now draws:
+the intro scene (castle walls, the skip arrows) shows from about frame 20,
+with no OpenGL errors. Frame 1 comes about 115 s into a qemu run; after
+that about one frame a second (the phone will be far faster).
+
+Added: OpenGL ES through the system library (Apple and extension names
+mapped to ES 3), EAGLContext on EGL (shared contexts, handing a context
+from the main thread to the engine thread), the iPhone 5s extension list
+and limits, PVRTC textures decoded when the chip can't read them, BGRA
+textures, shader fixes Mesa needs, frames saved as PNG pictures, touches
+(`UITouch`/`UIEvent`, test taps), CommonCrypto hashes, JSON, archiving of
+property lists, time zones, pasteboard, motion (reports "not available"),
+and an Android screen (`IosGameActivity`) that runs the game in a window.
+
+Bugs found on the way (details in `ios/DEBUGGING.md`):
+- Reporting the PC's extension list made the game size textures for one
+  format and fill them with another (memory corruption).
+- KVO change keys had the wrong text, so the startup movie never started
+  and the game waited for it forever.
+- `pthread_mach_thread_np` answered for the calling thread instead of the
+  asked one, so the engine thread thought it was the rendering thread and
+  drew with no context.
+
+Test switches: `IOS_FRAMES_DIR` (save frames), `IOS_FRAME_EVERY` (default
+60), `IOS_FRAME_LIMIT` (stop after that many frames), `IOS_TAPS`
+(`"seconds:x,y;..."` in points), `IOS_STACKS_AT` (every thread's call chain
+at that time). On the phone: `ios/tools/run-phone.sh <App>.app` (no window;
+frames and log copied back).
+
+Still to do in step 3: run on the Pixel, then inside the app's window.
+
 ## Later steps
 
 3. Screen, drawing and touches on Android (EAGLContext/CAEAGLLayer → EGL

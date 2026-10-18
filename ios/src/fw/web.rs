@@ -77,6 +77,19 @@ extern "C" fn cf_replacing_percent_escapes(_allocator: usize, text: Id, _leave: 
 
 // ----- NSURLRequest -----
 
+/// A getter and setter keeping one object per request.
+macro_rules! property_id {
+    ($get:ident, $set:ident, $key:literal) => {
+        extern "C" fn $get(this: Id, _: Sel) -> Id {
+            property_get(this, $key).unwrap_or(0) as Id
+        }
+        extern "C" fn $set(this: Id, _: Sel, value: Id) {
+            let value = if value != 0 { runtime::send(value, "copy", &[]) } else { 0 };
+            property_set(this, $key, value as u64);
+        }
+    };
+}
+
 extern "C" fn request_with_url(class: Class, _: Sel, url: Id) -> Id {
     let object = runtime::alloc_instance(class);
     property_set(object, "url", url as u64);
@@ -107,7 +120,7 @@ extern "C" fn request_set_url(this: Id, _: Sel, url: Id) {
 /// Copies give a separate request, so later changes to a mutable one don't show in the copy.
 fn copy_request(this: Id, class_name: &str) -> Id {
     let object = runtime::alloc_instance(runtime::class_named(class_name));
-    for key in ["url", "method"] {
+    for key in ["url", "method", "body", "headers", "timeout", "cachePolicy", "mainDocumentURL"] {
         if let Some(value) = property_get(this, key) {
             property_set(object, key, value);
         }
@@ -123,10 +136,72 @@ extern "C" fn request_mutable_copy(this: Id, _: Sel, _zone: usize) -> Id {
     copy_request(this, "NSMutableURLRequest")
 }
 
+property_id!(request_body, request_set_body, "body");
+property_id!(request_main_document_url, request_set_main_document_url, "mainDocumentURL");
+
+extern "C" fn request_timeout(this: Id, _: Sel) -> f64 {
+    property_get(this, "timeout").map(f64::from_bits).unwrap_or(60.0)
+}
+
+extern "C" fn request_set_timeout(this: Id, _: Sel, seconds: f64) {
+    property_set(this, "timeout", seconds.to_bits());
+}
+
+extern "C" fn request_cache_policy(this: Id, _: Sel) -> usize {
+    property_get(this, "cachePolicy").unwrap_or(0) as usize
+}
+
+extern "C" fn request_set_cache_policy(this: Id, _: Sel, policy: usize) {
+    property_set(this, "cachePolicy", policy as u64);
+}
+
+/// Header names are matched without regard to case, as in HTTP.
+fn headers(this: Id) -> Vec<(String, Id)> {
+    let dict = property_get(this, "headers").unwrap_or(0) as Id;
+    collections::dictionary_pairs(dict).into_iter().map(|(k, v)| (string::get(k), v)).collect()
+}
+
+fn set_headers(this: Id, list: &[(String, Id)]) {
+    let pairs: Vec<(Id, Id)> = list.iter().map(|(k, v)| (string::make(k), *v)).collect();
+    property_set(this, "headers", collections::dictionary_from(&pairs) as u64);
+}
+
+extern "C" fn request_all_headers(this: Id, _: Sel) -> Id {
+    property_get(this, "headers").unwrap_or(0) as Id
+}
+
+extern "C" fn request_set_all_headers(this: Id, _: Sel, fields: Id) {
+    let list: Vec<(String, Id)> = collections::dictionary_pairs(fields).into_iter().map(|(k, v)| (string::get(k), v)).collect();
+    set_headers(this, &list);
+}
+
+extern "C" fn request_header(this: Id, _: Sel, name: Id) -> Id {
+    let name = string::get(name);
+    headers(this).into_iter().find(|(k, _)| k.eq_ignore_ascii_case(&name)).map(|(_, v)| v).unwrap_or(0)
+}
+
+extern "C" fn request_set_header(this: Id, _: Sel, value: Id, name: Id) {
+    let name = string::get(name);
+    let mut list = headers(this);
+    list.retain(|(k, _)| !k.eq_ignore_ascii_case(&name));
+    if value != 0 {
+        list.push((name, value));
+    }
+    set_headers(this, &list);
+}
+
+extern "C" fn request_add_header(this: Id, _: Sel, value: Id, name: Id) {
+    let name = string::get(name);
+    let mut list = headers(this);
+    match list.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(&name)) {
+        Some(entry) => entry.1 = string::make(&format!("{},{}", string::get(entry.1), string::get(value))),
+        None => list.push((name, value)),
+    }
+    set_headers(this, &list);
+}
+
 extern "C" fn ignore_id(_this: Id, _: Sel, _value: Id) {}
 extern "C" fn ignore_id_id(_this: Id, _: Sel, _a: Id, _b: Id) {}
-extern "C" fn ignore_int(_this: Id, _: Sel, _value: usize) {}
-extern "C" fn ignore_double(_this: Id, _: Sel, _value: f64) {}
 extern "C" fn ignore_bool(_this: Id, _: Sel, _value: u8) {}
 
 extern "C" fn request_method(this: Id, _: Sel) -> Id {
@@ -246,6 +321,12 @@ pub fn register(r: &mut Registry) {
             ("initWithURL:cachePolicy:timeoutInterval:", request_init_with_url_policy as usize),
             ("URL", request_url as usize),
             ("HTTPMethod", request_method as usize),
+            ("HTTPBody", request_body as usize),
+            ("allHTTPHeaderFields", request_all_headers as usize),
+            ("valueForHTTPHeaderField:", request_header as usize),
+            ("timeoutInterval", request_timeout as usize),
+            ("cachePolicy", request_cache_policy as usize),
+            ("mainDocumentURL", request_main_document_url as usize),
             ("mutableCopyWithZone:", request_mutable_copy as usize),
         ],
     );
@@ -255,12 +336,13 @@ pub fn register(r: &mut Registry) {
             ("copyWithZone:", request_copy as usize),
             ("setURL:", request_set_url as usize),
             ("setHTTPMethod:", request_set_method as usize),
-            ("setHTTPBody:", ignore_id as usize),
-            ("setValue:forHTTPHeaderField:", ignore_id_id as usize),
-            ("addValue:forHTTPHeaderField:", ignore_id_id as usize),
-            ("setAllHTTPHeaderFields:", ignore_id as usize),
-            ("setCachePolicy:", ignore_int as usize),
-            ("setTimeoutInterval:", ignore_double as usize),
+            ("setHTTPBody:", request_set_body as usize),
+            ("setValue:forHTTPHeaderField:", request_set_header as usize),
+            ("addValue:forHTTPHeaderField:", request_add_header as usize),
+            ("setAllHTTPHeaderFields:", request_set_all_headers as usize),
+            ("setCachePolicy:", request_set_cache_policy as usize),
+            ("setTimeoutInterval:", request_set_timeout as usize),
+            ("setMainDocumentURL:", request_set_main_document_url as usize),
             ("setHTTPShouldHandleCookies:", ignore_bool as usize),
         ],
     );

@@ -14,14 +14,36 @@ static OUT: Mutex<()> = Mutex::new(());
 static MILESTONE: Mutex<Option<(bool, String)>> = Mutex::new(None);
 static RUN_LOOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Seconds since the layer started.
+pub fn seconds_since_start() -> f64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()
+}
+
 pub fn reached_run_loop() {
     RUN_LOOP.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Where log lines also go (IOS_LOG_FILE), for the phone app, whose
+/// standard error output is not kept.
+fn log_file() -> Option<&'static Mutex<std::fs::File>> {
+    static FILE: std::sync::OnceLock<Option<Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    FILE.get_or_init(|| {
+        let path = std::env::var_os("IOS_LOG_FILE")?;
+        std::fs::OpenOptions::new().create(true).append(true).open(path).ok().map(Mutex::new)
+    })
+    .as_ref()
 }
 
 pub fn line(text: &str) {
     let _guard = OUT.lock().unwrap_or_else(|e| e.into_inner());
     let tid = unsafe { libc::gettid() };
     let _ = writeln!(std::io::stderr(), "[ios {tid}] {text}");
+    if let Some(file) = log_file() {
+        if let Ok(mut file) = file.try_lock() {
+            let _ = writeln!(file, "[ios {tid}] {text}");
+        }
+    }
 }
 
 pub fn reached_did_finish(in_game: bool, place: &str) {
@@ -81,6 +103,10 @@ pub fn finish(code: i32) -> ! {
     }
     if RUN_LOOP.load(std::sync::atomic::Ordering::Relaxed) {
         summary += &format!("MILESTONE: start-up finished and the run loop ran ({} timer calls)\n", crate::fw::runloop::timers_fired());
+    }
+    let frames = crate::fw::eagl::frames_shown();
+    if frames > 0 {
+        summary += &format!("MILESTONE: the game showed {frames} frames\n");
     }
     for text in summary.lines() {
         line(text);
@@ -156,6 +182,81 @@ extern "C" fn on_crash(signal: i32, info: *mut libc::siginfo_t, context: *mut li
     finish(1);
 }
 
+/// The call chain of the calling thread, from its frame pointer (game code included).
+#[inline(never)]
+pub fn call_chain() -> String {
+    let mut frame: usize;
+    unsafe { std::arch::asm!("mov {}, x29", out(reg) frame, options(nomem, nostack)) };
+    let mut text = String::new();
+    for _ in 0..16 {
+        if frame == 0 || frame % 8 != 0 {
+            break;
+        }
+        let Some(pair) = read_frame(frame) else { break };
+        if pair[1] == 0 {
+            break;
+        }
+        text += &format!(" <- {}", crate::loader::describe_address(pair[1]));
+        if pair[0] <= frame {
+            break;
+        }
+        frame = pair[0];
+    }
+    text
+}
+
+/// IOS_STACKS_AT=<seconds>: at that time every thread writes its call chain
+/// to the log (to see where a game is waiting or busy).
+pub fn schedule_stack_dump() {
+    let Some(seconds) = std::env::var("IOS_STACKS_AT").ok().and_then(|v| v.parse::<f64>().ok()) else { return };
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = on_stack_request as usize;
+        action.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
+        libc::sigaction(STACK_SIGNAL, &action, std::ptr::null_mut());
+    }
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs_f64(seconds));
+        line(&format!("call chains of every thread at {seconds} s:"));
+        let me = unsafe { libc::gettid() };
+        if let Ok(tasks) = std::fs::read_dir("/proc/self/task") {
+            for task in tasks.flatten() {
+                let Some(tid) = task.file_name().to_str().and_then(|t| t.parse::<i32>().ok()) else { continue };
+                if tid != me {
+                    unsafe { libc::syscall(libc::SYS_tgkill, libc::getpid(), tid, STACK_SIGNAL) };
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+        }
+    });
+}
+
+const STACK_SIGNAL: i32 = 42;
+
+extern "C" fn on_stack_request(_signal: i32, _info: *mut libc::siginfo_t, context: *mut libc::c_void) {
+    unsafe {
+        let m = &(*(context as *const libc::ucontext_t)).uc_mcontext;
+        let mut text = format!("thread {}: at {}", libc::gettid(), crate::loader::describe_address(m.pc as usize));
+        text += &format!(" <- {}", crate::loader::describe_address(m.regs[30] as usize));
+        let mut frame = m.regs[29] as usize;
+        for _ in 0..12 {
+            if frame == 0 || frame % 8 != 0 {
+                break;
+            }
+            let Some(pair) = read_frame(frame) else { break };
+            if pair[1] == 0 {
+                break;
+            }
+            text += &format!(" <- {}", crate::loader::describe_address(pair[1]));
+            if pair[0] <= frame {
+                break;
+            }
+            frame = pair[0];
+        }
+        line(&text);
+    }
+}
+
 pub fn install_crash_handler() {
     unsafe {
         let mut fds = [-1i32; 2];
@@ -170,7 +271,7 @@ pub fn install_crash_handler() {
         let mut action: libc::sigaction = std::mem::zeroed();
         action.sa_sigaction = on_crash as usize;
         action.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
-        for signal in [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGFPE, libc::SIGTRAP] {
+        for signal in [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGFPE, libc::SIGTRAP, libc::SIGABRT] {
             libc::sigaction(signal, &action, std::ptr::null_mut());
         }
     }

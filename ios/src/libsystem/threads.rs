@@ -129,8 +129,28 @@ extern "C" fn attr_setdetachstate(attr: *mut libc::pthread_attr_t, apple_state: 
     unsafe { libc::pthread_attr_setdetachstate(attr, state) }
 }
 
-extern "C" fn pthread_mach_thread_np(_thread: libc::pthread_t) -> u32 {
-    unsafe { libc::gettid() as u32 }
+/// Each thread's Mach port number (here its Linux thread id), by pthread_t.
+/// Games compare these to tell threads apart (Unreal: "am I the rendering
+/// thread?"), so another thread's number must never be the caller's own.
+static THREAD_IDS: std::sync::Mutex<Option<std::collections::HashMap<usize, u32>>> = std::sync::Mutex::new(None);
+
+/// Records the calling thread's number (every thread start does this).
+pub fn note_this_thread() -> u32 {
+    let tid = unsafe { libc::gettid() as u32 };
+    let me = unsafe { libc::pthread_self() } as usize;
+    THREAD_IDS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(me, tid);
+    tid
+}
+
+extern "C" fn pthread_mach_thread_np(thread: libc::pthread_t) -> u32 {
+    if unsafe { libc::pthread_equal(thread, libc::pthread_self()) } != 0 {
+        return note_this_thread();
+    }
+    if let Some(&tid) = THREAD_IDS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&(thread as usize))) {
+        return tid;
+    }
+    crate::log!("pthread_mach_thread_np: thread {:#x} was not started through this layer; giving a made-up number", thread as usize);
+    0x4000_0000 | (thread as usize as u32 >> 4)
 }
 
 // ----- OSAtomic and spin locks -----
@@ -252,9 +272,36 @@ extern "C" fn ios_backtrace(_buffer: usize, _size: i32) -> i32 {
     0
 }
 
+/// What a game thread needs to start; the new thread records its number
+/// before the game's code runs, and pthread_create waits for that, so the
+/// game can ask for the number as soon as it has the thread.
+struct Start {
+    start: usize,
+    arg: usize,
+    noted: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+
+extern "C" fn thread_entry(start: *mut libc::c_void) -> *mut libc::c_void {
+    let start = unsafe { Box::from_raw(start as *mut Start) };
+    note_this_thread();
+    *start.noted.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    start.noted.1.notify_all();
+    let game: extern "C" fn(*mut libc::c_void) -> *mut libc::c_void = unsafe { std::mem::transmute(start.start) };
+    game(start.arg as *mut _)
+}
+
 extern "C" fn ios_pthread_create(thread: *mut libc::pthread_t, attr: *const libc::pthread_attr_t, start: usize, arg: usize) -> i32 {
-    let start: extern "C" fn(*mut libc::c_void) -> *mut libc::c_void = unsafe { std::mem::transmute(start) };
-    let r = unsafe { libc::pthread_create(thread, attr, start, arg as *mut _) };
+    let noted = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let boxed = Box::into_raw(Box::new(Start { start, arg, noted: noted.clone() }));
+    let r = unsafe { libc::pthread_create(thread, attr, thread_entry, boxed as *mut _) };
+    if r != 0 {
+        drop(unsafe { Box::from_raw(boxed) });
+    } else {
+        let mut done = noted.0.lock().unwrap_or_else(|e| e.into_inner());
+        while !*done {
+            done = noted.1.wait(done).unwrap_or_else(|e| e.into_inner());
+        }
+    }
     crate::log!("game started a thread (result {r})");
     r
 }
@@ -268,10 +315,12 @@ pub fn register(r: &mut Registry) {
         pthread_join, pthread_detach, pthread_self, pthread_equal, pthread_key_create, pthread_key_delete,
         pthread_getspecific, pthread_setspecific, pthread_mutex_init, pthread_mutexattr_init,
         pthread_mutexattr_destroy, pthread_cond_init, pthread_condattr_init, pthread_condattr_destroy,
-        pthread_kill, pthread_exit, pthread_attr_setschedparam, pthread_attr_getschedparam,
+        pthread_kill, pthread_exit,
         pthread_setschedparam, pthread_getschedparam, sched_get_priority_max, sched_get_priority_min,
         nanosleep, pause
     );
+    r.function("pthread_attr_setschedparam", crate::libsystem::host::pthread_attr_setschedparam as usize);
+    r.function("pthread_attr_getschedparam", crate::libsystem::host::pthread_attr_getschedparam as usize);
     r.function("pthread_create", ios_pthread_create as usize);
     r.function("pthread_mutex_lock", mutex_lock as usize);
     r.function("pthread_mutex_trylock", mutex_trylock as usize);
@@ -306,4 +355,27 @@ pub fn register(r: &mut Registry) {
     r.function("sigaltstack", ios_sigaltstack as usize);
     r.function("raise", ios_raise as usize);
     r.function("backtrace", ios_backtrace as usize);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static CHILD_TID: AtomicU64 = AtomicU64::new(0);
+
+    extern "C" fn child(_: *mut libc::c_void) -> *mut libc::c_void {
+        CHILD_TID.store(unsafe { libc::gettid() } as u64, Ordering::SeqCst);
+        std::ptr::null_mut()
+    }
+
+    #[test]
+    fn mach_thread_numbers_belong_to_the_asked_thread() {
+        let mut thread: libc::pthread_t = 0;
+        assert_eq!(ios_pthread_create(&mut thread, std::ptr::null(), child as usize, 0), 0);
+        let asked = pthread_mach_thread_np(thread);
+        unsafe { libc::pthread_join(thread, std::ptr::null_mut()) };
+        assert_eq!(asked as u64, CHILD_TID.load(Ordering::SeqCst));
+        assert_ne!(asked, unsafe { libc::gettid() } as u32);
+        assert_eq!(pthread_mach_thread_np(unsafe { libc::pthread_self() }), unsafe { libc::gettid() } as u32);
+    }
 }

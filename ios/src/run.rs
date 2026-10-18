@@ -34,7 +34,10 @@ fn find_program(app_dir: &str) -> Result<String, String> {
 pub fn run(app_dir: &str) -> Result<(), String> {
     let app_dir = std::fs::canonicalize(app_dir).map_err(|e| format!("{app_dir}: {e}"))?;
     let app_dir = app_dir.to_string_lossy().into_owned();
+    crate::report::seconds_since_start();
     crate::report::install_crash_handler();
+    crate::report::schedule_stack_dump();
+    crate::libsystem::threads::note_this_thread();
     setup();
     let program = find_program(&app_dir)?;
     crate::log!("loading {program}");

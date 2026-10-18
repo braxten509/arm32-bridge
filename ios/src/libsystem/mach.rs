@@ -320,25 +320,135 @@ extern "C" fn dispatch_get_global_queue(_priority: i64, _flags: u64) -> usize {
     *GLOBAL_QUEUE_OBJECT.get_or_init(|| leak([0usize; 16]))
 }
 
-extern "C" fn dispatch_get_current_queue() -> usize {
-    main_queue()
+// ----- queues -----
+// The main queue runs on the main thread's run loop. Queues the game makes
+// are serial (Apple's default): their blocks run one at a time, in order, on
+// a worker thread. Global queues run each block on its own thread.
+
+enum Job {
+    Later(usize),
+    Now(usize, std::sync::Arc<(Mutex<bool>, Condvar)>),
 }
 
-extern "C" fn dispatch_queue_create(_label: usize, _attr: usize) -> usize {
-    leak([0usize; 16])
+struct SerialQueue {
+    jobs: Mutex<(std::collections::VecDeque<Job>, bool)>,
+}
+
+static SERIAL_QUEUES: Mutex<Option<std::collections::HashMap<usize, &'static SerialQueue>>> = Mutex::new(None);
+
+thread_local! {
+    static CURRENT_QUEUE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn serial_queue(queue: usize) -> Option<&'static SerialQueue> {
+    SERIAL_QUEUES.lock().unwrap().as_ref().and_then(|m| m.get(&queue).copied())
+}
+
+extern "C" fn dispatch_get_current_queue() -> usize {
+    let current = CURRENT_QUEUE.with(|c| c.get());
+    if current != 0 {
+        current
+    } else if crate::fw::runloop::is_main_thread() {
+        main_queue()
+    } else {
+        dispatch_get_global_queue(0, 0)
+    }
+}
+
+/// DISPATCH_QUEUE_SERIAL is no attribute; any attribute means concurrent.
+extern "C" fn dispatch_queue_create(_label: usize, attr: usize) -> usize {
+    let queue = leak([0usize; 16]);
+    if attr == 0 {
+        let state: &'static SerialQueue = Box::leak(Box::new(SerialQueue { jobs: Mutex::new((Default::default(), false)) }));
+        SERIAL_QUEUES.lock().unwrap().get_or_insert_with(Default::default).insert(queue, state);
+    }
+    queue
+}
+
+fn mark_done(done: &(Mutex<bool>, Condvar)) {
+    *done.0.lock().unwrap() = true;
+    done.1.notify_all();
+}
+
+fn wait_for(done: &(Mutex<bool>, Condvar)) {
+    let mut finished = done.0.lock().unwrap();
+    while !*finished {
+        finished = done.1.wait(finished).unwrap();
+    }
+}
+
+fn enqueue(queue: usize, state: &'static SerialQueue, job: Job) {
+    let mut jobs = state.jobs.lock().unwrap();
+    jobs.0.push_back(job);
+    if jobs.1 {
+        return;
+    }
+    jobs.1 = true;
+    drop(jobs);
+    std::thread::spawn(move || {
+        CURRENT_QUEUE.with(|c| c.set(queue));
+        loop {
+            let job = {
+                let mut jobs = state.jobs.lock().unwrap();
+                match jobs.0.pop_front() {
+                    Some(job) => job,
+                    None => {
+                        jobs.1 = false;
+                        return;
+                    }
+                }
+            };
+            match job {
+                Job::Later(block) => unsafe { call_block(block) },
+                Job::Now(block, done) => {
+                    unsafe { call_block(block) };
+                    mark_done(&done);
+                }
+            }
+        }
+    });
 }
 
 extern "C" fn dispatch_async(queue: usize, block: usize) {
     let copy = block_copy(block as *mut BlockHeader) as usize;
     if queue == main_queue() {
         crate::fw::runloop::post(crate::fw::runloop::Work::Block(copy));
+    } else if let Some(state) = serial_queue(queue) {
+        enqueue(queue, state, Job::Later(copy));
     } else {
-        std::thread::spawn(move || unsafe { call_block(copy) });
+        std::thread::spawn(move || {
+            CURRENT_QUEUE.with(|c| c.set(queue));
+            unsafe { call_block(copy) }
+        });
     }
 }
 
-extern "C" fn dispatch_sync(_queue: usize, block: usize) {
-    unsafe { call_block(block) };
+/// Runs the block on the queue's turn and waits for it.
+extern "C" fn dispatch_sync(queue: usize, block: usize) {
+    let inline = || unsafe { call_block(block) };
+    if queue == main_queue() {
+        if crate::fw::runloop::is_main_thread() {
+            return inline();
+        }
+        let done = std::sync::Arc::new((Mutex::new(false), Condvar::new()));
+        let signal = done.clone();
+        crate::fw::runloop::post(crate::fw::runloop::Work::Native(Box::new(move || {
+            unsafe { call_block(block) };
+            mark_done(&signal);
+        })));
+        wait_for(&done);
+    } else if let Some(state) = serial_queue(queue) {
+        if CURRENT_QUEUE.with(|c| c.get()) == queue {
+            // On Apple this waits forever; running it here keeps the game going.
+            crate::log!("dispatch_sync onto the queue already running; ran it directly");
+            return inline();
+        }
+        let done = std::sync::Arc::new((Mutex::new(false), Condvar::new()));
+        enqueue(queue, state, Job::Now(block, done.clone()));
+        wait_for(&done);
+    } else {
+        inline();
+    }
 }
 
 extern "C" fn dispatch_after(when: u64, queue: usize, block: usize) {

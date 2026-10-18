@@ -68,7 +68,7 @@ thread_local! {
 /// so values the game writes into the cell itself stay until the next error.
 extern "C" fn error_location() -> *mut i32 {
     unsafe {
-        let host = libc::__errno_location();
+        let host = crate::libsystem::host_errno();
         let value = *host;
         APPLE_ERRNO.with(|cell| {
             if value != 0 {
@@ -147,7 +147,7 @@ unsafe extern "C" fn ios_fcntl_impl(fd: i32, command: i32, va: *const u64) -> i3
         45 | 48 | 51 => 0,
         _ => {
             crate::log!("fcntl command {command} not translated, refusing");
-            *libc::__errno_location() = libc::EINVAL;
+            *crate::libsystem::host_errno() = libc::EINVAL;
             -1
         }
     }
@@ -349,7 +349,7 @@ unsafe fn answer(value: &[u8], old: *mut u8, old_length: *mut usize) -> i32 {
         return 0;
     }
     if *old_length < value.len() {
-        *libc::__errno_location() = libc::ENOMEM;
+        *crate::libsystem::host_errno() = libc::ENOMEM;
         return -1;
     }
     std::ptr::copy_nonoverlapping(value.as_ptr(), old, value.len());
@@ -363,7 +363,7 @@ extern "C" fn ios_sysctlbyname(name: *const libc::c_char, old: *mut u8, old_leng
         Some(value) => unsafe { answer(&value, old, old_length) },
         None => {
             crate::log!("sysctl {name}: not known, answered 'no such entry'");
-            unsafe { *libc::__errno_location() = libc::ENOENT };
+            unsafe { *crate::libsystem::host_errno() = libc::ENOENT };
             -1
         }
     }
@@ -390,7 +390,7 @@ extern "C" fn ios_sysctl(mib: *const i32, count: u32, old: *mut u8, old_length: 
         return unsafe { answer(&[0u8; 648], old, old_length) };
     }
     crate::log!("sysctl {parts:?}: not known, answered 'no such entry'");
-    unsafe { *libc::__errno_location() = libc::ENOENT };
+    unsafe { *crate::libsystem::host_errno() = libc::ENOENT };
     -1
 }
 
