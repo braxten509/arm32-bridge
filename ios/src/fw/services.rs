@@ -82,56 +82,6 @@ extern "C" fn link_ntoa(address: *const u8) -> usize {
     })
 }
 
-// ----- AUGraph / AudioUnit -----
-
-extern "C" fn new_graph(graph: *mut usize) -> i32 {
-    if !graph.is_null() {
-        unsafe { *graph = leak([0usize; 8]) };
-    }
-    0
-}
-
-extern "C" fn graph_add_node(_graph: usize, _description: usize, node: *mut i32) -> i32 {
-    static NEXT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
-    if !node.is_null() {
-        unsafe { *node = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) };
-    }
-    0
-}
-
-extern "C" fn graph_node_info(_graph: usize, _node: i32, description: *mut u8, unit: *mut usize) -> i32 {
-    if !description.is_null() {
-        unsafe { std::ptr::write_bytes(description, 0, 20) };
-    }
-    if !unit.is_null() {
-        unsafe { *unit = leak([0usize; 4]) };
-    }
-    0
-}
-
-extern "C" fn ok_1(_a: usize) -> i32 {
-    0
-}
-extern "C" fn ok_4(_a: usize, _b: usize, _c: usize, _d: usize) -> i32 {
-    0
-}
-extern "C" fn ok_5(_a: usize, _b: usize, _c: usize, _d: usize, _e: usize) -> i32 {
-    0
-}
-extern "C" fn ok_6(_a: usize, _b: usize, _c: usize, _d: usize, _e: usize, _f: usize) -> i32 {
-    0
-}
-
-extern "C" fn graph_start(_graph: usize) -> i32 {
-    crate::log!("audio graph started (no sound yet, step 4)");
-    0
-}
-
-/// AudioUnitSetParameter(unit, id, scope, element, value (float), frames).
-extern "C" fn unit_set_parameter(_unit: usize, _id: u32, _scope: u32, _element: u32, _value: f32, _frames: u32) -> i32 {
-    0
-}
-
 pub fn register(r: &mut Registry) {
     r.function("SCNetworkReachabilityCreateWithName", reachability_create as usize);
     r.function("SCNetworkReachabilityCreateWithAddress", reachability_create as usize);
@@ -143,19 +93,4 @@ pub fn register(r: &mut Registry) {
     r.function("getifaddrs", getifaddrs as usize);
     r.function("freeifaddrs", freeifaddrs as usize);
     r.function("link_ntoa", link_ntoa as usize);
-    r.function("NewAUGraph", new_graph as usize);
-    r.function("AUGraphAddNode", graph_add_node as usize);
-    r.function("AUGraphNodeInfo", graph_node_info as usize);
-    r.function("AUGraphOpen", ok_1 as usize);
-    r.function("AUGraphInitialize", ok_1 as usize);
-    r.function("AUGraphStart", graph_start as usize);
-    r.function("AUGraphStop", ok_1 as usize);
-    r.function("AUGraphUninitialize", ok_1 as usize);
-    r.function("AUGraphClose", ok_1 as usize);
-    r.function("DisposeAUGraph", ok_1 as usize);
-    r.function("AUGraphConnectNodeInput", ok_5 as usize);
-    r.function("AUGraphSetNodeInputCallback", ok_4 as usize);
-    r.function("AudioUnitSetProperty", ok_6 as usize);
-    r.function("AudioUnitSetParameter", unit_set_parameter as usize);
-    r.function("CAShow", ok_1 as usize);
 }

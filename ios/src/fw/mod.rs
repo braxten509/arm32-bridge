@@ -23,6 +23,7 @@ pub mod regex;
 pub mod runloop;
 pub mod sqlite;
 pub mod services;
+pub mod sound;
 pub mod string;
 pub mod system;
 pub mod touch;
@@ -55,6 +56,7 @@ pub fn register(r: &mut Registry) {
     json::register(r);
     system::register(r);
     touch::register(r);
+    sound::register(r);
     immutable_copies();
 }
 

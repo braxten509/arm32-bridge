@@ -276,34 +276,6 @@ fn object_method(name: &str) -> usize {
     rt.lookup(object, s).expect("NSObject method")
 }
 
-// ----- simple stand-ins for sound players (step 4 plays them) -----
-
-extern "C" fn audio_player_init_with_url(this: Id, _: Sel, url: Id, _error: usize) -> Id {
-    property_set(this, "url", url as u64);
-    this
-}
-
-extern "C" fn audio_player_init_with_data(this: Id, _: Sel, _data: Id, _error: usize) -> Id {
-    this
-}
-
-extern "C" fn audio_player_play(this: Id, _: Sel) -> bool {
-    let url = property_get(this, "url").unwrap_or(0) as Id;
-    crate::log!("music {} not played yet (step 4)", string::describe(url));
-    true
-}
-
-extern "C" fn audio_player_nothing(_this: Id, _: Sel) {}
-extern "C" fn audio_player_yes(_this: Id, _: Sel) -> bool {
-    true
-}
-extern "C" fn audio_player_set_float(_this: Id, _: Sel, _value: f32) {}
-extern "C" fn audio_player_set_double(_this: Id, _: Sel, _value: f64) {}
-extern "C" fn audio_player_set_int(_this: Id, _: Sel, _value: isize) {}
-extern "C" fn audio_player_zero_double(_this: Id, _: Sel) -> f64 {
-    0.0
-}
-
 pub fn register(r: &mut Registry) {
     r.function("AudioSessionInitialize", audio_session_initialize as usize);
     r.function("AudioSessionGetProperty", audio_session_get_property as usize);
@@ -393,24 +365,5 @@ pub fn register(r: &mut Registry) {
         &[("setVideoGravity:", ignore_id as usize), ("setPlayer:", layer_set_player as usize), ("player", layer_player as usize)],
     );
 
-    let audio_player = define_class("AVAudioPlayer", "NSObject", 8);
-    methods(
-        audio_player,
-        &[
-            ("initWithContentsOfURL:error:", audio_player_init_with_url as usize),
-            ("initWithData:error:", audio_player_init_with_data as usize),
-            ("play", audio_player_play as usize),
-            ("prepareToPlay", audio_player_yes as usize),
-            ("pause", audio_player_nothing as usize),
-            ("stop", audio_player_nothing as usize),
-            ("isPlaying", no as usize),
-            ("setVolume:", audio_player_set_float as usize),
-            ("setNumberOfLoops:", audio_player_set_int as usize),
-            ("setCurrentTime:", audio_player_set_double as usize),
-            ("currentTime", audio_player_zero_double as usize),
-            ("duration", audio_player_zero_double as usize),
-            ("setDelegate:", ignore_id as usize),
-        ],
-    );
     let _ = collections::array_from;
 }
