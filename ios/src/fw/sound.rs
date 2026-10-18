@@ -97,7 +97,14 @@ struct Unit {
     description: [u32; 5],
     inputs: BTreeMap<u32, Input>,
     master: f32,
+    /// The most frames one render call asks an input for (iOS's
+    /// kAudioUnitProperty_MaximumFramesPerSlice; games size their own
+    /// buffers by it).
+    max_frames: u32,
 }
+
+/// iOS's default maximum frames per render call.
+const DEFAULT_MAX_FRAMES: u32 = 1156;
 
 #[derive(Default)]
 struct Graph {
@@ -162,7 +169,7 @@ extern "C" fn graph_add_node(graph: usize, description: *const u32, node: *mut i
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     let unit = leak([0usize; 4]);
     with_graph(|g| {
-        g.units.insert(unit, Unit { kind, graph, description: d, inputs: BTreeMap::new(), master: 1.0 });
+        g.units.insert(unit, Unit { kind, graph, description: d, inputs: BTreeMap::new(), master: 1.0, max_frames: DEFAULT_MAX_FRAMES });
         g.nodes.insert(id, unit);
     });
     if kind == Kind::Other {
@@ -189,6 +196,9 @@ extern "C" fn graph_set_node_input_callback(_graph: usize, node: i32, bus: u32, 
     let (function, data) = if callback.is_null() { (0, 0) } else { unsafe { (*callback, *callback.add(1)) } };
     let Some(unit) = with_graph(|g| g.nodes.get(&node).copied()) else { return -10866 };
     with_input(unit, bus, |input| {
+        if input.callback != 0 && (input.callback != function || input.data != data) {
+            crate::log!("DIAG audio: node {node} bus {bus} callback replaced ({:#x},{:#x}) -> ({function:#x},{data:#x})", input.callback, input.data);
+        }
         input.callback = function;
         input.data = data;
         input.generation = next_generation();
@@ -255,6 +265,7 @@ extern "C" fn graph_connect(_graph: usize, _from: i32, _from_output: u32, _to: i
 
 const STREAM_FORMAT: u32 = 8;
 const ELEMENT_COUNT: u32 = 11;
+const MAXIMUM_FRAMES_PER_SLICE: u32 = 14;
 const SET_RENDER_CALLBACK: u32 = 23;
 const INPUT_SCOPE: u32 = 1;
 const OUTPUT_SCOPE: u32 = 2;
@@ -282,6 +293,16 @@ fn readable(flags: u32, bits: u32) -> bool {
 
 /// AudioUnitSetProperty(unit, id, scope, element, data, size).
 extern "C" fn unit_set_property(unit: usize, id: u32, scope: u32, element: u32, data: *const u8, size: u32) -> i32 {
+    // DIAG: each property the game sets, once (with its first word).
+    {
+        static SEEN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if !seen.contains(&id) {
+            seen.push(id);
+            let first = if !data.is_null() && size >= 4 { unsafe { *(data as *const u32) } } else { 0 };
+            crate::log!("DIAG audio: property {id} scope {scope} element {element} size {size} first word {first}");
+        }
+    }
     match id {
         STREAM_FORMAT if scope == INPUT_SCOPE && !data.is_null() && size >= 40 => {
             let rate = unsafe { *(data as *const f64) };
@@ -303,9 +324,17 @@ extern "C" fn unit_set_property(unit: usize, id: u32, scope: u32, element: u32, 
             });
             0
         }
+        MAXIMUM_FRAMES_PER_SLICE if !data.is_null() && size >= 4 => {
+            let frames = unsafe { *(data as *const u32) }.max(1);
+            with_graph(|g| g.units.get_mut(&unit).map(|u| u.max_frames = frames));
+            0
+        }
         SET_RENDER_CALLBACK if !data.is_null() && size >= 16 => {
             let (function, refcon) = unsafe { (*(data as *const usize), *(data as *const usize).add(1)) };
             with_input(unit, element, |input| {
+                if input.callback != 0 && (input.callback != function || input.data != refcon) {
+                    crate::log!("DIAG audio: unit {unit:#x} bus {element} callback replaced ({:#x},{:#x}) -> ({function:#x},{refcon:#x})", input.callback, input.data);
+                }
                 input.callback = function;
                 input.data = refcon;
                 input.generation = next_generation();
@@ -338,6 +367,13 @@ extern "C" fn unit_get_property(unit: usize, id: u32, scope: u32, element: u32, 
         }
         ELEMENT_COUNT if unsafe { *size } >= 4 => {
             unsafe { *(data as *mut u32) = with_graph(|g| g.units.get(&unit).map(|u| u.inputs.len().max(1) as u32)).unwrap_or(1) };
+            0
+        }
+        MAXIMUM_FRAMES_PER_SLICE if unsafe { *size } >= 4 => {
+            unsafe {
+                *(data as *mut u32) = with_graph(|g| g.units.get(&unit).map(|u| u.max_frames)).unwrap_or(DEFAULT_MAX_FRAMES);
+                *size = 4;
+            }
             0
         }
         _ => -10879,
@@ -427,6 +463,12 @@ const MAX_CHANNELS: usize = 8;
 /// as stereo floats (left, right, ...). Anything the game doesn't give
 /// (an error, a short buffer) is silence, so timing stays right.
 fn pull(input: &Input, bus: u32, frames: usize, sample_time: f64, scratch: &mut Vec<u8>, out: &mut Vec<f32>) {
+    {
+        static BIGGEST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        if frames > BIGGEST.fetch_max(frames, Ordering::Relaxed) {
+            crate::log!("DIAG audio: biggest request so far {frames} frames (bus {bus}, rate {}, speed {})", input.rate, input.speed);
+        }
+    }
     let start = out.len();
     out.resize(start + frames * 2, 0.0);
     let callback: RenderCallback = unsafe { std::mem::transmute(input.callback) };
@@ -564,7 +606,7 @@ fn pan_gains(pan: f32, volume: f32, stereo_source: bool) -> (f32, f32) {
 struct Mixer {
     streams: HashMap<(usize, u32), Stream>,
     scratch: Vec<u8>,
-    sources: Vec<(usize, u32, Input, Kind, f32)>,
+    sources: Vec<(usize, u32, Input, Kind, f32, u32)>,
 }
 
 static MIXER: Mutex<Option<Mixer>> = Mutex::new(None);
@@ -581,10 +623,10 @@ fn mix_graph(out: &mut [f32], frames: usize, out_rate: f64) {
             g.units
                 .iter()
                 .filter(|(_, u)| matches!(u.kind, Kind::Mixer3D | Kind::MixerMulti | Kind::Output) && running.get(&u.graph).copied().unwrap_or(false))
-                .flat_map(|(&unit, u)| u.inputs.iter().filter(|(_, i)| i.enabled && i.callback != 0).map(move |(&bus, i)| (unit, bus, i.clone(), u.kind, u.master))),
+                .flat_map(|(&unit, u)| u.inputs.iter().filter(|(_, i)| i.enabled && i.callback != 0).map(move |(&bus, i)| (unit, bus, i.clone(), u.kind, u.master, u.max_frames))),
         )
     });
-    for (unit, bus, input, kind, master) in sources.drain(..) {
+    for (unit, bus, input, kind, master, max_frames) in sources.drain(..) {
         let stream = streams.entry((unit, bus)).or_default();
         if stream.generation != input.generation {
             *stream = Stream { generation: input.generation, ..Stream::default() };
@@ -592,9 +634,14 @@ fn mix_graph(out: &mut [f32], frames: usize, out_rate: f64) {
         let step = input.rate * input.speed as f64 / out_rate;
         let want = stream.needed(frames, step).saturating_sub(stream.frames());
         if want > 0 {
-            let want = want.max(64);
-            pull(&input, bus, want, stream.sample_time, scratch, &mut stream.pending);
-            stream.sample_time += want as f64;
+            // Like iOS, never ask for more than the unit's maximum in one call.
+            let mut left = want.max(64);
+            while left > 0 {
+                let chunk = left.min(max_frames as usize);
+                pull(&input, bus, chunk, stream.sample_time, scratch, &mut stream.pending);
+                stream.sample_time += chunk as f64;
+                left -= chunk;
+            }
         }
         let (pan, volume) = input.placement(kind);
         let (left, right) = pan_gains(pan, volume * master, input.channels > 1);
@@ -1210,6 +1257,12 @@ mod aaudio {
     }
 
     extern "C" fn on_data(_stream: Stream, _user: usize, data: *mut f32, frames: i32) -> i32 {
+        {
+            static BIGGEST: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+            if frames > BIGGEST.fetch_max(frames, Ordering::Relaxed) {
+                crate::log!("DIAG audio: AAudio asked for {frames} frames (most so far)");
+            }
+        }
         if !data.is_null() && frames > 0 {
             let out = unsafe { std::slice::from_raw_parts_mut(data, frames as usize * 2) };
             mix(out, OUT_RATE.load(Ordering::Relaxed));
@@ -1352,7 +1405,11 @@ mod tests {
     use super::*;
 
     /// A game-style callback: a 441 Hz tone, 16-bit mono.
+    /// The most frames `tone` was asked for in one call.
+    static TONE_MOST_FRAMES: AtomicU32 = AtomicU32::new(0);
+
     extern "C" fn tone(_data: usize, _flags: *mut u32, stamp: *const u8, _bus: u32, frames: u32, list: *mut u8) -> i32 {
+        TONE_MOST_FRAMES.fetch_max(frames, Ordering::Relaxed);
         unsafe {
             let start = *(stamp as *const f64);
             let samples = *(list.add(16) as *const *mut i16);
@@ -1390,6 +1447,9 @@ mod tests {
         mix(&mut out, 44100);
         let (left, right) = (energy(&out, 0), energy(&out, 1));
         assert!(left > 100.0 && (left - right).abs() < left * 0.01, "centred tone: {left} {right}");
+        // 0.1 s needs about 2200 source frames, but one call never asks for more than iOS's maximum.
+        let most = TONE_MOST_FRAMES.load(Ordering::Relaxed);
+        assert!(most > 0 && most <= DEFAULT_MAX_FRAMES, "{most} frames in one call");
         // Hard right: the left side goes quiet.
         unit_set_parameter(unit, 0, INPUT_SCOPE, 3, 90.0, 0);
         mix(&mut out, 44100);

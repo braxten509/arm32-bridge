@@ -245,28 +245,47 @@ pub fn window_to_points(x: f64, y: f64, width: i32, height: i32) -> Point {
 }
 
 /// IOS_TAPS="12:284,160;20:100,50": taps at those times (seconds after start) and points.
+/// IOS_TAPS="seconds:x,y;seconds:x,y>x2,y2;..." (points): test taps, or
+/// swipes from x,y to x2,y2 over about 150 ms.
 pub fn schedule_test_taps() {
     let Ok(text) = std::env::var("IOS_TAPS") else { return };
-    let taps: Vec<(f64, Point)> = text
+    let point = |text: &str| -> Option<Point> {
+        let (x, y) = text.split_once(',')?;
+        Some(Point { x: x.trim().parse().ok()?, y: y.trim().parse().ok()? })
+    };
+    let touches: Vec<(f64, Point, Point)> = text
         .split(';')
         .filter_map(|part| {
             let (time, place) = part.split_once(':')?;
-            let (x, y) = place.split_once(',')?;
-            Some((time.trim().parse().ok()?, Point { x: x.trim().parse().ok()?, y: y.trim().parse().ok()? }))
+            let (from, to) = match place.split_once('>') {
+                Some((from, to)) => (point(from)?, point(to)?),
+                None => (point(place)?, point(place)?),
+            };
+            Some((time.trim().parse().ok()?, from, to))
         })
         .collect();
     std::thread::spawn(move || {
         let start = now();
-        for (finger, (time, point)) in taps.into_iter().enumerate() {
+        for (finger, (time, from, to)) in touches.into_iter().enumerate() {
             let wait = start + time - now();
             if wait > 0.0 {
                 std::thread::sleep(std::time::Duration::from_secs_f64(wait));
             }
-            crate::log!("test tap at {:.0},{:.0}", point.x, point.y);
+            let swipe = from.x != to.x || from.y != to.y;
+            crate::log!("test {} at {:.0},{:.0}", if swipe { "swipe" } else { "tap" }, from.x, from.y);
             let finger = finger as i32;
-            crate::fw::runloop::post(crate::fw::runloop::Work::Native(Box::new(move || deliver_now(finger, Phase::Began, point))));
-            std::thread::sleep(std::time::Duration::from_millis(80));
-            crate::fw::runloop::post(crate::fw::runloop::Work::Native(Box::new(move || deliver_now(finger, Phase::Ended, point))));
+            let send = |phase: Phase, at: Point| {
+                crate::fw::runloop::post(crate::fw::runloop::Work::Native(Box::new(move || deliver_now(finger, phase, at))));
+            };
+            send(Phase::Began, from);
+            let steps = if swipe { 6 } else { 0 };
+            for step in 1..=steps {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                let f = step as f64 / steps as f64;
+                send(Phase::Moved, Point { x: from.x + (to.x - from.x) * f, y: from.y + (to.y - from.y) * f });
+            }
+            std::thread::sleep(std::time::Duration::from_millis(if swipe { 25 } else { 80 }));
+            send(Phase::Ended, to);
         }
     });
 }

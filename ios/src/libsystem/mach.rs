@@ -323,11 +323,15 @@ extern "C" fn dispatch_get_global_queue(_priority: i64, _flags: u64) -> usize {
 // ----- queues -----
 // The main queue runs on the main thread's run loop. Queues the game makes
 // are serial (Apple's default): their blocks run one at a time, in order, on
-// a worker thread. Global queues run each block on its own thread.
+// a worker thread. Global queues run each block on its own thread. A queue
+// whose target (dispatch_set_target_queue) is serial or the main queue runs
+// its blocks there, taking turns with that queue's own blocks.
 
+/// A block to run, and the queue it was sent to (what
+/// dispatch_get_current_queue answers while it runs).
 enum Job {
-    Later(usize),
-    Now(usize, std::sync::Arc<(Mutex<bool>, Condvar)>),
+    Later(usize, usize),
+    Now(usize, std::sync::Arc<(Mutex<bool>, Condvar)>, usize),
 }
 
 struct SerialQueue {
@@ -336,12 +340,38 @@ struct SerialQueue {
 
 static SERIAL_QUEUES: Mutex<Option<std::collections::HashMap<usize, &'static SerialQueue>>> = Mutex::new(None);
 
+/// Queue -> its target queue.
+static TARGETS: Mutex<Option<std::collections::HashMap<usize, usize>>> = Mutex::new(None);
+
 thread_local! {
     static CURRENT_QUEUE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The serial queue whose worker this thread is (0: none).
+    static CURRENT_RUNNER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn serial_queue(queue: usize) -> Option<&'static SerialQueue> {
     SERIAL_QUEUES.lock().unwrap().as_ref().and_then(|m| m.get(&queue).copied())
+}
+
+/// Where a queue's blocks run: the last serial (or main) queue along its
+/// targets, or the queue itself.
+fn runs_on(queue: usize) -> usize {
+    let targets = TARGETS.lock().unwrap();
+    let mut at = queue;
+    for _ in 0..32 {
+        match targets.as_ref().and_then(|t| t.get(&at)).copied() {
+            Some(target) if target == main_queue() || serial_queue(target).is_some() => at = target,
+            _ => break,
+        }
+    }
+    at
+}
+
+/// Runs a block as if on `queue` (for blocks run by another queue's thread).
+fn run_as(queue: usize, block: usize) {
+    let before = CURRENT_QUEUE.with(|c| c.replace(queue));
+    unsafe { call_block(block) };
+    CURRENT_QUEUE.with(|c| c.set(before));
 }
 
 extern "C" fn dispatch_get_current_queue() -> usize {
@@ -386,7 +416,7 @@ fn enqueue(queue: usize, state: &'static SerialQueue, job: Job) {
     jobs.1 = true;
     drop(jobs);
     std::thread::spawn(move || {
-        CURRENT_QUEUE.with(|c| c.set(queue));
+        CURRENT_RUNNER.with(|c| c.set(queue));
         loop {
             let job = {
                 let mut jobs = state.jobs.lock().unwrap();
@@ -399,9 +429,9 @@ fn enqueue(queue: usize, state: &'static SerialQueue, job: Job) {
                 }
             };
             match job {
-                Job::Later(block) => unsafe { call_block(block) },
-                Job::Now(block, done) => {
-                    unsafe { call_block(block) };
+                Job::Later(block, sent_to) => run_as(sent_to, block),
+                Job::Now(block, done, sent_to) => {
+                    run_as(sent_to, block);
                     mark_done(&done);
                 }
             }
@@ -411,10 +441,13 @@ fn enqueue(queue: usize, state: &'static SerialQueue, job: Job) {
 
 extern "C" fn dispatch_async(queue: usize, block: usize) {
     let copy = block_copy(block as *mut BlockHeader) as usize;
+    let runner = runs_on(queue);
     if queue == main_queue() {
         crate::fw::runloop::post(crate::fw::runloop::Work::Block(copy));
-    } else if let Some(state) = serial_queue(queue) {
-        enqueue(queue, state, Job::Later(copy));
+    } else if runner == main_queue() {
+        crate::fw::runloop::post(crate::fw::runloop::Work::Native(Box::new(move || run_as(queue, copy))));
+    } else if let Some(state) = serial_queue(runner) {
+        enqueue(runner, state, Job::Later(copy, queue));
     } else {
         std::thread::spawn(move || {
             CURRENT_QUEUE.with(|c| c.set(queue));
@@ -425,26 +458,27 @@ extern "C" fn dispatch_async(queue: usize, block: usize) {
 
 /// Runs the block on the queue's turn and waits for it.
 extern "C" fn dispatch_sync(queue: usize, block: usize) {
-    let inline = || unsafe { call_block(block) };
-    if queue == main_queue() {
+    let inline = || run_as(queue, block);
+    let runner = runs_on(queue);
+    if runner == main_queue() {
         if crate::fw::runloop::is_main_thread() {
             return inline();
         }
         let done = std::sync::Arc::new((Mutex::new(false), Condvar::new()));
         let signal = done.clone();
         crate::fw::runloop::post(crate::fw::runloop::Work::Native(Box::new(move || {
-            unsafe { call_block(block) };
+            run_as(queue, block);
             mark_done(&signal);
         })));
         wait_for(&done);
-    } else if let Some(state) = serial_queue(queue) {
-        if CURRENT_QUEUE.with(|c| c.get()) == queue {
+    } else if let Some(state) = serial_queue(runner) {
+        if CURRENT_RUNNER.with(|c| c.get()) == runner {
             // On Apple this waits forever; running it here keeps the game going.
             crate::log!("dispatch_sync onto the queue already running; ran it directly");
             return inline();
         }
         let done = std::sync::Arc::new((Mutex::new(false), Condvar::new()));
-        enqueue(queue, state, Job::Now(block, done.clone()));
+        enqueue(runner, state, Job::Now(block, done.clone(), queue));
         wait_for(&done);
     } else {
         inline();
@@ -464,7 +498,19 @@ extern "C" fn dispatch_after(when: u64, queue: usize, block: usize) {
 
 extern "C" fn dispatch_noop(_object: usize) {}
 
-extern "C" fn dispatch_set_target_queue(_object: usize, _queue: usize) {}
+/// A null target means the default (a global queue): no target.
+extern "C" fn dispatch_set_target_queue(object: usize, queue: usize) {
+    if object == 0 || object == main_queue() || object == queue {
+        return;
+    }
+    let mut targets = TARGETS.lock().unwrap();
+    let targets = targets.get_or_insert_with(Default::default);
+    if queue == 0 {
+        targets.remove(&object);
+    } else {
+        targets.insert(object, queue);
+    }
+}
 
 struct Semaphore {
     count: Mutex<i64>,
@@ -618,4 +664,63 @@ pub fn register(r: &mut Registry) {
     r.function("_dyld_register_func_for_add_image", dyld_register_add_image as usize);
     r.function("_dyld_register_func_for_remove_image", dyld_register_remove_image as usize);
     r.function("NSVersionOfLinkTimeLibrary", ns_version_of_link_time_library as usize);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A global block carrying a number and the queue it should report.
+    #[repr(C)]
+    struct TestBlock {
+        header: BlockHeader,
+        id: usize,
+        queue: usize,
+    }
+
+    static INSIDE: AtomicUsize = AtomicUsize::new(0);
+    static MOST_INSIDE: AtomicUsize = AtomicUsize::new(0);
+    static FINISHED: AtomicUsize = AtomicUsize::new(0);
+    static WRONG_QUEUE: AtomicUsize = AtomicUsize::new(0);
+    static ORDER: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+    extern "C" fn record(block: usize) {
+        let block = unsafe { &*(block as *const TestBlock) };
+        let now = INSIDE.fetch_add(1, Ordering::SeqCst) + 1;
+        MOST_INSIDE.fetch_max(now, Ordering::SeqCst);
+        if dispatch_get_current_queue() != block.queue {
+            WRONG_QUEUE.fetch_add(1, Ordering::SeqCst);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        ORDER.lock().unwrap().push(block.id);
+        INSIDE.fetch_sub(1, Ordering::SeqCst);
+        FINISHED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn block(id: usize, queue: usize) -> usize {
+        let header = BlockHeader { isa: 0, flags: BLOCK_IS_GLOBAL, reserved: 0, invoke: record as usize, descriptor: std::ptr::null() };
+        Box::leak(Box::new(TestBlock { header, id, queue })) as *mut TestBlock as usize
+    }
+
+    #[test]
+    fn queues_sharing_a_serial_target_take_turns() {
+        let target = dispatch_queue_create(0, 0);
+        let (a, b) = (dispatch_queue_create(0, 0), dispatch_queue_create(0, 1));
+        dispatch_set_target_queue(a, target);
+        dispatch_set_target_queue(b, target);
+        for i in 0..30 {
+            let queue = [a, b, target][i % 3];
+            dispatch_async(queue, block(i, queue));
+        }
+        // A synchronous block waits its turn behind the others.
+        dispatch_sync(a, block(100, a));
+        assert_eq!(FINISHED.load(Ordering::SeqCst), 31);
+        assert_eq!(MOST_INSIDE.load(Ordering::SeqCst), 1, "blocks overlapped");
+        assert_eq!(WRONG_QUEUE.load(Ordering::SeqCst), 0, "dispatch_get_current_queue named the wrong queue");
+        let order = ORDER.lock().unwrap().clone();
+        let mut expected: Vec<usize> = (0..30).collect();
+        expected.push(100);
+        assert_eq!(order, expected, "blocks ran out of order");
+    }
 }

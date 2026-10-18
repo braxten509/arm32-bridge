@@ -267,12 +267,17 @@ extern "C" fn get_string(name: Enum) -> *const u8 {
     }
     static TEXT: OnceLock<usize> = OnceLock::new();
     *TEXT.get_or_init(|| {
+        // Test switch: IOS_GL_HIDE="GL_EXT_a,GL_EXT_b" keeps those from the game.
+        let hidden = std::env::var("IOS_GL_HIDE").unwrap_or_default();
         let list: Vec<&str> = IPHONE_EXTENSIONS
             .iter()
             .copied()
             .filter(|name| ALWAYS_AVAILABLE.contains(name) || system_has_extension(name))
+            .filter(|name| !hidden.split(',').any(|h| h.trim() == *name))
             .collect();
         crate::log!("graphics: telling the game it has {} of the iPhone's {} extensions", list.len(), IPHONE_EXTENSIONS.len());
+        let from_chip: Vec<&str> = list.iter().copied().filter(|name| !ALWAYS_AVAILABLE.contains(name)).collect();
+        crate::log!("graphics: from the chip: {}", from_chip.join(" "));
         leak_cstr(&list.join(" "))
     }) as *const u8
 }

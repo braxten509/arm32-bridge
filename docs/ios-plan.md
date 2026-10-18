@@ -131,7 +131,8 @@ Bugs found on the way (details in `ios/DEBUGGING.md`):
 
 Test switches: `IOS_FRAMES_DIR` (save frames), `IOS_FRAME_EVERY` (default
 60), `IOS_FRAME_LIMIT` (stop after that many frames), `IOS_TAPS`
-(`"seconds:x,y;..."` in points), `IOS_STACKS_AT` (every thread's call chain
+(`"seconds:x,y;seconds:x,y>x2,y2"` in points: taps, or swipes from x,y to
+x2,y2), `IOS_STACKS_AT` (every thread's call chain
 at that time). On the phone: `ios/tools/run-phone.sh <App>.app` (no window;
 frames and log copied back).
 
@@ -219,12 +220,42 @@ works when held (a quick tap doesn't skip, as in the game itself). A second-mode
 found 15 problems; all are fixed. Unit tests: the mixer (pan, resampling,
 on/off) and the music player (time, loops, seeking, end).
 
-## Later steps
+## Plan to play IB2 and IB3 on the phone (approved 2026-10-18)
 
-3. Screen, drawing and touches on Android (EAGLContext/CAEAGLLayer → EGL
-   surface), then the first picture inside an Android app.
-4. Sound (AUGraph, AVAudioPlayer) and the intro videos.
-5. Game Center, store, ads, iCloud answer "not available"; keychain → file.
-6. Check the games' texture formats on the Pixel and decode if needed.
-7. Game Bridge takes `.ipa` files.
-8. Infinity Blade III, then Dungeons through the 32-bit translator.
+Rule: Game Bridge will run more iPhone games later. Nothing is made for one
+game only; anything that would be, the owner decides first.
+
+1. Fix the IB2 crash when the second fight loads (Pixel, drawing thread,
+   a call through a game object holding junk). Reproduce with the owner's
+   save on the PC/emulator, log in `ios/DEBUGGING.md`. Done: the second
+   fight loads 3 times in a row, then 30 minutes of play, no crash.
+2. Sharper picture and speed: report a screen that matches the phone
+   (2424x1080 on the Pixel 10, not 1136x640 with bars), maybe a newer
+   device so the game picks better textures and edges; the owner picks
+   from side-by-side pictures with frame rates. Done: full-screen sharp
+   picture, steady 60+ fps, no repeated pauses over 50 ms in fights.
+3. IB2 everyday play: leaving and coming back resumes the game; Android's
+   edge swipes don't eat sword swipes; the missing Apple pieces (alerts,
+   Game Center and store answering "not available", ...) filled in; saves
+   survive updates and are in Game Bridge's backups; a crash shows a
+   message and leaves a log readable without root. Done: the story plays
+   through with no crash, resume works, an update keeps the save.
+   Research (2026-10-18, details and scratch tools in
+   ~/.cache/ios-debug/res-research/): UE3 draws at UIScreen bounds (read
+   once in -[IPhoneViewController loadView]) x the per-device
+   `MobileContentScaleFactor` (iPhone 5s: 2.0), read back from the
+   renderbuffer; touches use the same factor. hw.machine picks the
+   settings section (IB2 parses one digit: iPhone10+ = unsupported; IB3
+   falls back to iPhone6/6 Plus). Coalesced_*.bin are AES-256-ECB with a
+   key in the program. Options: report the window's shape (`1212x540@2`
+   = native 2424x1080, ~3.6x the pixels; camera keeps its horizontal view,
+   so ~21% less vertical view at 20:9), the same at a fraction with a
+   smooth stretch, or 16:9 at full height (`960x540@2`, bars stay). Config
+   also has bSmoothFrameRate=TRUE, MaxSmoothedFrameRate=30 (check).
+4. IB3: PC, then emulator, then Pixel (Game Center first), then steps 1-3
+   for it. Done: the same checks as IB2.
+5. Second-model review of everything, all tests, docs, commit. Pushing is
+   the owner's call.
+
+Later: Game Bridge takes `.ipa` files; Infinity Blade: Dungeons through
+the 32-bit translator.

@@ -46,7 +46,27 @@ extern "C" fn set_property_copy(this: Id, _: Sel, value: Id, offset: isize) {
     }
 }
 
-extern "C" fn copy_struct(dest: *mut u8, src: *const u8, size: usize, _atomic: bool, _strong: bool) {
+/// Like Apple's runtime: atomic struct properties are guarded by one of a
+/// few locks picked by the property's address.
+static STRUCT_LOCKS: [Mutex<()>; 64] = [const { Mutex::new(()) }; 64];
+
+fn struct_lock(address: usize) -> &'static Mutex<()> {
+    &STRUCT_LOCKS[(address >> 4) % STRUCT_LOCKS.len()]
+}
+
+/// objc_copyStruct: one of `dest` or `src` is the property; with `atomic`
+/// the copy can't be seen half done.
+extern "C" fn copy_struct(dest: *mut u8, src: *const u8, size: usize, atomic: bool, _strong: bool) {
+    if !atomic {
+        unsafe { std::ptr::copy(src, dest, size) };
+        return;
+    }
+    let (first, second) = {
+        let (a, b) = (struct_lock(dest as usize) as *const Mutex<()>, struct_lock(src as usize) as *const Mutex<()>);
+        if a <= b { (a, b) } else { (b, a) }
+    };
+    let _first = unsafe { &*first }.lock().unwrap_or_else(|e| e.into_inner());
+    let _second = (first != second).then(|| unsafe { &*second }.lock().unwrap_or_else(|e| e.into_inner()));
     unsafe { std::ptr::copy(src, dest, size) };
 }
 

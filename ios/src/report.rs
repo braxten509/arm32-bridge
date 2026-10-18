@@ -137,6 +137,51 @@ fn read_frame(frame: usize) -> Option<[usize; 2]> {
     }
 }
 
+/// Reads `out.len()` bytes at an address that may be bad (None if it can't be read).
+fn read_memory(address: usize, out: &mut [u8]) -> bool {
+    unsafe {
+        let local = libc::iovec { iov_base: out.as_mut_ptr() as *mut _, iov_len: out.len() };
+        let remote = libc::iovec { iov_base: address as *mut _, iov_len: out.len() };
+        libc::process_vm_readv(libc::getpid(), &local, 1, &remote, 1, 0) == out.len() as isize
+    }
+}
+
+/// For each register that points at readable memory: which mapping it is in
+/// and the 64 bytes around it (16 before, 48 after), to see what overwrote
+/// an object.
+fn describe_pointed_memory(registers: &[u64]) {
+    let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
+    let mapping = |address: usize| -> String {
+        for row in maps.lines() {
+            let mut fields = row.split_whitespace();
+            let Some((start, end)) = fields.next().and_then(|range| range.split_once('-')) else { continue };
+            let (Ok(start), Ok(end)) = (usize::from_str_radix(start, 16), usize::from_str_radix(end, 16)) else { continue };
+            if address >= start && address < end {
+                let rest: Vec<&str> = fields.collect();
+                let name = rest.get(4).copied().unwrap_or("(anonymous)");
+                return format!("{} +{:#x} in {start:#x}..{end:#x}", name, address - start);
+            }
+        }
+        "not mapped".into()
+    };
+    let mut seen = Vec::new();
+    for (index, &value) in registers.iter().enumerate() {
+        // Top byte ignored, as the processor does for addresses.
+        let address = (value as usize) & 0x00ff_ffff_ffff_ffff;
+        if address < 0x10000 || seen.contains(&address) {
+            continue;
+        }
+        let mut bytes = [0u8; 64];
+        if !read_memory(address.wrapping_sub(16), &mut bytes) {
+            continue;
+        }
+        seen.push(address);
+        let words: Vec<String> = bytes.chunks(8).map(|w| format!("{:016x}", u64::from_le_bytes(w.try_into().unwrap()))).collect();
+        line(&format!("  x{index} -> {}", mapping(address)));
+        line(&format!("     -16: {} {} | {}", words[0], words[1], words[2..].join(" ")));
+    }
+}
+
 /// Prints where a crash happened (place, registers, call chain) and stops.
 /// The report takes locks and allocates, which a crash may have left busy:
 /// a second crash ends at once, and a timer ends a report that hangs.
@@ -160,6 +205,7 @@ extern "C" fn on_crash(signal: i32, info: *mut libc::siginfo_t, context: *mut li
             }
         }
         line(&format!("  {text}sp={:#x}", m.sp));
+        describe_pointed_memory(&m.regs[..29]);
         let mut frame = m.regs[29] as usize;
         for depth in 0..24 {
             if frame == 0 || frame % 8 != 0 {
