@@ -8,6 +8,7 @@ pub mod eagl;
 pub mod files;
 pub mod foundation;
 pub mod gamekit;
+pub mod openal;
 pub mod geometry;
 pub mod gl;
 pub mod json;
@@ -60,6 +61,7 @@ pub fn register(r: &mut Registry) {
     touch::register(r);
     sound::register(r);
     gamekit::register(r);
+    openal::register(r);
     storekit::register(r);
     immutable_copies();
 }

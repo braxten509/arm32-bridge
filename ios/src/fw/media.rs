@@ -238,7 +238,13 @@ fn close_video_of(player: Id) {
 
 /// UIView removeFromSuperview: a view showing a player's picture is gone.
 pub fn view_removed(view: Id) {
-    if showing().is_none() || !runtime::responds(view, "layer") {
+    if showing().is_none() {
+        return;
+    }
+    if let Some(player) = property_get(view, "moviePlayerOf") {
+        return close_video_of(player as Id);
+    }
+    if !runtime::responds(view, "layer") {
         return;
     }
     let layer = runtime::send(view, "layer", &[]);
@@ -251,6 +257,9 @@ pub fn view_removed(view: Id) {
 }
 
 fn tell_ended(player: Id, item: Id) {
+    if property_get(player, "moviePlayer").is_some() {
+        return movie_player_ended(player);
+    }
     property_set(player, "rate", 0);
     struct Ended(Id);
     let ended = Box::into_raw(Box::new(Ended(item))) as usize;
@@ -263,42 +272,47 @@ fn tell_ended(player: Id, item: Id) {
 
 extern "C" fn player_play(this: Id, _: Sel) {
     let item = player_item(this, 0);
+    let asset = property_get(item, "asset").unwrap_or(0) as Id;
+    let url = property_get(asset, "url").unwrap_or(0) as Id;
+    show_video(this, item, &string::get(runtime::send(url, "path", &[])));
+}
+
+/// Shows the video at `path` for `player` (an AVPlayer with its item, or a
+/// movie player controller, which is its own item), or carries on with it
+/// when it is already this player's; without a video screen the game is
+/// told at once that it ended.
+fn show_video(player: Id, item: Id, path: &str) {
     if let Some(screen) = VIDEO_SCREEN.get() {
         let mut showing = showing();
         // Already this player's video: carry on where it is.
         if let Some(s) = showing.as_mut() {
-            if s.player == this && s.item == item {
+            if s.player == player && s.item == item {
                 if s.paused {
                     s.paused = false;
                     (screen.resume)(s.token);
                 }
-                property_set(this, "rate", 1f32.to_bits() as u64);
+                property_set(player, "rate", 1f32.to_bits() as u64);
                 return;
             }
         }
-        let asset = property_get(item, "asset").unwrap_or(0) as Id;
-        let url = property_get(asset, "url").unwrap_or(0) as Id;
-        let path = string::get(runtime::send(url, "path", &[]));
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let token = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(old) = showing.take() {
             (screen.stop)(old.token);
         }
-        if (screen.show)(&path, token) {
-            *showing = Some(Showing { token, player: this, item, paused: false });
-            property_set(this, "rate", 1f32.to_bits() as u64);
+        if (screen.show)(path, token) {
+            *showing = Some(Showing { token, player, item, paused: false });
+            property_set(player, "rate", 1f32.to_bits() as u64);
             crate::log!("video {path} playing");
             return;
         }
         drop(showing);
         crate::log!("video {path} could not be shown; telling the game it ended");
-        tell_ended(this, item);
+        tell_ended(player, item);
         return;
     }
-    let asset = property_get(item, "asset").unwrap_or(0) as Id;
-    let url = property_get(asset, "url").unwrap_or(0) as Id;
-    crate::log!("video {} skipped (no screen for videos here); telling the game it ended", string::get(runtime::send(url, "path", &[])));
-    tell_ended(this, item);
+    crate::log!("video {path} skipped (no screen for videos here); telling the game it ended");
+    tell_ended(player, item);
 }
 
 /// A tiny block (Apple's closure object) that calls a Rust function once.
@@ -427,7 +441,192 @@ fn object_method(name: &str) -> usize {
     rt.lookup(object, s).expect("NSObject method")
 }
 
+// ----- MPMoviePlayerController (MediaPlayer framework) -----
+// The older full-screen movie player: shown through the same video screen
+// as AVPlayer. It tells the game a movie finished with
+// MPMoviePlayerPlaybackDidFinishNotification, or starts it again when it
+// repeats (MPMovieRepeatModeOne).
+
+const MOVIE_STOPPED: u64 = 0;
+const MOVIE_PLAYING: u64 = 1;
+const MOVIE_PAUSED: u64 = 2;
+
+extern "C" fn movie_init_with_url(this: Id, _: Sel, url: Id) -> Id {
+    property_set(this, "moviePlayer", 1);
+    property_set(this, "url", url as u64);
+    this
+}
+
+extern "C" fn movie_url(this: Id, _: Sel) -> Id {
+    property_get(this, "url").unwrap_or(0) as Id
+}
+
+extern "C" fn movie_set_url(this: Id, _: Sel, url: Id) {
+    property_set(this, "url", url as u64);
+}
+
+fn movie_path(player: Id) -> String {
+    let url = movie_url(player, 0);
+    if url == 0 { String::new() } else { string::get(runtime::send(url, "path", &[])) }
+}
+
+extern "C" fn movie_play(this: Id, _: Sel) {
+    property_set(this, "moviePlayer", 1);
+    property_set(this, "playbackState", MOVIE_PLAYING);
+    show_video(this, this, &movie_path(this));
+}
+
+extern "C" fn movie_prepare(this: Id, _: Sel) {
+    // shouldAutoplay (YES unless the game says no) starts it once ready.
+    if property_get(this, "shouldAutoplay").unwrap_or(1) != 0 && property_get(this, "playbackState").unwrap_or(MOVIE_STOPPED) == MOVIE_STOPPED {
+        movie_play(this, 0);
+    }
+}
+
+extern "C" fn movie_pause(this: Id, s: Sel) {
+    property_set(this, "playbackState", MOVIE_PAUSED);
+    player_pause(this, s);
+}
+
+extern "C" fn movie_stop(this: Id, _: Sel) {
+    property_set(this, "playbackState", MOVIE_STOPPED);
+    property_set(this, "rate", 0);
+    close_video_of(this);
+}
+
+/// The movie played to its end: again when it repeats, else the game hears
+/// MPMoviePlayerPlaybackDidFinishNotification (reason: playback ended).
+fn movie_player_ended(player: Id) {
+    struct Ended(Id);
+    let ended = Box::into_raw(Box::new(Ended(player))) as usize;
+    let block = make_callback(ended, |data| {
+        let player = unsafe { Box::from_raw(data as *mut Ended) }.0;
+        if property_get(player, "playbackState") != Some(MOVIE_PLAYING) {
+            return;
+        }
+        if property_get(player, "repeatMode") == Some(1) {
+            return show_video(player, player, &movie_path(player));
+        }
+        property_set(player, "playbackState", MOVIE_STOPPED);
+        let info = crate::fw::collections::dictionary_from(&[(
+            string::make("MPMoviePlayerPlaybackDidFinishReasonUserInfoKey"),
+            crate::fw::collections::number_int(0),
+        )]);
+        crate::fw::foundation::post("MPMoviePlayerPlaybackDidFinishNotification", player, info);
+    });
+    crate::fw::runloop::post(crate::fw::runloop::Work::Block(block));
+}
+
+/// The movie's view (and background view): a plain view over the screen;
+/// taking it off the screen takes the movie off too.
+fn movie_view_named(this: Id, key: &'static str) -> Id {
+    if let Some(view) = property_get(this, key) {
+        return view as Id;
+    }
+    let screen = runtime::send(runtime::class_named("UIScreen") as Id, "mainScreen", &[]);
+    let bounds: crate::fw::geometry::Rect = unsafe {
+        let s = runtime::sel("bounds");
+        let imp = runtime::imp_for(screen, s).unwrap();
+        let f: extern "C" fn(Id, Sel) -> crate::fw::geometry::Rect = std::mem::transmute(imp);
+        f(screen, s)
+    };
+    let view = runtime::send(runtime::class_named("UIView") as Id, "alloc", &[]);
+    let view = unsafe {
+        let s = runtime::sel("initWithFrame:");
+        let imp = runtime::imp_for(view, s).unwrap();
+        let f: extern "C" fn(Id, Sel, crate::fw::geometry::Rect) -> Id = std::mem::transmute(imp);
+        f(view, s, bounds)
+    };
+    property_set(view, "moviePlayerOf", this as u64);
+    property_set(this, key, view as u64);
+    view
+}
+
+extern "C" fn movie_view(this: Id, _: Sel) -> Id {
+    movie_view_named(this, "view")
+}
+
+extern "C" fn movie_background_view(this: Id, _: Sel) -> Id {
+    movie_view_named(this, "backgroundView")
+}
+
+extern "C" fn movie_playback_state(this: Id, _: Sel) -> isize {
+    property_get(this, "playbackState").unwrap_or(MOVIE_STOPPED) as isize
+}
+
+extern "C" fn movie_load_state(_this: Id, _: Sel) -> isize {
+    // MPMovieLoadStatePlayable | MPMovieLoadStatePlaythroughOK
+    3
+}
+
+extern "C" fn movie_yes(_this: Id, _: Sel) -> bool {
+    true
+}
+
+extern "C" fn movie_zero_seconds(_this: Id, _: Sel) -> f64 {
+    0.0
+}
+
+extern "C" fn movie_set_repeat_mode(this: Id, _: Sel, mode: isize) {
+    property_set(this, "repeatMode", mode as u64);
+}
+
+extern "C" fn movie_repeat_mode(this: Id, _: Sel) -> isize {
+    property_get(this, "repeatMode").unwrap_or(0) as isize
+}
+
+extern "C" fn movie_set_should_autoplay(this: Id, _: Sel, autoplay: u8) {
+    property_set(this, "shouldAutoplay", (autoplay != 0) as u64);
+}
+
+extern "C" fn movie_should_autoplay(this: Id, _: Sel) -> bool {
+    property_get(this, "shouldAutoplay").unwrap_or(1) != 0
+}
+
+extern "C" fn movie_ignore_bool_bool(_this: Id, _: Sel, _a: u8, _b: u8) {}
+extern "C" fn movie_ignore_double(_this: Id, _: Sel, _value: f64) {}
+
+fn register_movie_player() {
+    let movie = define_class("MPMoviePlayerController", "NSObject", 8);
+    methods(
+        movie,
+        &[
+            ("initWithContentURL:", movie_init_with_url as usize),
+            ("contentURL", movie_url as usize),
+            ("setContentURL:", movie_set_url as usize),
+            ("play", movie_play as usize),
+            ("prepareToPlay", movie_prepare as usize),
+            ("isPreparedToPlay", movie_yes as usize),
+            ("pause", movie_pause as usize),
+            ("stop", movie_stop as usize),
+            ("view", movie_view as usize),
+            ("backgroundView", movie_background_view as usize),
+            ("playbackState", movie_playback_state as usize),
+            ("loadState", movie_load_state as usize),
+            ("duration", movie_zero_seconds as usize),
+            ("playableDuration", movie_zero_seconds as usize),
+            ("currentPlaybackTime", movie_zero_seconds as usize),
+            ("setCurrentPlaybackTime:", movie_ignore_double as usize),
+            ("setInitialPlaybackTime:", movie_ignore_double as usize),
+            ("setEndPlaybackTime:", movie_ignore_double as usize),
+            ("repeatMode", movie_repeat_mode as usize),
+            ("setRepeatMode:", movie_set_repeat_mode as usize),
+            ("shouldAutoplay", movie_should_autoplay as usize),
+            ("setShouldAutoplay:", movie_set_should_autoplay as usize),
+            ("setControlStyle:", player_ignore_int as usize),
+            ("setScalingMode:", player_ignore_int as usize),
+            ("setMovieSourceType:", player_ignore_int as usize),
+            ("setMovieControlMode:", player_ignore_int as usize),
+            ("setUseApplicationAudioSession:", player_ignore_int as usize),
+            ("setFullscreen:", player_ignore_int as usize),
+            ("setFullscreen:animated:", movie_ignore_bool_bool as usize),
+            ("setBackgroundColor:", ignore_id as usize),
+        ],
+    );
+}
+
 pub fn register(r: &mut Registry) {
+    register_movie_player();
     r.function("CMTimeGetSeconds", cm_time_get_seconds as usize);
     r.data("kCMTimeZero", leak(CmTime { value: 0, timescale: 1, flags: 1, epoch: 0 }));
     r.function("AudioSessionInitialize", audio_session_initialize as usize);

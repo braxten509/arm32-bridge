@@ -1,8 +1,9 @@
 //! Sound. Games make sound two ways here:
 //! - an audio graph (AUGraph): a mixer (3D or multichannel) whose inputs ask
 //!   the game for samples through callbacks, feeding the output unit;
-//! - AVAudioPlayer for music files (MP3, decoded here).
-//! Both are mixed into one stereo stream, played through AAudio on Android.
+//! - AVAudioPlayer for music files (MP3, decoded here);
+//! - OpenAL sources (fw::openal).
+//! All are mixed into one stereo stream, played through AAudio on Android.
 //! PC tests have no sound device: the stream is pulled in real time and can
 //! be saved as a WAV file (IOS_SOUND_FILE).
 
@@ -1097,12 +1098,18 @@ fn mix_music(out: &mut [f32], frames: usize, out_rate: f64) {
 static OUT_RATE: AtomicU32 = AtomicU32::new(44100);
 static STARTED: AtomicBool = AtomicBool::new(false);
 
+/// The output's sample rate.
+pub fn output_rate() -> u32 {
+    OUT_RATE.load(Ordering::Relaxed)
+}
+
 /// Fills `out` (stereo, interleaved) with everything that is playing.
 pub fn mix(out: &mut [f32], rate: u32) {
     out.fill(0.0);
     let frames = out.len() / 2;
     mix_graph(out, frames, rate as f64);
     mix_music(out, frames, rate as f64);
+    crate::fw::openal::mix(out, frames, rate as f64);
     for sample in out.iter_mut() {
         *sample = sample.clamp(-1.0, 1.0);
     }

@@ -68,11 +68,11 @@ pub fn needed(elf: &[u8]) -> Option<Vec<String>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A minimal 64-bit library: one load segment holding the dynamic entries and their strings.
-    fn library64(names: &[&str]) -> Vec<u8> {
+    pub(crate) fn library64(names: &[&str]) -> Vec<u8> {
         let mut strings = vec![0u8];
         let offsets: Vec<u64> = names.iter().map(|name| {
             let at = strings.len() as u64;

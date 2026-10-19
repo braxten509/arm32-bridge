@@ -632,24 +632,50 @@ fn report_code(names: &[String], own_engine: impl FnOnce(&str) -> bool) {
 
 /// Libraries a game's own engine draws with and plays sound through.
 const GRAPHICS_LIBRARIES: [&str; 4] = ["libGLESv1_CM.so", "libGLESv2.so", "libGLESv3.so", "libvulkan.so"];
-const SOUND_LIBRARIES: [&str; 2] = ["libOpenSLES.so", "libaaudio.so"];
+/// Android's own sound libraries, and the game sound libraries games ship next to their
+/// engine (OpenAL Soft, FMOD), which load Android's while running.
+const SOUND_LIBRARIES: [&str; 8] = [
+    "libOpenSLES.so", "libaaudio.so", "libopenal.so",
+    "libfmod.so", "libfmodL.so", "libfmodex.so", "libfmodevent.so", "libfmodstudio.so",
+];
+/// Libraries Game Bridge itself ships (in its app, and in the games it converts): never a game's engine.
+const OWN_LIBRARIES: [&str; 4] = [BRIDGE_FILE, PACER_FILE, "libapkconvert.so", "libgamebridge_ios.so"];
 
 /// The size of the biggest library in lib/<abi>/ that looks like a game engine of the
-/// app's own (PvZ 2's libPVZ2.so, for one): it asks for a graphics library and a sound
-/// library itself. 0 if there is none. Most ordinary apps leave drawing to Android's views or a
-/// web page and the sound to Android's players; those that do it themselves (video calls) do
-/// it in a part smaller than their Java code, while a game's engine is most of the game.
+/// app's own (PvZ 2's libPVZ2.so, for one): it asks for a sound library itself, and for a
+/// graphics library either itself or by holding its name, which it may load while running
+/// (the Infinity Blade ports dlopen libGLESv2.so or the ANGLE copy they ship). 0 if there is
+/// none. Most ordinary apps leave drawing to Android's views or a web page and the sound to
+/// Android's players; the size rule keeps out most of those that do it themselves (video
+/// calls do it in a part smaller than their Java code, while a game's engine is most of the game).
 fn own_engine<R: Read + Seek>(archive: &mut ZipArchive<R>, abi: &str) -> u64 {
-    let names: Vec<String> = archive.file_names().filter(|name| library_in(abi, name).is_some()).map(String::from).collect();
+    let names: Vec<String> = archive.file_names()
+        .filter(|name| library_in(abi, name).is_some_and(|file| !OWN_LIBRARIES.contains(&file.as_str())))
+        .map(String::from)
+        .collect();
     names.iter()
         .filter_map(|name| {
             let mut file = archive.by_name(name).ok()?;
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes).ok()?;
-            needed::needed(&bytes).filter(|needed| draws_and_plays(needed)).map(|_| bytes.len() as u64)
+            let needed = needed::needed(&bytes)?;
+            (plays(&needed) && (draws(&needed) || names_graphics_library(&bytes))).then_some(bytes.len() as u64)
         })
         .max()
         .unwrap_or(0)
+}
+
+/// Whether a library's bytes hold a graphics library's file name as a whole text of its own
+/// ("libGLESv2.so" or "/system/lib64/libGLESv2.so", ending in a zero byte), the way a name
+/// handed to dlopen is stored.
+fn names_graphics_library(bytes: &[u8]) -> bool {
+    GRAPHICS_LIBRARIES.iter().any(|name| {
+        let mut text = name.as_bytes().to_vec();
+        text.push(0);
+        bytes.windows(text.len()).enumerate().any(|(start, window)| {
+            window == text.as_slice() && (start == 0 || matches!(bytes[start - 1], 0 | b'/'))
+        })
+    })
 }
 
 /// The size of the app's Java code (its classes*.dex files, unpacked).
@@ -661,9 +687,12 @@ fn java_size<R: Read + Seek>(archive: &mut ZipArchive<R>) -> u64 {
     dex_files.iter().filter_map(|name| archive.by_name(name).ok().map(|file| file.size())).sum()
 }
 
-fn draws_and_plays(needed: &[String]) -> bool {
+fn draws(needed: &[String]) -> bool {
     needed.iter().any(|name| GRAPHICS_LIBRARIES.contains(&name.as_str()))
-        && needed.iter().any(|name| SOUND_LIBRARIES.contains(&name.as_str()))
+}
+
+fn plays(needed: &[String]) -> bool {
+    needed.iter().any(|name| SOUND_LIBRARIES.contains(&name.as_str()))
 }
 
 fn yes_no(answer: bool) -> &'static str {
@@ -723,10 +752,53 @@ mod tests {
     #[test]
     fn own_engines() {
         let names = |list: &[&str]| list.iter().map(|name| name.to_string()).collect::<Vec<_>>();
-        assert!(draws_and_plays(&names(&["libz.so", "libGLESv2.so", "libOpenSLES.so", "libc.so"])));
-        assert!(draws_and_plays(&names(&["libvulkan.so", "libaaudio.so"])));
-        assert!(!draws_and_plays(&names(&["libGLESv2.so", "libEGL.so", "libc.so"])));
-        assert!(!draws_and_plays(&names(&["libOpenSLES.so", "libc.so"])));
+        let draws_and_plays = |list: &[&str]| draws(&names(list)) && plays(&names(list));
+        assert!(draws_and_plays(&["libz.so", "libGLESv2.so", "libOpenSLES.so", "libc.so"]));
+        assert!(draws_and_plays(&["libvulkan.so", "libaaudio.so"]));
+        assert!(!draws_and_plays(&["libGLESv2.so", "libEGL.so", "libc.so"]));
+        assert!(!draws_and_plays(&["libOpenSLES.so", "libc.so"]));
+    }
+
+    #[test]
+    fn graphics_libraries_named_in_code() {
+        assert!(names_graphics_library(b"\x7fELF\0libGLESv2.so\0libEGL.so\0"));
+        assert!(names_graphics_library(b"x\0/system/lib64/libvulkan.so\0"));
+        assert!(names_graphics_library(b"libGLESv3.so\0"));
+        // Only whole names: a longer name, or one that runs on, is another library.
+        assert!(!names_graphics_library(b"\0libGLESv2_angle.so\0"));
+        assert!(!names_graphics_library(b"\0mylibGLESv2.so\0"));
+        assert!(!names_graphics_library(b"\0libGLESv2.so.1\0"));
+        assert!(!names_graphics_library(b"\0libEGL.so\0libc.so\0"));
+    }
+
+    #[test]
+    fn own_engine_with_graphics_loaded_by_name() {
+        // An APK with `dex_size` bytes of Java code and one library that links `needs` and
+        // names libGLESv2.so in its data, the way the Infinity Blade ports do.
+        let apk_named = |file: &str, needs: &[&str], dex_size: usize| {
+            let mut library = needed::tests::library64(needs);
+            library.extend_from_slice(b"\0libGLESv2.so\0libEGL.so\0");
+            library.resize(library.len() + 1000, 0);
+            let mut writer = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            writer.start_file("classes.dex", options).unwrap();
+            writer.write_all(&vec![0; dex_size]).unwrap();
+            writer.start_file(format!("lib/arm64-v8a/{file}"), options).unwrap();
+            writer.write_all(&library).unwrap();
+            ZipArchive::new(writer.finish().unwrap()).unwrap()
+        };
+        let apk = |needs: &[&str], dex_size: usize| apk_named("libgame.so", needs, dex_size);
+        let is_engine = |mut archive: ZipArchive<_>| own_engine(&mut archive, "arm64-v8a") > java_size(&mut archive);
+        assert!(is_engine(apk(&["libOpenSLES.so", "libc.so"], 100)));
+        // No sound library of its own: not an engine.
+        assert!(!is_engine(apk(&["libc.so"], 100)));
+        // Smaller than the Java code: the size rule still says no.
+        assert!(!is_engine(apk(&["libOpenSLES.so", "libc.so"], 100_000)));
+        // Sound through a game sound library the game ships (Infinity Blade's OpenAL).
+        assert!(is_engine(apk(&["libopenal.so", "libGLESv2.so"], 100)));
+        // Game Bridge's own bridge draws and plays too, but is no game's engine.
+        assert!(!is_engine(apk_named(BRIDGE_FILE, &["libOpenSLES.so", "libEGL.so"], 100)));
+        assert!(!is_engine(apk_named("libapkconvert.so", &["libOpenSLES.so", "libEGL.so"], 100)));
     }
 
     #[test]

@@ -69,7 +69,16 @@ fn origin_in_window(view: Id) -> Point {
 }
 
 fn takes_touches(view: Id) -> bool {
-    property_get(view, "hidden").unwrap_or(0) == 0 && property_get(view, "userInteraction").map(|v| v != 0).unwrap_or(true)
+    // As in UIKit, image views (and labels) ignore touches unless the game
+    // turns them on; other views take them.
+    let default = || {
+        let plain = ["UIImageView", "UILabel"].iter().any(|name| {
+            let class = runtime::class_named(name);
+            class != 0 && runtime::send(view, "isKindOfClass:", &[class as Id]) & 0xFF != 0
+        });
+        !plain
+    };
+    property_get(view, "hidden").unwrap_or(0) == 0 && property_get(view, "userInteraction").map(|v| v != 0).unwrap_or_else(default)
 }
 
 /// The deepest visible view under the point (window points), as UIKit's hitTest finds it.

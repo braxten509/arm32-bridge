@@ -39,6 +39,10 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
     private var videoPlayer: VideoView? = null
     /** The game's number for the video on screen (0: none). */
     private var videoToken = 0L
+    /** The game asked to hold the video (it is paused until the game resumes it). */
+    private var videoHeld = false
+    /** Where the video was when the player left (ms), or -1. */
+    private var videoLeftAt = -1
     /** The pipe the "game stopped" byte comes down, kept so it stays open. */
     private var stopPipe: ParcelFileDescriptor? = null
 
@@ -160,6 +164,22 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
         }
     }
 
+    // Android's video player lets go of its video while the app is away and,
+    // back again, loads it paused at the start; so its place is kept here,
+    // and it goes on from there unless the game is holding it.
+    override fun onPause() {
+        super.onPause()
+        videoPlayer?.let { videoLeftAt = it.currentPosition }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        val player = videoPlayer ?: return
+        if (videoLeftAt > 0) player.seekTo(videoLeftAt)
+        videoLeftAt = -1
+        if (!videoHeld) player.start()
+    }
+
     override fun surfaceDestroyed(holder: SurfaceHolder) {
         // The game pauses (told it is in the background, like on iOS) and
         // lets go of the window before this returns; it carries on when the
@@ -226,13 +246,23 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
     /** Called by the game (any thread): hold the video where it is. */
     @Suppress("unused")
     fun pauseVideo(token: Long) {
-        runOnUiThread { if (videoToken == token) videoPlayer?.pause() }
+        runOnUiThread {
+            if (videoToken == token) {
+                videoHeld = true
+                videoPlayer?.pause()
+            }
+        }
     }
 
     /** Called by the game (any thread): go on from where it was held. */
     @Suppress("unused")
     fun resumeVideo(token: Long) {
-        runOnUiThread { if (videoToken == token) videoPlayer?.start() }
+        runOnUiThread {
+            if (videoToken == token) {
+                videoHeld = false
+                videoPlayer?.start()
+            }
+        }
     }
 
     /** Called by the game (any thread): take the video off the screen. */
@@ -247,6 +277,8 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
         video = null
         videoPlayer = null
         videoToken = 0
+        videoHeld = false
+        videoLeftAt = -1
     }
 
     private external fun nativeVideoEnded(token: Long)

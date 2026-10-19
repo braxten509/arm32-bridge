@@ -328,6 +328,10 @@ pub fn view_state(view: Id) -> &'static mut ViewState {
 property!(view_hidden, view_set_hidden, "hidden", bool, false);
 property!(view_alpha, view_set_alpha, "alpha", f64, 1.0);
 property!(view_user_interaction, view_set_user_interaction, "userInteraction", bool, true);
+
+extern "C" fn image_view_user_interaction(this: Id, _: Sel) -> bool {
+    property_get(this, "userInteraction").is_some_and(|v| v != 0)
+}
 property!(view_multiple_touch, view_set_multiple_touch, "multipleTouch", bool, false);
 property!(view_exclusive_touch, view_set_exclusive_touch, "exclusiveTouch", bool, false);
 property!(view_opaque, view_set_opaque, "opaque", bool, true);
@@ -847,6 +851,41 @@ extern "C" fn app_open_url(_this: Id, _: Sel, url: Id) -> bool {
     false
 }
 
+// A spinner (UIActivityIndicatorView): a view of the right size that keeps
+// its settings; nothing spins on screen.
+extern "C" fn spinner_init_with_style(this: Id, _: Sel, style: isize) -> Id {
+    // UIActivityIndicatorViewStyleWhiteLarge (0) is 37 points, the others 20.
+    let side = if style == 0 { 37.0 } else { 20.0 };
+    property_set(this, "style", style as u64);
+    view_init_with_frame(this, 0, Rect { origin: Point { x: 0.0, y: 0.0 }, size: Size { width: side, height: side } })
+}
+
+extern "C" fn spinner_animating(this: Id, _: Sel) -> bool {
+    property_get(this, "animating").is_some_and(|v| v != 0)
+}
+
+property!(spinner_hides_when_stopped, spinner_set_hides_when_stopped, "hidesWhenStopped", bool, true);
+property!(spinner_style, spinner_set_style, "style", isize, 0);
+property!(spinner_color, spinner_set_color, "color", id, 0);
+
+extern "C" fn spinner_start(this: Id, _: Sel) {
+    property_set(this, "animating", 1);
+}
+
+extern "C" fn spinner_stop(this: Id, _: Sel) {
+    property_set(this, "animating", 0);
+}
+
+// The accelerometer (UIAccelerometer): it keeps its settings and never
+// reports a tilt (the phone's sensors aren't wired to it).
+extern "C" fn accelerometer_shared(_: Class, _: Sel) -> Id {
+    static SHARED: OnceLock<usize> = OnceLock::new();
+    *SHARED.get_or_init(|| runtime::alloc_instance(runtime::class_named("UIAccelerometer")) as usize) as Id
+}
+
+property!(accelerometer_delegate, accelerometer_set_delegate, "delegate", id, 0);
+property!(accelerometer_interval, accelerometer_set_interval, "updateInterval", f64, 0.0);
+
 extern "C" fn app_scheduled_notifications(_this: Id, _: Sel) -> Id {
     collections::array_from(&[])
 }
@@ -1156,11 +1195,39 @@ pub fn register(r: &mut Registry) {
             ("scale", image_scale as usize),
         ],
     );
+    let spinner = define_class("UIActivityIndicatorView", "UIView", 16);
+    methods(
+        spinner,
+        &[
+            ("initWithActivityIndicatorStyle:", spinner_init_with_style as usize),
+            ("startAnimating", spinner_start as usize),
+            ("stopAnimating", spinner_stop as usize),
+            ("isAnimating", spinner_animating as usize),
+            ("hidesWhenStopped", spinner_hides_when_stopped as usize),
+            ("setHidesWhenStopped:", spinner_set_hides_when_stopped as usize),
+            ("activityIndicatorViewStyle", spinner_style as usize),
+            ("setActivityIndicatorViewStyle:", spinner_set_style as usize),
+            ("color", spinner_color as usize),
+            ("setColor:", spinner_set_color as usize),
+        ],
+    );
+    let accelerometer = define_class("UIAccelerometer", "NSObject", 8);
+    class_methods(accelerometer, &[("sharedAccelerometer", accelerometer_shared as usize)]);
+    methods(
+        accelerometer,
+        &[
+            ("delegate", accelerometer_delegate as usize),
+            ("setDelegate:", accelerometer_set_delegate as usize),
+            ("updateInterval", accelerometer_interval as usize),
+            ("setUpdateInterval:", accelerometer_set_interval as usize),
+        ],
+    );
     let image_view = define_class("UIImageView", "UIView", 16);
     methods(
         image_view,
         &[
             ("initWithImage:", image_view_init_with_image as usize),
+            ("isUserInteractionEnabled", image_view_user_interaction as usize),
             ("image", image_view_image as usize),
             ("setImage:", image_view_set_image as usize),
         ],
