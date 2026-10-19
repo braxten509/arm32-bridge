@@ -353,7 +353,10 @@ with CCCrypt (Apple's encryption) and our stand-in answered "done" with
 no output, so it read a null save. `fw/crypto.rs` now does CCCrypt for
 real (AES, DES, 3DES, CAST, RC4, Blowfish; CBC/ECB; PKCS7), with Apple's
 status codes. IB1 writes its save AES-256 CBC with padding and reads it
-back without. Test switch `IOS_TRACE_MESSAGES=<regex>` logs matching
+back without. A save written by the old stand-in is 8 bytes (version
+4, 0xC0DEDBAD, no data) and IB1 crashes reading it (emulator
+reproduces it); the Pixel's was renamed `SwordSave.bin.empty-from-old-build`
+so the game starts a new save. Test switch `IOS_TRACE_MESSAGES=<regex>` logs matching
 Objective-C messages ("-[Class sel]", 50 each, with the caller); on
 Android through `debug.gamebridge.ios.env` (92 characters at most).
 
