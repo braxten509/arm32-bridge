@@ -191,6 +191,36 @@ draw to an off-screen surface, not the window.
   store_only_barriers_become_full_barriers.
 - Proof still to do: window runs on the Pixel, 3 loads + 30 min, no crash.
 
+### 15. Proof: Pixel, Game Bridge window, sound muted, 3 loads x 10.5 min
+- Script: ~/.cache/ios-debug/phone-window.sh 3 with SECS=630 TAG=proofC
+  (owner's save copied in fresh each run, walk into the second fight, then
+  dodge/swipe/block/tap inputs the whole time; owner's save put back after).
+- Predicted: with the barrier fix, no crash in 3 loads and 30+ min (before
+  the fix the owner crashed at 207 s, and attempts 10-13 crashed within a
+  few minutes in some runs).
+- Actual (2026-10-18, commit 6ae0c4a + e54f6dd): run 1, 2, 3 each reached
+  frame 37800 at 631 s, no crash, no STOP line (the only "crash" text is the
+  game's own crash reporter being refused task_threads at start-up). 31.5
+  minutes of play in total, ~60 fps (300 frames per 5.0 s, except the
+  first 14 s of loading and one 7.8 s stretch per run at ~8-9 min).
+  Earlier with the same fix: 5.2 min clean (proofA), ~10 min (proofB).
+- Conclusion: fixed. Plan item 1 done.
+
+## Final entry (2026-10-18)
+- Root cause: the game's rendering thread reads Unreal's render-command
+  ring buffer after a store-only barrier (`dsb st`), which doesn't order
+  loads; the Pixel's weakly ordered cores could read a command before it
+  was fully written, so a render command ran with junk in it. The x86
+  emulator keeps load order, which is why it never crashed there.
+- Fix: the loader makes every store-only DSB/DMB barrier in a game's
+  instruction sections a full barrier (all games, commit 6ae0c4a).
+- Evidence: attempt 14 (code read, three agreeing signs) and attempt 15
+  (31.5 min and 3 loads clean on the Pixel window where it crashed before).
+- Known risk left: FinishRead frees ring-buffer space with no barrier at all
+  (codex review); no crash seen from it. Fixing it would need an
+  engine-specific patch, which needs the owner's OK first.
+- Temporary DIAG sound logging removed after the proof.
+
 ## Sub-agent reviews
 - 2026-10-18: codex gpt-6.1-sol: see attempt 6. Took all corrections; its
   ranking (stale light pointer > sound callbacks > frame counts > target

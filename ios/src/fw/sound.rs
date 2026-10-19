@@ -196,9 +196,6 @@ extern "C" fn graph_set_node_input_callback(_graph: usize, node: i32, bus: u32, 
     let (function, data) = if callback.is_null() { (0, 0) } else { unsafe { (*callback, *callback.add(1)) } };
     let Some(unit) = with_graph(|g| g.nodes.get(&node).copied()) else { return -10866 };
     with_input(unit, bus, |input| {
-        if input.callback != 0 && (input.callback != function || input.data != data) {
-            crate::log!("DIAG audio: node {node} bus {bus} callback replaced ({:#x},{:#x}) -> ({function:#x},{data:#x})", input.callback, input.data);
-        }
         input.callback = function;
         input.data = data;
         input.generation = next_generation();
@@ -293,16 +290,6 @@ fn readable(flags: u32, bits: u32) -> bool {
 
 /// AudioUnitSetProperty(unit, id, scope, element, data, size).
 extern "C" fn unit_set_property(unit: usize, id: u32, scope: u32, element: u32, data: *const u8, size: u32) -> i32 {
-    // DIAG: each property the game sets, once (with its first word).
-    {
-        static SEEN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
-        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-        if !seen.contains(&id) {
-            seen.push(id);
-            let first = if !data.is_null() && size >= 4 { unsafe { *(data as *const u32) } } else { 0 };
-            crate::log!("DIAG audio: property {id} scope {scope} element {element} size {size} first word {first}");
-        }
-    }
     match id {
         STREAM_FORMAT if scope == INPUT_SCOPE && !data.is_null() && size >= 40 => {
             let rate = unsafe { *(data as *const f64) };
@@ -332,9 +319,6 @@ extern "C" fn unit_set_property(unit: usize, id: u32, scope: u32, element: u32, 
         SET_RENDER_CALLBACK if !data.is_null() && size >= 16 => {
             let (function, refcon) = unsafe { (*(data as *const usize), *(data as *const usize).add(1)) };
             with_input(unit, element, |input| {
-                if input.callback != 0 && (input.callback != function || input.data != refcon) {
-                    crate::log!("DIAG audio: unit {unit:#x} bus {element} callback replaced ({:#x},{:#x}) -> ({function:#x},{refcon:#x})", input.callback, input.data);
-                }
                 input.callback = function;
                 input.data = refcon;
                 input.generation = next_generation();
@@ -463,12 +447,6 @@ const MAX_CHANNELS: usize = 8;
 /// as stereo floats (left, right, ...). Anything the game doesn't give
 /// (an error, a short buffer) is silence, so timing stays right.
 fn pull(input: &Input, bus: u32, frames: usize, sample_time: f64, scratch: &mut Vec<u8>, out: &mut Vec<f32>) {
-    {
-        static BIGGEST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        if frames > BIGGEST.fetch_max(frames, Ordering::Relaxed) {
-            crate::log!("DIAG audio: biggest request so far {frames} frames (bus {bus}, rate {}, speed {})", input.rate, input.speed);
-        }
-    }
     let start = out.len();
     out.resize(start + frames * 2, 0.0);
     let callback: RenderCallback = unsafe { std::mem::transmute(input.callback) };
@@ -1271,12 +1249,6 @@ mod aaudio {
     }
 
     extern "C" fn on_data(_stream: Stream, _user: usize, data: *mut f32, frames: i32) -> i32 {
-        {
-            static BIGGEST: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-            if frames > BIGGEST.fetch_max(frames, Ordering::Relaxed) {
-                crate::log!("DIAG audio: AAudio asked for {frames} frames (most so far)");
-            }
-        }
         if !data.is_null() && frames > 0 {
             let out = unsafe { std::slice::from_raw_parts_mut(data, frames as usize * 2) };
             mix(out, OUT_RATE.load(Ordering::Relaxed));
