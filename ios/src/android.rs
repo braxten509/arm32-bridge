@@ -48,8 +48,13 @@ pub unsafe extern "C" fn Java_dev_braxten_gamebridge_IosGameActivity_nativeStart
     let _ = std::fs::create_dir_all(&home);
     std::env::set_var("IOS_HOME", &home);
     if std::env::var_os("IOS_LOG_FILE").is_none() {
+        // Each start writes a new log; the one before is kept beside it.
+        let _ = std::fs::rename(format!("{home}/ios-run.log"), format!("{home}/ios-run.prev.log"));
         std::env::set_var("IOS_LOG_FILE", format!("{home}/ios-run.log"));
     }
+    // An Apple feature we don't have yet answers "nothing" (0), as asking a
+    // missing object does on iOS, and the game carries on; the log notes it.
+    crate::trap::KEEP_GOING.store(true, Ordering::Relaxed);
     // Test switches for the game screen (it has no command line; they win
     // over the settings above, IOS_HOME included):
     // setprop debug.gamebridge.ios.env "IOS_STACKS_AT=40;IOS_TAPS=20:550,300"
@@ -90,6 +95,23 @@ pub unsafe extern "C" fn Java_dev_braxten_gamebridge_IosGameActivity_nativeStart
         }
     });
     if started.is_ok() { JNI_TRUE } else { JNI_FALSE }
+}
+
+/// nativeSetReport(game name, folder): where a report goes when the game
+/// stops by mistake (IOS_GAME_NAME, IOS_REPORT_DIR). Set here, not from
+/// Java: under the emulator's ARM translation the game's C library has its
+/// own copy of the environment.
+#[no_mangle]
+pub unsafe extern "C" fn Java_dev_braxten_gamebridge_IosGameActivity_nativeSetReport(env: *mut JNIEnv, _this: jobject, name: jstring, folder: jstring) {
+    std::env::set_var("IOS_GAME_NAME", text(env, name));
+    std::env::set_var("IOS_REPORT_DIR", text(env, folder));
+}
+
+/// nativeNoticeFd(): the end of the "game stopped" pipe the screen watches
+/// (see report::notice_pipe), or -1.
+#[no_mangle]
+pub unsafe extern "C" fn Java_dev_braxten_gamebridge_IosGameActivity_nativeNoticeFd(_env: *mut JNIEnv, _this: jobject) -> jint {
+    crate::report::notice_pipe()
 }
 
 /// The Android window the game's frames go to (to hand back when it goes).

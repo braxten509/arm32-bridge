@@ -50,12 +50,71 @@ pub fn reached_did_finish(in_game: bool, place: &str) {
     *MILESTONE.lock().unwrap() = Some((in_game, place.to_string()));
 }
 
-/// Prints the summary and ends the process.
+/// The phone app's end of the "game stopped" pipe (see notice_pipe), or -1.
+static NOTICE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// A pipe the phone app's screen watches: when the game stops by mistake,
+/// a byte arrives (1: a report was saved, 2: it couldn't be) and the screen
+/// shows a message over the game; the process ends when the player closes
+/// it. Gives the end to watch (-1 on failure).
+pub fn notice_pipe() -> i32 {
+    let mut fds = [-1i32; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return -1;
+    }
+    NOTICE.store(fds[1], std::sync::atomic::Ordering::SeqCst);
+    fds[0]
+}
+
+/// A thread that stops after another one already did waits here when the
+/// phone app shows a message: the first one ends the process or puts the
+/// message up, and the process must not end under it. The phone's main
+/// thread draws the message, so it never waits.
+fn wait_for_first_stop() {
+    let main_thread = unsafe { libc::gettid() == libc::getpid() };
+    if NOTICE.load(std::sync::atomic::Ordering::SeqCst) >= 0 && !main_thread {
+        loop {
+            unsafe { libc::pause() };
+        }
+    }
+}
+
+/// Copies the run log to IOS_REPORT_DIR as "<IOS_GAME_NAME> <date> <time>.txt",
+/// where the player can read it without root. True when it was saved.
+fn save_report() -> bool {
+    let (Some(folder), Some(log)) = (std::env::var_os("IOS_REPORT_DIR"), std::env::var_os("IOS_LOG_FILE")) else { return false };
+    let name = std::env::var("IOS_GAME_NAME").unwrap_or_else(|_| "game".into()).replace('/', "-");
+    let mut stamp = [0u8; 32];
+    let written = unsafe {
+        let now = libc::time(std::ptr::null_mut());
+        let mut parts: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&now, &mut parts);
+        libc::strftime(stamp.as_mut_ptr() as *mut libc::c_char, stamp.len(), c"%Y-%m-%d %H%M%S".as_ptr(), &parts)
+    };
+    let stamp = String::from_utf8_lossy(&stamp[..written]);
+    let target = std::path::Path::new(&folder).join(format!("{name} {stamp}.txt"));
+    let _ = std::fs::create_dir_all(&folder);
+    match std::fs::copy(&log, &target) {
+        Ok(_) => {
+            line(&format!("report saved: {}", target.display()));
+            true
+        }
+        Err(error) => {
+            line(&format!("report not saved to {}: {error}", target.display()));
+            false
+        }
+    }
+}
+
+/// Prints the summary and ends the process. When the game stopped by
+/// mistake (code not 0) on the phone, the report is saved and the game
+/// screen shows a message; the process ends when the player closes it.
 pub fn finish(code: i32) -> ! {
     static ONCE: Mutex<bool> = Mutex::new(false);
     {
         let mut done = ONCE.lock().unwrap_or_else(|e| e.into_inner());
         if *done {
+            wait_for_first_stop();
             unsafe { libc::_exit(code) };
         }
         *done = true;
@@ -112,6 +171,23 @@ pub fn finish(code: i32) -> ! {
         line(text);
     }
     let _ = std::io::stderr().flush();
+    let notice = NOTICE.load(std::sync::atomic::Ordering::SeqCst);
+    // The phone's main thread draws the message, so it can't wait for itself.
+    let main_thread = unsafe { libc::gettid() == libc::getpid() };
+    if code != 0 && notice >= 0 && !main_thread {
+        let saved = save_report();
+        unsafe {
+            libc::alarm(0);
+            let byte = if saved { 1u8 } else { 2u8 };
+            if libc::write(notice, [byte].as_ptr() as *const libc::c_void, 1) == 1 {
+                loop {
+                    libc::pause();
+                }
+            }
+        }
+    } else if code != 0 {
+        save_report();
+    }
     unsafe { libc::_exit(code) };
 }
 
@@ -187,6 +263,7 @@ fn describe_pointed_memory(registers: &[u64]) {
 /// a second crash ends at once, and a timer ends a report that hangs.
 extern "C" fn on_crash(signal: i32, info: *mut libc::siginfo_t, context: *mut libc::c_void) {
     if CRASHING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        wait_for_first_stop();
         unsafe { libc::_exit(1) };
     }
     unsafe {
@@ -249,6 +326,17 @@ pub fn call_chain() -> String {
         frame = pair[0];
     }
     text
+}
+
+/// IOS_CRASH_AT=<seconds> (test switch): at that time a thread reads a bad
+/// address, to check what the player sees when a game stops by mistake.
+pub fn schedule_test_crash() {
+    let Some(seconds) = std::env::var("IOS_CRASH_AT").ok().and_then(|v| v.parse::<f64>().ok()) else { return };
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs_f64(seconds));
+        line(&format!("test crash at {seconds} s (IOS_CRASH_AT)"));
+        unsafe { std::ptr::read_volatile(8 as *const usize) };
+    });
 }
 
 /// IOS_STACKS_AT=<seconds>: at that time every thread writes its call chain

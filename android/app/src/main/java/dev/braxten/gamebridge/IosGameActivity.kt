@@ -1,6 +1,11 @@
 package dev.braxten.gamebridge
 
 import android.app.Activity
+import android.app.AlertDialog
+import android.os.Environment
+import android.os.Looper
+import android.os.MessageQueue
+import android.os.ParcelFileDescriptor
 import android.os.Bundle
 import android.graphics.Color
 import android.view.Gravity
@@ -34,6 +39,8 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
     private var videoPlayer: VideoView? = null
     /** The game's number for the video on screen (0: none). */
     private var videoToken = 0L
+    /** The pipe the "game stopped" byte comes down, kept so it stays open. */
+    private var stopPipe: ParcelFileDescriptor? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -78,8 +85,52 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
         }
         val app = intent.getStringExtra("app") ?: run { finish(); return }
         val home = File(filesDir, "ios/" + File(app).nameWithoutExtension).path
+        val name = gameName(File(app))
+        // Where a report goes when the game stops by mistake, readable without root.
+        val reports = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "Game Bridge/logs")
         System.loadLibrary("gamebridge_ios")
-        if (nativeStart(holder.surface, app, home, width, height)) startedApp = app else finish()
+        nativeSetReport(name, reports.path)
+        if (!nativeStart(holder.surface, app, home, width, height)) {
+            finish()
+            return
+        }
+        startedApp = app
+        watchForStop(name)
+    }
+
+    /** The game's name from its Info.plist, else its folder's. */
+    private fun gameName(folder: File): String {
+        val info = runCatching { Plist.read(File(folder, "Info.plist")) as? Map<*, *> }.getOrNull()
+        fun text(key: String) = (info?.get(key) as? String)?.takeIf { it.isNotBlank() }
+        return text("CFBundleDisplayName") ?: text("CFBundleName") ?: folder.nameWithoutExtension
+    }
+
+    /**
+     * When the game stops by mistake, the iPhone layer saves a report and
+     * sends a byte down a pipe; this shows a message over the game, and the
+     * process ends when the player closes it.
+     */
+    private fun watchForStop(name: String) {
+        val fd = nativeNoticeFd()
+        if (fd < 0) return
+        val pipe = ParcelFileDescriptor.adoptFd(fd).also { stopPipe = it }
+        Looper.getMainLooper().queue.addOnFileDescriptorEventListener(pipe.fileDescriptor,
+            MessageQueue.OnFileDescriptorEventListener.EVENT_INPUT) { descriptor, _ ->
+            // 1: the report was saved, 2: it couldn't be.
+            val saved = runCatching { java.io.FileInputStream(descriptor).read() }.getOrDefault(-1) == 1
+            closeVideo()
+            AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                .setTitle("$name stopped")
+                .setMessage("Something went wrong in the game. Your progress up to its last save is kept." +
+                    if (saved) " A report was saved in Download/Game Bridge/logs." else "")
+                .setCancelable(false)
+                .setPositiveButton("OK") { _, _ ->
+                    finishAndRemoveTask()
+                    android.os.Process.killProcess(android.os.Process.myPid())
+                }
+                .show()
+            0
+        }
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
@@ -177,5 +228,7 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
     private external fun nativeTouch(finger: Int, phase: Int, x: Float, y: Float)
     private external fun nativeResize(width: Int, height: Int)
     private external fun nativePause()
+    private external fun nativeNoticeFd(): Int
+    private external fun nativeSetReport(name: String, folder: String)
     private external fun nativeResume(surface: android.view.Surface, width: Int, height: Int)
 }

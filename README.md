@@ -45,6 +45,9 @@ Backing up again only sends what changed. Restore lists the games in the backup 
 iPhone games' saves go in the same backup (Game Bridge/ios/<game>/), and with the box ticked the game folder
 too. Restoring one closes the game, puts its saves back (the replaced ones stay in the app's ios-replaced
 folder until the next restore) and copies the game folder back if it is no longer on the phone.
+If an iPhone game stops by mistake, a message shows over it and a report is saved in
+Download/Game Bridge/logs. An Apple feature the iPhone layer doesn't have yet answers "nothing" and
+the game carries on (the log notes it).
 
 **64-bit games: lifting their frame limit.** Downloaded 64-bit games show up too (apps that say they are games,
 are built with a known game engine like Unity or Unreal, or have code of their own that both draws and plays

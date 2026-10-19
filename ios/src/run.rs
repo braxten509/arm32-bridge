@@ -37,6 +37,7 @@ pub fn run(app_dir: &str) -> Result<(), String> {
     crate::report::seconds_since_start();
     crate::report::install_crash_handler();
     crate::report::schedule_stack_dump();
+    crate::report::schedule_test_crash();
     crate::libsystem::threads::note_this_thread();
     setup();
     let program = find_program(&app_dir)?;
