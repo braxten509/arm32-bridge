@@ -335,9 +335,11 @@ class MainActivity : ComponentActivity() {
                     fontWeight = FontWeight.SemiBold,
                     modifier = Modifier.weight(1f).padding(start = 18.dp, top = 22.dp, bottom = 4.dp),
                 )
+                // Asked again as files move, so the button goes as soon as the last one has.
                 val outside = games.orEmpty().filter(Games::needsMove)
-                if (setup == null && outside.isNotEmpty()) {
-                    MoveAllButton(outside.size, enabled = !busy) { move(outside) }
+                val moved = Conversions.moved
+                if (setup == null && (outside.isNotEmpty() || moved != null)) {
+                    MoveAllButton(moved?.let { (done, total) -> "Moved $done/$total" } ?: "Move all (${outside.size})", counting = moved != null, enabled = !busy) { move(outside) }
                     Spacer(Modifier.width(8.dp))
                 }
                 BackupButton(enabled = setup == null && !Conversions.moving) { backingUp = true }
@@ -490,7 +492,7 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun GameCard(game: Game, state: CardState, busy: Boolean, onConvert: () -> Unit, onReplace: () -> Unit, onRemove: () -> Unit, onRename: () -> Unit, onMove: () -> Unit, onOpen: () -> Unit) {
         // Outside the Game Bridge folder: Move comes before anything else (an installed game keeps Open).
-        val outside = remember(game) { Games.needsMove(game) }
+        val outside = remember(game, Conversions.moved) { Games.needsMove(game) }
         // Press and hold a card for its menu; a running conversion can't be removed under itself.
         var menu by remember { mutableStateOf(false) }
         // A failed card shows a short line; tapping the card shows the whole reason.
@@ -798,16 +800,18 @@ class MainActivity : ComponentActivity() {
     }
 
     /** The round backup button next to refresh: an arrow going up out of a tray. */
-    /** "Move all (N)" next to the backup button, while games are outside the Game Bridge folder. */
+    /** "Move all (N)" next to the backup button, while games are outside the Game Bridge folder; "Moved 2/6" while they move. */
     @Composable
-    private fun MoveAllButton(count: Int, enabled: Boolean, onClick: () -> Unit) {
+    private fun MoveAllButton(text: String, counting: Boolean, enabled: Boolean, onClick: () -> Unit) {
+        val colors = ButtonDefaults.buttonColors(containerColor = Accent)
         Button(
             onClick = onClick,
             enabled = enabled,
-            colors = ButtonDefaults.buttonColors(containerColor = Accent),
+            // Same look while it counts, so it doesn't turn gray.
+            colors = if (counting) ButtonDefaults.buttonColors(containerColor = Accent, disabledContainerColor = Accent, disabledContentColor = colors.contentColor) else colors,
             contentPadding = PaddingValues(horizontal = 14.dp),
             modifier = Modifier.height(40.dp),
-        ) { Text("Move all ($count)", fontSize = 13.sp) }
+        ) { Text(text, fontSize = 13.sp) }
     }
 
     /** Game Bridge's iPhone game screen runs in its own process (":ios"), alive while a game plays. */

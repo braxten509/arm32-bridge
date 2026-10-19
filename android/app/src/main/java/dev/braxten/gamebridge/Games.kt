@@ -371,10 +371,13 @@ object Games {
     /** A card's file is where it belongs. */
     private fun inPlace(file: File) = inside(file, if (isIphone(file)) IPHONE else ANDROID)
 
-    /** Each of the game's files that isn't in the Game Bridge folder yet, with the folder it goes to. */
+    /**
+     * Each of the game's files that isn't in the Game Bridge folder yet, with the folder it goes to.
+     * A file no longer there has moved (or gone), so a card stops asking as soon as it moves.
+     */
     private fun moves(game: Game): List<Pair<File, File>> = buildList {
         fun add(file: File, kind: String) {
-            if (!inside(file, kind)) folderFor(file, kind)?.let { add(file to it) }
+            if (!inside(file, kind) && file.exists()) folderFor(file, kind)?.let { add(file to it) }
         }
         game.file?.let { add(it, if (isIphone(it)) IPHONE else ANDROID) }
         game.looseData?.let { add(it.file, ANDROID) }

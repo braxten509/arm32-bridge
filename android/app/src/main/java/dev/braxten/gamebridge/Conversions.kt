@@ -25,7 +25,10 @@ object Conversions {
         private set
 
     /** True while game files move into the Game Bridge folder (a backup waits: it reads them). */
-    var moving by mutableStateOf(false)
+    val moving get() = moved != null
+
+    /** While games move: how many are done of how many. */
+    var moved by mutableStateOf<Pair<Int, Int>?>(null)
         private set
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
@@ -54,11 +57,15 @@ object Conversions {
     fun move(context: Context, games: List<Game>, onDone: (String?) -> Unit) {
         if (busy || Backups.status != null) return
         busy = true
-        moving = true
+        moved = 0 to games.size
         val appContext = context.applicationContext
         scope.launch {
-            val problem = withContext(Dispatchers.IO) { games.mapNotNull { Games.move(appContext, it) }.firstOrNull() }
-            moving = false
+            val problem = withContext(Dispatchers.IO) {
+                games.mapIndexedNotNull { index, game ->
+                    Games.move(appContext, game).also { scope.launch { moved = index + 1 to games.size } }
+                }.firstOrNull()
+            }
+            moved = null
             busy = false
             onDone(problem)
         }
