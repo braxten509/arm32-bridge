@@ -71,6 +71,11 @@ object Backups {
     var status by mutableStateOf<String?>(null)
         private set
 
+    /** While a backup runs: the game being copied, how far the whole backup is, and which game of how many. */
+    class Progress(val label: String, val percent: Int, val game: Int, val games: Int)
+    var progress by mutableStateOf<Progress?>(null)
+        private set
+
     /** The last finished run's problem, or null when it went well. */
     var problem by mutableStateOf<String?>(null)
         private set
@@ -81,6 +86,8 @@ object Backups {
     private const val FOLDER_NAME = "folder_name"
     private const val ORIGINALS = "originals"
     private const val LAST = "last"
+    private const val LAST_GAMES = "last_games"
+    private const val LAST_SIZE = "last_size"
     private const val TOP = "Game Bridge"
     private const val INFO = "info.txt"
 
@@ -131,6 +138,10 @@ object Backups {
     /** When the last backup finished (milliseconds), or 0. */
     fun lastBackup(context: Context) = preferences(context).getLong(LAST, 0)
 
+    /** How many games the last finished backup held, and their size in bytes (0 before the first). */
+    fun lastGames(context: Context) = preferences(context).getInt(LAST_GAMES, 0)
+    fun lastSize(context: Context) = preferences(context).getLong(LAST_SIZE, 0)
+
     /** Installed games Game Bridge converted, each with the original file it came from when it is on the phone. */
     fun convertedGames(context: Context, games: List<Game>): List<Pair<String, File?>> =
         context.packageManager.getInstalledApplications(PackageManager.ApplicationInfoFlags.of(0))
@@ -169,11 +180,13 @@ object Backups {
         status = "Getting ready…"
         problem = null
         scope.launch {
-            val failure = withContext(Dispatchers.IO) {
-                runCatching { backUpAll(appContext, games, iphone, originals) }.exceptionOrNull()
-            }
+            val result = withContext(Dispatchers.IO) { runCatching { backUpAll(appContext, games, iphone, originals) } }
+            val failure = result.exceptionOrNull()
             problem = failure?.let { "The backup stopped: ${it.message ?: it.javaClass.simpleName}" }
-            if (failure == null) preferences(appContext).edit().putLong(LAST, System.currentTimeMillis()).apply()
+            result.getOrNull()?.let { (count, size) ->
+                preferences(appContext).edit().putLong(LAST, System.currentTimeMillis()).putInt(LAST_GAMES, count).putLong(LAST_SIZE, size).apply()
+            }
+            progress = null
             status = null
             onDone()
         }
@@ -188,7 +201,8 @@ object Backups {
     /** Files a backup without originals leaves alone: Android games' original files and iPhone game folders. */
     private fun isOriginal(path: String) = path.startsWith("original/") || path.startsWith("app/")
 
-    private fun backUpAll(context: Context, games: List<Pair<String, File?>>, iphone: List<IphoneSave>, originals: Boolean) {
+    /** Returns how many games it backed up and their size in bytes. */
+    private fun backUpAll(context: Context, games: List<Pair<String, File?>>, iphone: List<IphoneSave>, originals: Boolean): Pair<Int, Long> {
         val tree = folder(context) ?: throw IllegalStateException("pick a backup folder first")
         val top = child(context, tree, root(tree), TOP, directory = true)
         val packages = context.packageManager
@@ -226,8 +240,13 @@ object Backups {
         }
         val total = plans.sumOf { plan -> plan.items.sumOf { it.size } }.coerceAtLeast(1)
         var done = 0L
-        for (plan in plans) {
+        for ((index, plan) in plans.withIndex()) {
             val label = plan.label
+            fun show(percent: Int) = scope.launch {
+                status = "Backing up $label · $percent%"
+                progress = Progress(label, percent, index + 1, plans.size)
+            }
+            show((done * 100 / total).toInt())
             val items = plan.items
             val gameFolder = child(context, tree, top, plan.folder, directory = true)
             val savedInfo = readInfo(context, tree, gameFolder)
@@ -265,7 +284,7 @@ object Backups {
                             val percent = (done * 100 / total).toInt()
                             if (percent != lastShown) {
                                 lastShown = percent
-                                scope.launch { status = "Backing up $label · $percent%" }
+                                show(percent)
                             }
                         }
                     }
@@ -292,6 +311,7 @@ object Backups {
             val target = child(context, tree, gameFolder, INFO, directory = false)
             context.contentResolver.openOutputStream(target, "wt")!!.use { it.write(text.toByteArray()) }
         }
+        return plans.size to plans.sumOf { plan -> plan.items.sumOf { it.size } }
     }
 
     /** The games in the backup folder whose backups are complete. */

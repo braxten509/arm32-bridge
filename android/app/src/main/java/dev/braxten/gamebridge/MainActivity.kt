@@ -19,6 +19,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -46,20 +47,27 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.BottomSheetDefaults
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CheckboxDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -108,6 +116,9 @@ private val CheckboxInset = 14.dp
 
 /** The space between a text button's edge and its text. */
 private val TextButtonInset = 12.dp
+
+/** The backup panel's outlined buttons: a faint accent edge. */
+private val SheetOutline = BorderStroke(1.dp, Accent.copy(alpha = 0.4f))
 
 /**
  * Where the folder picker opens. Left to itself it opens the last folder used, and a cloud
@@ -314,7 +325,7 @@ class MainActivity : ComponentActivity() {
             if (Backups.status != null) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         }
-        if (backingUp) BackupDialog(games.orEmpty(), onDismiss = { backingUp = false }, onRestore = { backingUp = false; restoring = true })
+        if (backingUp) BackupSheet(games.orEmpty(), onDismiss = { backingUp = false }, onRestore = { backingUp = false; restoring = true })
         if (restoring) RestoreDialog(onDismiss = { restoring = false }, onRestored = ::refresh)
 
         // Searching the whole phone takes a moment, so only when the app opens (above) and on the refresh button.
@@ -851,12 +862,23 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Backs up every converted game with its game data files to the folder picked with Android's
-     * folder picker; the box adds the original downloaded files. Restore opens the restore window.
+     * The backup panel, up from the bottom: the folder, whether original files go too, and the last
+     * backup, then Restore and Back up. While a backup runs it shows the game being copied and how
+     * far the whole backup is; when one finishes here, what it saved.
      */
+    @OptIn(ExperimentalMaterial3Api::class)
     @Composable
-    private fun BackupDialog(games: List<Game>, onDismiss: () -> Unit, onRestore: () -> Unit) {
+    private fun BackupSheet(games: List<Game>, onDismiss: () -> Unit, onRestore: () -> Unit) {
         val context = this@MainActivity
+        val scope = rememberCoroutineScope()
+        val sheet = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+        // Slides down first, then goes (not when the slide was stopped, by a drag, and it stays open).
+        fun close(then: () -> Unit) {
+            scope.launch {
+                sheet.hide()
+                if (!sheet.isVisible) then()
+            }
+        }
         var folder by remember { mutableStateOf(Backups.folder(context)) }
         var originals by remember { mutableStateOf(Backups.run { loadChoices(context); keepOriginals }) }
         var converted by remember { mutableStateOf<List<Pair<String, java.io.File?>>?>(null) }
@@ -877,70 +899,117 @@ class MainActivity : ComponentActivity() {
             }
         }
         val status = Backups.status
-        // Whether a backup ran while this window was open, so the button that closes it says Done afterwards.
+        // Whether a backup ran while this panel was open, so it shows what it saved afterwards.
         var ran by remember { mutableStateOf(status != null) }
         LaunchedEffect(status) { if (status != null) ran = true }
         val count = converted?.let { it.size + iphone.size }
-        AlertDialog(
+        val folderText = if (folder == null) "Not chosen yet" else folderName ?: "Loading…"
+        ModalBottomSheet(
             onDismissRequest = onDismiss,
+            sheetState = sheet,
             containerColor = CardColor,
-            title = { Text("Back up games", color = Color(0xFFE8E8EE)) },
-            text = {
-                Column {
-                    if (status != null) {
-                        Text(status, color = Color(0xFFE8E8EE), fontSize = 14.sp)
-                        Text("Keep Game Bridge open until it finishes.", color = Muted, fontSize = 12.sp, modifier = Modifier.padding(top = 6.dp))
-                        return@Column
+            scrimColor = Color.Black.copy(alpha = 0.55f),
+            dragHandle = { BottomSheetDefaults.DragHandle(color = Track) },
+        ) {
+            Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 24.dp)) {
+                Text("Backups", color = Color(0xFFE8E8EE), fontSize = 20.sp, fontWeight = FontWeight.SemiBold)
+                Spacer(Modifier.height(6.dp))
+                val progress = Backups.progress
+                when {
+                    status != null -> {
+                        Row(Modifier.fillMaxWidth().padding(top = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Text(progress?.let { "Backing up ${it.label}" } ?: status, color = Color(0xFFE8E8EE), fontSize = 15.sp, maxLines = 1,
+                                overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                            progress?.let { Text("${it.percent}%", color = AccentText, fontSize = 15.sp, modifier = Modifier.padding(start = 12.dp)) }
+                        }
+                        LinearProgressIndicator(
+                            progress = { (progress?.percent ?: 0) / 100f },
+                            color = Accent,
+                            trackColor = Track,
+                            drawStopIndicator = {},
+                            gapSize = 0.dp,
+                            modifier = Modifier.fillMaxWidth().padding(top = 12.dp).height(6.dp).clip(RoundedCornerShape(3.dp)),
+                        )
+                        Text((progress?.let { "Game ${it.game} of ${it.games} · " } ?: "") + "keep Game Bridge open", color = Muted, fontSize = 12.sp,
+                            modifier = Modifier.padding(top = 8.dp))
+                        OutlinedButton(onClick = { close(onDismiss) }, border = SheetOutline, modifier = Modifier.fillMaxWidth().padding(top = 22.dp).height(44.dp)) {
+                            Text("Hide", color = AccentText, fontSize = 14.sp)
+                        }
                     }
-                    val what = when (count) {
-                        null -> "Looking for converted games…"
-                        0 -> "No converted games or iPhone game saves yet."
-                        1 -> "1 game and its data files or saves go to:"
-                        else -> "$count games and their data files and saves go to:"
+                    ran && Backups.problem == null -> {
+                        val size = android.text.format.Formatter.formatShortFileSize(context, Backups.lastSize(context))
+                        val saved = Backups.lastGames(context)
+                        SheetRow("Backed up just now", "$saved ${if (saved == 1) "game" else "games"} · $size") {
+                            Text("✓", color = AccentText, fontSize = 18.sp)
+                        }
+                        SheetRow("Folder", folderText, divider = false) {}
+                        Button(
+                            onClick = { close(onDismiss) },
+                            colors = ButtonDefaults.buttonColors(containerColor = Accent, contentColor = Color.White),
+                            modifier = Modifier.fillMaxWidth().padding(top = 20.dp).height(44.dp),
+                        ) { Text("Done", fontSize = 14.sp) }
                     }
-                    Text(what, color = Muted, fontSize = 14.sp)
-                    Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Text(if (folder == null) "No folder chosen" else folderName ?: "Loading…", color = Color(0xFFE8E8EE), fontSize = 14.sp, maxLines = 2,
-                            overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
-                        TextButton(onClick = { pick.launch(PHONE_STORAGE) }, modifier = Modifier.bleed(end = TextButtonInset)) { Text(if (folder == null) "Choose" else "Change", color = AccentText) }
+                    else -> {
+                        SheetRow("Folder", folderText) {
+                            TextButton(onClick = { pick.launch(PHONE_STORAGE) }, modifier = Modifier.bleed(end = TextButtonInset)) {
+                                Text(if (folder == null) "Choose" else "Change", color = AccentText, fontSize = 14.sp)
+                            }
+                        }
+                        val toggle = { value: Boolean -> originals = value; Backups.setKeepOriginals(context, value) }
+                        SheetRow("Original game files", "Also keep the APKs and iPhone game folders", onClick = { toggle(!originals) }) {
+                            Switch(originals, onCheckedChange = toggle, colors = SwitchDefaults.colors(
+                                checkedTrackColor = Accent, checkedThumbColor = Color.White,
+                                uncheckedTrackColor = Track, uncheckedThumbColor = Muted, uncheckedBorderColor = Track,
+                            ))
+                        }
+                        val last = Backups.lastBackup(context)
+                        val lastText = when {
+                            count == null -> "Looking for games…"
+                            count == 0 -> "Nothing to back up yet"
+                            Backups.problem != null -> "Didn't finish"
+                            last == 0L -> "Never"
+                            // Backups from before Game Bridge counted their games say only when.
+                            else -> (if (System.currentTimeMillis() - last < DateUtils.MINUTE_IN_MILLIS) "Just now" else DateUtils.getRelativeTimeSpanString(last).toString()) +
+                                Backups.lastGames(context).let { if (it > 0) " · $it ${if (it == 1) "game" else "games"}" else "" }
+                        }
+                        SheetRow("Last backup", lastText, divider = Backups.problem == null) {}
+                        Backups.problem?.let { Text(it, color = ErrorText, fontSize = 12.sp, modifier = Modifier.padding(top = 10.dp)) }
+                        val canBackUp = folder != null && (count ?: 0) > 0
+                        val canRestore = folder != null
+                        Row(Modifier.fillMaxWidth().padding(top = 20.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            OutlinedButton(enabled = canRestore, onClick = { close(onRestore) }, border = if (canRestore) SheetOutline else BorderStroke(1.dp, Track),
+                                modifier = Modifier.weight(1f).height(44.dp)) {
+                                Text("Restore", color = if (canRestore) AccentText else Muted, fontSize = 14.sp)
+                            }
+                            Button(
+                                enabled = canBackUp,
+                                onClick = { Backups.backUp(context, converted.orEmpty(), iphone, originals) },
+                                colors = ButtonDefaults.buttonColors(containerColor = Accent, contentColor = Color.White, disabledContainerColor = Track, disabledContentColor = Muted),
+                                modifier = Modifier.weight(1.4f).height(44.dp),
+                            ) { Text(if (Backups.problem != null) "Try again" else "Back up", fontSize = 14.sp) }
+                        }
                     }
-                    Row(
-                        Modifier.padding(top = 4.dp).bleed(start = CheckboxInset).clip(RoundedCornerShape(8.dp)).clickable {
-                            originals = !originals
-                            Backups.setKeepOriginals(context, originals)
-                        }.padding(end = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Checkbox(originals, onCheckedChange = { originals = it; Backups.setKeepOriginals(context, it) },
-                            colors = CheckboxDefaults.colors(checkedColor = Accent, uncheckedColor = AccentText))
-                        Text("Also back up the original files", color = Color(0xFFE8E8EE), fontSize = 14.sp)
-                    }
-                    val last = Backups.lastBackup(context)
-                    if (last > 0) {
-                        Text("Last backup: ${DateUtils.getRelativeTimeSpanString(last)}", color = Muted, fontSize = 12.sp, modifier = Modifier.padding(top = 6.dp))
-                    }
-                    Backups.problem?.let { Text(it, color = ErrorText, fontSize = 13.sp, modifier = Modifier.padding(top = 8.dp)) }
                 }
-            },
-            // All three spread over the full width: Restore's text starts where the text above
-            // starts and Back up's ends where it ends (bleed undoes the buttons' inner padding).
-            confirmButton = {
-                val canBackUp = status == null && folder != null && (count ?: 0) > 0
-                val canRestore = status == null && folder != null
-                val close = when {
-                    status != null -> "Hide"
-                    ran && Backups.problem == null -> "Done"
-                    else -> "Cancel"
+            }
+        }
+    }
+
+    /** One row of the backup panel: a name with a line under it, and its control on the right. */
+    @Composable
+    private fun SheetRow(title: String, detail: String, divider: Boolean = true, onClick: (() -> Unit)? = null, end: @Composable () -> Unit) {
+        Column {
+            Row(
+                Modifier.fillMaxWidth().then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier).padding(vertical = 13.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f).padding(end = 12.dp)) {
+                    Text(title, color = Color(0xFFE8E8EE), fontSize = 15.sp)
+                    Text(detail, color = Muted, fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 2.dp))
                 }
-                Row(Modifier.bleed(TextButtonInset, TextButtonInset).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    TextButton(enabled = canRestore, onClick = onRestore) { Text("Restore", color = if (canRestore) AccentText else Muted) }
-                    TextButton(onClick = onDismiss) { Text(close, color = AccentText) }
-                    TextButton(enabled = canBackUp, onClick = { Backups.backUp(context, converted.orEmpty(), iphone, originals) }) {
-                        Text("Back up", color = if (canBackUp) AccentText else Muted)
-                    }
-                }
-            },
-        )
+                end()
+            }
+            if (divider) HorizontalDivider(color = Track)
+        }
     }
 
     /**
