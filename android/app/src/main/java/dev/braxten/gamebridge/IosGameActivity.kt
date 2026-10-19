@@ -31,6 +31,8 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
         private var startedApp: String? = null
         /** The player left and the game let go of its window; it waits for a new one. */
         private var away = false
+        /** Game screens open in this process (a new one may open as an old one closes). */
+        private var screens = 0
     }
     private val started get() = startedApp != null
     private lateinit var root: FrameLayout
@@ -49,6 +51,7 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
     private var stopPipe: ParcelFileDescriptor? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        screens++
         super.onCreate(savedInstanceState)
         if (switchingGames(intent)) return
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -71,9 +74,12 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
         switchingGames(intent)
     }
 
+    /** The game's folder; a shortcut made before the game moved into the Game Bridge folder still has the old one. */
+    private fun appFolder(intent: android.content.Intent) = intent.getStringExtra("app")?.let { Games.current(this, File(it)).path }
+
     /** Another game asked for while one runs here: start this process over for it. */
     private fun switchingGames(intent: android.content.Intent): Boolean {
-        val app = intent.getStringExtra("app") ?: return false
+        val app = appFolder(intent) ?: return false
         if (startedApp == null || startedApp == app) return false
         startActivity(intent)
         android.os.Process.killProcess(android.os.Process.myPid())
@@ -92,7 +98,7 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
             }
             return
         }
-        val app = intent.getStringExtra("app") ?: run { finish(); return }
+        val app = appFolder(intent) ?: run { finish(); return }
         val home = File(filesDir, "ios/" + File(app).nameWithoutExtension).path
         val name = gameName(File(app))
         // Where a report goes when the game stops by mistake, readable without root.
@@ -127,7 +133,7 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
      * on a 90 or 144 Hz screen would show its frames unevenly).
      */
     private fun useTopRefreshRate() {
-        val app = intent.getStringExtra("app") ?: return
+        val app = appFolder(intent) ?: return
         if (!File(app, "CookedIPhone/UE3CommandLine.txt").exists()) return
         val mode = topMode() ?: return
         window.attributes = window.attributes.apply { preferredDisplayModeId = mode.modeId }
@@ -167,6 +173,29 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
                 .show()
             0
         }
+    }
+
+    /**
+     * Closing the game's window (swiped away in the recent apps) ends the game: the process
+     * would otherwise keep it, frozen in the background, until Game Bridge is closed. The game
+     * was told it is in the background when its window went; it ends once it has answered that
+     * (games save then), or after 10 seconds. Leaving with Home keeps it, so it goes on where it was.
+     */
+    override fun onDestroy() {
+        super.onDestroy()
+        screens--
+        if (isFinishing && started) endWhenSettled(System.currentTimeMillis() + 10_000)
+    }
+
+    private fun endWhenSettled(deadline: Long) {
+        android.os.Handler(mainLooper).postDelayed({
+            when {
+                // Opened again meanwhile: it goes on.
+                screens > 0 -> {}
+                nativeSettled() || System.currentTimeMillis() > deadline -> android.os.Process.killProcess(android.os.Process.myPid())
+                else -> endWhenSettled(deadline)
+            }
+        }, 250)
     }
 
     // Android's video player lets go of its video while the app is away and,
@@ -295,6 +324,7 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
     }
 
     private external fun nativeVideoEnded(token: Long)
+    private external fun nativeSettled(): Boolean
 
     private external fun nativeStart(surface: android.view.Surface, app: String, home: String, width: Int, height: Int): Boolean
     private external fun nativeTouch(finger: Int, phase: Int, x: Float, y: Float)

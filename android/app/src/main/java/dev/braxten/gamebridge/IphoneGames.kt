@@ -45,6 +45,13 @@ object IphoneGames {
             .build()
     }
 
+    /** Shortcuts already made (pinned or in the icon menu) get the game's folder as it is now, after a move. */
+    fun updateShortcuts(context: Context, games: List<Game>) {
+        val shortcuts = context.getSystemService(ShortcutManager::class.java) ?: return
+        val iphone = games.filter { it.action == Action.PlayIphone && it.file != null }
+        if (iphone.isNotEmpty()) runCatching { shortcuts.updateShortcuts(iphone.map { shortcut(context, it) }) }
+    }
+
     /** The game shows in Game Bridge's own icon menu (press and hold it), most recent first. */
     private fun publish(context: Context, game: Game) {
         val shortcuts = context.getSystemService(ShortcutManager::class.java) ?: return

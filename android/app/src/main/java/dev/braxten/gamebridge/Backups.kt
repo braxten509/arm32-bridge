@@ -164,7 +164,7 @@ object Backups {
 
     /** Backs up every converted game (and its original file when `originals`) and every iPhone game's saves (and its game folder when `originals`). Runs in the background; `status` follows it. */
     fun backUp(context: Context, games: List<Pair<String, File?>>, iphone: List<IphoneSave>, originals: Boolean, onDone: () -> Unit = {}) {
-        if (status != null) return
+        if (status != null || Conversions.moving) return
         val appContext = context.applicationContext
         status = "Getting ready…"
         problem = null
@@ -394,7 +394,7 @@ object Backups {
 
     /**
      * Puts an iPhone game's saves back as they were backed up (the game is closed first), and its
-     * game folder where it was (or in Download/ios) when it's no longer there. The saves it replaces
+     * game folder in Game Bridge/iPhone when it's no longer on the phone. The saves it replaces
      * are kept in files/ios-replaced/<name> until the next restore of that game.
      */
     private fun restoreIphone(context: Context, tree: Uri, game: SavedGame, onProgress: (String) -> Unit): String? {
@@ -403,15 +403,16 @@ object Backups {
         val staging = File(homes, "$name.restoring").apply { deleteRecursively() }
         try {
             val files = readInfo(context, tree, game.folder)?.files ?: return "The backup of ${game.label} is incomplete."
-            val placed = game.place?.let(::File)
+            // Where Game Bridge moved it since, when it did.
+            val placed = game.place?.let { Games.current(context, File(it)) }
             val download = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "ios")
+            val folderName = placed?.name ?: "$name.app"
             // The game folder comes back only when it isn't on the phone any more.
             val appTarget = when {
                 files.keys.none { it.startsWith("app/") } -> null
                 placed != null && File(placed, "Info.plist").isFile -> null
-                File(download, placed?.name ?: "$name.app").let { File(it, "Info.plist").isFile } -> null
-                placed != null && (placed.parentFile?.let { it.isDirectory && it.canWrite() } == true) -> placed
-                else -> File(download, placed?.name ?: "$name.app")
+                listOf(Games.iphoneFolder(), download).any { File(File(it, folderName), "Info.plist").isFile } -> null
+                else -> File(Games.iphoneFolder(), folderName)
             }
             val wanted = files.filterKeys { it.startsWith("save/") || (appTarget != null && it.startsWith("app/")) }
             val total = wanted.values.sum().coerceAtLeast(1)

@@ -57,7 +57,14 @@ class Game(
     val dataFile: String? = null,
     /** Its data file (or an older version's, which it may use) found on the phone, to copy into place on install. */
     val looseData: DataSource? = null,
+    /** Other files of the same game and version (only one shows as the card); they move to Game Bridge/Originals. */
+    val copies: List<File> = emptyList(),
+    /** Other data files on the phone that fit it (older versions, a second copy): they move to Game Bridge/Originals. */
+    val otherData: List<File> = emptyList(),
 ) {
+    fun copy(file: File? = this.file, place: String = this.place, looseData: DataSource? = this.looseData, copies: List<File> = this.copies) =
+        Game(file, place, label, packageName, versionCode, icon, action, dataFile, looseData, copies, otherData)
+
     /** One game split over several APKs in one file (.xapk, .apkm, .apks). */
     val isBundle get() = file != null && Games.isBundle(file)
 
@@ -88,10 +95,13 @@ object Games {
         }
         val (dataFiles, gameFiles) = found.partition { (file, _) -> file.name.endsWith(".obb", ignoreCase = true) || isZip(file) }
         val loose = dataFiles.map { (file, _) -> file }
-        // The same game and version found twice shows once.
+        // The same game and version found twice shows once: the file already in Game Bridge/Android or
+        // /iPhone, else the first one, else one in Game Bridge/Originals. The others are its copies.
         val games = gameFiles
             .mapNotNull { (file, place) -> remembered(file) { read(context, file, place) }?.let { withLooseData(named(context, it), loose) } }
-            .distinctBy { it.packageName to it.versionCode }
+            .sortedBy { game -> game.file?.let { if (inPlace(it)) 0 else if (inside(it, ORIGINALS)) 2 else 1 } ?: 1 }
+            .groupBy { it.packageName to it.versionCode }.values
+            .map { same -> same.first().copy(copies = same.drop(1).mapNotNull { it.file }) }
         val withFiles = games.map { it.packageName }.toSet()
         val installed = installed(context, loose)
         // Files that are gone (deleted, or a game's old APK after an update) are forgotten.
@@ -166,8 +176,12 @@ object Games {
             .put("loose", game.looseData?.let {
                 JSONObject().put("file", it.file.path).put("entry", it.entry ?: JSONObject.NULL).put("name", it.name).put("size", it.size)
             } ?: JSONObject.NULL)
+            .put("copies", JSONArray(game.copies.map { it.path }))
+            .put("otherData", JSONArray(game.otherData.map { it.path }))
         return json to icon
     }
+
+    private fun files(paths: JSONArray?) = paths?.let { (0 until it.length()).map { index -> File(it.getString(index)) } }.orEmpty()
 
     private fun gameFrom(json: JSONObject, icons: File): Game {
         fun text(name: String) = if (json.isNull(name)) null else json.getString(name)
@@ -177,6 +191,7 @@ object Games {
         return Game(
             text("file")?.let(::File), json.getString("place"), json.getString("label"), json.getString("package"), json.getLong("version"),
             text("icon")?.let { BitmapFactory.decodeFile(File(icons, it).path) }, Action.valueOf(json.getString("action")), text("data"), loose,
+            files(json.optJSONArray("copies")), files(json.optJSONArray("otherData")),
         )
     }
 
@@ -265,10 +280,13 @@ object Games {
         val (zips, loose) = found.partition(::isZip)
         // A known file of the wrong size is damaged or another one: as good as missing.
         fun usable(source: DataSource) = fits(source.name, game) && knownData[source.name]?.let { it.size == source.size } ?: true
-        val sources = loose.map { DataSource(it, null, it.name, it.length()) }.filter(::usable)
-            .ifEmpty { zips.flatMap { zipped(it, game) }.filter(::usable) }
-        val best = sources.maxByOrNull { dataVersion(it.name, game.packageName)!! }
-        return Game(game.file, game.place, game.label, game.packageName, game.versionCode, game.icon, game.action, data, best)
+        val looseSources = loose.map { DataSource(it, null, it.name, it.length()) }.filter(::usable)
+        val zipSources = zips.flatMap { zipped(it, game) }.filter(::usable)
+        // Of the newest, one already in the Game Bridge folder, so moving settles on it.
+        val best = looseSources.ifEmpty { zipSources }
+            .maxWithOrNull(compareBy({ dataVersion(it.name, game.packageName)!! }, { inside(it.file, ANDROID) }))
+        val others = (looseSources + zipSources).map { it.file }.distinct().filter { it != best?.file }
+        return Game(game.file, game.place, game.label, game.packageName, game.versionCode, game.icon, game.action, data, best, otherData = others)
     }
 
     /** The game's data files inside `zip` (only its file list is read). */
@@ -328,6 +346,91 @@ object Games {
 
     private fun isRoot(folder: File) = folder == Environment.getExternalStorageDirectory() ||
         folder.parentFile?.path == "/storage"
+
+    /**
+     * Every game lives in one folder at the top of its drive, so backing up that folder backs up
+     * every game: APKs, bundles and their data files in Game Bridge/Android, iPhone games in
+     * Game Bridge/iPhone, other copies of a game in Game Bridge/Originals. A file stays on its
+     * drive: moving it there is instant, and moving between drives would mean copying.
+     */
+    const val FOLDER = "Game Bridge"
+    private const val ANDROID = "Android"
+    private const val IPHONE = "iPhone"
+    private const val ORIGINALS = "Originals"
+
+    /** The top of the drive `file` is on (phone storage, an SD card), or null. */
+    private fun driveOf(file: File): File? = generateSequence(file.absoluteFile.parentFile) { it.parentFile }.firstOrNull(::isRoot)
+
+    private fun folderFor(file: File, kind: String) = driveOf(file)?.let { File(File(it, FOLDER), kind) }
+
+    /** `file` is somewhere in Game Bridge/`kind` (inside folders of the owner's own too). */
+    private fun inside(file: File, kind: String) = folderFor(file, kind)?.let { file.path.startsWith(it.path + "/") } == true
+
+    private fun isIphone(file: File) = file.isDirectory && file.name.endsWith(".app", ignoreCase = true)
+
+    /** A card's file is where it belongs. */
+    private fun inPlace(file: File) = inside(file, if (isIphone(file)) IPHONE else ANDROID)
+
+    /** Each of the game's files that isn't in the Game Bridge folder yet, with the folder it goes to. */
+    private fun moves(game: Game): List<Pair<File, File>> = buildList {
+        fun add(file: File, kind: String) {
+            if (!inside(file, kind)) folderFor(file, kind)?.let { add(file to it) }
+        }
+        game.file?.let { add(it, if (isIphone(it)) IPHONE else ANDROID) }
+        game.looseData?.let { add(it.file, ANDROID) }
+        game.copies.forEach { add(it, ORIGINALS) }
+        // Spare data files anywhere in the Game Bridge folder stay put.
+        game.otherData.filter { !inside(it, ANDROID) }.forEach { add(it, ORIGINALS) }
+    }
+
+    /** The card shows Move instead of its other buttons until this is false. */
+    fun needsMove(game: Game) = moves(game).isNotEmpty()
+
+    /**
+     * Moves the game's files into the Game Bridge folder; a problem to show, or null. Each file keeps
+     * its name (a game data file is found by its name, an iPhone game's saves go by its folder's), so
+     * a name already taken there goes in a numbered folder inside it ("2", "3", …).
+     */
+    fun move(context: Context, game: Game): String? {
+        val problems = mutableListOf<String>()
+        for ((file, folder) in moves(game)) {
+            // Moved already (a data file two versions share).
+            if (!file.exists()) continue
+            val target = generateSequence(1) { it + 1 }.map { File(if (it == 1) folder else File(folder, "$it"), file.name) }.first { !it.exists() }
+            target.parentFile!!.mkdirs()
+            if (!file.renameTo(target)) {
+                problems += "${file.name} couldn't be moved to ${target.parentFile!!.relativeTo(driveOf(target)!!).path}."
+                continue
+            }
+            if (isIphone(target)) remember(context, file, target)
+            // What was read about it still holds (moving keeps its size and date), so it isn't read again.
+            seen.remove(file.path)?.let { entry ->
+                val place = storageRoots(context).firstOrNull { (root, _) -> target.path.startsWith(root.path + "/") }
+                    ?.let { (root, name) -> place(root, name, target) } ?: entry.game?.place.orEmpty()
+                seen[target.path] = Seen(entry.length, entry.modified, entry.game?.copy(file = target, place = place))
+            }
+        }
+        return problems.firstOrNull()
+    }
+
+    private const val MOVED = "moved-folders"
+
+    /** An iPhone game's old folder → its new one, for home-screen apps and shortcuts that still have the old one. */
+    private fun remember(context: Context, from: File, to: File) {
+        context.getSharedPreferences(MOVED, Context.MODE_PRIVATE).edit().putString(from.path, to.path).commit()
+    }
+
+    /** Where an iPhone game folder is now: `folder` itself, or where Game Bridge moved it. */
+    fun current(context: Context, folder: File): File {
+        val moved = context.getSharedPreferences(MOVED, Context.MODE_PRIVATE)
+        // Moved more than once: follow each step (a few at most, so a loop of entries can't hang).
+        return generateSequence(folder) { from -> if (File(from, "Info.plist").isFile) null
+            else (moved.getString(from.path, null) ?: moved.getString(from.canonicalPath, null))?.let(::File) }
+            .take(8).last()
+    }
+
+    /** Where iPhone games go on the phone's own storage. */
+    fun iphoneFolder() = File(File(Environment.getExternalStorageDirectory(), FOLDER), IPHONE)
 
     /** "Download", "Documents/Games", or the drive's name for files on an SD card. */
     private fun place(root: File, rootName: String, file: File): String {

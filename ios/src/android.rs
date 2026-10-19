@@ -149,6 +149,13 @@ pub unsafe extern "C" fn Java_dev_braxten_gamebridge_IosGameActivity_nativePause
     crate::fw::app::change_state(true);
 }
 
+/// nativeSettled(): the game has finished answering its last change of state
+/// (it saves when told it is in the background), so its process may end.
+#[no_mangle]
+pub extern "C" fn Java_dev_braxten_gamebridge_IosGameActivity_nativeSettled(_env: *mut JNIEnv, _this: jobject) -> jboolean {
+    crate::fw::app::settled() as jboolean
+}
+
 /// nativeResume(surface, width, height): the player came back with a new window.
 #[no_mangle]
 pub unsafe extern "C" fn Java_dev_braxten_gamebridge_IosGameActivity_nativeResume(

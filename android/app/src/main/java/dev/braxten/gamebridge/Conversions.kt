@@ -20,8 +20,12 @@ object Conversions {
     /** Each game's card, by package name. */
     val states = mutableStateMapOf<String, CardState>()
 
-    /** True while a conversion runs (one at a time: they share a work folder). */
+    /** True while a conversion runs (one at a time: they share a work folder), or while game files move. */
     var busy by mutableStateOf(false)
+        private set
+
+    /** True while game files move into the Game Bridge folder (a backup waits: it reads them). */
+    var moving by mutableStateOf(false)
         private set
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
@@ -43,6 +47,20 @@ object Conversions {
                 is Outcome.OtherCopy -> CardState.OtherCopy
             }
             busy = false
+        }
+    }
+
+    /** Moves the games' files into the Game Bridge folder, then `onDone` with the first problem, or null. */
+    fun move(context: Context, games: List<Game>, onDone: (String?) -> Unit) {
+        if (busy || Backups.status != null) return
+        busy = true
+        moving = true
+        val appContext = context.applicationContext
+        scope.launch {
+            val problem = withContext(Dispatchers.IO) { games.mapNotNull { Games.move(appContext, it) }.firstOrNull() }
+            moving = false
+            busy = false
+            onDone(problem)
         }
     }
 }

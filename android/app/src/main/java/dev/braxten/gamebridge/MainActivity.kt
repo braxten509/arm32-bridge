@@ -1,5 +1,6 @@
 package dev.braxten.gamebridge
 
+import android.app.ActivityManager
 import android.content.ComponentName
 import android.content.Intent
 import android.net.Uri
@@ -258,6 +259,26 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        /**
+         * Moves the games' files into the Game Bridge folder, then searches again. Not while a backup
+         * reads them, nor an iPhone game's folder while an iPhone game runs.
+         */
+        fun move(moving: List<Game>) {
+            val problem = when {
+                Backups.status != null -> "Wait for the backup to finish, then move."
+                moving.any { it.action == Action.PlayIphone } && iphoneGameRunning() -> "Close the iPhone game first, then move."
+                else -> null
+            }
+            if (problem != null) {
+                Toast.makeText(this@MainActivity, problem, Toast.LENGTH_LONG).show()
+                return
+            }
+            Conversions.move(this@MainActivity, moving) { moveProblem ->
+                moveProblem?.let { Toast.makeText(this@MainActivity, it, Toast.LENGTH_LONG).show() }
+                refresh()
+            }
+        }
+
         /** Uninstalls the game and/or deletes its file, then searches again so the card updates or goes. */
         fun remove(game: Game, uninstall: Boolean, deleteFile: Boolean) {
             scope.launch {
@@ -314,7 +335,12 @@ class MainActivity : ComponentActivity() {
                     fontWeight = FontWeight.SemiBold,
                     modifier = Modifier.weight(1f).padding(start = 18.dp, top = 22.dp, bottom = 4.dp),
                 )
-                BackupButton(enabled = setup == null) { backingUp = true }
+                val outside = games.orEmpty().filter(Games::needsMove)
+                if (setup == null && outside.isNotEmpty()) {
+                    MoveAllButton(outside.size, enabled = !busy) { move(outside) }
+                    Spacer(Modifier.width(8.dp))
+                }
+                BackupButton(enabled = setup == null && !Conversions.moving) { backingUp = true }
                 Spacer(Modifier.width(8.dp))
                 RefreshButton(enabled = !searching && setup == null, spinning = searching && setup == null, onClick = ::refresh)
             }
@@ -335,7 +361,7 @@ class MainActivity : ComponentActivity() {
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
                     items(games!!, key = { it.file?.path ?: it.packageName }) { game ->
-                        GameCard(game, states[game.packageName] ?: CardState.Ready, busy, onConvert = { if (game.action == Action.PlayIphone) IphoneGames.play(this@MainActivity, game) else convert(game) }, onReplace = { replacing = game }, onRemove = { removing = game }, onRename = { renaming = game }, onOpen = {
+                        GameCard(game, states[game.packageName] ?: CardState.Ready, busy, onConvert = { if (game.action == Action.PlayIphone) IphoneGames.play(this@MainActivity, game) else convert(game) }, onReplace = { replacing = game }, onRemove = { removing = game }, onRename = { renaming = game }, onMove = { move(listOf(game)) }, onOpen = {
                             packageManager.getLaunchIntentForPackage(game.packageName)?.let(::startActivity)
                         })
                     }
@@ -462,7 +488,9 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun GameCard(game: Game, state: CardState, busy: Boolean, onConvert: () -> Unit, onReplace: () -> Unit, onRemove: () -> Unit, onRename: () -> Unit, onOpen: () -> Unit) {
+    private fun GameCard(game: Game, state: CardState, busy: Boolean, onConvert: () -> Unit, onReplace: () -> Unit, onRemove: () -> Unit, onRename: () -> Unit, onMove: () -> Unit, onOpen: () -> Unit) {
+        // Outside the Game Bridge folder: Move comes before anything else (an installed game keeps Open).
+        val outside = remember(game) { Games.needsMove(game) }
         // Press and hold a card for its menu; a running conversion can't be removed under itself.
         var menu by remember { mutableStateOf(false) }
         // A failed card shows a short line; tapping the card shows the whole reason.
@@ -487,6 +515,7 @@ class MainActivity : ComponentActivity() {
                         indication = null,
                         onClick = {
                             when {
+                                outside && state != CardState.Done -> {}
                                 state is CardState.Failed -> why = true
                                 state == CardState.OtherCopy && !busy -> onReplace()
                                 needsDataNotice(game, state) -> dataWhy = true
@@ -496,11 +525,13 @@ class MainActivity : ComponentActivity() {
                     )
                     .padding(14.dp).fillMaxWidth(),
                 horizontalAlignment = Alignment.CenterHorizontally,
-            ) { CardContent(game, state, busy, onConvert, onReplace, onOpen) }
+            ) { CardContent(game, state, busy, outside, onConvert, onReplace, onMove, onOpen) }
             DropdownMenu(expanded = menu, onDismissRequest = { menu = false }, containerColor = Track) {
                 val close = { menu = false }
                 if (state == CardState.Done) MenuItem("Open") { close(); onOpen() }
-                if (game.action == Action.PlayIphone) {
+                if (outside) {
+                    if (!busy) MenuItem("Move to ${Games.FOLDER}") { close(); onMove() }
+                } else if (game.action == Action.PlayIphone) {
                     MenuItem("Play") { close(); onConvert() }
                     MenuItem("Rename") { close(); onRename() }
                     if (!IphoneApps.isInstalled(this@MainActivity, game)) MenuItem("Install app") { close(); installIphoneApp(game) }
@@ -523,7 +554,7 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun CardContent(game: Game, state: CardState, busy: Boolean, onConvert: () -> Unit, onReplace: () -> Unit, onOpen: () -> Unit) {
+    private fun CardContent(game: Game, state: CardState, busy: Boolean, outside: Boolean, onConvert: () -> Unit, onReplace: () -> Unit, onMove: () -> Unit, onOpen: () -> Unit) {
         Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
             Box(Modifier.size(72.dp).clip(RoundedCornerShape(18.dp)).background(Track)) {
                 game.icon?.let { Image(it.asImageBitmap(), contentDescription = null, modifier = Modifier.fillMaxSize()) }
@@ -538,7 +569,10 @@ class MainActivity : ComponentActivity() {
                 textAlign = TextAlign.Center,
             )
             // Same line in every state, so a failure doesn't make the card taller than its neighbour.
-            if (state is CardState.Failed) {
+            if (outside && state != CardState.Done && state !is CardState.Working) {
+                Text("${game.place} · move first", color = NoticeText, fontSize = 11.sp, maxLines = 1,
+                    overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 3.dp))
+            } else if (state is CardState.Failed) {
                 Text("Didn't install · tap for why", color = ErrorText, fontSize = 11.sp, maxLines = 1,
                     overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 3.dp))
             } else if (state == CardState.OtherCopy) {
@@ -555,7 +589,15 @@ class MainActivity : ComponentActivity() {
             Spacer(Modifier.height(10.dp))
             // Every state uses the same 36dp slot, so cards keep their height while converting.
             Box(Modifier.fillMaxWidth().height(36.dp), contentAlignment = Alignment.Center) {
-                when (state) {
+                when {
+                    outside && state != CardState.Done && state !is CardState.Working -> Button(
+                        onClick = onMove,
+                        enabled = !busy,
+                        colors = ButtonDefaults.buttonColors(containerColor = Accent),
+                        contentPadding = PaddingValues(0.dp),
+                        modifier = Modifier.fillMaxSize(),
+                    ) { Text("Move", fontSize = 13.sp) }
+                    else -> when (state) {
                     CardState.Ready -> Button(
                         onClick = onConvert,
                         // Playing an iPhone game doesn't wait for a conversion.
@@ -599,6 +641,7 @@ class MainActivity : ComponentActivity() {
                         contentPadding = PaddingValues(0.dp),
                         modifier = Modifier.fillMaxSize(),
                     ) { Text("Try again", color = AccentText, fontSize = 13.sp) }
+                    }
                 }
             }
         }
@@ -647,6 +690,7 @@ class MainActivity : ComponentActivity() {
     /** Makes or updates the iPhone games' own apps, one at a time, off the main thread. */
     private fun updateIphoneApps(games: List<Game>) {
         if (games.none { it.action == Action.PlayIphone }) return
+        IphoneGames.updateShortcuts(this, games)
         Thread {
             val problems = IphoneApps.update(applicationContext, games)
             problems.firstOrNull()?.let { runOnUiThread { Toast.makeText(this, it, Toast.LENGTH_LONG).show() } }
@@ -754,6 +798,22 @@ class MainActivity : ComponentActivity() {
     }
 
     /** The round backup button next to refresh: an arrow going up out of a tray. */
+    /** "Move all (N)" next to the backup button, while games are outside the Game Bridge folder. */
+    @Composable
+    private fun MoveAllButton(count: Int, enabled: Boolean, onClick: () -> Unit) {
+        Button(
+            onClick = onClick,
+            enabled = enabled,
+            colors = ButtonDefaults.buttonColors(containerColor = Accent),
+            contentPadding = PaddingValues(horizontal = 14.dp),
+            modifier = Modifier.height(40.dp),
+        ) { Text("Move all ($count)", fontSize = 13.sp) }
+    }
+
+    /** Game Bridge's iPhone game screen runs in its own process (":ios"), alive while a game plays. */
+    private fun iphoneGameRunning() = getSystemService(ActivityManager::class.java).runningAppProcesses.orEmpty()
+        .any { it.processName == "$packageName:ios" }
+
     @Composable
     private fun BackupButton(enabled: Boolean, onClick: () -> Unit) {
         Box(

@@ -100,6 +100,16 @@ extern "C" fn ui_application_main(_argc: i32, _argv: usize, principal: Id, deleg
 /// UIApplicationState: 0 active, 1 inactive, 2 background.
 pub static STATE: AtomicUsize = AtomicUsize::new(0);
 
+/// Changes of state the game hasn't finished answering (on its own thread;
+/// `change_state` stops waiting after two seconds).
+static UNANSWERED: AtomicUsize = AtomicUsize::new(0);
+
+/// The game has finished answering every change of state (going to the
+/// background is when games save).
+pub fn settled() -> bool {
+    UNANSWERED.load(Ordering::SeqCst) == 0
+}
+
 /// Tells the game what iOS tells an app on the way out (to the background)
 /// or back in, on the main thread like iOS, then waits for it (up to 2 s).
 pub fn change_state(to_background: bool) {
@@ -116,6 +126,7 @@ pub fn change_state(to_background: bool) {
     };
     let done = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let signal = done.clone();
+    UNANSWERED.fetch_add(1, Ordering::SeqCst);
     crate::fw::runloop::post(crate::fw::runloop::Work::Native(Box::new(move || {
         let app = APPLICATION.load(Ordering::Relaxed);
         let delegate_object = DELEGATE.load(Ordering::Relaxed);
@@ -132,6 +143,7 @@ pub fn change_state(to_background: bool) {
             crate::fw::foundation::post(notification, app, 0);
             STATE.store(state, Ordering::SeqCst);
         }
+        UNANSWERED.fetch_sub(1, Ordering::SeqCst);
         *signal.0.lock().unwrap() = true;
         signal.1.notify_all();
     })));

@@ -14,7 +14,8 @@ import java.io.File
 class OpenIphoneGame : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val folder = intent.getStringExtra("app")?.let(::File)?.canonicalFile
+        // An app made before its game moved into the Game Bridge folder still has the old folder.
+        val folder = intent.getStringExtra("app")?.let { Games.current(this, File(it)) }?.canonicalFile
         val storage = Environment.getExternalStorageDirectory().canonicalFile
         when {
             folder == null || !folder.path.startsWith(storage.path + "/") || !folder.name.endsWith(".app") -> {}
