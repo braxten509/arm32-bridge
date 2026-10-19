@@ -314,7 +314,8 @@ Progress (2026-10-18, night):
   with the new build; not on the emulator with the same build, not in the
   Pixel runs before the call): Android keeps the status bar shown over the
   game ("ShowingTransientControlTarget"), covering the health numbers.
-  Recheck after the call to tell the call from the build apart.
+  The owner saw it gone after the call: it comes from the call, not
+  from the build; no change.
 
 Later: Game Bridge takes `.ipa` files; Infinity Blade: Dungeons through
 the 32-bit translator.
