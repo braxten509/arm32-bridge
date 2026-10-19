@@ -91,7 +91,7 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
         val reports = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "Game Bridge/logs")
         System.loadLibrary("gamebridge_ios")
         nativeSetReport(name, reports.path)
-        nativeSetScreenRate(topRefreshRate().toInt())
+        nativeSetScreenRate(Math.round(topRefreshRate()))
         if (!nativeStart(holder.surface, app, home, width, height)) {
             finish()
             return
@@ -112,10 +112,15 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
     private fun topRefreshRate(): Float = topMode()?.refreshRate ?: 60f
 
     /**
-     * Asks for the screen's fastest mode while a game plays, so a game that
-     * draws faster than 60 frames a second is shown at its full rate.
+     * Asks for the screen's fastest mode while a game that can draw faster
+     * than 60 frames a second plays: Unreal Engine 3 games, whose frame
+     * limit the iPhone layer sets to that rate (ios/src/fw/paths.rs). Other
+     * games keep Android's own choice, which suits their 60 (a 60 fps game
+     * on a 90 or 144 Hz screen would show its frames unevenly).
      */
     private fun useTopRefreshRate() {
+        val app = intent.getStringExtra("app") ?: return
+        if (!File(app, "CookedIPhone/UE3CommandLine.txt").exists()) return
         val mode = topMode() ?: return
         window.attributes = window.attributes.apply { preferredDisplayModeId = mode.modeId }
     }

@@ -297,6 +297,24 @@ Progress (2026-10-18, night):
   video, sound, opening scene and first fight. Both games ship as
   `SwordGame.app` and the save folder is named after the game folder, so
   IB3 is copied as `InfinityBlade3.app` to keep the saves apart.
+- IB3 on the Pixel window (new game, sound muted): start video, opening,
+  first fight; 4 minute fight test (`~/.cache/ios-debug/px-ib3-fight.sh`)
+  ~116 fps, no crash, one 63.9 ms frame in play, battery up to 37.8 C,
+  thermal status 0. The copy of its commands keeps all its own lines with
+  ours last.
+- Second-model review (Claude Opus, read-only, of a80d430): no crash-level
+  bugs. Fixed: copies are only made where the game's own file is (a folder
+  it merely tries stays missing), `\` in -exec= and absolute paths, UTF-16
+  (both byte orders) command lines, -exec= put on the first line, each copy
+  made once under a lock (threads asking together got a half-written or
+  missing file), fast screen mode only for UE3 games (a 60 fps game on a
+  90/144 Hz screen would judder), rate rounded, more Game Center/store
+  answers (achievements, scores, listeners, mutable payments).
+- Seen on the Pixel in every run during a phone call (IB2 and IB3, all
+  with the new build; not on the emulator with the same build, not in the
+  Pixel runs before the call): Android keeps the status bar shown over the
+  game ("ShowingTransientControlTarget"), covering the health numbers.
+  Recheck after the call to tell the call from the build apart.
 
 Later: Game Bridge takes `.ipa` files; Infinity Blade: Dungeons through
 the 32-bit translator.

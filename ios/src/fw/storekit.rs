@@ -29,8 +29,18 @@ extern "C" fn no_transactions(_this: Id, _: Sel) -> Id {
     collections::array_from(&[])
 }
 
-extern "C" fn class_payment_with(_: Class, _: Sel, _product: Id) -> Id {
-    runtime::alloc_instance(runtime::class_named("SKPayment"))
+/// +paymentWithProduct: / +paymentWithProductIdentifier: on SKPayment or
+/// SKMutablePayment: an object of the class asked.
+extern "C" fn class_payment_with(class: Class, _: Sel, _product: Id) -> Id {
+    runtime::alloc_instance(class)
+}
+
+extern "C" fn payment_quantity(this: Id, _: Sel) -> isize {
+    property_get(this, "quantity").map_or(1, |q| q as isize)
+}
+
+extern "C" fn payment_set_quantity(this: Id, _: Sel, quantity: isize) {
+    property_set(this, "quantity", quantity as u64);
 }
 
 extern "C" fn request_init(this: Id, _: Sel, _identifiers: Id) -> Id {
@@ -89,7 +99,9 @@ pub fn register(_r: &mut Registry) {
             ("paymentWithProductIdentifier:", class_payment_with as usize),
         ],
     );
-    define_class("SKMutablePayment", "SKPayment", 8);
+    methods(payment, &[("quantity", payment_quantity as usize)]);
+    let mutable = define_class("SKMutablePayment", "SKPayment", 8);
+    methods(mutable, &[("setQuantity:", payment_set_quantity as usize)]);
 
     let request = define_class("SKRequest", "NSObject", 8);
     methods(

@@ -428,12 +428,12 @@ pub fn frames_shown() -> usize {
 const SLOW_FRAME_MS: f64 = 50.0;
 static SLOW_FRAMES: AtomicUsize = AtomicUsize::new(0);
 
-/// Logs the gap since the last shown frame when it is a slow frame; returns
-/// the number of slow frames so far.
 /// When the last frame was shown; cleared while the app is away, so time
 /// spent away isn't counted as a slow frame.
 static LAST_FRAME_AT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 
+/// Logs the gap since the last shown frame when it is a slow frame; returns
+/// the number of slow frames so far.
 fn note_frame_gap(frame: usize) -> usize {
     let now = std::time::Instant::now();
     let previous = LAST_FRAME_AT.lock().unwrap().replace(now);
