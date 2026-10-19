@@ -1,6 +1,9 @@
-//! CommonCrypto hashing: CC_MD5, CC_SHA1, CC_SHA256 and CCHmac.
+//! CommonCrypto: hashing (CC_MD5, CC_SHA1, CC_SHA256, CCHmac) and
+//! encryption (CCCrypt).
 
 use crate::symbols::Registry;
+use cipher::generic_array::GenericArray;
+use cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 
 pub fn md5(data: &[u8]) -> [u8; 16] {
     const SHIFT: [u32; 64] = [
@@ -179,11 +182,253 @@ extern "C" fn cc_hmac(algorithm: u32, key: *const u8, key_length: usize, data: *
     }
 }
 
+// ----- Encryption: CCCrypt -----
+//
+// CCCrypt(operation, algorithm, options, key, key length, iv, data in,
+// data in length, data out, data out available, data out moved) encrypts
+// or decrypts a whole message at once. Games use it for their save files
+// and settings, so a wrong answer shows up as a crash much later.
+
+/// CCCryptorStatus values.
+const SUCCESS: i32 = 0;
+const PARAM_ERROR: i32 = -4300;
+const BUFFER_TOO_SMALL: i32 = -4301;
+const ALIGNMENT_ERROR: i32 = -4303;
+const DECODE_ERROR: i32 = -4304;
+const UNIMPLEMENTED: i32 = -4305;
+
+/// CCOptions bits.
+const PKCS7_PADDING: u32 = 1;
+const ECB_MODE: u32 = 2;
+
+/// CCAlgorithm values, for the log.
+const ALGORITHM_NAMES: [&str; 7] = ["AES", "DES", "3DES", "CAST", "RC4", "RC2", "Blowfish"];
+
+/// A block cipher with its key set.
+enum BlockCipher {
+    Aes128(aes::Aes128),
+    Aes192(aes::Aes192),
+    Aes256(aes::Aes256),
+    Des(des::Des),
+    TripleDes(des::TdesEde3),
+    Cast(cast5::Cast5),
+    Blowfish(blowfish::Blowfish),
+}
+
+macro_rules! each_cipher {
+    ($cipher:expr, $c:ident => $body:expr) => {
+        match $cipher {
+            BlockCipher::Aes128($c) => $body,
+            BlockCipher::Aes192($c) => $body,
+            BlockCipher::Aes256($c) => $body,
+            BlockCipher::Des($c) => $body,
+            BlockCipher::TripleDes($c) => $body,
+            BlockCipher::Cast($c) => $body,
+            BlockCipher::Blowfish($c) => $body,
+        }
+    };
+}
+
+impl BlockCipher {
+    /// The cipher for a CCAlgorithm (RC4 is a stream cipher, not here), or the status to answer.
+    fn new(algorithm: u32, key: &[u8]) -> Result<BlockCipher, i32> {
+        fn keyed<C: KeyInit>(key: &[u8]) -> Result<C, i32> {
+            C::new_from_slice(key).map_err(|_| PARAM_ERROR)
+        }
+        Ok(match (algorithm, key.len()) {
+            (0, 16) => BlockCipher::Aes128(keyed(key)?),
+            (0, 24) => BlockCipher::Aes192(keyed(key)?),
+            (0, 32) => BlockCipher::Aes256(keyed(key)?),
+            (1, 8) => BlockCipher::Des(keyed(key)?),
+            (2, 24) => BlockCipher::TripleDes(keyed(key)?),
+            (3, 5..=16) => BlockCipher::Cast(keyed(key)?),
+            (6, 8..=56) => BlockCipher::Blowfish(keyed(key)?),
+            (0..=3 | 6, _) => return Err(PARAM_ERROR),
+            _ => return Err(UNIMPLEMENTED),
+        })
+    }
+
+    fn block_size(&self) -> usize {
+        match self {
+            BlockCipher::Aes128(_) | BlockCipher::Aes192(_) | BlockCipher::Aes256(_) => 16,
+            _ => 8,
+        }
+    }
+
+    fn encrypt(&self, block: &mut [u8]) {
+        each_cipher!(self, c => c.encrypt_block(GenericArray::from_mut_slice(block)))
+    }
+
+    fn decrypt(&self, block: &mut [u8]) {
+        each_cipher!(self, c => c.decrypt_block(GenericArray::from_mut_slice(block)))
+    }
+}
+
+/// RC4: the key stream XORed over the data (the same both ways).
+fn rc4(key: &[u8], data: &[u8]) -> Result<Vec<u8>, i32> {
+    if key.is_empty() || key.len() > 512 {
+        return Err(PARAM_ERROR);
+    }
+    let mut state: Vec<u8> = (0..=255).collect();
+    let mut j = 0u8;
+    for i in 0..256 {
+        j = j.wrapping_add(state[i]).wrapping_add(key[i % key.len()]);
+        state.swap(i, j as usize);
+    }
+    let (mut i, mut j) = (0u8, 0u8);
+    Ok(data
+        .iter()
+        .map(|byte| {
+            i = i.wrapping_add(1);
+            j = j.wrapping_add(state[i as usize]);
+            state.swap(i as usize, j as usize);
+            byte ^ state[state[i as usize].wrapping_add(state[j as usize]) as usize]
+        })
+        .collect())
+}
+
+/// The room CCCrypt asks for before it starts (CCCryptorGetOutputLength
+/// for the final block): a padded message's length when encrypting with
+/// padding, else the input's length.
+fn room_needed(decrypt: bool, options: u32, block_size: usize, length: usize) -> usize {
+    if !decrypt && options & PKCS7_PADDING != 0 {
+        length + block_size - length % block_size
+    } else {
+        length
+    }
+}
+
+/// One whole CCCrypt: the output, or the status to answer.
+pub fn crypt(decrypt: bool, algorithm: u32, options: u32, key: &[u8], iv: Option<&[u8]>, input: &[u8]) -> Result<Vec<u8>, i32> {
+    if algorithm == 4 {
+        return rc4(key, input);
+    }
+    let cipher = BlockCipher::new(algorithm, key)?;
+    let size = cipher.block_size();
+    let padded = options & PKCS7_PADDING != 0;
+    let mut data = input.to_vec();
+    if !decrypt && padded {
+        let pad = size - data.len() % size;
+        data.resize(data.len() + pad, pad as u8);
+    }
+    if data.len() % size != 0 {
+        return Err(ALIGNMENT_ERROR);
+    }
+    // CBC starts from the IV (zeros when there is none); ECB has no chaining.
+    let chained = options & ECB_MODE == 0;
+    let mut previous = vec![0u8; size];
+    if let Some(iv) = iv {
+        previous.copy_from_slice(&iv[..size]);
+    }
+    for block in data.chunks_mut(size) {
+        if decrypt {
+            let encrypted = block.to_vec();
+            cipher.decrypt(block);
+            if chained {
+                block.iter_mut().zip(&previous).for_each(|(b, p)| *b ^= p);
+                previous = encrypted;
+            }
+        } else {
+            if chained {
+                block.iter_mut().zip(&previous).for_each(|(b, p)| *b ^= p);
+            }
+            cipher.encrypt(block);
+            if chained {
+                previous.copy_from_slice(block);
+            }
+        }
+    }
+    if decrypt && padded {
+        let pad = *data.last().ok_or(DECODE_ERROR)? as usize;
+        if pad == 0 || pad > size || !data[data.len() - pad..].iter().all(|&b| b as usize == pad) {
+            return Err(DECODE_ERROR);
+        }
+        data.truncate(data.len() - pad);
+    }
+    Ok(data)
+}
+
+/// The kinds of CCCrypt use seen so far, so each is logged once.
+static CRYPT_KINDS: std::sync::Mutex<Vec<(u32, u32, u32, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// Calls answered so far; the first few are logged with their answer.
+static CRYPT_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[allow(clippy::too_many_arguments)]
+extern "C" fn cc_crypt(
+    operation: u32,
+    algorithm: u32,
+    options: u32,
+    key: *const u8,
+    key_length: usize,
+    iv: *const u8,
+    data_in: *const u8,
+    data_in_length: usize,
+    data_out: *mut u8,
+    data_out_available: usize,
+    data_out_moved: *mut usize,
+) -> i32 {
+    let name = ALGORITHM_NAMES.get(algorithm as usize).copied().unwrap_or("unknown");
+    let kind = (operation, algorithm, options, key_length);
+    {
+        let mut seen = CRYPT_KINDS.lock().unwrap();
+        if !seen.contains(&kind) {
+            seen.push(kind);
+            let action = if operation == 1 { "decrypt" } else { "encrypt" };
+            let mode = if options & ECB_MODE != 0 { "ECB" } else { "CBC" };
+            let padding = if options & PKCS7_PADDING != 0 { ", PKCS7 padding" } else { "" };
+            crate::log!("CommonCrypto: CCCrypt {action} {name} ({}-byte key), {mode}{padding}", key_length);
+        }
+    }
+    let moved = |value: usize| {
+        if !data_out_moved.is_null() {
+            unsafe { *data_out_moved = value };
+        }
+    };
+    moved(0);
+    if operation > 1 || (key.is_null() && key_length != 0) || (data_in.is_null() && data_in_length != 0) {
+        return PARAM_ERROR;
+    }
+    let block_size = match algorithm {
+        0 => 16,
+        4 => 1,
+        _ => 8,
+    };
+    let needed = room_needed(operation == 1, options, block_size, data_in_length);
+    if needed > data_out_available || (data_out.is_null() && needed != 0) {
+        moved(needed);
+        return BUFFER_TOO_SMALL;
+    }
+    let (key, input) = unsafe { (bytes(key, key_length), bytes(data_in, data_in_length)) };
+    let iv = (!iv.is_null() && algorithm != 4).then(|| unsafe { std::slice::from_raw_parts(iv, block_size) });
+    let result = crypt(operation == 1, algorithm, options, key, iv, input);
+    if CRYPT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+        match &result {
+            Ok(output) => crate::log!("CommonCrypto: CCCrypt {data_in_length} bytes in, {} out (room {data_out_available})", output.len()),
+            Err(status) => crate::log!("CommonCrypto: CCCrypt {data_in_length} bytes in: status {status}"),
+        }
+    }
+    match result {
+        Ok(output) => {
+            unsafe { write(data_out, &output) };
+            moved(output.len());
+            SUCCESS
+        }
+        Err(status) => {
+            if status == UNIMPLEMENTED {
+                crate::log!("CommonCrypto: CCCrypt with {name} isn't here (answered 'unimplemented')");
+            }
+            status
+        }
+    }
+}
+
 pub fn register(r: &mut Registry) {
     r.function("CC_MD5", cc_md5 as usize);
     r.function("CC_SHA1", cc_sha1 as usize);
     r.function("CC_SHA256", cc_sha256 as usize);
     r.function("CCHmac", cc_hmac as usize);
+    r.function("CCCrypt", cc_crypt as usize);
 }
 
 #[cfg(test)]
@@ -206,6 +451,64 @@ mod tests {
             hex(&hmac(|d| sha256(d).to_vec(), b"key", b"The quick brown fox jumps over the lazy dog")),
             "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
         );
+    }
+
+    fn unhex(text: &str) -> Vec<u8> {
+        (0..text.len()).step_by(2).map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap()).collect()
+    }
+
+    #[test]
+    fn known_ciphertexts() {
+        let block = unhex("00112233445566778899aabbccddeeff");
+        // FIPS-197 appendix C (one block, so ECB).
+        let aes128 = crypt(false, 0, ECB_MODE, &unhex("000102030405060708090a0b0c0d0e0f"), None, &block).unwrap();
+        assert_eq!(hex(&aes128), "69c4e0d86a7b0430d8cdb78070b4c55a");
+        let key256 = unhex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+        assert_eq!(hex(&crypt(false, 0, ECB_MODE, &key256, None, &block).unwrap()), "8ea2b7ca516745bfeafc49904b496089");
+        // SP 800-38A F.2.1, AES-128 CBC, two blocks.
+        let key = unhex("2b7e151628aed2a6abf7158809cf4f3c");
+        let iv = unhex("000102030405060708090a0b0c0d0e0f");
+        let plain = unhex("6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51");
+        let encrypted = crypt(false, 0, 0, &key, Some(&iv), &plain).unwrap();
+        assert_eq!(hex(&encrypted), "7649abac8119b246cee98e9b12e9197d5086cb9b507219ee95db113a917678b2");
+        assert_eq!(crypt(true, 0, 0, &key, Some(&iv), &encrypted).unwrap(), plain);
+        // DES, and 3DES with the same key three times (the same as DES).
+        let des_key = unhex("133457799bbcdff1");
+        let des_plain = unhex("0123456789abcdef");
+        assert_eq!(hex(&crypt(false, 1, ECB_MODE, &des_key, None, &des_plain).unwrap()), "85e813540f0ab405");
+        let triple: Vec<u8> = des_key.iter().chain(&des_key).chain(&des_key).copied().collect();
+        assert_eq!(hex(&crypt(false, 2, ECB_MODE, &triple, None, &des_plain).unwrap()), "85e813540f0ab405");
+        assert_eq!(hex(&crypt(false, 6, ECB_MODE, &[0; 8], None, &[0; 8]).unwrap()), "4ef997456198dd78");
+        assert_eq!(hex(&crypt(false, 4, 0, b"Key", None, b"Plaintext").unwrap()), "bbf316e8d940af0ad3");
+    }
+
+    #[test]
+    fn padding_and_errors() {
+        let key = [7u8; 32];
+        for length in [0, 1, 15, 16, 17, 100] {
+            let plain: Vec<u8> = (0..length as u8).collect();
+            let encrypted = crypt(false, 0, PKCS7_PADDING, &key, None, &plain).unwrap();
+            assert_eq!(encrypted.len(), room_needed(false, PKCS7_PADDING, 16, length));
+            assert_eq!(crypt(true, 0, PKCS7_PADDING, &key, None, &encrypted).unwrap(), plain);
+        }
+        assert_eq!(crypt(false, 0, 0, &key, None, &[1; 15]), Err(ALIGNMENT_ERROR));
+        assert_eq!(crypt(false, 0, 0, &[1; 20], None, &[1; 16]), Err(PARAM_ERROR));
+        assert_eq!(crypt(false, 5, 0, &[1; 16], None, &[1; 16]), Err(UNIMPLEMENTED));
+        // A wrong key leaves padding that doesn't check out.
+        let encrypted = crypt(false, 0, PKCS7_PADDING, &key, None, b"save data").unwrap();
+        assert_eq!(crypt(true, 0, PKCS7_PADDING, &[8; 32], None, &encrypted), Err(DECODE_ERROR));
+
+        // Too little room: the room needed comes back, nothing is written.
+        let plain = [3u8; 20];
+        let mut out = [0u8; 32];
+        let mut moved = 0usize;
+        let status = cc_crypt(0, 0, PKCS7_PADDING, key.as_ptr(), 32, std::ptr::null(), plain.as_ptr(), 20, out.as_mut_ptr(), 31, &mut moved);
+        assert_eq!((status, moved, out), (BUFFER_TOO_SMALL, 32, [0; 32]));
+        let status = cc_crypt(0, 0, PKCS7_PADDING, key.as_ptr(), 32, std::ptr::null(), plain.as_ptr(), 20, out.as_mut_ptr(), 32, &mut moved);
+        assert_eq!((status, moved), (SUCCESS, 32));
+        let mut back = [0u8; 32];
+        let status = cc_crypt(1, 0, PKCS7_PADDING, key.as_ptr(), 32, std::ptr::null(), out.as_ptr(), 32, back.as_mut_ptr(), 32, &mut moved);
+        assert_eq!((status, moved, &back[..20]), (SUCCESS, 20, &plain[..]));
     }
 
     #[test]

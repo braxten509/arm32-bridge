@@ -14,6 +14,11 @@ name = "ios-run"
 path = "src/main.rs"
 
 [dependencies]
+aes = "0.8"
+blowfish = "0.9"
+cast5 = "0.11"
+cipher = "0.4"
+des = "0.8"
 libc = "0.2.190"
 libsqlite3-sys = { version = "0.38.2", features = ["bundled"] }
 regex = "1.13.1"
