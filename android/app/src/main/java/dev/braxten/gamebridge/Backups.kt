@@ -578,26 +578,28 @@ object Backups {
     private fun removeOldCopies(context: Context, tree: Uri, game: Saved, copied: Map<Drive, Map<String, Pair<Long, String>>>) {
         val old = game.files.filterKeys { isOldCopy(it) }
         if (old.isEmpty()) return
-        val place = game.plan.place
-        // The game folder's path in its drive's copy, wherever Game Bridge moved it since.
-        val appPath = place?.let { Games.current(context, it) }?.let { folder ->
-            copied.entries.firstOrNull { folder.path.startsWith(it.key.folder.path + "/") }?.let { (drive, list) -> list to folder.relativeTo(drive.folder).invariantSeparatorsPath }
+        // The game's own file or folder (its original file, its iPhone game folder) in its drive's copy, wherever
+        // Game Bridge moved it since: restore finds it there, so only it can stand in for an old copy.
+        val placed = game.plan.place?.let { Games.current(context, it) }?.let { file ->
+            copied.entries.firstOrNull { file.path.startsWith(it.key.folder.path + "/") }?.let { (drive, list) -> Triple(list, file.relativeTo(drive.folder).invariantSeparatorsPath, file.name) }
         }
-        val originals = copied.values.flatMap { list -> list.map { (path, entry) -> (path.substringAfterLast('/') to entry.first) to entry.second } }
-            .groupBy({ it.first }, { it.second })
-        // The fingerprints the copy has for the same file (the same name and size for an original file).
-        fun matches(path: String, size: Long): List<String> = when {
-            path.startsWith("original/") -> originals[path.substringAfterLast('/') to size].orEmpty()
-            else -> listOfNotNull(appPath?.let { (list, folder) -> list["$folder/${path.removePrefix("app/")}"]?.takeIf { it.first == size }?.second })
+        // The fingerprint the copy has for the same file.
+        fun matches(path: String, size: Long): String? {
+            val (list, folder, name) = placed ?: return null
+            val listed = when {
+                path.startsWith("original/") -> list[folder].takeIf { path.substringAfterLast('/') == name }
+                else -> list["$folder/${path.removePrefix("app/")}"]
+            }
+            return listed?.takeIf { it.first == size }?.second
         }
         // Old copies have no fingerprints, so each file is read once from the backup to compare.
         val documents by lazy { documents(context, tree, game.folder, "") }
         fun inCopy(path: String, size: Long): Boolean {
-            val wanted = matches(path, size).ifEmpty { return false }
+            val wanted = matches(path, size) ?: return false
             val document = documents[path] ?: return false
             val digest = MessageDigest.getInstance("SHA-256")
             context.contentResolver.openInputStream(document)!!.use { pump(it, null, digest) {} }
-            return hex(digest) in wanted
+            return hex(digest) == wanted
         }
         val gone = old.entries.groupBy { it.key.substringBefore('/') }.filterValues { files -> files.all { (path, size) -> inCopy(path, size) } }.keys
         if (gone.isEmpty()) return
@@ -765,7 +767,7 @@ object Backups {
                 val target = File(Games.obbFolder(game.packageName), path.removePrefix("obb/"))
                 val size = files.getValue(path)
                 // One there at the same size is checked by its fingerprint when the backup has one.
-                val same = target.length() == size && info.hashes[path].let { hash ->
+                val same = target.isFile && target.length() == size && info.hashes[path].let { hash ->
                     hash == null || hex(MessageDigest.getInstance("SHA-256").also { digest -> target.inputStream().use { pump(it, null, digest) {} } }) == hash
                 }
                 if (same) fetch.add(size) else fetch.place(target) { copy(path, it) }
@@ -777,12 +779,17 @@ object Backups {
                 fetch.place(target) { fetch.copy(copy.document, it, size, hash) }
             }
             // A backup from before the Game Bridge folder was copied keeps the original file with the game.
+            // Not when the game's original file is on the phone again (put back above, or never gone).
+            val placed = info.original?.let(::File)?.takeIf { it.isFile }
             for (path in files.keys.filter { it.startsWith("original/") }) {
                 val target = File(Games.androidFolder(), path.removePrefix("original/"))
-                if (target.length() != files[path] && (original == null || original.first.name != target.name)) {
-                    target.parentFile!!.mkdirs()
-                    fetch.place(target) { copy(path, it) }
+                val size = files.getValue(path)
+                if ((target.isFile && target.length() == size) || placed?.name == target.name) {
+                    fetch.add(size)
+                    continue
                 }
+                target.parentFile!!.mkdirs()
+                fetch.place(target) { copy(path, it) }
             }
             return null
         } catch (failure: Exception) {
