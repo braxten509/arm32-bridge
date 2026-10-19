@@ -331,5 +331,22 @@ Also fixed: leaving during a video left Android's VideoView paused at its
 start after coming back, so the game waited on a black screen
 (IosGameActivity keeps the video's place and starts it again).
 
+Each iPhone game is its own app (owner's choice, 2026-10-18): a tiny app
+with the game's name and icon in the app list and on the home screen.
+It only opens the game in Game Bridge (exported `OpenIphoneGame`, which
+takes game folders on shared storage only), so saves and backups stay
+in Game Bridge. The app is the template `assets/iphone-launcher.apk`
+(source `android/iphone-launcher`, built by
+`tools/build-iphone-launcher.sh`); Game Bridge replaces its package name
+(`dev.braxten.gamebridge.iphone.<game id>`), name, folder and a stamp in
+the compiled manifest's string pool, swaps in the game's icon, signs it
+with its own key and installs it (`IphoneApps.kt`). After each search it
+makes or updates the app of every game whose stamp differs; Android asks
+once per new game, updates go through silently. A "no" is remembered;
+the card's menu then has "Install app". Cards have "Rename" (names in
+the "iphone-names" settings, applied after the search's kept results);
+the new name goes to the card, the game's app and the game screen.
+Emulator: all three apps installed, opening the IB3 app starts IB3.
+
 Later: Game Bridge takes `.ipa` files; Infinity Blade: Dungeons through
 the 32-bit translator.

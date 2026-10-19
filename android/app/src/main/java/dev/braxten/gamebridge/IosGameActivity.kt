@@ -129,11 +129,12 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
         window.attributes = window.attributes.apply { preferredDisplayModeId = mode.modeId }
     }
 
-    /** The game's name from its Info.plist, else its folder's. */
+    /** The name the user gave the game, else the one in its Info.plist, else its folder's. */
     private fun gameName(folder: File): String {
         val info = runCatching { Plist.read(File(folder, "Info.plist")) as? Map<*, *> }.getOrNull()
         fun text(key: String) = (info?.get(key) as? String)?.takeIf { it.isNotBlank() }
-        return text("CFBundleDisplayName") ?: text("CFBundleName") ?: folder.nameWithoutExtension
+        return IphoneGames.customName(this, text("CFBundleIdentifier") ?: folder.name)
+            ?: text("CFBundleDisplayName") ?: text("CFBundleName") ?: folder.nameWithoutExtension
     }
 
     /**

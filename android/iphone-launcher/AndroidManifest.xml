@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The template of an iPhone game's own app (tools/build-iphone-launcher.sh). Game Bridge
+  copies it for each iPhone game and puts in the game's package name, name, folder and icon
+  in place of the placeholders below (IphoneApps.kt), so their lengths don't matter.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="dev.braxten.gamebridge.iphone.placeholder"
+    android:versionCode="1"
+    android:versionName="1">
+    <queries>
+        <package android:name="dev.braxten.gamebridge" />
+    </queries>
+    <application
+        android:label="GAME_BRIDGE_PLACEHOLDER_NAME"
+        android:icon="@mipmap/ic_launcher"
+        android:allowBackup="false"
+        android:hasCode="true">
+        <meta-data android:name="dev.braxten.gamebridge.game" android:value="GAME_BRIDGE_PLACEHOLDER_FOLDER" />
+        <meta-data android:name="dev.braxten.gamebridge.stamp" android:value="GAME_BRIDGE_PLACEHOLDER_STAMP" />
+        <activity
+            android:name="dev.braxten.gamebridge.launcher.Launcher"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.NoDisplay">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

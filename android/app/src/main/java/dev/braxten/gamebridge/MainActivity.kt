@@ -54,6 +54,8 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
@@ -216,6 +218,8 @@ class MainActivity : ComponentActivity() {
                 result.first?.let { games = it }
                 setup = result.second
                 searching = false
+                // Each iPhone game gets its own app (made or updated in the background; Android may ask).
+                result.first?.let { found -> updateIphoneApps(found) }
                 if (searchAgain) refresh()
                 // Android/obb opens up only in a process started with the switch on.
                 if (setup == null && installsAtStart == false) restart()
@@ -243,6 +247,16 @@ class MainActivity : ComponentActivity() {
 
         // The game whose Remove dialog is showing.
         var removing by remember { mutableStateOf<Game?>(null) }
+
+        // The iPhone game whose Rename dialog is showing.
+        var renaming by remember { mutableStateOf<Game?>(null) }
+        renaming?.let { game ->
+            RenameDialog(game, onDismiss = { renaming = null }) { name ->
+                renaming = null
+                IphoneGames.rename(this@MainActivity, game.packageName, name)
+                refresh()
+            }
+        }
 
         /** Uninstalls the game and/or deletes its file, then searches again so the card updates or goes. */
         fun remove(game: Game, uninstall: Boolean, deleteFile: Boolean) {
@@ -321,7 +335,7 @@ class MainActivity : ComponentActivity() {
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
                     items(games!!, key = { it.file?.path ?: it.packageName }) { game ->
-                        GameCard(game, states[game.packageName] ?: CardState.Ready, busy, onConvert = { if (game.action == Action.PlayIphone) IphoneGames.play(this@MainActivity, game) else convert(game) }, onReplace = { replacing = game }, onRemove = { removing = game }, onOpen = {
+                        GameCard(game, states[game.packageName] ?: CardState.Ready, busy, onConvert = { if (game.action == Action.PlayIphone) IphoneGames.play(this@MainActivity, game) else convert(game) }, onReplace = { replacing = game }, onRemove = { removing = game }, onRename = { renaming = game }, onOpen = {
                             packageManager.getLaunchIntentForPackage(game.packageName)?.let(::startActivity)
                         })
                     }
@@ -448,7 +462,7 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun GameCard(game: Game, state: CardState, busy: Boolean, onConvert: () -> Unit, onReplace: () -> Unit, onRemove: () -> Unit, onOpen: () -> Unit) {
+    private fun GameCard(game: Game, state: CardState, busy: Boolean, onConvert: () -> Unit, onReplace: () -> Unit, onRemove: () -> Unit, onRename: () -> Unit, onOpen: () -> Unit) {
         // Press and hold a card for its menu; a running conversion can't be removed under itself.
         var menu by remember { mutableStateOf(false) }
         // A failed card shows a short line; tapping the card shows the whole reason.
@@ -488,7 +502,8 @@ class MainActivity : ComponentActivity() {
                 if (state == CardState.Done) MenuItem("Open") { close(); onOpen() }
                 if (game.action == Action.PlayIphone) {
                     MenuItem("Play") { close(); onConvert() }
-                    MenuItem("Add to home screen") { close(); IphoneGames.addToHomeScreen(this@MainActivity, game) }
+                    MenuItem("Rename") { close(); onRename() }
+                    if (!IphoneApps.isInstalled(this@MainActivity, game)) MenuItem("Install app") { close(); installIphoneApp(game) }
                 } else if (game.file != null && !busy) when (state) {
                     CardState.Ready -> MenuItem(if (game.action == Action.Install) "Install" else "Convert") { close(); onConvert() }
                     CardState.Done -> if (game.action == Action.Convert) MenuItem("Convert again") { close(); onConvert() }
@@ -629,6 +644,49 @@ class MainActivity : ComponentActivity() {
      * Asks before replacing a copy of the game that came from elsewhere: Android won't install a
      * copy signed by Game Bridge over it, so it has to go, and its saved progress with it.
      */
+    /** Makes or updates the iPhone games' own apps, one at a time, off the main thread. */
+    private fun updateIphoneApps(games: List<Game>) {
+        if (games.none { it.action == Action.PlayIphone }) return
+        Thread {
+            val problems = IphoneApps.update(applicationContext, games)
+            problems.firstOrNull()?.let { runOnUiThread { Toast.makeText(this, it, Toast.LENGTH_LONG).show() } }
+        }.start()
+    }
+
+    /** The card's "Install app": asks again even after a no. */
+    private fun installIphoneApp(game: Game) {
+        Thread {
+            val problem = IphoneApps.install(applicationContext, game)
+            runOnUiThread { Toast.makeText(this, problem ?: "${game.label} is now in your apps.", Toast.LENGTH_LONG).show() }
+        }.start()
+    }
+
+    /** A new name for an iPhone game; empty goes back to the game's own name. */
+    @Composable
+    private fun RenameDialog(game: Game, onDismiss: () -> Unit, onConfirm: (String) -> Unit) {
+        var name by remember { mutableStateOf(game.label) }
+        AlertDialog(
+            onDismissRequest = onDismiss,
+            containerColor = CardColor,
+            title = { Text("Rename ${game.label}", color = Color(0xFFE8E8EE)) },
+            text = {
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    singleLine = true,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedTextColor = Color(0xFFE8E8EE),
+                        unfocusedTextColor = Color(0xFFE8E8EE),
+                        focusedBorderColor = AccentText,
+                        cursorColor = AccentText,
+                    ),
+                )
+            },
+            confirmButton = { TextButton(onClick = { onConfirm(name) }) { Text("Rename", color = AccentText) } },
+            dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel", color = AccentText) } },
+        )
+    }
+
     @Composable
     private fun ReplaceDialog(game: Game, onDismiss: () -> Unit, onConfirm: () -> Unit) {
         AlertDialog(

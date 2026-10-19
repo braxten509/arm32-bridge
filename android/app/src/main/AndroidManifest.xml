@@ -30,6 +30,14 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <!-- Opens an iPhone game for the game's own app (IphoneApps.kt, OpenIphoneGame.kt):
+             only a game folder on shared storage, then the private game screen below. -->
+        <activity
+            android:name=".OpenIphoneGame"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.NoDisplay" />
         <!-- iPhone games (64-bit): own process and task, landscape, full screen. Opened by
              Game Bridge itself (a game's card or its home-screen icon) with the unpacked game
              folder in the "app" extra; opening it again goes back to the running game. Not exported:

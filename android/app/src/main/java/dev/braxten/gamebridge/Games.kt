@@ -90,7 +90,7 @@ object Games {
         val loose = dataFiles.map { (file, _) -> file }
         // The same game and version found twice shows once.
         val games = gameFiles
-            .mapNotNull { (file, place) -> remembered(file) { read(context, file, place) }?.let { withLooseData(it, loose) } }
+            .mapNotNull { (file, place) -> remembered(file) { read(context, file, place) }?.let { withLooseData(named(context, it), loose) } }
             .distinctBy { it.packageName to it.versionCode }
         val withFiles = games.map { it.packageName }.toSet()
         val installed = installed(context, loose)
@@ -118,7 +118,7 @@ object Games {
         }
         val games = saved.getJSONArray("games")
         // A file deleted while the app was closed shows no card, not even until the search ends.
-        (0 until games.length()).map { gameFrom(games.getJSONObject(it), icons) }.filter { it.file?.exists() != false }
+        (0 until games.length()).map { named(context, gameFrom(games.getJSONObject(it), icons)) }.filter { it.file?.exists() != false }
     }.getOrNull()
 
     private fun savedFile(context: Context) = File(context.filesDir, "games.json")
@@ -361,7 +361,7 @@ object Games {
 
     /** The card for a game file, with the data file it needs (not yet looked for on the phone). */
     private fun read(context: Context, file: File, place: String): Game? {
-        if (file.isDirectory) return readIphone(file, place)
+        if (file.isDirectory) return readIphone(context, file, place)
         if (isBundle(file)) return readBundle(context, file, place)
         val bits = nativeBits(file) ?: return null
         // Plenty of ordinary apps are 64-bit too; only games are listed.
@@ -370,14 +370,27 @@ object Games {
         return needingData(context, game, file)
     }
 
+    /**
+     * The game with the name the user gave it (Rename), if any. Applied after `remembered`, which
+     * keeps the name the game itself has, so a rename shows at once and an undone one goes back
+     * at the next search.
+     */
+    private fun named(context: Context, game: Game): Game {
+        if (game.action != Action.PlayIphone) return game
+        val label = IphoneGames.customName(context, game.packageName) ?: return game
+        if (label == game.label) return game
+        return Game(game.file, game.place, label, game.packageName, game.versionCode, game.icon, game.action, game.dataFile, game.looseData)
+    }
+
     /** An unpacked iPhone game: its name, id and icon from its Info.plist; null without 64-bit ARM code. */
-    private fun readIphone(folder: File, place: String): Game? {
+    private fun readIphone(context: Context, folder: File, place: String): Game? {
         val info = Plist.read(File(folder, "Info.plist")) as? Map<*, *> ?: return null
         fun text(key: String) = (info[key] as? String)?.takeIf { it.isNotBlank() }
         val program = File(folder, text("CFBundleExecutable") ?: return null)
         if (!hasArm64(program)) return null
+        val id = text("CFBundleIdentifier") ?: folder.name
         val label = text("CFBundleDisplayName") ?: text("CFBundleName") ?: folder.nameWithoutExtension
-        return Game(folder, place, label, text("CFBundleIdentifier") ?: folder.name, 0, iphoneIcon(folder, info), Action.PlayIphone)
+        return Game(folder, place, label, id, 0, iphoneIcon(folder, info), Action.PlayIphone)
     }
 
     /** CPU_TYPE_ARM64 in an Apple program: a 64-bit one, or one part of a universal file. */

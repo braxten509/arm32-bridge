@@ -47,6 +47,9 @@ else
     cp "$HOME/.android/debug.keystore" "$ASSETS/debug.keystore"
 fi
 
+# The template of each iPhone game's own app (IphoneApps.kt).
+"$ROOT/tools/build-iphone-launcher.sh"
+
 echo "== app"
 (cd "$ROOT/android" && ./gradlew -q assembleRelease)
 APK=$ROOT/android/app/build/outputs/apk/release/app-release.apk
