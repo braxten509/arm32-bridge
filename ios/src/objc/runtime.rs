@@ -485,11 +485,53 @@ extern "C" fn ios_objc_lookup(receiver: Id, sel: Sel, caller: usize) -> Imp {
         crate::report::finish(1);
     }
     ensure_initialized(if is_class { receiver } else { isa });
+    if let Some(pattern) = message_trace() {
+        trace_message(pattern, isa, is_class, sel, caller);
+    }
     let found = lock().lookup(isa, sel);
     match found {
         Some(imp) => imp,
         None => missing_method(isa, is_class, sel, caller),
     }
+}
+
+/// Test switch IOS_TRACE_MESSAGES=<pattern>: logs the game's messages whose
+/// "-[Class selector]" matches the pattern (each one up to 50 times), to see
+/// what a game asks for at a point where it stops going on.
+fn message_trace() -> Option<&'static regex::Regex> {
+    static TRACE: std::sync::OnceLock<Option<regex::Regex>> = std::sync::OnceLock::new();
+    TRACE
+        .get_or_init(|| {
+            let pattern = std::env::var("IOS_TRACE_MESSAGES").ok().filter(|p| !p.is_empty())?;
+            match regex::Regex::new(&pattern) {
+                Ok(regex) => Some(regex),
+                Err(error) => {
+                    crate::log!("IOS_TRACE_MESSAGES: not a pattern ({error})");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+fn trace_message(pattern: &regex::Regex, isa: Class, is_class: bool, sel: Sel, caller: usize) {
+    static COUNTS: Mutex<Option<HashMap<String, u32>>> = Mutex::new(None);
+    let text = {
+        let rt = lock();
+        format!("{}[{} {}]", if is_class { "+" } else { "-" }, rt.class_name(isa), rt.sel_name(sel))
+    };
+    if !pattern.is_match(&text) {
+        return;
+    }
+    {
+        let mut counts = COUNTS.lock().unwrap_or_else(|e| e.into_inner());
+        let count = counts.get_or_insert_with(HashMap::new).entry(text.clone()).or_default();
+        *count += 1;
+        if *count > 50 {
+            return;
+        }
+    }
+    crate::log!("message {text} from {}", crate::loader::describe_address(caller));
 }
 
 #[no_mangle]
