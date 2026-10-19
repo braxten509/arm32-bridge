@@ -435,6 +435,9 @@ object Games {
     /** Where iPhone games go on the phone's own storage. */
     fun iphoneFolder() = File(File(Environment.getExternalStorageDirectory(), FOLDER), IPHONE)
 
+    /** Where Android games go on the phone's own storage. */
+    fun androidFolder() = File(File(Environment.getExternalStorageDirectory(), FOLDER), ANDROID)
+
     /** "Download", "Documents/Games", or the drive's name for files on an SD card. */
     private fun place(root: File, rootName: String, file: File): String {
         val folder = file.parentFile!!.relativeTo(root).path

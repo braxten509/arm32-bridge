@@ -7,6 +7,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Environment
+import android.os.storage.StorageManager
 import android.provider.DocumentsContract
 import android.provider.DocumentsContract.Document
 import androidx.compose.runtime.getValue
@@ -19,6 +20,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.InputStream
+import java.io.OutputStream
+import java.security.MessageDigest
 
 /** A game found in the backup folder. */
 class SavedGame(
@@ -55,14 +58,23 @@ class SavedGame(
 }
 
 /**
- * Backups of converted games in a folder picked with Android's folder picker, so it works with
- * any storage app that offers folders there (DAVx5's WebDAV mounts, Google Drive, a USB drive).
- * Inside it, "Game Bridge/<package>/" holds a game's installed APKs (apk/), its game data files
- * (obb/), optionally the original file it was converted from (original/), its icon, and
- * info.txt, which is written last and lists every file with its size: a game whose files don't
- * all match it is an unfinished backup. "Game Bridge/ios/<name>/" holds an unpacked iPhone game's
- * saves (save/, its home folder without caches), optionally the game folder itself (app/), its
- * icon and info.txt the same way.
+ * Backups in a folder picked with Android's folder picker, so it works with any storage app that
+ * offers folders there (DAVx5's WebDAV mounts, Google Drive, a USB drive). Inside it:
+ *
+ * - "Game Bridge/Games/" is a copy of the phone's Game Bridge folder (every game file: Android,
+ *   iPhone, Originals), kept exactly the same: a file gone from the phone goes from the copy too.
+ *   "Game Bridge/Games.txt" lists each file in it with its size and fingerprint (SHA-256). An SD
+ *   card's or USB drive's Game Bridge folder goes to "Games on <drive id>" the same way.
+ * - "Game Bridge/<package>/" holds an installed converted game's APKs (apk/), its game data files
+ *   (obb/), its icon and info.txt, which is written last and lists every file with its size and
+ *   fingerprint: a game whose files don't all match it is an unfinished backup.
+ * - "Game Bridge/ios/<name>/" holds an iPhone game's saves (save/, its home folder without caches),
+ *   its icon and info.txt the same way.
+ *
+ * A file is copied only when its fingerprint differs from the one the backup has; a file's
+ * fingerprint is worked out again only when its size or modified time changed (saves: every time).
+ * Backups from before the Game Bridge folder was copied also kept original files with each game
+ * (original/, app/); those go once the folder's copy holds every file in them.
  *
  * Process-wide like Conversions, so a backup keeps going when the screen is rebuilt.
  */
@@ -71,8 +83,8 @@ object Backups {
     var status by mutableStateOf<String?>(null)
         private set
 
-    /** While a backup runs: the game being copied, how far the whole backup is, and which game of how many. */
-    class Progress(val label: String, val percent: Int, val game: Int, val games: Int)
+    /** While a backup runs: what is being copied, how far the whole backup is, and where it is ("Game 2 of 9"). */
+    class Progress(val label: String, val percent: Int, val detail: String)
     var progress by mutableStateOf<Progress?>(null)
         private set
 
@@ -80,16 +92,29 @@ object Backups {
     var problem by mutableStateOf<String?>(null)
         private set
 
+    /** The last run was stopped with Cancel: what it copied stays, and the next backup goes on from there. */
+    var stopped by mutableStateOf(false)
+        private set
+
+    /** Cancel was pressed: the backup ends after the piece it is copying. */
+    var stopping by mutableStateOf(false)
+        private set
+
+    @Volatile
+    private var cancelled = false
+
+    private class Stopped : Exception("stopped")
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private const val PREFERENCES = "backups"
     private const val FOLDER = "folder"
     private const val FOLDER_NAME = "folder_name"
-    private const val ORIGINALS = "originals"
     private const val LAST = "last"
     private const val LAST_GAMES = "last_games"
     private const val LAST_SIZE = "last_size"
     private const val TOP = "Game Bridge"
     private const val INFO = "info.txt"
+    private const val COPY = "Games"
 
     private fun preferences(context: Context) = context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
 
@@ -105,7 +130,6 @@ object Backups {
         preferences(context).edit().putString(FOLDER, tree.toString()).remove(FOLDER_NAME).apply()
     }
 
-    /** "DAVx5 › Game backups": the app that keeps the folder, then the folder's name. */
     /** The folder's name from the last [folderName] call, read without asking the folder's app. */
     fun savedFolderName(context: Context): String? = preferences(context).getString(FOLDER_NAME, null)
 
@@ -123,22 +147,10 @@ object Backups {
         return full
     }
 
-    var keepOriginals: Boolean = false
-        private set
-
-    fun loadChoices(context: Context) {
-        keepOriginals = preferences(context).getBoolean(ORIGINALS, false)
-    }
-
-    fun setKeepOriginals(context: Context, keep: Boolean) {
-        keepOriginals = keep
-        preferences(context).edit().putBoolean(ORIGINALS, keep).apply()
-    }
-
     /** When the last backup finished (milliseconds), or 0. */
     fun lastBackup(context: Context) = preferences(context).getLong(LAST, 0)
 
-    /** How many games the last finished backup held, and their size in bytes (0 before the first). */
+    /** How many games the last finished backup held, and its size in bytes (0 before the first). */
     fun lastGames(context: Context) = preferences(context).getInt(LAST_GAMES, 0)
     fun lastSize(context: Context) = preferences(context).getLong(LAST_SIZE, 0)
 
@@ -168,41 +180,158 @@ object Backups {
 
     /** A home folder's files worth keeping: Documents and Library without Library/Caches, as iOS backs up (tmp and our run log stay out). */
     private fun saveFiles(home: File): List<File> =
-        home.walkTopDown().filter { it.isFile }.filter { file ->
+        home.walkTopDown().onFail { _, failure -> throw failure }.filter { it.isFile }.filter { file ->
             val path = file.relativeTo(home).invariantSeparatorsPath
             (path.startsWith("Documents/") || path.startsWith("Library/")) && !path.startsWith("Library/Caches/")
         }.toList()
 
-    /** Backs up every converted game (and its original file when `originals`) and every iPhone game's saves (and its game folder when `originals`). Runs in the background; `status` follows it. */
-    fun backUp(context: Context, games: List<Pair<String, File?>>, iphone: List<IphoneSave>, originals: Boolean, onDone: () -> Unit = {}) {
+    /** A drive's Game Bridge folder, and the name of its copy in the backup ("Games", "Games on 1A2B-3C4D"); its list of files is "<copy>.txt". */
+    private class Drive(val folder: File, val copy: String) {
+        val index get() = "$copy.txt"
+    }
+
+    /** The phone's own storage, then each SD card or USB drive that is in (one taken out keeps its copy as it was). */
+    private fun drives(context: Context): List<Drive> {
+        val phone = Environment.getExternalStorageDirectory()
+        val others = context.getSystemService(StorageManager::class.java).storageVolumes.mapNotNull { volume ->
+            val root = volume.directory?.takeIf { it != phone } ?: return@mapNotNull null
+            volume.uuid?.let { Drive(File(root, Games.FOLDER), "$COPY on $it") }
+        }
+        return listOf(Drive(File(phone, Games.FOLDER), COPY)) + others
+    }
+
+    /** Ends a running backup after the piece it is copying. */
+    fun cancel() {
+        if (status == null) return
+        cancelled = true
+        stopping = true
+    }
+
+    /** Backs up the Game Bridge folder, every converted game and every iPhone game's saves. Runs in the background; `status` follows it. */
+    fun backUp(context: Context, games: List<Pair<String, File?>>, iphone: List<IphoneSave>, onDone: () -> Unit = {}) {
         if (status != null || Conversions.moving) return
         val appContext = context.applicationContext
         status = "Getting ready…"
         problem = null
+        stopped = false
+        cancelled = false
         scope.launch {
-            val result = withContext(Dispatchers.IO) { runCatching { backUpAll(appContext, games, iphone, originals) } }
+            val result = withContext(Dispatchers.IO) { runCatching { backUpAll(appContext, games, iphone) } }
             val failure = result.exceptionOrNull()
-            problem = failure?.let { "The backup stopped: ${it.message ?: it.javaClass.simpleName}" }
+            stopped = failure is Stopped
+            problem = failure?.takeIf { it !is Stopped }?.let { "The backup stopped: ${it.message ?: it.javaClass.simpleName}" }
             result.getOrNull()?.let { (count, size) ->
                 preferences(appContext).edit().putLong(LAST, System.currentTimeMillis()).putInt(LAST_GAMES, count).putLong(LAST_SIZE, size).apply()
             }
             progress = null
+            stopping = false
+            // Reading for a restore stops on it too.
+            cancelled = false
             status = null
             onDone()
         }
     }
 
-    /** One file to save: its name in the game's folder, its size, and how to read it. `always`: copied even when the backup has it at this size (saves change in place). */
-    private class Item(val path: String, val size: Long, val always: Boolean = false, val open: () -> InputStream)
+    /** One file to save: its name in the game's folder and the file. `fresh`: its fingerprint is always worked out again (saves can change keeping their size and time). */
+    private class Item(val path: String, val file: File, val fresh: Boolean = false) {
+        val size = file.length()
+    }
 
-    /** One game's backup: its folder below "Game Bridge", the lines that start its info.txt, and its files. */
-    private class Plan(val folder: String, val label: String, val installed: Long?, val header: List<String>, val items: List<Item>, val icon: () -> Bitmap?)
+    /** One game's backup: its folder below "Game Bridge", the lines that start its info.txt, its files, and where its game folder or original file is. */
+    private class Plan(val folder: String, val label: String, val header: List<String>, val items: List<Item>, val place: File?, val icon: () -> Bitmap?)
 
-    /** Files a backup without originals leaves alone: Android games' original files and iPhone game folders. */
-    private fun isOriginal(path: String) = path.startsWith("original/") || path.startsWith("app/")
+    /** A game backed up in this run: its folder, header, and the files its info.txt lists (size and fingerprint; old copies have no fingerprint). */
+    private class Saved(val folder: Uri, val plan: Plan, val files: Map<String, Long>, val hashes: Map<String, String>)
 
-    /** Returns how many games it backed up and their size in bytes. */
-    private fun backUpAll(context: Context, games: List<Pair<String, File?>>, iphone: List<IphoneSave>, originals: Boolean): Pair<Int, Long> {
+    /** Files of backups from before the Game Bridge folder was copied: Android games' original files and iPhone game folders. */
+    private fun isOldCopy(path: String) = path.startsWith("original/") || path.startsWith("app/")
+
+    private fun hex(digest: MessageDigest) = digest.digest().joinToString("") { "%02x".format(it) }
+
+    /** Copies `input` to `output` (or only reads it, for null), feeding `digest`; stops between pieces when Cancel was pressed. Returns the bytes read. */
+    private fun pump(input: InputStream, output: OutputStream?, digest: MessageDigest, counted: (Long) -> Unit): Long {
+        val buffer = ByteArray(1 shl 20)
+        var total = 0L
+        while (true) {
+            if (cancelled) throw Stopped()
+            val count = input.read(buffer)
+            if (count < 0) break
+            output?.write(buffer, 0, count)
+            digest.update(buffer, 0, count)
+            total += count
+            counted(count.toLong())
+        }
+        return total
+    }
+
+    /**
+     * Each file's fingerprint from the last time it was read, with its size and modified time then:
+     * while both stay the same, the file isn't read again. Kept in the app's own files.
+     */
+    private class Fingerprints(private val file: File) {
+        private class Known(val size: Long, val modified: Long, val hash: String)
+
+        private val known = HashMap<String, Known>()
+
+        init {
+            runCatching {
+                file.readLines().forEach { line ->
+                    val parts = line.split(' ', limit = 4)
+                    val size = parts.getOrNull(0)?.toLongOrNull()
+                    val modified = parts.getOrNull(1)?.toLongOrNull()
+                    if (parts.size == 4 && size != null && modified != null) known[parts[3]] = Known(size, modified, parts[2])
+                }
+            }
+        }
+
+        fun cached(source: File): String? = known[source.path]?.takeIf { it.size == source.length() && it.modified == source.lastModified() }?.hash
+
+        /** Remembers what was read from `source`, when it didn't change while being read. */
+        fun learn(source: File, size: Long, modified: Long, read: Long, hash: String) {
+            if (read == size && source.length() == size && source.lastModified() == modified) known[source.path] = Known(size, modified, hash)
+        }
+
+        /** Saved for the next backup, without files no longer there. */
+        fun save() {
+            val text = buildString {
+                known.filterKeys { File(it).isFile }.forEach { (path, entry) -> appendLine("${entry.size} ${entry.modified} ${entry.hash} $path") }
+            }
+            val partial = File(file.parentFile, "${file.name}.part")
+            partial.writeText(text)
+            partial.renameTo(file)
+        }
+    }
+
+    /** `source`'s fingerprint: the remembered one while its size and time are the same (not for `fresh` files), else read now. */
+    private fun fingerprint(source: File, fresh: Boolean, fingerprints: Fingerprints): String {
+        if (!fresh) fingerprints.cached(source)?.let { return it }
+        val size = source.length()
+        val modified = source.lastModified()
+        val digest = MessageDigest.getInstance("SHA-256")
+        val read = source.inputStream().use { pump(it, null, digest) {} }
+        return hex(digest).also { if (!fresh) fingerprints.learn(source, size, modified, read, it) }
+    }
+
+    /** Every file in `folder`, by its path below it. A folder that can't be read stops the backup: the copy must never take it for an empty one. */
+    private fun walk(folder: File, prefix: String, into: MutableMap<String, File>) {
+        val entries = folder.listFiles() ?: throw IllegalStateException("couldn't read ${folder.path}")
+        for (entry in entries) {
+            if (entry.isDirectory) walk(entry, "$prefix${entry.name}/", into) else into["$prefix${entry.name}"] = entry
+        }
+    }
+
+    /** The folders `path` ("iPhone/Game.app/a.png") is in, top first ("iPhone", "iPhone/Game.app"). */
+    private fun parents(path: String): List<String> =
+        path.split('/').dropLast(1).runningReduce { above, name -> "$above/$name" }
+
+    /** What the progress shows for a file in the Game Bridge folder: its game ("SwordGame" for iPhone/2/SwordGame.app/…) or file name. */
+    private fun entryName(path: String): String {
+        val names = path.split('/')
+        return names.drop(1).dropLast(1).firstOrNull { name -> name.any { !it.isDigit() } }?.removeSuffix(".app") ?: names.last()
+    }
+
+    /** Returns how many games it backed up and the size of everything backed up, in bytes. */
+    private fun backUpAll(context: Context, games: List<Pair<String, File?>>, iphone: List<IphoneSave>): Pair<Int, Long> {
         val tree = folder(context) ?: throw IllegalStateException("pick a backup folder first")
         val top = child(context, tree, root(tree), TOP, directory = true)
         val packages = context.packageManager
@@ -212,113 +341,303 @@ object Backups {
             val label = application.loadLabel(packages).toString()
             val items = mutableListOf<Item>()
             (listOf(File(application.sourceDir)) + application.splitSourceDirs.orEmpty().map(::File)).forEach { apk ->
-                items += Item("apk/${apk.name}", apk.length()) { apk.inputStream() }
+                items += Item("apk/${apk.name}", apk)
             }
-            Games.obbFolder(packageName).listFiles().orEmpty().filter { it.isFile }.forEach { data ->
-                items += Item("obb/${data.name}", data.length()) { data.inputStream() }
+            // A data folder that can't be read stops the backup (its earlier backup's data files would go).
+            val obb = Games.obbFolder(packageName)
+            (if (obb.exists()) obb.listFiles() ?: throw IllegalStateException("couldn't read ${obb.path}") else emptyArray()).filter { it.isFile }.forEach { data ->
+                items += Item("obb/${data.name}", data)
             }
-            if (originals && original != null && original.isFile) items += Item("original/${original.name}", original.length()) { original.inputStream() }
-            val header = listOf("package=$packageName", "label=$label", "versionCode=${info.longVersionCode}",
-                "versionName=${info.versionName ?: ""}", "installed=${info.lastUpdateTime}")
-            Plan(packageName, label, info.lastUpdateTime, header, items) { runCatching { Games.iconBitmap(application.loadIcon(packages)) }.getOrNull() }
+            val header = listOfNotNull("package=$packageName", "label=$label", "versionCode=${info.longVersionCode}",
+                "versionName=${info.versionName ?: ""}", "installed=${info.lastUpdateTime}", original?.let { "original=${it.path}" })
+            Plan(packageName, label, header, items, original) { runCatching { Games.iconBitmap(application.loadIcon(packages)) }.getOrNull() }
         } + iphone.mapNotNull { game ->
             val home = File(iosHomes(context), game.name)
-            val items = saveFiles(home).map { file ->
-                Item("save/${file.relativeTo(home).invariantSeparatorsPath}", file.length(), always = true) { file.inputStream() }
-            }.toMutableList()
-            val app = game.app
-            if (originals && app != null && app.isDirectory) {
-                app.walkTopDown().filter { it.isFile }.forEach { file ->
-                    items += Item("app/${file.relativeTo(app).invariantSeparatorsPath}", file.length()) { file.inputStream() }
-                }
-            }
-            // A game never played and left out as an original has nothing to back up.
+            val items = saveFiles(home).map { file -> Item("save/${file.relativeTo(home).invariantSeparatorsPath}", file, fresh = true) }
+            // A game never played has no saves; its game folder is in the Game Bridge folder's copy.
             if (items.isEmpty()) return@mapNotNull null
             val header = listOfNotNull("kind=iphone", "package=${game.bundleId}", "label=${game.label}", "name=${game.name}",
-                app?.let { "place=${it.path}" }, "saved=${System.currentTimeMillis()}")
-            Plan("ios/${game.name}", game.label, null, header, items) { game.icon }
+                game.app?.let { "place=${it.path}" }, "saved=${System.currentTimeMillis()}")
+            Plan("ios/${game.name}", game.label, header, items, game.app) { game.icon }
         }
-        val total = plans.sumOf { plan -> plan.items.sumOf { it.size } }.coerceAtLeast(1)
+        // Every drive's Game Bridge folder, read whole before anything in its copy changes.
+        val folders = drives(context).filter { it.folder.isDirectory }.associateWith { drive -> HashMap<String, File>().also { walk(drive.folder, "", it) } }
+        val folderBytes = folders.values.sumOf { files -> files.values.sumOf { it.length() } }
+        val total = (plans.sumOf { plan -> plan.items.sumOf { it.size } } + folderBytes).coerceAtLeast(1)
+        val fingerprints = Fingerprints(File(context.filesDir, "backup-fingerprints.txt"))
+
+        var label = ""
+        var detail = ""
         var done = 0L
-        for ((index, plan) in plans.withIndex()) {
-            val label = plan.label
-            fun show(percent: Int) = scope.launch {
-                status = "Backing up $label · $percent%"
-                progress = Progress(label, percent, index + 1, plans.size)
+        var shown = -1
+        fun show(force: Boolean = false) {
+            val percent = (done * 100 / total).toInt().coerceIn(0, 100)
+            if (percent == shown && !force) return
+            shown = percent
+            val (text, where) = label to detail
+            scope.launch {
+                status = "Backing up $text · $percent%"
+                progress = Progress(text, percent, where)
             }
-            show((done * 100 / total).toInt())
-            val items = plan.items
-            val gameFolder = child(context, tree, top, plan.folder, directory = true)
-            val savedInfo = readInfo(context, tree, gameFolder)
-            val saved = savedInfo?.files.orEmpty()
-            // A game installed again (converted again, updated) has new APKs even when their sizes match.
-            val sameInstall = savedInfo?.installed == plan.installed
-            val present = listing(context, tree, gameFolder, "")
-            // Already saved by the earlier, finished backup (info.txt exists only for finished ones):
-            // same name and size (or a size the storage app doesn't tell), and for the APKs the same install.
-            fun unchanged(item: Item) = !item.always && saved[item.path] == item.size && present[item.path].let { it == item.size || it == -1L } &&
-                (sameInstall || !item.path.startsWith("apk/"))
-            // Changing files would leave the old info.txt calling a half-changed backup finished.
-            if (items.any { !unchanged(it) }) find(context, tree, gameFolder, INFO)?.let { DocumentsContract.deleteDocument(context.contentResolver, it) }
-            // Folders already found or made, so a game folder with hundreds of files isn't listed again for each.
-            val folders = HashMap<String, Uri>()
-            for (item in items) {
-                if (unchanged(item)) {
-                    done += item.size
-                    continue
+        }
+        fun add(bytes: Long) {
+            done += bytes
+            show()
+        }
+        /** Copies `source` into the document `target`; the size and fingerprint of what it wrote. */
+        fun copy(source: File, target: Uri, fresh: Boolean): Pair<Long, String> {
+            val size = source.length()
+            val modified = source.lastModified()
+            val digest = MessageDigest.getInstance("SHA-256")
+            val written = context.contentResolver.openOutputStream(target, "wt")!!.use { output ->
+                source.inputStream().use { input -> pump(input, output, digest, ::add) }
+            }
+            // The fingerprint of the bytes written, so the backup's list always tells what the backup holds.
+            return (written to hex(digest)).also { (_, hash) -> if (!fresh) fingerprints.learn(source, size, modified, written, hash) }
+        }
+
+        try {
+            val saved = mutableListOf<Saved>()
+            for ((index, plan) in plans.withIndex()) {
+                if (cancelled) throw Stopped()
+                label = plan.label
+                detail = "Game ${index + 1} of ${plans.size}"
+                show(force = true)
+                val items = plan.items
+                val gameFolder = child(context, tree, top, plan.folder, directory = true)
+                val savedInfo = readInfo(context, tree, gameFolder)
+                val before = savedInfo?.files.orEmpty()
+                val hashes = savedInfo?.hashes.orEmpty()
+                val present = listing(context, tree, gameFolder, "")
+                // Already in the earlier, finished backup (info.txt exists only for finished ones): the same size there
+                // (or a size the storage app doesn't tell) and the same fingerprint. A backup from before fingerprints is copied again.
+                val same = items.filter { item ->
+                    val hash = hashes[item.path]
+                    hash != null && before[item.path] == item.size && present[item.path].let { it == item.size || it == -1L } &&
+                        fingerprint(item.file, item.fresh, fingerprints) == hash
+                }.mapTo(HashSet()) { it.path }
+                // Changing files would leave the old info.txt calling a half-changed backup finished.
+                if (items.any { it.path !in same }) find(context, tree, gameFolder, INFO)?.let { DocumentsContract.deleteDocument(context.contentResolver, it) }
+                // Folders already found or made, so a game folder with hundreds of files isn't listed again for each.
+                val made = HashMap<String, Uri>()
+                val files = LinkedHashMap<String, Long>()
+                val written = HashMap<String, String>()
+                for (item in items) {
+                    if (cancelled) throw Stopped()
+                    if (item.path in same) {
+                        files[item.path] = item.size
+                        written[item.path] = hashes.getValue(item.path)
+                        add(item.size)
+                        continue
+                    }
+                    val folderPath = item.path.substringBeforeLast('/')
+                    val parent = made.getOrPut(folderPath) { child(context, tree, gameFolder, folderPath, directory = true) }
+                    val name = item.path.substringAfterLast('/')
+                    // A file the backup doesn't have yet is made without listing its folder first.
+                    val target = if (item.path in present) child(context, tree, parent, name, directory = false) else make(context, parent, name, directory = false)
+                    val (size, hash) = copy(item.file, target, item.fresh)
+                    files[item.path] = size
+                    written[item.path] = hash
                 }
-                val folderPath = item.path.substringBeforeLast('/')
-                val parent = folders.getOrPut(folderPath) { child(context, tree, gameFolder, folderPath, directory = true) }
-                val name = item.path.substringAfterLast('/')
-                // A file the backup doesn't have yet is made without listing its folder first.
-                val target = if (item.path in present) child(context, tree, parent, name, directory = false) else make(context, parent, name, directory = false)
-                context.contentResolver.openOutputStream(target, "wt")!!.use { output ->
-                    item.open().use { input ->
-                        val buffer = ByteArray(1 shl 20)
-                        var lastShown = -1
-                        while (true) {
-                            val count = input.read(buffer)
-                            if (count < 0) break
-                            output.write(buffer, 0, count)
-                            done += count
-                            val percent = (done * 100 / total).toInt()
-                            if (percent != lastShown) {
-                                lastShown = percent
-                                show(percent)
-                            }
-                        }
+                // Files of an earlier backup this one doesn't have (an old version's data file, a deleted save) go.
+                // Old copies of original files stay until the Game Bridge folder's copy holds them.
+                present.keys.filter { it !in files && it != INFO && it != "icon.png" && !isOldCopy(it) }.forEach { path ->
+                    find(context, tree, gameFolder, path)?.let { DocumentsContract.deleteDocument(context.contentResolver, it) }
+                }
+                plan.icon()?.let { picture ->
+                    val target = child(context, tree, gameFolder, "icon.png", directory = false)
+                    context.contentResolver.openOutputStream(target, "wt")!!.use { picture.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                }
+                // Old copies stay listed (at the size the storage app tells, else the one the earlier info.txt had), so they can still be restored.
+                present.filterKeys { isOldCopy(it) }.forEach { (path, size) -> (size.takeIf { it >= 0 } ?: before[path])?.let { files[path] = it } }
+                writeInfo(context, tree, gameFolder, plan.header, files, written)
+                saved += Saved(gameFolder, plan, files, written)
+            }
+
+            // The Game Bridge folder of each drive.
+            val copied = HashMap<Drive, Map<String, Pair<Long, String>>>()
+            for ((drive, local) in folders) {
+                label = "game files"
+                detail = "Game Bridge folder"
+                show(force = true)
+                copied[drive] = mirror(context, tree, top, drive, local, fingerprints, ::copy, ::add) { name ->
+                    if (name != label) {
+                        label = name
+                        show(force = true)
                     }
                 }
             }
-            // Files of an earlier backup this one doesn't have (an old version's data file, a deleted save) go,
-            // except original files when this backup leaves them out.
-            val kept = items.map { it.path }.toSet()
-            present.keys.filter { it !in kept && it != INFO && it != "icon.png" && (originals || !isOriginal(it)) }.forEach { path ->
-                find(context, tree, gameFolder, path)?.let { DocumentsContract.deleteDocument(context.contentResolver, it) }
+
+            // Old copies of original files go once the folder's copy holds every file in them.
+            label = "old copies"
+            detail = "Checking them against the folder's copy"
+            show(force = true)
+            for (game in saved) removeOldCopies(context, tree, game, copied)
+
+            return plans.size to plans.sumOf { plan -> plan.items.sumOf { it.size } } + folderBytes
+        } finally {
+            runCatching { fingerprints.save() }
+        }
+    }
+
+    /**
+     * Makes the backup's copy of a drive's Game Bridge folder the same as `local` (its files by path):
+     * copies the files that differ, removes what the phone no longer has. Returns the copy's list.
+     */
+    private fun mirror(
+        context: Context, tree: Uri, top: Uri, drive: Drive, local: Map<String, File>, fingerprints: Fingerprints,
+        copy: (File, Uri, Boolean) -> Pair<Long, String>, add: (Long) -> Unit, showing: (String) -> Unit,
+    ): Map<String, Pair<Long, String>> {
+        val copyFolder = child(context, tree, top, drive.copy, directory = true)
+        val files = HashMap<String, Entry>()
+        val folders = hashMapOf("" to copyFolder)
+        fun list(parent: Uri, prefix: String) {
+            for (entry in children(context, tree, parent)) {
+                val path = "$prefix${entry.name}"
+                if (entry.directory) {
+                    folders[path] = entry.uri
+                    list(entry.uri, "$path/")
+                } else {
+                    files[path] = entry
+                }
             }
-            plan.icon()?.let { picture ->
-                val target = child(context, tree, gameFolder, "icon.png", directory = false)
-                context.contentResolver.openOutputStream(target, "wt")!!.use { picture.compress(Bitmap.CompressFormat.PNG, 100, it) }
-            }
-            // The sizes this backup wrote, and earlier original files kept as they are listed.
-            val listed = items.associate { it.path to it.size } +
-                listing(context, tree, gameFolder, "").filterKeys { isOriginal(it) && it !in kept }
-                    .mapValues { (path, size) -> if (size >= 0) size else saved[path] ?: size }.filterValues { it >= 0 }
+        }
+        list(copyFolder, "")
+        val indexDocument = find(context, tree, top, drive.index)
+        val index = indexDocument?.let { readIndex(context, it).files }.orEmpty()
+
+        // Unchanged: listed with the same size and fingerprint, and there at that size (or a size the storage app doesn't tell).
+        val changed = local.filter { (path, file) ->
+            if (cancelled) throw Stopped()
+            val size = file.length()
+            val listed = index[path]
+            val there = files[path]
+            val same = listed != null && there != null && listed.first == size && (there.size == size || there.size == -1L) &&
+                fingerprint(file, false, fingerprints) == listed.second
+            if (same) add(size)
+            !same
+        }.toSortedMap()
+        // The list keeps only files that stay as they are, saved before anything changes: a backup cut off
+        // partway never vouches for a file it was rewriting.
+        val kept = HashMap(index.filterKeys { it in local && it !in changed && it in files })
+        var indexTarget = indexDocument
+        // `finished`: the list holds every file of the folder (a last line "finished"); a game folder is restored from the copy only then.
+        fun save(finished: Boolean) {
             val text = buildString {
-                plan.header.forEach(::appendLine)
-                listed.forEach { (path, size) -> appendLine("file=$size $path") }
+                kept.toSortedMap().forEach { (path, entry) -> appendLine("${entry.first} ${entry.second} $path") }
+                if (finished) appendLine(FINISHED)
             }
-            val target = child(context, tree, gameFolder, INFO, directory = false)
+            val target = indexTarget ?: child(context, tree, top, drive.index, directory = false).also { indexTarget = it }
             context.contentResolver.openOutputStream(target, "wt")!!.use { it.write(text.toByteArray()) }
         }
-        return plans.size to plans.sumOf { plan -> plan.items.sumOf { it.size } }
+        if (changed.isNotEmpty() || kept.size != index.size || indexDocument == null) save(finished = false)
+
+        // What the phone no longer has: whole folders in one step each (the topmost one), then single files.
+        val localFolders = local.keys.flatMapTo(HashSet()) { parents(it) }
+        val goneFolders = folders.keys.filter { it != "" && it !in localFolders }.toSet()
+        for (path in goneFolders.filter { folder -> parents("$folder/").dropLast(1).none { it in goneFolders } }) {
+            if (cancelled) throw Stopped()
+            DocumentsContract.deleteDocument(context.contentResolver, folders.getValue(path))
+        }
+        for (path in files.keys.filter { it !in local && parents(it).none { folder -> folder in goneFolders } }) {
+            if (cancelled) throw Stopped()
+            DocumentsContract.deleteDocument(context.contentResolver, files.getValue(path).uri)
+        }
+        folders.keys.removeAll(goneFolders)
+        files.keys.retainAll(local.keys)
+
+        fun folder(path: String): Uri = folders[path] ?: make(context, folder(path.substringBeforeLast('/', "")), path.substringAfterLast('/'), directory = true)
+            .also { folders[path] = it }
+        var lastSaved = System.currentTimeMillis()
+        try {
+            for ((path, file) in changed) {
+                if (cancelled) throw Stopped()
+                showing(entryName(path))
+                val target = files[path]?.uri ?: make(context, folder(path.substringBeforeLast('/', "")), path.substringAfterLast('/'), directory = false)
+                kept[path] = copy(file, target, false)
+                // Saved now and then, so a long copy cut off partway doesn't start over.
+                if (System.currentTimeMillis() - lastSaved > 30_000) {
+                    save(finished = false)
+                    lastSaved = System.currentTimeMillis()
+                }
+            }
+        } catch (failure: Throwable) {
+            runCatching { save(finished = false) }
+            throw failure
+        }
+        // Not saved is a failed backup: old copies of original files stay until the list is safely written.
+        save(finished = true)
+        return kept
+    }
+
+    /**
+     * Removes a game's old copies of its original files (original/, app/) once the Game Bridge
+     * folder's copy holds every file in them: info.txt is written without them first, so a backup
+     * cut off between the two never lists a file that is gone.
+     */
+    private fun removeOldCopies(context: Context, tree: Uri, game: Saved, copied: Map<Drive, Map<String, Pair<Long, String>>>) {
+        val old = game.files.filterKeys { isOldCopy(it) }
+        if (old.isEmpty()) return
+        val place = game.plan.place
+        // The game folder's path in its drive's copy, wherever Game Bridge moved it since.
+        val appPath = place?.let { Games.current(context, it) }?.let { folder ->
+            copied.entries.firstOrNull { folder.path.startsWith(it.key.folder.path + "/") }?.let { (drive, list) -> list to folder.relativeTo(drive.folder).invariantSeparatorsPath }
+        }
+        val originals = copied.values.flatMap { list -> list.map { (path, entry) -> (path.substringAfterLast('/') to entry.first) to entry.second } }
+            .groupBy({ it.first }, { it.second })
+        // The fingerprints the copy has for the same file (the same name and size for an original file).
+        fun matches(path: String, size: Long): List<String> = when {
+            path.startsWith("original/") -> originals[path.substringAfterLast('/') to size].orEmpty()
+            else -> listOfNotNull(appPath?.let { (list, folder) -> list["$folder/${path.removePrefix("app/")}"]?.takeIf { it.first == size }?.second })
+        }
+        // Old copies have no fingerprints, so each file is read once from the backup to compare.
+        val documents by lazy { documents(context, tree, game.folder, "") }
+        fun inCopy(path: String, size: Long): Boolean {
+            val wanted = matches(path, size).ifEmpty { return false }
+            val document = documents[path] ?: return false
+            val digest = MessageDigest.getInstance("SHA-256")
+            context.contentResolver.openInputStream(document)!!.use { pump(it, null, digest) {} }
+            return hex(digest) in wanted
+        }
+        val gone = old.entries.groupBy { it.key.substringBefore('/') }.filterValues { files -> files.all { (path, size) -> inCopy(path, size) } }.keys
+        if (gone.isEmpty()) return
+        writeInfo(context, tree, game.folder, game.plan.header, game.files.filterKeys { it.substringBefore('/') !in gone }, game.hashes)
+        gone.forEach { name -> find(context, tree, game.folder, name)?.let { DocumentsContract.deleteDocument(context.contentResolver, it) } }
+    }
+
+    /** Writes a game's info.txt: its header, then each file's size and fingerprint. */
+    private fun writeInfo(context: Context, tree: Uri, gameFolder: Uri, header: List<String>, files: Map<String, Long>, hashes: Map<String, String>) {
+        val text = buildString {
+            header.forEach(::appendLine)
+            files.forEach { (path, size) -> appendLine("file=$size $path") }
+            files.keys.forEach { path -> hashes[path]?.let { appendLine("hash=$it $path") } }
+        }
+        val target = child(context, tree, gameFolder, INFO, directory = false)
+        context.contentResolver.openOutputStream(target, "wt")!!.use { it.write(text.toByteArray()) }
+    }
+
+    /** A copy's list: each file's path to its size and fingerprint, and whether it holds the whole folder. */
+    private class Index(val files: Map<String, Pair<Long, String>>, val finished: Boolean)
+
+    private const val FINISHED = "finished"
+
+    /** Lines a cut-off write left broken are left out. */
+    private fun readIndex(context: Context, document: Uri): Index {
+        val lines = context.contentResolver.openInputStream(document)!!.use { it.readBytes().decodeToString() }.lines()
+        val files = lines.mapNotNull { line ->
+            val parts = line.split(' ', limit = 3)
+            val size = parts.getOrNull(0)?.toLongOrNull()
+            if (parts.size == 3 && size != null && parts[1].length == 64 && parts[2].isNotEmpty()) parts[2] to (size to parts[1]) else null
+        }.toMap()
+        return Index(files, lines.any { it == FINISHED })
     }
 
     /** The games in the backup folder whose backups are complete. */
     fun list(context: Context): List<SavedGame> {
         val tree = folder(context) ?: return emptyList()
         val top = find(context, tree, root(tree), TOP) ?: return emptyList()
-        val folders = children(context, tree, top).filter { it.directory }
+        // The Game Bridge folder's copies hold game files, not games' backups.
+        val folders = children(context, tree, top).filter { it.directory && it.name != COPY && !it.name.startsWith("$COPY on ") }
         val iphone = folders.firstOrNull { it.name == "ios" }?.let { children(context, tree, it.uri).filter { entry -> entry.directory } }.orEmpty()
         return (folders + iphone).mapNotNull { folder ->
             val info = readInfo(context, tree, folder.uri) ?: return@mapNotNull null
@@ -335,36 +654,93 @@ object Backups {
         }.sortedBy { it.label.lowercase() }
     }
 
-    /** Installs a saved game, puts its data files back and its original file in Download (if not there). Null on success, else a plain reason. */
+    /** A path from a backup's list that stays inside the folder it is copied into. */
+    private fun safe(path: String) = !path.startsWith("/") && path.split('/').none { it == ".." }
+
+    /** Copies backup documents to files on the phone, checking each one's size and fingerprint (when the backup has one) and showing how far it is. */
+    private class Fetch(val context: Context, total: Long, val onProgress: (String) -> Unit) {
+        private val total = total.coerceAtLeast(1)
+        private var done = 0L
+        private var shown = -1
+
+        fun add(bytes: Long) {
+            done += bytes
+            val percent = (done * 100 / total).toInt()
+            if (percent != shown) {
+                shown = percent
+                onProgress("Copying back · $percent%")
+            }
+        }
+
+        fun copy(source: Uri, target: File, size: Long, hash: String?) {
+            target.parentFile!!.mkdirs()
+            val digest = MessageDigest.getInstance("SHA-256")
+            val buffer = ByteArray(1 shl 20)
+            context.contentResolver.openInputStream(source)!!.use { input ->
+                target.outputStream().use { output ->
+                    while (true) {
+                        val count = input.read(buffer)
+                        if (count < 0) break
+                        output.write(buffer, 0, count)
+                        digest.update(buffer, 0, count)
+                        add(count.toLong())
+                    }
+                }
+            }
+            if (target.length() != size) throw IllegalStateException("${target.name} didn't copy completely")
+            if (hash != null && hex(digest) != hash) throw IllegalStateException("${target.name} in the backup is damaged")
+        }
+
+        /** Copied under a .part name first, so a stopped copy never looks like the finished file or folder. */
+        fun place(target: File, fill: (File) -> Unit) {
+            val partial = File(target.parentFile, "${target.name}.part").apply { deleteRecursively() }
+            try {
+                fill(partial)
+                if (!partial.renameTo(target)) throw IllegalStateException("${target.name} couldn't be put in place")
+            } finally {
+                partial.deleteRecursively()
+            }
+        }
+    }
+
+    /**
+     * A file or folder's copy in the backup's copy of its drive's Game Bridge folder: where it goes
+     * on the phone, each file's path below it ("" for a file) with its size and fingerprint, and its document.
+     */
+    private class InCopy(val target: File, val files: Map<String, Pair<Long, String>>, val document: Uri)
+
+    /**
+     * Where `target` (a file or folder in a Game Bridge folder) is in the backup's copy, when the copy
+     * has it whole: only a copy whose last backup finished holds every file of a game folder.
+     */
+    private fun inCopy(context: Context, tree: Uri, top: Uri, target: File): InCopy? {
+        val real = target.canonicalFile
+        val drive = drives(context).firstOrNull { real.path.startsWith(it.folder.canonicalPath + "/") } ?: return null
+        val path = real.relativeTo(drive.folder.canonicalFile).invariantSeparatorsPath
+        val index = find(context, tree, top, drive.index)?.let { readIndex(context, it) }?.takeIf { it.finished } ?: return null
+        val files = index.files.filter { (listed, _) -> listed == path || listed.startsWith("$path/") }
+            .mapKeys { (listed, _) -> listed.removePrefix(path).removePrefix("/") }
+        if (files.isEmpty() || !files.keys.all(::safe)) return null
+        val document = find(context, tree, top, "${drive.copy}/$path") ?: return null
+        return InCopy(real, files, document)
+    }
+
+    /** Installs a saved game, puts its data files back and its original file in the Game Bridge folder (if not there). Null on success, else a plain reason. */
     fun restore(context: Context, game: SavedGame, onProgress: (String) -> Unit): String? {
         val tree = folder(context) ?: return "Pick the backup folder again."
         if (game.isIphone) return restoreIphone(context, tree, game, onProgress)
         val work = File(context.cacheDir, "restore").apply { deleteRecursively(); mkdirs() }
         try {
-            val files = readInfo(context, tree, game.folder)?.files ?: return "The backup of ${game.label} is incomplete."
-            val total = files.values.sum().coerceAtLeast(1)
-            var done = 0L
+            val info = readInfo(context, tree, game.folder) ?: return "The backup of ${game.label} is incomplete."
+            val files = info.files
+            if (!files.keys.all(::safe)) return "The backup of ${game.label} is damaged."
+            val top = find(context, tree, root(tree), TOP) ?: return "The backup of ${game.label} is incomplete."
+            // Its original file from the Game Bridge folder's copy, when it is no longer on the phone.
+            val original = info.original?.let(::File)?.takeIf { !it.isFile }?.let { file -> inCopy(context, tree, top, file)?.let { file to it } }
+            val fetch = Fetch(context, files.values.sum() + (original?.second?.files?.values?.sumOf { it.first } ?: 0), onProgress)
             fun copy(path: String, target: File) {
                 val source = find(context, tree, game.folder, path) ?: throw IllegalStateException("$path is missing from the backup")
-                target.parentFile!!.mkdirs()
-                context.contentResolver.openInputStream(source)!!.use { input ->
-                    target.outputStream().use { output ->
-                        val buffer = ByteArray(1 shl 20)
-                        var lastShown = -1
-                        while (true) {
-                            val count = input.read(buffer)
-                            if (count < 0) break
-                            output.write(buffer, 0, count)
-                            done += count
-                            val percent = (done * 100 / total).toInt()
-                            if (percent != lastShown) {
-                                lastShown = percent
-                                onProgress("Copying back · $percent%")
-                            }
-                        }
-                    }
-                }
-                if (target.length() != files[path]) throw IllegalStateException("$path didn't copy completely")
+                fetch.copy(source, target, files.getValue(path), info.hashes[path])
             }
             val installed = runCatching {
                 context.packageManager.getPackageInfo(game.packageName, PackageManager.PackageInfoFlags.of(0)).longVersionCode
@@ -383,26 +759,30 @@ object Backups {
                 }
                 pieces.forEach(File::delete)
             } else {
-                done += files.filterKeys { it.startsWith("apk/") }.values.sum()
-            }
-            // Copied under a .part name first, so a stopped copy never looks like the finished file.
-            fun place(path: String, target: File) {
-                val partial = File(target.parentFile, "${target.name}.part")
-                try {
-                    copy(path, partial)
-                    if (!partial.renameTo(target)) throw IllegalStateException("${target.name} couldn't be put in place")
-                } finally {
-                    partial.delete()
-                }
+                fetch.add(files.filterKeys { it.startsWith("apk/") }.values.sum())
             }
             for (path in files.keys.filter { it.startsWith("obb/") }) {
                 val target = File(Games.obbFolder(game.packageName), path.removePrefix("obb/"))
-                if (target.length() != files[path]) place(path, target)
+                val size = files.getValue(path)
+                // One there at the same size is checked by its fingerprint when the backup has one.
+                val same = target.length() == size && info.hashes[path].let { hash ->
+                    hash == null || hex(MessageDigest.getInstance("SHA-256").also { digest -> target.inputStream().use { pump(it, null, digest) {} } }) == hash
+                }
+                if (same) fetch.add(size) else fetch.place(target) { copy(path, it) }
             }
-            val download = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            original?.let { (_, copy) ->
+                val target = copy.target
+                val (size, hash) = copy.files.getValue("")
+                target.parentFile!!.mkdirs()
+                fetch.place(target) { fetch.copy(copy.document, it, size, hash) }
+            }
+            // A backup from before the Game Bridge folder was copied keeps the original file with the game.
             for (path in files.keys.filter { it.startsWith("original/") }) {
-                val target = File(download, path.removePrefix("original/"))
-                if (target.length() != files[path]) place(path, target)
+                val target = File(Games.androidFolder(), path.removePrefix("original/"))
+                if (target.length() != files[path] && (original == null || original.first.name != target.name)) {
+                    target.parentFile!!.mkdirs()
+                    fetch.place(target) { copy(path, it) }
+                }
             }
             return null
         } catch (failure: Exception) {
@@ -414,63 +794,57 @@ object Backups {
 
     /**
      * Puts an iPhone game's saves back as they were backed up (the game is closed first), and its
-     * game folder in Game Bridge/iPhone when it's no longer on the phone. The saves it replaces
+     * game folder in the Game Bridge folder when it's no longer on the phone. The saves it replaces
      * are kept in files/ios-replaced/<name> until the next restore of that game.
      */
     private fun restoreIphone(context: Context, tree: Uri, game: SavedGame, onProgress: (String) -> Unit): String? {
         val name = game.homeName ?: return "The backup of ${game.label} is incomplete."
+        if (name.isEmpty() || '/' in name || name == "." || name == "..") return "The backup of ${game.label} is damaged."
         val homes = iosHomes(context)
         val staging = File(homes, "$name.restoring").apply { deleteRecursively() }
         try {
-            val files = readInfo(context, tree, game.folder)?.files ?: return "The backup of ${game.label} is incomplete."
+            val info = readInfo(context, tree, game.folder) ?: return "The backup of ${game.label} is incomplete."
+            val files = info.files
+            if (!files.keys.all(::safe)) return "The backup of ${game.label} is damaged."
+            val top = find(context, tree, root(tree), TOP) ?: return "The backup of ${game.label} is incomplete."
             // Where Game Bridge moved it since, when it did.
             val placed = game.place?.let { Games.current(context, File(it)) }
             val download = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "ios")
-            val folderName = placed?.name ?: "$name.app"
-            // The game folder comes back only when it isn't on the phone any more.
+            val folderName = placed?.name?.takeIf { it != "." && it != ".." } ?: "$name.app"
+            val there = (placed != null && File(placed, "Info.plist").isFile) ||
+                listOf(Games.iphoneFolder(), download).any { File(File(it, folderName), "Info.plist").isFile }
+            // The game folder comes back only when it isn't on the phone any more: from the Game Bridge
+            // folder's copy, or for a backup from before that, the copy kept with the game (app/).
+            val fromCopy = if (there || placed == null) null else inCopy(context, tree, top, placed)
             val appTarget = when {
-                files.keys.none { it.startsWith("app/") } -> null
-                placed != null && File(placed, "Info.plist").isFile -> null
-                listOf(Games.iphoneFolder(), download).any { File(File(it, folderName), "Info.plist").isFile } -> null
-                else -> File(Games.iphoneFolder(), folderName)
+                there -> null
+                fromCopy != null -> fromCopy.target
+                files.keys.any { it.startsWith("app/") } -> File(Games.iphoneFolder(), folderName)
+                else -> null
             }
-            val wanted = files.filterKeys { it.startsWith("save/") || (appTarget != null && it.startsWith("app/")) }
-            val total = wanted.values.sum().coerceAtLeast(1)
-            var done = 0L
+            val wanted = files.filterKeys { it.startsWith("save/") || (appTarget != null && fromCopy == null && it.startsWith("app/")) }
+            val fetch = Fetch(context, wanted.values.sum() + (fromCopy?.files?.values?.sumOf { it.first } ?: 0), onProgress)
             // Every file's document, found in one pass (a game folder has hundreds).
             val documents = documents(context, tree, game.folder, "")
             fun copy(path: String, target: File) {
                 val source = documents[path] ?: throw IllegalStateException("$path is missing from the backup")
-                target.parentFile!!.mkdirs()
-                context.contentResolver.openInputStream(source)!!.use { input ->
-                    target.outputStream().use { output ->
-                        val buffer = ByteArray(1 shl 20)
-                        var lastShown = -1
-                        while (true) {
-                            val count = input.read(buffer)
-                            if (count < 0) break
-                            output.write(buffer, 0, count)
-                            done += count
-                            val percent = (done * 100 / total).toInt()
-                            if (percent != lastShown) {
-                                lastShown = percent
-                                onProgress("Copying back · $percent%")
-                            }
-                        }
-                    }
-                }
-                if (target.length() != files[path]) throw IllegalStateException("$path didn't copy completely")
+                fetch.copy(source, target, files.getValue(path), info.hashes[path])
             }
             // Copied beside the game's home folder first, so a stopped copy leaves the current saves alone.
             for (path in wanted.keys.filter { it.startsWith("save/") }) copy(path, File(staging, path.removePrefix("save/")))
             staging.mkdirs()
             if (appTarget != null) {
-                val partial = File(appTarget.parentFile, "${appTarget.name}.part").apply { deleteRecursively() }
-                try {
-                    for (path in wanted.keys.filter { it.startsWith("app/") }) copy(path, File(partial, path.removePrefix("app/")))
-                    if (!partial.renameTo(appTarget)) throw IllegalStateException("${appTarget.name} couldn't be put in place")
-                } finally {
-                    partial.deleteRecursively()
+                appTarget.parentFile!!.mkdirs()
+                fetch.place(appTarget) { partial ->
+                    if (fromCopy != null) {
+                        val copyDocuments = documents(context, tree, fromCopy.document, "")
+                        for ((path, entry) in fromCopy.files) {
+                            val source = copyDocuments[path] ?: throw IllegalStateException("$path is missing from the backup")
+                            fetch.copy(source, File(partial, path), entry.first, entry.second)
+                        }
+                    } else {
+                        for (path in wanted.keys.filter { it.startsWith("app/") }) copy(path, File(partial, path.removePrefix("app/")))
+                    }
                 }
             }
             // A backup made before the game was ever played has no saves: the current ones stay.
@@ -507,13 +881,14 @@ object Backups {
     private class Entry(val uri: Uri, val name: String, val directory: Boolean, val size: Long)
 
     private class Info(val packageName: String, val label: String, val versionCode: Long, val versionName: String, val installed: Long?, val files: Map<String, Long>,
-        val kind: String?, val name: String?, val place: String?, val saved: Long?)
+        val hashes: Map<String, String>, val kind: String?, val name: String?, val place: String?, val saved: Long?, val original: String?)
 
     private fun root(tree: Uri) = DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree))
 
     private fun displayName(context: Context, document: Uri): String? =
         context.contentResolver.query(document, arrayOf(Document.COLUMN_DISPLAY_NAME), null, null, null)?.use { if (it.moveToFirst()) it.getString(0) else null }
 
+    /** What is in `parent`. A folder that can't be listed is a problem, never an empty folder (the backup would take its files for gone). */
     private fun children(context: Context, tree: Uri, parent: Uri): List<Entry> {
         val list = DocumentsContract.buildChildDocumentsUriUsingTree(tree, DocumentsContract.getDocumentId(parent))
         val columns = arrayOf(Document.COLUMN_DOCUMENT_ID, Document.COLUMN_DISPLAY_NAME, Document.COLUMN_MIME_TYPE, Document.COLUMN_SIZE)
@@ -524,7 +899,7 @@ object Backups {
                         cursor.getString(2) == Document.MIME_TYPE_DIR, if (cursor.isNull(3)) -1 else cursor.getLong(3)))
                 }
             }
-        }.orEmpty()
+        } ?: throw IllegalStateException("the backup folder didn't list ${displayName(context, parent) ?: "a folder"}")
     }
 
     /** Every file under `parent`, by its path below it, with its size. */
@@ -569,10 +944,10 @@ object Backups {
         val lines = runCatching { context.contentResolver.openInputStream(uri)!!.use { it.readBytes().decodeToString().lines() } }.getOrNull() ?: return null
         val values = lines.mapNotNull { line -> line.split('=', limit = 2).takeIf { it.size == 2 }?.let { it[0] to it[1] } }
         fun value(key: String) = values.firstOrNull { it.first == key }?.second
-        val files = values.filter { it.first == "file" }.mapNotNull { (_, text) ->
-            text.split(' ', limit = 2).takeIf { it.size == 2 }?.let { (size, path) -> size.toLongOrNull()?.let { path to it } }
-        }.toMap()
+        fun pairs(key: String) = values.filter { it.first == key }.mapNotNull { (_, text) -> text.split(' ', limit = 2).takeIf { it.size == 2 }?.let { it[1] to it[0] } }
+        val files = pairs("file").mapNotNull { (path, size) -> size.toLongOrNull()?.let { path to it } }.toMap()
+        val hashes = pairs("hash").filter { it.second.length == 64 }.toMap()
         return Info(value("package") ?: return null, value("label") ?: "", value("versionCode")?.toLongOrNull() ?: 0, value("versionName") ?: "",
-            value("installed")?.toLongOrNull(), files, value("kind"), value("name"), value("place"), value("saved")?.toLongOrNull())
+            value("installed")?.toLongOrNull(), files, hashes, value("kind"), value("name"), value("place"), value("saved")?.toLongOrNull(), value("original"))
     }
 }
