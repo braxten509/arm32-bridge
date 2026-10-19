@@ -317,5 +317,19 @@ Progress (2026-10-18, night):
   The owner saw it gone after the call: it comes from the call, not
   from the build; no change.
 
+IB1 (Community Patch v2.5 IPA, 2026-10-18): has an arm64 program; ships as
+`SwordGame.app` too, so it lives at `Download/ios/InfinityBlade1.app`.
+It needed OpenAL (`fw/openal.rs`, mixed into the shared output),
+MPMoviePlayerController (looping loading video, same video screen as
+AVPlayer), UIActivityIndicatorView, UIAccelerometer and image views that
+ignore touches by default (its loading picture took the start tap). On
+the emulator: loading video, start screen (tap to start), opening scene
+with OpenAL sound mixed ("OpenAL: first sound mixed into the output"),
+60 fps. Not tested on the Pixel. Our layer doesn't draw UIKit views, so
+UIKit-only pictures (IB1's Start button image) don't show.
+Also fixed: leaving during a video left Android's VideoView paused at its
+start after coming back, so the game waited on a black screen
+(IosGameActivity keeps the video's place and starts it again).
+
 Later: Game Bridge takes `.ipa` files; Infinity Blade: Dungeons through
 the 32-bit translator.
