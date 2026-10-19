@@ -348,5 +348,27 @@ the "iphone-names" settings, applied after the search's kept results);
 the new name goes to the card, the game's app and the game screen.
 Emulator: all three apps installed, opening the IB3 app starts IB3.
 
+IB1 crash after the first fight's cutscene (2026-10-19): the game saves
+with CCCrypt (Apple's encryption) and our stand-in answered "done" with
+no output, so it read a null save. `fw/crypto.rs` now does CCCrypt for
+real (AES, DES, 3DES, CAST, RC4, Blowfish; CBC/ECB; PKCS7), with Apple's
+status codes. IB1 writes its save AES-256 CBC with padding and reads it
+back without. Test switch `IOS_TRACE_MESSAGES=<regex>` logs matching
+Objective-C messages ("-[Class sel]", 50 each, with the caller); on
+Android through `debug.gamebridge.ios.env` (92 characters at most).
+
+UIKit pictures (owner's choice, 2026-10-19, for every game): after a
+restart IB1 shows only its UIKit StartButtonView, which we didn't draw,
+so the screen stayed black. `fw/pictures.rs` walks the windows on the
+main thread (at most 20 times a second), collects visible UIImageViews
+placed through every parent (centre, transform, bounds origin), and
+sends the list when it changes to `IosPicturesView` over the game and
+the video, in the game's letterboxed area. A view playing a video covers
+the pictures under it, as on iOS (IB1 puts its splash picture off-centre
+under its movie view). Pictures take no touches. Emulator: restart from
+a save shows the start button, a tap continues the save; a new game
+shows the video, then the button, then the opening with nothing left
+over; IB2 and IB3 send no pictures and run as before.
+
 Later: Game Bridge takes `.ipa` files; Infinity Blade: Dungeons through
 the 32-bit translator.

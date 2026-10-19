@@ -236,6 +236,19 @@ fn close_video_of(player: Id) {
     }
 }
 
+/// Whether `view` shows a video: a movie player's view, or a view whose layer
+/// is an AVPlayerLayer with a player. As on iOS it covers what is under it
+/// while it is on screen, also before and after the video plays.
+pub fn shows_video(view: Id) -> bool {
+    if property_get(view, "moviePlayerOf").is_some() {
+        return true;
+    }
+    let layer = crate::fw::uikit::view_state(view).layer;
+    layer != 0
+        && property_get(layer, "player").is_some_and(|player| player != 0)
+        && runtime::send(layer, "isKindOfClass:", &[runtime::class_named("AVPlayerLayer") as Id]) & 0xFF != 0
+}
+
 /// UIView removeFromSuperview: a view showing a player's picture is gone.
 pub fn view_removed(view: Id) {
     if showing().is_none() {

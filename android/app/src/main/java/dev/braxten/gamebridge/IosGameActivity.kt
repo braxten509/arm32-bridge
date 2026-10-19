@@ -43,6 +43,8 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
     private var videoHeld = false
     /** Where the video was when the player left (ms), or -1. */
     private var videoLeftAt = -1
+    /** The game's UIKit pictures, drawn over the game and its video. */
+    private lateinit var pictures: IosPicturesView
     /** The pipe the "game stopped" byte comes down, kept so it stays open. */
     private var stopPipe: ParcelFileDescriptor? = null
 
@@ -54,6 +56,8 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
         view.holder.addCallback(this)
         root = FrameLayout(this)
         root.addView(view)
+        pictures = IosPicturesView(this)
+        root.addView(pictures)
         setContentView(root)
         useTopRefreshRate()
         window.insetsController?.let {
@@ -236,12 +240,20 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
             frame.addView(player, FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT, Gravity.CENTER))
             root.addView(frame)
+            // The game's pictures in front of its video stay in front.
+            pictures.bringToFront()
             video = frame
             videoPlayer = player
             videoToken = token
             player.setVideoPath(path)
             player.start()
         }
+    }
+
+    /** Called by the game (any thread): the UIKit pictures to draw (IosPicturesView.show). */
+    @Suppress("unused")
+    fun showPictures(list: String) {
+        runOnUiThread { pictures.show(list) }
     }
 
     /** Called by the game (any thread): hold the video where it is. */

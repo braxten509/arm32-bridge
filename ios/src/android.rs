@@ -86,6 +86,7 @@ pub unsafe extern "C" fn Java_dev_braxten_gamebridge_IosGameActivity_nativeStart
         let activity = (functions.NewGlobalRef.unwrap())(env, this);
         *JAVA.lock().unwrap() = Some((vm as usize, activity as usize));
         crate::fw::media::set_video_screen(crate::fw::media::VideoScreen { show: show_video, pause: pause_video, resume: resume_video, stop: stop_video });
+        crate::fw::pictures::set_picture_screen(crate::fw::pictures::PictureScreen { show: show_pictures });
     }
     crate::log!("phone app: starting {app} ({width}x{height} window)");
     let started = std::thread::Builder::new().name("ios-main".into()).stack_size(16 << 20).spawn(move || {
@@ -264,6 +265,18 @@ fn show_video(path: &str, token: u64) -> bool {
         let shown = call_activity(c"playVideo", c"(Ljava/lang/String;J)V", &[jvalue { l: string }, jvalue { j: token as jlong }]);
         (functions.DeleteLocalRef.unwrap())(env, string);
         shown
+    }
+}
+
+/// The game's UIKit pictures to draw over it (fw/pictures.rs `encode`).
+fn show_pictures(list: &str) {
+    unsafe {
+        let Some((env, _)) = java_env() else { return };
+        let Ok(text) = std::ffi::CString::new(list) else { return };
+        let functions = &**env;
+        let string = (functions.NewStringUTF.unwrap())(env, text.as_ptr());
+        call_activity(c"showPictures", c"(Ljava/lang/String;)V", &[jvalue { l: string }]);
+        (functions.DeleteLocalRef.unwrap())(env, string);
     }
 }
 

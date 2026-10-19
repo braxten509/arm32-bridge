@@ -560,6 +560,11 @@ extern "C" fn view_gesture_recognizers(_this: Id, _: Sel) -> Id {
 static KEY_WINDOW: Mutex<Id> = Mutex::new(0);
 static WINDOWS: Mutex<Vec<Id>> = Mutex::new(Vec::new());
 
+/// The windows shown, back to front.
+pub fn windows() -> Vec<Id> {
+    WINDOWS.lock().unwrap().clone()
+}
+
 extern "C" fn window_make_key_and_visible(this: Id, _: Sel) {
     *KEY_WINDOW.lock().unwrap() = this;
     let mut windows = WINDOWS.lock().unwrap();
@@ -769,7 +774,10 @@ fn image_from_path(path: &str) -> Id {
     object
 }
 
-fn image_info(image: Id) -> Option<&'static ImageInfo> {
+pub fn image_info(image: Id) -> Option<&'static ImageInfo> {
+    if image == 0 {
+        return None;
+    }
     unsafe { (*((image + 8) as *const *const ImageInfo)).as_ref() }
 }
 

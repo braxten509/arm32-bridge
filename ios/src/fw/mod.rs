@@ -18,6 +18,7 @@ pub mod media;
 pub mod misc;
 pub mod object;
 pub mod paths;
+pub mod pictures;
 pub mod plist;
 pub mod png;
 pub mod pvrtc;

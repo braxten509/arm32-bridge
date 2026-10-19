@@ -283,6 +283,11 @@ fn run_loop_until(run_loop: &'static Loop, until: Option<f64>, once: bool) -> bo
         if once && handled {
             return true;
         }
+        // The game's UIKit pictures go to the phone screen from the main thread.
+        let pictures = std::ptr::eq(run_loop, &MAIN_LOOP) && crate::fw::pictures::active();
+        if pictures {
+            crate::fw::pictures::tick();
+        }
         let current = now();
         if let Some(end) = until {
             if current >= end {
@@ -290,6 +295,9 @@ fn run_loop_until(run_loop: &'static Loop, until: Option<f64>, once: bool) -> bo
             }
         }
         let mut wait_until = next_timer.unwrap_or(current + 0.25);
+        if pictures {
+            wait_until = wait_until.min(current + 0.05);
+        }
         if let Some(end) = until {
             wait_until = wait_until.min(end);
         }
