@@ -3,6 +3,9 @@ package dev.braxten.gamebridge
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.graphics.Rect
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.nio.ByteBuffer
@@ -109,12 +112,22 @@ object IphoneApps {
     }
 
     private const val TEMPLATE = "iphone-launcher.apk"
+    private const val ICON_PICTURE = "res/mipmap-nodpi-v4/ic_launcher_picture.png"
 
-    /** The icon as a 192-pixel PNG (the size of the largest launcher icons), or null to keep the template's. */
+    /**
+     * The picture layer of the app's layered icon, or null to keep the template's. A layer is
+     * 108 units wide and the launcher shows the middle 72 in its icon shape, so the game's icon
+     * fills that middle; the rest (seen only while the launcher moves icons) is the icon again,
+     * larger. 432 pixels = 4 per unit, the size of the largest launcher icons.
+     */
     private fun iconPng(icon: Bitmap?): ByteArray? {
         icon ?: return null
-        val scaled = Bitmap.createScaledBitmap(icon, 192, 192, true)
-        return ByteArrayOutputStream().also { scaled.compress(Bitmap.CompressFormat.PNG, 100, it) }.toByteArray()
+        val layer = Bitmap.createBitmap(432, 432, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(layer)
+        val paint = Paint(Paint.FILTER_BITMAP_FLAG)
+        canvas.drawBitmap(icon, null, Rect(0, 0, 432, 432), paint)
+        canvas.drawBitmap(icon, null, Rect(72, 72, 360, 360), paint)
+        return ByteArrayOutputStream().also { layer.compress(Bitmap.CompressFormat.PNG, 100, it) }.toByteArray()
     }
 
     /** The template with the placeholders replaced. resources.arsc stays uncompressed (the signer aligns it). */
@@ -125,6 +138,7 @@ object IphoneApps {
             "GAME_BRIDGE_PLACEHOLDER_FOLDER" to folder,
             "GAME_BRIDGE_PLACEHOLDER_STAMP" to stamp,
         )
+        var pictureFound = false
         ZipInputStream(context.assets.open(TEMPLATE)).use { input ->
             ZipOutputStream(output.outputStream().buffered()).use { zip ->
                 while (true) {
@@ -132,7 +146,10 @@ object IphoneApps {
                     var bytes = input.readBytes()
                     when (entry.name) {
                         "AndroidManifest.xml" -> bytes = replaceStrings(bytes, replacements)
-                        "res/mipmap/ic_launcher.png" -> if (icon != null) bytes = icon
+                        ICON_PICTURE -> {
+                            pictureFound = true
+                            if (icon != null) bytes = icon
+                        }
                     }
                     val out = ZipEntry(entry.name).apply { time = entry.time }
                     if (entry.name == "resources.arsc") {
@@ -147,6 +164,7 @@ object IphoneApps {
                 }
             }
         }
+        check(pictureFound) { "the template has no $ICON_PICTURE" }
     }
 
     /**

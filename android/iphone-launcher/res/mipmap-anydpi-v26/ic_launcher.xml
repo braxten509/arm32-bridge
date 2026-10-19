@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  A layered icon, so the launcher shapes it like other apps' icons instead of putting it in a
+  white box. Game Bridge swaps ic_launcher_picture.png for the game's icon, sized to fill the
+  whole layer (IphoneApps.iconPng).
+-->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@mipmap/ic_launcher_picture" />
+    <foreground android:drawable="@android:color/transparent" />
+</adaptive-icon>
