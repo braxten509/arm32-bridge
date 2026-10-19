@@ -373,5 +373,33 @@ a save shows the start button, a tap continues the save; a new game
 shows the video, then the button, then the opening with nothing left
 over; IB2 and IB3 send no pictures and run as before.
 
+Sharper pictures (owner's choice, 2026-10-19, after comparing with a
+fan-made Android rebuild of IB1, com.chair.infinityblade 1.0.12):
+- Same texture sizes in both; the iPhone build stores PVRTC (431 at
+  2 bits a pixel, 271 at 4) under DXT labels, the Android build ASTC 8x8 /
+  6x6 at about the same bytes but much cleaner.
+- Every game: textures get the chip's most sharpening at an angle (up to
+  16x anisotropic; `sharpen` in fw/gl.rs; test switch IOS_SHARPENING=0).
+  UE3 games with plain (unencrypted) packed settings read a copy with
+  every texture group's LODBias above 0 set to 0 (fw/coalesced.rs,
+  `settings_replacement` in fw/paths.rs; IOS_FULL_SIZE_TEXTURES=0). IB1:
+  25 textures at 2048 instead of 18 in the castle scene. IB2/IB3 encrypt
+  theirs, so only the sharpening applies there.
+- `tools/merge-unreal-textures.py IPHONE.app ANDROID.apk OUT.app --name
+  --id` makes a new copy with the Android ASTC levels written over the
+  PVRTC ones in place (padded, no file changes size) and
+  GameBridgeTextures.txt listing them (size, bytes, FNV-1a of the first
+  4096 bytes, block); fw/gl.rs sends listed levels as ASTC. Left alone:
+  bIsCompositingSource textures (the engine builds the player's gear from
+  their PVRTC itself; merging them drew the gear flat or black), cube-map
+  faces, and any texture whose levels could be mistaken for unmerged ones.
+  A 2D texture never mixes ASTC and other levels: it stops at the last
+  matching level (TEXTURE_MAX_LEVEL). IB1 HD: 960 textures, 4356 levels,
+  `Download/ios/InfinityBlade1HD.app` (bundle id
+  com.chairentertainment.birthright.hd, own save and card); packed as
+  ~/Downloads/Infinity Blade I - Community Patch v2.5 HD.ipa. Emulator:
+  castle scene right (gear, lighting), 60 fps, stone path ~10% sharper.
+  Test switch IOS_TRACE_TEXTURES=1 logs every level sent.
+
 Later: Game Bridge takes `.ipa` files; Infinity Blade: Dungeons through
 the 32-bit translator.

@@ -138,6 +138,10 @@ system! {
     glClear(mask: u32);
     glClearColor(r: f32, g: f32, b: f32, a: f32);
     glGetFloatv(name: Enum, out: *mut f32);
+    glTexParameteri(target: Enum, name: Enum, value: i32);
+    glTexParameterf(target: Enum, name: Enum, value: f32);
+    glTexParameteriv(target: Enum, name: Enum, values: *const i32);
+    glTexParameterfv(target: Enum, name: Enum, values: *const f32);
 }
 
 pub const COLOR_CLEAR_VALUE: Enum = 0x0C22;
@@ -556,6 +560,8 @@ fn standard_type(kind: Enum) -> Enum {
 
 extern "C" fn tex_image_2d(target: Enum, level: i32, internal: i32, width: i32, height: i32, border: i32, format: Enum, kind: Enum, data: *const u8) {
     let kind = standard_type(kind);
+    trace_texture("plain", level, format, width, height, 0, std::ptr::null());
+    texture_redefined(target, level);
     unsafe {
         if format == BGRA && kind == UNSIGNED_BYTE {
             let unpack = unpack_state();
@@ -585,7 +591,186 @@ extern "C" fn tex_sub_image_2d(target: Enum, level: i32, x: i32, y: i32, width: 
 
 const PVRTC_FORMATS: std::ops::RangeInclusive<Enum> = 0x8C00..=0x8C03;
 
+/// Test switch IOS_TRACE_TEXTURES=1: logs every texture level the game sends
+/// (bound texture, level, size, format, byte count and a hash of its first
+/// 4096 bytes, FNV-1a), to match uploads against the game's files.
+fn trace_texture(kind: &str, level: i32, internal: Enum, width: i32, height: i32, size: i32, data: *const u8) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("IOS_TRACE_TEXTURES").is_ok_and(|v| v == "1")) {
+        return;
+    }
+    let mut bound = 0;
+    unsafe { glGetIntegerv(TEXTURE_BINDING_2D, &mut bound) };
+    let bytes = read_source(&unpack_state(), data, (size.max(0) as usize).min(4096)).unwrap_or_default();
+    let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
+    crate::log!("texture: {kind} #{bound} level {level} {width}x{height} format {internal:#x} {size} bytes key {hash:016x}");
+}
+
+// ----- Pictures merged from an Android build -----
+//
+// tools/merge-unreal-textures.py makes a copy of an Unreal game with an
+// Android build's ASTC pictures written over its PVRTC ones (same places,
+// padded to the same size). The game still sends them as PVRTC; the copy's
+// GameBridgeTextures.txt lists those levels (size, byte count and a key of
+// their first 4096 bytes) with their ASTC block, so they go to the chip as
+// ASTC.
+
+const MERGED_LIST: &str = "GameBridgeTextures.txt";
+const ASTC_BLOCKS: [(u8, u8); 14] = [(4, 4), (5, 4), (5, 5), (6, 5), (6, 6), (8, 5), (8, 6), (8, 8), (10, 5), (10, 6), (10, 8), (10, 10), (12, 10), (12, 12)];
+
+/// (width, height, bytes, key) -> ASTC block of each merged level.
+type Merged = std::collections::HashMap<(u32, u32, u32, u64), (u8, u8)>;
+
+/// FNV-1a 64 of the first 4096 bytes, as the merge tool writes it.
+fn picture_key(bytes: &[u8]) -> u64 {
+    bytes.iter().take(4096).fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3))
+}
+
+fn read_merged_list(text: &str) -> Merged {
+    let mut list = Merged::new();
+    let mut conflicting = Vec::new();
+    for (key, block) in text.lines()
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let [w, h, size, key, bw, bh] = f[..] else { return None };
+            let block = (bw.parse().ok()?, bh.parse().ok()?);
+            ASTC_BLOCKS.contains(&block).then_some(())?;
+            Some(((w.parse().ok()?, h.parse().ok()?, size.parse().ok()?, u64::from_str_radix(key, 16).ok()?), block))
+        })
+    {
+        // The same level listed with two different blocks can't be trusted.
+        if list.insert(key, block).is_some_and(|old| old != block) {
+            conflicting.push(key);
+        }
+    }
+    for key in conflicting {
+        list.remove(&key);
+    }
+    list
+}
+
+fn merged() -> &'static Merged {
+    static LIST: OnceLock<Merged> = OnceLock::new();
+    LIST.get_or_init(|| {
+        let program = crate::fw::paths::apple_executable_path();
+        let Some((app, _)) = program.rsplit_once('/') else { return Merged::new() };
+        let Ok(text) = std::fs::read_to_string(format!("{app}/{MERGED_LIST}")) else { return Merged::new() };
+        let list = read_merged_list(&text);
+        if !system_has_extension("GL_KHR_texture_compression_astc_ldr") {
+            crate::log!("graphics: this game has {} picture levels in ASTC, but the chip has no ASTC; they will look wrong", list.len());
+            return Merged::new();
+        }
+        crate::log!("graphics: {} picture levels merged from an Android build go to the chip as ASTC", list.len());
+        list
+    })
+}
+
+/// ASTC size of a level and the GL format of its block.
+fn astc(width: i32, height: i32, block: (u8, u8)) -> (usize, Enum) {
+    let index = ASTC_BLOCKS.iter().position(|&b| b == block).unwrap_or(0);
+    let blocks = |n: i32, b: u8| (n.max(1) as usize).div_ceil(b as usize);
+    (blocks(width, block.0) * blocks(height, block.1) * 16, 0x93B0 + index as Enum)
+}
+
+/// Per texture (context, bound 2D texture name): whether its first level
+/// was merged, and the level it stops at when a later level turned out the
+/// other kind. A texture must not mix ASTC and other levels (the chip would
+/// draw it black), so it then keeps only the levels before that one.
+static MERGED_TEXTURES: std::sync::Mutex<Option<std::collections::HashMap<(usize, u32), (bool, Option<i32>)>>> = std::sync::Mutex::new(None);
+const TEXTURE_MAX_LEVEL: Enum = 0x813D;
+
+/// The bound 2D texture of the current context, when `target` is a 2D texture.
+fn bound_texture(target: Enum) -> Option<(usize, u32)> {
+    if target != TEXTURE_2D {
+        return None;
+    }
+    let mut name = 0;
+    unsafe { glGetIntegerv(TEXTURE_BINDING_2D, &mut name) };
+    (name > 0).then(|| (unsafe { eglGetCurrentContext() }, name as u32))
+}
+
+/// A texture's first level is being defined some other way: forget what
+/// was known about it and undo a stop set for its earlier contents.
+fn texture_redefined(target: Enum, level: i32) {
+    if level != 0 || merged().is_empty() {
+        return;
+    }
+    let Some(texture) = bound_texture(target) else { return };
+    if let Some(textures) = MERGED_TEXTURES.lock().unwrap().as_mut() {
+        if let Some((_, Some(_))) = textures.remove(&texture) {
+            unsafe { glTexParameteri(target, TEXTURE_MAX_LEVEL, 1000) };
+        }
+    }
+}
+
+/// What to do with a PVRTC level of a game that has merged pictures.
+enum Merge {
+    /// Not a merged level: the usual path.
+    Plain,
+    /// A merged level: send it as ASTC.
+    Astc(Vec<u8>, Enum, usize),
+    /// Past where this texture stops: not sent.
+    Skip,
+}
+
+fn merge_decision(target: Enum, level: i32, width: i32, height: i32, size: i32, data: *const u8) -> Merge {
+    let list = merged();
+    if list.is_empty() || size <= 0 || width <= 0 || height <= 0 {
+        return Merge::Plain;
+    }
+    // Only plain 2D textures: a cube map needs all its faces alike.
+    let Some(texture) = bound_texture(target) else { return Merge::Plain };
+    let unpack = unpack_state();
+    let hit = read_source(&unpack, data, (size as usize).min(4096))
+        .and_then(|start| list.get(&(width as u32, height as u32, size as u32, picture_key(&start))).copied())
+        .map(|block| astc(width, height, block))
+        .filter(|&(needed, _)| needed <= size as usize);
+    {
+        let mut textures = MERGED_TEXTURES.lock().unwrap();
+        let textures = textures.get_or_insert_with(Default::default);
+        if level == 0 {
+            if let Some((_, Some(_))) = textures.insert(texture, (hit.is_some(), None)) {
+                unsafe { glTexParameteri(target, TEXTURE_MAX_LEVEL, 1000) };
+            }
+        } else if let Some((first_merged, stop)) = textures.get_mut(&texture) {
+            if stop.is_some_and(|stop| level >= stop) {
+                return Merge::Skip;
+            }
+            if *first_merged != hit.is_some() {
+                *stop = Some(level);
+                unsafe { glTexParameteri(target, TEXTURE_MAX_LEVEL, level - 1) };
+                static REPORTED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if REPORTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 10 {
+                    crate::log!("graphics: texture {} ({width}x{height} at level {level}) mixes merged and other levels; it keeps levels 0-{}", texture.1, level - 1);
+                }
+                return Merge::Skip;
+            }
+        }
+    }
+    match hit.and_then(|(needed, format)| Some((read_source(&unpack, data, needed)?, format, needed))) {
+        Some((bytes, format, needed)) => Merge::Astc(bytes, format, needed),
+        None => Merge::Plain,
+    }
+}
+
 extern "C" fn compressed_tex_image_2d(target: Enum, level: i32, internal: Enum, width: i32, height: i32, border: i32, size: i32, data: *const u8) {
+    trace_texture("compressed", level, internal, width, height, size, data);
+    if !PVRTC_FORMATS.contains(&internal) {
+        texture_redefined(target, level);
+    } else {
+        match merge_decision(target, level, width, height, size, data) {
+            Merge::Plain => {}
+            Merge::Skip => return,
+            Merge::Astc(bytes, format, needed) => {
+                let unpack = unpack_state();
+                upload_plain(&unpack, || unsafe { glCompressedTexImage2D(target, level, format, width, height, border, needed as i32, bytes.as_ptr()) });
+                static FIRST: std::sync::Once = std::sync::Once::new();
+                FIRST.call_once(|| crate::log!("graphics: first merged picture sent as ASTC ({width}x{height})"));
+                return;
+            }
+        }
+    }
     if PVRTC_FORMATS.contains(&internal) && !pvrtc_on_chip() {
         // 0x8C00/0x8C02 are 4 bits per pixel, 0x8C01/0x8C03 are 2.
         let two_bits = internal & 1 == 1;
@@ -608,6 +793,87 @@ extern "C" fn compressed_tex_image_2d(target: Enum, level: i32, internal: Enum, 
         return;
     }
     unsafe { glCompressedTexImage2D(target, level, internal, width, height, border, size, data) };
+}
+
+// ----- Sharper surfaces seen at an angle -----
+//
+// Games set how much texture sharpening at an angle (anisotropic filtering)
+// the iPhones of their day could afford, often 2x or none. Like a graphics
+// driver's override, every mipmapped texture gets the chip's most (up to
+// 16x) instead, whatever the game asks for.
+
+const TEXTURE_MIN_FILTER: Enum = 0x2801;
+const TEXTURE_MAX_ANISOTROPY: Enum = 0x84FE;
+const MAX_TEXTURE_MAX_ANISOTROPY: Enum = 0x84FF;
+
+/// The sharpening every mipmapped texture gets; None when the chip has none.
+fn sharpening() -> Option<f32> {
+    static MOST: OnceLock<Option<f32>> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        // Test switch: IOS_SHARPENING=0 leaves the game's own setting.
+        if std::env::var("IOS_SHARPENING").is_ok_and(|v| v == "0") {
+            crate::log!("graphics: sharpening at an angle left to the game (IOS_SHARPENING=0)");
+            return None;
+        }
+        if !system_has_extension("GL_EXT_texture_filter_anisotropic") {
+            crate::log!("graphics: the chip has no sharpening at an angle (anisotropic filtering)");
+            return None;
+        }
+        let mut most = 0f32;
+        unsafe { glGetFloatv(MAX_TEXTURE_MAX_ANISOTROPY, &mut most) };
+        let level = most.min(16.0);
+        crate::log!("graphics: textures get {level}x sharpening at an angle (the chip's most is {most}x)");
+        (level > 1.0).then_some(level)
+    })
+}
+
+/// True for the minifying filters that read mipmap levels.
+fn uses_mipmaps(filter: i32) -> bool {
+    (0x2700..=0x2703).contains(&filter)
+}
+
+/// After the game set `name` on the bound texture: our sharpening where it
+/// applies. Its own sharpening value is replaced rather than passed on.
+fn sharpen(target: Enum, name: Enum, value: f32) -> bool {
+    let wanted = match name {
+        TEXTURE_MIN_FILTER => uses_mipmaps(value as i32),
+        TEXTURE_MAX_ANISOTROPY => true,
+        _ => return false,
+    };
+    match sharpening() {
+        Some(level) if wanted => {
+            if name == TEXTURE_MIN_FILTER {
+                unsafe { glTexParameteri(target, name, value as i32) };
+            }
+            unsafe { glTexParameterf(target, TEXTURE_MAX_ANISOTROPY, level) };
+            true
+        }
+        _ => false,
+    }
+}
+
+extern "C" fn tex_parameter_i(target: Enum, name: Enum, value: i32) {
+    if !sharpen(target, name, value as f32) {
+        unsafe { glTexParameteri(target, name, value) };
+    }
+}
+
+extern "C" fn tex_parameter_f(target: Enum, name: Enum, value: f32) {
+    if !sharpen(target, name, value) {
+        unsafe { glTexParameterf(target, name, value) };
+    }
+}
+
+extern "C" fn tex_parameter_iv(target: Enum, name: Enum, values: *const i32) {
+    if values.is_null() || !sharpen(target, name, unsafe { *values } as f32) {
+        unsafe { glTexParameteriv(target, name, values) };
+    }
+}
+
+extern "C" fn tex_parameter_fv(target: Enum, name: Enum, values: *const f32) {
+    if values.is_null() || !sharpen(target, name, unsafe { *values }) {
+        unsafe { glTexParameterfv(target, name, values) };
+    }
 }
 
 fn pvrtc_on_chip() -> bool {
@@ -813,6 +1079,10 @@ pub fn register(r: &mut Registry) {
     r.function("glTexImage2D", tex_image_2d as usize);
     r.function("glTexSubImage2D", tex_sub_image_2d as usize);
     r.function("glCompressedTexImage2D", compressed_tex_image_2d as usize);
+    r.function("glTexParameteri", tex_parameter_i as usize);
+    r.function("glTexParameterf", tex_parameter_f as usize);
+    r.function("glTexParameteriv", tex_parameter_iv as usize);
+    r.function("glTexParameterfv", tex_parameter_fv as usize);
     r.function("glShaderSource", shader_source as usize);
     r.function("glCompileShader", compile_shader as usize);
     r.function("glLinkProgram", link_program as usize);
@@ -821,4 +1091,22 @@ pub fn register(r: &mut Registry) {
     r.function("glInsertEventMarkerEXT", debug_marker as usize);
     r.function("glPushGroupMarkerEXT", debug_marker as usize);
     r.function("glPopGroupMarkerEXT", debug_pop as usize);
+}
+
+#[cfg(test)]
+mod merged_tests {
+    use super::*;
+
+    #[test]
+    fn merged_list_and_astc_sizes() {
+        let list = read_merged_list("# comment\n2048 2048 1048576 00ff00ff00ff00ff 8 8\n4 4 32 0000000000000001 6 6\nbad line\n8 8 32 0000000000000002 7 7\n16 16 64 0000000000000003 8 8\n16 16 64 0000000000000003 6 6\n");
+        // The bad line, the unknown block and the level listed twice with different blocks are left out.
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[&(2048, 2048, 1048576, 0x00ff00ff00ff00ff)], (8, 8));
+        assert_eq!(astc(2048, 2048, (8, 8)), (1048576, 0x93B7));
+        assert_eq!(astc(2048, 2048, (6, 6)), (342 * 342 * 16, 0x93B4));
+        assert_eq!(astc(1, 1, (12, 12)), (16, 0x93BD));
+        assert_eq!(picture_key(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(picture_key(b"a"), 0xaf63_dc4c_8601_ec8c);
+    }
 }

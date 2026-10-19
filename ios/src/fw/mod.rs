@@ -1,6 +1,7 @@
 //! Stand-ins for Apple's Foundation and UIKit classes.
 
 pub mod app;
+pub mod coalesced;
 pub mod collections;
 pub mod crypto;
 pub mod data;

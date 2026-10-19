@@ -1,6 +1,7 @@
 //! Where Apple-side paths live on this device. The game sees the real
 //! folders directly, so paths pass through unchanged, except for the
-//! start-up command files of Unreal Engine 3 games (below).
+//! start-up command files and packed settings of Unreal Engine 3 games
+//! (below).
 
 use std::ffi::{CStr, CString};
 use std::collections::HashMap;
@@ -11,7 +12,7 @@ pub unsafe fn host_path_c(path: *const libc::c_char) -> CString {
         return CString::default();
     }
     let original = CStr::from_ptr(path);
-    if let Some(replacement) = original.to_str().ok().and_then(unreal_replacement) {
+    if let Some(replacement) = original.to_str().ok().and_then(|p| unreal_replacement(p).or_else(|| settings_replacement(p))) {
         return replacement;
     }
     original.to_owned()
@@ -68,6 +69,39 @@ fn unreal_replacement(path: &str) -> Option<CString> {
         return made.clone();
     }
     let made = if name == OUR_COMMANDS { commands_copy(path, hz) } else { command_line_copy(path, hz) };
+    copies.insert(path.to_string(), made.clone());
+    made
+}
+
+// ----- Unreal Engine 3 texture detail -----
+//
+// The game's packed settings (CookedIPhone/Coalesced_*.bin) choose per
+// iPhone model how many top picture levels each texture group drops; the
+// model we say we are drops some. The game reads a copy with every texture
+// group at full size (fw/coalesced.rs). Encrypted settings stay as they are.
+
+fn settings_replacement(path: &str) -> Option<CString> {
+    let (folder, name) = path.rsplit_once('/')?;
+    if !folder.ends_with("/CookedIPhone") || !name.starts_with("Coalesced") || !name.ends_with(".bin") {
+        return None;
+    }
+    // Test switch: IOS_FULL_SIZE_TEXTURES=0 lets the game read its own settings.
+    if std::env::var("IOS_FULL_SIZE_TEXTURES").is_ok_and(|v| v == "0") {
+        return None;
+    }
+    let mut copies = COPIES.lock().unwrap();
+    let copies = copies.get_or_insert_with(HashMap::new);
+    if let Some(made) = copies.get(path) {
+        return made.clone();
+    }
+    let made = std::fs::read(path).ok().and_then(|bytes| {
+        let (changed, entries) = crate::fw::coalesced::full_size_textures(&bytes)?;
+        crate::log!("Unreal texture detail: {entries} texture group settings in {name} set to full size");
+        write_copy(path, &changed)
+    });
+    if made.is_none() {
+        crate::log!("Unreal texture detail: {name} left as it is (encrypted, or nothing to change)");
+    }
     copies.insert(path.to_string(), made.clone());
     made
 }
@@ -185,6 +219,10 @@ fn write_copy(asked: &str, contents: &[u8]) -> Option<CString> {
     let folder = format!("{}/tmp/gamebridge", crate::fw::foundation::home());
     std::fs::create_dir_all(&folder).ok()?;
     let path = format!("{folder}/{:016x}-{name}", hasher.finish());
+    // Same copy as last run: kept as it is.
+    if std::fs::read(&path).is_ok_and(|old| old == contents) {
+        return CString::new(path).ok();
+    }
     let partial = format!("{path}.partial");
     std::fs::write(&partial, contents).ok()?;
     std::fs::rename(&partial, &path).ok()?;
