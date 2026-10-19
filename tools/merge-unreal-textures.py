@@ -19,6 +19,9 @@ Run with python3 -I. The two inputs are only read.
 import argparse, os, plistlib, shutil, struct, sys, zipfile
 
 TEXTURE_CLASSES = {'Texture2D', 'LightMapTexture2D', 'ShadowMapTexture2D', 'TerrainWeightMapTexture'}
+# Only plain pictures are merged: a lightmap's brightness comes with scale
+# numbers stored in the level, which belong to the iPhone build's own lightmaps.
+MERGED_CLASSES = {'Texture2D'}
 LIST_NAME = 'GameBridgeTextures.txt'
 
 
@@ -134,10 +137,10 @@ class Package:
         klass = export['klass']
         return self.object_name(klass)[0] if klass else 'Class'
 
-    def textures(self):
+    def textures(self, classes=TEXTURE_CLASSES):
         """(path, properties, levels) per texture; a level is (width, height, data at, data size)."""
         for i, e in enumerate(self.exports):
-            if self.class_name(e) not in TEXTURE_CLASSES:
+            if self.class_name(e) not in classes:
                 continue
             try:
                 yield self.path(i + 1), *self.texture(e)
@@ -253,7 +256,7 @@ def plan_package(ios, android):
         theirs.setdefault(path, []).append((props, levels))
     faces = i_pkg.cube_faces() | a_pkg.cube_faces()
     textures, kept, skipped = [], set(), 0
-    for path, props, levels in i_pkg.textures():
+    for path, props, levels in i_pkg.textures(MERGED_CLASSES):
         writes = plan_texture(path, props, levels, theirs.get(path, []), faces, android)
         if writes:
             textures.append(writes)

@@ -392,9 +392,12 @@ fan-made Android rebuild of IB1, com.chair.infinityblade 1.0.12):
   4096 bytes, block); fw/gl.rs sends listed levels as ASTC. Left alone:
   bIsCompositingSource textures (the engine builds the player's gear from
   their PVRTC itself; merging them drew the gear flat or black), cube-map
-  faces, and any texture whose levels could be mistaken for unmerged ones.
+  faces, lightmaps and shadow maps (their brightness comes with scale
+  numbers stored in the level for the iPhone build's own maps; merged
+  ones drew castle walls black on the Pixel), and any texture whose
+  levels could be mistaken for unmerged ones.
   A 2D texture never mixes ASTC and other levels: it stops at the last
-  matching level (TEXTURE_MAX_LEVEL). IB1 HD: 960 textures, 4356 levels,
+  matching level (TEXTURE_MAX_LEVEL). IB1 HD: 815 textures, 2795 levels,
   `Download/ios/InfinityBlade1HD.app` (bundle id
   com.chairentertainment.birthright.hd, own save and card); packed as
   ~/Downloads/Infinity Blade I - Community Patch v2.5 HD.ipa. Emulator:
