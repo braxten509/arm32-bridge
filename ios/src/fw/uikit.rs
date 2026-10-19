@@ -851,8 +851,48 @@ extern "C" fn app_scheduled_notifications(_this: Id, _: Sel) -> Id {
     collections::array_from(&[])
 }
 
+// A local notification only keeps what the game sets; scheduling one does
+// nothing, so it never shows.
+property!(notification_fire_date, notification_set_fire_date, "fireDate", id, 0);
+property!(notification_time_zone, notification_set_time_zone, "timeZone", id, 0);
+property!(notification_alert_body, notification_set_alert_body, "alertBody", id, 0);
+property!(notification_alert_action, notification_set_alert_action, "alertAction", id, 0);
+property!(notification_sound_name, notification_set_sound_name, "soundName", id, 0);
+property!(notification_user_info, notification_set_user_info, "userInfo", id, 0);
+property!(notification_category, notification_set_category, "category", id, 0);
+property!(notification_badge, notification_set_badge, "applicationIconBadgeNumber", isize, 0);
+property!(notification_repeat_interval, notification_set_repeat_interval, "repeatInterval", isize, 0);
+property!(notification_has_action, notification_set_has_action, "hasAction", bool, true);
+
 pub fn register(r: &mut Registry) {
     crate::fw::geometry::register(r);
+
+    let notification = define_class("UILocalNotification", "NSObject", 8);
+    methods(
+        notification,
+        &[
+            ("fireDate", notification_fire_date as usize),
+            ("setFireDate:", notification_set_fire_date as usize),
+            ("timeZone", notification_time_zone as usize),
+            ("setTimeZone:", notification_set_time_zone as usize),
+            ("alertBody", notification_alert_body as usize),
+            ("setAlertBody:", notification_set_alert_body as usize),
+            ("alertAction", notification_alert_action as usize),
+            ("setAlertAction:", notification_set_alert_action as usize),
+            ("soundName", notification_sound_name as usize),
+            ("setSoundName:", notification_set_sound_name as usize),
+            ("userInfo", notification_user_info as usize),
+            ("setUserInfo:", notification_set_user_info as usize),
+            ("category", notification_category as usize),
+            ("setCategory:", notification_set_category as usize),
+            ("applicationIconBadgeNumber", notification_badge as usize),
+            ("setApplicationIconBadgeNumber:", notification_set_badge as usize),
+            ("repeatInterval", notification_repeat_interval as usize),
+            ("setRepeatInterval:", notification_set_repeat_interval as usize),
+            ("hasAction", notification_has_action as usize),
+            ("setHasAction:", notification_set_has_action as usize),
+        ],
+    );
 
     let screen = define_class("UIScreen", "NSObject", 8);
     class_methods(screen, &[("mainScreen", main_screen as usize), ("screens", screens as usize)]);

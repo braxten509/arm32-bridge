@@ -104,6 +104,7 @@ pub fn attach_window(window: usize) {
         crate::log!("graphics: the new window can't be drawn into (error {:#x})", unsafe { eglGetError() });
         return;
     }
+    *LAST_FRAME_AT.lock().unwrap() = None;
     WINDOW_SURFACE.store(surface, Ordering::SeqCst);
     crate::log!("graphics: window back");
 }
@@ -422,6 +423,30 @@ pub fn frames_shown() -> usize {
     FRAMES.load(Ordering::Relaxed)
 }
 
+/// A gap between two shown frames longer than this is logged as a slow frame
+/// (the plan's smoothness goal: no repeated pauses over 50 ms).
+const SLOW_FRAME_MS: f64 = 50.0;
+static SLOW_FRAMES: AtomicUsize = AtomicUsize::new(0);
+
+/// Logs the gap since the last shown frame when it is a slow frame; returns
+/// the number of slow frames so far.
+/// When the last frame was shown; cleared while the app is away, so time
+/// spent away isn't counted as a slow frame.
+static LAST_FRAME_AT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+fn note_frame_gap(frame: usize) -> usize {
+    let now = std::time::Instant::now();
+    let previous = LAST_FRAME_AT.lock().unwrap().replace(now);
+    if let Some(previous) = previous {
+        let gap_ms = now.duration_since(previous).as_secs_f64() * 1000.0;
+        if gap_ms > SLOW_FRAME_MS {
+            SLOW_FRAMES.fetch_add(1, Ordering::Relaxed);
+            crate::log!("graphics: slow frame {gap_ms:.1} ms before frame {frame} at {:.1} s", crate::report::seconds_since_start());
+        }
+    }
+    SLOW_FRAMES.load(Ordering::Relaxed)
+}
+
 /// presentRenderbuffer: shows the bound renderbuffer.
 extern "C" fn present(this: Id, _: Sel, _target: Enum) -> bool {
     let egl = egl();
@@ -513,8 +538,9 @@ extern "C" fn present(this: Id, _: Sel, _target: Enum) -> bool {
     }
     drop(state);
     gl::check_errors(&format!("in frame {frame}"));
+    let slow_frames = note_frame_gap(frame);
     if frame <= 3 || frame % 300 == 0 {
-        crate::log!("graphics: frame {frame} shown ({width}x{height}) at {:.1} s", crate::report::seconds_since_start());
+        crate::log!("graphics: frame {frame} shown ({width}x{height}) at {:.1} s, {slow_frames} slow so far", crate::report::seconds_since_start());
     }
     if let Some(limit) = std::env::var("IOS_FRAME_LIMIT").ok().and_then(|v| v.parse::<usize>().ok()) {
         if frame >= limit {

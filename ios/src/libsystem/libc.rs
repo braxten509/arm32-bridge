@@ -278,6 +278,14 @@ unsafe extern "C" fn ios_printf_impl(fmt: *const libc::c_char, va: *const u64) -
     text.len() as i32
 }
 
+/// puts: the text and a newline to standard output, like printf.
+unsafe extern "C" fn ios_puts(text: *const libc::c_char) -> i32 {
+    let mut bytes = varargs::c_bytes(text).to_vec();
+    bytes.push(b'\n');
+    host_write(stdout_file(), &bytes);
+    bytes.len() as i32
+}
+
 #[no_mangle]
 unsafe extern "C" fn ios_fprintf_impl(file: *mut libc::FILE, fmt: *const libc::c_char, va: *const u64) -> i32 {
     let text = varargs::format(varargs::c_bytes(fmt), &mut Args::new(va), false);
@@ -520,6 +528,7 @@ pub fn register(r: &mut Registry) {
     r.function("__cxa_guard_release", cxa_guard_release as usize);
     r.function("__cxa_guard_abort", cxa_guard_abort as usize);
     r.function("printf", ios_printf as usize);
+    r.function("puts", ios_puts as usize);
     r.function("fprintf", ios_fprintf as usize);
     r.function("snprintf", ios_snprintf as usize);
     r.function("sprintf", ios_sprintf as usize);

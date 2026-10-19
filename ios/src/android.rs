@@ -107,6 +107,15 @@ pub unsafe extern "C" fn Java_dev_braxten_gamebridge_IosGameActivity_nativeSetRe
     std::env::set_var("IOS_REPORT_DIR", text(env, folder));
 }
 
+/// nativeSetScreenRate(hz): the screen's top refresh rate (IOS_SCREEN_HZ),
+/// so games with their own frame limit can be let up to it (fw::paths).
+#[no_mangle]
+pub unsafe extern "C" fn Java_dev_braxten_gamebridge_IosGameActivity_nativeSetScreenRate(_env: *mut JNIEnv, _this: jobject, hz: jint) {
+    if hz > 0 {
+        std::env::set_var("IOS_SCREEN_HZ", hz.to_string());
+    }
+}
+
 /// nativeNoticeFd(): the end of the "game stopped" pipe the screen watches
 /// (see report::notice_pipe), or -1.
 #[no_mangle]

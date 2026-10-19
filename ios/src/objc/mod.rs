@@ -222,7 +222,69 @@ extern "C" fn personality() -> i32 {
     crate::report::finish(1);
 }
 
+// ----- ARC entry points (compiler-made calls in ARC code) -----
+// Objects are never freed here (retain/release do nothing), so these only
+// pass objects along and store them; weak references are plain stores.
+
+extern "C" fn arc_same(object: Id) -> Id {
+    object
+}
+
+extern "C" fn arc_release(_object: Id) {}
+
+extern "C" fn arc_store(location: *mut Id, object: Id) -> Id {
+    if !location.is_null() {
+        unsafe { *location = object };
+    }
+    object
+}
+
+extern "C" fn arc_load(location: *const Id) -> Id {
+    if location.is_null() {
+        0
+    } else {
+        unsafe { *location }
+    }
+}
+
+extern "C" fn arc_destroy(location: *mut Id) {
+    if !location.is_null() {
+        unsafe { *location = 0 };
+    }
+}
+
+extern "C" fn arc_move_or_copy_weak(to: *mut Id, from: *mut Id) {
+    if !to.is_null() && !from.is_null() {
+        unsafe { *to = *from };
+    }
+}
+
+extern "C" fn arc_retain_block(block: usize) -> usize {
+    crate::libsystem::mach::block_copy(block as *mut _) as usize
+}
+
 pub fn register(r: &mut Registry) {
+    for name in [
+        "objc_retain",
+        "objc_autorelease",
+        "objc_autoreleaseReturnValue",
+        "objc_retainAutorelease",
+        "objc_retainAutoreleaseReturnValue",
+        "objc_retainAutoreleasedReturnValue",
+        "objc_unsafeClaimAutoreleasedReturnValue",
+    ] {
+        r.function(name, arc_same as usize);
+    }
+    r.function("objc_release", arc_release as usize);
+    r.function("objc_storeStrong", arc_store as usize);
+    r.function("objc_storeWeak", arc_store as usize);
+    r.function("objc_initWeak", arc_store as usize);
+    r.function("objc_loadWeak", arc_load as usize);
+    r.function("objc_loadWeakRetained", arc_load as usize);
+    r.function("objc_destroyWeak", arc_destroy as usize);
+    r.function("objc_copyWeak", arc_move_or_copy_weak as usize);
+    r.function("objc_moveWeak", arc_move_or_copy_weak as usize);
+    r.function("objc_retainBlock", arc_retain_block as usize);
     r.function("objc_msgSend", runtime::ios_objc_msgSend as usize);
     r.function("objc_msgSendSuper2", runtime::ios_objc_msgSendSuper2 as usize);
     r.function("objc_msgSendSuper", runtime::ios_objc_msgSendSuper as usize);

@@ -51,6 +51,7 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
         root = FrameLayout(this)
         root.addView(view)
         setContentView(root)
+        useTopRefreshRate()
         window.insetsController?.let {
             it.hide(WindowInsets.Type.systemBars())
             it.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
@@ -90,12 +91,33 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
         val reports = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "Game Bridge/logs")
         System.loadLibrary("gamebridge_ios")
         nativeSetReport(name, reports.path)
+        nativeSetScreenRate(topRefreshRate().toInt())
         if (!nativeStart(holder.surface, app, home, width, height)) {
             finish()
             return
         }
         startedApp = app
         watchForStop(name)
+    }
+
+    /** The screen's fastest mode at its current resolution. */
+    private fun topMode(): android.view.Display.Mode? {
+        val display = display ?: return null
+        val now = display.mode
+        return display.supportedModes
+            .filter { it.physicalWidth == now.physicalWidth && it.physicalHeight == now.physicalHeight }
+            .maxByOrNull { it.refreshRate }
+    }
+
+    private fun topRefreshRate(): Float = topMode()?.refreshRate ?: 60f
+
+    /**
+     * Asks for the screen's fastest mode while a game plays, so a game that
+     * draws faster than 60 frames a second is shown at its full rate.
+     */
+    private fun useTopRefreshRate() {
+        val mode = topMode() ?: return
+        window.attributes = window.attributes.apply { preferredDisplayModeId = mode.modeId }
     }
 
     /** The game's name from its Info.plist, else its folder's. */
@@ -230,5 +252,6 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
     private external fun nativePause()
     private external fun nativeNoticeFd(): Int
     private external fun nativeSetReport(name: String, folder: String)
+    private external fun nativeSetScreenRate(hz: Int)
     private external fun nativeResume(surface: android.view.Surface, width: Int, height: Int)
 }

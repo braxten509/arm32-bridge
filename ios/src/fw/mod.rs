@@ -7,6 +7,7 @@ pub mod data;
 pub mod eagl;
 pub mod files;
 pub mod foundation;
+pub mod gamekit;
 pub mod geometry;
 pub mod gl;
 pub mod json;
@@ -22,6 +23,7 @@ pub mod pvrtc;
 pub mod regex;
 pub mod runloop;
 pub mod sqlite;
+pub mod storekit;
 pub mod services;
 pub mod sound;
 pub mod string;
@@ -57,6 +59,8 @@ pub fn register(r: &mut Registry) {
     system::register(r);
     touch::register(r);
     sound::register(r);
+    gamekit::register(r);
+    storekit::register(r);
     immutable_copies();
 }
 

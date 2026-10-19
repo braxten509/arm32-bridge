@@ -268,5 +268,35 @@ game only; anything that would be, the owner decides first.
 5. Second-model review of everything, all tests, docs, commit. Pushing is
    the owner's call.
 
+Progress (2026-10-18, night):
+- Every frame gap over 50 ms is logged (`graphics: slow frame ...`), and
+  time spent away from the game isn't counted. IB2 on the Pixel window, 10
+  minute fight from the owner's save: 60 fps, no crash, one 52.6 ms frame
+  in play; the other slow frames are the first load and one map load
+  (`MapLoad.png` beside it in the log).
+- Resume on the Pixel: Home and back twice, the same game process goes on
+  drawing in the same fight (`~/.cache/ios-debug/phone-resume.sh`).
+- Edge swipes: the owner never had a swipe taken by Android; no change.
+- Frame rate (owner chose: every Unreal game, up to the screen's top
+  rate): UE3 reads `CookedIPhone/UE3CommandLine.txt`, whose `-exec=` file
+  (`Binaries/Commands.txt` in these copies) sets
+  `Engine MaxSmoothedFrameRate` (IB2: 62, IB3: 240, UE3 default 30). The
+  game now reads copies of both with `Set Engine MaxSmoothedFrameRate
+  <screen Hz + 2>` added (`ios/src/fw/paths.rs`; the game's files are not
+  changed), and the game screen asks Android for its fastest mode at the
+  current resolution (`IosGameActivity.useTopRefreshRate`, rate passed in
+  as IOS_SCREEN_HZ). Our 60 Hz display link does not hold UE3 back. IB2
+  on the Pixel window, 10 minute fight: 119.6 fps, no crash, no slow
+  frame in play (first load and one map load only), battery 32.6 to
+  36.6 C, Android thermal status 0 throughout (phone-window.sh now logs
+  heat.txt and screen-mode.txt).
+- IB3: Game Center (`fw/gamekit.rs`) and the store (`fw/storekit.rs`)
+  answer "not available" as on an offline iPhone; ARC calls, `puts`,
+  `CMTimeGetSeconds`/`kCMTimeZero`, `UILocalNotification` added. IB3 ran
+  10 minutes on the PC with no stop, and on the emulator plays its start
+  video, sound, opening scene and first fight. Both games ship as
+  `SwordGame.app` and the save folder is named after the game folder, so
+  IB3 is copied as `InfinityBlade3.app` to keep the saves apart.
+
 Later: Game Bridge takes `.ipa` files; Infinity Blade: Dungeons through
 the 32-bit translator.

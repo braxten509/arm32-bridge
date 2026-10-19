@@ -369,6 +369,22 @@ extern "C" fn zero_time(_this: Id, _: Sel) -> CmTime {
     CmTime { value: 0, timescale: 600, flags: 1, epoch: 0 }
 }
 
+/// CMTimeGetSeconds: NaN for an invalid or indefinite time, +/- infinity for
+/// the infinite ones (flags: 1 valid, 4 +inf, 8 -inf, 16 indefinite).
+extern "C" fn cm_time_get_seconds(time: CmTime) -> f64 {
+    if time.flags & 1 == 0 || time.flags & 16 != 0 {
+        f64::NAN
+    } else if time.flags & 4 != 0 {
+        f64::INFINITY
+    } else if time.flags & 8 != 0 {
+        f64::NEG_INFINITY
+    } else if time.timescale == 0 {
+        f64::NAN
+    } else {
+        time.value as f64 / time.timescale as f64
+    }
+}
+
 extern "C" fn layer_set_player(this: Id, _: Sel, player: Id) {
     let old = property_get(this, "player").unwrap_or(0) as Id;
     if old != 0 && old != player {
@@ -412,6 +428,8 @@ fn object_method(name: &str) -> usize {
 }
 
 pub fn register(r: &mut Registry) {
+    r.function("CMTimeGetSeconds", cm_time_get_seconds as usize);
+    r.data("kCMTimeZero", leak(CmTime { value: 0, timescale: 1, flags: 1, epoch: 0 }));
     r.function("AudioSessionInitialize", audio_session_initialize as usize);
     r.function("AudioSessionGetProperty", audio_session_get_property as usize);
     r.function("AudioSessionSetProperty", audio_session_ok_3 as usize);
