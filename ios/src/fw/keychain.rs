@@ -269,10 +269,12 @@ extern "C" fn boolean_type_id() -> usize {
 }
 
 extern "C" fn cf_retain(object: Id) -> Id {
+    crate::fw::corevideo::retained(object);
     crate::fw::counted::retain(object)
 }
 
 extern "C" fn cf_release(object: Id) {
+    crate::fw::corevideo::released(object);
     crate::fw::counted::release(object);
 }
 

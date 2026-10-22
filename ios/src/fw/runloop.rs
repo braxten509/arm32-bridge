@@ -88,6 +88,16 @@ pub fn post_to(run_loop: &'static Loop, work: Work) {
     run_loop.wake.notify_all();
 }
 
+/// Queues work for a run loop object (CFRunLoopRef) the game handed over.
+pub fn post_to_object(run_loop: Id, work: Work) {
+    if run_loop == 0 || run_loop == main_run_loop() {
+        return post(work);
+    }
+    let target = unsafe { &**((run_loop + 8) as *const *const Loop) };
+    target.queue.lock().unwrap().push_back(work);
+    target.wake.notify_all();
+}
+
 fn run_work(work: Work) {
     match work {
         Work::Block(block) => unsafe { crate::libsystem::mach::call_block(block) },
