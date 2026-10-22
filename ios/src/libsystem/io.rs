@@ -137,7 +137,7 @@ crate::libsystem::libc::variadic!(ios_fcntl, 2, ios_fcntl_impl);
 unsafe extern "C" fn ios_open_impl(path: *const libc::c_char, flags: i32, va: *const u64) -> i32 {
     let mode = if flags & APPLE_O_CREAT != 0 { *va as u32 } else { 0 };
     let path = crate::fw::paths::host_path_c(path);
-    libc::open(path.as_ptr(), open_flags(flags), mode)
+    crate::libsystem::threads::blocking(|| libc::open(path.as_ptr(), open_flags(flags), mode))
 }
 
 #[no_mangle]
@@ -479,10 +479,7 @@ pub fn register(r: &mut Registry) {
     r.function("munmap", libc::munmap as usize);
     r.function("mprotect", libc::mprotect as usize);
     r.function("close", libc::close as usize);
-    r.function("read", libc::read as usize);
-    r.function("write", libc::write as usize);
     r.function("lseek", libc::lseek as usize);
-    r.function("fsync", libc::fsync as usize);
     r.function("fflush", libc::fflush as usize);
     r.function("fwrite", libc::fwrite as usize);
     r.function("fread", libc::fread as usize);

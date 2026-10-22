@@ -95,16 +95,19 @@ unsafe extern "C" fn ios_asprintf_impl(out: *mut *mut u8, fmt: *const libc::c_ch
     text.len() as i32
 }
 
-unsafe extern "C" fn vsnprintf_chk(buf: *mut libc::c_char, size: usize, _flag: i32, _room: usize, fmt: *const libc::c_char, va: *const u64) -> i32 {
+/// __vsnprintf_chk: Apple aborts when the size given is bigger than the room.
+unsafe extern "C" fn vsnprintf_chk(buf: *mut libc::c_char, size: usize, _flag: i32, room: usize, fmt: *const libc::c_char, va: *const u64) -> i32 {
+    if crate::libsystem::libc::overflows(size, room) {
+        crate::libsystem::libc::stop_overflow("vsnprintf", size, room);
+    }
     ios_snprintf_impl(buf, size, fmt, va)
 }
 
 /// __memcpy_chk: memcpy that stops the game when the copy is bigger than
 /// the room the compiler knew about (Apple aborts there too).
 unsafe extern "C" fn memcpy_chk(dest: *mut u8, src: *const u8, length: usize, room: usize) -> *mut u8 {
-    if length > room {
-        crate::log!("STOP: the game overflowed a buffer (memcpy of {length} bytes into {room})");
-        crate::report::finish(1);
+    if crate::libsystem::libc::overflows(length, room) {
+        crate::libsystem::libc::stop_overflow("memcpy", length, room);
     }
     std::ptr::copy(src, dest, length);
     dest
@@ -216,8 +219,15 @@ fn locale_answer(names: &[&'static str; 6], category: i32) -> usize {
     *ANSWERS.lock().unwrap().get_or_insert_with(Default::default).entry(text.clone()).or_insert_with(|| leak_cstr(&text))
 }
 
-/// setlocale with Apple's category numbers. The system's own locale is left
-/// alone (this layer formats numbers for the game in the C locale).
+/// The system's character handling (wide characters, multibyte text) follows
+/// the game's LC_CTYPE: "UTF-8" or plain "C". False: the system can't.
+fn set_host_ctype(name: &str) -> bool {
+    let candidates: &[&std::ffi::CStr] = if name == "UTF-8" { &[c"C.UTF-8", c"en_US.UTF-8"] } else { &[c"C"] };
+    candidates.iter().any(|candidate| !unsafe { libc::setlocale(libc::LC_CTYPE, candidate.as_ptr()) }.is_null())
+}
+
+/// setlocale with Apple's category numbers. Of the system's own locale only
+/// LC_CTYPE changes (this layer formats numbers for the game in the C locale).
 extern "C" fn ios_setlocale(category: i32, asked: *const libc::c_char) -> usize {
     if !(APPLE_LC_ALL..=APPLE_LC_LAST).contains(&category) {
         set_errno(libc::EINVAL);
@@ -226,23 +236,22 @@ extern "C" fn ios_setlocale(category: i32, asked: *const libc::c_char) -> usize 
     let mut names = LOCALE.lock().unwrap();
     if !asked.is_null() {
         let asked = unsafe { String::from_utf8_lossy(varargs::c_bytes(asked)).into_owned() };
+        let Some(name) = locale_name(category, &asked) else {
+            crate::log!("setlocale {category}: locale '{asked}' isn't here (answered none)");
+            return 0;
+        };
+        let mut wanted = *names;
         if category == APPLE_LC_ALL {
-            match locale_name(APPLE_LC_ALL, &asked) {
-                Some(name) => names.fill(name),
-                None => {
-                    crate::log!("setlocale: locale '{asked}' isn't here (answered none)");
-                    return 0;
-                }
-            }
+            wanted.fill(name);
         } else {
-            match locale_name(category, &asked) {
-                Some(name) => names[category as usize - 1] = name,
-                None => {
-                    crate::log!("setlocale {category}: locale '{asked}' isn't here (answered none)");
-                    return 0;
-                }
-            }
+            wanted[category as usize - 1] = name;
         }
+        let ctype = (APPLE_LC_CTYPE - 1) as usize;
+        if wanted[ctype] != names[ctype] && !set_host_ctype(wanted[ctype]) {
+            crate::log!("setlocale: the system has no '{}' character set (answered none)", wanted[ctype]);
+            return 0;
+        }
+        *names = wanted;
     }
     locale_answer(&names, category)
 }
@@ -507,14 +516,30 @@ mod tests {
         assert_eq!(hash_search(table, key.as_ptr(), 0, 0), 33);
     }
 
+    /// Apple's _chk calls stop the game only when the size passes the known room.
+    #[test]
+    fn chk_calls_check_their_room() {
+        use crate::libsystem::libc::overflows;
+        assert!(!overflows(16, 16));
+        assert!(overflows(17, 16), "a size past the room was let through");
+        assert!(!overflows(4096, usize::MAX), "an unknown room (~0) stopped the game");
+        let mut buffer = [0u8; 8];
+        let written = unsafe { vsnprintf_chk(buffer.as_mut_ptr() as *mut _, 8, 0, 8, c"abcdefghij".as_ptr(), std::ptr::null()) };
+        assert_eq!(written, 10);
+        assert_eq!(&buffer, b"abcdefg\0");
+    }
+
     #[test]
     fn setlocale_uses_apple_categories() {
         let name = |p: usize| unsafe { CStr::from_ptr(p as *const libc::c_char).to_str().unwrap().to_string() };
         assert_eq!(name(ios_setlocale(APPLE_LC_ALL, c"".as_ptr())), "C");
         assert_eq!(name(ios_setlocale(APPLE_LC_CTYPE, c"UTF-8".as_ptr())), "UTF-8");
         assert_eq!(name(ios_setlocale(APPLE_LC_ALL, std::ptr::null())), "C/UTF-8/C/C/C/C");
+        let host_ctype = || name(unsafe { libc::setlocale(libc::LC_CTYPE, std::ptr::null()) } as usize);
+        assert!(host_ctype().contains("UTF-8"), "the system's characters stayed in {}", host_ctype());
         assert_eq!(ios_setlocale(4, c"de_DE".as_ptr()), 0, "a missing locale was accepted");
         assert_eq!(name(ios_setlocale(4, std::ptr::null())), "C");
         assert_eq!(name(ios_setlocale(APPLE_LC_ALL, c"C".as_ptr())), "C");
+        assert_eq!(host_ctype(), "C");
     }
 }

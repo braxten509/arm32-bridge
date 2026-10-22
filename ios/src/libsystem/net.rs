@@ -163,11 +163,60 @@ extern "C" fn ios_socket(family: i32, kind: i32, protocol: i32) -> i32 {
     unsafe { libc::socket(host_family(family), kind, protocol) }
 }
 
-extern "C" fn ios_bind(fd: i32, address: *const u8, length: u32) -> i32 {
-    match unsafe { host_address(address, length) } {
-        Some(host) => unsafe { libc::bind(fd, host.pointer(), host.length) },
-        None => -1,
+/// The address part (IPv4 at 4..8, IPv6 at 8..24) of an IP socket address.
+fn ip_part(host: &mut HostAddress) -> Option<&mut [u8]> {
+    let length = host.length as usize;
+    let family = i32::from(u16::from_ne_bytes([host.bytes()[0], host.bytes()[1]]));
+    let bytes = unsafe { std::slice::from_raw_parts_mut(host.pointer_mut() as *mut u8, length) };
+    match family {
+        libc::AF_INET if length >= 8 => Some(&mut bytes[4..8]),
+        libc::AF_INET6 if length >= 24 => Some(&mut bytes[8..24]),
+        _ => None,
     }
+}
+
+fn loopback_number(family: usize) -> &'static [u8] {
+    if family == 4 { &[127, 0, 0, 1] } else { &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1] }
+}
+
+/// Offline, the device's only addresses are its loopback ones: binding to
+/// "any address" binds loopback (so nothing off the device can reach the
+/// socket), and binding to any other address isn't possible.
+extern "C" fn ios_bind(fd: i32, address: *const u8, length: u32) -> i32 {
+    let Some(mut host) = (unsafe { host_address(address, length) }) else { return -1 };
+    if let Some(part) = ip_part(&mut host) {
+        if part.iter().all(|&b| b == 0) {
+            part.copy_from_slice(loopback_number(part.len()));
+            log_once("bind", "to any address: bound to loopback instead (offline)");
+        }
+    }
+    if !on_this_device(&host) {
+        log_once("bind", "to an address off this device: answered 'address not available' (offline)");
+        set_errno(libc::EADDRNOTAVAIL);
+        return -1;
+    }
+    unsafe { libc::bind(fd, host.pointer(), host.length) }
+}
+
+/// An IP socket with no address yet gets a loopback one, before the system
+/// would give it "any address" by itself (listen, sendto).
+fn bind_loopback_if_unbound(fd: i32) {
+    let mut host = HostAddress::empty();
+    if unsafe { libc::getsockname(fd, host.pointer_mut(), &mut host.length) } != 0 {
+        return;
+    }
+    let port = u16::from_ne_bytes([host.bytes()[2], host.bytes()[3]]);
+    let Some(part) = ip_part(&mut host) else { return };
+    if port != 0 || !part.iter().all(|&b| b == 0) {
+        return;
+    }
+    part.copy_from_slice(loopback_number(part.len()));
+    unsafe { libc::bind(fd, host.pointer(), host.length) };
+}
+
+extern "C" fn ios_listen(fd: i32, backlog: i32) -> i32 {
+    bind_loopback_if_unbound(fd);
+    unsafe { libc::listen(fd, backlog) }
 }
 
 extern "C" fn ios_connect(fd: i32, address: *const u8, length: u32) -> i32 {
@@ -181,12 +230,20 @@ extern "C" fn ios_connect(fd: i32, address: *const u8, length: u32) -> i32 {
 }
 
 extern "C" fn ios_accept(fd: i32, address: *mut u8, length: *mut u32) -> i32 {
-    let mut host = HostAddress::empty();
-    let result = blocking(|| unsafe { libc::accept(fd, host.pointer_mut(), &mut host.length) });
-    if result >= 0 {
-        unsafe { write_apple_address(&host, address, length) };
+    loop {
+        let mut host = HostAddress::empty();
+        let result = blocking(|| unsafe { libc::accept(fd, host.pointer_mut(), &mut host.length) });
+        if result >= 0 && !on_this_device(&host) {
+            // Never reachable offline; dropped if it got through anyway.
+            log_once("accept", "of a peer off this device: dropped (offline)");
+            unsafe { libc::close(result) };
+            continue;
+        }
+        if result >= 0 {
+            unsafe { write_apple_address(&host, address, length) };
+        }
+        return result;
     }
-    result
 }
 
 extern "C" fn ios_getsockname(fd: i32, address: *mut u8, length: *mut u32) -> i32 {
@@ -234,6 +291,9 @@ extern "C" fn ios_sendto(fd: i32, data: *const libc::c_void, length: usize, flag
             None => return -1,
         }
     };
+    if host.is_some() {
+        bind_loopback_if_unbound(fd);
+    }
     let (pointer, size) = host.as_ref().map_or((std::ptr::null(), 0), |h| (h.pointer(), h.length));
     let result = blocking(|| unsafe { libc::sendto(fd, data, length, host_message_flags(flags), pointer, size) });
     result
@@ -263,6 +323,8 @@ enum Value {
     Time,
     /// An error number (SO_ERROR).
     Error,
+    /// Apple's SO_LINGER: the time in ticks (1/100 s); the system's is in seconds.
+    LingerTicks,
     /// Apple's "no SIGPIPE" switch: always on here.
     NoSigpipe,
     /// Bytes waiting to be read (SO_NREAD).
@@ -283,7 +345,8 @@ fn host_option(level: i32, name: i32) -> Option<(i32, i32, Value)> {
                 0x8 => (libc::SO_KEEPALIVE, Same),
                 0x10 => (libc::SO_DONTROUTE, Same),
                 0x20 => (libc::SO_BROADCAST, Same),
-                0x80 | 0x1080 => (libc::SO_LINGER, Same),
+                0x80 => (libc::SO_LINGER, LingerTicks),
+                0x1080 => (libc::SO_LINGER, Same),
                 0x100 => (libc::SO_OOBINLINE, Same),
                 0x200 => (libc::SO_REUSEPORT, Same),
                 0x1001 => (libc::SO_SNDBUF, Same),
@@ -343,6 +406,15 @@ extern "C" fn ios_setsockopt(fd: i32, level: i32, name: i32, value: *const u8, l
     unsafe {
         match kind {
             Value::NoSigpipe | Value::Waiting => 0,
+            Value::LingerTicks => {
+                if value.is_null() || length < 8 {
+                    set_errno(libc::EINVAL);
+                    return -1;
+                }
+                let ticks = (value.add(4) as *const i32).read_unaligned().max(0);
+                let linger = libc::linger { l_onoff: (value as *const i32).read_unaligned(), l_linger: (ticks + 99) / 100 };
+                libc::setsockopt(fd, host_level, host_name, &linger as *const _ as *const _, 8)
+            }
             Value::Time => {
                 if value.is_null() || length < 12 {
                     set_errno(libc::EINVAL);
@@ -403,6 +475,21 @@ extern "C" fn ios_getsockopt(fd: i32, level: i32, name: i32, value: *mut u8, len
                 (value as *mut i64).write_unaligned(time.tv_sec as i64);
                 (value.add(8) as *mut i32).write_unaligned(time.tv_usec as i32);
                 *length = 16;
+                0
+            }
+            Value::LingerTicks => {
+                let mut linger = libc::linger { l_onoff: 0, l_linger: 0 };
+                let mut size = 8u32;
+                if libc::getsockopt(fd, host_level, host_name, &mut linger as *mut _ as *mut _, &mut size) != 0 {
+                    return -1;
+                }
+                if value.is_null() || length.is_null() || *length < 8 {
+                    set_errno(libc::EINVAL);
+                    return -1;
+                }
+                (value as *mut i32).write_unaligned(linger.l_onoff);
+                (value.add(4) as *mut i32).write_unaligned(linger.l_linger.saturating_mul(100));
+                *length = 8;
                 0
             }
             Value::Same => libc::getsockopt(fd, host_level, host_name, value as *mut _, length),
@@ -692,18 +779,36 @@ const APPLE_NI: [(i32, i32); 5] = [
     (0x10, libc::NI_DGRAM),
 ];
 
+/// 127.0.0.1 or ::1 exactly: the address "localhost" names.
+fn is_localhost_address(host: &HostAddress) -> bool {
+    let mut copy = HostAddress { storage: host.storage, length: host.length };
+    ip_part(&mut copy).is_some_and(|part| part == loopback_number(part.len()))
+}
+
+/// Offline, names are never looked up: addresses come back as numbers,
+/// except that 127.0.0.1 and ::1 are "localhost", as on an iPhone.
 extern "C" fn ios_getnameinfo(address: *const u8, length: u32, host: *mut libc::c_char, host_length: u32, service: *mut libc::c_char, service_length: u32, flags: i32) -> i32 {
     let Some(converted) = (unsafe { host_address(address, length) }) else { return 5 };
-    let mut host_flags = APPLE_NI.iter().filter(|(a, _)| flags & a != 0).fold(0, |f, (_, h)| f | h);
-    if !on_this_device(&converted) {
-        // Offline: no name can be looked up for another machine's address.
-        if host_flags & libc::NI_NAMEREQD != 0 && !host.is_null() && host_length > 0 {
-            log_once("getnameinfo", "for an address off this device: answered 'not known' (offline)");
-            return 8;
+    let host_flags = APPLE_NI.iter().filter(|(a, _)| flags & a != 0).fold(0, |f, (_, h)| f | h);
+    let wants_name = !host.is_null() && host_length > 0 && host_flags & libc::NI_NUMERICHOST == 0;
+    if wants_name && is_localhost_address(&converted) {
+        if !service.is_null() && service_length > 0 {
+            let error = unsafe { libc::getnameinfo(converted.pointer(), converted.length, std::ptr::null_mut(), 0, service, service_length as _, host_flags | libc::NI_NUMERICHOST) };
+            if error != 0 {
+                return apple_lookup_error(error);
+            }
         }
-        host_flags |= libc::NI_NUMERICHOST;
+        if host_length < 10 {
+            return 14; // EAI_OVERFLOW
+        }
+        unsafe { crate::varargs::write_bounded(host, host_length as usize, b"localhost") };
+        return 0;
     }
-    let error = unsafe { libc::getnameinfo(converted.pointer(), converted.length, host, host_length as _, service, service_length as _, host_flags) };
+    if wants_name && host_flags & libc::NI_NAMEREQD != 0 {
+        log_once("getnameinfo", "asking a name for an address: answered 'not known' (offline)");
+        return 8;
+    }
+    let error = unsafe { libc::getnameinfo(converted.pointer(), converted.length, host, host_length as _, service, service_length as _, host_flags | libc::NI_NUMERICHOST) };
     apple_lookup_error(error)
 }
 
@@ -716,7 +821,7 @@ pub fn register(r: &mut Registry) {
     r.function("bind", ios_bind as usize);
     r.function("connect", ios_connect as usize);
     r.function("accept", ios_accept as usize);
-    r.function("listen", libc::listen as usize);
+    r.function("listen", ios_listen as usize);
     r.function("shutdown", libc::shutdown as usize);
     r.function("getsockname", ios_getsockname as usize);
     r.function("send", ios_send as usize);
@@ -789,14 +894,15 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_millis(100), "offline answers took {:?}", started.elapsed());
         assert_eq!(ios_getaddrinfo(c"localhost".as_ptr(), c"80".as_ptr(), std::ptr::null(), &mut list), 0, "localhost not found");
         ios_freeaddrinfo(list);
-        // A loopback listener takes a loopback connection.
+        // A listener bound to "any address" is only on loopback, and takes a loopback connection.
         let server = ios_socket(libc::AF_INET, libc::SOCK_STREAM, 0);
         let mut near = [0u8; 16];
-        near[..8].copy_from_slice(&[16, 2, 0, 0, 127, 0, 0, 1]);
+        near[..8].copy_from_slice(&[16, 2, 0, 0, 0, 0, 0, 0]);
         assert_eq!(ios_bind(server, near.as_ptr(), 16), 0);
-        assert_eq!(unsafe { libc::listen(server, 1) }, 0);
+        assert_eq!(ios_listen(server, 1), 0);
         let mut length = 16u32;
         assert_eq!(ios_getsockname(server, near.as_mut_ptr(), &mut length), 0);
+        assert_eq!(&near[4..8], &[127, 0, 0, 1], "a wildcard bind is reachable from other machines");
         let client = ios_socket(libc::AF_INET, libc::SOCK_STREAM, 0);
         assert_eq!(ios_connect(client, near.as_ptr(), 16), 0, "loopback refused");
         unsafe {
