@@ -456,6 +456,123 @@ extern "C" fn url_init_with_string(_this: Id, _: Sel, text: Id) -> Id {
     if text == 0 { 0 } else { url(&string::get(text), false) }
 }
 
+/// A link's parts: scheme, authority, path, query, fragment (RFC 3986 appendix B).
+struct Parts<'a> {
+    scheme: Option<&'a str>,
+    authority: Option<&'a str>,
+    path: &'a str,
+    query: Option<&'a str>,
+    fragment: Option<&'a str>,
+}
+
+fn split_link(text: &str) -> Parts<'_> {
+    let (rest, fragment) = match text.split_once('#') {
+        Some((rest, fragment)) => (rest, Some(fragment)),
+        None => (text, None),
+    };
+    let (rest, query) = match rest.split_once('?') {
+        Some((rest, query)) => (rest, Some(query)),
+        None => (rest, None),
+    };
+    let (scheme, rest) = match rest.find(':') {
+        Some(colon) if colon > 0 && !rest[..colon].contains('/') => (Some(&rest[..colon]), &rest[colon + 1..]),
+        _ => (None, rest),
+    };
+    let (authority, path) = match rest.strip_prefix("//") {
+        Some(after) => {
+            let end = after.find('/').unwrap_or(after.len());
+            (Some(&after[..end]), &after[end..])
+        }
+        None => (None, rest),
+    };
+    Parts { scheme, authority, path, query, fragment }
+}
+
+fn remove_dot_segments(path: &str) -> String {
+    let mut output: Vec<&str> = Vec::new();
+    let segments: Vec<&str> = path.split('/').collect();
+    for (index, segment) in segments.iter().enumerate() {
+        let last = index + 1 == segments.len();
+        match *segment {
+            "." => {
+                if last {
+                    output.push("");
+                }
+            }
+            ".." => {
+                if output.len() > 1 || output.first().is_some_and(|first| !first.is_empty()) {
+                    output.pop();
+                }
+                if last {
+                    output.push("");
+                }
+            }
+            _ => output.push(segment),
+        }
+    }
+    let joined = output.join("/");
+    if path.starts_with('/') && !joined.starts_with('/') { format!("/{joined}") } else { joined }
+}
+
+/// Resolves `reference` against `base` (RFC 3986 section 5.2.2).
+fn resolve_link(base: &str, reference: &str) -> String {
+    let (b, r) = (split_link(base), split_link(reference));
+    let (scheme, authority, path, query);
+    if r.scheme.is_some() {
+        (scheme, authority, path, query) = (r.scheme, r.authority, remove_dot_segments(r.path), r.query);
+    } else {
+        scheme = b.scheme;
+        if r.authority.is_some() {
+            (authority, path, query) = (r.authority, remove_dot_segments(r.path), r.query);
+        } else {
+            authority = b.authority;
+            if r.path.is_empty() {
+                (path, query) = (b.path.to_string(), r.query.or(b.query));
+            } else {
+                let merged = if r.path.starts_with('/') {
+                    r.path.to_string()
+                } else if b.authority.is_some() && b.path.is_empty() {
+                    format!("/{}", r.path)
+                } else {
+                    format!("{}{}", &b.path[..b.path.rfind('/').map_or(0, |slash| slash + 1)], r.path)
+                };
+                (path, query) = (remove_dot_segments(&merged), r.query);
+            }
+        }
+    }
+    let mut out = String::new();
+    if let Some(scheme) = scheme {
+        out += scheme;
+        out.push(':');
+    }
+    if let Some(authority) = authority {
+        out += "//";
+        out += authority;
+    }
+    out += &path;
+    if let Some(query) = query {
+        out.push('?');
+        out += query;
+    }
+    if let Some(fragment) = r.fragment {
+        out.push('#');
+        out += fragment;
+    }
+    out
+}
+
+extern "C" fn url_with_string_relative(_: Class, _: Sel, text: Id, base: Id) -> Id {
+    match (text, base) {
+        (0, _) => 0,
+        (_, 0) => url(&string::get(text), false),
+        _ => url(&resolve_link(&url_text(base), &string::get(text)), false),
+    }
+}
+
+extern "C" fn url_init_with_string_relative(_this: Id, s: Sel, text: Id, base: Id) -> Id {
+    url_with_string_relative(0, s, text, base)
+}
+
 extern "C" fn url_init_file(_this: Id, _: Sel, path: Id) -> Id {
     if path == 0 { 0 } else { url(&string::get(path), true) }
 }
@@ -713,12 +830,14 @@ pub fn register(r: &mut Registry) {
             ("fileURLWithPath:", url_file as usize),
             ("fileURLWithPath:isDirectory:", url_file_dir as usize),
             ("URLWithString:", url_with_string as usize),
+            ("URLWithString:relativeToURL:", url_with_string_relative as usize),
         ],
     );
     methods(
         url_class,
         &[
             ("initWithString:", url_init_with_string as usize),
+            ("initWithString:relativeToURL:", url_init_with_string_relative as usize),
             ("initFileURLWithPath:", url_init_file as usize),
             ("absoluteString", url_absolute_string as usize),
             ("description", url_absolute_string as usize),
@@ -792,4 +911,44 @@ extern "C" fn cf_uuid_get_bytes(uuid: Id) -> UuidBytes {
 extern "C" fn uuid_new(class: Class, _: Sel) -> Id {
     let object = runtime::alloc_instance(class);
     uuid_init(object, 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A link relative to a base resolves the standard way (RFC 3986's own examples).
+    #[test]
+    fn relative_links_resolve_against_their_base() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let class = runtime::class_named("NSURL");
+        assert!(runtime::responds(class, "URLWithString:relativeToURL:"), "+[NSURL URLWithString:relativeToURL:] is missing");
+        let base = runtime::send(class, "URLWithString:", &[string::make("http://a/b/c/d;p?q")]);
+        for (reference, expected) in [
+            ("g", "http://a/b/c/g"),
+            ("./g", "http://a/b/c/g"),
+            ("g/", "http://a/b/c/g/"),
+            ("/g", "http://a/g"),
+            ("//g", "http://g"),
+            ("?y", "http://a/b/c/d;p?y"),
+            ("g?y", "http://a/b/c/g?y"),
+            ("#s", "http://a/b/c/d;p?q#s"),
+            ("g;x?y#s", "http://a/b/c/g;x?y#s"),
+            ("", "http://a/b/c/d;p?q"),
+            (".", "http://a/b/c/"),
+            ("..", "http://a/b/"),
+            ("../g", "http://a/b/g"),
+            ("../../../g", "http://a/g"),
+            ("https://other/x", "https://other/x"),
+        ] {
+            let link = runtime::send(class, "URLWithString:relativeToURL:", &[string::make(reference), base]);
+            assert_eq!(string::get(runtime::send(link, "absoluteString", &[])), expected, "{reference:?}");
+        }
+        let host_only = runtime::send(class, "URLWithString:", &[string::make("https://app.example.com")]);
+        let link = runtime::send(runtime::alloc_instance(class), "initWithString:relativeToURL:", &[string::make("/session"), host_only]);
+        assert_eq!(string::get(runtime::send(link, "absoluteString", &[])), "https://app.example.com/session");
+        let alone = runtime::send(class, "URLWithString:relativeToURL:", &[string::make("http://x/y"), 0]);
+        assert_eq!(string::get(runtime::send(alone, "absoluteString", &[])), "http://x/y");
+    }
 }
