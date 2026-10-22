@@ -14,6 +14,7 @@ pub mod gamekit;
 pub mod openal;
 pub mod geometry;
 pub mod gl;
+pub mod invocation;
 pub mod json;
 pub mod keychain;
 pub mod locks;
@@ -73,6 +74,7 @@ pub fn register(r: &mut Registry) {
     numbers::register(r);
     scanner::register(r);
     cfbridge::register(r);
+    invocation::register(r);
     immutable_copies();
 }
 
