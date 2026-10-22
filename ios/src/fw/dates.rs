@@ -1374,6 +1374,10 @@ pub fn parse_date(pattern: &str, text: &str, kind: Kind, am: &str, pm: &str, fir
                             };
                             if *letter == 'Y' {
                                 p.year_for_week = Some(year);
+                            } else if *letter == 'u' && matches!(kind, Kind::Gregorian | Kind::Iso8601 | Kind::Other) {
+                                // The astronomical year: 0 is 1 BC, -1 is 2 BC.
+                                p.era = Some(if year > 0 { 1 } else { 0 });
+                                p.year = Some(if year > 0 { year } else { 1 - year });
                             } else {
                                 p.year = Some(year);
                             }
@@ -1600,8 +1604,10 @@ fn wall_from_parsed(p: &Parsed, kind: Kind, first_weekday: i64, min_days: i64, b
     let (hour, minute, second, nanosecond) = (time(p.hour, HOUR), time(p.minute, MINUTE), time(p.second, SECOND), p.nanosecond.unwrap_or(0));
     let era = p.era.unwrap_or(base[ERA]);
     let no_date = p.month.is_none() && p.day.is_none();
+    // With a month or day, a week-based year (YYYY) names the year too.
+    let named_year = if no_date { p.year } else { p.year.or(p.year_for_week) };
     let build = |shift: i64| -> f64 {
-        let year = p.year.map(|y| y + shift).unwrap_or(base[YEAR]);
+        let year = named_year.map(|y| y + shift).unwrap_or(base[YEAR]);
         if no_date && (p.week.is_some() || p.year_for_week.is_some()) {
             let mut v = [UNDEFINED; SLOTS];
             v[ERA] = era;
@@ -1630,14 +1636,16 @@ fn wall_from_parsed(p: &Parsed, kind: Kind, first_weekday: i64, min_days: i64, b
     if !lenient {
         let got = components_of(kind, wall, first_weekday, min_days);
         let c = cal_date(kind, wall);
+        // The day of the calendar's own year.
+        let year_start = split_wall(cal_wall(kind, c.era, c.year, 1, 1, 0, 0, 0, 0)).0;
         let fields = [
-            (p.year.map(|y| y + shift), c.year),
+            (named_year.map(|y| y + shift), c.year),
             (p.month, c.month),
             (p.day, c.day),
             (p.hour, c.hour),
             (p.minute, c.minute),
             (p.second, c.second),
-            (if no_date { p.day_of_year } else { None }, c.days - days_from_civil(c.gregorian_year, 1, 1) + 1),
+            (if no_date { p.day_of_year } else { None }, c.days - year_start + 1),
             (if no_date { p.week } else { None }, got[WEEK_OF_YEAR]),
             (if no_date { p.year_for_week.map(|y| y + shift) } else { None }, got[YEAR_FOR_WEEK]),
         ];
@@ -1682,7 +1690,8 @@ extern "C" fn df_date_from_string(this: Id, _: Sel, text: Id) -> Id {
 
 extern "C" fn df_two_digit_start(this: Id, _: Sel) -> Id {
     match formatter(this).two_digit_start {
-        0 => misc::date(default_two_digit_start() - SINCE_1970),
+        // Midnight on the formatter's clock, as the parser reads it.
+        0 => misc::date(wall_to_unix(formatter(this).zone, default_two_digit_start()) - SINCE_1970),
         date => date,
     }
 }
@@ -2137,6 +2146,24 @@ mod tests {
         assert_eq!(read("MM/dd/yy", "01/02/50", 1, 1, false), Some((1950, 1, 2)));
         assert_eq!(read("MM/dd/yy", "01/02/49", 1, 1, false), Some((2049, 1, 2)));
         assert_eq!(read("MM/dd/yy", "12/31/49", 1, 1, false), Some((1949, 12, 31)));
+        // YYYY with a month and day still names the year.
+        assert_eq!(read("YYYY-MM-dd", "2015-12-30", 1, 1, false), Some((2015, 12, 30)));
+        // u is the astronomical year: 0 is 1 BC, -1 is 2 BC.
+        assert_eq!(read("uuuu-MM-dd", "0000-03-01", 1, 1, false), Some((1, 3, 1)));
+        assert_eq!(read("u-MM-dd", "-1-03-01", 1, 1, false), Some((2, 3, 1)));
+        // D counts days of the calendar's own year.
+        let p = parse_date("y-DDD", "1445-030", Kind::IslamicCivil, "AM", "PM", 1, 1949).unwrap();
+        let wall = wall_from_parsed(&p, Kind::IslamicCivil, 1, 1, &base, false, false, default_two_digit_start()).expect("a real Islamic day");
+        let c = cal_date(Kind::IslamicCivil, wall);
+        assert_eq!((c.year, c.month, c.day), (1445, 1, 30));
+        // twoDigitStartDate is 1949-12-31 on the formatter's own clock.
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let formatter_object = runtime::send(runtime::alloc_instance(runtime::class_named("NSDateFormatter")), "init", &[]);
+        let zone = runtime::send(runtime::class_named("NSTimeZone"), "timeZoneForSecondsFromGMT:", &[(-7 * 3600) as usize]);
+        df_set_time_zone(formatter_object, 0, zone);
+        let start = date_seconds(df_two_digit_start(formatter_object, 0)) + SINCE_1970;
+        assert_eq!(start, default_two_digit_start() + 7.0 * 3600.0);
     }
 
     #[test]
