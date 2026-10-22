@@ -1,6 +1,7 @@
 //! Apple kernel (Mach) calls, dispatch queues, blocks and dynamic loading.
 
 use crate::symbols::{leak, Registry};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 
 const KERN_SUCCESS: i32 = 0;
@@ -355,13 +356,38 @@ pub(crate) extern "C" fn dispatch_get_global_queue(_priority: i64, _flags: u64) 
 // its blocks there, taking turns with that queue's own blocks.
 // dispatch_suspend works on every queue the game made (serial or concurrent):
 // a block bound for a suspended queue, or for a queue whose targets pass
-// through one, doesn't start; it is held in order and sent on at resume.
+// through one, doesn't start; it is held and sent on at resume, in the order
+// the blocks were sent. While no queue is suspended, sending and running a
+// block checks one counter and takes no shared lock for this.
 
-/// A block to run, and the queue it was sent to (what
-/// dispatch_get_current_queue answers while it runs).
-enum Job {
-    Later(usize, usize),
-    Now(usize, std::sync::Arc<(Mutex<bool>, Condvar)>, usize),
+type Done = std::sync::Arc<(Mutex<bool>, Condvar)>;
+
+/// A block to run, the queue it was sent to (what dispatch_get_current_queue
+/// answers while it runs), who waits for it, and its place in sending order.
+struct Job {
+    block: usize,
+    sent_to: usize,
+    done: Option<Done>,
+    order: u64,
+}
+
+static NEXT_ORDER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn job(block: usize, sent_to: usize, done: Option<Done>) -> Job {
+    Job { block, sent_to, done, order: NEXT_ORDER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) }
+}
+
+fn run(job: Job) {
+    // Blocks sent with dispatch_async get a pool each, as GCD's worker
+    // threads drain theirs (sync blocks use the caller's).
+    let pool = job.done.is_none().then(crate::fw::counted::pool_mark);
+    run_as(job.sent_to, job.block);
+    if let Some(pool) = pool {
+        crate::fw::counted::pool_drain(pool);
+    }
+    if let Some(done) = job.done {
+        mark_done(&done);
+    }
 }
 
 struct SerialQueue {
@@ -379,24 +405,19 @@ struct Jobs {
 
 static SERIAL_QUEUES: Mutex<Option<std::collections::HashMap<usize, &'static SerialQueue>>> = Mutex::new(None);
 
-/// A block held back by a suspended queue: where it was sent, and who waits for it.
-struct Held {
-    sent_to: usize,
-    block: usize,
-    done: Option<std::sync::Arc<(Mutex<bool>, Condvar)>>,
-}
-
 #[derive(Default)]
 struct Suspensions {
     /// Concurrent queues the game made: their suspension counts.
     concurrent: std::collections::HashMap<usize, u32>,
-    /// Blocks held back, by the suspended queue holding them.
-    held: std::collections::HashMap<usize, std::collections::VecDeque<Held>>,
+    /// Blocks held back, by the suspended queue holding them, in sending order.
+    held: std::collections::HashMap<usize, std::collections::VecDeque<Job>>,
 }
 
-/// Also taken around every suspension change, so holding a block and
-/// releasing the held ones can't cross.
+/// Taken around every suspension change, holding and release.
 static SUSPENSIONS: Mutex<Option<Suspensions>> = Mutex::new(None);
+
+/// How many queues are suspended now: 0 lets blocks skip the check.
+static ANY_SUSPENDED: AtomicUsize = AtomicUsize::new(0);
 
 /// Queue -> its target queue.
 static TARGETS: Mutex<Option<std::collections::HashMap<usize, usize>>> = Mutex::new(None);
@@ -494,22 +515,8 @@ fn start_worker(queue: usize, state: &'static SerialQueue, mut jobs: std::sync::
                     }
                 }
             };
-            match job {
-                // Blocks sent with dispatch_async get a pool each, as GCD's
-                // worker threads drain theirs (sync blocks use the caller's).
-                Job::Later(block, sent_to) => {
-                    if !try_hold(sent_to, queue, block, None) {
-                        let pool = crate::fw::counted::pool_mark();
-                        run_as(sent_to, block);
-                        crate::fw::counted::pool_drain(pool);
-                    }
-                }
-                Job::Now(block, done, sent_to) => {
-                    if !try_hold(sent_to, queue, block, Some(done.clone())) {
-                        run_as(sent_to, block);
-                        mark_done(&done);
-                    }
-                }
+            if let Some(job) = try_hold(job, queue) {
+                run(job);
             }
         }
     });
@@ -522,29 +529,34 @@ fn is_suspended(suspensions: &Suspensions, queue: usize) -> bool {
     }
 }
 
-/// Holds a block bound for `sent_to` (run by `runner`) if a queue on its way
-/// is suspended. A serial runner's own suspension is kept by its worker.
-fn try_hold(sent_to: usize, runner: usize, block: usize, done: Option<std::sync::Arc<(Mutex<bool>, Condvar)>>) -> bool {
+/// Holds a job (run by `runner`) if a queue on its way is suspended: the
+/// queue it was sent to or any target after it, serial or concurrent. A
+/// serial runner's own suspension is kept by its worker. Gives the job back
+/// if it may run.
+fn try_hold(job: Job, runner: usize) -> Option<Job> {
+    if ANY_SUSPENDED.load(Ordering::SeqCst) == 0 {
+        return Some(job);
+    }
     let mut suspensions = SUSPENSIONS.lock().unwrap();
-    let suspensions = suspensions.get_or_insert_with(Default::default);
-    let mut at = sent_to;
+    try_hold_locked(suspensions.get_or_insert_with(Default::default), job, runner)
+}
+
+fn try_hold_locked(suspensions: &mut Suspensions, job: Job, runner: usize) -> Option<Job> {
+    let mut at = job.sent_to;
     for _ in 0..32 {
-        if at == runner && serial_queue(at).is_some() {
-            return false;
-        }
-        if is_suspended(suspensions, at) {
-            suspensions.held.entry(at).or_default().push_back(Held { sent_to, block, done });
-            return true;
-        }
-        if at == runner {
-            return false;
+        let own_worker_keeps_it = at == runner && serial_queue(at).is_some();
+        if !own_worker_keeps_it && is_suspended(suspensions, at) {
+            let held = suspensions.held.entry(at).or_default();
+            let place = held.partition_point(|other| other.order <= job.order);
+            held.insert(place, job);
+            return None;
         }
         match TARGETS.lock().unwrap().as_ref().and_then(|t| t.get(&at)).copied() {
             Some(target) => at = target,
-            None => return false,
+            None => break,
         }
     }
-    false
+    Some(job)
 }
 
 /// dispatch_suspend on a queue the game made. Apple ignores it for the main
@@ -552,88 +564,97 @@ fn try_hold(sent_to: usize, runner: usize, block: usize, done: Option<std::sync:
 pub(crate) fn suspend_queue(queue: usize) -> bool {
     let mut suspensions = SUSPENSIONS.lock().unwrap();
     let suspensions = suspensions.get_or_insert_with(Default::default);
-    if let Some(state) = serial_queue(queue) {
-        state.jobs.lock().unwrap().suspended += 1;
-        return true;
-    }
-    match suspensions.concurrent.get_mut(&queue) {
-        Some(count) => {
-            *count += 1;
-            true
+    let count = if let Some(state) = serial_queue(queue) {
+        let mut jobs = state.jobs.lock().unwrap();
+        jobs.suspended += 1;
+        jobs.suspended
+    } else {
+        match suspensions.concurrent.get_mut(&queue) {
+            Some(count) => {
+                *count += 1;
+                *count
+            }
+            None => return false,
         }
-        None => false,
-    }
-}
-
-pub(crate) fn resume_queue(queue: usize) -> bool {
-    let released = {
-        let mut suspensions = SUSPENSIONS.lock().unwrap();
-        let suspensions = suspensions.get_or_insert_with(Default::default);
-        let still_suspended = if let Some(state) = serial_queue(queue) {
-            let mut jobs = state.jobs.lock().unwrap();
-            if jobs.suspended == 0 {
-                crate::log!("dispatch_resume on a queue that wasn't suspended; ignored");
-                return true;
-            }
-            jobs.suspended -= 1;
-            let still = jobs.suspended > 0;
-            start_worker(queue, state, jobs);
-            still
-        } else {
-            match suspensions.concurrent.get_mut(&queue) {
-                None => return false,
-                Some(0) => {
-                    crate::log!("dispatch_resume on a queue that wasn't suspended; ignored");
-                    return true;
-                }
-                Some(count) => {
-                    *count -= 1;
-                    *count > 0
-                }
-            }
-        };
-        if still_suspended { Default::default() } else { suspensions.held.remove(&queue).unwrap_or_default() }
     };
-    for held in released {
-        submit(held.sent_to, held.block, held.done);
+    if count == 1 {
+        ANY_SUSPENDED.fetch_add(1, Ordering::SeqCst);
     }
     true
 }
 
-/// Sends a (copied) block to a queue; `done` is marked once it has run.
-fn submit(queue: usize, block: usize, done: Option<std::sync::Arc<(Mutex<bool>, Condvar)>>) {
-    let runner = runs_on(queue);
-    if try_hold(queue, runner, block, done.clone()) {
-        return;
-    }
-    let finish = move |done: Option<std::sync::Arc<(Mutex<bool>, Condvar)>>| {
-        if let Some(done) = done {
-            mark_done(&done);
+/// The held blocks are sent on before the lock is let go, so blocks sent
+/// after this can't pass them.
+pub(crate) fn resume_queue(queue: usize) -> bool {
+    let mut suspensions = SUSPENSIONS.lock().unwrap();
+    let suspensions = suspensions.get_or_insert_with(Default::default);
+    let still_suspended = if let Some(state) = serial_queue(queue) {
+        let mut jobs = state.jobs.lock().unwrap();
+        if jobs.suspended == 0 {
+            crate::log!("dispatch_resume on a queue that wasn't suspended; ignored");
+            return true;
+        }
+        jobs.suspended -= 1;
+        jobs.suspended > 0
+    } else {
+        match suspensions.concurrent.get_mut(&queue) {
+            None => return false,
+            Some(0) => {
+                crate::log!("dispatch_resume on a queue that wasn't suspended; ignored");
+                return true;
+            }
+            Some(count) => {
+                *count -= 1;
+                *count > 0
+            }
         }
     };
-    if queue == main_queue() && done.is_none() {
-        crate::fw::runloop::post(crate::fw::runloop::Work::Block(block));
+    if still_suspended {
+        return true;
+    }
+    for job in suspensions.held.remove(&queue).unwrap_or_default() {
+        submit_with(Some(&mut *suspensions), job);
+    }
+    if let Some(state) = serial_queue(queue) {
+        start_worker(queue, state, state.jobs.lock().unwrap());
+    }
+    ANY_SUSPENDED.fetch_sub(1, Ordering::SeqCst);
+    true
+}
+
+/// Sends a (copied) block to its queue; `done` is marked once it has run.
+fn submit(job: Job) {
+    submit_with(None, job);
+}
+
+fn submit_with(locked: Option<&mut Suspensions>, job: Job) {
+    let queue = job.sent_to;
+    let runner = runs_on(queue);
+    let job = match locked {
+        Some(suspensions) => try_hold_locked(suspensions, job, runner),
+        None => try_hold(job, runner),
+    };
+    let Some(job) = job else { return };
+    if queue == main_queue() && job.done.is_none() {
+        crate::fw::runloop::post(crate::fw::runloop::Work::Block(job.block));
     } else if runner == main_queue() {
         crate::fw::runloop::post(crate::fw::runloop::Work::Native(Box::new(move || {
-            if !try_hold(queue, runner, block, done.clone()) {
-                run_as(queue, block);
-                finish(done);
+            if let Some(job) = try_hold(job, runner) {
+                run(job);
             }
         })));
     } else if let Some(state) = serial_queue(runner) {
-        let job = match done {
-            None => Job::Later(block, queue),
-            Some(done) => Job::Now(block, done, queue),
-        };
         enqueue(runner, state, job);
     } else {
         std::thread::spawn(move || {
-            if !try_hold(queue, runner, block, done.clone()) {
+            if let Some(job) = try_hold(job, runner) {
                 CURRENT_QUEUE.with(|c| c.set(queue));
                 let pool = crate::fw::counted::pool_mark();
-                unsafe { call_block(block) };
+                unsafe { call_block(job.block) };
                 crate::fw::counted::pool_drain(pool);
-                finish(done);
+                if let Some(done) = job.done {
+                    mark_done(&done);
+                }
             }
         });
     }
@@ -641,19 +662,19 @@ fn submit(queue: usize, block: usize, done: Option<std::sync::Arc<(Mutex<bool>, 
 
 pub(crate) extern "C" fn dispatch_async(queue: usize, block: usize) {
     let copy = block_copy(block as *mut BlockHeader) as usize;
-    submit(queue, copy, None);
+    submit(job(copy, queue, None));
 }
 
 /// Runs the block on the queue's turn and waits for it.
 extern "C" fn dispatch_sync(queue: usize, block: usize) {
     let inline = || run_as(queue, block);
     let runner = runs_on(queue);
-    let done = std::sync::Arc::new((Mutex::new(false), Condvar::new()));
+    let done: Done = std::sync::Arc::new((Mutex::new(false), Condvar::new()));
     if runner == main_queue() {
         if crate::fw::runloop::is_main_thread() {
             return inline();
         }
-        submit(queue, block, Some(done.clone()));
+        submit(job(block, queue, Some(done.clone())));
         wait_for(&done);
     } else if serial_queue(runner).is_some() {
         if CURRENT_RUNNER.with(|c| c.get()) == runner {
@@ -661,12 +682,13 @@ extern "C" fn dispatch_sync(queue: usize, block: usize) {
             crate::log!("dispatch_sync onto the queue already running; ran it directly");
             return inline();
         }
-        submit(queue, block, Some(done.clone()));
-        wait_for(&done);
-    } else if try_hold(queue, runner, block, Some(done.clone())) {
+        submit(job(block, queue, Some(done.clone())));
         wait_for(&done);
     } else {
-        inline();
+        match try_hold(job(block, queue, Some(done.clone())), runner) {
+            None => wait_for(&done),
+            Some(_) => inline(),
+        }
     }
 }
 
@@ -925,5 +947,22 @@ mod tests {
         let mut expected: Vec<usize> = (0..30).collect();
         expected.push(100);
         assert_eq!(order, expected, "blocks ran out of order");
+
+        // A serial queue whose target is a suspended concurrent queue holds its
+        // blocks, and runs them in sending order after resume.
+        let concurrent = dispatch_queue_create(0, 1);
+        let serial = dispatch_queue_create(0, 0);
+        dispatch_set_target_queue(serial, concurrent);
+        assert!(suspend_queue(concurrent));
+        ORDER.lock().unwrap().clear();
+        for i in 200..205 {
+            dispatch_async(serial, block(i, serial));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(ORDER.lock().unwrap().is_empty(), "a block ran through a suspended concurrent queue");
+        assert!(resume_queue(concurrent));
+        dispatch_sync(serial, block(205, serial));
+        assert_eq!(*ORDER.lock().unwrap(), (200..206).collect::<Vec<_>>(), "held blocks ran out of order");
+        assert_eq!(ANY_SUSPENDED.load(Ordering::SeqCst), 0);
     }
 }

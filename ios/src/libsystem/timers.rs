@@ -30,8 +30,9 @@ fn timer_type() -> usize {
 struct Timer {
     state: Mutex<TimerState>,
     wake: Condvar,
-    /// Our own block that runs the game's handler on the queue.
+    /// Our own blocks that run the game's event and cancel handlers on the queue.
     runner: usize,
+    cancel_runner: usize,
 }
 
 struct TimerState {
@@ -54,6 +55,7 @@ struct TimerState {
     running: bool,
     cancelled: bool,
     cancel_sent: bool,
+    cancel_queued: bool,
     thread_started: bool,
 }
 
@@ -78,13 +80,29 @@ fn send_handler(timer: &'static Timer, state: &mut TimerState) {
     }
 }
 
-/// Sends the cancel handler once, when it may run. Lock held.
-fn send_cancel_handler(state: &mut TimerState) {
-    if state.cancelled && !state.cancel_sent && !state.running && !state.queued && state.suspended == 0 {
-        state.cancel_sent = true;
-        if state.cancel_handler != 0 {
-            mach::dispatch_async(state.queue, state.cancel_handler);
+/// Sends the cancel handler once, when it may run. Lock held. Like the event
+/// handler, a cancel handler sent but not started waits while the source is
+/// suspended.
+fn send_cancel_handler(timer: &'static Timer, state: &mut TimerState) {
+    if state.cancelled && !state.cancel_sent && !state.cancel_queued && !state.running && !state.queued && state.suspended == 0 {
+        state.cancel_queued = true;
+        mach::dispatch_async(state.queue, timer.cancel_runner);
+    }
+}
+
+extern "C" fn run_cancel_handler(block: usize) {
+    let timer = unsafe { &*((*(block as *const RunnerBlock)).timer as *const Timer) };
+    let handler = {
+        let mut state = timer.state.lock().unwrap();
+        state.cancel_queued = false;
+        if state.suspended > 0 || state.cancel_sent {
+            return;
         }
+        state.cancel_sent = true;
+        state.cancel_handler
+    };
+    if handler != 0 {
+        unsafe { mach::call_block(handler) };
     }
 }
 
@@ -95,7 +113,7 @@ extern "C" fn run_handler(block: usize) {
         state.queued = false;
         if state.cancelled || state.suspended > 0 || state.handler == 0 {
             // Suspended: the firings stay counted until dispatch_resume sends it again.
-            send_cancel_handler(&mut state);
+            send_cancel_handler(timer, &mut state);
             return;
         }
         state.running = true;
@@ -106,7 +124,7 @@ extern "C" fn run_handler(block: usize) {
     let mut state = timer.state.lock().unwrap();
     state.running = false;
     send_handler(timer, &mut state);
-    send_cancel_handler(&mut state);
+    send_cancel_handler(timer, &mut state);
     drop(state);
     timer.wake.notify_all();
 }
@@ -156,6 +174,10 @@ extern "C" fn dispatch_source_create(kind: usize, _handle: usize, _mask: usize, 
         header: BlockHeader { isa, flags: BLOCK_IS_GLOBAL, reserved: 0, invoke: run_handler as usize, descriptor },
         timer: 0,
     });
+    let cancel_runner = leak(RunnerBlock {
+        header: BlockHeader { isa, flags: BLOCK_IS_GLOBAL, reserved: 0, invoke: run_cancel_handler as usize, descriptor },
+        timer: 0,
+    });
     let timer: &'static Timer = Box::leak(Box::new(Timer {
         state: Mutex::new(TimerState {
             queue,
@@ -170,12 +192,17 @@ extern "C" fn dispatch_source_create(kind: usize, _handle: usize, _mask: usize, 
             running: false,
             cancelled: false,
             cancel_sent: false,
+            cancel_queued: false,
             thread_started: false,
         }),
         wake: Condvar::new(),
         runner,
+        cancel_runner,
     }));
-    unsafe { (*(runner as *mut RunnerBlock)).timer = timer as *const Timer as usize };
+    unsafe {
+        (*(runner as *mut RunnerBlock)).timer = timer as *const Timer as usize;
+        (*(cancel_runner as *mut RunnerBlock)).timer = timer as *const Timer as usize;
+    }
     TIMERS.lock().unwrap().get_or_insert_with(Default::default).insert(source, timer);
     source
 }
@@ -208,7 +235,7 @@ extern "C" fn dispatch_source_cancel(source: usize) {
     };
     let mut state = timer.state.lock().unwrap();
     state.cancelled = true;
-    send_cancel_handler(&mut state);
+    send_cancel_handler(timer, &mut state);
     drop(state);
     timer.wake.notify_all();
 }
@@ -276,7 +303,7 @@ extern "C" fn dispatch_resume(object: usize) {
             std::thread::spawn(move || timer_thread(timer));
         }
         send_handler(timer, &mut state);
-        send_cancel_handler(&mut state);
+        send_cancel_handler(timer, &mut state);
     }
     drop(state);
     timer.wake.notify_all();

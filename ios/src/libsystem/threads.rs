@@ -199,11 +199,15 @@ extern "C" fn get_stackaddr_np(thread: libc::pthread_t) -> usize {
 // layer exports (read, write, open, fsync, pause, sleep, usleep, nanosleep,
 // pthread_join, condition waits, socket calls, poll, select) and
 // pthread_testcancel. A thread blocked in one of those is woken: its
-// condition is broadcast, or a no-op signal ends its system call. The wake is
-// sent again every 10 ms for 3 s after a cancel, in case it came just before
-// the thread went to sleep; nothing runs while no cancel is under way. A
-// system call our wake interrupted without ending the thread is simply made
-// again, so the game never sees that interruption.
+// condition is broadcast, or a no-op signal (a free real-time signal, picked
+// so no one else's handler is replaced) ends its system call. While the
+// cancel is pending the wake is sent again, every 10 ms at first and then
+// less often (up to once a second), so a wake that came just before the
+// thread went to sleep isn't lost; nothing runs while no cancel is under way.
+// A system call our wake interrupted without ending the thread is made again
+// with the time it had left, so the game never sees that interruption.
+// Limit: a thread the game didn't start through this layer and that never
+// reaches a cancellation point keeps its request (and one check a second).
 
 const APPLE_PTHREAD_CANCELED: usize = 1;
 
@@ -215,6 +219,8 @@ struct Slot {
     enabled: std::sync::atomic::AtomicBool,
     /// A wake signal was sent while it was blocked.
     woken: std::sync::atomic::AtomicBool,
+    /// The wake signal this thread has unblocked (0: none yet).
+    unblocked: std::sync::atomic::AtomicI32,
 }
 
 #[derive(Default)]
@@ -253,17 +259,28 @@ impl Drop for Registered {
     }
 }
 
+/// Forgets the thread's cancel request when a thread started here ends.
+struct ThreadEnd(usize);
+
+impl Drop for ThreadEnd {
+    fn drop(&mut self) {
+        forget_cancel(self.0);
+    }
+}
+
 thread_local! {
     static SLOT: Registered = {
         let slot: &'static Slot = Box::leak(Box::new(Slot {
             blocked_in: AtomicUsize::new(0),
             enabled: std::sync::atomic::AtomicBool::new(true),
             woken: std::sync::atomic::AtomicBool::new(false),
+            unblocked: std::sync::atomic::AtomicI32::new(0),
         }));
         let me = unsafe { libc::pthread_self() } as usize;
         cancel_state().get_or_insert_with(Default::default).slots.insert(me, slot);
         Registered(slot, me)
     };
+    static THREAD_END: std::cell::RefCell<Option<ThreadEnd>> = const { std::cell::RefCell::new(None) };
 }
 
 fn my_slot() -> Option<&'static Slot> {
@@ -322,9 +339,17 @@ pub fn waiting<T>(cond: usize, work: impl FnOnce() -> T) -> T {
 }
 
 /// A system call as a cancellation point. A call our wake signal ended with
-/// EINTR, where the thread then wasn't cancelled, is made again.
+/// EINTR, where the thread then wasn't cancelled, is made again (the closure
+/// keeps what time is left for calls with a time limit).
 pub fn blocking<T: PartialEq + From<i8>>(mut work: impl FnMut() -> T) -> T {
     let slot = my_slot();
+    if let Some(slot) = slot {
+        let signal = WAKE_SIGNAL.load(Ordering::Relaxed);
+        if signal != 0 && slot.unblocked.load(Ordering::Relaxed) != signal {
+            unblock(signal);
+            slot.unblocked.store(signal, Ordering::Relaxed);
+        }
+    }
     loop {
         if let Some(slot) = slot {
             slot.woken.store(false, Ordering::SeqCst);
@@ -346,27 +371,68 @@ pub fn blocking<T: PartialEq + From<i8>>(mut work: impl FnMut() -> T) -> T {
     }
 }
 
-fn wake_signal() -> i32 {
-    libc::SIGRTMIN() + 7
+/// The real-time signal used to wake blocked threads (0: none picked yet or none free).
+static WAKE_SIGNAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+static SIGNAL_ARRIVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn ignore_signal(_signal: i32) {
+    SIGNAL_ARRIVED.store(true, Ordering::SeqCst);
 }
 
-extern "C" fn ignore_signal(_signal: i32) {}
+/// Whether the signal really arrives (an emulator can lack some numbers).
+fn signal_arrives(signal: i32) -> bool {
+    SIGNAL_ARRIVED.store(false, Ordering::SeqCst);
+    std::thread::spawn(move || {
+        unblock(signal);
+        unsafe { libc::pthread_kill(libc::pthread_self(), signal) };
+    })
+    .join()
+    .is_ok()
+        && SIGNAL_ARRIVED.load(Ordering::SeqCst)
+}
 
-fn install_wake_signal() {
+fn unblock(signal: i32) {
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, signal);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+    }
+}
+
+/// Picks a real-time signal nobody handles, from SIGRTMIN+7 up (clear of the
+/// ones the C library keeps), and installs a no-op handler there (no
+/// SA_RESTART, so a blocked system call returns EINTR).
+fn wake_signal() -> i32 {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| unsafe {
-        let mut action: libc::sigaction = std::mem::zeroed();
-        action.sa_sigaction = ignore_signal as usize;
-        // No SA_RESTART: a blocked system call returns EINTR.
-        action.sa_flags = 0;
-        libc::sigemptyset(&mut action.sa_mask);
-        libc::sigaction(wake_signal(), &action, std::ptr::null_mut());
+        for signal in libc::SIGRTMIN() + 7..=libc::SIGRTMAX() {
+            let mut current: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(signal, std::ptr::null(), &mut current) != 0 || current.sa_sigaction != libc::SIG_DFL {
+                continue;
+            }
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = ignore_signal as usize;
+            action.sa_flags = 0;
+            libc::sigemptyset(&mut action.sa_mask);
+            if libc::sigaction(signal, &action, std::ptr::null_mut()) != 0 {
+                continue;
+            }
+            if signal_arrives(signal) {
+                WAKE_SIGNAL.store(signal, Ordering::SeqCst);
+                return;
+            }
+            libc::sigaction(signal, &current, std::ptr::null_mut());
+        }
+        crate::log!("pthread_cancel: no free real-time signal; blocked system calls end only at their next cancellation point");
     });
+    WAKE_SIGNAL.load(Ordering::SeqCst)
 }
 
 extern "C" fn ios_pthread_cancel(thread: libc::pthread_t) -> i32 {
     let target = thread as usize;
-    install_wake_signal();
+    let signal = wake_signal();
     {
         let mut state = cancel_state();
         if state.get_or_insert_with(Default::default).pending.insert(target) {
@@ -377,7 +443,8 @@ extern "C" fn ios_pthread_cancel(thread: libc::pthread_t) -> i32 {
         return 0;
     }
     std::thread::spawn(move || {
-        for _ in 0..300 {
+        let mut pause_ms = 10;
+        loop {
             {
                 let state = cancel_state();
                 let Some(state) = state.as_ref() else { return };
@@ -389,10 +456,11 @@ extern "C" fn ios_pthread_cancel(thread: libc::pthread_t) -> i32 {
                     if slot.enabled.load(Ordering::SeqCst) {
                         match slot.blocked_in.load(Ordering::SeqCst) {
                             0 => {}
-                            1 => unsafe {
+                            1 if signal != 0 => unsafe {
                                 slot.woken.store(true, Ordering::SeqCst);
-                                libc::pthread_kill(target as libc::pthread_t, wake_signal());
+                                libc::pthread_kill(target as libc::pthread_t, signal);
                             },
+                            1 => {}
                             cond => unsafe {
                                 libc::pthread_cond_broadcast(cond as *mut libc::pthread_cond_t);
                             },
@@ -400,7 +468,8 @@ extern "C" fn ios_pthread_cancel(thread: libc::pthread_t) -> i32 {
                     }
                 }
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(pause_ms));
+            pause_ms = (pause_ms * 2).min(1000);
         }
     });
     0
@@ -425,23 +494,41 @@ extern "C" fn ios_pthread_testcancel() {
     cancel_point();
 }
 
+/// nanosleep as a cancellation point; a retry after our wake sleeps only what was left.
+fn sleep_for(span: libc::timespec, left: *mut libc::timespec) -> i32 {
+    let mut request = span;
+    let result = blocking(|| {
+        let mut rest = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        let result = unsafe { libc::nanosleep(&request, &mut rest) };
+        if result != 0 && unsafe { *crate::libsystem::host_errno() } == libc::EINTR {
+            request = rest;
+        }
+        result
+    });
+    if result != 0 && !left.is_null() {
+        unsafe { *left = request };
+    }
+    result
+}
+
 extern "C" fn ios_usleep(micros: u32) -> i32 {
-    blocking(|| unsafe { libc::usleep(micros) })
+    let span = libc::timespec { tv_sec: (micros / 1_000_000) as _, tv_nsec: ((micros % 1_000_000) * 1000) as _ };
+    sleep_for(span, std::ptr::null_mut())
 }
 
 extern "C" fn ios_nanosleep(span: *const libc::timespec, left: *mut libc::timespec) -> i32 {
-    blocking(|| unsafe { libc::nanosleep(span, left) })
+    if span.is_null() {
+        unsafe { *crate::libsystem::host_errno() = libc::EFAULT };
+        return -1;
+    }
+    sleep_for(unsafe { *span }, left)
 }
 
 /// sleep: whole seconds; a cancel ends it like the other sleeps.
 extern "C" fn ios_sleep(seconds: u32) -> u32 {
-    let mut span = libc::timespec { tv_sec: seconds as _, tv_nsec: 0 };
     let mut left = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    while blocking(|| unsafe { libc::nanosleep(&span, &mut left) }) != 0 {
-        if unsafe { *crate::libsystem::host_errno() } != libc::EINTR {
-            return 0;
-        }
-        span = left;
+    if sleep_for(libc::timespec { tv_sec: seconds as _, tv_nsec: 0 }, &mut left) != 0 {
+        return left.tv_sec as u32 + (left.tv_nsec > 0) as u32;
     }
     0
 }
@@ -462,43 +549,62 @@ pub extern "C" fn ios_fsync(fd: i32) -> i32 {
     blocking(|| unsafe { libc::fsync(fd) })
 }
 
-// ----- pthread_join: waits on the thread's end word, so a cancel can end the wait -----
-
-/// Set to 1 (and woken) when a thread started through this layer ends.
-struct ThreadEnd(std::sync::Arc<std::sync::atomic::AtomicU32>);
-
-impl Drop for ThreadEnd {
-    fn drop(&mut self) {
-        forget_cancel(unsafe { libc::pthread_self() } as usize);
-        self.0.store(1, Ordering::SeqCst);
-        unsafe { libc::syscall(libc::SYS_futex, self.0.as_ptr(), FUTEX_WAKE_PRIVATE, i32::MAX) };
-    }
-}
+// ----- pthread_join -----
+// The system's pthread_join can't be interrupted, so a helper thread does it
+// and the caller waits for the helper (cancellably, on a futex word). The
+// answer therefore comes only once the thread has really ended (its key
+// destructors included). If the caller is cancelled while waiting, the
+// helper still finishes, and a later pthread_join of that thread gets the
+// same answer.
 
 const FUTEX_WAIT_PRIVATE: i32 = 128;
 const FUTEX_WAKE_PRIVATE: i32 = 129;
 
-thread_local! {
-    static THREAD_END: std::cell::RefCell<Option<ThreadEnd>> = const { std::cell::RefCell::new(None) };
+#[derive(Default)]
+struct Join {
+    /// 1 once the helper's pthread_join returned.
+    done: std::sync::atomic::AtomicU32,
+    result: std::sync::atomic::AtomicI32,
+    value: AtomicUsize,
 }
 
-static THREAD_ENDS: std::sync::Mutex<Option<std::collections::HashMap<usize, std::sync::Arc<std::sync::atomic::AtomicU32>>>> =
-    std::sync::Mutex::new(None);
+static JOINS: std::sync::Mutex<Option<std::collections::HashMap<usize, std::sync::Arc<Join>>>> = std::sync::Mutex::new(None);
 
 extern "C" fn ios_pthread_join(thread: libc::pthread_t, value: *mut *mut libc::c_void) -> i32 {
-    let end = THREAD_ENDS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&(thread as usize)).cloned());
-    if let Some(end) = &end {
-        while end.load(Ordering::SeqCst) == 0 {
-            blocking(|| unsafe { libc::syscall(libc::SYS_futex, end.as_ptr(), FUTEX_WAIT_PRIVATE, 0, std::ptr::null::<libc::timespec>()) });
+    if unsafe { libc::pthread_equal(thread, libc::pthread_self()) } != 0 {
+        return libc::EDEADLK;
+    }
+    let (join, start) = {
+        let mut joins = JOINS.lock().unwrap_or_else(|e| e.into_inner());
+        let joins = joins.get_or_insert_with(Default::default);
+        match joins.get(&(thread as usize)) {
+            Some(join) => (join.clone(), false),
+            None => {
+                let join = std::sync::Arc::new(Join::default());
+                joins.insert(thread as usize, join.clone());
+                (join, true)
+            }
         }
-    } else {
-        cancel_point();
+    };
+    if start {
+        let helper = join.clone();
+        std::thread::spawn(move || {
+            let mut out: *mut libc::c_void = std::ptr::null_mut();
+            let result = unsafe { libc::pthread_join(thread, &mut out) };
+            helper.value.store(out as usize, Ordering::SeqCst);
+            helper.result.store(result, Ordering::SeqCst);
+            helper.done.store(1, Ordering::SeqCst);
+            unsafe { libc::syscall(libc::SYS_futex, helper.done.as_ptr(), FUTEX_WAKE_PRIVATE, i32::MAX) };
+        });
     }
-    let result = unsafe { libc::pthread_join(thread, value) };
-    if result == 0 && end.is_some() {
-        THREAD_ENDS.lock().unwrap_or_else(|e| e.into_inner()).as_mut().map(|m| m.remove(&(thread as usize)));
+    while join.done.load(Ordering::SeqCst) == 0 {
+        blocking(|| unsafe { libc::syscall(libc::SYS_futex, join.done.as_ptr(), FUTEX_WAIT_PRIVATE, 0, std::ptr::null::<libc::timespec>()) });
     }
-    result
+    JOINS.lock().unwrap_or_else(|e| e.into_inner()).as_mut().map(|m| m.remove(&(thread as usize)));
+    if !value.is_null() {
+        unsafe { *value = join.value.load(Ordering::SeqCst) as *mut libc::c_void };
+    }
+    join.result.load(Ordering::SeqCst)
 }
 
 /// Each thread's Mach port number (here its Linux thread id), by pthread_t.
@@ -651,14 +757,13 @@ struct Start {
     start: usize,
     arg: usize,
     noted: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
-    end: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 extern "C" fn thread_entry(start: *mut libc::c_void) -> *mut libc::c_void {
     let start = unsafe { Box::from_raw(start as *mut Start) };
     note_this_thread();
     forget_cancel(unsafe { libc::pthread_self() } as usize);
-    THREAD_END.with(|cell| *cell.borrow_mut() = Some(ThreadEnd(start.end.clone())));
+    THREAD_END.with(|cell| *cell.borrow_mut() = Some(ThreadEnd(unsafe { libc::pthread_self() } as usize)));
     *start.noted.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
     start.noted.1.notify_all();
     let game: extern "C" fn(*mut libc::c_void) -> *mut libc::c_void = unsafe { std::mem::transmute(start.start) };
@@ -667,13 +772,11 @@ extern "C" fn thread_entry(start: *mut libc::c_void) -> *mut libc::c_void {
 
 extern "C" fn ios_pthread_create(thread: *mut libc::pthread_t, attr: *const libc::pthread_attr_t, start: usize, arg: usize) -> i32 {
     let noted = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-    let end = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let boxed = Box::into_raw(Box::new(Start { start, arg, noted: noted.clone(), end: end.clone() }));
+    let boxed = Box::into_raw(Box::new(Start { start, arg, noted: noted.clone() }));
     let r = unsafe { libc::pthread_create(thread, attr, thread_entry, boxed as *mut _) };
     if r != 0 {
         drop(unsafe { Box::from_raw(boxed) });
     } else {
-        THREAD_ENDS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(unsafe { *thread } as usize, end);
         let mut done = noted.0.lock().unwrap_or_else(|e| e.into_inner());
         while !*done {
             done = noted.1.wait(done).unwrap_or_else(|e| e.into_inner());
