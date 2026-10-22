@@ -194,12 +194,30 @@ macro_rules! fails {
 }
 
 fails!(
-    mach_port_allocate, mach_port_deallocate, mach_port_insert_right, mach_port_mod_refs,
-    mach_port_move_member, mach_port_request_notification, mach_msg, task_get_exception_ports,
-    task_swap_exception_ports, thread_get_exception_ports, thread_swap_exception_ports, task_threads,
-    thread_info, exception_raise, exception_raise_state, exception_raise_state_identity, vm_map,
-    mach_make_memory_entry_64
+    mach_port_allocate, mach_port_insert_right, mach_port_move_member, mach_port_request_notification,
+    mach_msg, task_get_exception_ports, task_swap_exception_ports, thread_get_exception_ports,
+    thread_swap_exception_ports, task_threads, thread_info, exception_raise, exception_raise_state,
+    exception_raise_state_identity, vm_map, mach_make_memory_entry_64
 );
+
+const MACH_PORT_RIGHT_SEND: u32 = 0;
+const MACH_PORT_RIGHT_DEAD_NAME: u32 = 4;
+const KERN_INVALID_RIGHT: i32 = 17;
+
+/// Every port name we hand out (task, host, threads) is a plain send right
+/// with nothing behind it, so letting go of one always works (as it does on
+/// Apple for MACH_PORT_NULL and MACH_PORT_DEAD too).
+extern "C" fn mach_port_deallocate(_task: u32, _name: u32) -> i32 {
+    KERN_SUCCESS
+}
+
+/// Only send rights (and dead names) exist here; no receive rights or sets are ever made.
+extern "C" fn mach_port_mod_refs(_task: u32, _name: u32, right: u32, _delta: i32) -> i32 {
+    match right {
+        MACH_PORT_RIGHT_SEND | MACH_PORT_RIGHT_DEAD_NAME => KERN_SUCCESS,
+        _ => KERN_INVALID_RIGHT,
+    }
+}
 
 extern "C" fn thread_policy_set() -> i32 {
     KERN_SUCCESS
@@ -850,15 +868,16 @@ pub fn register(r: &mut Registry) {
     r.function("vm_protect", vm_protect as usize);
     r.function("vm_read_overwrite", vm_read_overwrite as usize);
     r.function("thread_policy_set", thread_policy_set as usize);
+    r.function("mach_port_deallocate", mach_port_deallocate as usize);
+    r.function("mach_port_mod_refs", mach_port_mod_refs as usize);
     macro_rules! refused {
         ($($name:ident),* $(,)?) => { $( r.function(stringify!($name), $name as usize); )* };
     }
     refused!(
-        mach_port_allocate, mach_port_deallocate, mach_port_insert_right, mach_port_mod_refs,
-        mach_port_move_member, mach_port_request_notification, mach_msg, task_get_exception_ports,
-        task_swap_exception_ports, thread_get_exception_ports, thread_swap_exception_ports, task_threads,
-        thread_info, exception_raise, exception_raise_state, exception_raise_state_identity, vm_map,
-        mach_make_memory_entry_64
+        mach_port_allocate, mach_port_insert_right, mach_port_move_member, mach_port_request_notification,
+        mach_msg, task_get_exception_ports, task_swap_exception_ports, thread_get_exception_ports,
+        thread_swap_exception_ports, task_threads, thread_info, exception_raise, exception_raise_state,
+        exception_raise_state_identity, vm_map, mach_make_memory_entry_64
     );
     r.data("mach_task_self_", leak(0x103u32));
     r.data("vm_page_size", leak(16384usize));
@@ -895,6 +914,25 @@ pub fn register(r: &mut Registry) {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Giving back the send right mach_thread_self (or the task or host) handed out works,
+    /// as on Apple, where each call adds a reference the caller drops later.
+    #[test]
+    fn thread_and_task_ports_can_be_let_go() {
+        let port_function = |name: &str| {
+            let mut r = crate::symbols::Registry::default();
+            crate::libsystem::register(&mut r);
+            r.get(name).unwrap().0
+        };
+        let deallocate: extern "C" fn(u32, u32) -> i32 = unsafe { std::mem::transmute(port_function("mach_port_deallocate")) };
+        let mod_refs: extern "C" fn(u32, u32, u32, i32) -> i32 = unsafe { std::mem::transmute(port_function("mach_port_mod_refs")) };
+        let task = 0x103;
+        for port in [mach_thread_self(), mach_host_self(), task, 0, u32::MAX] {
+            assert_eq!(deallocate(task, port), KERN_SUCCESS, "mach_port_deallocate({port:#x}) failed");
+        }
+        assert_eq!(mod_refs(task, mach_thread_self(), 0, -1), KERN_SUCCESS, "dropping a send right failed");
+        assert_eq!(mod_refs(task, mach_thread_self(), 1, -1), 17, "a receive right that was never made was dropped");
+    }
 
     /// A global block carrying a number and the queue it should report.
     #[repr(C)]
