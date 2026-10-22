@@ -5,5 +5,8 @@
 //! - [`encoding`]: type encodings and the armv7 / AAPCS64 layouts;
 //! - [`selectors`]: encodings of the framework selectors the games send.
 
+pub mod convert;
+#[cfg(test)]
+mod convert_tests;
 pub mod encoding;
 pub mod selectors;
