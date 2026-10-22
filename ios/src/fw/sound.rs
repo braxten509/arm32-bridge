@@ -26,7 +26,7 @@ enum Kind {
     Other,
 }
 
-fn four_cc(value: u32) -> String {
+pub(crate) fn four_cc(value: u32) -> String {
     value.to_be_bytes().iter().map(|&b| if b.is_ascii_graphic() { b as char } else { '?' }).collect()
 }
 
@@ -154,29 +154,149 @@ extern "C" fn new_graph(graph: *mut usize) -> i32 {
     0
 }
 
-extern "C" fn graph_add_node(graph: usize, description: *const u32, node: *mut i32) -> i32 {
+fn kind_of(d: &[u32; 5]) -> Kind {
+    match (&four_cc(d[0])[..], &four_cc(d[1])[..]) {
+        ("auou", _) => Kind::Output,
+        ("aumx", "3dem") => Kind::Mixer3D,
+        ("aumx", "mcmx") => Kind::MixerMulti,
+        _ => Kind::Other,
+    }
+}
+
+/// Makes a unit in `graph` (0: the unit is its own graph, as one made by
+/// AudioComponentInstanceNew). Returns the unit and its node number.
+fn add_unit(graph: usize, d: [u32; 5]) -> (usize, i32) {
     static NEXT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
+    let kind = kind_of(&d);
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    let unit = leak([0usize; 4]);
+    let graph = if graph == 0 { unit } else { graph };
+    with_graph(|g| {
+        g.units.insert(unit, Unit { kind, graph, description: d, inputs: BTreeMap::new(), master: 1.0, max_frames: DEFAULT_MAX_FRAMES });
+        g.nodes.insert(id, unit);
+        if graph == unit {
+            g.running.insert(unit, false);
+        }
+    });
+    if kind == Kind::Other {
+        crate::log!("audio: a {}/{} unit isn't supported; it stays silent", four_cc(d[0]), four_cc(d[1]));
+    }
+    (unit, id)
+}
+
+extern "C" fn graph_add_node(graph: usize, description: *const u32, node: *mut i32) -> i32 {
     if node.is_null() || description.is_null() {
         return -50;
     }
     let mut d = [0u32; 5];
     d.copy_from_slice(unsafe { std::slice::from_raw_parts(description, 5) });
-    let kind = match (&four_cc(d[0])[..], &four_cc(d[1])[..]) {
-        ("auou", _) => Kind::Output,
-        ("aumx", "3dem") => Kind::Mixer3D,
-        ("aumx", "mcmx") => Kind::MixerMulti,
-        _ => Kind::Other,
-    };
-    let id = NEXT.fetch_add(1, Ordering::Relaxed);
-    let unit = leak([0usize; 4]);
-    with_graph(|g| {
-        g.units.insert(unit, Unit { kind, graph, description: d, inputs: BTreeMap::new(), master: 1.0, max_frames: DEFAULT_MAX_FRAMES });
-        g.nodes.insert(id, unit);
-    });
-    if kind == Kind::Other {
-        crate::log!("audio: a {}/{} unit isn't supported; it stays silent", four_cc(d[0]), four_cc(d[1]));
-    }
+    let (_, id) = add_unit(graph, d);
     unsafe { *node = id };
+    0
+}
+
+// ----- units on their own: AudioComponent -----
+
+/// The units this layer has: RemoteIO and voice-processing output, and the two mixers.
+fn components() -> &'static [usize] {
+    static MADE: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
+    MADE.get_or_init(|| {
+        let appl = u32::from_be_bytes(*b"appl");
+        [(b"auou", b"rioc"), (b"auou", b"vpio"), (b"aumx", b"3dem"), (b"aumx", b"mcmx")]
+            .iter()
+            .map(|(kind, sub)| leak([u32::from_be_bytes(**kind), u32::from_be_bytes(**sub), appl, 0u32, 0u32]))
+            .collect()
+    })
+}
+
+/// AudioComponentFindNext(after, description): zero fields match anything.
+extern "C" fn component_find_next(after: usize, description: *const u32) -> usize {
+    if description.is_null() {
+        return 0;
+    }
+    let want = unsafe { std::slice::from_raw_parts(description, 3) };
+    let list = components();
+    let from = if after == 0 { 0 } else { list.iter().position(|&c| c == after).map_or(list.len(), |i| i + 1) };
+    for &component in &list[from..] {
+        let d = unsafe { &*(component as *const [u32; 5]) };
+        if (0..3).all(|i| want[i] == 0 || want[i] == d[i]) {
+            return component;
+        }
+    }
+    crate::log!("AudioComponentFindNext: no {}/{} unit here", four_cc(want[0]), four_cc(want[1]));
+    0
+}
+
+extern "C" fn component_get_description(component: usize, description: *mut u32) -> i32 {
+    if component == 0 || description.is_null() || !components().contains(&component) {
+        return -50;
+    }
+    unsafe { std::ptr::copy_nonoverlapping(component as *const u32, description, 5) };
+    0
+}
+
+/// AudioComponentInstanceNew(component, *unit).
+extern "C" fn component_instance_new(component: usize, unit: *mut usize) -> i32 {
+    if unit.is_null() || !components().contains(&component) {
+        return -50;
+    }
+    let d = unsafe { *(component as *const [u32; 5]) };
+    unsafe { *unit = add_unit(0, d).0 };
+    0
+}
+
+/// AudioComponentInstanceDispose(unit): no callback runs after this returns.
+extern "C" fn component_instance_dispose(unit: usize) -> i32 {
+    let graph = with_graph(|g| g.units.get(&unit).map(|u| u.graph));
+    match graph {
+        Some(graph) if graph == unit => graph_dispose(graph),
+        Some(_) => 0,
+        None => -50,
+    }
+}
+
+thread_local! {
+    static RENDER_SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// AudioUnitRender(unit, *flags, timeStamp, bus, frames, list). The only
+/// sound a unit can be asked for here is input (the microphone), and there
+/// is none, as on an iPhone without microphone access: silence.
+extern "C" fn unit_render(unit: usize, flags: *mut u32, _stamp: *const u8, bus: u32, frames: u32, list: *mut u8) -> i32 {
+    let Some(kind) = with_graph(|g| g.units.get(&unit).map(|u| u.kind)) else { return -10879 };
+    if list.is_null() {
+        return -50;
+    }
+    static TOLD: AtomicBool = AtomicBool::new(false);
+    if !(kind == Kind::Output && bus == 1) && !TOLD.swap(true, Ordering::Relaxed) {
+        crate::log!("AudioUnitRender: rendering a unit's output on demand isn't supported; it gives silence");
+    }
+    unsafe {
+        let count = *(list as *const u32) as usize;
+        for b in 0..count {
+            let entry = list.add(8 + 16 * b);
+            let size = *(entry.add(4) as *const u32) as usize;
+            let mut data = *(entry.add(8) as *const usize) as *mut u8;
+            if data.is_null() {
+                // The caller asked the unit to supply the memory.
+                let channels = (*(entry as *const u32)).max(1) as usize;
+                let want = (frames as usize * channels * 4).max(size);
+                data = RENDER_SCRATCH.with(|s| {
+                    let mut s = s.borrow_mut();
+                    if s.len() < want * count {
+                        s.resize(want * count, 0);
+                    }
+                    s.as_mut_ptr().add(b * want)
+                });
+                *(entry.add(4) as *mut u32) = want as u32;
+                *(entry.add(8) as *mut usize) = data as usize;
+            }
+            std::ptr::write_bytes(data, 0, (*(entry.add(4) as *const u32)) as usize);
+        }
+        if !flags.is_null() {
+            *flags |= OUTPUT_IS_SILENCE;
+        }
+    }
     0
 }
 
@@ -527,15 +647,15 @@ fn pull(input: &Input, bus: u32, frames: usize, sample_time: f64, scratch: &mut 
 
 /// A source's samples waiting to be played, and where playback is in them.
 #[derive(Default)]
-struct Stream {
-    pending: Vec<f32>,
+pub(crate) struct Stream {
+    pub(crate) pending: Vec<f32>,
     position: f64,
     generation: u64,
     sample_time: f64,
 }
 
 impl Stream {
-    fn frames(&self) -> usize {
+    pub(crate) fn frames(&self) -> usize {
         self.pending.len() / 2
     }
 
@@ -547,7 +667,7 @@ impl Stream {
     /// Adds up to `frames` output frames to `out`, reading at `step` source
     /// frames per output frame (linear interpolation). Returns the source
     /// frames played (never past the samples there are).
-    fn mix_into(&mut self, out: &mut [f32], frames: usize, step: f64, left: f32, right: f32) -> f64 {
+    pub(crate) fn mix_into(&mut self, out: &mut [f32], frames: usize, step: f64, left: f32, right: f32) -> f64 {
         let start = self.position;
         let mut made = 0;
         while made < frames {
@@ -571,7 +691,7 @@ impl Stream {
 }
 
 /// Left/right volumes for a placement of -1 .. 1 (equal power, centre = full).
-fn pan_gains(pan: f32, volume: f32, stereo_source: bool) -> (f32, f32) {
+pub(crate) fn pan_gains(pan: f32, volume: f32, stereo_source: bool) -> (f32, f32) {
     if stereo_source || pan == 0.0 {
         return (volume, volume);
     }
@@ -1103,12 +1223,24 @@ pub fn output_rate() -> u32 {
     OUT_RATE.load(Ordering::Relaxed)
 }
 
+/// Held while audio queues are mixed.
+static QUEUE_MIXING: Mutex<()> = Mutex::new(());
+
+/// Waits for the output to finish mixing audio queues (if it is right now).
+pub fn wait_for_mix() {
+    drop(QUEUE_MIXING.lock().unwrap_or_else(|e| e.into_inner()));
+}
+
 /// Fills `out` (stereo, interleaved) with everything that is playing.
 pub fn mix(out: &mut [f32], rate: u32) {
     out.fill(0.0);
     let frames = out.len() / 2;
     mix_graph(out, frames, rate as f64);
     mix_music(out, frames, rate as f64);
+    {
+        let _mixing = QUEUE_MIXING.lock().unwrap_or_else(|e| e.into_inner());
+        crate::fw::audioqueue::mix(out, frames, rate as f64);
+    }
     crate::fw::openal::mix(out, frames, rate as f64);
     for sample in out.iter_mut() {
         *sample = sample.clamp(-1.0, 1.0);
@@ -1373,6 +1505,12 @@ pub fn register(r: &mut Registry) {
     r.function("AudioUnitSetParameter", unit_set_parameter as usize);
     r.function("AudioUnitGetParameter", unit_get_parameter as usize);
     r.function("AudioUnitInitialize", ok_1 as usize);
+    r.function("AudioUnitUninitialize", ok_1 as usize);
+    r.function("AudioUnitRender", unit_render as usize);
+    r.function("AudioComponentFindNext", component_find_next as usize);
+    r.function("AudioComponentGetDescription", component_get_description as usize);
+    r.function("AudioComponentInstanceNew", component_instance_new as usize);
+    r.function("AudioComponentInstanceDispose", component_instance_dispose as usize);
     r.function("AudioOutputUnitStart", unit_start as usize);
     r.function("AudioOutputUnitStop", unit_stop as usize);
     r.function("CAShow", ok_1 as usize);

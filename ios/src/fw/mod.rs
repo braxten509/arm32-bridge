@@ -1,6 +1,8 @@
 //! Stand-ins for Apple's Foundation and UIKit classes.
 
 pub mod app;
+pub mod audiofile;
+pub mod audioqueue;
 pub mod coalesced;
 pub mod collections;
 pub mod crypto;
@@ -65,6 +67,8 @@ pub fn register(r: &mut Registry) {
     gamekit::register(r);
     openal::register(r);
     storekit::register(r);
+    audiofile::register(r);
+    audioqueue::register(r);
     immutable_copies();
 }
 
