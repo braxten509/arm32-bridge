@@ -90,7 +90,7 @@ extern "C" fn cond_wait(c: *mut libc::pthread_cond_t, m: *mut libc::pthread_mute
     unsafe {
         fix_cond(c);
         fix_mutex(m);
-        libc::pthread_cond_wait(c, m)
+        waiting(c as usize, || libc::pthread_cond_wait(c, m))
     }
 }
 
@@ -98,9 +98,26 @@ extern "C" fn cond_timedwait(c: *mut libc::pthread_cond_t, m: *mut libc::pthread
     unsafe {
         fix_cond(c);
         fix_mutex(m);
-        let r = libc::pthread_cond_timedwait(c, m, t);
+        let r = waiting(c as usize, || libc::pthread_cond_timedwait(c, m, t));
         if r == libc::ETIMEDOUT { 60 } else { r }
     }
+}
+
+/// pthread_cond_timedwait_relative_np: the wait limit is a span from now
+/// (conditions here measure time on the wall clock, the default).
+extern "C" fn cond_timedwait_relative(c: *mut libc::pthread_cond_t, m: *mut libc::pthread_mutex_t, span: *const libc::timespec) -> i32 {
+    if span.is_null() {
+        return libc::EINVAL;
+    }
+    let mut at = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_REALTIME, &mut at);
+        at.tv_sec += (*span).tv_sec;
+        at.tv_nsec += (*span).tv_nsec;
+    }
+    at.tv_sec += at.tv_nsec / 1_000_000_000;
+    at.tv_nsec %= 1_000_000_000;
+    cond_timedwait(c, m, &at)
 }
 
 extern "C" fn cond_signal(c: *mut libc::pthread_cond_t) -> i32 {
@@ -127,6 +144,236 @@ extern "C" fn cond_destroy(c: *mut libc::pthread_cond_t) -> i32 {
 extern "C" fn attr_setdetachstate(attr: *mut libc::pthread_attr_t, apple_state: i32) -> i32 {
     let state = if apple_state == 2 { libc::PTHREAD_CREATE_DETACHED } else { libc::PTHREAD_CREATE_JOINABLE };
     unsafe { libc::pthread_attr_setdetachstate(attr, state) }
+}
+
+extern "C" {
+    fn pthread_attr_setschedpolicy(attr: *mut libc::pthread_attr_t, policy: i32) -> i32;
+    fn pthread_atfork(prepare: usize, parent: usize, child: usize) -> i32;
+    fn pthread_getattr_np(thread: libc::pthread_t, attr: *mut libc::pthread_attr_t) -> i32;
+}
+
+/// Apple's policy numbers: SCHED_OTHER 1, SCHED_RR 2, SCHED_FIFO 4.
+extern "C" fn attr_setschedpolicy(attr: *mut libc::pthread_attr_t, apple_policy: i32) -> i32 {
+    let policy = match apple_policy {
+        1 => 0, // SCHED_OTHER (the libc crate lacks it on Android)
+        2 => libc::SCHED_RR,
+        4 => libc::SCHED_FIFO,
+        _ => return libc::EINVAL,
+    };
+    unsafe { pthread_attr_setschedpolicy(attr, policy) }
+}
+
+/// Apple's pthread_setname_np names the calling thread (the system keeps 15 bytes).
+extern "C" fn setname_np(name: *const libc::c_char) -> i32 {
+    if name.is_null() {
+        return libc::EINVAL;
+    }
+    let mut short = unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes().to_vec();
+    short.truncate(15);
+    while std::str::from_utf8(&short).is_err() {
+        short.pop();
+    }
+    let short = std::ffi::CString::new(short).unwrap_or_default();
+    unsafe { libc::pthread_setname_np(libc::pthread_self(), short.as_ptr()) };
+    0
+}
+
+/// pthread_get_stackaddr_np: the top (highest address) of the thread's stack.
+extern "C" fn get_stackaddr_np(thread: libc::pthread_t) -> usize {
+    unsafe {
+        let mut attr: libc::pthread_attr_t = std::mem::zeroed();
+        if pthread_getattr_np(thread, &mut attr) != 0 {
+            return 0;
+        }
+        let (mut low, mut size) = (std::ptr::null_mut(), 0usize);
+        libc::pthread_attr_getstack(&attr, &mut low, &mut size);
+        libc::pthread_attr_destroy(&mut attr);
+        low as usize + size
+    }
+}
+
+// ----- cancellation (deferred, Apple's default) -----
+// Android has no pthread_cancel, so it is done here: the request is noted,
+// and the thread ends (as if it called pthread_exit(PTHREAD_CANCELED)) at
+// the next cancellation point this layer runs for it: condition waits,
+// sleeps, socket waits and pthread_testcancel. A thread blocked in one of
+// those is woken (its condition is signalled, or a no-op signal ends its
+// system call), again every 10 ms for 3 s, in case the wake came just
+// before it went to sleep.
+
+const APPLE_PTHREAD_CANCELED: usize = 1;
+
+/// What a thread is blocked in: 0 nothing, 1 a system call, else a condition.
+struct Slot(AtomicUsize);
+
+#[derive(Default)]
+struct CancelState {
+    /// Threads that ran a cancellation point (and still live): their slot.
+    slots: std::collections::HashMap<usize, &'static Slot>,
+    pending: std::collections::HashSet<usize>,
+}
+
+static CANCEL: std::sync::Mutex<Option<CancelState>> = std::sync::Mutex::new(None);
+static ANY_PENDING: AtomicUsize = AtomicUsize::new(0);
+
+fn cancel_state() -> std::sync::MutexGuard<'static, Option<CancelState>> {
+    CANCEL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The calling thread's slot, registered on first use and dropped at thread end.
+struct Registered(&'static Slot, usize);
+
+impl Drop for Registered {
+    fn drop(&mut self) {
+        if let Some(state) = cancel_state().as_mut() {
+            state.slots.remove(&self.1);
+            if state.pending.remove(&self.1) {
+                ANY_PENDING.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+thread_local! {
+    static SLOT: Registered = {
+        let slot: &'static Slot = Box::leak(Box::new(Slot(AtomicUsize::new(0))));
+        let me = unsafe { libc::pthread_self() } as usize;
+        cancel_state().get_or_insert_with(Default::default).slots.insert(me, slot);
+        Registered(slot, me)
+    };
+    static CANCEL_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+std::arch::global_asm!(
+    // pthread_exit called from code with no unwind tables, so on glibc the
+    // thread's unwinding stops here and jumps straight to the thread's end
+    // instead of running through this layer's Rust frames.
+    ".globl ios_cancel_exit",
+    ".p2align 2",
+    "ios_cancel_exit:",
+    "mov x16, x0",
+    "mov x0, x1",
+    "blr x16",
+    "brk #0",
+);
+
+extern "C" {
+    fn ios_cancel_exit(exit: usize, value: usize) -> !;
+}
+
+/// Ends the calling thread here if it was cancelled (and allows it).
+pub fn cancel_point() {
+    if ANY_PENDING.load(Ordering::SeqCst) == 0 || !CANCEL_ENABLED.with(|e| e.get()) {
+        return;
+    }
+    let me = unsafe { libc::pthread_self() } as usize;
+    let found = cancel_state().as_mut().is_some_and(|state| state.pending.remove(&me));
+    if !found {
+        return;
+    }
+    ANY_PENDING.fetch_sub(1, Ordering::SeqCst);
+    crate::log!("a cancelled game thread ends at a cancellation point");
+    unsafe { ios_cancel_exit(libc::pthread_exit as usize, APPLE_PTHREAD_CANCELED) }
+}
+
+/// Runs a blocking call as a cancellation point (`on`: 1, or the condition waited on).
+pub fn waiting<T>(on: usize, work: impl FnOnce() -> T) -> T {
+    let slot = SLOT.try_with(|s| s.0).ok();
+    if let Some(slot) = slot {
+        slot.0.store(on, Ordering::SeqCst);
+    }
+    cancel_point();
+    let result = work();
+    if let Some(slot) = slot {
+        slot.0.store(0, Ordering::SeqCst);
+    }
+    cancel_point();
+    result
+}
+
+pub fn blocking<T>(work: impl FnOnce() -> T) -> T {
+    waiting(1, work)
+}
+
+fn wake_signal() -> i32 {
+    libc::SIGRTMIN() + 7
+}
+
+extern "C" fn ignore_signal(_signal: i32) {}
+
+fn install_wake_signal() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = ignore_signal as usize;
+        // No SA_RESTART: a blocked system call returns EINTR.
+        action.sa_flags = 0;
+        libc::sigemptyset(&mut action.sa_mask);
+        libc::sigaction(wake_signal(), &action, std::ptr::null_mut());
+    });
+}
+
+extern "C" fn ios_pthread_cancel(thread: libc::pthread_t) -> i32 {
+    let target = thread as usize;
+    install_wake_signal();
+    {
+        let mut state = cancel_state();
+        if state.get_or_insert_with(Default::default).pending.insert(target) {
+            ANY_PENDING.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    if unsafe { libc::pthread_equal(thread, libc::pthread_self()) } != 0 {
+        return 0;
+    }
+    std::thread::spawn(move || {
+        for _ in 0..300 {
+            {
+                let state = cancel_state();
+                let Some(state) = state.as_ref() else { return };
+                if !state.pending.contains(&target) {
+                    return;
+                }
+                // Threads in `slots` are alive: they leave it before they end.
+                if let Some(slot) = state.slots.get(&target) {
+                    match slot.0.load(Ordering::SeqCst) {
+                        0 => {}
+                        1 => unsafe {
+                            libc::pthread_kill(target as libc::pthread_t, wake_signal());
+                        },
+                        cond => unsafe {
+                            libc::pthread_cond_broadcast(cond as *mut libc::pthread_cond_t);
+                        },
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    });
+    0
+}
+
+/// Apple: PTHREAD_CANCEL_ENABLE 1, PTHREAD_CANCEL_DISABLE 0.
+extern "C" fn ios_pthread_setcancelstate(state: i32, old: *mut i32) -> i32 {
+    if state != 0 && state != 1 {
+        return libc::EINVAL;
+    }
+    let before = CANCEL_ENABLED.with(|e| e.replace(state == 1));
+    if !old.is_null() {
+        unsafe { *old = before as i32 };
+    }
+    0
+}
+
+extern "C" fn ios_pthread_testcancel() {
+    cancel_point();
+}
+
+extern "C" fn ios_usleep(micros: u32) -> i32 {
+    blocking(|| unsafe { libc::usleep(micros) })
+}
+
+extern "C" fn ios_nanosleep(span: *const libc::timespec, left: *mut libc::timespec) -> i32 {
+    blocking(|| unsafe { libc::nanosleep(span, left) })
 }
 
 /// Each thread's Mach port number (here its Linux thread id), by pthread_t.
@@ -317,8 +564,18 @@ pub fn register(r: &mut Registry) {
         pthread_mutexattr_destroy, pthread_cond_init, pthread_condattr_init, pthread_condattr_destroy,
         pthread_kill, pthread_exit,
         pthread_setschedparam, pthread_getschedparam, sched_get_priority_max, sched_get_priority_min,
-        nanosleep, pause
+        pause
     );
+    r.function("pthread_cond_timedwait_relative_np", cond_timedwait_relative as usize);
+    r.function("pthread_attr_setschedpolicy", attr_setschedpolicy as usize);
+    r.function("pthread_atfork", pthread_atfork as usize);
+    r.function("pthread_setname_np", setname_np as usize);
+    r.function("pthread_get_stackaddr_np", get_stackaddr_np as usize);
+    r.function("pthread_cancel", ios_pthread_cancel as usize);
+    r.function("pthread_setcancelstate", ios_pthread_setcancelstate as usize);
+    r.function("pthread_testcancel", ios_pthread_testcancel as usize);
+    r.function("usleep", ios_usleep as usize);
+    r.function("nanosleep", ios_nanosleep as usize);
     r.function("pthread_attr_setschedparam", crate::libsystem::host::pthread_attr_setschedparam as usize);
     r.function("pthread_attr_getschedparam", crate::libsystem::host::pthread_attr_getschedparam as usize);
     r.function("pthread_create", ios_pthread_create as usize);
@@ -366,6 +623,37 @@ mod tests {
     extern "C" fn child(_: *mut libc::c_void) -> *mut libc::c_void {
         CHILD_TID.store(unsafe { libc::gettid() } as u64, Ordering::SeqCst);
         std::ptr::null_mut()
+    }
+
+    struct Waiter {
+        mutex: libc::pthread_mutex_t,
+        cond: libc::pthread_cond_t,
+    }
+
+    extern "C" fn wait_forever(waiter: *mut libc::c_void) -> *mut libc::c_void {
+        let waiter = waiter as *mut Waiter;
+        unsafe {
+            mutex_lock(&mut (*waiter).mutex);
+            loop {
+                cond_wait(&mut (*waiter).cond, &mut (*waiter).mutex);
+            }
+        }
+    }
+
+    /// A thread asleep in a condition wait is woken by pthread_cancel and
+    /// ends with Apple's PTHREAD_CANCELED, holding the mutex as on Apple.
+    #[test]
+    fn cancelled_condition_waiter_ends_cancelled() {
+        let waiter = Box::leak(Box::new(Waiter { mutex: libc::PTHREAD_MUTEX_INITIALIZER, cond: libc::PTHREAD_COND_INITIALIZER }));
+        let mut thread: libc::pthread_t = 0;
+        let arg = waiter as *mut Waiter as *mut libc::c_void;
+        assert_eq!(unsafe { libc::pthread_create(&mut thread, std::ptr::null(), wait_forever, arg) }, 0);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(ios_pthread_cancel(thread), 0);
+        let mut value: *mut libc::c_void = std::ptr::null_mut();
+        assert_eq!(unsafe { libc::pthread_join(thread, &mut value) }, 0);
+        assert_eq!(value as usize, APPLE_PTHREAD_CANCELED);
+        assert_eq!(unsafe { libc::pthread_mutex_trylock(&mut waiter.mutex) }, libc::EBUSY, "mutex not held after the cancel");
     }
 
     #[test]

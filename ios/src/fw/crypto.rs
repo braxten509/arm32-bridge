@@ -51,40 +51,118 @@ fn padded(data: &[u8], big_endian: bool) -> Vec<u8> {
     message
 }
 
+const SHA1_START: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
+
 pub fn sha1(data: &[u8]) -> [u8; 20] {
-    let mut state = [0x67452301u32, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
+    let mut state = SHA1_START;
     for block in padded(data, true).chunks(64) {
-        let mut w = [0u32; 80];
-        for i in 0..16 {
-            w[i] = u32::from_be_bytes([block[i * 4], block[i * 4 + 1], block[i * 4 + 2], block[i * 4 + 3]]);
-        }
-        for i in 16..80 {
-            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
-        }
-        let [mut a, mut b, mut c, mut d, mut e] = state;
-        for (i, word) in w.iter().enumerate() {
-            let (f, k) = match i / 20 {
-                0 => ((b & c) | (!b & d), 0x5A827999),
-                1 => (b ^ c ^ d, 0x6ED9EBA1),
-                2 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
-                _ => (b ^ c ^ d, 0xCA62C1D6),
-            };
-            let next = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(*word);
-            e = d;
-            d = c;
-            c = b.rotate_left(30);
-            b = a;
-            a = next;
-        }
-        for (s, v) in state.iter_mut().zip([a, b, c, d, e]) {
-            *s = s.wrapping_add(v);
-        }
+        sha1_block(&mut state, block);
     }
+    sha1_digest(&state)
+}
+
+fn sha1_digest(state: &[u32; 5]) -> [u8; 20] {
     let mut out = [0u8; 20];
     for (i, s) in state.iter().enumerate() {
         out[i * 4..i * 4 + 4].copy_from_slice(&s.to_be_bytes());
     }
     out
+}
+
+fn sha1_block(state: &mut [u32; 5], block: &[u8]) {
+    let mut w = [0u32; 80];
+    for i in 0..16 {
+        w[i] = u32::from_be_bytes([block[i * 4], block[i * 4 + 1], block[i * 4 + 2], block[i * 4 + 3]]);
+    }
+    for i in 16..80 {
+        w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+    }
+    let [mut a, mut b, mut c, mut d, mut e] = *state;
+    for (i, word) in w.iter().enumerate() {
+        let (f, k) = match i / 20 {
+            0 => ((b & c) | (!b & d), 0x5A827999),
+            1 => (b ^ c ^ d, 0x6ED9EBA1),
+            2 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
+            _ => (b ^ c ^ d, 0xCA62C1D6),
+        };
+        let next = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(*word);
+        e = d;
+        d = c;
+        c = b.rotate_left(30);
+        b = a;
+        a = next;
+    }
+    for (s, v) in state.iter_mut().zip([a, b, c, d, e]) {
+        *s = s.wrapping_add(v);
+    }
+}
+
+// ----- CC_SHA1_Init / Update / Final -----
+// Apple's CC_SHA1_CTX (96 bytes): h0..h4, Nl, Nh (bit count, low and high
+// words), 64 bytes of waiting data, and how many of them are used.
+
+#[repr(C)]
+struct Sha1Context {
+    state: [u32; 5],
+    bits_low: u32,
+    bits_high: u32,
+    waiting: [u8; 64],
+    used: u32,
+}
+
+extern "C" fn cc_sha1_init(context: *mut Sha1Context) -> i32 {
+    unsafe { *context = Sha1Context { state: SHA1_START, bits_low: 0, bits_high: 0, waiting: [0; 64], used: 0 } };
+    1
+}
+
+fn sha1_update(context: &mut Sha1Context, mut data: &[u8]) {
+    let bits = ((u64::from(context.bits_high) << 32) | u64::from(context.bits_low)).wrapping_add((data.len() as u64).wrapping_mul(8));
+    (context.bits_low, context.bits_high) = (bits as u32, (bits >> 32) as u32);
+    let used = (context.used as usize).min(63);
+    if used > 0 {
+        let take = data.len().min(64 - used);
+        context.waiting[used..used + take].copy_from_slice(&data[..take]);
+        data = &data[take..];
+        context.used = (used + take) as u32;
+        if context.used < 64 {
+            return;
+        }
+        let block = context.waiting;
+        sha1_block(&mut context.state, &block);
+        context.used = 0;
+    }
+    let mut blocks = data.chunks_exact(64);
+    for block in &mut blocks {
+        sha1_block(&mut context.state, block);
+    }
+    let rest = blocks.remainder();
+    context.waiting[..rest.len()].copy_from_slice(rest);
+    context.used = rest.len() as u32;
+}
+
+extern "C" fn cc_sha1_update(context: *mut Sha1Context, data: *const u8, length: u32) -> i32 {
+    let bytes = if data.is_null() || length == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(data, length as usize) } };
+    sha1_update(unsafe { &mut *context }, bytes);
+    1
+}
+
+fn sha1_final(context: &mut Sha1Context) -> [u8; 20] {
+    let bits = (u64::from(context.bits_high) << 32) | u64::from(context.bits_low);
+    let used = context.used as usize % 64;
+    let mut tail = vec![0x80u8];
+    tail.resize(if used < 56 { 56 - used } else { 120 - used }, 0);
+    sha1_update(context, &tail);
+    sha1_update(context, &bits.to_be_bytes());
+    sha1_digest(&context.state)
+}
+
+extern "C" fn cc_sha1_final(digest: *mut u8, context: *mut Sha1Context) -> i32 {
+    let out = sha1_final(unsafe { &mut *context });
+    unsafe {
+        std::ptr::copy_nonoverlapping(out.as_ptr(), digest, 20);
+        std::ptr::write_bytes(context as *mut u8, 0, std::mem::size_of::<Sha1Context>());
+    }
+    1
 }
 
 pub fn sha256(data: &[u8]) -> [u8; 32] {
@@ -426,6 +504,9 @@ extern "C" fn cc_crypt(
 pub fn register(r: &mut Registry) {
     r.function("CC_MD5", cc_md5 as usize);
     r.function("CC_SHA1", cc_sha1 as usize);
+    r.function("CC_SHA1_Init", cc_sha1_init as usize);
+    r.function("CC_SHA1_Update", cc_sha1_update as usize);
+    r.function("CC_SHA1_Final", cc_sha1_final as usize);
     r.function("CC_SHA256", cc_sha256 as usize);
     r.function("CCHmac", cc_hmac as usize);
     r.function("CCCrypt", cc_crypt as usize);
@@ -437,6 +518,29 @@ mod tests {
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Fed in uneven pieces (crossing block edges), the streaming SHA-1
+    /// gives the one-shot answer, also when the end needs an extra block.
+    #[test]
+    fn sha1_in_pieces_matches_one_shot() {
+        let data: Vec<u8> = (0..1000u32).map(|i| (i * 7 + 3) as u8).collect();
+        for total in [0usize, 55, 56, 63, 64, 1000] {
+            let mut context: Sha1Context = unsafe { std::mem::zeroed() };
+            cc_sha1_init(&mut context);
+            let mut at = 0;
+            for piece in [1usize, 62, 3, 130].iter().cycle() {
+                if at >= total {
+                    break;
+                }
+                let end = (at + piece).min(total);
+                cc_sha1_update(&mut context, data[at..end].as_ptr(), (end - at) as u32);
+                at = end;
+            }
+            let mut digest = [0u8; 20];
+            cc_sha1_final(digest.as_mut_ptr(), &mut context);
+            assert_eq!(digest, sha1(&data[..total]), "{total} bytes");
+        }
     }
 
     #[test]

@@ -6,10 +6,31 @@ use std::sync::{Condvar, Mutex};
 const KERN_SUCCESS: i32 = 0;
 const KERN_FAILURE: i32 = 5;
 
-fn now_nanos() -> u64 {
+pub(crate) fn now_nanos() -> u64 {
     let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
     t.tv_sec as u64 * 1_000_000_000 + t.tv_nsec as u64
+}
+
+pub(crate) fn wall_nanos() -> u64 {
+    let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut t) };
+    t.tv_sec as u64 * 1_000_000_000 + t.tv_nsec as u64
+}
+
+/// A dispatch time as a monotonic deadline (None: never). Apple's times are
+/// 0 (now), ~0 (forever), a mach_absolute_time value, or a wall-clock time
+/// from dispatch_walltime, stored negated.
+pub(crate) fn deadline_nanos(when: u64) -> Option<u64> {
+    match when {
+        0 => Some(now_nanos()),
+        u64::MAX => None,
+        _ if (when as i64) < 0 => {
+            let wall = (when as i64).wrapping_neg() as u64;
+            Some(now_nanos().saturating_add(wall.saturating_sub(wall_nanos())))
+        }
+        _ => Some(when),
+    }
 }
 
 extern "C" fn mach_absolute_time() -> u64 {
@@ -316,7 +337,7 @@ fn main_queue() -> usize {
     *MAIN_QUEUE_OBJECT.get_or_init(|| leak([0usize; 16]))
 }
 
-extern "C" fn dispatch_get_global_queue(_priority: i64, _flags: u64) -> usize {
+pub(crate) extern "C" fn dispatch_get_global_queue(_priority: i64, _flags: u64) -> usize {
     *GLOBAL_QUEUE_OBJECT.get_or_init(|| leak([0usize; 16]))
 }
 
@@ -335,7 +356,16 @@ enum Job {
 }
 
 struct SerialQueue {
-    jobs: Mutex<(std::collections::VecDeque<Job>, bool)>,
+    jobs: Mutex<Jobs>,
+}
+
+#[derive(Default)]
+struct Jobs {
+    waiting: std::collections::VecDeque<Job>,
+    /// A worker thread is running the queue's blocks.
+    running: bool,
+    /// dispatch_suspend count: no new block starts while above 0.
+    suspended: u32,
 }
 
 static SERIAL_QUEUES: Mutex<Option<std::collections::HashMap<usize, &'static SerialQueue>>> = Mutex::new(None);
@@ -389,7 +419,7 @@ extern "C" fn dispatch_get_current_queue() -> usize {
 extern "C" fn dispatch_queue_create(_label: usize, attr: usize) -> usize {
     let queue = leak([0usize; 16]);
     if attr == 0 {
-        let state: &'static SerialQueue = Box::leak(Box::new(SerialQueue { jobs: Mutex::new((Default::default(), false)) }));
+        let state: &'static SerialQueue = Box::leak(Box::new(SerialQueue { jobs: Mutex::new(Jobs::default()) }));
         SERIAL_QUEUES.lock().unwrap().get_or_insert_with(Default::default).insert(queue, state);
     }
     queue
@@ -409,21 +439,27 @@ fn wait_for(done: &(Mutex<bool>, Condvar)) {
 
 fn enqueue(queue: usize, state: &'static SerialQueue, job: Job) {
     let mut jobs = state.jobs.lock().unwrap();
-    jobs.0.push_back(job);
-    if jobs.1 {
+    jobs.waiting.push_back(job);
+    start_worker(queue, state, jobs);
+}
+
+/// Starts the queue's worker unless one runs, the queue is suspended or empty.
+fn start_worker(queue: usize, state: &'static SerialQueue, mut jobs: std::sync::MutexGuard<'_, Jobs>) {
+    if jobs.running || jobs.suspended > 0 || jobs.waiting.is_empty() {
         return;
     }
-    jobs.1 = true;
+    jobs.running = true;
     drop(jobs);
     std::thread::spawn(move || {
         CURRENT_RUNNER.with(|c| c.set(queue));
         loop {
             let job = {
                 let mut jobs = state.jobs.lock().unwrap();
-                match jobs.0.pop_front() {
+                let next = if jobs.suspended == 0 { jobs.waiting.pop_front() } else { None };
+                match next {
                     Some(job) => job,
                     None => {
-                        jobs.1 = false;
+                        jobs.running = false;
                         return;
                     }
                 }
@@ -439,7 +475,27 @@ fn enqueue(queue: usize, state: &'static SerialQueue, job: Job) {
     });
 }
 
-extern "C" fn dispatch_async(queue: usize, block: usize) {
+/// dispatch_suspend on a queue: serial queues stop starting blocks; Apple
+/// ignores it for the main and global queues. False: not a serial queue.
+pub(crate) fn suspend_queue(queue: usize) -> bool {
+    let Some(state) = serial_queue(queue) else { return false };
+    state.jobs.lock().unwrap().suspended += 1;
+    true
+}
+
+pub(crate) fn resume_queue(queue: usize) -> bool {
+    let Some(state) = serial_queue(queue) else { return false };
+    let mut jobs = state.jobs.lock().unwrap();
+    if jobs.suspended == 0 {
+        crate::log!("dispatch_resume on a queue that wasn't suspended; ignored");
+        return true;
+    }
+    jobs.suspended -= 1;
+    start_worker(queue, state, jobs);
+    true
+}
+
+pub(crate) extern "C" fn dispatch_async(queue: usize, block: usize) {
     let copy = block_copy(block as *mut BlockHeader) as usize;
     let runner = runs_on(queue);
     if queue == main_queue() {
@@ -489,8 +545,10 @@ extern "C" fn dispatch_after(when: u64, queue: usize, block: usize) {
     let copy = block_copy(block as *mut BlockHeader) as usize;
     std::thread::spawn(move || {
         let now = now_nanos();
-        if when != !0 && when > now {
-            std::thread::sleep(std::time::Duration::from_nanos(when - now));
+        match deadline_nanos(when) {
+            Some(at) if at > now => std::thread::sleep(std::time::Duration::from_nanos(at - now)),
+            Some(_) => {}
+            None => return,
         }
         dispatch_async(queue, copy);
     });
@@ -531,11 +589,10 @@ extern "C" fn dispatch_semaphore_signal(semaphore: usize) -> i64 {
 extern "C" fn dispatch_semaphore_wait(semaphore: usize, timeout: u64) -> i64 {
     let semaphore = unsafe { &*(semaphore as *const Semaphore) };
     let mut count = semaphore.count.lock().unwrap();
-    let deadline = if timeout == !0 { None } else { Some(timeout) };
+    let deadline = deadline_nanos(timeout);
     while *count <= 0 {
         match deadline {
             None => count = semaphore.wake.wait(count).unwrap(),
-            Some(0) => return 1,
             Some(at) => {
                 let now = now_nanos();
                 if now >= at {
@@ -553,8 +610,22 @@ extern "C" fn dispatch_time(when: u64, delta: i64) -> u64 {
     if when == !0 {
         return !0;
     }
+    if (when as i64) < 0 {
+        // A wall-clock time (negated nanoseconds since 1970).
+        return wall_time((when as i64).wrapping_neg() as u64, delta);
+    }
     let base = if when == 0 { now_nanos() } else { when };
     (base as i64 + delta) as u64
+}
+
+/// Apple's wall-clock dispatch time: the nanoseconds since 1970, negated.
+pub(crate) fn wall_time(nanos: u64, delta: i64) -> u64 {
+    let total = (nanos as i64).saturating_add(delta);
+    if total <= 1 {
+        // -1 and -0 mean "forever" and "now" (Apple's rule).
+        return if delta >= 0 { !0 } else { (-2i64) as u64 };
+    }
+    total.wrapping_neg() as u64
 }
 
 // ----- dynamic loading -----

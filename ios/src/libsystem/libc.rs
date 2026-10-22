@@ -470,7 +470,7 @@ pub fn register(r: &mut Registry) {
     same!(
         malloc, calloc, realloc, free, memcpy, memmove, memset, memcmp, strlen, strcmp, strncmp,
         strcpy, strncpy, strcat, strchr, strrchr, strdup, strcasecmp, strtod, strtol, strtoull, atoi,
-        qsort, abort, exit, getpid, usleep, sched_yield, time, difftime, mktime,
+        qsort, abort, exit, getpid, sched_yield, time, difftime, mktime,
         gmtime, gmtime_r, localtime_r, putchar, strerror, strstr, strncasecmp, strtoul, strtoll,
         atof, atol, memchr, posix_memalign, malloc_usable_size, strcspn, strspn, strpbrk
     );

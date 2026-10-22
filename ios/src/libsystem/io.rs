@@ -22,7 +22,7 @@ impl CellAddr {
 
 // ----- errno -----
 
-fn apple_errno(linux: i32) -> i32 {
+pub(crate) fn apple_errno(linux: i32) -> i32 {
     match linux {
         libc::EAGAIN => 35,
         0..=34 => linux,
@@ -66,7 +66,7 @@ thread_local! {
 /// Apple's errno cell. A host call that failed since the last look left a
 /// non-zero host errno: translate it into the cell and clear the host value,
 /// so values the game writes into the cell itself stay until the next error.
-extern "C" fn error_location() -> *mut i32 {
+pub(crate) extern "C" fn error_location() -> *mut i32 {
     unsafe {
         let host = crate::libsystem::host_errno();
         let value = *host;
@@ -78,6 +78,17 @@ extern "C" fn error_location() -> *mut i32 {
             cell.as_ptr()
         })
     }
+}
+
+/// Sets Apple's errno to an Apple number that has no Linux twin (ENOATTR).
+pub(crate) fn set_apple_errno(apple: i32) {
+    unsafe { *crate::libsystem::host_errno() = 0 };
+    APPLE_ERRNO.with(|cell| cell.set(apple));
+}
+
+/// The Linux number for an Apple errno (for the system's messages).
+pub(crate) fn linux_errno(apple: i32) -> Option<i32> {
+    (0..256).find(|&linux| apple_errno(linux) == apple)
 }
 
 // ----- open / fcntl -----
@@ -292,10 +303,6 @@ extern "C" fn ios_mkstemp(template: *mut libc::c_char) -> i32 {
     unsafe { libc::mkstemp(template) }
 }
 
-extern "C" fn ios_setxattr(_path: *const libc::c_char, _name: *const libc::c_char, _v: usize, _s: usize, _p: u32, _o: i32) -> i32 {
-    0
-}
-
 // ----- mmap -----
 
 extern "C" fn ios_mmap(address: usize, length: usize, protection: i32, apple_flags: i32, fd: i32, offset: i64) -> usize {
@@ -468,7 +475,6 @@ pub fn register(r: &mut Registry) {
     r.function("fopen", ios_fopen as usize);
     r.function("utimes", ios_utimes as usize);
     r.function("mkstemp", ios_mkstemp as usize);
-    r.function("setxattr", ios_setxattr as usize);
     r.function("mmap", ios_mmap as usize);
     r.function("munmap", libc::munmap as usize);
     r.function("mprotect", libc::mprotect as usize);
