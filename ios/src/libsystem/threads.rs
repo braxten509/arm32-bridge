@@ -402,12 +402,15 @@ fn unblock(signal: i32) {
 }
 
 /// Picks a real-time signal nobody handles, from SIGRTMIN+7 up (clear of the
-/// ones the C library keeps), and installs a no-op handler there (no
+/// ones the C library keeps, and of thread_suspend's), and installs a no-op handler there (no
 /// SA_RESTART, so a blocked system call returns EINTR).
 fn wake_signal() -> i32 {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| unsafe {
         for signal in libc::SIGRTMIN() + 7..=libc::SIGRTMAX() {
+            if signal == super::suspend::suspend_signal() {
+                continue;
+            }
             let mut current: libc::sigaction = std::mem::zeroed();
             if libc::sigaction(signal, std::ptr::null(), &mut current) != 0 || current.sa_sigaction != libc::SIG_DFL {
                 continue;

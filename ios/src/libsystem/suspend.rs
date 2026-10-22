@@ -49,7 +49,8 @@ fn find(tid: i32) -> Option<&'static Slot> {
     TABLE.iter().find(|slot| slot.tid.load(Ordering::Acquire) == tid)
 }
 
-fn suspend_signal() -> i32 {
+/// The signal Mach thread_suspend stops threads with; other pickers skip it.
+pub(crate) fn suspend_signal() -> i32 {
     libc::SIGRTMIN() + 9
 }
 
