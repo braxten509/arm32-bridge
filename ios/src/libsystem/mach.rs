@@ -6,10 +6,31 @@ use std::sync::{Condvar, Mutex};
 const KERN_SUCCESS: i32 = 0;
 const KERN_FAILURE: i32 = 5;
 
-fn now_nanos() -> u64 {
+pub(crate) fn now_nanos() -> u64 {
     let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
     t.tv_sec as u64 * 1_000_000_000 + t.tv_nsec as u64
+}
+
+pub(crate) fn wall_nanos() -> u64 {
+    let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut t) };
+    t.tv_sec as u64 * 1_000_000_000 + t.tv_nsec as u64
+}
+
+/// A dispatch time as a monotonic deadline (None: never). Apple's times are
+/// 0 (now), ~0 (forever), a mach_absolute_time value, or a wall-clock time
+/// from dispatch_walltime, stored negated.
+pub(crate) fn deadline_nanos(when: u64) -> Option<u64> {
+    match when {
+        0 => Some(now_nanos()),
+        u64::MAX => None,
+        _ if (when as i64) < 0 => {
+            let wall = (when as i64).wrapping_neg() as u64;
+            Some(now_nanos().saturating_add(wall.saturating_sub(wall_nanos())))
+        }
+        _ => Some(when),
+    }
 }
 
 extern "C" fn mach_absolute_time() -> u64 {
@@ -316,7 +337,7 @@ fn main_queue() -> usize {
     *MAIN_QUEUE_OBJECT.get_or_init(|| leak([0usize; 16]))
 }
 
-extern "C" fn dispatch_get_global_queue(_priority: i64, _flags: u64) -> usize {
+pub(crate) extern "C" fn dispatch_get_global_queue(_priority: i64, _flags: u64) -> usize {
     *GLOBAL_QUEUE_OBJECT.get_or_init(|| leak([0usize; 16]))
 }
 
@@ -326,6 +347,9 @@ extern "C" fn dispatch_get_global_queue(_priority: i64, _flags: u64) -> usize {
 // a worker thread. Global queues run each block on its own thread. A queue
 // whose target (dispatch_set_target_queue) is serial or the main queue runs
 // its blocks there, taking turns with that queue's own blocks.
+// dispatch_suspend works on every queue the game made (serial or concurrent):
+// a block bound for a suspended queue, or for a queue whose targets pass
+// through one, doesn't start; it is held in order and sent on at resume.
 
 /// A block to run, and the queue it was sent to (what
 /// dispatch_get_current_queue answers while it runs).
@@ -335,10 +359,38 @@ enum Job {
 }
 
 struct SerialQueue {
-    jobs: Mutex<(std::collections::VecDeque<Job>, bool)>,
+    jobs: Mutex<Jobs>,
+}
+
+#[derive(Default)]
+struct Jobs {
+    waiting: std::collections::VecDeque<Job>,
+    /// A worker thread is running the queue's blocks.
+    running: bool,
+    /// dispatch_suspend count: no new block starts while above 0.
+    suspended: u32,
 }
 
 static SERIAL_QUEUES: Mutex<Option<std::collections::HashMap<usize, &'static SerialQueue>>> = Mutex::new(None);
+
+/// A block held back by a suspended queue: where it was sent, and who waits for it.
+struct Held {
+    sent_to: usize,
+    block: usize,
+    done: Option<std::sync::Arc<(Mutex<bool>, Condvar)>>,
+}
+
+#[derive(Default)]
+struct Suspensions {
+    /// Concurrent queues the game made: their suspension counts.
+    concurrent: std::collections::HashMap<usize, u32>,
+    /// Blocks held back, by the suspended queue holding them.
+    held: std::collections::HashMap<usize, std::collections::VecDeque<Held>>,
+}
+
+/// Also taken around every suspension change, so holding a block and
+/// releasing the held ones can't cross.
+static SUSPENSIONS: Mutex<Option<Suspensions>> = Mutex::new(None);
 
 /// Queue -> its target queue.
 static TARGETS: Mutex<Option<std::collections::HashMap<usize, usize>>> = Mutex::new(None);
@@ -386,11 +438,13 @@ extern "C" fn dispatch_get_current_queue() -> usize {
 }
 
 /// DISPATCH_QUEUE_SERIAL is no attribute; any attribute means concurrent.
-extern "C" fn dispatch_queue_create(_label: usize, attr: usize) -> usize {
+pub(crate) extern "C" fn dispatch_queue_create(_label: usize, attr: usize) -> usize {
     let queue = leak([0usize; 16]);
     if attr == 0 {
-        let state: &'static SerialQueue = Box::leak(Box::new(SerialQueue { jobs: Mutex::new((Default::default(), false)) }));
+        let state: &'static SerialQueue = Box::leak(Box::new(SerialQueue { jobs: Mutex::new(Jobs::default()) }));
         SERIAL_QUEUES.lock().unwrap().get_or_insert_with(Default::default).insert(queue, state);
+    } else {
+        SUSPENSIONS.lock().unwrap().get_or_insert_with(Default::default).concurrent.insert(queue, 0);
     }
     queue
 }
@@ -409,76 +463,195 @@ fn wait_for(done: &(Mutex<bool>, Condvar)) {
 
 fn enqueue(queue: usize, state: &'static SerialQueue, job: Job) {
     let mut jobs = state.jobs.lock().unwrap();
-    jobs.0.push_back(job);
-    if jobs.1 {
+    jobs.waiting.push_back(job);
+    start_worker(queue, state, jobs);
+}
+
+/// Starts the queue's worker unless one runs, the queue is suspended or empty.
+fn start_worker(queue: usize, state: &'static SerialQueue, mut jobs: std::sync::MutexGuard<'_, Jobs>) {
+    if jobs.running || jobs.suspended > 0 || jobs.waiting.is_empty() {
         return;
     }
-    jobs.1 = true;
+    jobs.running = true;
     drop(jobs);
     std::thread::spawn(move || {
         CURRENT_RUNNER.with(|c| c.set(queue));
         loop {
             let job = {
                 let mut jobs = state.jobs.lock().unwrap();
-                match jobs.0.pop_front() {
+                let next = if jobs.suspended == 0 { jobs.waiting.pop_front() } else { None };
+                match next {
                     Some(job) => job,
                     None => {
-                        jobs.1 = false;
+                        jobs.running = false;
                         return;
                     }
                 }
             };
             match job {
-                Job::Later(block, sent_to) => run_as(sent_to, block),
+                Job::Later(block, sent_to) => {
+                    if !try_hold(sent_to, queue, block, None) {
+                        run_as(sent_to, block);
+                    }
+                }
                 Job::Now(block, done, sent_to) => {
-                    run_as(sent_to, block);
-                    mark_done(&done);
+                    if !try_hold(sent_to, queue, block, Some(done.clone())) {
+                        run_as(sent_to, block);
+                        mark_done(&done);
+                    }
                 }
             }
         }
     });
 }
 
-extern "C" fn dispatch_async(queue: usize, block: usize) {
-    let copy = block_copy(block as *mut BlockHeader) as usize;
+fn is_suspended(suspensions: &Suspensions, queue: usize) -> bool {
+    match serial_queue(queue) {
+        Some(state) => state.jobs.lock().unwrap().suspended > 0,
+        None => suspensions.concurrent.get(&queue).is_some_and(|&count| count > 0),
+    }
+}
+
+/// Holds a block bound for `sent_to` (run by `runner`) if a queue on its way
+/// is suspended. A serial runner's own suspension is kept by its worker.
+fn try_hold(sent_to: usize, runner: usize, block: usize, done: Option<std::sync::Arc<(Mutex<bool>, Condvar)>>) -> bool {
+    let mut suspensions = SUSPENSIONS.lock().unwrap();
+    let suspensions = suspensions.get_or_insert_with(Default::default);
+    let mut at = sent_to;
+    for _ in 0..32 {
+        if at == runner && serial_queue(at).is_some() {
+            return false;
+        }
+        if is_suspended(suspensions, at) {
+            suspensions.held.entry(at).or_default().push_back(Held { sent_to, block, done });
+            return true;
+        }
+        if at == runner {
+            return false;
+        }
+        match TARGETS.lock().unwrap().as_ref().and_then(|t| t.get(&at)).copied() {
+            Some(target) => at = target,
+            None => return false,
+        }
+    }
+    false
+}
+
+/// dispatch_suspend on a queue the game made. Apple ignores it for the main
+/// and global queues. False: not a queue the game made.
+pub(crate) fn suspend_queue(queue: usize) -> bool {
+    let mut suspensions = SUSPENSIONS.lock().unwrap();
+    let suspensions = suspensions.get_or_insert_with(Default::default);
+    if let Some(state) = serial_queue(queue) {
+        state.jobs.lock().unwrap().suspended += 1;
+        return true;
+    }
+    match suspensions.concurrent.get_mut(&queue) {
+        Some(count) => {
+            *count += 1;
+            true
+        }
+        None => false,
+    }
+}
+
+pub(crate) fn resume_queue(queue: usize) -> bool {
+    let released = {
+        let mut suspensions = SUSPENSIONS.lock().unwrap();
+        let suspensions = suspensions.get_or_insert_with(Default::default);
+        let still_suspended = if let Some(state) = serial_queue(queue) {
+            let mut jobs = state.jobs.lock().unwrap();
+            if jobs.suspended == 0 {
+                crate::log!("dispatch_resume on a queue that wasn't suspended; ignored");
+                return true;
+            }
+            jobs.suspended -= 1;
+            let still = jobs.suspended > 0;
+            start_worker(queue, state, jobs);
+            still
+        } else {
+            match suspensions.concurrent.get_mut(&queue) {
+                None => return false,
+                Some(0) => {
+                    crate::log!("dispatch_resume on a queue that wasn't suspended; ignored");
+                    return true;
+                }
+                Some(count) => {
+                    *count -= 1;
+                    *count > 0
+                }
+            }
+        };
+        if still_suspended { Default::default() } else { suspensions.held.remove(&queue).unwrap_or_default() }
+    };
+    for held in released {
+        submit(held.sent_to, held.block, held.done);
+    }
+    true
+}
+
+/// Sends a (copied) block to a queue; `done` is marked once it has run.
+fn submit(queue: usize, block: usize, done: Option<std::sync::Arc<(Mutex<bool>, Condvar)>>) {
     let runner = runs_on(queue);
-    if queue == main_queue() {
-        crate::fw::runloop::post(crate::fw::runloop::Work::Block(copy));
+    if try_hold(queue, runner, block, done.clone()) {
+        return;
+    }
+    let finish = move |done: Option<std::sync::Arc<(Mutex<bool>, Condvar)>>| {
+        if let Some(done) = done {
+            mark_done(&done);
+        }
+    };
+    if queue == main_queue() && done.is_none() {
+        crate::fw::runloop::post(crate::fw::runloop::Work::Block(block));
     } else if runner == main_queue() {
-        crate::fw::runloop::post(crate::fw::runloop::Work::Native(Box::new(move || run_as(queue, copy))));
+        crate::fw::runloop::post(crate::fw::runloop::Work::Native(Box::new(move || {
+            if !try_hold(queue, runner, block, done.clone()) {
+                run_as(queue, block);
+                finish(done);
+            }
+        })));
     } else if let Some(state) = serial_queue(runner) {
-        enqueue(runner, state, Job::Later(copy, queue));
+        let job = match done {
+            None => Job::Later(block, queue),
+            Some(done) => Job::Now(block, done, queue),
+        };
+        enqueue(runner, state, job);
     } else {
         std::thread::spawn(move || {
-            CURRENT_QUEUE.with(|c| c.set(queue));
-            unsafe { call_block(copy) }
+            if !try_hold(queue, runner, block, done.clone()) {
+                CURRENT_QUEUE.with(|c| c.set(queue));
+                unsafe { call_block(block) };
+                finish(done);
+            }
         });
     }
+}
+
+pub(crate) extern "C" fn dispatch_async(queue: usize, block: usize) {
+    let copy = block_copy(block as *mut BlockHeader) as usize;
+    submit(queue, copy, None);
 }
 
 /// Runs the block on the queue's turn and waits for it.
 extern "C" fn dispatch_sync(queue: usize, block: usize) {
     let inline = || run_as(queue, block);
     let runner = runs_on(queue);
+    let done = std::sync::Arc::new((Mutex::new(false), Condvar::new()));
     if runner == main_queue() {
         if crate::fw::runloop::is_main_thread() {
             return inline();
         }
-        let done = std::sync::Arc::new((Mutex::new(false), Condvar::new()));
-        let signal = done.clone();
-        crate::fw::runloop::post(crate::fw::runloop::Work::Native(Box::new(move || {
-            run_as(queue, block);
-            mark_done(&signal);
-        })));
+        submit(queue, block, Some(done.clone()));
         wait_for(&done);
-    } else if let Some(state) = serial_queue(runner) {
+    } else if serial_queue(runner).is_some() {
         if CURRENT_RUNNER.with(|c| c.get()) == runner {
             // On Apple this waits forever; running it here keeps the game going.
             crate::log!("dispatch_sync onto the queue already running; ran it directly");
             return inline();
         }
-        let done = std::sync::Arc::new((Mutex::new(false), Condvar::new()));
-        enqueue(runner, state, Job::Now(block, done.clone(), queue));
+        submit(queue, block, Some(done.clone()));
+        wait_for(&done);
+    } else if try_hold(queue, runner, block, Some(done.clone())) {
         wait_for(&done);
     } else {
         inline();
@@ -489,8 +662,10 @@ extern "C" fn dispatch_after(when: u64, queue: usize, block: usize) {
     let copy = block_copy(block as *mut BlockHeader) as usize;
     std::thread::spawn(move || {
         let now = now_nanos();
-        if when != !0 && when > now {
-            std::thread::sleep(std::time::Duration::from_nanos(when - now));
+        match deadline_nanos(when) {
+            Some(at) if at > now => std::thread::sleep(std::time::Duration::from_nanos(at - now)),
+            Some(_) => {}
+            None => return,
         }
         dispatch_async(queue, copy);
     });
@@ -501,6 +676,9 @@ extern "C" fn dispatch_noop(_object: usize) {}
 /// A null target means the default (a global queue): no target.
 extern "C" fn dispatch_set_target_queue(object: usize, queue: usize) {
     if object == 0 || object == main_queue() || object == queue {
+        return;
+    }
+    if crate::libsystem::timers::retarget(object, queue) {
         return;
     }
     let mut targets = TARGETS.lock().unwrap();
@@ -531,11 +709,10 @@ extern "C" fn dispatch_semaphore_signal(semaphore: usize) -> i64 {
 extern "C" fn dispatch_semaphore_wait(semaphore: usize, timeout: u64) -> i64 {
     let semaphore = unsafe { &*(semaphore as *const Semaphore) };
     let mut count = semaphore.count.lock().unwrap();
-    let deadline = if timeout == !0 { None } else { Some(timeout) };
+    let deadline = deadline_nanos(timeout);
     while *count <= 0 {
         match deadline {
             None => count = semaphore.wake.wait(count).unwrap(),
-            Some(0) => return 1,
             Some(at) => {
                 let now = now_nanos();
                 if now >= at {
@@ -553,8 +730,22 @@ extern "C" fn dispatch_time(when: u64, delta: i64) -> u64 {
     if when == !0 {
         return !0;
     }
+    if (when as i64) < 0 {
+        // A wall-clock time (negated nanoseconds since 1970).
+        return wall_time((when as i64).wrapping_neg() as u64, delta);
+    }
     let base = if when == 0 { now_nanos() } else { when };
     (base as i64 + delta) as u64
+}
+
+/// Apple's wall-clock dispatch time: the nanoseconds since 1970, negated.
+pub(crate) fn wall_time(nanos: u64, delta: i64) -> u64 {
+    let total = (nanos as i64).saturating_add(delta);
+    if total <= 1 {
+        // -1 and -0 mean "forever" and "now" (Apple's rule).
+        return if delta >= 0 { !0 } else { (-2i64) as u64 };
+    }
+    total.wrapping_neg() as u64
 }
 
 // ----- dynamic loading -----

@@ -79,8 +79,25 @@ extern "C" fn memset_pattern16(dest: *mut u8, pattern: *const u8, length: usize)
     }
 }
 
-extern "C" fn strcat_chk(dest: *mut libc::c_char, src: *const libc::c_char, _len: usize) -> *mut libc::c_char {
-    unsafe { libc::strcat(dest, src) }
+/// Whether a `_chk` call would write past the room the compiler knew about.
+pub(crate) fn overflows(needed: usize, room: usize) -> bool {
+    needed > room
+}
+
+/// Apple's __chk_fail_overflow: the game is stopped, as Apple aborts it.
+pub(crate) fn stop_overflow(what: &str, needed: usize, room: usize) -> ! {
+    crate::log!("STOP: the game overflowed a buffer ({what} needs {needed} bytes, room {room})");
+    crate::report::finish(1);
+}
+
+extern "C" fn strcat_chk(dest: *mut libc::c_char, src: *const libc::c_char, room: usize) -> *mut libc::c_char {
+    unsafe {
+        let needed = libc::strlen(dest) + libc::strlen(src) + 1;
+        if overflows(needed, room) {
+            stop_overflow("strcat", needed, room);
+        }
+        libc::strcat(dest, src)
+    }
 }
 
 extern "C" fn stack_chk_fail() -> ! {
@@ -310,10 +327,13 @@ unsafe extern "C" fn ios_snprintf_chk_impl(
     buf: *mut libc::c_char,
     size: usize,
     _flag: i32,
-    _slen: usize,
+    room: usize,
     fmt: *const libc::c_char,
     va: *const u64,
 ) -> i32 {
+    if overflows(size, room) {
+        stop_overflow("snprintf", size, room);
+    }
     ios_snprintf_impl(buf, size, fmt, va)
 }
 
@@ -326,7 +346,10 @@ unsafe extern "C" fn ios_sprintf_chk_impl(
     va: *const u64,
 ) -> i32 {
     let text = varargs::format(varargs::c_bytes(fmt), &mut Args::new(va), false);
-    varargs::write_bounded(buf, slen, &text)
+    if slen <= i32::MAX as usize && overflows(text.len() + 1, slen) {
+        stop_overflow("sprintf", text.len() + 1, slen);
+    }
+    varargs::write_bounded(buf, usize::MAX, &text)
 }
 
 #[no_mangle]
@@ -470,7 +493,7 @@ pub fn register(r: &mut Registry) {
     same!(
         malloc, calloc, realloc, free, memcpy, memmove, memset, memcmp, strlen, strcmp, strncmp,
         strcpy, strncpy, strcat, strchr, strrchr, strdup, strcasecmp, strtod, strtol, strtoull, atoi,
-        qsort, abort, exit, getpid, usleep, sched_yield, time, difftime, mktime,
+        qsort, abort, exit, getpid, sched_yield, time, difftime, mktime,
         gmtime, gmtime_r, localtime_r, putchar, strerror, strstr, strncasecmp, strtoul, strtoll,
         atof, atol, memchr, posix_memalign, malloc_usable_size, strcspn, strspn, strpbrk
     );

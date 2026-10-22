@@ -93,7 +93,16 @@ extern "C" fn nslogv(format: Id, va: *const u64) {
     ios_nslog_impl(format, va);
 }
 
-extern "C" fn set_uncaught_exception_handler(_handler: usize) {}
+/// The game's NSSetUncaughtExceptionHandler function (0: none).
+pub static UNCAUGHT_EXCEPTION_HANDLER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+extern "C" fn set_uncaught_exception_handler(handler: usize) {
+    UNCAUGHT_EXCEPTION_HANDLER.store(handler, std::sync::atomic::Ordering::SeqCst);
+}
+
+extern "C" fn get_uncaught_exception_handler() -> usize {
+    UNCAUGHT_EXCEPTION_HANDLER.load(std::sync::atomic::Ordering::SeqCst)
+}
 
 // ----- NSBundle: { isa, folder path string } -----
 
@@ -501,6 +510,7 @@ pub fn register(r: &mut Registry) {
     r.function("NSLog", ios_nslog as usize);
     r.function("NSLogv", nslogv as usize);
     r.function("NSSetUncaughtExceptionHandler", set_uncaught_exception_handler as usize);
+    r.function("NSGetUncaughtExceptionHandler", get_uncaught_exception_handler as usize);
 
     let bundle = define_class("NSBundle", "NSObject", 16);
     class_methods(bundle, &[("mainBundle", main_bundle as usize)]);

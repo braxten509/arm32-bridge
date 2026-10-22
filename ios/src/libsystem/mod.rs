@@ -1,9 +1,12 @@
 //! Apple's C library (libSystem) for the game.
 
+pub mod extra;
 pub mod io;
 pub mod libc;
 pub mod mach;
+pub mod net;
 pub mod threads;
+pub mod timers;
 
 use crate::symbols::Registry;
 
@@ -12,6 +15,9 @@ pub fn register(r: &mut Registry) {
     io::register(r);
     threads::register(r);
     mach::register(r);
+    extra::register(r);
+    net::register(r);
+    timers::register(r);
 }
 
 /// The system's own error number for this thread (named differently on Android).

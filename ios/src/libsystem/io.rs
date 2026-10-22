@@ -22,7 +22,7 @@ impl CellAddr {
 
 // ----- errno -----
 
-fn apple_errno(linux: i32) -> i32 {
+pub(crate) fn apple_errno(linux: i32) -> i32 {
     match linux {
         libc::EAGAIN => 35,
         0..=34 => linux,
@@ -66,7 +66,7 @@ thread_local! {
 /// Apple's errno cell. A host call that failed since the last look left a
 /// non-zero host errno: translate it into the cell and clear the host value,
 /// so values the game writes into the cell itself stay until the next error.
-extern "C" fn error_location() -> *mut i32 {
+pub(crate) extern "C" fn error_location() -> *mut i32 {
     unsafe {
         let host = crate::libsystem::host_errno();
         let value = *host;
@@ -78,6 +78,17 @@ extern "C" fn error_location() -> *mut i32 {
             cell.as_ptr()
         })
     }
+}
+
+/// Sets Apple's errno to an Apple number that has no Linux twin (ENOATTR).
+pub(crate) fn set_apple_errno(apple: i32) {
+    unsafe { *crate::libsystem::host_errno() = 0 };
+    APPLE_ERRNO.with(|cell| cell.set(apple));
+}
+
+/// The Linux number for an Apple errno (for the system's messages).
+pub(crate) fn linux_errno(apple: i32) -> Option<i32> {
+    (0..256).find(|&linux| apple_errno(linux) == apple)
 }
 
 // ----- open / fcntl -----
@@ -126,7 +137,7 @@ crate::libsystem::libc::variadic!(ios_fcntl, 2, ios_fcntl_impl);
 unsafe extern "C" fn ios_open_impl(path: *const libc::c_char, flags: i32, va: *const u64) -> i32 {
     let mode = if flags & APPLE_O_CREAT != 0 { *va as u32 } else { 0 };
     let path = crate::fw::paths::host_path_c(path);
-    libc::open(path.as_ptr(), open_flags(flags), mode)
+    crate::libsystem::threads::blocking(|| libc::open(path.as_ptr(), open_flags(flags), mode))
 }
 
 #[no_mangle]
@@ -290,10 +301,6 @@ extern "C" fn ios_utimes(path: *const libc::c_char, times: *const libc::timeval)
 
 extern "C" fn ios_mkstemp(template: *mut libc::c_char) -> i32 {
     unsafe { libc::mkstemp(template) }
-}
-
-extern "C" fn ios_setxattr(_path: *const libc::c_char, _name: *const libc::c_char, _v: usize, _s: usize, _p: u32, _o: i32) -> i32 {
-    0
 }
 
 // ----- mmap -----
@@ -468,15 +475,11 @@ pub fn register(r: &mut Registry) {
     r.function("fopen", ios_fopen as usize);
     r.function("utimes", ios_utimes as usize);
     r.function("mkstemp", ios_mkstemp as usize);
-    r.function("setxattr", ios_setxattr as usize);
     r.function("mmap", ios_mmap as usize);
     r.function("munmap", libc::munmap as usize);
     r.function("mprotect", libc::mprotect as usize);
     r.function("close", libc::close as usize);
-    r.function("read", libc::read as usize);
-    r.function("write", libc::write as usize);
     r.function("lseek", libc::lseek as usize);
-    r.function("fsync", libc::fsync as usize);
     r.function("fflush", libc::fflush as usize);
     r.function("fwrite", libc::fwrite as usize);
     r.function("fread", libc::fread as usize);
