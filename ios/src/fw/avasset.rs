@@ -686,9 +686,11 @@ extern "C" fn reader_start(this: Id, s: Sel) -> bool {
         let end = if range.duration.is_numeric() { start.saturating_add((range.duration.seconds().max(0.0) * rate) as u64) } else { u64::MAX };
         let skip = start + parsed.priming as u64;
         let end = end.saturating_add(parsed.priming as u64).min(parsed.priming as u64 + parsed.valid_frames());
+        // Decoded sound is timed from the range start, in the output's frames.
+        let first = (start as f64 * out.rate / rate.max(1.0)) as u64;
         READERS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(
             output,
-            SoundReader { parsed, decoder, out, next_packet: 0, pending: Vec::new(), skip, end, decoded_frames: 0, sent_frames: 0, position: 0.0 },
+            SoundReader { parsed, decoder, out, next_packet: 0, pending: Vec::new(), skip, end, decoded_frames: 0, sent_frames: first, position: 0.0 },
         );
     }
     property_set(this, "status", STATUS_READING as u64);

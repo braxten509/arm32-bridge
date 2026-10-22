@@ -24,6 +24,7 @@ const INVALID_PROPERTY_SIZE: i32 = -66683;
 const INVALID_PARAMETER: i32 = -66682;
 const DISPOSAL_PENDING: i32 = -66685;
 const CANNOT_START: i32 = -66681;
+const INVALID_RUN_STATE: i32 = -66678;
 const ENQUEUE_DURING_RESET: i32 = -66632;
 const INVALID_OFFLINE_MODE: i32 = -66626;
 const UNSUPPORTED_FORMAT: i32 = four(b"fmt?") as i32;
@@ -433,6 +434,10 @@ struct State {
     /// IsRunning changed: listeners still to be told.
     tell_running: bool,
     buffers: Vec<usize>,
+    /// Every enqueued buffer not yet handed back (waiting, being decoded or
+    /// with its callback posted), with the epoch it was enqueued in. A
+    /// buffer is handed back by whoever takes it out of here, so only once.
+    outstanding: Vec<(usize, u64)>,
     /// Changes on every stop or reset; work begun before one is dropped.
     epoch: u64,
     quit: bool,
@@ -441,6 +446,10 @@ struct State {
     /// Properties stored as set (metering, time-pitch, codec policy, ...).
     settings: HashMap<u32, Vec<u8>>,
 }
+
+/// How long Stop, Reset and Dispose wait for a callback another thread is
+/// running before giving up (it may be waiting on their caller).
+const CALLBACK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Which thread is running one of the queue's callbacks, and how deeply.
 #[derive(Default)]
@@ -452,7 +461,8 @@ struct Busy {
 struct Queue {
     state: Mutex<State>,
     wake: Condvar,
-    worker: std::sync::Once,
+    /// The playing thread was started.
+    worker: Mutex<bool>,
     busy: Mutex<Busy>,
     idle: Condvar,
 }
@@ -473,49 +483,57 @@ impl Drop for Turn<'_> {
 
 impl Queue {
     fn new(state: State) -> Queue {
-        Queue { state: Mutex::new(state), wake: Condvar::new(), worker: std::sync::Once::new(), busy: Mutex::default(), idle: Condvar::new() }
+        Queue { state: Mutex::new(state), wake: Condvar::new(), worker: Mutex::new(false), busy: Mutex::default(), idle: Condvar::new() }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Takes the callback turn, waiting while another thread has it.
-    fn turn(&self) -> Turn<'_> {
+    /// Takes the callback turn, waiting while another thread has it (at most
+    /// `limit`; None if it is still busy then).
+    fn take_turn(&self, limit: Option<std::time::Duration>) -> Option<Turn<'_>> {
         let me = std::thread::current().id();
+        let deadline = limit.map(|l| std::time::Instant::now() + l);
         let mut busy = self.busy.lock().unwrap_or_else(|e| e.into_inner());
         while busy.depth > 0 && busy.owner != Some(me) {
-            busy = self.idle.wait(busy).unwrap_or_else(|e| e.into_inner());
+            busy = match deadline {
+                None => self.idle.wait(busy).unwrap_or_else(|e| e.into_inner()),
+                Some(deadline) => {
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        return None;
+                    }
+                    self.idle.wait_timeout(busy, left).unwrap_or_else(|e| e.into_inner()).0
+                }
+            };
         }
         busy.owner = Some(me);
         busy.depth += 1;
-        Turn(self)
+        Some(Turn(self))
     }
 
-    /// Waits until no other thread is inside one of the queue's callbacks
-    /// (Stop, Reset and Dispose return only after it). `false` if a callback
-    /// stayed busy for seconds (it may be waiting on the caller).
-    fn wait_idle(&self) -> bool {
-        let me = std::thread::current().id();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        let mut busy = self.busy.lock().unwrap_or_else(|e| e.into_inner());
-        while busy.depth > 0 && busy.owner != Some(me) {
-            let left = deadline.saturating_duration_since(std::time::Instant::now());
-            if left.is_zero() {
-                return false;
-            }
-            busy = self.idle.wait_timeout(busy, left).unwrap_or_else(|e| e.into_inner()).0;
-        }
-        true
+    fn turn(&self) -> Turn<'_> {
+        self.take_turn(None).expect("an unlimited wait ends with the turn")
     }
 }
 
-/// Runs a game callback in the queue's turn, unless the queue was disposed,
-/// a stop or reset came after `epoch`, or `buffer` was freed meanwhile.
-fn deliver(q: &Queue, epoch: Option<u64>, buffer: Option<usize>, call: impl FnOnce()) {
+/// Runs a game callback in the queue's turn, unless the queue was disposed.
+/// With `owed`, only if that buffer (from that epoch) is still waiting to be
+/// handed back; it is taken off the list, so no one else hands it back.
+fn deliver(q: &Queue, owed: Option<(usize, u64)>, call: impl FnOnce()) {
     let _turn = q.turn();
-    let state = q.lock();
-    let live = !state.quit && epoch.map_or(true, |e| e == state.epoch) && buffer.map_or(true, |b| state.buffers.contains(&b));
+    let mut state = q.lock();
+    let mut live = !state.quit;
+    if let Some(owed) = owed {
+        match state.outstanding.iter().position(|&o| o == owed) {
+            Some(at) if live => {
+                state.outstanding.remove(at);
+                live = state.buffers.contains(&owed.0);
+            }
+            _ => live = false,
+        }
+    }
     drop(state);
     if live {
         call();
@@ -621,6 +639,7 @@ extern "C" fn free_buffer(handle: usize, buffer: usize) -> i32 {
     let Some(at) = state.buffers.iter().position(|&b| b == buffer) else { return INVALID_BUFFER };
     state.buffers.remove(at);
     state.pending.retain(|p| p.buffer != buffer);
+    state.outstanding.retain(|o| o.0 != buffer);
     unsafe { libc::free(buffer as *mut libc::c_void) };
     0
 }
@@ -672,6 +691,8 @@ fn enqueue(handle: usize, buffer: usize, count: u32, descriptions: *const u8, tr
         return PARAMETER;
     }
     state.pending.push_back(Pending { buffer, data: bytes, packets, trim_start, trim_end });
+    let epoch = state.epoch;
+    state.outstanding.push((buffer, epoch));
     drop(state);
     q.wake.notify_all();
     0
@@ -712,7 +733,7 @@ fn work(handle: usize, q: Arc<Queue>) {
             drop(state);
             for (id, listener, data) in listeners {
                 let listener: PropertyListener = unsafe { std::mem::transmute(listener) };
-                deliver(&q, None, None, || listener(data, handle, id));
+                deliver(&q, None, || listener(data, handle, id));
             }
             continue;
         }
@@ -734,6 +755,7 @@ fn work(handle: usize, q: Arc<Queue>) {
         decode_pending(&mut decoder, &pending, &mut scratch, channels);
         let mut state = q.lock();
         if state.epoch != epoch {
+            // Stop or Reset came meanwhile and handed the buffer back.
             continue;
         }
         state.decoder = Some(decoder);
@@ -758,7 +780,7 @@ fn call_back(q: &Arc<Queue>, handle: usize, callback: usize, user: usize, run_lo
     }
     let output: OutputCallback = unsafe { std::mem::transmute(callback) };
     if run_loop == 0 {
-        deliver(q, Some(epoch), Some(buffer), || output(user, handle, buffer));
+        deliver(q, Some((buffer, epoch)), || output(user, handle, buffer));
         return;
     }
     let weak = Arc::downgrade(q);
@@ -766,30 +788,51 @@ fn call_back(q: &Arc<Queue>, handle: usize, callback: usize, user: usize, run_lo
         run_loop,
         Work::Native(Box::new(move || {
             if let Some(q) = weak.upgrade() {
-                deliver(&q, Some(epoch), Some(buffer), || output(user, handle, buffer));
+                deliver(&q, Some((buffer, epoch)), || output(user, handle, buffer));
             }
         })),
     );
 }
 
-/// Stop and Reset hand every flushed buffer back to the game, in order,
-/// before they return (enqueueing meanwhile fails, as on iOS).
-fn hand_back(q: &Queue, handle: usize, buffers: Vec<usize>) {
-    if buffers.is_empty() {
-        return;
-    }
-    let (callback, user) = {
-        let mut state = q.lock();
-        state.resetting += 1;
-        (state.callback, state.user)
+/// Stop(immediate) and Reset: in the queue's callback turn (so no callback
+/// runs on another thread meanwhile, and none is half done), drop what is
+/// enqueued and hand every outstanding buffer back, in order, before
+/// returning; enqueueing from those callbacks fails, as on iOS. If another
+/// thread's callback doesn't finish in time nothing changes and the call
+/// fails, so the game still owns a working queue.
+fn flush_all(q: &Queue, handle: usize, stop: bool) -> i32 {
+    let Some(_turn) = q.take_turn(Some(CALLBACK_WAIT)) else {
+        crate::log!("AudioQueue{}: a buffer callback on another thread is still running; nothing was done", if stop { "Stop" } else { "Reset" });
+        return INVALID_RUN_STATE;
     };
+    let (flushed, callback, user) = {
+        let mut state = q.lock();
+        if stop {
+            if state.running {
+                state.tell_running = !state.listeners.is_empty();
+            }
+            state.running = false;
+            state.stopping = false;
+            state.played = 0.0;
+        }
+        state.resetting += 1;
+        (clear(&mut state), state.callback, state.user)
+    };
+    q.wake.notify_all();
     if callback != 0 {
         let output: OutputCallback = unsafe { std::mem::transmute(callback) };
-        for buffer in buffers {
-            deliver(q, None, Some(buffer), || output(user, handle, buffer));
+        for buffer in flushed {
+            let live = {
+                let state = q.lock();
+                !state.quit && state.buffers.contains(&buffer)
+            };
+            if live {
+                output(user, handle, buffer);
+            }
         }
     }
     q.lock().resetting -= 1;
+    0
 }
 
 /// AudioQueueStart(queue, startTime).
@@ -806,23 +849,27 @@ extern "C" fn start(handle: usize, _time: usize) -> i32 {
     drop(state);
     if !offline {
         sound::start();
-        let me = q.clone();
-        let mut started = true;
-        q.worker.call_once(|| {
-            started = std::thread::Builder::new().name("ios-audioqueue".into()).spawn(move || work(handle, me)).is_ok();
-        });
-        if !started {
-            q.lock().running = false;
-            return CANNOT_START;
+        let mut worker = q.worker.lock().unwrap_or_else(|e| e.into_inner());
+        if !*worker {
+            let me = q.clone();
+            // A thread that can't be made is tried again at the next Start.
+            if std::thread::Builder::new().name("ios-audioqueue".into()).spawn(move || work(handle, me)).is_err() {
+                drop(worker);
+                q.lock().running = false;
+                return CANNOT_START;
+            }
+            *worker = true;
         }
     }
     q.wake.notify_all();
     0
 }
 
-/// Drops what's enqueued and decoded; returns the buffers that were waiting.
+/// Drops what's enqueued and decoded; returns every buffer not yet handed
+/// back (the caller hands them back or frees them).
 fn clear(state: &mut State) -> Vec<usize> {
-    let flushed = state.pending.drain(..).map(|p| p.buffer).collect();
+    state.pending.clear();
+    let flushed = state.outstanding.drain(..).map(|o| o.0).collect();
     state.stream = Stream::default();
     state.decoded.clear();
     state.position = 0.0;
@@ -836,22 +883,8 @@ extern "C" fn stop(handle: usize, immediate: u8) -> i32 {
     let Some(q) = queue(handle) else { return PARAMETER };
     let mut state = q.lock();
     if immediate != 0 || state.offline.is_some() || !state.running {
-        let was = state.running;
-        let flushed = clear(&mut state);
-        state.running = false;
-        state.stopping = false;
-        state.played = 0.0;
-        if was {
-            state.tell_running = !state.listeners.is_empty();
-        }
         drop(state);
-        q.wake.notify_all();
-        if q.wait_idle() {
-            hand_back(&q, handle, flushed);
-        } else {
-            crate::log!("AudioQueueStop: a buffer callback is still running after 2 s; flushed buffers aren't handed back");
-        }
-        return 0;
+        return flush_all(&q, handle, true);
     }
     state.stopping = true;
     drop(state);
@@ -878,13 +911,7 @@ extern "C" fn flush(handle: usize) -> i32 {
 /// AudioQueueReset(queue): drops what's enqueued, handing it back; keeps running.
 extern "C" fn reset(handle: usize) -> i32 {
     let Some(q) = queue(handle) else { return PARAMETER };
-    let flushed = clear(&mut q.lock());
-    if q.wait_idle() {
-        hand_back(&q, handle, flushed);
-    } else {
-        crate::log!("AudioQueueReset: a buffer callback is still running after 2 s; flushed buffers aren't handed back");
-    }
-    0
+    flush_all(&q, handle, false)
 }
 
 /// AudioQueuePrime(queue, frames, *prepared).
@@ -900,23 +927,29 @@ extern "C" fn prime(handle: usize, _frames: u32, prepared: *mut u32) -> i32 {
 }
 
 /// AudioQueueDispose(queue, immediate): no callback runs after it returns.
+/// Done in the queue's callback turn, so one running on another thread
+/// finishes first; if it doesn't in time, the queue stays and the call
+/// fails. (One on this thread, disposing from inside it, checks `quit`
+/// when it comes back.)
 extern "C" fn dispose(handle: usize, _immediate: u8) -> i32 {
-    let Some(q) = QUEUES.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|queues| queues.remove(&handle)) else { return PARAMETER };
+    let Some(q) = queue(handle) else { return PARAMETER };
+    let Some(turn) = q.take_turn(Some(CALLBACK_WAIT)) else {
+        crate::log!("AudioQueueDispose: a buffer callback on another thread is still running; the queue stays");
+        return INVALID_RUN_STATE;
+    };
+    if QUEUES.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|queues| queues.remove(&handle)).is_none() {
+        return PARAMETER;
+    }
     let buffers = {
         let mut state = q.lock();
         clear(&mut state);
         state.quit = true;
         std::mem::take(&mut state.buffers)
     };
+    drop(turn);
     q.wake.notify_all();
     // The output may be mixing it right now; wait for that turn to finish.
     sound::wait_for_mix();
-    // And for a callback another thread is running (one on this thread, which
-    // is disposing from inside it, checks `quit` when it comes back).
-    if !q.wait_idle() {
-        crate::log!("AudioQueueDispose: a buffer callback is still running after 2 s; its buffers are kept");
-        return 0;
-    }
     for buffer in buffers {
         unsafe { libc::free(buffer as *mut libc::c_void) };
     }
@@ -967,6 +1000,8 @@ fn property(state: &State, id: u32) -> Option<Vec<u8>> {
         b"xops" | b"dcbf" => 4096u32.to_ne_bytes().to_vec(),
         // Off / default policy / no converter error.
         b"aqcp" | b"aqme" | b"q_tp" | b"qtpb" | b"qcve" => 0u32.to_ne_bytes().to_vec(),
+        // kAudioQueueTimePitchAlgorithm_TimeDomain, the iPhone's default.
+        b"qtpa" => four(b"tido").to_ne_bytes().to_vec(),
         // AudioQueueLevelMeterState (average, peak) per channel: silence.
         b"aqmv" => vec![0; 8 * state.format.channels.clamp(1, 64) as usize],
         b"aqmd" => (0..2 * state.format.channels.clamp(1, 64)).flat_map(|_| (-120.0f32).to_ne_bytes()).collect(),
@@ -1158,7 +1193,9 @@ extern "C" fn offline_render(handle: usize, _stamp: *const u8, buffer: usize, fr
             state.decoded = decoded;
         }
         let (callback, user) = (state.callback, state.user);
-        let give_back = callback != 0 && state.buffers.contains(&pending.buffer);
+        // Handed back here unless something else already did (taken off the list).
+        let owed = state.outstanding.iter().position(|&o| o == (pending.buffer, epoch)).map(|at| state.outstanding.remove(at));
+        let give_back = callback != 0 && owed.is_some() && state.buffers.contains(&pending.buffer);
         drop(state);
         if give_back {
             let output: OutputCallback = unsafe { std::mem::transmute(callback) };
@@ -1378,10 +1415,39 @@ mod tests {
         }
         assert_eq!(reset(q), 0);
         unsafe { assert_eq!(((*feeder).handed_back, (*feeder).refused), (handed_back + 1, 1)) };
+        // A buffer already taken out for decoding (as the playing thread does)
+        // is still handed back by Reset, exactly once.
+        unsafe { fill(&mut *feeder, q, a) };
+        assert!(super::queue(q).unwrap().lock().pending.pop_front().is_some());
+        assert_eq!(reset(q), 0);
+        unsafe { assert_eq!((*feeder).handed_back, handed_back + 2) };
+        assert_eq!(reset(q), 0);
+        unsafe { assert_eq!((*feeder).handed_back, handed_back + 2, "handed back once") };
+        // The time-pitch algorithm reads back before it is set (TimeDomain, iOS's default).
+        let (mut value, mut size) = (0u32, 4u32);
+        assert_eq!(get_property(q, four(b"qtpa"), &mut value as *mut u32 as *mut u8, &mut size), 0);
+        assert_eq!(value, four(b"tido"));
+        // Stop never reports success while a callback on another thread still runs.
+        let queue_ref = super::queue(q).unwrap();
+        let (started, done) = (Arc::new(std::sync::atomic::AtomicBool::new(false)), Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let (s, d) = (started.clone(), done.clone());
+        let thread = std::thread::spawn(move || {
+            deliver(&queue_ref, None, || {
+                s.store(true, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(CALLBACK_WAIT + std::time::Duration::from_millis(300));
+                d.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+        });
+        while !started.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        let stopped = stop(q, 1);
+        assert!(stopped != 0 || done.load(std::sync::atomic::Ordering::SeqCst), "Stop said done while a callback ran");
+        thread.join().unwrap();
+        assert_eq!(stop(q, 1), 0);
         // Apple's property IDs: metering is kept and reads back; made-up IDs are refused.
         let on = 1u32;
         assert_eq!(set_property(q, four(b"aqme"), &on as *const u32 as *const u8, 4), 0);
-        let (mut value, mut size) = (0u32, 4u32);
         assert_eq!(get_property(q, four(b"aqme"), &mut value as *mut u32 as *mut u8, &mut size), 0);
         assert_eq!(value, 1);
         assert_eq!(set_property(q, four(b"aqtp"), &on as *const u32 as *const u8, 4), INVALID_PROPERTY);
@@ -1390,7 +1456,7 @@ mod tests {
         let (started, done) = (Arc::new(std::sync::atomic::AtomicBool::new(false)), Arc::new(std::sync::atomic::AtomicBool::new(false)));
         let (s, d) = (started.clone(), done.clone());
         let thread = std::thread::spawn(move || {
-            deliver(&queue_ref, None, None, || {
+            deliver(&queue_ref, None, || {
                 s.store(true, std::sync::atomic::Ordering::SeqCst);
                 std::thread::sleep(std::time::Duration::from_millis(150));
                 d.store(true, std::sync::atomic::Ordering::SeqCst);

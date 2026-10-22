@@ -744,10 +744,23 @@ fn mix_graph(out: &mut [f32], frames: usize, out_rate: f64) {
         }
         let step = input.rate * input.speed as f64 / out_rate;
         let want = stream.needed(frames, step).saturating_sub(stream.frames());
+        // A callback can stop, change or dispose of its unit (or another one
+        // in this list): check before every call that it is still wanted.
+        let wanted = || {
+            with_graph(|g| {
+                g.units.get(&unit).is_some_and(|u| {
+                    g.running.get(&u.graph).copied().unwrap_or(false)
+                        && u.inputs.get(&bus).is_some_and(|i| i.enabled && i.callback == input.callback && i.generation == input.generation)
+                })
+            })
+        };
         if want > 0 {
             // Like iOS, never ask for more than the unit's maximum in one call.
             let mut left = want.max(64);
             while left > 0 {
+                if !wanted() {
+                    break;
+                }
                 let chunk = left.min(max_frames as usize);
                 pull(&input, bus, chunk, stream.sample_time, scratch, &mut stream.pending);
                 stream.sample_time += chunk as f64;
@@ -1619,6 +1632,30 @@ mod tests {
         unit_set_parameter(unit, 5, INPUT_SCOPE, 3, 0.0, 0);
         mix(&mut out, 44100);
         assert_eq!(energy(&out, 1), 0.0);
+        // A callback that disposes of its own graph is not called again.
+        let mut graph = 0;
+        new_graph(&mut graph);
+        DISPOSING_GRAPH.store(graph, Ordering::Relaxed);
+        let mut node = 0;
+        assert_eq!(graph_add_node(graph, description.as_ptr(), &mut node), 0);
+        let callback = [dispose_own_graph as usize, 0];
+        graph_set_node_input_callback(graph, node, 0, callback.as_ptr());
+        // Small slices, so one turn asks it several times.
+        let (mut own, slice) = (0, 16u32);
+        graph_node_info(graph, node, std::ptr::null_mut(), &mut own);
+        unit_set_property(own, MAXIMUM_FRAMES_PER_SLICE, 0, 0, &slice as *const u32 as *const u8, 4);
+        graph_start(graph);
+        mix(&mut out, 44100);
+        assert_eq!(DISPOSING_CALLS.load(Ordering::Relaxed), 1, "called after its graph was disposed");
+    }
+
+    static DISPOSING_GRAPH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static DISPOSING_CALLS: AtomicU32 = AtomicU32::new(0);
+
+    extern "C" fn dispose_own_graph(_data: usize, _flags: *mut u32, _stamp: *const u8, _bus: u32, _frames: u32, _list: *mut u8) -> i32 {
+        DISPOSING_CALLS.fetch_add(1, Ordering::Relaxed);
+        graph_dispose(DISPOSING_GRAPH.load(Ordering::Relaxed));
+        0
     }
 
     /// A WAV file in memory: `seconds` of a quiet tone, 16-bit stereo.

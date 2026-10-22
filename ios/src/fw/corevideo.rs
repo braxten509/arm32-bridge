@@ -97,7 +97,8 @@ pub fn time_from_seconds(seconds: f64, timescale: i32) -> CmTime {
     let mut scale = timescale;
     loop {
         let exact = seconds * scale as f64;
-        if exact.abs() < 9.2e18 {
+        // 2^63 is the first value past i64 (and exactly representable).
+        if exact.round() < 9_223_372_036_854_775_808.0 && exact.round() >= -9_223_372_036_854_775_808.0 {
             let value = exact.round() as i64;
             let rounded = value as f64 / scale as f64 != seconds;
             return CmTime { value, timescale: scale, flags: TIME_VALID | if rounded { TIME_ROUNDED } else { 0 }, epoch: 0 };
@@ -109,17 +110,18 @@ pub fn time_from_seconds(seconds: f64, timescale: i32) -> CmTime {
     }
 }
 
-/// CMTimeRoundingMethod.
+/// CMTimeRoundingMethod (Apple's numbers; 0 and unknown ones act as the
+/// default, half away from zero).
 const ROUND_HALF_AWAY: u32 = 1;
 const ROUND_TOWARD_ZERO: u32 = 2;
 const ROUND_AWAY_FROM_ZERO: u32 = 3;
 const ROUND_QUICKTIME: u32 = 4;
-const ROUND_DOWN: u32 = 5;
-const ROUND_UP: u32 = 6;
+const ROUND_UP: u32 = 5;
+const ROUND_DOWN: u32 = 6;
 
 /// `value * to / from`, rounded by `method`; the flag says whether it had to be.
-fn rescale(value: i64, from: i32, to: i32, method: u32) -> (i128, bool) {
-    let wide = value as i128 * to as i128;
+fn rescale(value: i128, from: i64, to: i64, method: u32) -> (i128, bool) {
+    let wide = value * to as i128;
     let (whole, rest) = (wide / from as i128, wide % from as i128);
     if rest == 0 {
         return (whole, false);
@@ -128,11 +130,11 @@ fn rescale(value: i64, from: i32, to: i32, method: u32) -> (i128, bool) {
     let away = match method {
         ROUND_TOWARD_ZERO => false,
         ROUND_AWAY_FROM_ZERO => true,
-        ROUND_DOWN => negative,
         ROUND_UP => !negative,
-        // QuickTime's method truncates when going to a finer timescale.
-        ROUND_QUICKTIME if to > from => false,
-        // Default, half away from zero.
+        ROUND_DOWN => negative,
+        // QuickTime: away from zero to a finer timescale, toward zero to a
+        // coarser one, but a negative time never rounds up to 0.
+        ROUND_QUICKTIME => to > from || (negative && whole == 0),
         _ => rest.abs() * 2 >= from as i128,
     };
     (if away { whole + if negative { -1 } else { 1 } } else { whole }, true)
@@ -186,18 +188,18 @@ pub fn compare_times(a: &CmTime, b: &CmTime) -> i32 {
     left.cmp(&right) as i32
 }
 
-/// CMTimeAdd / CMTimeSubtract. Numeric times add in the least common
-/// multiple of their timescales (at most kCMTimeMaxTimescale, then rounded);
-/// a sum too large halves the timescale, then becomes infinite. Invalid
-/// times or different epochs give an invalid time; indefinite wins over
-/// infinities; opposite infinities cancel to invalid.
+/// CMTimeAdd / CMTimeSubtract. Numeric times add exactly in the least
+/// common multiple of their timescales, rounded once into
+/// kCMTimeMaxTimescale if that is too fine; a sum too large halves the
+/// timescale, then becomes infinite. Invalid times give an invalid time;
+/// infinities win over indefinite, and opposite ones cancel to invalid.
+/// Epochs: adding a duration (epoch 0) keeps the time's epoch; the
+/// difference of two times in one epoch is a duration (epoch 0); times of
+/// different epochs don't mix.
 fn combine(a: &CmTime, b: &CmTime, negate: bool) -> CmTime {
     let valid = |t: &CmTime| t.flags & TIME_VALID != 0 && !t.is_broken();
-    if !valid(a) || !valid(b) || a.epoch != b.epoch {
+    if !valid(a) || !valid(b) {
         return CmTime::INVALID;
-    }
-    if (a.flags | b.flags) & TIME_INDEFINITE != 0 {
-        return CmTime::INDEFINITE;
     }
     // +1 / -1 / 0 for each side's infinity (b's turned around when subtracting).
     let sign = |t: &CmTime| if t.flags & TIME_POSITIVE_INFINITY != 0 { 1 } else if t.flags & TIME_NEGATIVE_INFINITY != 0 { -1 } else { 0 };
@@ -205,16 +207,25 @@ fn combine(a: &CmTime, b: &CmTime, negate: bool) -> CmTime {
     if ia != 0 || ib != 0 {
         return if ia != 0 && ib != 0 && ia != ib { CmTime::INVALID } else { infinity(ia + ib > 0) };
     }
+    if (a.flags | b.flags) & TIME_INDEFINITE != 0 {
+        return CmTime::INDEFINITE;
+    }
+    let epoch = match (a.epoch, b.epoch) {
+        (x, y) if x == y => if negate { 0 } else { x },
+        (x, 0) => x,
+        (0, y) if !negate => y,
+        _ => return CmTime::INVALID,
+    };
     fn gcd(x: i64, y: i64) -> i64 {
         if y == 0 { x } else { gcd(y, x % y) }
     }
     let (sa, sb) = (a.timescale as i64, b.timescale as i64);
     let common = sa / gcd(sa, sb) * sb;
+    let (va, vb) = (a.value as i128 * (common / sa) as i128, b.value as i128 * (common / sb) as i128);
+    let exact = if negate { va - vb } else { va + vb };
     let scale = common.min(MAX_TIMESCALE);
-    let (va, ra) = rescale(a.value, a.timescale, scale as i32, ROUND_HALF_AWAY);
-    let (vb, rb) = rescale(b.value, b.timescale, scale as i32, ROUND_HALF_AWAY);
-    let sum = if negate { va - vb } else { va + vb };
-    fitted(sum, scale, ra || rb || (a.flags | b.flags) & TIME_ROUNDED != 0, a.epoch)
+    let (sum, rounded) = rescale(exact, common, scale, ROUND_HALF_AWAY);
+    fitted(sum, scale, rounded || (a.flags | b.flags) & TIME_ROUNDED != 0, epoch)
 }
 
 /// CMTimeRange (48 bytes).
@@ -258,7 +269,7 @@ extern "C" fn time_convert_scale(time: CmTime, timescale: i32, method: u32) -> C
     if !time.is_numeric() {
         return time;
     }
-    let (value, rounded) = rescale(time.value, time.timescale, timescale, method);
+    let (value, rounded) = rescale(time.value as i128, time.timescale as i64, timescale as i64, method);
     if value > i64::MAX as i128 || value < i64::MIN as i128 {
         return CmTime { epoch: time.epoch, ..infinity(value > 0) };
     }
@@ -335,16 +346,9 @@ fn free(object: Id) {
         if let Some(buffer) = buffer_of(texture.buffer) {
             buffer.lock().unwrap_or_else(|e| e.into_inner()).textures.retain(|&t| t != object);
         }
-        // Freed at the cache's next flush, on a thread with its context (or
-        // now, if the cache is already gone).
-        let mut caches = CACHES.lock().unwrap_or_else(|e| e.into_inner());
-        match caches.as_mut().and_then(|c| c.get_mut(&texture.cache)) {
-            Some(cache) => cache.unused.push(texture.name),
-            None => {
-                drop(caches);
-                delete_textures(vec![texture.name]);
-            }
-        }
+        // Deleted at the next cache flush (or texture made) that runs in the
+        // context the name was made in.
+        WAITING_NAMES.lock().unwrap_or_else(|e| e.into_inner()).push((texture.name, texture.context));
     }
     let sample = SAMPLES.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|s| s.remove(&object));
     if let Some(sample) = sample {
@@ -355,16 +359,31 @@ fn free(object: Id) {
         }
     }
     PARTS.lock().unwrap_or_else(|e| e.into_inner()).as_mut().map(|p| p.remove(&object));
-    let cache = CACHES.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|c| c.remove(&object));
-    if let Some(cache) = cache {
-        delete_textures(cache.unused);
-    }
+    CACHES.lock().unwrap_or_else(|e| e.into_inner()).as_mut().map(|c| c.remove(&object));
 }
 
-/// Deletes GL texture names if this thread can (else they are left behind:
-/// a few names, no pixels the game can see).
-fn delete_textures(names: Vec<u32>) {
-    if !names.is_empty() && has_context() {
+/// Texture names of released textures, with the EGL context each was made
+/// in. GL deletes a name in whatever context is current, which may be
+/// another one's (a different texture), so each waits for its own.
+static WAITING_NAMES: Mutex<Vec<(u32, usize)>> = Mutex::new(Vec::new());
+
+/// Takes out the names made in `current` (none without a context).
+fn take_owned(names: &mut Vec<(u32, usize)>, current: usize) -> Vec<u32> {
+    let mut owned = Vec::new();
+    if current != 0 {
+        names.retain(|&(name, context)| context != current || {
+            owned.push(name);
+            false
+        });
+    }
+    owned
+}
+
+/// Deletes the waiting names that belong to this thread's current context.
+fn delete_waiting_names() {
+    let current = unsafe { gl::eglGetCurrentContext() } as usize;
+    let names = take_owned(&mut WAITING_NAMES.lock().unwrap_or_else(|e| e.into_inner()), current);
+    if !names.is_empty() {
         unsafe { glDeleteTextures(names.len() as i32, names.as_ptr()) };
     }
 }
@@ -536,9 +555,18 @@ extern "C" fn pixel_buffer_base_address(object: Id) -> usize {
     with_buffer(object, |b| b.base() as usize).unwrap_or(0)
 }
 
-/// Row bytes; for a planar buffer, those of its first plane.
+/// Row bytes; for a planar buffer (as CVPixelBuffer.h says) a value that
+/// times the height covers the whole buffer, every plane included.
+fn bytes_per_row(b: &PixelBuffer) -> usize {
+    if b.planes.len() == 1 {
+        return b.planes[0].stride;
+    }
+    let end = b.planes.iter().map(|p| p.offset + p.stride * p.height).max().unwrap_or(0);
+    end.div_ceil(b.height.max(1))
+}
+
 extern "C" fn pixel_buffer_bytes_per_row(object: Id) -> usize {
-    with_buffer(object, |b| b.planes[0].stride).unwrap_or(0)
+    with_buffer(object, |b| bytes_per_row(b)).unwrap_or(0)
 }
 
 extern "C" fn pixel_buffer_width(object: Id) -> usize {
@@ -600,15 +628,11 @@ extern "C" fn buffer_release(object: Id) {
 
 // ----- CVOpenGLESTextureCache -----
 
-struct Cache {
-    /// Texture names whose objects were released; deleted at the next flush.
-    unused: Vec<u32>,
-}
-
 struct Texture {
     name: u32,
     target: Enum,
-    cache: Id,
+    /// The EGL context current when the name was made (it owns the name).
+    context: usize,
     /// The pixel buffer it shows (0 once that is gone) and which plane.
     buffer: Id,
     plane: usize,
@@ -619,7 +643,8 @@ struct Texture {
     height: i32,
 }
 
-static CACHES: Mutex<Option<HashMap<Id, Cache>>> = Mutex::new(None);
+/// Texture caches and the EAGL context each was made for.
+static CACHES: Mutex<Option<HashMap<Id, Id>>> = Mutex::new(None);
 static TEXTURES: Mutex<Option<HashMap<Id, Texture>>> = Mutex::new(None);
 
 gl::system! {
@@ -818,7 +843,7 @@ extern "C" fn cache_create(_allocator: usize, _attributes: Id, context: Id, _tex
         return RETURN_INVALID_ARGUMENT;
     }
     let cache = new_object("CVOpenGLESTextureCache");
-    CACHES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(cache, Cache { unused: Vec::new() });
+    CACHES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(cache, context);
     unsafe { *out = cache };
     RETURN_SUCCESS
 }
@@ -868,6 +893,8 @@ extern "C" fn cache_create_texture(
         crate::log!("CoreVideo: a texture was asked for with no GL context on this thread");
         return RETURN_INVALID_ARGUMENT;
     }
+    delete_waiting_names();
+    let context = unsafe { gl::eglGetCurrentContext() } as usize;
     let mut name = 0;
     unsafe {
         glGenTextures(1, &mut name);
@@ -883,7 +910,7 @@ extern "C" fn cache_create_texture(
     let texture = new_object("CVOpenGLESTexture");
     TEXTURES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(
         texture,
-        Texture { name, target, cache, buffer: image, plane, internal: internal as Enum, format, kind, width, height },
+        Texture { name, target, context, buffer: image, plane, internal: internal as Enum, format, kind, width, height },
     );
     buffer.lock().unwrap_or_else(|e| e.into_inner()).textures.push(texture);
     if upload_texture(texture) {
@@ -896,19 +923,10 @@ extern "C" fn cache_create_texture(
     RETURN_SUCCESS
 }
 
-/// CVOpenGLESTextureCacheFlush: textures released since the last flush go.
-extern "C" fn cache_flush(cache: Id, _options: u64) {
-    let unused = CACHES.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|c| c.get_mut(&cache)).map(|c| std::mem::take(&mut c.unused));
-    if let Some(names) = unused {
-        if !names.is_empty() && has_context() {
-            unsafe { glDeleteTextures(names.len() as i32, names.as_ptr()) };
-        } else if !names.is_empty() {
-            // No context here: try again at the next flush.
-            if let Some(c) = CACHES.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|c| c.get_mut(&cache)) {
-                c.unused.extend(names);
-            }
-        }
-    }
+/// CVOpenGLESTextureCacheFlush: textures released since the last flush go
+/// (those made in another context wait until a flush runs in that one).
+extern "C" fn cache_flush(_cache: Id, _options: u64) {
+    delete_waiting_names();
 }
 
 extern "C" fn texture_name(texture: Id) -> u32 {
@@ -1212,20 +1230,38 @@ mod tests {
         let doubled = combine(&huge, &huge, false);
         assert_eq!((doubled.value, doubled.timescale, doubled.flags), (i64::MAX, 1, TIME_VALID), "{doubled:?}");
         assert_eq!(combine(&CmTime::new(i64::MAX, 1), &CmTime::new(1, 1), false), CmTime::POSITIVE_INFINITY);
-        // Different epochs, opposite infinities and a valid time with timescale 0 are invalid.
-        assert_eq!(combine(&CmTime { epoch: 1, ..half }, &half, false), CmTime::INVALID);
+        // Epochs: a duration (epoch 0) moves a time within its epoch; two times
+        // of one epoch differ by a duration; different epochs don't mix.
+        let later = combine(&CmTime { epoch: 3, ..half }, &half, false);
+        assert_eq!((later.value, later.timescale, later.epoch), (2, 2, 3), "{later:?}");
+        assert_eq!(combine(&CmTime { epoch: 3, ..thirds }, &CmTime { epoch: 3, ..half }, true).epoch, 0);
+        assert_eq!(combine(&CmTime { epoch: 1, ..half }, &CmTime { epoch: 2, ..half }, false), CmTime::INVALID);
+        // Infinities win over indefinite; opposite infinities and timescale 0 are invalid.
         assert_eq!(combine(&infinite, &infinite, true), CmTime::INVALID);
-        assert_eq!(combine(&indefinite, &infinite, false), CmTime::INDEFINITE);
+        assert_eq!(combine(&indefinite, &infinite, false), CmTime::POSITIVE_INFINITY);
+        assert_eq!(combine(&indefinite, &half, false), CmTime::INDEFINITE);
+        // The exact sum is rounded once (not each side on its own).
+        let fine = combine(&half, &CmTime::new(1, 1_073_741_825), false);
+        assert_eq!((fine.value, fine.timescale), (1_073_741_825, i32::MAX), "{fine:?}");
+        // Seconds that fit in 64 bits stay finite.
+        assert_eq!(time_from_seconds(9.21e18, 1).value, 9_210_000_000_000_000_000);
         let broken = CmTime { value: 5, timescale: 0, flags: TIME_VALID, epoch: 0 };
         assert_eq!(combine(&broken, &half, false), CmTime::INVALID);
         assert_eq!(time_convert_scale(broken, 600, 0), CmTime::INVALID);
         // CMTimeConvertScale rounds by the method asked for and says so.
         let t = CmTime::new(-5, 4); // -1.25 s
-        let at = |method| time_convert_scale(t, 2, method);
-        assert_eq!((at(ROUND_HALF_AWAY).value, at(ROUND_TOWARD_ZERO).value, at(ROUND_AWAY_FROM_ZERO).value), (-3, -2, -3));
-        assert_eq!((at(ROUND_DOWN).value, at(ROUND_UP).value), (-3, -2));
-        assert_eq!(at(ROUND_UP).flags, TIME_VALID | TIME_ROUNDED);
-        assert_eq!(time_convert_scale(t, 8, 0), CmTime::new(-10, 8), "exact: not rounded");
+        // Apple's kCMTimeRoundingMethod numbers, literally: 1 half away from
+        // zero, 2 toward zero, 3 away from zero, 4 QuickTime, 5 toward +inf, 6 toward -inf.
+        let at = |method| time_convert_scale(t, 2, method).value;
+        assert_eq!((at(1), at(2), at(3), at(5), at(6)), (-3, -2, -3, -2, -3));
+        assert_eq!(time_convert_scale(t, 2, 5).flags, TIME_VALID | TIME_ROUNDED);
+        assert_eq!(time_convert_scale(t, 8, 1), CmTime::new(-10, 8), "exact: not rounded");
+        // QuickTime: toward zero to a coarser timescale (a negative time
+        // never becomes 0, at least -1), away from zero to a finer one.
+        assert_eq!(at(4), -2);
+        assert_eq!(time_convert_scale(CmTime::new(-1, 4), 2, 4).value, -1);
+        assert_eq!(time_convert_scale(CmTime::new(1, 4), 2, 4).value, 0);
+        assert_eq!(time_convert_scale(CmTime::new(1, 3), 4, 4).value, 2);
     }
 
     #[test]
@@ -1238,6 +1274,14 @@ mod tests {
         let planar = PixelBuffer::new(FORMAT_420V, 33, 17).unwrap();
         let header: Vec<u32> = planar.bytes()[..16].chunks_exact(4).map(|b| u32::from_be_bytes(b.try_into().unwrap())).collect();
         assert_eq!(header, [64, 64, 64 + 64 * 17, 64]);
+        // Its bytes per row times the height covers every plane.
+        let end = planar.planes[1].offset + planar.planes[1].stride * planar.planes[1].height;
+        assert!(bytes_per_row(&planar) * 17 >= end && bytes_per_row(&planar) * 16 < end);
+        // Texture names are deleted only in the context they were made in.
+        let mut waiting = vec![(1, 0xA), (2, 0xB), (3, 0xA)];
+        assert!(take_owned(&mut waiting, 0).is_empty(), "no context: nothing deleted");
+        assert_eq!(take_owned(&mut waiting, 0xA), [1, 3]);
+        assert_eq!(waiting, [(2, 0xB)]);
         let mut buffer = PixelBuffer::new(FORMAT_BGRA, 3, 2).unwrap();
         let plane = buffer.planes[0];
         assert_eq!(plane.stride, 64);
