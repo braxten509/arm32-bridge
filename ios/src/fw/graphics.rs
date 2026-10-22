@@ -1096,8 +1096,8 @@ pub fn orient(orientation: i64, u: f64, v: f64) -> (f64, f64) {
         3 => (v, 1.0 - u),       // right: turned a quarter clockwise
         4 => (1.0 - u, v),       // up, mirrored
         5 => (u, 1.0 - v),       // down, mirrored
-        6 => (1.0 - v, 1.0 - u), // left, mirrored
-        7 => (v, u),             // right, mirrored
+        6 => (v, u),             // left, mirrored: rows become columns (EXIF 5)
+        7 => (1.0 - v, 1.0 - u), // right, mirrored (EXIF 7)
         _ => (u, v),
     }
 }
@@ -1370,6 +1370,9 @@ mod tests {
         // Turned a quarter clockwise (UIImageOrientationRight): the stored bottom left shows at the top left.
         assert_eq!(orient(3, 0.0, 0.0), (0.0, 1.0));
         assert_eq!(orient(2, 0.0, 0.0), (1.0, 0.0));
+        // Left mirrored: the stored first row runs down the left side.
+        assert_eq!(orient(6, 0.0, 1.0), (1.0, 0.0));
+        assert_eq!(orient(7, 0.0, 0.0), (1.0, 1.0));
     }
 
     #[test]
