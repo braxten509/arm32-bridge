@@ -305,8 +305,27 @@ fn zone_abbreviation(zone: Id, unix: f64) -> String {
 
 /// The UTC moment of a wall-clock time in a zone.
 pub fn wall_to_unix(zone: Id, wall: f64) -> f64 {
-    let guess = wall - zone_offset(zone, wall) as f64;
-    wall - zone_offset(zone, guess) as f64
+    resolve_wall(wall, &|unix| zone_offset(zone, unix))
+}
+
+/// The UTC moment of a wall-clock time, given the zone's offset at any
+/// moment. As on iOS (ICU): a time a clock change repeats is its first
+/// occurrence, and a time a clock change skips is read with the offset from
+/// before the change (02:30 on a spring-forward night is 03:30 daylight time).
+pub fn resolve_wall(wall: f64, offset: &dyn Fn(f64) -> i64) -> f64 {
+    // Offsets are under a day, so these are the offsets on either side of any
+    // change near this time.
+    let before = offset(wall - 86_400.0);
+    let after = offset(wall + 86_400.0);
+    let valid: Vec<f64> = [before, after]
+        .into_iter()
+        .map(|o| wall - o as f64)
+        .filter(|&unix| (unix + offset(unix) as f64) == wall)
+        .collect();
+    match valid.into_iter().reduce(f64::min) {
+        Some(unix) => unix,
+        None => wall - before as f64,
+    }
 }
 
 pub fn unix_to_wall(zone: Id, unix: f64) -> f64 {
@@ -531,37 +550,68 @@ pub fn components_of(kind: Kind, wall: f64, first_weekday: i64, min_days: i64) -
     v
 }
 
-/// The difference between two wall-clock times in the units asked for,
-/// largest first (as NSCalendar does).
-pub fn difference(kind: Kind, units: u64, from: f64, to: f64) -> [i64; SLOTS] {
+/// The difference between two moments (seconds since 1970) in the units
+/// asked for, largest first (as NSCalendar does). Years, months, weeks and
+/// days count on the wall clock of the zone `offset` describes; hours and
+/// smaller count real elapsed time (a spring-forward day is 23 hours).
+pub fn difference(kind: Kind, units: u64, from: f64, to: f64, offset: &dyn Fn(f64) -> i64) -> [i64; SLOTS] {
     let mut v = [UNDEFINED; SLOTS];
-    let mut current = from;
+    let wall_of_moment = |unix: f64| unix + offset(unix) as f64;
+    let to_wall = wall_of_moment(to);
+    let (mut wall, mut unix) = (wall_of_moment(from), from);
     let forward = to >= from;
     let step = if forward { 1 } else { -1 };
-    let passed = |w: f64| if forward { w > to } else { w < to };
+    let passed = |w: f64| {
+        let u = resolve_wall(w, offset);
+        if forward {
+            u > to
+        } else {
+            u < to
+        }
+    };
     let arithmetic = arithmetic_kind(kind);
     if units & UNIT_ERA != 0 {
         v[ERA] = 0;
     }
-    if units & UNIT_YEAR != 0 {
-        let (a, b) = (cal_date(arithmetic, current), cal_date(arithmetic, to));
-        let mut n = b.year - a.year;
-        while n != 0 && passed(add_months(kind, current, n * 12)) {
+    // Moves the wall clock by a whole count found by `count`.
+    let mut advance = |slots: &[(u64, usize)], count: &dyn Fn(f64) -> i64, apply: &dyn Fn(f64, i64) -> f64| {
+        if !slots.iter().any(|(u, _)| units & u != 0) {
+            return;
+        }
+        let mut n = count(wall);
+        while n != 0 && passed(apply(wall, n)) {
             n -= step;
         }
-        v[YEAR] = n;
-        current = add_months(kind, current, n * 12);
-    }
-    if units & UNIT_MONTH != 0 {
-        let (a, b) = (cal_date(arithmetic, current), cal_date(arithmetic, to));
-        let mut n = (b.year * 12 + b.month) - (a.year * 12 + a.month);
-        while n != 0 && passed(add_months(kind, current, n)) {
-            n -= step;
+        for (u, slot) in slots {
+            if units & u != 0 {
+                v[*slot] = n;
+            }
         }
-        v[MONTH] = n;
-        current = add_months(kind, current, n);
+        if n != 0 {
+            wall = apply(wall, n);
+            unix = resolve_wall(wall, offset);
+        }
+    };
+    advance(
+        &[(UNIT_YEAR, YEAR)],
+        &|w| cal_date(arithmetic, to_wall).year - cal_date(arithmetic, w).year,
+        &|w, n| add_months(kind, w, n * 12),
+    );
+    advance(
+        &[(UNIT_MONTH, MONTH)],
+        &|w| {
+            let (a, b) = (cal_date(arithmetic, w), cal_date(arithmetic, to_wall));
+            (b.year * 12 + b.month) - (a.year * 12 + a.month)
+        },
+        &|w, n| add_months(kind, w, n),
+    );
+    for (slots, size) in [
+        (&[(UNIT_WEEK_OF_YEAR, WEEK_OF_YEAR), (UNIT_WEEK_OF_MONTH, WEEK_OF_MONTH), (UNIT_WEEK, WEEK)][..], 604_800.0),
+        (&[(UNIT_DAY, DAY)][..], 86_400.0),
+    ] {
+        advance(slots, &|w| ((to_wall - w) / size).trunc() as i64, &|w, n| w + n as f64 * size);
     }
-    let mut rest = to - current;
+    let mut rest = to - unix;
     let mut take = |slot_units: &[(u64, usize)], size: f64, rest: &mut f64| {
         if slot_units.iter().any(|(u, _)| units & u != 0) {
             let n = (*rest / size).trunc();
@@ -573,8 +623,6 @@ pub fn difference(kind: Kind, units: u64, from: f64, to: f64) -> [i64; SLOTS] {
             }
         }
     };
-    take(&[(UNIT_WEEK_OF_YEAR, WEEK_OF_YEAR), (UNIT_WEEK_OF_MONTH, WEEK_OF_MONTH), (UNIT_WEEK, WEEK)], 604_800.0, &mut rest);
-    take(&[(UNIT_DAY, DAY)], 86_400.0, &mut rest);
     take(&[(UNIT_HOUR, HOUR)], 3600.0, &mut rest);
     take(&[(UNIT_MINUTE, MINUTE)], 60.0, &mut rest);
     take(&[(UNIT_SECOND, SECOND)], 1.0, &mut rest);
@@ -750,7 +798,9 @@ extern "C" fn calendar_difference(this: Id, _: Sel, units: u64, from: Id, to: Id
     if from == 0 || to == 0 {
         return 0;
     }
-    let values = difference(calendar(this).kind, units, wall_in(this, from), wall_in(this, to));
+    let zone = calendar(this).zone;
+    let (from, to) = (date_seconds(from) + SINCE_1970, date_seconds(to) + SINCE_1970);
+    let values = difference(calendar(this).kind, units, from, to, &|unix| zone_offset(zone, unix));
     make_components(values)
 }
 
@@ -767,24 +817,34 @@ extern "C" fn calendar_date_from_components(this: Id, _: Sel, comps: Id) -> Id {
     misc::date(wall_to_unix(zone, wall) - SINCE_1970)
 }
 
-/// Adds components largest first: years and months by the calendar, the rest
-/// as wall-clock time.
-fn add_components(kind: Kind, wall: f64, v: &[i64; SLOTS]) -> f64 {
+/// Adds components to a moment (seconds since 1970), largest first, as
+/// NSCalendar does: years, months, weeks and days move the wall clock of the
+/// zone `offset` describes; hours and smaller add real elapsed time.
+fn add_components(kind: Kind, unix: f64, v: &[i64; SLOTS], offset: &dyn Fn(f64) -> i64) -> f64 {
     let get = |slot: usize| if v[slot] == UNDEFINED { 0 } else { v[slot] };
     let months = get(YEAR) * 12 + get(QUARTER) * 3 + get(MONTH);
     let weeks = get(WEEK_OF_YEAR) + get(WEEK_OF_MONTH) + get(WEEK);
     let days = get(DAY) + weeks * 7 + get(WEEKDAY) + get(WEEKDAY_ORDINAL) * 7;
-    add_months(kind, wall, months)
-        + (days * 86_400 + get(HOUR) * 3600 + get(MINUTE) * 60 + get(SECOND)) as f64
-        + get(NANOSECOND) as f64 / 1e9
+    let unix = if months == 0 && days == 0 {
+        unix
+    } else {
+        let wall = unix + offset(unix) as f64;
+        resolve_wall(add_months(kind, wall, months) + (days * 86_400) as f64, offset)
+    };
+    unix + (get(HOUR) * 3600 + get(MINUTE) * 60 + get(SECOND)) as f64 + get(NANOSECOND) as f64 / 1e9
+}
+
+fn add_to_date(this: Id, date: Id, values: &[i64; SLOTS]) -> Id {
+    let zone = calendar(this).zone;
+    let unix = add_components(calendar(this).kind, date_seconds(date) + SINCE_1970, values, &|unix| zone_offset(zone, unix));
+    misc::date(unix - SINCE_1970)
 }
 
 extern "C" fn calendar_date_by_adding(this: Id, _: Sel, comps: Id, date: Id, _options: u64) -> Id {
     if comps == 0 || date == 0 {
         return 0;
     }
-    let wall = add_components(calendar(this).kind, wall_in(this, date), &components(comps).values);
-    date_from_wall(this, wall)
+    add_to_date(this, date, &components(comps).values)
 }
 
 extern "C" fn calendar_date_by_adding_unit(this: Id, _: Sel, unit: u64, value: isize, date: Id, _options: u64) -> Id {
@@ -793,8 +853,10 @@ extern "C" fn calendar_date_by_adding_unit(this: Id, _: Sel, unit: u64, value: i
         Some((_, slot)) => values[*slot] = value as i64,
         None => return 0,
     }
-    let wall = add_components(calendar(this).kind, wall_in(this, date), &values);
-    date_from_wall(this, wall)
+    if date == 0 {
+        return 0;
+    }
+    add_to_date(this, date, &values)
 }
 
 extern "C" fn calendar_start_of_day(this: Id, _: Sel, date: Id) -> Id {
@@ -1129,6 +1191,19 @@ pub struct Parsed {
     pub pm: Option<bool>,
     pub twelve_hour: bool,
     pub offset: Option<i64>,
+    /// Y: the year its weeks belong to.
+    pub year_for_week: Option<i64>,
+    /// w: week of the year.
+    pub week: Option<i64>,
+    /// E, e, c: 1 = Sunday ... 7 = Saturday.
+    pub weekday: Option<i64>,
+    /// D: day of the year.
+    pub day_of_year: Option<i64>,
+    /// The year was two digits, read into the window from the start year.
+    pub two_digit_year: bool,
+    /// A field was outside its range (hour 13 for h): a strict formatter
+    /// rejects the text.
+    pub out_of_range: bool,
 }
 
 const ZONE_ABBREVIATIONS: [(&str, i64); 14] = [
@@ -1229,7 +1304,11 @@ fn read_signed_offset(input: &[char], at: &mut usize) -> Option<i64> {
 }
 
 /// Reads `text` by `pattern`; None when the text doesn't match all the way.
-pub fn parse_date(pattern: &str, text: &str, kind: Kind, am: &str, pm: &str, this_year: i64) -> Option<Parsed> {
+/// Two-digit years land in the hundred years from `start_year` (the
+/// formatter's twoDigitStartDate refines the edge); numeric e and c count
+/// from `first_weekday`.
+#[allow(clippy::too_many_arguments)]
+pub fn parse_date(pattern: &str, text: &str, kind: Kind, am: &str, pm: &str, first_weekday: i64, start_year: i64) -> Option<Parsed> {
     let input: Vec<char> = text.chars().collect();
     let list = tokens(pattern);
     let mut at = 0;
@@ -1271,22 +1350,39 @@ pub fn parse_date(pattern: &str, text: &str, kind: Kind, am: &str, pm: &str, thi
                     }
                     let (value, digits) = read_digits(&input, &mut at, width)?;
                     let value = if negative { -value } else { value };
+                    let mut check = |range: std::ops::RangeInclusive<i64>| {
+                        if !range.contains(&value) {
+                            p.out_of_range = true;
+                        }
+                    };
+                    match letter {
+                        'h' => check(1..=12),
+                        'K' => check(0..=11),
+                        'k' => check(1..=24),
+                        'e' | 'c' => check(1..=7),
+                        'w' => check(1..=53),
+                        'D' => check(1..=366),
+                        _ => {}
+                    }
                     match letter {
                         'y' | 'Y' | 'u' => {
-                            p.year = Some(if n == 2 && digits == 2 {
-                                let century = this_year - this_year.rem_euclid(100);
-                                let candidate = century + value;
-                                if candidate > this_year + 20 {
-                                    candidate - 100
-                                } else {
-                                    candidate
-                                }
+                            let year = if n == 2 && digits == 2 && *letter != 'u' {
+                                p.two_digit_year = true;
+                                start_year + (value - start_year).rem_euclid(100)
                             } else {
                                 value
-                            })
+                            };
+                            if *letter == 'Y' {
+                                p.year_for_week = Some(year);
+                            } else {
+                                p.year = Some(year);
+                            }
                         }
                         'M' | 'L' => p.month = Some(value),
                         'd' => p.day = Some(value),
+                        'D' => p.day_of_year = Some(value),
+                        'w' => p.week = Some(value),
+                        'e' | 'c' => p.weekday = Some((value - 1 + first_weekday - 1).rem_euclid(7) + 1),
                         'H' | 'k' => p.hour = Some(if *letter == 'k' && value == 24 { 0 } else { value }),
                         'h' | 'K' => {
                             p.hour = Some(value % 12);
@@ -1311,7 +1407,7 @@ pub fn parse_date(pattern: &str, text: &str, kind: Kind, am: &str, pm: &str, thi
                     'E' | 'e' | 'c' => {
                         let mut names: Vec<String> = (1..=7).map(|d| weekday_name(d, 4)).collect();
                         names.extend((1..=7).map(|d| weekday_name(d, 3)));
-                        read_name(&input, &mut at, &names)?;
+                        p.weekday = Some(read_name(&input, &mut at, &names)? as i64 % 7 + 1);
                     }
                     'a' => {
                         let names = [am.to_string(), pm.to_string(), "a.m.".into(), "p.m.".into()];
@@ -1362,6 +1458,8 @@ struct DateFormatter {
     am: String,
     pm: String,
     default_date: Id,
+    /// twoDigitStartDate (0: 1949-12-31).
+    two_digit_start: Id,
 }
 
 fn formatter(this: Id) -> &'static mut DateFormatter {
@@ -1381,6 +1479,7 @@ fn formatter(this: Id) -> &'static mut DateFormatter {
                 am: "AM".into(),
                 pm: "PM".into(),
                 default_date: 0,
+                two_digit_start: 0,
             }));
         }
         &mut **slot
@@ -1481,43 +1580,115 @@ extern "C" fn df_string_from_date(this: Id, _: Sel, date: Id) -> Id {
     string::make(&format_with(f, &formatter_pattern(f), date))
 }
 
+/// The default twoDigitStartDate: 1949-12-31, so "50" is 1950 and "49" 2049.
+fn default_two_digit_start() -> f64 {
+    cal_wall(Kind::Gregorian, 1, 1949, 12, 31, 0, 0, 0, 0)
+}
+
+/// The wall-clock time parsed fields name. Missing fields come from `base`
+/// (the default date's fields); with `keep_time` false a missing time of day
+/// is midnight. Day of year (D) and week dates (Y, w, e) are used when no
+/// month or day was given. A strict (non-lenient) read is None when the
+/// fields don't name a real date (February 29 of 2025, hour 13 for h); a
+/// lenient one rolls them over.
+#[allow(clippy::too_many_arguments)]
+fn wall_from_parsed(p: &Parsed, kind: Kind, first_weekday: i64, min_days: i64, base: &[i64; SLOTS], keep_time: bool, lenient: bool, two_digit_start: f64) -> Option<f64> {
+    if !lenient && p.out_of_range {
+        return None;
+    }
+    let time = |field: Option<i64>, slot: usize| field.unwrap_or(if keep_time { base[slot] } else { 0 });
+    let (hour, minute, second, nanosecond) = (time(p.hour, HOUR), time(p.minute, MINUTE), time(p.second, SECOND), p.nanosecond.unwrap_or(0));
+    let era = p.era.unwrap_or(base[ERA]);
+    let no_date = p.month.is_none() && p.day.is_none();
+    let build = |shift: i64| -> f64 {
+        let year = p.year.map(|y| y + shift).unwrap_or(base[YEAR]);
+        if no_date && (p.week.is_some() || p.year_for_week.is_some()) {
+            let mut v = [UNDEFINED; SLOTS];
+            v[ERA] = era;
+            v[YEAR_FOR_WEEK] = p.year_for_week.map(|y| y + shift).unwrap_or(year);
+            v[WEEK_OF_YEAR] = p.week.unwrap_or(1);
+            v[WEEKDAY] = p.weekday.unwrap_or(first_weekday);
+            v[HOUR] = hour;
+            v[MINUTE] = minute;
+            v[SECOND] = second;
+            v[NANOSECOND] = nanosecond;
+            return wall_from_components(kind, &v, first_weekday, min_days, era);
+        }
+        if no_date {
+            if let Some(day) = p.day_of_year {
+                return cal_wall(kind, era, year, 1, day, hour, minute, second, nanosecond);
+            }
+        }
+        cal_wall(kind, era, year, p.month.unwrap_or(base[MONTH]), p.day.unwrap_or(base[DAY]), hour, minute, second, nanosecond)
+    };
+    let mut shift = 0;
+    let mut wall = build(0);
+    if p.two_digit_year && wall < two_digit_start {
+        shift = 100;
+        wall = build(shift);
+    }
+    if !lenient {
+        let got = components_of(kind, wall, first_weekday, min_days);
+        let c = cal_date(kind, wall);
+        let fields = [
+            (p.year.map(|y| y + shift), c.year),
+            (p.month, c.month),
+            (p.day, c.day),
+            (p.hour, c.hour),
+            (p.minute, c.minute),
+            (p.second, c.second),
+            (if no_date { p.day_of_year } else { None }, c.days - days_from_civil(c.gregorian_year, 1, 1) + 1),
+            (if no_date { p.week } else { None }, got[WEEK_OF_YEAR]),
+            (if no_date { p.year_for_week.map(|y| y + shift) } else { None }, got[YEAR_FOR_WEEK]),
+        ];
+        if fields.iter().any(|(given, real)| given.is_some_and(|g| g != *real)) {
+            return None;
+        }
+    }
+    Some(wall)
+}
+
 extern "C" fn df_date_from_string(this: Id, _: Sel, text: Id) -> Id {
     if text == 0 {
         return 0;
     }
     let f = formatter(this);
     let (kind, first_weekday, min_days) = formatter_kind(f);
-    let now_wall = unix_to_wall(f.zone, misc::now_since_2001() + SINCE_1970);
-    let this_year = cal_date(Kind::Gregorian, now_wall).year;
+    let two_digit_start = match f.two_digit_start {
+        0 => default_two_digit_start(),
+        date => unix_to_wall(f.zone, date_seconds(date) + SINCE_1970),
+    };
+    let start_year = cal_date(Kind::Gregorian, two_digit_start).year;
     let text = string::get(text);
     let source = if f.lenient { text.trim().to_string() } else { text.clone() };
-    let Some(p) = parse_date(&formatter_pattern(f), &source, kind, &f.am, &f.pm, this_year) else {
+    let Some(p) = parse_date(&formatter_pattern(f), &source, kind, &f.am, &f.pm, first_weekday, start_year) else {
         return 0;
     };
     // Missing fields come from the default date, else 2000-01-01 00:00.
     let base = if f.default_date != 0 {
         components_of(kind, unix_to_wall(f.zone, date_seconds(f.default_date) + SINCE_1970), first_weekday, min_days)
     } else {
-        let mut v = components_of(kind, cal_wall(Kind::Gregorian, 1, 2000, 1, 1, 0, 0, 0, 0), first_weekday, min_days);
-        v[HOUR] = 0;
-        v
+        components_of(kind, cal_wall(Kind::Gregorian, 1, 2000, 1, 1, 0, 0, 0, 0), first_weekday, min_days)
     };
-    let wall = cal_wall(
-        kind,
-        p.era.unwrap_or(base[ERA]),
-        p.year.unwrap_or(base[YEAR]),
-        p.month.unwrap_or(base[MONTH]),
-        p.day.unwrap_or(base[DAY]),
-        p.hour.unwrap_or(if f.default_date != 0 { base[HOUR] } else { 0 }),
-        p.minute.unwrap_or(if f.default_date != 0 { base[MINUTE] } else { 0 }),
-        p.second.unwrap_or(if f.default_date != 0 { base[SECOND] } else { 0 }),
-        p.nanosecond.unwrap_or(0),
-    );
+    let Some(wall) = wall_from_parsed(&p, kind, first_weekday, min_days, &base, f.default_date != 0, f.lenient, two_digit_start) else {
+        return 0;
+    };
     let unix = match p.offset {
         Some(offset) => wall - offset as f64,
         None => wall_to_unix(f.zone, wall),
     };
     misc::date(unix - SINCE_1970)
+}
+
+extern "C" fn df_two_digit_start(this: Id, _: Sel) -> Id {
+    match formatter(this).two_digit_start {
+        0 => misc::date(default_two_digit_start() - SINCE_1970),
+        date => date,
+    }
+}
+
+extern "C" fn df_set_two_digit_start(this: Id, _: Sel, value: Id) {
+    formatter(this).two_digit_start = value;
 }
 
 extern "C" fn df_string_for_object(this: Id, s: Sel, object: Id) -> Id {
@@ -1742,6 +1913,7 @@ extern "C" fn df_copy(this: Id, _: Sel, _zone: usize) -> Id {
     g.am = f.am.clone();
     g.pm = f.pm.clone();
     g.default_date = f.default_date;
+    g.two_digit_start = f.two_digit_start;
     copy
 }
 
@@ -1883,6 +2055,8 @@ pub fn register(_: &mut Registry) {
             ("setPMSymbol:", df_set_pm as usize),
             ("defaultDate", df_default_date as usize),
             ("setDefaultDate:", df_set_default_date as usize),
+            ("twoDigitStartDate", df_two_digit_start as usize),
+            ("setTwoDigitStartDate:", df_set_two_digit_start as usize),
             ("monthSymbols", df_month_symbols as usize),
             ("shortMonthSymbols", df_short_month_symbols as usize),
             ("weekdaySymbols", df_weekday_symbols as usize),
@@ -1935,14 +2109,34 @@ mod tests {
 
     #[test]
     fn date_strings_parse_back() {
-        let p = parse_date("yyyy-MM-dd'T'HH:mm:ssZZZZZ", "2013-02-28T23:59:01+05:30", Kind::Gregorian, "AM", "PM", 2026).unwrap();
+        let p = parse_date("yyyy-MM-dd'T'HH:mm:ssZZZZZ", "2013-02-28T23:59:01+05:30", Kind::Gregorian, "AM", "PM", 1, 1949).unwrap();
         assert_eq!((p.year, p.month, p.day, p.hour, p.minute, p.second), (Some(2013), Some(2), Some(28), Some(23), Some(59), Some(1)));
         assert_eq!(p.offset, Some(5 * 3600 + 30 * 60));
-        let p = parse_date("MMM d, yy h:mm a", "jan 5, 98 12:30 am", Kind::Gregorian, "AM", "PM", 2026).unwrap();
+        let p = parse_date("MMM d, yy h:mm a", "jan 5, 98 12:30 am", Kind::Gregorian, "AM", "PM", 1, 1949).unwrap();
         assert_eq!((p.year, p.month, p.day, p.hour), (Some(1998), Some(1), Some(5), Some(0)));
-        let p = parse_date("yyyyMMddHHmm", "202610211405", Kind::Gregorian, "AM", "PM", 2026).unwrap();
+        let p = parse_date("yyyyMMddHHmm", "202610211405", Kind::Gregorian, "AM", "PM", 1, 1949).unwrap();
         assert_eq!((p.year, p.month, p.day, p.hour, p.minute), (Some(2026), Some(10), Some(21), Some(14), Some(5)));
-        assert_eq!(parse_date("yyyy-MM-dd", "2026-10-21 extra", Kind::Gregorian, "AM", "PM", 2026), None);
+        assert_eq!(parse_date("yyyy-MM-dd", "2026-10-21 extra", Kind::Gregorian, "AM", "PM", 1, 1949), None);
+        let base = components_of(Kind::Gregorian, cal_wall(Kind::Gregorian, 1, 2000, 1, 1, 0, 0, 0, 0), 1, 1);
+        let read = |pattern: &str, text: &str, first_weekday: i64, min_days: i64, lenient: bool| {
+            let p = parse_date(pattern, text, Kind::Gregorian, "AM", "PM", first_weekday, 1949)?;
+            let wall = wall_from_parsed(&p, Kind::Gregorian, first_weekday, min_days, &base, false, lenient, default_two_digit_start())?;
+            let c = cal_date(Kind::Gregorian, wall);
+            Some((c.year, c.month, c.day))
+        };
+        // Strict formatters reject dates that don't exist; lenient ones roll over.
+        assert_eq!(read("yyyy-MM-dd", "2025-02-29", 1, 1, false), None);
+        assert_eq!(read("yyyy-MM-dd", "2025-02-29", 1, 1, true), Some((2025, 3, 1)));
+        assert_eq!(read("yyyy-MM-dd h:mm", "2025-02-28 13:00", 1, 1, false), None);
+        // ISO week dates and days of the year.
+        // (ISO weeks start Monday, so e=5 is Friday, 2027-01-01, still in 2026's week 53.)
+        assert_eq!(read("YYYY-'W'ww-e", "2026-W53-5", 2, 4, false), Some((2027, 1, 1)));
+        assert_eq!(read("YYYY-'W'ww-e", "2026-W01-1", 2, 4, false), Some((2025, 12, 29)));
+        assert_eq!(read("yyyy-DDD", "2024-060", 1, 1, false), Some((2024, 2, 29)));
+        // Two-digit years from 1949-12-31: 50 is 1950, 49 is 2049 except on Dec 31.
+        assert_eq!(read("MM/dd/yy", "01/02/50", 1, 1, false), Some((1950, 1, 2)));
+        assert_eq!(read("MM/dd/yy", "01/02/49", 1, 1, false), Some((2049, 1, 2)));
+        assert_eq!(read("MM/dd/yy", "12/31/49", 1, 1, false), Some((1949, 12, 31)));
     }
 
     #[test]
@@ -1952,10 +2146,30 @@ mod tests {
         assert_eq!((feb.year, feb.month, feb.day, feb.hour), (2024, 2, 29, 10));
         let later = cal_wall(Kind::Gregorian, 1, 2025, 3, 1, 9, 30, 15, 0);
         let units = UNIT_YEAR | UNIT_MONTH | UNIT_DAY | UNIT_HOUR | UNIT_MINUTE | UNIT_SECOND;
-        let d = difference(Kind::Gregorian, units, jan31, later);
+        let utc = |_: f64| 0;
+        let d = difference(Kind::Gregorian, units, jan31, later, &utc);
         assert_eq!((d[YEAR], d[MONTH], d[DAY], d[HOUR], d[MINUTE], d[SECOND]), (1, 1, 0, 23, 30, 15));
-        let back = difference(Kind::Gregorian, UNIT_DAY, later, jan31);
+        let back = difference(Kind::Gregorian, UNIT_DAY, later, jan31, &utc);
         assert_eq!(back[DAY], -394);
+        // A US zone that springs forward at 2025-03-09 10:00 GMT (02:00 -08:00).
+        let change = cal_wall(Kind::Gregorian, 1, 2025, 3, 9, 10, 0, 0, 0);
+        let pacific = move |unix: f64| if unix < change { -8 * 3600 } else { -7 * 3600 };
+        let noon_before = cal_wall(Kind::Gregorian, 1, 2025, 3, 8, 20, 0, 0, 0);
+        let noon_after = noon_before + 23.0 * 3600.0;
+        assert_eq!(difference(Kind::Gregorian, UNIT_HOUR, noon_before, noon_after, &pacific)[HOUR], 23);
+        let d = difference(Kind::Gregorian, UNIT_DAY | UNIT_HOUR, noon_before, noon_after, &pacific);
+        assert_eq!((d[DAY], d[HOUR]), (1, 0));
+        let mut one_hour = [UNDEFINED; SLOTS];
+        one_hour[HOUR] = 1;
+        // 01:30 -08:00 plus an hour is 03:30 -07:00, not the skipped 02:30.
+        let half_past_one = change - 1800.0;
+        assert_eq!(add_components(Kind::Gregorian, half_past_one, &one_hour, &pacific), change + 1800.0);
+        let mut one_day = [UNDEFINED; SLOTS];
+        one_day[DAY] = 1;
+        assert_eq!(add_components(Kind::Gregorian, noon_before, &one_day, &pacific), noon_after);
+        // 02:30 that night doesn't exist on the clock: read as 03:30 daylight time.
+        let skipped = cal_wall(Kind::Gregorian, 1, 2025, 3, 9, 2, 30, 0, 0);
+        assert_eq!(resolve_wall(skipped, &pacific), change + 1800.0);
         // 2027-01-01 is a Friday: US weeks put it in week 1, ISO in 2026's week 53.
         let day = days_from_civil(2027, 1, 1);
         assert_eq!(weekday_of(day), 6);
