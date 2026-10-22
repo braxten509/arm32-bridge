@@ -18,6 +18,16 @@ fn class_ro(class: Class) -> usize {
 
 // ----- methods -----
 
+/// Our own lasting copy of a C string (Apple copies a new method's type
+/// string, so the caller may free or reuse its buffer).
+fn copy_cstr(address: usize) -> usize {
+    if address == 0 {
+        return 0;
+    }
+    let bytes = unsafe { std::ffi::CStr::from_ptr(address as *const libc::c_char) }.to_bytes_with_nul();
+    Box::leak(bytes.to_vec().into_boxed_slice()).as_ptr() as usize
+}
+
 extern "C" fn get_instance_method(class: Class, sel: Sel) -> usize {
     if class == 0 || sel == 0 {
         return 0;
@@ -56,7 +66,7 @@ extern "C" fn add_method(class: Class, sel: Sel, imp: Imp, types: usize) -> bool
         _ => return false,
     }
     rt.add_method(class, sel, imp);
-    rt.method_object(class, sel, types);
+    rt.method_object(class, sel, copy_cstr(types));
     true
 }
 
@@ -70,7 +80,7 @@ extern "C" fn replace_method(class: Class, sel: Sel, imp: Imp, types: usize) -> 
     let old = rec.methods.get(&sel).copied();
     rt.add_method(class, sel, imp);
     if old.is_none() {
-        rt.method_object(class, sel, types);
+        rt.method_object(class, sel, copy_cstr(types));
     }
     old.unwrap_or(0)
 }
@@ -212,6 +222,16 @@ extern "C" fn register_class_pair(class: Class) {
     if !pending {
         crate::log!("objc_registerClassPair: {name} was not made by objc_allocateClassPair or is registered already");
         return;
+    }
+    // Until now the class's description may have changed (code that copies a
+    // compiled class writes its field list and final size there), so the
+    // sizes objects get are taken from it now.
+    let meta = rt.classes[&class].partner;
+    for c in [class, meta] {
+        let size = unsafe { read::<u32>(class_ro(c) + 8) } as usize;
+        if let Some(rec) = rt.classes.get_mut(&c) {
+            rec.instance_size = size.max(8);
+        }
     }
     if let Some(old) = rt.by_name.insert(name.clone(), class) {
         crate::log!("objc_registerClassPair: {name} replaces a stand-in class ({old:#x})");
@@ -373,6 +393,72 @@ extern "C" fn protocol_get_method_description(protocol: usize, sel: Sel, require
     }
 }
 
+/// A malloc'd array of `items` 8-byte words, or 0 for none (the caller
+/// frees it with free()).
+fn malloc_list(items: &[usize], count: *mut u32) -> usize {
+    if !count.is_null() {
+        unsafe { *count = items.len() as u32 };
+    }
+    if items.is_empty() {
+        return 0;
+    }
+    let list = unsafe { libc::malloc(items.len() * 8) } as *mut usize;
+    for (index, &item) in items.iter().enumerate() {
+        unsafe { *list.add(index) = item };
+    }
+    list as usize
+}
+
+/// The protocol's own methods of one kind (not those of the protocols it
+/// includes) as objc_method_description { SEL name; char *types; } pairs.
+extern "C" fn protocol_copy_method_descriptions(protocol: usize, required: u8, instance: u8, count: *mut u32) -> usize {
+    if protocol == 0 {
+        return malloc_list(&[], count);
+    }
+    let offset = match (required != 0, instance != 0) {
+        (true, true) => 24,
+        (true, false) => 32,
+        (false, true) => 40,
+        (false, false) => 48,
+    };
+    let mut words = Vec::new();
+    unsafe {
+        let list = read::<usize>(protocol + offset);
+        if list != 0 {
+            let entry_size = (read::<u32>(list) & !3) as usize;
+            let mut rt = lock();
+            for index in 0..read::<u32>(list + 4) as usize {
+                let entry = list + 8 + index * entry_size;
+                words.push(rt.sel(&cstr(read::<usize>(entry))));
+                words.push(read::<usize>(entry + 8));
+            }
+        }
+    }
+    let list = malloc_list(&words, std::ptr::null_mut());
+    if !count.is_null() {
+        unsafe { *count = (words.len() / 2) as u32 };
+    }
+    list
+}
+
+/// The protocols this one includes, as the runtime knows them by name.
+extern "C" fn protocol_copy_protocols(protocol: usize, count: *mut u32) -> usize {
+    let mut found = Vec::new();
+    if protocol != 0 {
+        unsafe {
+            let included = read::<usize>(protocol + 16);
+            if included != 0 {
+                for index in 0..read::<u64>(included) as usize {
+                    let child = read::<usize>(included + 8 + index * 8);
+                    let known = runtime::protocol_named(&cstr(read::<usize>(child + 8)));
+                    found.push(if known != 0 { known } else { child });
+                }
+            }
+        }
+    }
+    malloc_list(&found, count)
+}
+
 /// Adds a protocol unless the class itself already takes it on.
 extern "C" fn add_protocol(class: Class, protocol: usize) -> bool {
     if class == 0 || protocol == 0 {
@@ -529,6 +615,8 @@ pub fn register(r: &mut Registry) {
     r.function("objc_getProtocol", get_protocol as usize);
     r.function("protocol_getName", protocol_get_name as usize);
     r.function("protocol_getMethodDescription", protocol_get_method_description as usize);
+    r.function("protocol_copyMethodDescriptionList", protocol_copy_method_descriptions as usize);
+    r.function("protocol_copyProtocolList", protocol_copy_protocols as usize);
     r.function("class_addProtocol", add_protocol as usize);
     r.function("class_addProperty", add_property as usize);
     r.function("property_copyAttributeList", copy_attribute_list as usize);
@@ -613,6 +701,123 @@ mod tests {
         let meta = get_meta_class(name.as_ptr());
         assert!(is_meta_class(meta));
         assert_eq!(object_get_indexed_ivars(class), class + std::mem::size_of::<ClassObject>());
+    }
+
+    fn isa(object: usize) -> usize {
+        unsafe { (*(object as *const ClassObject)).isa }
+    }
+
+    /// Code that copies a compiled class into a new pair reads where the
+    /// parent's fields end, writes its own field list and final size, then
+    /// registers; objects then get that size and the field is found.
+    #[test]
+    fn copied_class_metadata_sets_sizes() {
+        let parent = lock().define_class("ReflectTestSized", 0, 24);
+        let name = CString::new("ReflectTestCopied").unwrap();
+        let class = allocate_class_pair(parent, name.as_ptr(), 0);
+        let ro = class_ro(class);
+        let meta = lock().classes[&class].partner;
+        unsafe {
+            assert_eq!((read::<u32>(ro + 4), read::<u32>(ro + 8)), (24, 24));
+            assert_eq!((read::<u32>(class_ro(meta) + 4), read::<u32>(class_ro(meta) + 8)), (40, 40));
+            // ivar_list_t { entsize 32, count 1 } + ivar_t { offset*, name, type, alignment 3, size 8 }
+            let ivars = leak([
+                32 | (1usize << 32),
+                leak(24i32),
+                leak_cstr("_extra"),
+                leak_cstr("@"),
+                3 | (8usize << 32),
+            ]);
+            *((ro + 48) as *mut usize) = ivars;
+            *((ro + 8) as *mut u32) = 32;
+            register_class_pair(class);
+            assert_eq!(lock().classes[&class].instance_size, 32);
+            let object = runtime::alloc_instance(class);
+            *((object + 24) as *mut usize) = 0x1234;
+            assert_eq!(object_get_indexed_ivars(object), object + 32);
+            let field = CString::new("_extra").unwrap();
+            let ivar = get_instance_variable(class, field.as_ptr());
+            assert_eq!(ivar, ivars + 8);
+            assert_eq!(object_get_ivar(object, ivar), 0x1234);
+        }
+    }
+
+    /// Every hierarchy's metaclasses point at its own root metaclass, and a
+    /// compiler-laid-out root class can be read in.
+    #[test]
+    fn root_classes_keep_their_own_hierarchy() {
+        let root = new_class("ReflectTestRootA", 0);
+        let child = new_class("ReflectTestRootAChild", root);
+        let other = new_class("ReflectTestRootB", 0);
+        let (root_meta, child_meta, other_meta) = {
+            let rt = lock();
+            (rt.classes[&root].partner, rt.classes[&child].partner, rt.classes[&other].partner)
+        };
+        assert_eq!(isa(root_meta), root_meta);
+        assert_eq!(get_superclass(root_meta), root);
+        assert_eq!(isa(child_meta), root_meta);
+        assert_eq!(isa(other_meta), other_meta);
+        assert_ne!(other_meta, root_meta);
+
+        // class_ro_t words: flags | instance_start << 32, instance_size, ivar_layout, name, ...
+        let name = leak_cstr("ReflectTestReadRoot");
+        let class_ro_words = leak([2usize, 8, 0, name, 0, 0, 0, 0, 0]);
+        let meta_ro_words = leak([3usize, 40, 0, name, 0, 0, 0, 0, 0]);
+        let class = leak(ClassObject { isa: 0, superclass: 0, cache: 0, vtable: 0, data: class_ro_words });
+        let meta = leak(ClassObject { isa: 0, superclass: class, cache: 0, vtable: 0, data: meta_ro_words });
+        unsafe {
+            (*(class as *mut ClassObject)).isa = meta;
+            (*(meta as *mut ClassObject)).isa = meta;
+        }
+        assert_eq!(read_class_pair(class, 0), class);
+        assert_eq!(runtime::class_named("ReflectTestReadRoot"), class);
+        assert!(is_meta_class(meta));
+        assert_eq!(get_superclass(meta), class);
+        let s = runtime::sel("reflectTestRootValue");
+        assert!(add_method(class, s, answer_two as usize, 0));
+        assert_eq!(call(runtime::alloc_instance(class), "reflectTestRootValue"), 2);
+    }
+
+    /// A new method's type string is the runtime's own copy.
+    #[test]
+    fn method_types_outlive_the_callers_buffer() {
+        let class = new_class("ReflectTestTypes", 0);
+        let (added, replaced) = (runtime::sel("reflectTestAdded"), runtime::sel("reflectTestReplaced"));
+        let mut buffer = *b"v@:\0";
+        assert!(add_method(class, added, answer_one as usize, buffer.as_ptr() as usize));
+        assert_eq!(replace_method(class, replaced, answer_two as usize, buffer.as_ptr() as usize), 0);
+        buffer.copy_from_slice(b"XXX\0");
+        std::hint::black_box(&buffer);
+        for s in [added, replaced] {
+            let method = get_instance_method(class, s);
+            let types = unsafe { (*(method as *const runtime::MethodObject)).types };
+            assert_eq!(unsafe { cstr(types) }, "v@:");
+        }
+    }
+
+    /// protocol_t { isa, name, protocols, instanceMethods, classMethods, optional... }
+    #[test]
+    fn protocol_lists_are_copied() {
+        let child = leak([0usize, leak_cstr("ReflectTestChildProtocol"), 0, 0, 0, 0, 0, 0, 0]);
+        let entry = |name: &str, types: &str| [leak_cstr(name), leak_cstr(types), 0];
+        let (first, second) = (entry("reflectFirst", "v@:"), entry("reflectSecond:", "v@:@"));
+        let methods = leak([24 | (2usize << 32), first[0], first[1], 0, second[0], second[1], 0]);
+        let included = leak([1usize, child]);
+        let protocol = leak([0usize, leak_cstr("ReflectTestProtocol"), included, methods, 0, 0, 0, 0, 0]);
+        let mut count = 99u32;
+        let list = protocol_copy_method_descriptions(protocol, 1, 1, &mut count);
+        assert_eq!(count, 2);
+        unsafe {
+            let pairs = std::slice::from_raw_parts(list as *const usize, 4);
+            assert_eq!(pairs, [runtime::sel("reflectFirst"), first[1], runtime::sel("reflectSecond:"), second[1]]);
+            libc::free(list as *mut _);
+        }
+        assert_eq!(protocol_copy_method_descriptions(protocol, 0, 1, &mut count), 0);
+        assert_eq!(count, 0);
+        let list = protocol_copy_protocols(protocol, &mut count);
+        assert_eq!(count, 1);
+        assert_eq!(unsafe { *(list as *const usize) }, child);
+        unsafe { libc::free(list as *mut _) };
     }
 
     #[test]

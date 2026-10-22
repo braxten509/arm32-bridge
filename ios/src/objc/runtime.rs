@@ -75,7 +75,6 @@ pub struct Runtime {
     cache: HashMap<(Class, Sel), Imp>,
     protocols: HashMap<String, usize>,
     missing_methods: HashMap<String, u64>,
-    root_meta: Class,
     /// Method handles given out, one per (defining class, selector).
     method_objects: HashMap<(Class, Sel), usize>,
     method_owner: HashMap<usize, (Class, Sel)>,
@@ -245,13 +244,22 @@ impl Runtime {
     }
 
     /// Fills in a class and its metaclass in the given memory (each at least
-    /// a ClassObject) and records them; the name is not findable yet.
+    /// a ClassObject) and records them; the name is not findable yet. As on
+    /// Apple's runtime, the fields start where the parent's end (a root class
+    /// has just its isa), and a metaclass's isa is its hierarchy's root
+    /// metaclass.
     pub fn build_class_pair(&mut self, class: Class, meta: Class, name: &str, superclass: Class, instance_size: usize) {
         let name_c = leak_cstr(name);
-        let make_ro = |meta: bool, size: usize| {
+        let super_meta = self.classes.get(&superclass).map(|r| r.partner).unwrap_or(0);
+        let (start, meta_start) = match self.classes.get(&superclass) {
+            Some(rec) => (rec.instance_size, self.classes.get(&super_meta).map(|r| r.instance_size).unwrap_or(40)),
+            None => (0, 0),
+        };
+        let size = instance_size.max(start).max(8);
+        let make_ro = |meta: bool, start: usize, size: usize| {
             leak(ClassRo {
                 flags: if meta { 1 } else { 0 } | if superclass == 0 { 2 } else { 0 },
-                instance_start: size as u32,
+                instance_start: start as u32,
                 instance_size: size as u32,
                 reserved: 0,
                 ivar_layout: 0,
@@ -266,30 +274,25 @@ impl Runtime {
         unsafe {
             std::ptr::write(
                 class as *mut ClassObject,
-                ClassObject { isa: 0, superclass, cache: 0, vtable: 0, data: make_ro(false, instance_size) },
+                ClassObject { isa: 0, superclass, cache: 0, vtable: 0, data: make_ro(false, start, size) },
             );
             std::ptr::write(
                 meta as *mut ClassObject,
-                ClassObject { isa: 0, superclass: 0, cache: 0, vtable: 0, data: make_ro(true, 40) },
+                ClassObject { isa: 0, superclass: 0, cache: 0, vtable: 0, data: make_ro(true, meta_start, 40) },
             );
         }
         let (meta_isa, meta_super) = if superclass == 0 {
             (meta, class)
+        } else if super_meta != 0 {
+            (unsafe { (*(super_meta as *const ClassObject)).isa }, super_meta)
         } else {
-            let super_meta = self.classes.get(&superclass).map(|r| r.partner).unwrap_or(0);
-            (self.root_meta, super_meta)
+            (meta, 0)
         };
         unsafe {
             (*(class as *mut ClassObject)).isa = meta;
             (*(meta as *mut ClassObject)).isa = meta_isa;
             (*(meta as *mut ClassObject)).superclass = meta_super;
         }
-        if superclass == 0 && self.root_meta == 0 {
-            self.root_meta = meta;
-        }
-        let size = instance_size.max(
-            self.classes.get(&superclass).map(|r| r.instance_size).unwrap_or(8),
-        );
         self.classes.insert(
             class,
             ClassRec {
@@ -782,7 +785,8 @@ fn realize(rt: &mut Runtime, class: Class, game_classes: &HashSet<Class>) -> Res
         }
         let protocols = protocol_list(read::<usize>(ro + 40));
         let meta_super = (*(meta as *const ClassObject)).superclass;
-        if meta_super != 0 && !rt.classes.contains_key(&meta_super) {
+        // A root metaclass's parent is its own class, recorded just below.
+        if meta_super != 0 && meta_super != class && !rt.classes.contains_key(&meta_super) {
             return Err(format!("metaclass of {name} has an unknown parent {meta_super:#x}"));
         }
         rt.classes.insert(

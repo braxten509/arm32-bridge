@@ -182,20 +182,6 @@ extern "C" fn protocol_conforms(protocol: usize, other: usize) -> bool {
     }
 }
 
-extern "C" fn protocol_copy_methods(_p: usize, _req: bool, _inst: bool, count: *mut u32) -> usize {
-    if !count.is_null() {
-        unsafe { *count = 0 };
-    }
-    0
-}
-
-extern "C" fn protocol_copy_protocols(_p: usize, count: *mut u32) -> usize {
-    if !count.is_null() {
-        unsafe { *count = 0 };
-    }
-    0
-}
-
 extern "C" fn objc_get_class(name: *const libc::c_char) -> usize {
     let name = unsafe { runtime::cstr(name as usize) };
     runtime::class_named(&name)
@@ -314,8 +300,6 @@ pub fn register(r: &mut Registry) {
     r.function("object_getClass", object_get_class as usize);
     r.function("class_getName", class_get_name as usize);
     r.function("protocol_conformsToProtocol", protocol_conforms as usize);
-    r.function("protocol_copyMethodDescriptionList", protocol_copy_methods as usize);
-    r.function("protocol_copyProtocolList", protocol_copy_protocols as usize);
     r.function("__objc_personality_v0", personality as usize);
     reflect::register(r);
     r.data("_objc_empty_cache", leak([0usize; 4]));
