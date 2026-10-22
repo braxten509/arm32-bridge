@@ -789,6 +789,41 @@ extern "C" fn dict_object_enumerator(this: Id, _: Sel) -> Id {
     enumerator(dictionary_pairs(this).into_iter().map(|(_, v)| v).collect())
 }
 
+// ----- NSValue holding a pointer: { isa, kind, pointer } -----
+
+const KIND_POINTER: usize = 3;
+
+extern "C" fn value_with_pointer(class: Class, _: Sel, pointer: usize) -> Id {
+    let object = runtime::alloc_instance(class);
+    unsafe {
+        *((object + 8) as *mut usize) = KIND_POINTER;
+        *((object + 16) as *mut usize) = pointer;
+    }
+    object
+}
+
+extern "C" fn value_pointer(this: Id, _: Sel) -> usize {
+    unsafe { *((this + 16) as *const usize) }
+}
+
+extern "C" fn value_get(this: Id, s: Sel, out: *mut usize) {
+    if !out.is_null() {
+        unsafe { out.write_unaligned(value_pointer(this, s)) };
+    }
+}
+
+extern "C" fn value_is_equal(this: Id, s: Sel, other: Id) -> bool {
+    let same_class = {
+        let rt = lock();
+        other != 0 && rt.class_of(other) == rt.class_of(this)
+    };
+    same_class && value_pointer(this, s) == value_pointer(other, s)
+}
+
+extern "C" fn value_hash(this: Id, s: Sel) -> usize {
+    value_pointer(this, s)
+}
+
 // ----- NSNumber: { isa, kind, value bits } -----
 
 const KIND_INT: usize = 0;
@@ -922,7 +957,22 @@ pub fn register(_: &mut Registry) {
     let mutable_dictionary = define_class("NSMutableDictionary", "NSDictionary", 16);
     let value = define_class("NSValue", "NSObject", 24);
     let number = define_class("NSNumber", "NSValue", 24);
-    let _ = value;
+    class_methods(
+        value,
+        &[("valueWithPointer:", value_with_pointer as usize), ("valueWithNonretainedObject:", value_with_pointer as usize)],
+    );
+    methods(
+        value,
+        &[
+            ("pointerValue", value_pointer as usize),
+            ("nonretainedObjectValue", value_pointer as usize),
+            ("getValue:", value_get as usize),
+            ("isEqual:", value_is_equal as usize),
+            ("isEqualToValue:", value_is_equal as usize),
+            ("hash", value_hash as usize),
+            ("copyWithZone:", return_self as usize),
+        ],
+    );
     CLASSES.set(Classes { array, mutable_array, dictionary, mutable_dictionary, number }).ok();
     let enumerator_class = define_class("NSEnumerator", "NSObject", 16);
     ENUMERATOR_CLASS.set(enumerator_class).ok();
@@ -1190,5 +1240,25 @@ mod tests {
         assert_eq!(pairs(dictionary).len(), 2, "read the pairs from the stack, not the registers");
         assert_eq!(dictionary_get(dictionary, key1), first);
         assert_eq!(dictionary_get(dictionary, key2), value2);
+    }
+
+    /// NSValue boxes a pointer (or an object it doesn't keep); equal when the pointers match.
+    #[test]
+    fn values_box_pointers() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let class = runtime::class_named("NSValue");
+        let boxed = runtime::send(class, "valueWithPointer:", &[0x1234_5670]);
+        assert_ne!(boxed, 0, "+[NSValue valueWithPointer:] gave nil");
+        assert_eq!(runtime::send(boxed, "pointerValue", &[]), 0x1234_5670);
+        let same = runtime::send(class, "valueWithNonretainedObject:", &[0x1234_5670]);
+        assert_eq!(runtime::send(same, "nonretainedObjectValue", &[]), 0x1234_5670);
+        assert_eq!(runtime::send(boxed, "isEqual:", &[same]) & 0xFF, 1);
+        assert_eq!(runtime::send(boxed, "hash", &[]), runtime::send(same, "hash", &[]));
+        let other = runtime::send(class, "valueWithPointer:", &[0x99]);
+        assert_eq!(runtime::send(boxed, "isEqualToValue:", &[other]) & 0xFF, 0);
+        let mut out = 0usize;
+        runtime::send(boxed, "getValue:", &[&mut out as *mut usize as usize]);
+        assert_eq!(out, 0x1234_5670);
     }
 }
