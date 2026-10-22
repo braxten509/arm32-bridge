@@ -25,7 +25,8 @@ extern "C" fn audio_session_get_property(id: u32, size: *mut u32, data: *mut u8)
                 *size = bytes.len() as u32;
             }
         };
-        if id == four(b"othr") || id == four(b"iavl") {
+        // Other audio playing, audio input (microphone) available: no.
+        if id == four(b"othr") || id == four(b"aiav") {
             write(&0u32.to_le_bytes());
         } else if id == four(b"chsr") {
             write(&44100.0f64.to_le_bytes());
@@ -731,4 +732,19 @@ pub fn register(r: &mut Registry) {
     );
 
     let _ = collections::array_from;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Sound engines (FMOD) ask whether a microphone is there before starting; the answer is no.
+    #[test]
+    fn audio_session_says_no_input_is_available() {
+        let mut available = 7u32;
+        let mut size = 4u32;
+        let result = audio_session_get_property(four(b"aiav"), &mut size, &mut available as *mut u32 as *mut u8);
+        assert_eq!(result, 0, "kAudioSessionProperty_AudioInputAvailable was refused");
+        assert_eq!((available, size), (0, 4));
+    }
 }
