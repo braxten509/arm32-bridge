@@ -21,6 +21,13 @@ pub fn property_set(object: Id, key: &'static str, value: u64) {
     PROPERTIES.lock().unwrap().get_or_insert_with(HashMap::new).insert((object, key), value);
 }
 
+/// Sets an object property: like UIKit's, it retains what it holds (this
+/// matters for objects with real counts: pictures, fw/counted.rs).
+pub fn property_set_object(object: Id, key: &'static str, value: Id) {
+    let old = PROPERTIES.lock().unwrap().get_or_insert_with(HashMap::new).insert((object, key), value as u64);
+    crate::fw::counted::replace(old.unwrap_or(0) as Id, value);
+}
+
 /// Makes a getter and setter pair that keep a value per object.
 macro_rules! property {
     ($get:ident, $set:ident, $key:literal, id, $default:expr) => {
@@ -28,7 +35,7 @@ macro_rules! property {
             property_get(this, $key).map(|v| v as Id).unwrap_or($default)
         }
         extern "C" fn $set(this: Id, _: Sel, value: Id) {
-            property_set(this, $key, value as u64);
+            property_set_object(this, $key, value);
         }
     };
     ($get:ident, $set:ident, $key:literal, bool, $default:expr) => {
@@ -916,9 +923,18 @@ extern "C" fn color_cg(this: Id, _: Sel) -> Id {
 // ----- images: { isa, *mut ImageInfo } -----
 
 pub struct ImageInfo {
+    /// The picture's file ("" for pictures made in memory).
     pub path: String,
     pub pixels: (u32, u32),
     pub scale: f64,
+    /// UIImageOrientation (0 = up).
+    pub orientation: i64,
+    /// Its CGImage (see fw/graphics.rs; read from the file when first asked for).
+    pub cg: OnceLock<Id>,
+    /// An upright PNG made to show it on the phone screen (see graphics::picture_file).
+    pub picture_file: OnceLock<Option<String>>,
+    /// Whether making that file has started.
+    pub picture_started: std::sync::atomic::AtomicBool,
 }
 
 fn png_size(path: &str) -> Option<(u32, u32)> {
@@ -926,20 +942,51 @@ fn png_size(path: &str) -> Option<(u32, u32)> {
     if bytes.len() < 24 || &bytes[1..4] != b"PNG" {
         return None;
     }
-    let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
-    let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+    // Apple's crushed PNGs put a CgBI chunk before the header.
+    let at = if &bytes[12..16] == b"CgBI" { 32 } else { 16 };
+    let width = u32::from_be_bytes(bytes.get(at..at + 4)?.try_into().ok()?);
+    let height = u32::from_be_bytes(bytes.get(at + 4..at + 8)?.try_into().ok()?);
     Some((width, height))
 }
 
 fn image_from_path(path: &str) -> Id {
-    let Some(pixels) = png_size(path) else {
-        crate::log!("image {path}: can't read its size (only PNG is read so far)");
+    let Some(pixels) = png_size(path).or_else(|| image::image_dimensions(path).ok()) else {
+        crate::log!("image {path}: can't read its size");
         return 0;
     };
-    let scale = if path.contains("@2x") { 2.0 } else { 1.0 };
+    let scale = if path.contains("@3x") {
+        3.0
+    } else if path.contains("@2x") {
+        2.0
+    } else {
+        1.0
+    };
+    // A photo's EXIF tag turns it, as UIImage reads it (the size is then swapped).
+    let orientation = crate::fw::graphics::file_orientation(path);
+    make_image(ImageInfo { path: path.into(), pixels, scale, orientation, cg: OnceLock::new(), picture_file: OnceLock::new(), picture_started: Default::default() })
+}
+
+/// A new UIImage with one reference (the caller's); it counts references (fw/counted.rs).
+pub fn make_image(info: ImageInfo) -> Id {
     let object = runtime::alloc_instance(runtime::class_named("UIImage"));
-    unsafe { *((object + 8) as *mut *mut ImageInfo) = Box::into_raw(Box::new(ImageInfo { path: path.into(), pixels, scale })) };
+    unsafe { *((object + 8) as *mut *mut ImageInfo) = Box::into_raw(Box::new(info)) };
+    crate::fw::counted::track(object, crate::fw::graphics::ui_image_clean_up);
     object
+}
+
+/// The image's size in points (sideways orientations swap width and height).
+pub fn image_points(image: Id) -> Size {
+    match image_info(image) {
+        Some(info) => {
+            let (w, h) = (info.pixels.0 as f64 / info.scale, info.pixels.1 as f64 / info.scale);
+            if matches!(info.orientation, 2 | 3 | 6 | 7) {
+                Size { width: h, height: w }
+            } else {
+                Size { width: w, height: h }
+            }
+        }
+        None => Size::default(),
+    }
 }
 
 pub fn image_info(image: Id) -> Option<&'static ImageInfo> {
@@ -958,7 +1005,18 @@ extern "C" fn image_named(_: Class, _: Sel, name: Id) -> Id {
     };
     for candidate in [format!("{dir}/{stem}@2x.{ext}"), format!("{dir}/{stem}.{ext}"), format!("{dir}/{name}")] {
         if std::path::Path::new(&candidate).exists() {
-            return image_from_path(&candidate);
+            // UIKit keeps named images in its cache (which holds its own reference).
+            static CACHE: Mutex<Option<HashMap<String, Id>>> = Mutex::new(None);
+            let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+            let cache = cache.get_or_insert_with(HashMap::new);
+            if let Some(&image) = cache.get(&candidate) {
+                return image;
+            }
+            let image = image_from_path(&candidate);
+            if image != 0 {
+                cache.insert(candidate, image);
+            }
+            return image;
         }
     }
     crate::log!("imageNamed {name}: not in the app");
@@ -966,7 +1024,7 @@ extern "C" fn image_named(_: Class, _: Sel, name: Id) -> Id {
 }
 
 extern "C" fn image_with_contents_of_file(_: Class, _: Sel, path: Id) -> Id {
-    image_from_path(&string::get(path))
+    crate::fw::counted::autorelease(image_from_path(&string::get(path)))
 }
 
 extern "C" fn image_init_with_contents_of_file(_this: Id, _: Sel, path: Id) -> Id {
@@ -974,10 +1032,7 @@ extern "C" fn image_init_with_contents_of_file(_this: Id, _: Sel, path: Id) -> I
 }
 
 extern "C" fn image_size(this: Id, _: Sel) -> Size {
-    match image_info(this) {
-        Some(info) => Size { width: info.pixels.0 as f64 / info.scale, height: info.pixels.1 as f64 / info.scale },
-        None => Size::default(),
-    }
+    image_points(this)
 }
 
 extern "C" fn image_scale(this: Id, _: Sel) -> f64 {
@@ -987,7 +1042,7 @@ extern "C" fn image_scale(this: Id, _: Sel) -> f64 {
 extern "C" fn image_view_init_with_image(this: Id, _: Sel, image: Id) -> Id {
     let size = if image != 0 { image_size(image, 0) } else { Size::default() };
     view_init_with_frame(this, 0, Rect { origin: Point::default(), size });
-    property_set(this, "image", image as u64);
+    property_set_object(this, "image", image);
     this
 }
 

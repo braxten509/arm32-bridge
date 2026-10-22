@@ -20,8 +20,6 @@ extern "C" fn set_delegate(_this: Id, _: Sel, value: Id) {
     DELEGATE.store(value, Ordering::Relaxed);
 }
 
-extern "C" fn nothing(_this: Id, _: Sel) {}
-
 extern "C" fn block_copy_method(this: Id, _: Sel) -> Id {
     crate::libsystem::mach::block_copy(this as *mut _) as Id
 }
@@ -161,7 +159,14 @@ pub fn register(r: &mut Registry) {
     r.function("UIApplicationMain", ui_application_main as usize);
 
     let pool = define_class("NSAutoreleasePool", "NSObject", 8);
-    methods(pool, &[("drain", nothing as usize), ("release", nothing as usize)]);
+    extern "C" fn pool_init(this: Id, _: Sel) -> Id {
+        crate::fw::counted::pool_object_open(this);
+        this
+    }
+    extern "C" fn pool_drain(this: Id, _: Sel) {
+        crate::fw::counted::pool_object_close(this);
+    }
+    methods(pool, &[("init", pool_init as usize), ("drain", pool_drain as usize), ("release", pool_drain as usize)]);
 
     let block = define_class("NSBlock", "NSObject", 8);
     methods(block, &[("copy", block_copy_method as usize), ("copyWithZone:", block_copy_method as usize)]);

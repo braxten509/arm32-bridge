@@ -8,11 +8,14 @@ use runtime::{lock, Id, Sel};
 use std::collections::HashMap;
 use std::sync::{Condvar, Mutex};
 
+// Pools only matter for objects with real reference counts (fw/counted.rs).
 extern "C" fn autorelease_pool_push() -> usize {
-    1
+    crate::fw::counted::pool_push()
 }
 
-extern "C" fn autorelease_pool_pop(_: usize) {}
+extern "C" fn autorelease_pool_pop(token: usize) {
+    crate::fw::counted::pool_pop(token)
+}
 
 extern "C" fn get_property(this: Id, _: Sel, offset: isize, _atomic: bool) -> Id {
     if this == 0 {
@@ -31,19 +34,26 @@ extern "C" fn set_property(this: Id, _: Sel, offset: isize, value: Id, _atomic: 
         2 => runtime::send(value, "mutableCopy", &[]),
         _ => runtime::send(value, "copy", &[]),
     };
-    unsafe { *((this as isize + offset) as *mut usize) = stored };
+    if copy == 0 {
+        crate::fw::counted::retain(stored);
+    }
+    let slot = (this as isize + offset) as *mut usize;
+    let old = unsafe { std::mem::replace(&mut *slot, stored) };
+    crate::fw::counted::release(old);
 }
 
 extern "C" fn set_property_plain(this: Id, _: Sel, value: Id, offset: isize) {
     if this != 0 {
-        unsafe { *((this as isize + offset) as *mut usize) = value };
+        let old = unsafe { std::mem::replace(&mut *((this as isize + offset) as *mut usize), value) };
+        crate::fw::counted::replace(old, value);
     }
 }
 
 extern "C" fn set_property_copy(this: Id, _: Sel, value: Id, offset: isize) {
     if this != 0 {
         let copied = runtime::send(value, "copy", &[]);
-        unsafe { *((this as isize + offset) as *mut usize) = copied };
+        let old = unsafe { std::mem::replace(&mut *((this as isize + offset) as *mut usize), copied) };
+        crate::fw::counted::release(old);
     }
 }
 
@@ -143,24 +153,38 @@ extern "C" fn terminate() -> ! {
     crate::report::finish(1);
 }
 
-static ASSOCIATED: Mutex<Option<HashMap<(usize, usize), usize>>> = Mutex::new(None);
+/// Associated objects: the value and whether it was retained (its policy isn't ASSIGN).
+static ASSOCIATED: Mutex<Option<HashMap<(usize, usize), (usize, bool)>>> = Mutex::new(None);
 
 extern "C" fn get_associated(object: Id, key: usize) -> Id {
     ASSOCIATED
         .lock()
         .unwrap()
         .as_ref()
-        .and_then(|m| m.get(&(object, key)).copied())
+        .and_then(|m| m.get(&(object, key)).map(|&(value, _)| value))
         .unwrap_or(0)
 }
 
-extern "C" fn set_associated(object: Id, key: usize, value: Id, _policy: usize) {
-    let mut guard = ASSOCIATED.lock().unwrap();
-    let map = guard.get_or_insert_with(HashMap::new);
-    if value == 0 {
-        map.remove(&(object, key));
-    } else {
-        map.insert((object, key), value);
+extern "C" fn set_associated(object: Id, key: usize, value: Id, policy: usize) {
+    // OBJC_ASSOCIATION_ASSIGN (0) holds without a retain; every other policy
+    // holds a reference (counts matter for counted objects only, whose copy
+    // is themselves).
+    let (value, retained) = match policy {
+        _ if value == 0 => (0, false),
+        0 => (value, false),
+        _ => (crate::fw::counted::retain(value), true),
+    };
+    let old = {
+        let mut guard = ASSOCIATED.lock().unwrap();
+        let map = guard.get_or_insert_with(HashMap::new);
+        if value == 0 {
+            map.remove(&(object, key))
+        } else {
+            map.insert((object, key), (value, retained))
+        }
+    };
+    if let Some((old, true)) = old {
+        crate::fw::counted::release(old);
     }
 }
 
@@ -210,40 +234,81 @@ extern "C" fn personality() -> i32 {
 }
 
 // ----- ARC entry points (compiler-made calls in ARC code) -----
-// Objects are never freed here (retain/release do nothing), so these only
-// pass objects along and store them; weak references are plain stores.
+// Objects are never freed here (retain/release do nothing), so these mostly
+// pass objects along and store them; weak references are plain stores. Only
+// objects with real counts (pictures, fw/counted.rs) are counted.
 
 extern "C" fn arc_same(object: Id) -> Id {
     object
 }
 
-extern "C" fn arc_release(_object: Id) {}
-
-extern "C" fn arc_store(location: *mut Id, object: Id) -> Id {
-    if !location.is_null() {
-        unsafe { *location = object };
-    }
-    object
+extern "C" fn arc_retain(object: Id) -> Id {
+    crate::fw::counted::retain(object)
 }
 
-extern "C" fn arc_load(location: *const Id) -> Id {
+extern "C" fn arc_release(object: Id) {
+    crate::fw::counted::release(object)
+}
+
+extern "C" fn arc_autorelease(object: Id) -> Id {
+    crate::fw::counted::autorelease(object)
+}
+
+extern "C" fn arc_retain_autorelease(object: Id) -> Id {
+    crate::fw::counted::autorelease(crate::fw::counted::retain(object))
+}
+
+// Weak references: zeroed when a counted object goes (fw/counted.rs);
+// for every other object they are plain stores, as objects never go.
+
+extern "C" fn arc_store_weak(location: *mut Id, object: Id) -> Id {
+    crate::fw::counted::store_weak(location, object)
+}
+
+/// objc_initWeak: `location` holds nothing yet (not even a valid old value).
+extern "C" fn arc_init_weak(location: *mut Id, object: Id) -> Id {
     if location.is_null() {
-        0
-    } else {
-        unsafe { *location }
+        return 0;
     }
+    unsafe { *location = 0 };
+    crate::fw::counted::store_weak(location, object)
 }
 
-extern "C" fn arc_destroy(location: *mut Id) {
+extern "C" fn arc_store_strong(location: *mut Id, object: Id) {
     if !location.is_null() {
-        unsafe { *location = 0 };
+        crate::fw::counted::retain(object);
+        let old = unsafe { std::mem::replace(&mut *location, object) };
+        crate::fw::counted::release(old);
     }
 }
 
-extern "C" fn arc_move_or_copy_weak(to: *mut Id, from: *mut Id) {
+/// objc_loadWeakRetained: +1, as ARC releases it after use.
+extern "C" fn arc_load_weak_retained(location: *const Id) -> Id {
+    crate::fw::counted::load_weak_retained(location)
+}
+
+/// objc_loadWeak: retained and autoreleased, as on Apple.
+extern "C" fn arc_load_weak(location: *const Id) -> Id {
+    crate::fw::counted::autorelease(crate::fw::counted::load_weak_retained(location))
+}
+
+extern "C" fn arc_destroy_weak(location: *mut Id) {
+    crate::fw::counted::store_weak(location, 0);
+}
+
+/// objc_copyWeak: `to` (new) refers weakly to what `from` does.
+extern "C" fn arc_copy_weak(to: *mut Id, from: *mut Id) {
     if !to.is_null() && !from.is_null() {
-        unsafe { *to = *from };
+        let object = crate::fw::counted::load_weak_retained(from);
+        arc_init_weak(to, object);
+        crate::fw::counted::release(object);
     }
+}
+
+/// objc_moveWeak: as copy, then `from` is left nil.
+extern "C" fn arc_move_weak(to: *mut Id, from: *mut Id) {
+    arc_copy_weak(to, from);
+    arc_destroy_weak(from);
 }
 
 extern "C" fn arc_retain_block(block: usize) -> usize {
@@ -251,26 +316,22 @@ extern "C" fn arc_retain_block(block: usize) -> usize {
 }
 
 pub fn register(r: &mut Registry) {
-    for name in [
-        "objc_retain",
-        "objc_autorelease",
-        "objc_autoreleaseReturnValue",
-        "objc_retainAutorelease",
-        "objc_retainAutoreleaseReturnValue",
-        "objc_retainAutoreleasedReturnValue",
-        "objc_unsafeClaimAutoreleasedReturnValue",
-    ] {
-        r.function(name, arc_same as usize);
-    }
+    r.function("objc_unsafeClaimAutoreleasedReturnValue", arc_same as usize);
+    r.function("objc_retain", arc_retain as usize);
+    r.function("objc_retainAutoreleasedReturnValue", arc_retain as usize);
+    r.function("objc_autorelease", arc_autorelease as usize);
+    r.function("objc_autoreleaseReturnValue", arc_autorelease as usize);
+    r.function("objc_retainAutorelease", arc_retain_autorelease as usize);
+    r.function("objc_retainAutoreleaseReturnValue", arc_retain_autorelease as usize);
     r.function("objc_release", arc_release as usize);
-    r.function("objc_storeStrong", arc_store as usize);
-    r.function("objc_storeWeak", arc_store as usize);
-    r.function("objc_initWeak", arc_store as usize);
-    r.function("objc_loadWeak", arc_load as usize);
-    r.function("objc_loadWeakRetained", arc_load as usize);
-    r.function("objc_destroyWeak", arc_destroy as usize);
-    r.function("objc_copyWeak", arc_move_or_copy_weak as usize);
-    r.function("objc_moveWeak", arc_move_or_copy_weak as usize);
+    r.function("objc_storeStrong", arc_store_strong as usize);
+    r.function("objc_storeWeak", arc_store_weak as usize);
+    r.function("objc_initWeak", arc_init_weak as usize);
+    r.function("objc_loadWeak", arc_load_weak as usize);
+    r.function("objc_loadWeakRetained", arc_load_weak_retained as usize);
+    r.function("objc_destroyWeak", arc_destroy_weak as usize);
+    r.function("objc_copyWeak", arc_copy_weak as usize);
+    r.function("objc_moveWeak", arc_move_weak as usize);
     r.function("objc_retainBlock", arc_retain_block as usize);
     r.function("objc_msgSend", runtime::ios_objc_msgSend as usize);
     r.function("objc_msgSendSuper2", runtime::ios_objc_msgSendSuper2 as usize);

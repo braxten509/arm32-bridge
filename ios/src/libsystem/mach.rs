@@ -281,12 +281,18 @@ extern "C" fn block_object_assign(destination: *mut usize, object: usize, flags:
         match flags & 0xFF {
             7 => *destination = block_copy(object as *mut BlockHeader) as usize,
             8 | 24 => *destination = byref_copy(object as *mut Byref) as usize,
+            // A captured object: copying the block retains it (counted objects only).
+            3 => *destination = crate::fw::counted::retain(object),
             _ => *destination = object,
         }
     }
 }
 
-extern "C" fn block_object_dispose(_object: usize, _flags: i32) {}
+extern "C" fn block_object_dispose(object: usize, flags: i32) {
+    if flags & 0xFF == 3 {
+        crate::fw::counted::release(object);
+    }
+}
 
 pub unsafe fn call_block(block: usize) {
     let header = block as *const BlockHeader;
@@ -489,9 +495,13 @@ fn start_worker(queue: usize, state: &'static SerialQueue, mut jobs: std::sync::
                 }
             };
             match job {
+                // Blocks sent with dispatch_async get a pool each, as GCD's
+                // worker threads drain theirs (sync blocks use the caller's).
                 Job::Later(block, sent_to) => {
                     if !try_hold(sent_to, queue, block, None) {
+                        let pool = crate::fw::counted::pool_mark();
                         run_as(sent_to, block);
+                        crate::fw::counted::pool_drain(pool);
                     }
                 }
                 Job::Now(block, done, sent_to) => {
@@ -620,7 +630,9 @@ fn submit(queue: usize, block: usize, done: Option<std::sync::Arc<(Mutex<bool>, 
         std::thread::spawn(move || {
             if !try_hold(queue, runner, block, done.clone()) {
                 CURRENT_QUEUE.with(|c| c.set(queue));
+                let pool = crate::fw::counted::pool_mark();
                 unsafe { call_block(block) };
+                crate::fw::counted::pool_drain(pool);
                 finish(done);
             }
         });

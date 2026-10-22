@@ -269,10 +269,12 @@ extern "C" fn boolean_type_id() -> usize {
 }
 
 extern "C" fn cf_retain(object: Id) -> Id {
-    object
+    crate::fw::counted::retain(object)
 }
 
-extern "C" fn cf_release(_object: Id) {}
+extern "C" fn cf_release(object: Id) {
+    crate::fw::counted::release(object);
+}
 
 pub fn register(r: &mut Registry) {
     r.function("SecItemCopyMatching", copy_matching as usize);
