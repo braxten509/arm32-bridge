@@ -9,11 +9,15 @@
 // `gamebridge_cxxrt_exports` (Apple name -> address, generated here from
 // ios/cxxrt/exports.txt, which ios/tools/cxxrt-exports.sh makes) and
 // `gamebridge_unwind_add_image`.
+#[path = "build/method_types.rs"]
+mod method_types;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    method_types::generate();
     println!("cargo:rerun-if-changed=cxxrt");
     if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("aarch64") {
         return;

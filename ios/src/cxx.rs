@@ -115,9 +115,7 @@ extern "C" fn gamebridge_objc_class_name(object: usize) -> *const c_char {
 /// An Objective-C exception nobody caught: the app ends, as on an iPhone.
 #[no_mangle]
 extern "C" fn gamebridge_objc_uncaught(object: usize) -> ! {
-    let reason = crate::fw::string::describe(object);
-    crate::log!("STOP: uncaught Objective-C exception: {reason}");
-    crate::report::finish(1);
+    crate::fw::exception::uncaught(object)
 }
 
 /// Tells the unwinder where a loaded game image's code and unwind tables are.

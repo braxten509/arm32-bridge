@@ -220,6 +220,7 @@ extern "C" fn locale_object_for_key(_this: Id, _: Sel, key: Id) -> Id {
         "kCFLocaleCountryCodeKey" => "US",
         "kCFLocaleLanguageCodeKey" => "en",
         "currency" => "USD",
+        "kCFLocaleCurrencySymbolKey" => "$",
         "kCFLocaleIdentifierKey" => "en_US",
         "kCFLocaleVariantCodeKey" => return 0,
         _ => {

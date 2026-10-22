@@ -261,7 +261,7 @@ fn decode(bytes: &[u8], encoding: usize) -> Option<Vec<u16>> {
     })
 }
 
-fn encode(units: &[u16], encoding: usize) -> Vec<u8> {
+pub fn encode(units: &[u16], encoding: usize) -> Vec<u8> {
     match encoding {
         NS_UTF16 | NS_UTF16_LE => units.iter().flat_map(|u| u.to_le_bytes()).collect(),
         NS_UTF32 | NS_UTF32_LE => String::from_utf16_lossy(units).chars().flat_map(|c| (c as u32).to_le_bytes()).collect(),

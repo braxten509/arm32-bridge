@@ -540,13 +540,16 @@ extern "C" fn dict_with_contents_of_url(class: Class, s: Sel, url: Id) -> Id {
     dict_with_contents_of_file(class, s, path)
 }
 
+// Apple arm64 passes every variadic argument on the stack, one 8-byte slot
+// each: the trampolines hand the implementations the stack pointer.
 crate::libsystem::libc::variadic!(ios_dict_with_objects_and_keys, 3, ios_dict_with_objects_and_keys_impl);
+crate::libsystem::libc::variadic!(ios_dict_init_with_objects_and_keys, 3, ios_dict_init_with_objects_and_keys_impl);
 
-#[no_mangle]
-extern "C" fn ios_dict_with_objects_and_keys_impl(class: Class, _: Sel, first: Id, va: *const u64) -> Id {
+/// Fills a dictionary from a nil-terminated value, key, value, key... list.
+fn fill_objects_and_keys(object: Id, first: Id, va: *const u64) -> Id {
     let list = nil_terminated(first, va);
-    let object = runtime::alloc_instance(class);
     let store = pairs(object);
+    store.clear();
     for pair in list.chunks(2) {
         if let [value, key] = pair {
             store.retain(|(k, _)| !keys_equal(*k, *key));
@@ -554,6 +557,16 @@ extern "C" fn ios_dict_with_objects_and_keys_impl(class: Class, _: Sel, first: I
         }
     }
     object
+}
+
+#[no_mangle]
+extern "C" fn ios_dict_with_objects_and_keys_impl(class: Class, _: Sel, first: Id, va: *const u64) -> Id {
+    fill_objects_and_keys(runtime::alloc_instance(class), first, va)
+}
+
+#[no_mangle]
+extern "C" fn ios_dict_init_with_objects_and_keys_impl(this: Id, _: Sel, first: Id, va: *const u64) -> Id {
+    fill_objects_and_keys(this, first, va)
 }
 
 extern "C" fn dict_object_for_key(this: Id, _: Sel, key: Id) -> Id {
@@ -817,6 +830,11 @@ pub fn number_is_bool(object: Id) -> bool {
     number_parts(object).0 == KIND_BOOL
 }
 
+/// Made from a float or double (not an integer or a BOOL).
+pub fn number_is_float(object: Id) -> bool {
+    number_parts(object).0 == KIND_FLOAT
+}
+
 pub fn number_as_f64(object: Id) -> f64 {
     let (kind, bits) = number_parts(object);
     if kind == KIND_FLOAT { f64::from_bits(bits) } else { bits as i64 as f64 }
@@ -1050,6 +1068,7 @@ pub fn register(_: &mut Registry) {
             ("mutableCopyWithZone:", dict_mutable_copy as usize),
             ("countByEnumeratingWithState:objects:count:", dict_enumerate as usize),
             ("description", dict_description as usize),
+            ("initWithObjectsAndKeys:", ios_dict_init_with_objects_and_keys as usize),
         ],
     );
     class_methods(
@@ -1115,4 +1134,61 @@ pub fn register(_: &mut Registry) {
             ("copyWithZone:", return_self as usize),
         ],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Calls `f(x0, x1, x2, ...)` the way Apple arm64 code calls a variadic
+    /// function: the variadic arguments in 8-byte stack slots, and x3-x7
+    /// pointing at a decoy list (what a register-reading version would see).
+    unsafe fn call_apple_variadic(f: usize, x0: usize, x1: usize, x2: usize, stack: &[usize], decoy: &[usize]) -> usize {
+        let mut slots = stack.to_vec();
+        slots.resize(stack.len().div_ceil(2) * 2, 0);
+        let result: usize;
+        std::arch::asm!(
+            "mov x20, sp",
+            "sub sp, sp, x13",
+            "mov x9, #0",
+            "2:",
+            "cmp x9, x13",
+            "b.ge 3f",
+            "ldr x10, [x12, x9]",
+            "str x10, [sp, x9]",
+            "add x9, x9, #8",
+            "b 2b",
+            "3:",
+            "blr x11",
+            "mov sp, x20",
+            inout("x0") x0 => result,
+            in("x1") x1,
+            in("x2") x2,
+            in("x3") decoy.as_ptr(),
+            in("x4") decoy.as_ptr(),
+            in("x5") decoy.as_ptr(),
+            in("x6") decoy.as_ptr(),
+            in("x7") decoy.as_ptr(),
+            in("x11") f,
+            in("x12") slots.as_ptr(),
+            in("x13") slots.len() * 8,
+            out("x20") _,
+            clobber_abi("C"),
+        );
+        result
+    }
+
+    #[test]
+    fn nil_terminated_initializers_read_the_stack() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let [first, key1, value2, key2, decoy] = ["first", "key1", "second", "key2", "decoy"].map(crate::fw::string::make);
+        let dictionary = runtime::alloc_instance(runtime::class_named("NSMutableDictionary"));
+        let f = ios_dict_init_with_objects_and_keys as usize;
+        let result = unsafe { call_apple_variadic(f, dictionary, 0, first, &[key1, value2, key2, 0], &[decoy, decoy, 0]) };
+        assert_eq!(result, dictionary);
+        assert_eq!(pairs(dictionary).len(), 2, "read the pairs from the stack, not the registers");
+        assert_eq!(dictionary_get(dictionary, key1), first);
+        assert_eq!(dictionary_get(dictionary, key2), value2);
+    }
 }

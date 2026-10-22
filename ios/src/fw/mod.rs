@@ -1,25 +1,31 @@
 //! Stand-ins for Apple's Foundation and UIKit classes.
 
 pub mod app;
+pub mod cfbridge;
 pub mod coalesced;
 pub mod collections;
 pub mod controls;
 pub mod counted;
 pub mod crypto;
 pub mod data;
+pub mod dates;
 pub mod eagl;
+pub mod exception;
 pub mod files;
 pub mod foundation;
 pub mod gamekit;
 pub mod openal;
+pub mod operations;
 pub mod geometry;
 pub mod gl;
 pub mod graphics;
+pub mod invocation;
 pub mod json;
 pub mod keychain;
 pub mod locks;
 pub mod media;
 pub mod misc;
+pub mod numbers;
 pub mod object;
 pub mod paths;
 pub mod pictures;
@@ -27,7 +33,9 @@ pub mod plist;
 pub mod png;
 pub mod pvrtc;
 pub mod regex;
+pub mod scanner;
 pub mod runloop;
+pub mod smallclasses;
 pub mod sqlite;
 pub mod storekit;
 pub mod services;
@@ -72,6 +80,14 @@ pub fn register(r: &mut Registry) {
     gamekit::register(r);
     openal::register(r);
     storekit::register(r);
+    dates::register(r);
+    numbers::register(r);
+    scanner::register(r);
+    cfbridge::register(r);
+    invocation::register(r);
+    operations::register(r);
+    smallclasses::register(r);
+    exception::register(r);
     immutable_copies();
 }
 
