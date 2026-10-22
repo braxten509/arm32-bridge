@@ -16,7 +16,7 @@ use crate::symbols::Registry;
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// NSOperationQueueDefaultMaxConcurrentOperationCount.
 const NO_LIMIT: isize = -1;
@@ -102,21 +102,34 @@ fn finished_now(op: Id) -> bool {
 }
 
 /// Started operations that haven't said they're finished yet (they finish
-/// later on their own: asynchronous ones, or subclasses with their own start).
-static PENDING: Mutex<Vec<Id>> = Mutex::new(Vec::new());
+/// later on their own: asynchronous ones, or subclasses with their own start),
+/// each with when to ask it next and how long to wait after that. Operations
+/// that send the isFinished notice are handled at once; for the ones that
+/// don't, the asking slows from every 20 ms to once a second.
+static PENDING: Mutex<Vec<(Id, Instant, Duration)>> = Mutex::new(Vec::new());
+const SLOWEST_POLL: Duration = Duration::from_secs(1);
 
 fn watch(op: Id) {
     let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
     let start_poller = pending.is_empty();
-    pending.push(op);
+    pending.push((op, Instant::now() + POLL, POLL));
     drop(pending);
     if start_poller {
         std::thread::spawn(|| loop {
-            std::thread::sleep(POLL);
-            let list: Vec<Id> = PENDING.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            let done: Vec<Id> = list.into_iter().filter(|&op| finished_now(op)).collect();
+            let next = PENDING.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(_, at, _)| *at).min();
+            let Some(next) = next else { return };
+            std::thread::sleep(next.saturating_duration_since(Instant::now()).max(POLL));
+            let now = Instant::now();
+            let due: Vec<Id> = PENDING.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|(_, at, _)| *at <= now).map(|(op, _, _)| *op).collect();
+            let done: Vec<Id> = due.iter().copied().filter(|&op| finished_now(op)).collect();
             let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
-            pending.retain(|op| !done.contains(op));
+            pending.retain(|(op, _, _)| !done.contains(op));
+            for (op, at, wait) in pending.iter_mut() {
+                if due.contains(op) {
+                    *wait = (*wait * 2).min(SLOWEST_POLL);
+                    *at = now + *wait;
+                }
+            }
             if pending.is_empty() {
                 return;
             }
