@@ -5,6 +5,7 @@
 pub mod dynarec;
 pub mod elf;
 pub mod imports;
+pub mod ios32;
 pub mod jni_names;
 pub mod log;
 pub mod mem;

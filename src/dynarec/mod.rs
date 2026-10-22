@@ -10,7 +10,7 @@ pub mod emit;
 pub mod thumb;
 
 mod engine;
-pub use engine::{enabled, invalidate, invalidate_library, print_stats, property, run, seed_from_unicorn, Native};
+pub use engine::{enabled, fallback_count, invalidate, invalidate_library, print_stats, property, run, seed_from_unicorn, Native};
 
 /// The CPSR bits MRS reads besides the flags (mode, A/I/F masks, E), as Unicorn
 /// has them: translated MRS returns what Unicorn's did. Set when an engine is made.
