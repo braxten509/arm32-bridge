@@ -225,7 +225,6 @@ extern "C" fn block_op_main(this: Id, _: Sel) {
 // ----- NSOperationQueue: { isa, *mut Queue } -----
 
 struct Queue {
-    object: Id,
     main: bool,
     name: Id,
     limit: isize,
@@ -250,7 +249,7 @@ fn queue(object: Id) -> &'static mut Queue {
     unsafe {
         let slot = (object + 8) as *mut *mut Queue;
         if (*slot).is_null() {
-            let state = Queue { object, main: false, name: 0, limit: NO_LIMIT, suspended: false, waiting: VecDeque::new(), running: Vec::new() };
+            let state = Queue { main: false, name: 0, limit: NO_LIMIT, suspended: false, waiting: VecDeque::new(), running: Vec::new() };
             *slot = Box::into_raw(Box::new(state));
             QUEUES.lock().unwrap_or_else(|e| e.into_inner()).push(object);
         }
