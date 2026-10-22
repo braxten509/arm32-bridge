@@ -65,7 +65,8 @@ fn banner_setup(this: Id, kind: isize) -> Id {
 
 fn super_init_frame(this: Id, frame: Rect) -> Id {
     let s = runtime::sel("initWithFrame:");
-    let imp = lock().lookup(runtime::class_named("UIView"), s).expect("UIView initWithFrame:");
+    let view = runtime::class_named("UIView"); // before taking the lock: it locks too
+    let imp = lock().lookup(view, s).expect("UIView initWithFrame:");
     let f: extern "C" fn(Id, Sel, Rect) -> Id = unsafe { std::mem::transmute(imp) };
     f(this, s, frame)
 }

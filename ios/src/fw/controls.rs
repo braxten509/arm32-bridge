@@ -98,7 +98,8 @@ fn call_rect(this: Id, name: &str, rect: Rect) -> Id {
 /// [super initWithFrame:] as seen from one of our view classes.
 fn super_init_frame(this: Id, parent: &str, frame: Rect) -> Id {
     let s = runtime::sel("initWithFrame:");
-    let imp = lock().lookup(runtime::class_named(parent), s).expect("UIView initWithFrame:");
+    let parent = runtime::class_named(parent); // before taking the lock: it locks too
+    let imp = lock().lookup(parent, s).expect("UIView initWithFrame:");
     let f: extern "C" fn(Id, Sel, Rect) -> Id = unsafe { std::mem::transmute(imp) };
     f(this, s, frame)
 }
@@ -161,7 +162,6 @@ extern "C" fn ignore_double(_this: Id, _: Sel, _value: f64) {}
 extern "C" fn ignore_id_bool(_this: Id, _: Sel, _value: Id, _flag: u8) {}
 extern "C" fn ignore_id_int(_this: Id, _: Sel, _value: Id, _number: isize) {}
 extern "C" fn ignore_id_int_int(_this: Id, _: Sel, _value: Id, _a: isize, _b: isize) {}
-extern "C" fn ignore_id_id(_this: Id, _: Sel, _a: Id, _b: Id) {}
 extern "C" fn nil_with_id(_this: Id, _: Sel, _value: Id) -> Id {
     0
 }
@@ -198,8 +198,9 @@ struct Range {
 /// (0.55 em) and line height (1.2 em), wrapped at `max_width` and cut at
 /// `max_lines` lines (0: no limit), rounded up like UIKit.
 pub fn text_size(text: &str, point_size: f64, max_width: f64, max_lines: usize) -> Size {
-    let letter = point_size * 0.55;
-    let line_height = (point_size * 1.2).ceil();
+    // Written as fractions so whole sizes give whole numbers (no 0.55 drift).
+    let letter = point_size * 11.0 / 20.0;
+    let line_height = (point_size * 6.0 / 5.0).ceil();
     let mut widest: f64 = 0.0;
     let mut lines = 0usize;
     for paragraph in text.split('\n') {
