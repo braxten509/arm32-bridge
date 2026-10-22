@@ -555,6 +555,21 @@ extern "C" fn uppercase(this: Id, _: Sel) -> Id {
     make(&get(this).to_uppercase())
 }
 
+/// Words are split by whitespace (spaces, tabs, line ends), as Apple documents.
+extern "C" fn capitalized(this: Id, _: Sel) -> Id {
+    let mut out = String::new();
+    let mut word_start = true;
+    for c in get(this).chars() {
+        if word_start {
+            out.extend(c.to_uppercase());
+        } else {
+            out.extend(c.to_lowercase());
+        }
+        word_start = c.is_whitespace();
+    }
+    make(&out)
+}
+
 extern "C" fn substring_from(this: Id, _: Sel, index: usize) -> Id {
     let value = units(this);
     let object = make("");
@@ -820,6 +835,7 @@ pub fn register(r: &mut Registry) {
             ("stringByAppendingFormat:", ios_by_appending_format as usize),
             ("lowercaseString", lowercase as usize),
             ("uppercaseString", uppercase as usize),
+            ("capitalizedString", capitalized as usize),
             ("substringFromIndex:", substring_from as usize),
             ("substringToIndex:", substring_to as usize),
             ("substringWithRange:", substring_with_range as usize),
@@ -868,4 +884,20 @@ pub fn register(r: &mut Registry) {
             ("setString:", set_string as usize),
         ],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each word (split by spaces, tabs or line ends) starts upper case, the rest lower case.
+    #[test]
+    fn capitalized_string_starts_each_word_upper_case() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let text = make("hELLO wORLD\tfoo-bar\nsuccess 1st");
+        assert!(crate::objc::runtime::responds(text, "capitalizedString"), "-[NSString capitalizedString] is missing");
+        let result = crate::objc::runtime::send(text, "capitalizedString", &[]);
+        assert_eq!(get(result), "Hello World\tFoo-bar\nSuccess 1st");
+    }
 }
