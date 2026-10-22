@@ -267,8 +267,9 @@ extern "C" fn credential_identity(_this: Id, _: Sel) -> usize {
 // transaction commits, on the main run loop.
 
 struct Transaction {
-    /// Started by a setter outside begin/commit (Apple commits it at the end
-    /// of the run loop turn; here at +flush).
+    /// Started by a setter outside begin/commit. Apple commits it at the end
+    /// of the run loop turn; so does the main thread here (other threads at
+    /// +flush).
     implicit: bool,
     disable_actions: Option<bool>,
     duration: Option<f64>,
@@ -307,13 +308,26 @@ fn run_completions(blocks: Vec<usize>) {
 
 /// The innermost transaction (an implicit one is started when there is none).
 fn with_top<R>(f: impl FnOnce(&mut Transaction) -> R) -> R {
-    TRANSACTIONS.with(|t| {
+    let (result, started) = TRANSACTIONS.with(|t| {
         let mut list = t.borrow_mut();
-        if list.is_empty() {
+        let started = list.is_empty();
+        if started {
             list.push(Transaction::new(true));
         }
-        f(list.last_mut().unwrap())
-    })
+        (f(list.last_mut().unwrap()), started)
+    });
+    if started {
+        commit_implicit_later();
+    }
+    result
+}
+
+/// On the main thread, the implicit transaction commits once the current
+/// run loop turn is over.
+fn commit_implicit_later() {
+    if runloop::is_main_thread() {
+        runloop::post(runloop::Work::Native(Box::new(|| ca_flush(0, 0))));
+    }
 }
 
 /// A setting as seen now: the innermost transaction that set it wins.
@@ -337,6 +351,10 @@ extern "C" fn ca_commit(_: Class, _: Sel) {
         match list.last_mut() {
             Some(parent) => {
                 parent.pending.extend(finished);
+                if list.len() == 1 && list[0].implicit {
+                    // The implicit one waited for this transaction.
+                    commit_implicit_later();
+                }
                 Some(Vec::new())
             }
             None => Some(finished),
