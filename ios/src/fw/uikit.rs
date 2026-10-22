@@ -35,7 +35,7 @@ macro_rules! property {
             property_get(this, $key).map(|v| v as Id).unwrap_or($default)
         }
         extern "C" fn $set(this: Id, _: Sel, value: Id) {
-            property_set_object(this, $key, value);
+            $crate::fw::uikit::property_set_object(this, $key, value);
         }
     };
     ($get:ident, $set:ident, $key:literal, bool, $default:expr) => {
