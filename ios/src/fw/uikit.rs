@@ -748,9 +748,14 @@ extern "C" fn color_cg(this: Id, _: Sel) -> Id {
 // ----- images: { isa, *mut ImageInfo } -----
 
 pub struct ImageInfo {
+    /// The picture's file ("" for pictures made in memory).
     pub path: String,
     pub pixels: (u32, u32),
     pub scale: f64,
+    /// UIImageOrientation (0 = up).
+    pub orientation: i64,
+    /// Its CGImage (see fw/graphics.rs; read from the file when first asked for).
+    pub cg: OnceLock<Id>,
 }
 
 fn png_size(path: &str) -> Option<(u32, u32)> {
@@ -758,20 +763,47 @@ fn png_size(path: &str) -> Option<(u32, u32)> {
     if bytes.len() < 24 || &bytes[1..4] != b"PNG" {
         return None;
     }
-    let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
-    let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+    // Apple's crushed PNGs put a CgBI chunk before the header.
+    let at = if &bytes[12..16] == b"CgBI" { 32 } else { 16 };
+    let width = u32::from_be_bytes(bytes.get(at..at + 4)?.try_into().ok()?);
+    let height = u32::from_be_bytes(bytes.get(at + 4..at + 8)?.try_into().ok()?);
     Some((width, height))
 }
 
 fn image_from_path(path: &str) -> Id {
-    let Some(pixels) = png_size(path) else {
-        crate::log!("image {path}: can't read its size (only PNG is read so far)");
+    let Some(pixels) = png_size(path).or_else(|| image::image_dimensions(path).ok()) else {
+        crate::log!("image {path}: can't read its size");
         return 0;
     };
-    let scale = if path.contains("@2x") { 2.0 } else { 1.0 };
+    let scale = if path.contains("@3x") {
+        3.0
+    } else if path.contains("@2x") {
+        2.0
+    } else {
+        1.0
+    };
+    make_image(ImageInfo { path: path.into(), pixels, scale, orientation: 0, cg: OnceLock::new() })
+}
+
+pub fn make_image(info: ImageInfo) -> Id {
     let object = runtime::alloc_instance(runtime::class_named("UIImage"));
-    unsafe { *((object + 8) as *mut *mut ImageInfo) = Box::into_raw(Box::new(ImageInfo { path: path.into(), pixels, scale })) };
+    unsafe { *((object + 8) as *mut *mut ImageInfo) = Box::into_raw(Box::new(info)) };
     object
+}
+
+/// The image's size in points (sideways orientations swap width and height).
+pub fn image_points(image: Id) -> Size {
+    match image_info(image) {
+        Some(info) => {
+            let (w, h) = (info.pixels.0 as f64 / info.scale, info.pixels.1 as f64 / info.scale);
+            if matches!(info.orientation, 2 | 3 | 6 | 7) {
+                Size { width: h, height: w }
+            } else {
+                Size { width: w, height: h }
+            }
+        }
+        None => Size::default(),
+    }
 }
 
 pub fn image_info(image: Id) -> Option<&'static ImageInfo> {
@@ -806,10 +838,7 @@ extern "C" fn image_init_with_contents_of_file(_this: Id, _: Sel, path: Id) -> I
 }
 
 extern "C" fn image_size(this: Id, _: Sel) -> Size {
-    match image_info(this) {
-        Some(info) => Size { width: info.pixels.0 as f64 / info.scale, height: info.pixels.1 as f64 / info.scale },
-        None => Size::default(),
-    }
+    image_points(this)
 }
 
 extern "C" fn image_scale(this: Id, _: Sel) -> f64 {

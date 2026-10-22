@@ -113,7 +113,8 @@ fn snapshot(view: Id, image_view_class: usize, depth: usize) -> Node {
     };
     let picture = if is_image_view {
         let image = property_get(view, "image").unwrap_or(0) as Id;
-        crate::fw::uikit::image_info(image).map(|info| {
+        // Pictures made in memory have no file the phone app could show.
+        crate::fw::uikit::image_info(image).filter(|info| !info.path.is_empty()).map(|info| {
             let mode = property_get(view, "contentMode").unwrap_or(0) as i64;
             (info.path.clone(), mode, (info.pixels.0 as f64 / info.scale, info.pixels.1 as f64 / info.scale))
         })

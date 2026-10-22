@@ -56,7 +56,29 @@ pub struct Transform {
 
 pub const IDENTITY: Transform = Transform { a: 1.0, b: 0.0, c: 0.0, d: 1.0, tx: 0.0, ty: 0.0 };
 
-fn concat(t1: Transform, t2: Transform) -> Transform {
+/// The point (x, y) moved by t.
+pub fn apply(t: Transform, x: f64, y: f64) -> (f64, f64) {
+    (t.a * x + t.c * y + t.tx, t.b * x + t.d * y + t.ty)
+}
+
+/// The transform that undoes t, or None when t flattens the plane.
+pub fn invert(t: Transform) -> Option<Transform> {
+    let det = t.a * t.d - t.b * t.c;
+    if det == 0.0 || !det.is_finite() {
+        return None;
+    }
+    Some(Transform {
+        a: t.d / det,
+        b: -t.b / det,
+        c: -t.c / det,
+        d: t.a / det,
+        tx: (t.c * t.ty - t.d * t.tx) / det,
+        ty: (t.b * t.tx - t.a * t.ty) / det,
+    })
+}
+
+/// t1 first, then t2.
+pub fn concat(t1: Transform, t2: Transform) -> Transform {
     Transform {
         a: t1.a * t2.a + t1.b * t2.c,
         b: t1.a * t2.b + t1.b * t2.d,
@@ -140,6 +162,33 @@ extern "C" fn transform_concat(t1: Transform, t2: Transform) -> Transform {
 extern "C" fn transform_is_identity(t: Transform) -> bool {
     t == IDENTITY
 }
+/// Apple hands a transform that can't be undone back unchanged.
+extern "C" fn transform_invert(t: Transform) -> Transform {
+    invert(t).unwrap_or(t)
+}
+
+const NULL_RECT: Rect = Rect { origin: Point { x: f64::INFINITY, y: f64::INFINITY }, size: Size { width: 0.0, height: 0.0 } };
+
+fn is_null(r: Rect) -> bool {
+    r.origin.x.is_infinite() || r.origin.y.is_infinite()
+}
+extern "C" fn rect_is_null(r: Rect) -> bool {
+    is_null(r)
+}
+/// The smallest rectangle holding both (a null rectangle adds nothing; empty ones still count).
+extern "C" fn rect_union(r1: Rect, r2: Rect) -> Rect {
+    if is_null(r1) {
+        return r2.standard();
+    }
+    if is_null(r2) {
+        return r1.standard();
+    }
+    let (a, b) = (r1.standard(), r2.standard());
+    let (x0, y0) = (a.origin.x.min(b.origin.x), a.origin.y.min(b.origin.y));
+    let x1 = (a.origin.x + a.size.width).max(b.origin.x + b.size.width);
+    let y1 = (a.origin.y + a.size.height).max(b.origin.y + b.size.height);
+    Rect::new(x0, y0, x1 - x0, y1 - y0)
+}
 
 pub fn register(r: &mut Registry) {
     r.function("CGRectGetWidth", rect_get_width as usize);
@@ -164,6 +213,10 @@ pub fn register(r: &mut Registry) {
     r.function("CGAffineTransformTranslate", transform_translate as usize);
     r.function("CGAffineTransformConcat", transform_concat as usize);
     r.function("CGAffineTransformIsIdentity", transform_is_identity as usize);
+    r.function("CGAffineTransformInvert", transform_invert as usize);
+    r.function("CGRectUnion", rect_union as usize);
+    r.function("CGRectIsNull", rect_is_null as usize);
+    r.data("CGRectNull", leak(NULL_RECT));
     r.data("CGAffineTransformIdentity", leak(IDENTITY));
     r.data("CGRectZero", leak(Rect::default()));
     r.data("CGPointZero", leak(Point::default()));

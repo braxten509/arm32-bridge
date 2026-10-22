@@ -12,6 +12,7 @@ pub mod gamekit;
 pub mod openal;
 pub mod geometry;
 pub mod gl;
+pub mod graphics;
 pub mod json;
 pub mod keychain;
 pub mod locks;
@@ -46,6 +47,7 @@ pub fn register(r: &mut Registry) {
     foundation::register(r);
     app::register(r);
     uikit::register(r);
+    graphics::register(r);
     runloop::register(r);
     media::register(r);
     keychain::register(r);
