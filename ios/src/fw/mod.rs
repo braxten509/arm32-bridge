@@ -3,6 +3,7 @@
 pub mod app;
 pub mod coalesced;
 pub mod collections;
+pub mod controls;
 pub mod crypto;
 pub mod data;
 pub mod eagl;
@@ -46,6 +47,7 @@ pub fn register(r: &mut Registry) {
     foundation::register(r);
     app::register(r);
     uikit::register(r);
+    controls::register(r);
     runloop::register(r);
     media::register(r);
     keychain::register(r);

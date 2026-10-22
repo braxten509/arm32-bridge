@@ -56,6 +56,7 @@ macro_rules! property {
         }
     };
 }
+pub(crate) use property;
 
 extern "C" fn ignore_bool(_this: Id, _: Sel, _value: u8) {}
 extern "C" fn ignore_id(_this: Id, _: Sel, _value: Id) {}
@@ -659,21 +660,65 @@ extern "C" fn controller_should_autorotate_to(_this: Id, _: Sel, orientation: is
     orientation == 3 || orientation == 4
 }
 
+/// Runs a completion block (no arguments) later on the main run loop, the
+/// way UIKit calls it once a presentation or dismissal has finished.
+fn complete_later(completion: usize) {
+    if completion != 0 {
+        let block = crate::libsystem::mach::block_copy(completion as *mut _) as usize;
+        crate::fw::runloop::post(crate::fw::runloop::Work::Block(block));
+    }
+}
+
 extern "C" fn controller_present(this: Id, _: Sel, controller: Id, _animated: u8) {
-    crate::log!("view controller {this:#x} shows {controller:#x} on top (not drawn yet)");
+    crate::log!(
+        "view controller {this:#x} shows {} {controller:#x} on top (not drawn yet)",
+        crate::fw::string::describe_class_of(controller)
+    );
     property_set(this, "presented", controller as u64);
+    if controller == 0 {
+        return;
+    }
+    property_set(controller, "presenting", this as u64);
+    // Screens for services this phone doesn't offer answer the way iOS does
+    // when the user closes them (see fw/controls.rs).
+    if runtime::responds(controller, "gamebridgeAnswerShown") {
+        crate::fw::runloop::post(crate::fw::runloop::Work::Native(Box::new(move || {
+            runtime::send(controller, "gamebridgeAnswerShown", &[]);
+        })));
+    }
 }
 
-extern "C" fn controller_present_completion(this: Id, s: Sel, controller: Id, animated: u8, _completion: usize) {
+extern "C" fn controller_present_completion(this: Id, s: Sel, controller: Id, animated: u8, completion: usize) {
     controller_present(this, s, controller, animated);
+    complete_later(completion);
 }
 
+/// Sent to the presenting controller it dismisses what it shows; sent to the
+/// shown controller itself it is passed to the one that presented it.
 extern "C" fn controller_dismiss(this: Id, _: Sel, _animated: u8) {
-    property_set(this, "presented", 0);
+    let owner = match property_get(this, "presented") {
+        Some(shown) if shown != 0 => this,
+        _ => property_get(this, "presenting").unwrap_or(0) as Id,
+    };
+    if owner != 0 {
+        let shown = property_get(owner, "presented").unwrap_or(0) as Id;
+        property_set(owner, "presented", 0);
+        if shown != 0 {
+            property_set(shown, "presenting", 0);
+        }
+    }
 }
 
-extern "C" fn controller_dismiss_completion(this: Id, s: Sel, animated: u8, _completion: usize) {
+extern "C" fn controller_dismiss_completion(this: Id, s: Sel, animated: u8, completion: usize) {
     controller_dismiss(this, s, animated);
+    complete_later(completion);
+}
+
+property!(controller_presenting, controller_set_presenting, "presenting", id, 0);
+
+/// The navigation controller a controller was pushed onto (fw/controls.rs).
+extern "C" fn controller_navigation(this: Id, _: Sel) -> Id {
+    property_get(this, "navigationController").unwrap_or(0) as Id
 }
 
 property!(controller_presented, controller_set_presented, "presented", id, 0);
@@ -1127,13 +1172,13 @@ pub fn register(r: &mut Registry) {
             ("didMoveToParentViewController:", ignore_id as usize),
             ("willMoveToParentViewController:", ignore_id as usize),
             ("parentViewController", zero as usize),
-            ("presentingViewController", zero as usize),
-            ("navigationController", zero as usize),
+            ("presentingViewController", controller_presenting as usize),
+            ("navigationController", controller_navigation as usize),
             ("setTitle:", ignore_id as usize),
             ("title", zero as usize),
         ],
     );
-    let _ = controller_set_presented;
+    let _ = (controller_set_presented, controller_set_presenting);
     let _ = return_self;
 
     let layer = define_class("CALayer", "NSObject", 8);
@@ -1266,7 +1311,8 @@ pub fn register(r: &mut Registry) {
             ("beginBackgroundTaskWithExpirationHandler:", app_begin_background_task as usize),
             ("endBackgroundTask:", ignore_int as usize),
             ("registerForRemoteNotificationTypes:", ignore_int as usize),
-            ("registerUserNotificationSettings:", ignore_id as usize),
+            ("registerUserNotificationSettings:", crate::fw::controls::app_register_user_notification_settings as usize),
+            ("currentUserNotificationSettings", crate::fw::controls::app_current_notification_settings as usize),
             ("registerForRemoteNotifications", nothing as usize),
             ("unregisterForRemoteNotifications", nothing as usize),
             ("openURL:", app_open_url as usize),

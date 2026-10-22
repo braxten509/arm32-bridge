@@ -78,7 +78,11 @@ fn takes_touches(view: Id) -> bool {
         });
         !plain
     };
-    property_get(view, "hidden").unwrap_or(0) == 0 && property_get(view, "userInteraction").map(|v| v != 0).unwrap_or_else(default)
+    // Views we don't draw yet (fw/controls.rs) must not catch taps meant
+    // for the game underneath them.
+    property_get(view, "notDrawn").is_none()
+        && property_get(view, "hidden").unwrap_or(0) == 0
+        && property_get(view, "userInteraction").map(|v| v != 0).unwrap_or_else(default)
 }
 
 /// The deepest visible view under the point (window points), as UIKit's hitTest finds it.
