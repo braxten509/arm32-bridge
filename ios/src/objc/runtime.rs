@@ -75,7 +75,18 @@ pub struct Runtime {
     cache: HashMap<(Class, Sel), Imp>,
     protocols: HashMap<String, usize>,
     missing_methods: HashMap<String, u64>,
-    root_meta: Class,
+    /// Method handles given out, one per (defining class, selector).
+    method_objects: HashMap<(Class, Sel), usize>,
+    method_owner: HashMap<usize, (Class, Sel)>,
+}
+
+/// Apple's method_t { SEL name; const char *types; IMP imp; }: the Method
+/// handle the game gets from class_getInstanceMethod.
+#[repr(C)]
+pub struct MethodObject {
+    pub name: Sel,
+    pub types: usize,
+    pub imp: Imp,
 }
 
 fn runtime() -> &'static Mutex<Runtime> {
@@ -138,7 +149,69 @@ impl Runtime {
         if let Some(rec) = self.classes.get_mut(&class) {
             rec.methods.insert(sel, imp);
         }
+        if let Some(&method) = self.method_objects.get(&(class, sel)) {
+            unsafe { (*(method as *mut MethodObject)).imp = imp };
+        }
         self.cache.clear();
+    }
+
+    /// The class in `class`'s parent chain that defines `sel` itself.
+    pub fn owner_of(&self, mut class: Class, sel: Sel) -> Option<Class> {
+        let mut guard = 0;
+        while class != 0 && guard < 256 {
+            let rec = self.classes.get(&class)?;
+            if rec.methods.contains_key(&sel) {
+                return Some(class);
+            }
+            class = rec.superclass;
+            guard += 1;
+        }
+        None
+    }
+
+    /// The Method handle for `sel` as `class` itself defines it.
+    pub fn method_object(&mut self, class: Class, sel: Sel, types: usize) -> usize {
+        if let Some(&method) = self.method_objects.get(&(class, sel)) {
+            return method;
+        }
+        let imp = self.classes.get(&class).and_then(|r| r.methods.get(&sel)).copied().unwrap_or(0);
+        let types = if types != 0 { types } else { self.declared_types(class, sel) };
+        let method = leak(MethodObject { name: sel, types, imp });
+        self.method_objects.insert((class, sel), method);
+        self.method_owner.insert(method, (class, sel));
+        method
+    }
+
+    /// method_setImplementation: the class's method table changes with it.
+    pub fn set_method_imp(&mut self, method: usize, imp: Imp) -> Imp {
+        let old = unsafe { (*(method as *const MethodObject)).imp };
+        match self.method_owner.get(&method).copied() {
+            Some((class, sel)) => self.add_method(class, sel, imp),
+            None => unsafe { (*(method as *mut MethodObject)).imp = imp },
+        }
+        old
+    }
+
+    /// The type string of a method in the class's own compiled method list.
+    fn declared_types(&self, class: Class, sel: Sel) -> usize {
+        if !self.classes.contains_key(&class) {
+            return 0;
+        }
+        let name = self.sel_name(sel);
+        unsafe {
+            let ro = (*(class as *const ClassObject)).data & !7;
+            let list = read::<usize>(ro + 32);
+            if list == 0 {
+                return 0;
+            }
+            let entry_size = (read::<u32>(list) & !3) as usize;
+            let count = read::<u32>(list + 4) as usize;
+            (0..count)
+                .map(|i| list + 8 + i * entry_size)
+                .find(|&entry| cstr(read::<usize>(entry)) == name)
+                .map(|entry| read::<usize>(entry + 8))
+                .unwrap_or(0)
+        }
     }
 
     pub fn class_name(&self, class: Class) -> String {
@@ -163,11 +236,30 @@ impl Runtime {
         if let Some(&existing) = self.by_name.get(name) {
             return existing;
         }
+        let empty = || leak(ClassObject { isa: 0, superclass: 0, cache: 0, vtable: 0, data: 0 });
+        let (class, meta) = (empty(), empty());
+        self.build_class_pair(class, meta, name, superclass, instance_size);
+        self.by_name.insert(name.to_string(), class);
+        class
+    }
+
+    /// Fills in a class and its metaclass in the given memory (each at least
+    /// a ClassObject) and records them; the name is not findable yet. As on
+    /// Apple's runtime, the fields start where the parent's end (a root class
+    /// has just its isa), and a metaclass's isa is its hierarchy's root
+    /// metaclass.
+    pub fn build_class_pair(&mut self, class: Class, meta: Class, name: &str, superclass: Class, instance_size: usize) {
         let name_c = leak_cstr(name);
-        let make_ro = |meta: bool, size: usize| {
+        let super_meta = self.classes.get(&superclass).map(|r| r.partner).unwrap_or(0);
+        let start = self.classes.get(&superclass).map(|r| r.instance_size).unwrap_or(0);
+        let size = instance_size.max(start).max(8);
+        // A metaclass has no fields of its own yet: it starts and ends where
+        // the parent metaclass ends (a root metaclass is one class object).
+        let meta_size = self.classes.get(&super_meta).map(|r| r.instance_size).unwrap_or(40).max(40);
+        let make_ro = |meta: bool, start: usize, size: usize| {
             leak(ClassRo {
                 flags: if meta { 1 } else { 0 } | if superclass == 0 { 2 } else { 0 },
-                instance_start: size as u32,
+                instance_start: start as u32,
                 instance_size: size as u32,
                 reserved: 0,
                 ivar_layout: 0,
@@ -179,25 +271,28 @@ impl Runtime {
                 base_properties: 0,
             })
         };
-        let class = leak(ClassObject { isa: 0, superclass, cache: 0, vtable: 0, data: make_ro(false, instance_size) });
-        let meta = leak(ClassObject { isa: 0, superclass: 0, cache: 0, vtable: 0, data: make_ro(true, 40) });
+        unsafe {
+            std::ptr::write(
+                class as *mut ClassObject,
+                ClassObject { isa: 0, superclass, cache: 0, vtable: 0, data: make_ro(false, start, size) },
+            );
+            std::ptr::write(
+                meta as *mut ClassObject,
+                ClassObject { isa: 0, superclass: 0, cache: 0, vtable: 0, data: make_ro(true, meta_size, meta_size) },
+            );
+        }
         let (meta_isa, meta_super) = if superclass == 0 {
             (meta, class)
+        } else if super_meta != 0 {
+            (unsafe { (*(super_meta as *const ClassObject)).isa }, super_meta)
         } else {
-            let super_meta = self.classes.get(&superclass).map(|r| r.partner).unwrap_or(0);
-            (self.root_meta, super_meta)
+            (meta, 0)
         };
         unsafe {
             (*(class as *mut ClassObject)).isa = meta;
             (*(meta as *mut ClassObject)).isa = meta_isa;
             (*(meta as *mut ClassObject)).superclass = meta_super;
         }
-        if superclass == 0 && self.root_meta == 0 {
-            self.root_meta = meta;
-        }
-        let size = instance_size.max(
-            self.classes.get(&superclass).map(|r| r.instance_size).unwrap_or(8),
-        );
         self.classes.insert(
             class,
             ClassRec {
@@ -221,15 +316,13 @@ impl Runtime {
                 meta: true,
                 partner: class,
                 methods: HashMap::new(),
-                instance_size: 40,
+                instance_size: meta_size,
                 protocols: Vec::new(),
                 from_game: false,
                 placeholder: false,
                 init: Init::No,
             },
         );
-        self.by_name.insert(name.to_string(), class);
-        class
     }
 
     pub fn class_of(&self, object: Id) -> Class {
@@ -692,7 +785,8 @@ fn realize(rt: &mut Runtime, class: Class, game_classes: &HashSet<Class>) -> Res
         }
         let protocols = protocol_list(read::<usize>(ro + 40));
         let meta_super = (*(meta as *const ClassObject)).superclass;
-        if meta_super != 0 && !rt.classes.contains_key(&meta_super) {
+        // A root metaclass's parent is its own class, recorded just below.
+        if meta_super != 0 && meta_super != class && !rt.classes.contains_key(&meta_super) {
             return Err(format!("metaclass of {name} has an unknown parent {meta_super:#x}"));
         }
         rt.classes.insert(
@@ -732,6 +826,41 @@ fn realize(rt: &mut Runtime, class: Class, game_classes: &HashSet<Class>) -> Res
     Ok(())
 }
 
+/// objc_readClassPair: takes in one class laid out the way the compiler
+/// writes it. Gives 0 if its parent is unknown (and it is not a root class).
+pub fn read_class_pair(class: Class) -> Class {
+    let mut rt = lock();
+    if rt.classes.contains_key(&class) {
+        return class;
+    }
+    let (superclass, root) = unsafe {
+        let object = &*(class as *const ClassObject);
+        (object.superclass, read::<u32>(object.data & !7) & 2 != 0)
+    };
+    let parent_ok = match superclass {
+        0 => root,
+        _ => rt.classes.get(&superclass).map(|r| !r.meta).unwrap_or(false),
+    };
+    if !parent_ok {
+        crate::log!("objc_readClassPair: class at {class:#x} has an unknown parent {superclass:#x}");
+        return 0;
+    }
+    match realize(&mut rt, class, &HashSet::new()) {
+        Ok(()) => class,
+        Err(error) => {
+            crate::log!("objc_readClassPair: {error}");
+            0
+        }
+    }
+}
+
+/// The game's classes, in the order its class list gives them.
+static IMAGE_CLASSES: Mutex<Vec<Class>> = Mutex::new(Vec::new());
+
+pub fn image_classes() -> Vec<Class> {
+    IMAGE_CLASSES.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 static LOAD_CALLS: Mutex<Vec<(Class, Imp, String)>> = Mutex::new(Vec::new());
 /// Each game class's own +load (categories may add another one).
 static BASE_LOAD: Mutex<Option<HashMap<Class, Imp>>> = Mutex::new(None);
@@ -760,6 +889,10 @@ pub fn load_image(loaded: &Loaded) -> Result<(), String> {
     for &class in &game_classes {
         realize(&mut rt, class, &game_classes)?;
     }
+    IMAGE_CLASSES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .extend(class_cells.iter().map(|&c| unsafe { read::<usize>(c) }));
     // Categories add methods to existing classes (ours or the game's).
     for cell in section_words(loaded, DATA_SEGMENTS, "__objc_catlist") {
         unsafe {
@@ -869,7 +1002,7 @@ pub fn conforms(class: Class, protocol: usize) -> bool {
     false
 }
 
-fn protocol_matches(protocol: usize, target: &str, depth: usize) -> bool {
+pub fn protocol_matches(protocol: usize, target: &str, depth: usize) -> bool {
     if protocol == 0 || depth > 16 {
         return false;
     }
