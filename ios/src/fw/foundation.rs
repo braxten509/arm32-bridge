@@ -111,6 +111,45 @@ extern "C" fn main_bundle(_: Class, _: Sel) -> Id {
     })
 }
 
+/// Bundles opened by path, one per folder (Apple hands back the same one).
+static BUNDLES: Mutex<Option<std::collections::HashMap<String, Id>>> = Mutex::new(None);
+
+/// The bundle of an existing folder (a relative path is inside the app's
+/// own folder, where mainBundle looks); None for anything else, as on Apple.
+fn bundle_for_path(path: Id, fresh: Option<Id>) -> Option<Id> {
+    if path == 0 {
+        return None;
+    }
+    let mut text = string::get(path);
+    if !text.starts_with('/') {
+        text = format!("{}/{text}", app_dir());
+    }
+    while text.len() > 1 && text.ends_with('/') {
+        text.pop();
+    }
+    if !std::path::Path::new(&text).is_dir() {
+        return None;
+    }
+    if crate::loader::try_loaded().is_some() && text == app_dir().trim_end_matches('/') {
+        return Some(main_bundle(0, 0));
+    }
+    let mut guard = BUNDLES.lock().unwrap();
+    let object = *guard.get_or_insert_with(Default::default).entry(text.clone()).or_insert_with(|| {
+        let object = fresh.unwrap_or_else(|| runtime::alloc_instance(runtime::class_named("NSBundle")));
+        unsafe { *((object + 8) as *mut Id) = string::make(&text) };
+        object
+    });
+    Some(object)
+}
+
+extern "C" fn bundle_with_path(_: Class, _: Sel, path: Id) -> Id {
+    bundle_for_path(path, None).unwrap_or(0)
+}
+
+extern "C" fn bundle_init_with_path(this: Id, _: Sel, path: Id) -> Id {
+    bundle_for_path(path, Some(this)).unwrap_or(0)
+}
+
 extern "C" fn bundle_path(this: Id, _: Sel) -> Id {
     string::make(&bundle_path_of(this))
 }
@@ -503,10 +542,11 @@ pub fn register(r: &mut Registry) {
     r.function("NSSetUncaughtExceptionHandler", set_uncaught_exception_handler as usize);
 
     let bundle = define_class("NSBundle", "NSObject", 16);
-    class_methods(bundle, &[("mainBundle", main_bundle as usize)]);
+    class_methods(bundle, &[("mainBundle", main_bundle as usize), ("bundleWithPath:", bundle_with_path as usize)]);
     methods(
         bundle,
         &[
+            ("initWithPath:", bundle_init_with_path as usize),
             ("bundlePath", bundle_path as usize),
             ("resourcePath", bundle_path as usize),
             ("executablePath", executable_path as usize),
@@ -638,4 +678,33 @@ pub fn register(r: &mut Registry) {
     r.data("NSLocaleLanguageCode", leak(string::make("kCFLocaleLanguageCodeKey")));
     r.data("NSLocaleCurrencyCode", leak(string::make("currency")));
     r.data("NSLocaleVariantCode", leak(string::make("kCFLocaleVariantCodeKey")));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundles_open_existing_folders_only() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let class = runtime::class_named("NSBundle");
+        assert!(runtime::responds(class, "bundleWithPath:"), "+[NSBundle bundleWithPath:] is missing");
+        let folder = std::env::temp_dir().join(format!("gamebridge-bundle-{}", std::process::id()));
+        std::fs::create_dir_all(folder.join("Art.bundle")).unwrap();
+        std::fs::write(folder.join("Art.bundle/hero.png"), b"png").unwrap();
+        let path = folder.join("Art.bundle").to_string_lossy().into_owned();
+        let bundle = runtime::send(class, "bundleWithPath:", &[string::make(&path)]);
+        assert_ne!(bundle, 0);
+        assert_eq!(string::get(runtime::send(bundle, "bundlePath", &[])), path);
+        let found = runtime::send(bundle, "pathForResource:ofType:", &[string::make("hero"), string::make("png")]);
+        assert_eq!(string::get(found), format!("{path}/hero.png"));
+        // The same folder gives the same bundle; a missing one or a file gives nil.
+        assert_eq!(runtime::send(class, "bundleWithPath:", &[string::make(&format!("{path}/"))]), bundle);
+        assert_eq!(runtime::send(class, "bundleWithPath:", &[string::make(&format!("{path}/nothing"))]), 0);
+        assert_eq!(runtime::send(class, "bundleWithPath:", &[string::make(&format!("{path}/hero.png"))]), 0);
+        let fresh = runtime::send(runtime::alloc_instance(class), "initWithPath:", &[string::make(&format!("{path}/nothing"))]);
+        assert_eq!(fresh, 0);
+        std::fs::remove_dir_all(&folder).unwrap();
+    }
 }
