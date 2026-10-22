@@ -13,6 +13,8 @@ pub mod fw;
 #[cfg(target_arch = "aarch64")]
 pub mod libsystem;
 #[cfg(target_arch = "aarch64")]
+pub mod cxx;
+#[cfg(target_arch = "aarch64")]
 pub mod loader;
 #[cfg(target_arch = "aarch64")]
 pub mod objc;

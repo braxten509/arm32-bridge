@@ -433,7 +433,7 @@ fn default_rune_locale() -> usize {
     table as usize
 }
 
-extern "C" fn maskrune(c: i32, mask: u64) -> u64 {
+pub(crate) extern "C" fn maskrune(c: i32, mask: u64) -> u64 {
     if (0..128).contains(&c) {
         u64::from(rune_flags(c as u32)) & mask
     } else {

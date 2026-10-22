@@ -8,6 +8,7 @@ pub fn setup() {
         crate::fw::register(r);
         crate::objc::register(r);
         crate::libsystem::register(r);
+        crate::cxx::register(r);
     });
     crate::log!("{} stand-in symbols ready", crate::symbols::with(|r| r.len()));
 }

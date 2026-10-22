@@ -274,7 +274,7 @@ extern "C" fn ios_rename(from: *const libc::c_char, to: *const libc::c_char) -> 
     }
 }
 
-extern "C" fn ios_fopen(path: *const libc::c_char, mode: *const libc::c_char) -> *mut libc::FILE {
+pub(crate) extern "C" fn ios_fopen(path: *const libc::c_char, mode: *const libc::c_char) -> *mut libc::FILE {
     unsafe {
         let path = crate::fw::paths::host_path_c(path);
         libc::fopen(path.as_ptr(), mode)
