@@ -146,6 +146,19 @@ extern "C" fn attr_setdetachstate(attr: *mut libc::pthread_attr_t, apple_state: 
     unsafe { libc::pthread_attr_setdetachstate(attr, state) }
 }
 
+/// Apple takes whole 16 KiB pages from 16 KiB up. The system here may want more
+/// (64-bit ARM Linux asks for 128 KiB); the thread then gets that much.
+extern "C" fn attr_setstacksize(attr: *mut libc::pthread_attr_t, size: usize) -> i32 {
+    const APPLE_PAGE: usize = 16384;
+    if size < APPLE_PAGE || size % APPLE_PAGE != 0 {
+        return libc::EINVAL;
+    }
+    match unsafe { libc::pthread_attr_setstacksize(attr, size) } {
+        0 => 0,
+        _ => unsafe { libc::pthread_attr_setstacksize(attr, size.max(128 * 1024)) },
+    }
+}
+
 extern "C" {
     fn pthread_attr_setschedpolicy(attr: *mut libc::pthread_attr_t, policy: i32) -> i32;
     fn pthread_atfork(prepare: usize, parent: usize, child: usize) -> i32;
@@ -794,7 +807,7 @@ pub fn register(r: &mut Registry) {
         ($($name:ident),* $(,)?) => { $( r.function(stringify!($name), libc::$name as usize); )* };
     }
     same!(
-        pthread_attr_init, pthread_attr_destroy, pthread_attr_setstacksize, pthread_attr_getstacksize,
+        pthread_attr_init, pthread_attr_destroy, pthread_attr_getstacksize,
         pthread_detach, pthread_self, pthread_equal, pthread_key_create, pthread_key_delete,
         pthread_getspecific, pthread_setspecific, pthread_mutex_init, pthread_mutexattr_init,
         pthread_mutexattr_destroy, pthread_cond_init, pthread_condattr_init, pthread_condattr_destroy,
@@ -809,6 +822,7 @@ pub fn register(r: &mut Registry) {
     r.function("fsync", ios_fsync as usize);
     r.function("pthread_cond_timedwait_relative_np", cond_timedwait_relative as usize);
     r.function("pthread_attr_setschedpolicy", attr_setschedpolicy as usize);
+    r.function("pthread_attr_setstacksize", attr_setstacksize as usize);
     r.function("pthread_atfork", pthread_atfork as usize);
     r.function("pthread_setname_np", setname_np as usize);
     r.function("pthread_get_stackaddr_np", get_stackaddr_np as usize);
@@ -858,6 +872,33 @@ pub fn register(r: &mut Registry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Apple takes any stack size that is a whole number of its 16 KiB pages, from
+    /// 16 KiB up (FMOD asks for 16-64 KiB); a thread made with it runs.
+    #[test]
+    fn stack_sizes_follow_apple_rules() {
+        let mut r = crate::symbols::Registry::default();
+        crate::libsystem::register(&mut r);
+        let set: extern "C" fn(*mut libc::pthread_attr_t, usize) -> i32 = unsafe { std::mem::transmute(r.get("pthread_attr_setstacksize").unwrap().0) };
+        let create: extern "C" fn(*mut libc::pthread_t, *const libc::pthread_attr_t, extern "C" fn(usize) -> usize, usize) -> i32 =
+            unsafe { std::mem::transmute(r.get("pthread_create").unwrap().0) };
+        let mut attr: libc::pthread_attr_t = unsafe { std::mem::zeroed() };
+        unsafe { libc::pthread_attr_init(&mut attr) };
+        assert_eq!(set(&mut attr, 16384), 0, "a 16 KiB stack was refused");
+        assert_eq!(set(&mut attr, 32768), 0);
+        assert_eq!(set(&mut attr, 16383), libc::EINVAL, "a stack under 16 KiB was taken");
+        assert_eq!(set(&mut attr, 20000), libc::EINVAL, "a stack that isn't whole pages was taken");
+        static RAN: AtomicU64 = AtomicU64::new(0);
+        extern "C" fn body(value: usize) -> usize {
+            RAN.store(value as u64, Ordering::SeqCst);
+            0
+        }
+        let mut thread: libc::pthread_t = 0;
+        assert_eq!(create(&mut thread, &attr, body, 7), 0);
+        unsafe { libc::pthread_join(thread, std::ptr::null_mut()) };
+        assert_eq!(RAN.load(Ordering::SeqCst), 7);
+        unsafe { libc::pthread_attr_destroy(&mut attr) };
+    }
 
     static CHILD_TID: AtomicU64 = AtomicU64::new(0);
 
