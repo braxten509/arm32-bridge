@@ -67,18 +67,20 @@ fn boxes(b: &[u8]) -> Vec<([u8; 4], &[u8])> {
     let mut found = Vec::new();
     let mut at = 0;
     while at + 8 <= b.len() {
-        let mut size = be32(b, at).unwrap_or(0) as usize;
+        let mut size = be32(b, at).unwrap_or(0) as u64;
         let kind: [u8; 4] = b[at + 4..at + 8].try_into().unwrap();
-        let mut header = 8;
+        let mut header = 8usize;
         if size == 1 {
-            size = be64(b, at + 8).unwrap_or(0) as usize;
+            size = be64(b, at + 8).unwrap_or(0);
             header = 16;
         } else if size == 0 {
-            size = b.len() - at;
+            size = (b.len() - at) as u64;
         }
-        if size < header || at + size > b.len() {
+        // A size past the end (or absurd) ends the list.
+        if size < header as u64 || size > (b.len() - at) as u64 {
             break;
         }
+        let size = size as usize;
         found.push((kind, &b[at + header..at + size]));
         at += size;
     }
@@ -118,7 +120,8 @@ pub fn mp4_tracks(moov: &[u8]) -> Vec<TrackInfo> {
         let samples = stbl
             .and_then(|s| child(s, b"stts"))
             .map(|stts| {
-                let count = be32(stts, 4).unwrap_or(0) as usize;
+                // No more entries than the box holds, whatever its count says.
+                let count = (be32(stts, 4).unwrap_or(0) as usize).min(stts.len().saturating_sub(8) / 8);
                 (0..count).map(|i| be32(stts, 8 + i * 8).unwrap_or(0) as u64).sum()
             })
             .unwrap_or(0);
@@ -152,7 +155,8 @@ pub fn file_tracks(path: &str) -> Result<Vec<TrackInfo>, String> {
             } else if size == 0 {
                 size = length - at;
             }
-            if size < skip {
+            // A box past the end of the file: the file is cut short or broken.
+            if size < skip || size > length - at {
                 break;
             }
             if &header[4..8] == b"moov" {
@@ -165,8 +169,7 @@ pub fn file_tracks(path: &str) -> Result<Vec<TrackInfo>, String> {
         }
         return Err(format!("{path}: no movie header"));
     }
-    let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
-    let parsed = audiofile::parse(&bytes).map_err(|code| format!("{path}: not a sound file this layer reads ({})", crate::fw::sound::four_cc(code as u32)))?;
+    let parsed = audiofile::parse_path(path).map_err(|code| format!("{path}: not a sound file this layer reads ({})", crate::fw::sound::four_cc(code as u32)))?;
     let rate = parsed.format.rate.round().max(1.0) as i32;
     Ok(vec![TrackInfo {
         id: 1,
@@ -652,7 +655,8 @@ extern "C" fn reader_start(this: Id, s: Sel) -> bool {
             fail(this, ERROR_DECODER_NOT_FOUND, &format!("{path}: only a movie's first sound track can be read here"));
             return false;
         }
-        let parsed = match std::fs::read(&path).map_err(|e| e.to_string()).and_then(|b| audiofile::parse(&b).map_err(|c| crate::fw::sound::four_cc(c as u32))) {
+        // Only the sound is read in (a movie's pictures stay on disk).
+        let parsed = match audiofile::parse_path(&path).map_err(|c| crate::fw::sound::four_cc(c as u32)) {
             Ok(parsed) => parsed,
             Err(e) => {
                 fail(this, ERROR_FILE_FAILED_TO_PARSE, &format!("{path}: {e}"));
@@ -679,7 +683,7 @@ extern "C" fn reader_start(this: Id, s: Sel) -> bool {
         };
         let decoder = if settings == 0 { None } else { decoder };
         let start = if range.start.is_numeric() { (range.start.seconds().max(0.0) * rate) as u64 } else { 0 };
-        let end = if range.duration.is_numeric() { start + (range.duration.seconds().max(0.0) * rate) as u64 } else { u64::MAX };
+        let end = if range.duration.is_numeric() { start.saturating_add((range.duration.seconds().max(0.0) * rate) as u64) } else { u64::MAX };
         let skip = start + parsed.priming as u64;
         let end = end.saturating_add(parsed.priming as u64).min(parsed.priming as u64 + parsed.valid_frames());
         READERS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(
@@ -730,18 +734,44 @@ extern "C" fn output_set_copies(this: Id, _: Sel, copies: bool) {
     property_set(this, "noCopies", (!copies) as u64);
 }
 
-/// The next stored packet as a sample buffer (no output settings).
-fn next_stored(r: &mut SoundReader) -> Option<(Vec<u8>, usize, u64)> {
-    let packet = r.parsed.packet(r.next_packet)?;
-    r.next_packet += 1;
-    let at = r.decoded_frames;
-    r.decoded_frames += packet.frames as u64;
-    Some((r.parsed.data[packet.offset..packet.offset + packet.size as usize].to_vec(), packet.frames.max(1) as usize, at))
+/// The sound as stored (no output settings), inside the reader's time
+/// range: linear PCM in runs of up to `FRAMES_PER_SAMPLE` frames (each
+/// packet is one frame), compressed sound one packet per sample buffer.
+/// Gives (bytes, samples, frames, time in frames).
+fn next_stored(r: &mut SoundReader) -> Option<(Vec<u8>, usize, usize, u64)> {
+    if r.parsed.format.format == audiofile::LPCM {
+        let start = r.decoded_frames.max(r.skip);
+        let stop = r.end.min(r.parsed.packet_count()).min(start + FRAMES_PER_SAMPLE as u64);
+        if start >= stop {
+            return None;
+        }
+        let (first, last) = (r.parsed.packet(start)?, r.parsed.packet(stop - 1)?);
+        let bytes = r.parsed.data.get(first.offset..last.offset + last.size as usize)?.to_vec();
+        r.decoded_frames = stop;
+        let frames = (stop - start) as usize;
+        return Some((bytes, frames, frames, start));
+    }
+    loop {
+        if r.decoded_frames >= r.end {
+            return None;
+        }
+        let packet = r.parsed.packet(r.next_packet)?;
+        r.next_packet += 1;
+        let at = r.decoded_frames;
+        r.decoded_frames += packet.frames as u64;
+        // Packets wholly before the range start are left out.
+        if r.decoded_frames <= r.skip && packet.frames > 0 {
+            continue;
+        }
+        let bytes = r.parsed.data.get(packet.offset..packet.offset + packet.size as usize)?.to_vec();
+        // Times are the asset's: priming frames come before zero.
+        return Some((bytes, 1, packet.frames as usize, at.saturating_sub(r.parsed.priming as u64)));
+    }
 }
 
 /// Decodes until `FRAMES_PER_SAMPLE` output frames are ready (or the end),
 /// in the output format: channels remapped, rate converted.
-fn next_decoded(r: &mut SoundReader) -> Option<(Vec<u8>, usize, u64)> {
+fn next_decoded(r: &mut SoundReader) -> Option<(Vec<u8>, usize, usize, u64)> {
     let source_channels = r.parsed.format.channels.max(1) as usize;
     let decoder = r.decoder.as_mut()?;
     let step = decoder.rate / r.out.rate.max(1.0);
@@ -750,7 +780,7 @@ fn next_decoded(r: &mut SoundReader) -> Option<(Vec<u8>, usize, u64)> {
         let Some(packet) = r.parsed.packet(r.next_packet) else { break };
         r.next_packet += 1;
         let mut decoded = Vec::new();
-        decoder.decode(&r.parsed.data[packet.offset..packet.offset + packet.size as usize], packet.frames, &mut decoded);
+        decoder.decode(r.parsed.data.get(packet.offset..packet.offset + packet.size as usize).unwrap_or(&[]), packet.frames, &mut decoded);
         let frames = (decoded.len() / source_channels) as u64;
         let first = r.decoded_frames;
         r.decoded_frames += frames;
@@ -792,7 +822,7 @@ fn next_decoded(r: &mut SoundReader) -> Option<(Vec<u8>, usize, u64)> {
     audioqueue::write_pcm(&remapped, &r.out, &mut bytes);
     let at = r.sent_frames;
     r.sent_frames += made as u64;
-    Some((bytes, made, at))
+    Some((bytes, made, made, at))
 }
 
 extern "C" fn output_copy_next(this: Id, _: Sel) -> Id {
@@ -807,9 +837,9 @@ extern "C" fn output_copy_next(this: Id, _: Sel) -> Id {
         next.map(|n| (n, r.out))
     };
     match next {
-        Some(((bytes, frames, at), format)) => {
-            let rate = format.rate.round().max(1.0) as i32;
-            corevideo::make_audio_sample(bytes, format, frames, CmTime::new(at as i64, rate))
+        Some(((bytes, samples, frames, at), format)) => {
+            let rate = format.rate.round().clamp(1.0, i32::MAX as f64) as i32;
+            corevideo::make_audio_sample(bytes, format, samples, frames, CmTime::new(at as i64, rate))
         }
         None => {
             // This output is done; the reader completes when all are.
@@ -1214,5 +1244,20 @@ mod tests {
         assert_eq!((t.id, t.media, t.width, t.height, t.timescale, t.duration, t.samples), (7, VIDEO, 640.0, 360.0, 600, 1200, 60));
         assert_eq!(t.codec, u32::from_be_bytes(*b"avc1"));
         assert!((t.samples as f64 / t.seconds() - 30.0).abs() < 1e-9);
+
+        // Broken files: a sample-time table claiming 4 billion entries reads
+        // only what it holds; a 64-bit box size past the end ends the list.
+        let lying = moov.windows(4).position(|w| w == b"stts").unwrap() + 8;
+        let mut broken = moov.clone();
+        broken[lying..lying + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(mp4_tracks(&broken)[0].samples, 60);
+        let mut huge = 1u32.to_be_bytes().to_vec();
+        huge.extend_from_slice(b"trak");
+        huge.extend_from_slice(&u64::MAX.to_be_bytes());
+        assert!(boxes(&huge).is_empty());
+        // A movie whose sound can't be found is an error, not a crash.
+        let mut movie = sized_box(b"ftyp", b"M4V \0\0\0\0M4V mp42");
+        movie.extend_from_slice(&sized_box(b"moov", &broken));
+        assert!(audiofile::parse(&movie).is_err());
     }
 }

@@ -22,6 +22,9 @@ const BUFFER_EMPTY: i32 = -66686;
 const INVALID_PROPERTY: i32 = -66684;
 const INVALID_PROPERTY_SIZE: i32 = -66683;
 const INVALID_PARAMETER: i32 = -66682;
+const DISPOSAL_PENDING: i32 = -66685;
+const CANNOT_START: i32 = -66681;
+const ENQUEUE_DURING_RESET: i32 = -66632;
 const INVALID_OFFLINE_MODE: i32 = -66626;
 const UNSUPPORTED_FORMAT: i32 = four(b"fmt?") as i32;
 
@@ -334,8 +337,8 @@ impl Decoder {
                         params.for_codec(CODEC_TYPE_AAC).with_extra_data(config.into_boxed_slice());
                     }
                 }
-                let decoder = symphonia::default::get_codecs().make(&params, &DecoderOptions::default()).map_err(|e| e.to_string())?;
-                Kind::Other(decoder)
+                let made = std::panic::catch_unwind(|| symphonia::default::get_codecs().make(&params, &DecoderOptions::default()));
+                Kind::Other(made.map_err(|_| "the decoder refused the stream".to_string())?.map_err(|e| e.to_string())?)
             }
             _ => return Err(format!("format {} isn't supported", sound::four_cc(f.format))),
         };
@@ -364,15 +367,20 @@ impl Decoder {
             Kind::Other(decoder) => {
                 use symphonia::core::audio::SampleBuffer;
                 let packet = symphonia::core::formats::Packet::new_from_slice(0, 0, frames as u64, packet);
-                match decoder.decode(&packet) {
-                    Ok(decoded) => {
-                        let spec = *decoded.spec();
-                        let mut samples = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
-                        samples.copy_interleaved_ref(decoded);
+                // A broken packet can make the decoder panic: that is silence too.
+                let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let decoded = decoder.decode(&packet).ok()?;
+                    let spec = *decoded.spec();
+                    let mut samples = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
+                    samples.copy_interleaved_ref(decoded);
+                    Some((spec, samples))
+                }));
+                match decoded {
+                    Ok(Some((spec, samples))) => {
                         self.rate = spec.rate as f64;
                         remap(samples.samples(), spec.channels.count(), channels, out);
                     }
-                    Err(_) => {
+                    _ => {
                         // Silence at the rate the decoder works in.
                         let n = (frames as f64 * self.rate / self.format.rate.max(1.0)) as usize;
                         out.resize(out.len() + n * channels, 0.0);
@@ -428,17 +436,89 @@ struct State {
     /// Changes on every stop or reset; work begun before one is dropped.
     epoch: u64,
     quit: bool,
+    /// Stop or Reset is handing flushed buffers back: enqueueing is refused.
+    resetting: u32,
+    /// Properties stored as set (metering, time-pitch, codec policy, ...).
+    settings: HashMap<u32, Vec<u8>>,
+}
+
+/// Which thread is running one of the queue's callbacks, and how deeply.
+#[derive(Default)]
+struct Busy {
+    owner: Option<std::thread::ThreadId>,
+    depth: u32,
 }
 
 struct Queue {
     state: Mutex<State>,
     wake: Condvar,
     worker: std::sync::Once,
+    busy: Mutex<Busy>,
+    idle: Condvar,
+}
+
+/// Holds a queue's callback turn; one thread at a time, re-entrant.
+struct Turn<'a>(&'a Queue);
+
+impl Drop for Turn<'_> {
+    fn drop(&mut self) {
+        let mut busy = self.0.busy.lock().unwrap_or_else(|e| e.into_inner());
+        busy.depth -= 1;
+        if busy.depth == 0 {
+            busy.owner = None;
+            self.0.idle.notify_all();
+        }
+    }
 }
 
 impl Queue {
+    fn new(state: State) -> Queue {
+        Queue { state: Mutex::new(state), wake: Condvar::new(), worker: std::sync::Once::new(), busy: Mutex::default(), idle: Condvar::new() }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Takes the callback turn, waiting while another thread has it.
+    fn turn(&self) -> Turn<'_> {
+        let me = std::thread::current().id();
+        let mut busy = self.busy.lock().unwrap_or_else(|e| e.into_inner());
+        while busy.depth > 0 && busy.owner != Some(me) {
+            busy = self.idle.wait(busy).unwrap_or_else(|e| e.into_inner());
+        }
+        busy.owner = Some(me);
+        busy.depth += 1;
+        Turn(self)
+    }
+
+    /// Waits until no other thread is inside one of the queue's callbacks
+    /// (Stop, Reset and Dispose return only after it). `false` if a callback
+    /// stayed busy for seconds (it may be waiting on the caller).
+    fn wait_idle(&self) -> bool {
+        let me = std::thread::current().id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut busy = self.busy.lock().unwrap_or_else(|e| e.into_inner());
+        while busy.depth > 0 && busy.owner != Some(me) {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            busy = self.idle.wait_timeout(busy, left).unwrap_or_else(|e| e.into_inner()).0;
+        }
+        true
+    }
+}
+
+/// Runs a game callback in the queue's turn, unless the queue was disposed,
+/// a stop or reset came after `epoch`, or `buffer` was freed meanwhile.
+fn deliver(q: &Queue, epoch: Option<u64>, buffer: Option<usize>, call: impl FnOnce()) {
+    let _turn = q.turn();
+    let state = q.lock();
+    let live = !state.quit && epoch.map_or(true, |e| e == state.epoch) && buffer.map_or(true, |b| state.buffers.contains(&b));
+    drop(state);
+    if live {
+        call();
     }
 }
 
@@ -488,13 +568,13 @@ extern "C" fn new_output(format: *const u8, callback: usize, user: usize, run_lo
         return PARAMETER;
     }
     let format = unsafe { Asbd::read(format) };
-    if !Decoder::supported(&format) {
+    if !Decoder::supported(&format) || format.channels > 64 || !(format.rate > 0.0 && format.rate < 1e7) {
         crate::log!("AudioQueue: format {} flags {:#x} {} bits isn't supported", sound::four_cc(format.format), format.flags, format.bits);
         return UNSUPPORTED_FORMAT;
     }
     let handle = crate::symbols::leak([0usize; 4]);
     let state = State { format, callback, user, run_loop, volume: 1.0, stream_rate: format.rate, decoded_rate: format.rate, ..State::default() };
-    let made = Arc::new(Queue { state: Mutex::new(state), wake: Condvar::new(), worker: std::sync::Once::new() });
+    let made = Arc::new(Queue::new(state));
     QUEUES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(handle, made);
     crate::log!("AudioQueue: new output queue for {} at {} Hz, {} channels", sound::four_cc(format.format), format.rate, format.channels);
     unsafe { *out = handle };
@@ -547,20 +627,27 @@ extern "C" fn free_buffer(handle: usize, buffer: usize) -> i32 {
 
 fn enqueue(handle: usize, buffer: usize, count: u32, descriptions: *const u8, trim_start: u32, trim_end: u32) -> i32 {
     let Some(q) = queue(handle) else { return PARAMETER };
-    if buffer == 0 {
+    let mut state = q.lock();
+    if !state.buffers.contains(&buffer) {
         return INVALID_BUFFER;
     }
-    let (data, size) = unsafe { (*((buffer + 8) as *const usize), *((buffer + 0x10) as *const u32) as usize) };
+    if state.resetting > 0 {
+        return ENQUEUE_DURING_RESET;
+    }
+    let (capacity, data, size) = unsafe { (*(buffer as *const u32) as usize, *((buffer + 8) as *const usize), *((buffer + 0x10) as *const u32) as usize) };
     if size == 0 || data == 0 {
         return BUFFER_EMPTY;
     }
+    if size > capacity {
+        return PARAMETER;
+    }
     let (count, descriptions) = if count == 0 || descriptions.is_null() {
-        unsafe { (*((buffer + 0x30) as *const u32), *((buffer + 0x28) as *const usize) as *const u8) }
+        // The buffer's own table holds at most the count it was made with.
+        unsafe { ((*((buffer + 0x30) as *const u32)).min(*((buffer + 0x20) as *const u32)), *((buffer + 0x28) as *const usize) as *const u8) }
     } else {
         (count, descriptions)
     };
     let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, size) }.to_vec();
-    let mut state = q.lock();
     let f = state.format;
     let mut packets = Vec::new();
     if count > 0 && !descriptions.is_null() && f.format != LPCM {
@@ -568,7 +655,7 @@ fn enqueue(handle: usize, buffer: usize, count: u32, descriptions: *const u8, tr
             let d = unsafe { descriptions.add(16 * i) };
             let (offset, frames, length) = unsafe { ((d as *const i64).read_unaligned(), (d.add(8) as *const u32).read_unaligned(), (d.add(12) as *const u32).read_unaligned()) };
             let frames = if frames > 0 { frames } else { f.frames_per_packet };
-            if offset >= 0 && offset as usize + length as usize <= size {
+            if offset >= 0 && (offset as u64).saturating_add(length as u64) <= size as u64 {
                 packets.push((offset as usize, length as usize, frames));
             }
         }
@@ -625,7 +712,7 @@ fn work(handle: usize, q: Arc<Queue>) {
             drop(state);
             for (id, listener, data) in listeners {
                 let listener: PropertyListener = unsafe { std::mem::transmute(listener) };
-                listener(data, handle, id);
+                deliver(&q, None, None, || listener(data, handle, id));
             }
             continue;
         }
@@ -671,7 +758,7 @@ fn call_back(q: &Arc<Queue>, handle: usize, callback: usize, user: usize, run_lo
     }
     let output: OutputCallback = unsafe { std::mem::transmute(callback) };
     if run_loop == 0 {
-        output(user, handle, buffer);
+        deliver(q, Some(epoch), Some(buffer), || output(user, handle, buffer));
         return;
     }
     let weak = Arc::downgrade(q);
@@ -679,15 +766,30 @@ fn call_back(q: &Arc<Queue>, handle: usize, callback: usize, user: usize, run_lo
         run_loop,
         Work::Native(Box::new(move || {
             if let Some(q) = weak.upgrade() {
-                let state = q.lock();
-                let live = state.epoch == epoch && !state.quit;
-                drop(state);
-                if live {
-                    output(user, handle, buffer);
-                }
+                deliver(&q, Some(epoch), Some(buffer), || output(user, handle, buffer));
             }
         })),
     );
+}
+
+/// Stop and Reset hand every flushed buffer back to the game, in order,
+/// before they return (enqueueing meanwhile fails, as on iOS).
+fn hand_back(q: &Queue, handle: usize, buffers: Vec<usize>) {
+    if buffers.is_empty() {
+        return;
+    }
+    let (callback, user) = {
+        let mut state = q.lock();
+        state.resetting += 1;
+        (state.callback, state.user)
+    };
+    if callback != 0 {
+        let output: OutputCallback = unsafe { std::mem::transmute(callback) };
+        for buffer in buffers {
+            deliver(q, None, Some(buffer), || output(user, handle, buffer));
+        }
+    }
+    q.lock().resetting -= 1;
 }
 
 /// AudioQueueStart(queue, startTime).
@@ -705,21 +807,28 @@ extern "C" fn start(handle: usize, _time: usize) -> i32 {
     if !offline {
         sound::start();
         let me = q.clone();
-        q.worker.call_once(move || {
-            std::thread::Builder::new().name("ios-audioqueue".into()).spawn(move || work(handle, me)).expect("audio queue thread");
+        let mut started = true;
+        q.worker.call_once(|| {
+            started = std::thread::Builder::new().name("ios-audioqueue".into()).spawn(move || work(handle, me)).is_ok();
         });
+        if !started {
+            q.lock().running = false;
+            return CANNOT_START;
+        }
     }
     q.wake.notify_all();
     0
 }
 
-fn clear(state: &mut State) {
-    state.pending.clear();
+/// Drops what's enqueued and decoded; returns the buffers that were waiting.
+fn clear(state: &mut State) -> Vec<usize> {
+    let flushed = state.pending.drain(..).map(|p| p.buffer).collect();
     state.stream = Stream::default();
     state.decoded.clear();
     state.position = 0.0;
     state.decoder = None;
     state.epoch += 1;
+    flushed
 }
 
 /// AudioQueueStop(queue, immediate).
@@ -728,16 +837,23 @@ extern "C" fn stop(handle: usize, immediate: u8) -> i32 {
     let mut state = q.lock();
     if immediate != 0 || state.offline.is_some() || !state.running {
         let was = state.running;
-        clear(&mut state);
+        let flushed = clear(&mut state);
         state.running = false;
         state.stopping = false;
         state.played = 0.0;
         if was {
             state.tell_running = !state.listeners.is_empty();
         }
-    } else {
-        state.stopping = true;
+        drop(state);
+        q.wake.notify_all();
+        if q.wait_idle() {
+            hand_back(&q, handle, flushed);
+        } else {
+            crate::log!("AudioQueueStop: a buffer callback is still running after 2 s; flushed buffers aren't handed back");
+        }
+        return 0;
     }
+    state.stopping = true;
     drop(state);
     q.wake.notify_all();
     0
@@ -759,10 +875,15 @@ extern "C" fn flush(handle: usize) -> i32 {
     }
 }
 
-/// AudioQueueReset(queue): drops what's enqueued; keeps running.
+/// AudioQueueReset(queue): drops what's enqueued, handing it back; keeps running.
 extern "C" fn reset(handle: usize) -> i32 {
     let Some(q) = queue(handle) else { return PARAMETER };
-    clear(&mut q.lock());
+    let flushed = clear(&mut q.lock());
+    if q.wait_idle() {
+        hand_back(&q, handle, flushed);
+    } else {
+        crate::log!("AudioQueueReset: a buffer callback is still running after 2 s; flushed buffers aren't handed back");
+    }
     0
 }
 
@@ -790,6 +911,12 @@ extern "C" fn dispose(handle: usize, _immediate: u8) -> i32 {
     q.wake.notify_all();
     // The output may be mixing it right now; wait for that turn to finish.
     sound::wait_for_mix();
+    // And for a callback another thread is running (one on this thread, which
+    // is disposing from inside it, checks `quit` when it comes back).
+    if !q.wait_idle() {
+        crate::log!("AudioQueueDispose: a buffer callback is still running after 2 s; its buffers are kept");
+        return 0;
+    }
     for buffer in buffers {
         unsafe { libc::free(buffer as *mut libc::c_void) };
     }
@@ -807,8 +934,16 @@ extern "C" fn set_property(handle: usize, id: u32, data: *const u8, size: u32) -
             state.decoder = None;
         }
         b"aqcl" => state.layout = bytes.to_vec(),
-        // Codec policy, metering, time-pitch and device choices change nothing here.
-        b"aqcp" | b"aqmv" | b"aqtp" | b"aqtb" | b"aqcd" | b"aqer" | b"qtpb" => {}
+        // Metering (meters read as silence), time-pitch, codec policy and
+        // decode buffer size: kept so they read back; the sound is the same.
+        b"aqme" | b"q_tp" | b"qtpa" | b"qtpb" | b"aqcp" | b"dcbf" => {
+            if bytes.len() < 4 {
+                return INVALID_PROPERTY_SIZE;
+            }
+            state.settings.insert(id, bytes[..4].to_vec());
+        }
+        // Output device and channel assignments: there is one output.
+        b"aqcd" | b"aqca" => {}
         other => {
             crate::log!("AudioQueueSetProperty '{}': not known", String::from_utf8_lossy(other));
             return INVALID_PROPERTY;
@@ -818,6 +953,9 @@ extern "C" fn set_property(handle: usize, id: u32, data: *const u8, size: u32) -
 }
 
 fn property(state: &State, id: u32) -> Option<Vec<u8>> {
+    if let Some(value) = state.settings.get(&id) {
+        return Some(value.clone());
+    }
     let format = unsafe { std::slice::from_raw_parts(&state.format as *const Asbd as *const u8, 40) };
     Some(match &id.to_be_bytes() {
         b"aqrn" => (state.running as u32).to_ne_bytes().to_vec(),
@@ -827,8 +965,11 @@ fn property(state: &State, id: u32) -> Option<Vec<u8>> {
         b"aqsr" => (sound::output_rate() as f64).to_ne_bytes().to_vec(),
         b"aqdc" => 2u32.to_ne_bytes().to_vec(),
         b"xops" | b"dcbf" => 4096u32.to_ne_bytes().to_vec(),
-        b"aqcp" => 1u32.to_ne_bytes().to_vec(),
-        b"aqme" => 0u32.to_ne_bytes().to_vec(),
+        // Off / default policy / no converter error.
+        b"aqcp" | b"aqme" | b"q_tp" | b"qtpb" | b"qcve" => 0u32.to_ne_bytes().to_vec(),
+        // AudioQueueLevelMeterState (average, peak) per channel: silence.
+        b"aqmv" => vec![0; 8 * state.format.channels.clamp(1, 64) as usize],
+        b"aqmd" => (0..2 * state.format.channels.clamp(1, 64)).flat_map(|_| (-120.0f32).to_ne_bytes()).collect(),
         _ => return None,
     })
 }
@@ -841,7 +982,7 @@ extern "C" fn get_property(handle: usize, id: u32, data: *mut u8, size: *mut u32
         return PARAMETER;
     }
     let room = unsafe { *size } as usize;
-    if room < value.len() && !matches!(&id.to_be_bytes(), b"aqmc" | b"aqcl") {
+    if room < value.len() && !matches!(&id.to_be_bytes(), b"aqmc" | b"aqcl" | b"aqmv" | b"aqmd") {
         return INVALID_PROPERTY_SIZE;
     }
     let n = room.min(value.len());
@@ -941,12 +1082,15 @@ extern "C" fn set_offline_render_format(handle: usize, format: *const u8, _layou
         return 0;
     }
     let format = unsafe { Asbd::read(format) };
-    if !pcm_supported(&format) {
+    if !pcm_supported(&format) || format.channels > 64 || !(format.rate > 0.0 && format.rate < 1e7) {
         crate::log!("AudioQueue: offline render format flags {:#x} {} bits isn't supported", format.flags, format.bits);
         return UNSUPPORTED_FORMAT;
     }
     state.offline = Some(format);
-    clear(&mut state);
+    // Sound decoded for the old format starts over; enqueued buffers stay.
+    state.decoded.clear();
+    state.position = 0.0;
+    state.stream = Stream::default();
     0
 }
 
@@ -969,11 +1113,14 @@ fn ready_frames(state: &State, out: &Asbd) -> usize {
 /// buffers back to the game (which enqueues more) as it goes.
 extern "C" fn offline_render(handle: usize, _stamp: *const u8, buffer: usize, frames: u32) -> i32 {
     let Some(q) = queue(handle) else { return PARAMETER };
-    if buffer == 0 {
+    // The game's callbacks run here, in the queue's turn: Stop, Reset and
+    // Dispose from other threads wait for this to finish.
+    let _turn = q.turn();
+    let mut state = q.lock();
+    if !state.buffers.contains(&buffer) {
         return INVALID_BUFFER;
     }
     let (capacity, data) = unsafe { (*(buffer as *const u32) as usize, *((buffer + 8) as *const usize)) };
-    let mut state = q.lock();
     let Some(out) = state.offline else { return INVALID_OFFLINE_MODE };
     let bytes_per_frame = stride(&out);
     let frames = (frames as usize).min(capacity / bytes_per_frame);
@@ -1011,12 +1158,24 @@ extern "C" fn offline_render(handle: usize, _stamp: *const u8, buffer: usize, fr
             state.decoded = decoded;
         }
         let (callback, user) = (state.callback, state.user);
+        let give_back = callback != 0 && state.buffers.contains(&pending.buffer);
         drop(state);
-        if callback != 0 {
+        if give_back {
             let output: OutputCallback = unsafe { std::mem::transmute(callback) };
             output(user, handle, pending.buffer);
         }
         state = q.lock();
+        // The callback may have disposed of the queue, freed the target
+        // buffer or left offline mode.
+        if state.quit {
+            return DISPOSAL_PENDING;
+        }
+        if !state.buffers.contains(&buffer) {
+            return INVALID_BUFFER;
+        }
+        if state.offline != Some(out) {
+            return INVALID_OFFLINE_MODE;
+        }
     }
     let made = ready_frames(&state, &out).min(frames);
     let mut samples = Vec::with_capacity(made * channels);
@@ -1062,7 +1221,8 @@ pub fn mix(out: &mut [f32], frames: usize, out_rate: f64) {
         let step = state.stream_rate / out_rate;
         let (left, right) = sound::pan_gains(state.pan, state.volume, false);
         let played = state.stream.mix_into(out, frames, step, left, right);
-        state.played += played;
+        // Counted in the queue format's frames (HE-AAC decodes at half rate).
+        state.played += played * state.format.rate / state.stream_rate;
         let low = (state.stream.frames() as f64) < state.stream_rate * 0.2;
         if state.stopping && state.pending.is_empty() && state.stream.frames() < 2 {
             // Played out after AudioQueueStop(queue, false).
@@ -1131,6 +1291,7 @@ mod tests {
         data: Vec<u8>,
         at: usize,
         handed_back: usize,
+        refused: usize,
     }
 
     /// The game's side, as FMOD does it: each buffer handed back is refilled
@@ -1152,15 +1313,30 @@ mod tests {
             *((buffer + 0x10) as *mut u32) = take as u32;
         }
         feeder.at += take;
-        assert_eq!(enqueue_buffer(queue, buffer, 0, std::ptr::null()), 0);
+        match enqueue_buffer(queue, buffer, 0, std::ptr::null()) {
+            0 => {}
+            ENQUEUE_DURING_RESET => feeder.refused += 1,
+            e => panic!("enqueue: {e}"),
+        }
     }
 
     #[test]
     fn offline_render_decodes_resamples_and_hands_buffers_back() {
         let parsed = audiofile::parse(&wav(22050, 0.5)).unwrap();
         assert_eq!((parsed.format.rate, parsed.format.channels, parsed.format.bits), (22050.0, 1, 16));
+        // AudioFile property IDs as Apple has them (DataOffset 'doff', IsOptimized 'optm').
+        assert_eq!(audiofile::property(&parsed, four(b"doff")), Some(44i64.to_ne_bytes().to_vec()));
+        assert!(audiofile::property(&parsed, four(b"optm")).is_some() && audiofile::property(&parsed, four(b"dofs")).is_none());
+        // A WAV claiming 0-bit samples, or a block too small for its channels, is refused.
+        let mut broken = wav(22050, 0.1);
+        broken[34..36].copy_from_slice(&0u16.to_le_bytes());
+        assert!(audiofile::parse(&broken).is_err());
+        let mut ima = wav(22050, 0.1);
+        ima[20..22].copy_from_slice(&0x11u16.to_le_bytes());
+        ima[32..34].copy_from_slice(&2u16.to_le_bytes());
+        assert!(audiofile::parse(&ima).is_err());
         let data = parsed.data.clone();
-        let feeder = Box::into_raw(Box::new(Feeder { queue: 0, data, at: 0, handed_back: 0 }));
+        let feeder = Box::into_raw(Box::new(Feeder { queue: 0, data, at: 0, handed_back: 0, refused: 0 }));
         let mut q = 0;
         assert_eq!(new_output(&parsed.format as *const Asbd as *const u8, refill as usize, feeder as usize, 0, 0, 0, &mut q), 0);
         unsafe { (*feeder).queue = q };
@@ -1195,6 +1371,37 @@ mod tests {
         assert!((218..=222).contains(&crossings), "{crossings} cycles");
         let handed_back = unsafe { (*feeder).handed_back };
         assert!(handed_back >= 5, "every used buffer goes back to the game ({handed_back})");
+        // Reset hands an enqueued buffer back; enqueueing from that callback is refused.
+        unsafe {
+            (*feeder).at = 0;
+            fill(&mut *feeder, q, a);
+        }
+        assert_eq!(reset(q), 0);
+        unsafe { assert_eq!(((*feeder).handed_back, (*feeder).refused), (handed_back + 1, 1)) };
+        // Apple's property IDs: metering is kept and reads back; made-up IDs are refused.
+        let on = 1u32;
+        assert_eq!(set_property(q, four(b"aqme"), &on as *const u32 as *const u8, 4), 0);
+        let (mut value, mut size) = (0u32, 4u32);
+        assert_eq!(get_property(q, four(b"aqme"), &mut value as *mut u32 as *mut u8, &mut size), 0);
+        assert_eq!(value, 1);
+        assert_eq!(set_property(q, four(b"aqtp"), &on as *const u32 as *const u8, 4), INVALID_PROPERTY);
+        // Dispose returns only after a callback running on another thread has finished.
+        let queue_ref = super::queue(q).unwrap();
+        let (started, done) = (Arc::new(std::sync::atomic::AtomicBool::new(false)), Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let (s, d) = (started.clone(), done.clone());
+        let thread = std::thread::spawn(move || {
+            deliver(&queue_ref, None, None, || {
+                s.store(true, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                d.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+        });
+        while !started.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
         assert_eq!(dispose(q, 1), 0);
+        assert!(done.load(std::sync::atomic::Ordering::SeqCst), "dispose waited for the callback");
+        thread.join().unwrap();
+        assert_eq!(start(q, 0), PARAMETER, "a disposed queue is gone");
     }
 }

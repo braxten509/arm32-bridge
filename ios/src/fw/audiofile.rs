@@ -171,8 +171,36 @@ fn le32(b: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?))
 }
 
-/// Works out what kind of file `bytes` is and reads it.
+/// Works out what kind of file `bytes` is and reads it. A damaged file is
+/// an error, never a crash (the readers' own slips are caught here too).
 pub fn parse(bytes: &[u8]) -> Result<Parsed, i32> {
+    std::panic::catch_unwind(|| parse_checked(bytes)).unwrap_or_else(|_| {
+        crate::log!("AudioFile: a damaged file could not be read");
+        Err(INVALID_FILE)
+    })
+}
+
+/// A file on disk: movies are read from the file as needed (only their
+/// sound is kept), other sounds are read whole.
+pub fn parse_path(path: &str) -> Result<Parsed, i32> {
+    let mut head = [0u8; 12];
+    {
+        use std::io::Read;
+        let mut file = std::fs::File::open(path).map_err(|_| -43)?;
+        file.read_exact(&mut head).map_err(|_| INVALID_FILE)?;
+    }
+    if &head[4..8] == b"ftyp" {
+        return std::panic::catch_unwind(|| {
+            let file = std::fs::File::open(path).map_err(|_| -43)?;
+            let file_type = four(if &head[8..11] == b"M4A" { b"m4af" } else { b"mp4f" });
+            parse_mp4_from(Box::new(file), file_type).and_then(checked)
+        })
+        .unwrap_or(Err(INVALID_FILE));
+    }
+    parse(&std::fs::read(path).map_err(|_| -43)?)
+}
+
+fn parse_checked(bytes: &[u8]) -> Result<Parsed, i32> {
     let start = bytes.get(..12).ok_or(INVALID_FILE)?;
     let parsed = if &start[..4] == b"RIFF" && &start[8..12] == b"WAVE" {
         parse_wav(bytes)
@@ -187,8 +215,17 @@ pub fn parse(bytes: &[u8]) -> Result<Parsed, i32> {
     } else {
         parse_mp3(bytes)
     }?;
-    if parsed.packet_count() == 0 && parsed.format.format == 0 {
+    checked(parsed)
+}
+
+/// Formats nothing can be read from are refused (no channels, zero-size PCM).
+fn checked(parsed: Parsed) -> Result<Parsed, i32> {
+    let f = &parsed.format;
+    if parsed.packet_count() == 0 && f.format == 0 {
         return Err(INVALID_FILE);
+    }
+    if f.channels == 0 || f.channels > 64 || !(f.rate > 0.0 && f.rate < 1e7) || (f.format == LPCM && (f.bits == 0 || f.bytes_per_frame == 0)) {
+        return Err(UNSUPPORTED_DATA_FORMAT);
     }
     Ok(parsed)
 }
@@ -224,7 +261,7 @@ fn parse_wav(b: &[u8]) -> Result<Parsed, i32> {
                         let per_block = if extra >= 2 && end >= body + 20 {
                             le16(b, body + 18).unwrap() as u32
                         } else {
-                            (align - 4 * channels) * 2 / channels + 1
+                            align.checked_sub(4 * channels).ok_or(UNSUPPORTED_DATA_FORMAT)? * 2 / channels + 1
                         };
                         Asbd { bits: 4, ..compressed(rate, 0x6D73_0011, channels, align, per_block) }
                     }
@@ -240,6 +277,10 @@ fn parse_wav(b: &[u8]) -> Result<Parsed, i32> {
         at = body.saturating_add(size + (size & 1));
     }
     let (format, (start, end)) = (format.ok_or(INVALID_FILE)?, data.ok_or(INVALID_FILE)?);
+    // A zero-bit or zero-size sample can't be read (and would divide by zero).
+    if format.bytes_per_packet == 0 || format.frames_per_packet == 0 || (format.format == LPCM && format.bits == 0) {
+        return Err(UNSUPPORTED_DATA_FORMAT);
+    }
     let whole = (end - start) / format.bytes_per_packet as usize * format.bytes_per_packet as usize;
     Ok(Parsed { file_type: four(b"WAVE"), format, data: b[start..start + whole].to_vec(), data_offset: start as u64, ..Parsed::default() })
 }
@@ -297,7 +338,7 @@ fn parse_aiff(b: &[u8]) -> Result<Parsed, i32> {
         at = body.saturating_add(size + (size & 1));
     }
     let (format, (start, end)) = (format.ok_or(INVALID_FILE)?, data.ok_or(INVALID_FILE)?);
-    if format.channels == 0 || format.bytes_per_packet == 0 {
+    if format.channels == 0 || format.bytes_per_packet == 0 || (format.format == LPCM && format.bits == 0) {
         return Err(UNSUPPORTED_DATA_FORMAT);
     }
     let whole = (end - start) / format.bytes_per_packet as usize * format.bytes_per_packet as usize;
@@ -596,10 +637,15 @@ fn parse_adts(b: &[u8]) -> Option<Parsed> {
 }
 
 fn parse_mp4(b: &[u8]) -> Result<Parsed, i32> {
+    let file_type = four(if &b[8..11] == b"M4A" { b"m4af" } else { b"mp4f" });
+    parse_mp4_from(Box::new(std::io::Cursor::new(b.to_vec())), file_type).and_then(checked)
+}
+
+fn parse_mp4_from(source: Box<dyn symphonia::core::io::MediaSource>, file_type: u32) -> Result<Parsed, i32> {
     use symphonia::core::codecs::{CODEC_TYPE_AAC, CODEC_TYPE_ALAC, CODEC_TYPE_MP3};
     use symphonia::core::formats::{FormatOptions, FormatReader};
     use symphonia::core::io::MediaSourceStream;
-    let stream = MediaSourceStream::new(Box::new(std::io::Cursor::new(b.to_vec())), Default::default());
+    let stream = MediaSourceStream::new(source, Default::default());
     let mut reader = symphonia::default::formats::IsoMp4Reader::try_new(stream, &FormatOptions { enable_gapless: false, ..Default::default() })
         .map_err(|e| {
             crate::log!("AudioFile: MP4 file not readable ({e})");
@@ -611,7 +657,7 @@ fn parse_mp4(b: &[u8]) -> Result<Parsed, i32> {
     let rate = p.sample_rate.unwrap_or(44100);
     let channels = p.channels.map(|c| c.count() as u32).unwrap_or(2);
     let extra = p.extra_data.as_deref().unwrap_or(&[]).to_vec();
-    let mut parsed = Parsed { file_type: four(if &b[8..11] == b"M4A" { b"m4af" } else { b"mp4f" }), ..Parsed::default() };
+    let mut parsed = Parsed { file_type, ..Parsed::default() };
     let (format, frames) = if p.codec == CODEC_TYPE_AAC {
         // HE-AAC is decoded at its core (plain AAC) rate here, so it is
         // described that way.
@@ -695,19 +741,21 @@ extern "C" fn open_with_callbacks(client: usize, read: usize, _write: usize, get
     }
     let read: ReadProc = unsafe { std::mem::transmute(read) };
     let get_size: SizeProc = unsafe { std::mem::transmute(get_size) };
-    let size = get_size(client).max(0) as usize;
-    let mut bytes = vec![0u8; size];
-    let mut at = 0;
-    while at < size {
-        let want = (size - at).min(1 << 20) as u32;
+    // The memory grows with what the game really hands over, not with the
+    // size it reports (which may be wrong).
+    let size = get_size(client).clamp(0, 1 << 31) as usize;
+    let mut bytes = Vec::new();
+    while bytes.len() < size {
+        let at = bytes.len();
+        let want = (size - at).min(1 << 20);
+        bytes.resize(at + want, 0);
         let mut got = 0u32;
-        let status = read(client, at as i64, want, bytes[at..].as_mut_ptr(), &mut got);
+        let status = read(client, at as i64, want as u32, bytes[at..].as_mut_ptr(), &mut got);
+        bytes.truncate(at + (got as usize).min(want));
         if got == 0 || (status != 0 && status != -39) {
             break;
         }
-        at += got as usize;
     }
-    bytes.truncate(at);
     opened(&bytes, out)
 }
 
@@ -734,7 +782,7 @@ extern "C" fn close(id: usize) -> i32 {
 }
 
 /// A property's value, as bytes.
-fn property(f: &Parsed, id: u32) -> Option<Vec<u8>> {
+pub(crate) fn property(f: &Parsed, id: u32) -> Option<Vec<u8>> {
     let format = unsafe { std::slice::from_raw_parts(&f.format as *const Asbd as *const u8, 40) };
     Some(match &id.to_be_bytes() {
         b"ffmt" => f.file_type.to_ne_bytes().to_vec(),
@@ -745,12 +793,11 @@ fn property(f: &Parsed, id: u32) -> Option<Vec<u8>> {
         b"bcnt" => (f.data.len() as u64).to_ne_bytes().to_vec(),
         b"pcnt" => f.packet_count().to_ne_bytes().to_vec(),
         b"psze" | b"pkub" => f.max_packet_size().to_ne_bytes().to_vec(),
-        b"dofs" => (f.data_offset as i64).to_ne_bytes().to_vec(),
+        b"doff" => (f.data_offset as i64).to_ne_bytes().to_vec(),
         b"pnfo" => [(f.valid_frames() as i64).to_ne_bytes().as_slice(), &(f.priming as i32).to_ne_bytes(), &(f.remainder as i32).to_ne_bytes()].concat(),
         b"edur" => (f.valid_frames() as f64 / f.format.rate.max(1.0)).to_ne_bytes().to_vec(),
         b"brat" => f.bitrate().to_ne_bytes().to_vec(),
-        b"isop" => 1u32.to_ne_bytes().to_vec(),
-        b"dlay" => 0u32.to_ne_bytes().to_vec(),
+        b"optm" => 1u32.to_ne_bytes().to_vec(),
         _ => return None,
     })
 }
@@ -783,16 +830,30 @@ extern "C" fn get_property(id: usize, property_id: u32, size: *mut u32, data: *m
     match &property_id.to_be_bytes() {
         b"pkfr" | b"frpk" if unsafe { *size } >= 20 => {
             // AudioFramePacketTranslation { frame, packet, frameOffsetInPacket }
-            let fpp = f.format.frames_per_packet.max(1) as i64;
+            let fpp = f.format.frames_per_packet as i64;
             unsafe {
                 let frame = data as *mut i64;
                 let packet = data.add(8) as *mut i64;
                 let offset = data.add(16) as *mut u32;
-                if property_id == four(b"pkfr") {
-                    *frame = *packet * fpp;
+                if fpp > 0 {
+                    if property_id == four(b"pkfr") {
+                        *frame = (*packet).saturating_mul(fpp);
+                    } else {
+                        *packet = (*frame).max(0) / fpp;
+                        *offset = ((*frame).max(0) % fpp) as u32;
+                    }
+                } else if property_id == four(b"pkfr") {
+                    // Packets of different lengths: add up the ones before.
+                    let n = (*packet).clamp(0, f.packets.len() as i64) as usize;
+                    *frame = f.packets[..n].iter().map(|p| p.frames as i64).sum();
                 } else {
-                    *packet = *frame / fpp;
-                    *offset = (*frame % fpp) as u32;
+                    let (mut start, mut index) = (0i64, 0usize);
+                    while index < f.packets.len() && start + f.packets[index].frames as i64 <= (*frame).max(0) {
+                        start += f.packets[index].frames as i64;
+                        index += 1;
+                    }
+                    *packet = index as i64;
+                    *offset = ((*frame).max(0) - start) as u32;
                 }
             }
             return 0;

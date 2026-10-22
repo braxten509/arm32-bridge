@@ -47,8 +47,18 @@ impl CmTime {
         CmTime { value, timescale, flags: TIME_VALID, epoch: 0 }
     }
 
+    pub const POSITIVE_INFINITY: CmTime = CmTime { value: 0, timescale: 0, flags: TIME_VALID | TIME_POSITIVE_INFINITY, epoch: 0 };
+    pub const NEGATIVE_INFINITY: CmTime = CmTime { value: 0, timescale: 0, flags: TIME_VALID | TIME_NEGATIVE_INFINITY, epoch: 0 };
+    pub const INDEFINITE: CmTime = CmTime { value: 0, timescale: 0, flags: TIME_VALID | TIME_INDEFINITE, epoch: 0 };
+
+    /// A plain number of seconds (valid, finite, with a usable timescale).
     pub fn is_numeric(&self) -> bool {
-        self.flags & TIME_VALID != 0 && self.flags & (TIME_POSITIVE_INFINITY | TIME_NEGATIVE_INFINITY | TIME_INDEFINITE) == 0
+        self.flags & TIME_VALID != 0 && self.flags & (TIME_POSITIVE_INFINITY | TIME_NEGATIVE_INFINITY | TIME_INDEFINITE) == 0 && self.timescale > 0
+    }
+
+    /// Valid flag set but a timescale nothing can be counted in: invalid.
+    fn is_broken(&self) -> bool {
+        self.flags & TIME_VALID != 0 && self.flags & (TIME_POSITIVE_INFINITY | TIME_NEGATIVE_INFINITY | TIME_INDEFINITE) == 0 && self.timescale <= 0
     }
 
     pub fn seconds(&self) -> f64 {
@@ -66,34 +76,93 @@ impl CmTime {
     }
 }
 
+fn infinity(positive: bool) -> CmTime {
+    if positive {
+        CmTime::POSITIVE_INFINITY
+    } else {
+        CmTime::NEGATIVE_INFINITY
+    }
+}
+
 /// CMTimeMakeWithSeconds: the nearest value in `timescale`; if it doesn't
-/// fit, the timescale is halved until it does (as iOS does). Not-a-number
-/// is an invalid time, infinities are the infinite times.
+/// fit, the timescale is halved until it does, and past timescale 1 the
+/// time is infinite (as iOS does). Not-a-number is an invalid time.
 pub fn time_from_seconds(seconds: f64, timescale: i32) -> CmTime {
     if seconds.is_nan() || timescale <= 0 {
         return CmTime::INVALID;
     }
     if seconds.is_infinite() {
-        let flags = TIME_VALID | if seconds > 0.0 { TIME_POSITIVE_INFINITY } else { TIME_NEGATIVE_INFINITY };
-        return CmTime { value: 0, timescale: 0, flags, epoch: 0 };
+        return infinity(seconds > 0.0);
     }
     let mut scale = timescale;
     loop {
         let exact = seconds * scale as f64;
-        if exact.abs() < 9.2e18 || scale == 1 {
-            let value = exact.round().clamp(i64::MIN as f64, i64::MAX as f64) as i64;
-            let rounded = value as f64 != exact || scale != timescale;
+        if exact.abs() < 9.2e18 {
+            let value = exact.round() as i64;
+            let rounded = value as f64 / scale as f64 != seconds;
             return CmTime { value, timescale: scale, flags: TIME_VALID | if rounded { TIME_ROUNDED } else { 0 }, epoch: 0 };
         }
-        scale = (scale / 2).max(1);
+        if scale == 1 {
+            return infinity(seconds > 0.0);
+        }
+        scale /= 2;
     }
+}
+
+/// CMTimeRoundingMethod.
+const ROUND_HALF_AWAY: u32 = 1;
+const ROUND_TOWARD_ZERO: u32 = 2;
+const ROUND_AWAY_FROM_ZERO: u32 = 3;
+const ROUND_QUICKTIME: u32 = 4;
+const ROUND_DOWN: u32 = 5;
+const ROUND_UP: u32 = 6;
+
+/// `value * to / from`, rounded by `method`; the flag says whether it had to be.
+fn rescale(value: i64, from: i32, to: i32, method: u32) -> (i128, bool) {
+    let wide = value as i128 * to as i128;
+    let (whole, rest) = (wide / from as i128, wide % from as i128);
+    if rest == 0 {
+        return (whole, false);
+    }
+    let negative = wide < 0;
+    let away = match method {
+        ROUND_TOWARD_ZERO => false,
+        ROUND_AWAY_FROM_ZERO => true,
+        ROUND_DOWN => negative,
+        ROUND_UP => !negative,
+        // QuickTime's method truncates when going to a finer timescale.
+        ROUND_QUICKTIME if to > from => false,
+        // Default, half away from zero.
+        _ => rest.abs() * 2 >= from as i128,
+    };
+    (if away { whole + if negative { -1 } else { 1 } } else { whole }, true)
+}
+
+/// The largest timescale a CMTime has (kCMTimeMaxTimescale).
+const MAX_TIMESCALE: i64 = i32::MAX as i64;
+
+/// A value in `scale` as a time: halving the timescale while it doesn't
+/// fit, infinite past timescale 1.
+fn fitted(mut value: i128, mut scale: i64, mut rounded: bool, epoch: i64) -> CmTime {
+    while value > i64::MAX as i128 || value < i64::MIN as i128 {
+        if scale == 1 {
+            return infinity(value > 0);
+        }
+        let next = scale / 2;
+        let wide = value * next as i128;
+        let rest = wide % scale as i128;
+        value = wide / scale as i128 + if rest.abs() * 2 >= scale as i128 { rest.signum() } else { 0 };
+        rounded |= rest != 0;
+        scale = next;
+    }
+    CmTime { value: value as i64, timescale: scale as i32, flags: TIME_VALID | if rounded { TIME_ROUNDED } else { 0 }, epoch }
 }
 
 /// CMTimeCompare's order: negative infinity < numeric times < indefinite <
 /// positive infinity < invalid; numeric times by epoch, then exact value.
 pub fn compare_times(a: &CmTime, b: &CmTime) -> i32 {
     fn rank(t: &CmTime) -> i32 {
-        if t.flags & TIME_VALID == 0 {
+        if t.flags & TIME_VALID == 0 || t.is_broken() {
             4
         } else if t.flags & TIME_NEGATIVE_INFINITY != 0 {
             0
@@ -117,29 +186,35 @@ pub fn compare_times(a: &CmTime, b: &CmTime) -> i32 {
     left.cmp(&right) as i32
 }
 
-/// The sum or difference of two numeric times: in a timescale both divide
-/// (exact) when it fits, else in the finer one, rounded.
+/// CMTimeAdd / CMTimeSubtract. Numeric times add in the least common
+/// multiple of their timescales (at most kCMTimeMaxTimescale, then rounded);
+/// a sum too large halves the timescale, then becomes infinite. Invalid
+/// times or different epochs give an invalid time; indefinite wins over
+/// infinities; opposite infinities cancel to invalid.
 fn combine(a: &CmTime, b: &CmTime, negate: bool) -> CmTime {
-    if !a.is_numeric() || !b.is_numeric() {
-        // Infinities and invalid times: the "larger" kind wins, as on iOS.
-        return if compare_times(a, b) >= 0 { *a } else { *b };
+    let valid = |t: &CmTime| t.flags & TIME_VALID != 0 && !t.is_broken();
+    if !valid(a) || !valid(b) || a.epoch != b.epoch {
+        return CmTime::INVALID;
+    }
+    if (a.flags | b.flags) & TIME_INDEFINITE != 0 {
+        return CmTime::INDEFINITE;
+    }
+    // +1 / -1 / 0 for each side's infinity (b's turned around when subtracting).
+    let sign = |t: &CmTime| if t.flags & TIME_POSITIVE_INFINITY != 0 { 1 } else if t.flags & TIME_NEGATIVE_INFINITY != 0 { -1 } else { 0 };
+    let (ia, ib) = (sign(a), if negate { -sign(b) } else { sign(b) });
+    if ia != 0 || ib != 0 {
+        return if ia != 0 && ib != 0 && ia != ib { CmTime::INVALID } else { infinity(ia + ib > 0) };
     }
     fn gcd(x: i64, y: i64) -> i64 {
         if y == 0 { x } else { gcd(y, x % y) }
     }
     let (sa, sb) = (a.timescale as i64, b.timescale as i64);
     let common = sa / gcd(sa, sb) * sb;
-    let exact = common <= i32::MAX as i64;
-    let scale = if exact { common } else { sa.max(sb) } as i128;
-    let convert = |t: &CmTime| {
-        let wide = t.value as i128 * scale;
-        let (whole, rest) = (wide / t.timescale as i128, wide % t.timescale as i128);
-        whole + (rest * 2 / t.timescale as i128)
-    };
-    let other = if negate { -convert(b) } else { convert(b) };
-    let sum = convert(a) + other;
-    let flags = TIME_VALID | if exact { 0 } else { TIME_ROUNDED };
-    CmTime { value: sum.clamp(i64::MIN as i128, i64::MAX as i128) as i64, timescale: scale as i32, flags, epoch: a.epoch }
+    let scale = common.min(MAX_TIMESCALE);
+    let (va, ra) = rescale(a.value, a.timescale, scale as i32, ROUND_HALF_AWAY);
+    let (vb, rb) = rescale(b.value, b.timescale, scale as i32, ROUND_HALF_AWAY);
+    let sum = if negate { va - vb } else { va + vb };
+    fitted(sum, scale, ra || rb || (a.flags | b.flags) & TIME_ROUNDED != 0, a.epoch)
 }
 
 /// CMTimeRange (48 bytes).
@@ -174,11 +249,21 @@ extern "C" fn time_subtract(a: CmTime, b: CmTime) -> CmTime {
     combine(&a, &b, true)
 }
 
-extern "C" fn time_convert_scale(time: CmTime, timescale: i32, _method: u32) -> CmTime {
+/// CMTimeConvertScale(time, timescale, method): exact, or rounded by
+/// `method` with the rounded flag set; non-numeric times stay as they are.
+extern "C" fn time_convert_scale(time: CmTime, timescale: i32, method: u32) -> CmTime {
+    if time.is_broken() || timescale <= 0 {
+        return CmTime::INVALID;
+    }
     if !time.is_numeric() {
         return time;
     }
-    time_from_seconds(time.seconds(), timescale)
+    let (value, rounded) = rescale(time.value, time.timescale, timescale, method);
+    if value > i64::MAX as i128 || value < i64::MIN as i128 {
+        return CmTime { epoch: time.epoch, ..infinity(value > 0) };
+    }
+    let flags = TIME_VALID | if rounded || time.flags & TIME_ROUNDED != 0 { TIME_ROUNDED } else { 0 };
+    CmTime { value: value as i64, timescale, flags, epoch: time.epoch }
 }
 
 extern "C" fn time_range_make(start: CmTime, duration: CmTime) -> CmTimeRange {
@@ -250,16 +335,37 @@ fn free(object: Id) {
         if let Some(buffer) = buffer_of(texture.buffer) {
             buffer.lock().unwrap_or_else(|e| e.into_inner()).textures.retain(|&t| t != object);
         }
-        // Freed at the cache's next flush, on a thread with its context.
-        if let Some(cache) = CACHES.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|c| c.get_mut(&texture.cache)) {
-            cache.unused.push(texture.name);
+        // Freed at the cache's next flush, on a thread with its context (or
+        // now, if the cache is already gone).
+        let mut caches = CACHES.lock().unwrap_or_else(|e| e.into_inner());
+        match caches.as_mut().and_then(|c| c.get_mut(&texture.cache)) {
+            Some(cache) => cache.unused.push(texture.name),
+            None => {
+                drop(caches);
+                delete_textures(vec![texture.name]);
+            }
         }
     }
     let sample = SAMPLES.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|s| s.remove(&object));
     if let Some(sample) = sample {
-        if sample.image != 0 {
-            released(sample.image);
+        for owned in [sample.image, sample.block, sample.description] {
+            if owned != 0 {
+                released(owned);
+            }
         }
+    }
+    PARTS.lock().unwrap_or_else(|e| e.into_inner()).as_mut().map(|p| p.remove(&object));
+    let cache = CACHES.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|c| c.remove(&object));
+    if let Some(cache) = cache {
+        delete_textures(cache.unused);
+    }
+}
+
+/// Deletes GL texture names if this thread can (else they are left behind:
+/// a few names, no pixels the game can see).
+fn delete_textures(names: Vec<u32>) {
+    if !names.is_empty() && has_context() {
+        unsafe { glDeleteTextures(names.len() as i32, names.as_ptr()) };
     }
 }
 
@@ -297,6 +403,10 @@ pub struct Plane {
     pub stride: usize,
 }
 
+/// Room before the planes of a planar buffer for its
+/// CVPlanarPixelBufferInfo_YCbCrBiPlanar (what its base address points at).
+const PLANAR_HEADER: usize = 64;
+
 /// Planes of a `width` x `height` picture in `format` (rows start on 64
 /// bytes, like iOS's buffers), or None for a format this layer doesn't make.
 pub fn layout(format: u32, width: usize, height: usize) -> Option<Vec<Plane>> {
@@ -308,9 +418,9 @@ pub fn layout(format: u32, width: usize, height: usize) -> Option<Vec<Plane>> {
         FORMAT_565 => single(2),
         FORMAT_L8 => single(1),
         FORMAT_420V | FORMAT_420F => {
-            let luma = Plane { offset: 0, width, height, bytes_per_pixel: 1, stride: align(width) };
+            let luma = Plane { offset: PLANAR_HEADER, width, height, bytes_per_pixel: 1, stride: align(width) };
             let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
-            let chroma = Plane { offset: luma.stride * height, width: cw, height: ch, bytes_per_pixel: 2, stride: align(cw * 2) };
+            let chroma = Plane { offset: luma.offset + luma.stride * height, width: cw, height: ch, bytes_per_pixel: 2, stride: align(cw * 2) };
             vec![luma, chroma]
         }
         _ => return None,
@@ -327,13 +437,22 @@ pub struct PixelBuffer {
     locks: usize,
     /// Textures made from this buffer (their objects).
     textures: Vec<Id>,
+    /// The game wrote pixels the textures couldn't be given (no GL context
+    /// then): the buffer is newer, so it isn't read back from them.
+    textures_behind: bool,
 }
 
 impl PixelBuffer {
     pub fn new(format: u32, width: usize, height: usize) -> Option<PixelBuffer> {
         let planes = layout(format, width, height)?;
         let bytes = planes.iter().map(|p| p.offset + p.stride * p.height).max().unwrap_or(0);
-        Some(PixelBuffer { width, height, format, planes, memory: vec![0u128; bytes.div_ceil(16)], locks: 0, textures: Vec::new() })
+        let mut buffer = PixelBuffer { width, height, format, planes, memory: vec![0u128; bytes.div_ceil(16)], locks: 0, textures: Vec::new(), textures_behind: false };
+        if buffer.planes.len() > 1 {
+            // Planar: each plane's offset from the base and its row bytes, big-endian.
+            let header: Vec<u8> = buffer.planes.iter().flat_map(|p| [(p.offset as u32).to_be_bytes(), (p.stride as u32).to_be_bytes()]).flatten().collect();
+            buffer.bytes_mut()[..header.len()].copy_from_slice(&header);
+        }
+        Some(buffer)
     }
 
     pub fn base(&self) -> *mut u8 {
@@ -406,19 +525,20 @@ extern "C" fn pixel_buffer_unlock(object: Id, flags: u64) -> i32 {
         // The game may have written: textures made from it see the change.
         let textures = b.textures.clone();
         drop(b);
-        for texture in textures {
-            upload_texture(texture);
-        }
+        let all = textures.into_iter().fold(true, |all, texture| upload_texture(texture) && all);
+        buffer.lock().unwrap_or_else(|e| e.into_inner()).textures_behind = !all;
     }
     RETURN_SUCCESS
 }
 
+/// The pixels, or for a planar buffer its plane table (as on iOS).
 extern "C" fn pixel_buffer_base_address(object: Id) -> usize {
     with_buffer(object, |b| b.base() as usize).unwrap_or(0)
 }
 
+/// Row bytes; for a planar buffer, those of its first plane.
 extern "C" fn pixel_buffer_bytes_per_row(object: Id) -> usize {
-    with_buffer(object, |b| if b.planes.len() == 1 { b.planes[0].stride } else { 0 }).unwrap_or(0)
+    with_buffer(object, |b| b.planes[0].stride).unwrap_or(0)
 }
 
 extern "C" fn pixel_buffer_width(object: Id) -> usize {
@@ -612,8 +732,9 @@ fn has_context() -> bool {
     unsafe { gl::eglGetCurrentContext() != 0 }
 }
 
-/// Gives texture `object` its pixel buffer's current pixels.
-fn upload_texture(object: Id) {
+/// Gives texture `object` its pixel buffer's current pixels; `false` if
+/// there is no GL context to do it with.
+fn upload_texture(object: Id) -> bool {
     let Some((name, target, buffer, plane, internal, format, kind, width, height)) = TEXTURES
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -621,15 +742,15 @@ fn upload_texture(object: Id) {
         .and_then(|t| t.get(&object))
         .map(|t| (t.name, t.target, t.buffer, t.plane, t.internal, t.format, t.kind, t.width, t.height))
     else {
-        return;
+        return true;
     };
-    let Some(buffer) = buffer_of(buffer) else { return };
+    let Some(buffer) = buffer_of(buffer) else { return true };
     if !has_context() {
         crate::log!("CoreVideo: no GL context on this thread; texture {name} keeps its old pixels");
-        return;
+        return false;
     }
     let b = buffer.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(p) = b.planes.get(plane).copied() else { return };
+    let Some(p) = b.planes.get(plane).copied() else { return true };
     let pixels = packed_pixels(b.bytes(), &p, width as usize, height as usize, format);
     drop(b);
     let (upload_internal, upload_format) = if format == BGRA { (RGBA, RGBA) } else { (internal, format) };
@@ -640,12 +761,14 @@ fn upload_texture(object: Id) {
         with_plain_unpack(|| gl::glTexImage2D(target, 0, upload_internal as i32, width, height, 0, upload_format, kind, pixels.as_ptr()));
         gl::glBindTexture(target, bound as u32);
     }
+    true
 }
 
 /// Before the game reads a buffer: pixels drawn into its (4-byte) texture
-/// are copied back into it.
+/// are copied back into it, unless the buffer holds newer pixels the
+/// texture never got.
 fn read_back(b: &mut PixelBuffer) {
-    if b.textures.is_empty() || !has_context() {
+    if b.textures.is_empty() || b.textures_behind || !has_context() {
         return;
     }
     let found = {
@@ -763,7 +886,12 @@ extern "C" fn cache_create_texture(
         Texture { name, target, cache, buffer: image, plane, internal: internal as Enum, format, kind, width, height },
     );
     buffer.lock().unwrap_or_else(|e| e.into_inner()).textures.push(texture);
-    upload_texture(texture);
+    if upload_texture(texture) {
+        let mut b = buffer.lock().unwrap_or_else(|e| e.into_inner());
+        if b.textures.len() == 1 {
+            b.textures_behind = false;
+        }
+    }
     unsafe { *out = texture };
     RETURN_SUCCESS
 }
@@ -814,11 +942,23 @@ pub struct Sample {
     pub time: CmTime,
     pub duration: CmTime,
     pub frames: usize,
-    pub data: Vec<u8>,
-    pub format: Option<crate::fw::audiofile::Asbd>,
-    /// The block buffer and format description objects, made when asked for.
+    pub data: Arc<Vec<u8>>,
+    pub format: Option<Arc<Asbd>>,
+    /// The block buffer and format description objects, made when asked for
+    /// (the sample owns one count of each).
     block: Id,
     description: Id,
+}
+
+use crate::fw::audiofile::Asbd;
+
+/// A block buffer or format description: shares its sample's bytes and
+/// format, so it stays good if the game keeps it after the sample is gone.
+struct Part {
+    data: Arc<Vec<u8>>,
+    format: Option<Arc<Asbd>>,
+    width: u32,
+    height: u32,
 }
 
 static SAMPLES: Mutex<Option<HashMap<Id, Sample>>> = Mutex::new(None);
@@ -826,13 +966,14 @@ static SAMPLES: Mutex<Option<HashMap<Id, Sample>>> = Mutex::new(None);
 /// A sample buffer showing `image` at `time` (owned once by the caller).
 pub fn make_image_sample(image: Id, time: CmTime, duration: CmTime) -> Id {
     retained(image);
-    make_sample(Sample { image, time, duration, frames: 1, data: Vec::new(), format: None, block: 0, description: 0 })
+    make_sample(Sample { image, time, duration, frames: 1, data: Arc::default(), format: None, block: 0, description: 0 })
 }
 
-/// A sample buffer of `frames` sound frames in `format` starting at `time`.
-pub fn make_audio_sample(data: Vec<u8>, format: crate::fw::audiofile::Asbd, frames: usize, time: CmTime) -> Id {
-    let duration = CmTime::new(frames as i64, format.rate.round().max(1.0) as i32);
-    make_sample(Sample { image: 0, time, duration, frames, data, format: Some(format), block: 0, description: 0 })
+/// A sample buffer of `samples` (frames for PCM, packets otherwise) holding
+/// `frames` sound frames in `format` starting at `time`.
+pub fn make_audio_sample(data: Vec<u8>, format: Asbd, samples: usize, frames: usize, time: CmTime) -> Id {
+    let duration = CmTime::new(frames as i64, format.rate.round().clamp(1.0, i32::MAX as f64) as i32);
+    make_sample(Sample { image: 0, time, duration, frames: samples, data: Arc::new(data), format: Some(Arc::new(format)), block: 0, description: 0 })
 }
 
 fn make_sample(sample: Sample) -> Id {
@@ -865,22 +1006,23 @@ extern "C" fn sample_is_valid(sample: Id) -> u8 {
     with_sample(sample, |_| 1).unwrap_or(0)
 }
 
-/// Block buffers and format descriptions point back at their sample.
-static PARTS: Mutex<Option<HashMap<Id, Id>>> = Mutex::new(None);
+static PARTS: Mutex<Option<HashMap<Id, Part>>> = Mutex::new(None);
 
+/// The sample's block buffer or format description, made on first ask.
 fn part(sample: Id, which: fn(&mut Sample) -> &mut Id, class: &str) -> Id {
-    let Some(existing) = with_sample(sample, |s| *which(s)) else { return 0 };
+    let Some((existing, data, format, image)) = with_sample(sample, |s| (*which(s), s.data.clone(), s.format.clone(), s.image)) else { return 0 };
     if existing != 0 {
         return existing;
     }
-    let object = runtime::alloc_instance(runtime::class_named(class));
-    PARTS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(object, sample);
+    let (width, height) = with_buffer(image, |b| (b.width as u32, b.height as u32)).unwrap_or((0, 0));
+    let object = new_object(class);
+    PARTS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(object, Part { data, format, width, height });
     with_sample(sample, |s| *which(s) = object);
     object
 }
 
-fn sample_of_part(object: Id) -> Id {
-    PARTS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|p| p.get(&object).copied()).unwrap_or(0)
+fn with_part<R>(object: Id, f: impl FnOnce(&Part) -> R) -> Option<R> {
+    PARTS.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&object).map(f)
 }
 
 /// CMSampleBufferGetDataBuffer: sound samples have one; pictures don't.
@@ -899,7 +1041,7 @@ extern "C" fn sample_format_description(sample: Id) -> Id {
 }
 
 extern "C" fn block_data_length(block: Id) -> usize {
-    with_sample(sample_of_part(block), |s| s.data.len()).unwrap_or(0)
+    with_part(block, |p| p.data.len()).unwrap_or(0)
 }
 
 /// CMBlockBufferCopyDataBytes(block, offset, length, destination).
@@ -908,7 +1050,7 @@ extern "C" fn block_copy_bytes(block: Id, offset: usize, length: usize, destinat
     if destination.is_null() {
         return -12760;
     }
-    with_sample(sample_of_part(block), |s| match s.data.get(offset..offset.saturating_add(length)) {
+    with_part(block, |s| match s.data.get(offset..offset.saturating_add(length)) {
         Some(bytes) => {
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), destination, bytes.len()) };
             0
@@ -920,7 +1062,7 @@ extern "C" fn block_copy_bytes(block: Id, offset: usize, length: usize, destinat
 
 /// CMBlockBufferGetDataPointer(block, offset, *lengthAtOffset, *totalLength, *pointer).
 extern "C" fn block_data_pointer(block: Id, offset: usize, at_offset: *mut usize, total: *mut usize, pointer: *mut usize) -> i32 {
-    with_sample(sample_of_part(block), |s| {
+    with_part(block, |s| {
         if offset > s.data.len() {
             return -12762;
         }
@@ -940,20 +1082,19 @@ extern "C" fn block_data_pointer(block: Id, offset: usize, at_offset: *mut usize
     .unwrap_or(-12760)
 }
 
-/// CMAudioFormatDescriptionGetStreamBasicDescription: lives as long as the sample.
+/// CMAudioFormatDescriptionGetStreamBasicDescription: good while the description lives.
 extern "C" fn audio_description_basic(description: Id) -> usize {
-    with_sample(sample_of_part(description), |s| s.format.as_ref().map(|f| f as *const _ as usize).unwrap_or(0)).unwrap_or(0)
+    with_part(description, |p| p.format.as_ref().map(|f| Arc::as_ptr(f) as usize).unwrap_or(0)).unwrap_or(0)
 }
 
 /// CMFormatDescriptionGetMediaType: 'soun' or 'vide'.
 extern "C" fn description_media_type(description: Id) -> u32 {
-    with_sample(sample_of_part(description), |s| u32::from_be_bytes(if s.format.is_some() { *b"soun" } else { *b"vide" })).unwrap_or(0)
+    with_part(description, |p| u32::from_be_bytes(if p.format.is_some() { *b"soun" } else { *b"vide" })).unwrap_or(0)
 }
 
 /// CMVideoFormatDescriptionGetDimensions: {width, height} as two int32s.
 extern "C" fn video_description_dimensions(description: Id) -> u64 {
-    let image = with_sample(sample_of_part(description), |s| s.image).unwrap_or(0);
-    with_buffer(image, |b| (b.width as u32 as u64) | ((b.height as u32 as u64) << 32)).unwrap_or(0)
+    with_part(description, |p| p.width as u64 | (p.height as u64) << 32).unwrap_or(0)
 }
 
 pub fn register(r: &mut Registry) {
@@ -1065,14 +1206,38 @@ mod tests {
         assert_eq!((sum.value, sum.timescale, sum.flags), (7, 6, TIME_VALID), "1/2 + 2/3 = 7/6 exactly");
         let difference = combine(&half, &thirds, true);
         assert_eq!((difference.value, difference.timescale), (-1, 6));
+        // Past timescale 1 a time is infinite; sums too big halve, then overflow to infinity.
+        assert_eq!(time_from_seconds(-1e30, 600), CmTime::NEGATIVE_INFINITY);
+        let huge = CmTime::new(i64::MAX, 2);
+        let doubled = combine(&huge, &huge, false);
+        assert_eq!((doubled.value, doubled.timescale, doubled.flags), (i64::MAX, 1, TIME_VALID), "{doubled:?}");
+        assert_eq!(combine(&CmTime::new(i64::MAX, 1), &CmTime::new(1, 1), false), CmTime::POSITIVE_INFINITY);
+        // Different epochs, opposite infinities and a valid time with timescale 0 are invalid.
+        assert_eq!(combine(&CmTime { epoch: 1, ..half }, &half, false), CmTime::INVALID);
+        assert_eq!(combine(&infinite, &infinite, true), CmTime::INVALID);
+        assert_eq!(combine(&indefinite, &infinite, false), CmTime::INDEFINITE);
+        let broken = CmTime { value: 5, timescale: 0, flags: TIME_VALID, epoch: 0 };
+        assert_eq!(combine(&broken, &half, false), CmTime::INVALID);
+        assert_eq!(time_convert_scale(broken, 600, 0), CmTime::INVALID);
+        // CMTimeConvertScale rounds by the method asked for and says so.
+        let t = CmTime::new(-5, 4); // -1.25 s
+        let at = |method| time_convert_scale(t, 2, method);
+        assert_eq!((at(ROUND_HALF_AWAY).value, at(ROUND_TOWARD_ZERO).value, at(ROUND_AWAY_FROM_ZERO).value), (-3, -2, -3));
+        assert_eq!((at(ROUND_DOWN).value, at(ROUND_UP).value), (-3, -2));
+        assert_eq!(at(ROUND_UP).flags, TIME_VALID | TIME_ROUNDED);
+        assert_eq!(time_convert_scale(t, 8, 0), CmTime::new(-10, 8), "exact: not rounded");
     }
 
     #[test]
     fn pixel_planes_and_bgra_round_trip() {
         let planes = layout(FORMAT_420V, 33, 17).unwrap();
         assert_eq!(planes[0].stride, 64);
-        assert_eq!((planes[1].width, planes[1].height, planes[1].offset), (17, 9, 64 * 17));
+        assert_eq!((planes[1].width, planes[1].height, planes[1].offset), (17, 9, 64 + 64 * 17));
         assert_eq!(planes[1].stride, 64);
+        // A planar buffer's base address holds CVPlanarPixelBufferInfo_YCbCrBiPlanar.
+        let planar = PixelBuffer::new(FORMAT_420V, 33, 17).unwrap();
+        let header: Vec<u32> = planar.bytes()[..16].chunks_exact(4).map(|b| u32::from_be_bytes(b.try_into().unwrap())).collect();
+        assert_eq!(header, [64, 64, 64 + 64 * 17, 64]);
         let mut buffer = PixelBuffer::new(FORMAT_BGRA, 3, 2).unwrap();
         let plane = buffer.planes[0];
         assert_eq!(plane.stride, 64);

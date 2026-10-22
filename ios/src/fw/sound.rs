@@ -273,24 +273,36 @@ extern "C" fn unit_render(unit: usize, flags: *mut u32, _stamp: *const u8, bus: 
     }
     unsafe {
         let count = *(list as *const u32) as usize;
+        // Buffers the caller asked the unit to supply: sized all at once, so
+        // growing the scratch never moves memory already handed out.
+        let wants: Vec<(usize, usize)> = (0..count)
+            .filter(|&b| (*(list.add(8 + 16 * b + 8) as *const usize)) == 0)
+            .map(|b| {
+                let entry = list.add(8 + 16 * b);
+                let channels = (*(entry as *const u32)).max(1) as usize;
+                (b, (frames as usize * channels * 4).max(*(entry.add(4) as *const u32) as usize))
+            })
+            .collect();
+        if !wants.is_empty() {
+            let total: usize = wants.iter().map(|w| w.1).sum();
+            let base = RENDER_SCRATCH.with(|s| {
+                let mut s = s.borrow_mut();
+                if s.len() < total {
+                    s.resize(total, 0);
+                }
+                s.as_mut_ptr()
+            });
+            let mut at = 0;
+            for &(b, want) in &wants {
+                let entry = list.add(8 + 16 * b);
+                *(entry.add(4) as *mut u32) = want as u32;
+                *(entry.add(8) as *mut usize) = base.add(at) as usize;
+                at += want;
+            }
+        }
         for b in 0..count {
             let entry = list.add(8 + 16 * b);
-            let size = *(entry.add(4) as *const u32) as usize;
-            let mut data = *(entry.add(8) as *const usize) as *mut u8;
-            if data.is_null() {
-                // The caller asked the unit to supply the memory.
-                let channels = (*(entry as *const u32)).max(1) as usize;
-                let want = (frames as usize * channels * 4).max(size);
-                data = RENDER_SCRATCH.with(|s| {
-                    let mut s = s.borrow_mut();
-                    if s.len() < want * count {
-                        s.resize(want * count, 0);
-                    }
-                    s.as_mut_ptr().add(b * want)
-                });
-                *(entry.add(4) as *mut u32) = want as u32;
-                *(entry.add(8) as *mut usize) = data as usize;
-            }
+            let data = *(entry.add(8) as *const usize) as *mut u8;
             std::ptr::write_bytes(data, 0, (*(entry.add(4) as *const u32)) as usize);
         }
         if !flags.is_null() {
@@ -346,19 +358,17 @@ extern "C" fn graph_is_running(graph: usize, running: *mut u8) -> i32 {
 
 /// DisposeAUGraph: its units go away; no callback runs after this returns.
 extern "C" fn graph_dispose(graph: usize) -> i32 {
-    let gone: Vec<usize> = with_graph(|g| {
+    with_graph(|g| {
         g.running.remove(&graph);
         let gone: Vec<usize> = g.units.iter().filter(|(_, u)| u.graph == graph).map(|(&k, _)| k).collect();
         for unit in &gone {
             g.units.remove(unit);
         }
         g.nodes.retain(|_, unit| !gone.contains(unit));
-        gone
     });
+    // Their streams go on the sound thread's next turn (this may be running
+    // inside one of its callbacks, which holds the mixer).
     wait_for_render();
-    if let Some(mixer) = MIXER.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-        mixer.streams.retain(|(unit, _), _| !gone.contains(unit));
-    }
     0
 }
 
@@ -717,6 +727,8 @@ fn mix_graph(out: &mut [f32], frames: usize, out_rate: f64) {
     let Mixer { streams, scratch, sources } = guard.get_or_insert_with(Mixer::default);
     sources.clear();
     with_graph(|g| {
+        // Streams of disposed units go.
+        streams.retain(|(unit, _), _| g.units.contains_key(unit));
         let running = &g.running;
         sources.extend(
             g.units
