@@ -435,7 +435,13 @@ fn enqueue(queue: usize, state: &'static SerialQueue, job: Job) {
                 }
             };
             match job {
-                Job::Later(block, sent_to) => run_as(sent_to, block),
+                // Blocks sent with dispatch_async get a pool each, as GCD's
+                // worker threads drain theirs (sync blocks use the caller's).
+                Job::Later(block, sent_to) => {
+                    let pool = crate::fw::counted::pool_mark();
+                    run_as(sent_to, block);
+                    crate::fw::counted::pool_drain(pool);
+                }
                 Job::Now(block, done, sent_to) => {
                     run_as(sent_to, block);
                     mark_done(&done);
@@ -457,7 +463,9 @@ extern "C" fn dispatch_async(queue: usize, block: usize) {
     } else {
         std::thread::spawn(move || {
             CURRENT_QUEUE.with(|c| c.set(queue));
-            unsafe { call_block(copy) }
+            let pool = crate::fw::counted::pool_mark();
+            unsafe { call_block(copy) };
+            crate::fw::counted::pool_drain(pool);
         });
     }
 }

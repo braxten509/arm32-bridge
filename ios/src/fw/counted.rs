@@ -10,7 +10,9 @@
 //! while still held; collections never let go (a picture stays alive rather
 //! than vanish under the game).
 //!
-//! Objects are looked up by address, so any value can be passed in safely.
+//! Only objects (or nil) may be passed in: whether one is counted is read
+//! from its class pointer without any lock, so the many retains and
+//! releases of every other object cost two loads and a compare or two.
 
 use crate::objc::runtime::Id;
 use std::cell::RefCell;
@@ -24,25 +26,51 @@ struct Entry {
 }
 
 static LIVE: Mutex<Option<HashMap<Id, Entry>>> = Mutex::new(None);
-/// How many objects are listed (lets the common case skip the lock).
-static LISTED: AtomicUsize = AtomicUsize::new(0);
+
+/// The classes whose objects count (exact classes: only our code makes them).
+static CLASSES: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
 
 fn live() -> std::sync::MutexGuard<'static, Option<HashMap<Id, Entry>>> {
     LIVE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Lists a new object with one reference; `clean_up` runs when the last goes.
+/// Objects of `class` count references from now on (see `track`).
+pub fn count_class(class: usize) {
+    for slot in &CLASSES {
+        match slot.compare_exchange(0, class, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(existing) if existing == class => return,
+            Err(_) => {}
+        }
+    }
+    panic!("counted: too many counted classes");
+}
+
+/// Whether `object` is of a counted class, without any lock.
+#[inline]
+fn counted_class(object: Id) -> bool {
+    // Not nil, a plain aligned object pointer (not a tagged one).
+    if object == 0 || object & 7 != 0 || (object as isize) < 0 {
+        return false;
+    }
+    let isa = unsafe { *(object as *const usize) };
+    CLASSES.iter().any(|c| {
+        let c = c.load(Ordering::Relaxed);
+        c != 0 && c == isa
+    })
+}
+
+/// Lists a new object of a counted class with one reference; `clean_up`
+/// runs when the last goes.
 pub fn track(object: Id, clean_up: fn(Id)) {
     if object == 0 {
         return;
     }
-    if live().get_or_insert_with(HashMap::new).insert(object, Entry { count: 1, clean_up }).is_none() {
-        LISTED.fetch_add(1, Ordering::Relaxed);
-    }
+    live().get_or_insert_with(HashMap::new).insert(object, Entry { count: 1, clean_up });
 }
 
 pub fn is_tracked(object: Id) -> bool {
-    object != 0 && LISTED.load(Ordering::Relaxed) != 0 && live().as_ref().is_some_and(|m| m.contains_key(&object))
+    counted_class(object) && live().as_ref().is_some_and(|m| m.contains_key(&object))
 }
 
 /// The reference count of a listed object.
@@ -52,7 +80,7 @@ pub fn count(object: Id) -> Option<usize> {
 
 /// +1 for a listed object (others: nothing). Returns the object.
 pub fn retain(object: Id) -> Id {
-    if object != 0 && LISTED.load(Ordering::Relaxed) != 0 {
+    if counted_class(object) {
         if let Some(entry) = live().as_mut().and_then(|m| m.get_mut(&object)) {
             entry.count += 1;
         }
@@ -67,7 +95,7 @@ pub fn keep(object: Id) {
 
 /// -1 for a listed object; at zero it leaves the list and is cleaned up.
 pub fn release(object: Id) {
-    if object == 0 || LISTED.load(Ordering::Relaxed) == 0 {
+    if !counted_class(object) {
         return;
     }
     let gone = {
@@ -78,16 +106,74 @@ pub fn release(object: Id) {
                 entry.count -= 1;
                 None
             }
-            Some(_) => {
-                LISTED.fetch_sub(1, Ordering::Relaxed);
-                m.remove(&object)
-            }
+            Some(_) => m.remove(&object),
             None => None,
         }
     };
     // Outside the lock: cleaning up may release what the object held.
     if let Some(entry) = gone {
+        clear_weak(object);
         (entry.clean_up)(object);
+    }
+}
+
+// ----- weak references (ARC's __weak) to counted objects -----
+
+/// Where weak references to each counted object are kept.
+static WEAK: Mutex<Option<HashMap<Id, Vec<usize>>>> = Mutex::new(None);
+
+fn weak() -> std::sync::MutexGuard<'static, Option<HashMap<Id, Vec<usize>>>> {
+    WEAK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// objc_storeWeak / objc_initWeak: `location` now refers weakly to `object`.
+pub fn store_weak(location: *mut Id, object: Id) -> Id {
+    if location.is_null() {
+        return object;
+    }
+    let old = unsafe { std::mem::replace(&mut *location, object) };
+    if counted_class(old) || counted_class(object) {
+        let mut map = weak();
+        let map = map.get_or_insert_with(HashMap::new);
+        if let Some(list) = map.get_mut(&old) {
+            list.retain(|&l| l != location as usize);
+        }
+        if counted_class(object) && is_tracked(object) {
+            map.entry(object).or_default().push(location as usize);
+        } else if counted_class(object) {
+            // Already gone: a weak reference to it reads nil, as on Apple.
+            unsafe { *location = 0 };
+            return 0;
+        }
+    }
+    object
+}
+
+/// objc_loadWeakRetained: the object (+1), or nil once it is gone.
+pub fn load_weak_retained(location: *const Id) -> Id {
+    if location.is_null() {
+        return 0;
+    }
+    // Under the weak lock, so the object can't be cleared halfway.
+    let _guard = weak();
+    let object = unsafe { *location };
+    if counted_class(object) && !is_tracked(object) {
+        return 0; // its last reference just went
+    }
+    retain(object)
+}
+
+/// Zeroes the weak references to an object whose last reference went.
+fn clear_weak(object: Id) {
+    if let Some(list) = weak().as_mut().and_then(|m| m.remove(&object)) {
+        for location in list {
+            let slot = location as *mut Id;
+            unsafe {
+                if *slot == object {
+                    *slot = 0;
+                }
+            }
+        }
     }
 }
 
@@ -178,9 +264,16 @@ mod tests {
         CLEANED.lock().unwrap().iter().filter(|&&o| o == object).count()
     }
 
+    /// A fake object of a counted class (only its class pointer is read).
+    fn object() -> Id {
+        count_class(0x7000_0000);
+        Box::leak(Box::new(0x7000_0000usize)) as *mut usize as Id
+    }
+
     #[test]
     fn counts_pools_and_holders_free_once_at_the_right_time() {
-        let (image, kept, other) = (0x7000_1000, 0x7000_2000, 0x7000_3000);
+        let (image, kept) = (object(), object());
+        let other = Box::leak(Box::new(0x1234usize)) as *mut usize as Id;
         track(image, note);
         // A factory's result: +1 and autoreleased, then retained by its user.
         let mark = pool_mark();
@@ -203,11 +296,22 @@ mod tests {
         retain(other);
         release(other);
         assert_eq!(count(other), None);
+        // A weak reference: loading it gives +1; once the object goes it reads nil.
+        let weak = object();
+        track(weak, note);
+        let mut slot: Id = 0;
+        store_weak(&mut slot, weak);
+        assert_eq!(load_weak_retained(&slot), weak);
+        assert_eq!(count(weak), Some(2));
+        release(weak);
+        release(weak);
+        assert_eq!((slot, load_weak_retained(&slot)), (0, 0));
+        store_weak(&mut slot, 0);
     }
 
     #[test]
     fn counting_from_many_threads_frees_exactly_once() {
-        let object = 0x7000_4000;
+        let object = object();
         track(object, note);
         let threads: Vec<_> = (0..8)
             .map(|_| {

@@ -522,6 +522,8 @@ fn new_thread(target: Id, selector: Sel, argument: Id) -> Id {
 
 fn spawn(thread: Id, target: Id, selector: Sel, argument: Id, why: &str) {
     let name = lock().sel_name(selector);
+    // Kept while the thread runs, as Apple's NSThread retains its argument.
+    crate::fw::counted::keep(argument);
     crate::log!("thread started: -[{} {name}] ({why})", string::describe_class_of(target));
     std::thread::Builder::new()
         .stack_size(THREAD_STACK)
@@ -529,6 +531,7 @@ fn spawn(thread: Id, target: Id, selector: Sel, argument: Id, why: &str) {
             crate::libsystem::threads::note_this_thread();
             CURRENT_THREAD.with(|cell| cell.set(thread));
             runtime::send(target, &name, &[argument]);
+            crate::fw::counted::release(argument);
         })
         .expect("can't start a thread");
 }

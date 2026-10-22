@@ -1089,6 +1089,7 @@ fn uikit_image_from_cg(picture: Id, scale: f64, orientation: i64) -> Id {
         orientation,
         cg: OnceLock::from(picture),
         picture_file: OnceLock::new(),
+        picture_started: Default::default(),
     };
     uikit::make_image(info)
 }
@@ -1097,10 +1098,10 @@ fn uikit_image_from_cg(picture: Id, scale: f64, orientation: i64) -> Id {
 /// go once nothing else holds them) and of the file made to show it.
 pub fn ui_image_clean_up(picture: Id) {
     let Some(info) = uikit::image_info(picture) else { return };
-    if let Some(&cg) = info.cg.get() {
-        counted::release(cg);
-    }
-    if let Some(Some(file)) = info.picture_file.get() {
+    // get_or_init waits for a CGImage being read right now, and stops later
+    // reads (the UIImage is then empty), so nothing is left behind.
+    counted::release(*info.cg.get_or_init(|| 0));
+    if let Some(file) = info.picture_file.get_or_init(|| None) {
         let _ = std::fs::remove_file(file);
     }
 }
@@ -1120,28 +1121,57 @@ pub fn image_cg(picture: Id) -> Id {
 /// A file the phone app can show for this UIImage as UIKit would draw it: the
 /// picture's own file when it is upright, else an upright PNG made once
 /// (pictures made in memory, turned photos). None if it can't be made.
+///
+/// The PNG is made on its own thread (not the game's main thread); until it
+/// is ready this gives None and the picture shows from the next update.
 pub fn picture_file(picture: Id) -> Option<String> {
     let info = uikit::image_info(picture)?;
     if info.orientation == 0 && !info.path.is_empty() {
         return Some(info.path.clone());
     }
-    let made = info.picture_file.get_or_init(|| {
-        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let (width, height, rgba, alpha) = upright_rgba(picture)?;
-        let bytes = encode_png(width, height, &rgba, alpha)?;
-        let folder = format!("{}/tmp/.gamebridge-pictures", crate::fw::foundation::home());
-        let _ = std::fs::create_dir_all(&folder);
-        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let file = format!("{folder}/{}-{n}.png", std::process::id());
-        match std::fs::write(&file, bytes) {
-            Ok(()) => Some(file),
-            Err(e) => {
-                crate::log!("UIImage {picture:#x}: can't write a picture file to show it: {e}");
-                None
+    if let Some(made) = info.picture_file.get() {
+        return made.clone();
+    }
+    if !info.picture_started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        // Held while the file is made, so the image can't go meanwhile.
+        counted::retain(picture);
+        std::thread::spawn(move || {
+            let made = write_picture_file(picture);
+            if let Some(info) = uikit::image_info(picture) {
+                if let Err(Some(file)) = info.picture_file.set(made) {
+                    let _ = std::fs::remove_file(file);
+                }
             }
+            counted::release(picture);
+        });
+    }
+    None
+}
+
+/// The folder for picture files, emptied the first time it's used in a run.
+fn picture_folder() -> &'static str {
+    static FOLDER: OnceLock<String> = OnceLock::new();
+    FOLDER.get_or_init(|| {
+        let folder = format!("{}/tmp/.gamebridge-pictures", crate::fw::foundation::home());
+        let _ = std::fs::remove_dir_all(&folder);
+        let _ = std::fs::create_dir_all(&folder);
+        folder
+    })
+}
+
+fn write_picture_file(picture: Id) -> Option<String> {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let (width, height, rgba, alpha) = upright_rgba(picture)?;
+    let bytes = encode_png(width, height, &rgba, alpha)?;
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let file = format!("{}/{}-{n}.png", picture_folder(), std::process::id());
+    match std::fs::write(&file, bytes) {
+        Ok(()) => Some(file),
+        Err(e) => {
+            crate::log!("UIImage {picture:#x}: can't write a picture file to show it: {e}");
+            None
         }
-    });
-    made.clone()
+    }
 }
 
 extern "C" fn ui_image_cg(this: Id, _: Sel) -> Id {
@@ -1293,12 +1323,15 @@ extern "C" fn ui_image_write_to_saved_photos_album(picture: Id, target: Id, sele
     if target == 0 || selector == 0 {
         return;
     }
+    // The picture is held until the game has been told (as on iOS).
+    counted::retain(picture);
     crate::fw::runloop::post(crate::fw::runloop::Work::Native(Box::new(move || {
         let error = crate::fw::misc::error("ALAssetsLibraryErrorDomain", -3311, "User denied access");
         let name = lock().sel_name(selector);
         if runtime::responds(target, &name) {
             runtime::send(target, &name, &[picture, error, context]);
         }
+        counted::release(picture);
     })));
 }
 
@@ -1322,6 +1355,7 @@ pub fn register(r: &mut Registry) {
     }
     let ui_image = runtime::class_named("UIImage");
     for class in [image_class, context, ui_image] {
+        counted::count_class(class);
         methods(
             class,
             &[

@@ -18,9 +18,14 @@ pub fn property_get(object: Id, key: &'static str) -> Option<u64> {
 }
 
 pub fn property_set(object: Id, key: &'static str, value: u64) {
-    let old = PROPERTIES.lock().unwrap().get_or_insert_with(HashMap::new).insert((object, key), value);
-    // UIKit's object properties retain what they hold (matters for counted objects: pictures).
-    crate::fw::counted::replace(old.unwrap_or(0) as Id, value as Id);
+    PROPERTIES.lock().unwrap().get_or_insert_with(HashMap::new).insert((object, key), value);
+}
+
+/// Sets an object property: like UIKit's, it retains what it holds (this
+/// matters for objects with real counts: pictures, fw/counted.rs).
+pub fn property_set_object(object: Id, key: &'static str, value: Id) {
+    let old = PROPERTIES.lock().unwrap().get_or_insert_with(HashMap::new).insert((object, key), value as u64);
+    crate::fw::counted::replace(old.unwrap_or(0) as Id, value);
 }
 
 /// Makes a getter and setter pair that keep a value per object.
@@ -30,7 +35,7 @@ macro_rules! property {
             property_get(this, $key).map(|v| v as Id).unwrap_or($default)
         }
         extern "C" fn $set(this: Id, _: Sel, value: Id) {
-            property_set(this, $key, value as u64);
+            property_set_object(this, $key, value);
         }
     };
     ($get:ident, $set:ident, $key:literal, bool, $default:expr) => {
@@ -760,6 +765,8 @@ pub struct ImageInfo {
     pub cg: OnceLock<Id>,
     /// An upright PNG made to show it on the phone screen (see graphics::picture_file).
     pub picture_file: OnceLock<Option<String>>,
+    /// Whether making that file has started.
+    pub picture_started: std::sync::atomic::AtomicBool,
 }
 
 fn png_size(path: &str) -> Option<(u32, u32)> {
@@ -788,7 +795,7 @@ fn image_from_path(path: &str) -> Id {
     };
     // A photo's EXIF tag turns it, as UIImage reads it (the size is then swapped).
     let orientation = crate::fw::graphics::file_orientation(path);
-    make_image(ImageInfo { path: path.into(), pixels, scale, orientation, cg: OnceLock::new(), picture_file: OnceLock::new() })
+    make_image(ImageInfo { path: path.into(), pixels, scale, orientation, cg: OnceLock::new(), picture_file: OnceLock::new(), picture_started: Default::default() })
 }
 
 /// A new UIImage with one reference (the caller's); it counts references (fw/counted.rs).
@@ -867,7 +874,7 @@ extern "C" fn image_scale(this: Id, _: Sel) -> f64 {
 extern "C" fn image_view_init_with_image(this: Id, _: Sel, image: Id) -> Id {
     let size = if image != 0 { image_size(image, 0) } else { Size::default() };
     view_init_with_frame(this, 0, Rect { origin: Point::default(), size });
-    property_set(this, "image", image as u64);
+    property_set_object(this, "image", image);
     this
 }
 

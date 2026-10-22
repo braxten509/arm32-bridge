@@ -34,6 +34,8 @@ pub fn set_from(list: &[Id]) -> Id {
 
 fn add(set: Id, item: Id) {
     if item != 0 && !items(set).iter().any(|&i| same(i, item)) {
+        // Kept, as Apple's set retains (fw/counted.rs; never let go).
+        crate::fw::counted::keep(item);
         items(set).push(item);
     }
 }
