@@ -5,7 +5,8 @@
 use crate::fw::object::{class_methods, define_class, methods};
 use crate::objc::runtime::{self, lock, Class, ClassObject, Id, Sel};
 use crate::symbols::{leak_cstr, Registry};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 
 // ----- type encodings -----
 
@@ -417,31 +418,117 @@ extern "C" fn ms_copy(this: Id, _: Sel, _zone: usize) -> Id {
     this
 }
 
-/// A game method's type encoding, read from its class's method list.
-fn game_method_types(class: Class, sel: Sel) -> Option<String> {
-    let name = lock().sel_name(sel);
-    let mut current = class;
-    for _ in 0..64 {
-        let (from_game, superclass) = {
-            let rt = lock();
-            let rec = rt.classes.get(&current)?;
-            (rec.from_game, rec.superclass)
-        };
-        if from_game {
-            unsafe {
-                let ro = (*(current as *const ClassObject)).data & !7;
-                let list = std::ptr::read_unaligned((ro + 32) as *const usize);
-                if list != 0 {
-                    let entry_size = (std::ptr::read_unaligned(list as *const u32) & !3) as usize;
-                    let count = std::ptr::read_unaligned((list + 4) as *const u32) as usize;
-                    for index in 0..count {
-                        let entry = list + 8 + index * entry_size;
-                        if runtime::cstr(std::ptr::read_unaligned(entry as *const usize)) == name {
-                            return Some(runtime::cstr(std::ptr::read_unaligned((entry + 8) as *const usize)));
-                        }
+/// Our own methods' encodings, made by build.rs from their Rust signatures:
+/// (class name, or "" when the class wasn't known there; class method?; selector; types).
+mod generated {
+    include!(concat!(env!("OUT_DIR"), "/method_types.rs"));
+}
+
+struct OurTypes {
+    exact: HashMap<(&'static str, bool, &'static str), &'static str>,
+    /// By selector alone, when every definition agrees (None: they differ).
+    by_selector: HashMap<(bool, &'static str), Option<&'static str>>,
+}
+
+fn our_types() -> &'static OurTypes {
+    static TYPES: OnceLock<OurTypes> = OnceLock::new();
+    TYPES.get_or_init(|| {
+        let mut exact = HashMap::new();
+        let mut by_selector: HashMap<(bool, &'static str), Option<&'static str>> = HashMap::new();
+        for &(class, meta, selector, types) in generated::METHOD_TYPES {
+            if !class.is_empty() {
+                exact.insert((class, meta, selector), types);
+            }
+            by_selector
+                .entry((meta, selector))
+                .and_modify(|known| {
+                    if *known != Some(types) {
+                        *known = None;
                     }
+                })
+                .or_insert(Some(types));
+        }
+        OurTypes { exact, by_selector }
+    })
+}
+
+/// The game's own encodings: (class or metaclass, selector) -> types, from
+/// its classes' method lists and then its categories (which win, as they
+/// replace the class's own methods).
+fn game_types() -> &'static HashMap<(Class, String), String> {
+    static TYPES: OnceLock<HashMap<(Class, String), String>> = OnceLock::new();
+    TYPES.get_or_init(|| {
+        let mut out = HashMap::new();
+        let Some(loaded) = crate::loader::try_loaded() else { return out };
+        unsafe fn read(address: usize) -> usize {
+            std::ptr::read_unaligned(address as *const usize)
+        }
+        unsafe fn add_list(out: &mut HashMap<(Class, String), String>, class: Class, list: usize) {
+            if list == 0 || class == 0 {
+                return;
+            }
+            let entry_size = (std::ptr::read_unaligned(list as *const u32) & !3) as usize;
+            let count = std::ptr::read_unaligned((list + 4) as *const u32) as usize;
+            for index in 0..count {
+                let entry = list + 8 + index * entry_size;
+                let types = read(entry + 8);
+                if types != 0 {
+                    out.insert((class, runtime::cstr(read(entry))), runtime::cstr(types));
                 }
             }
+        }
+        let cells = |name: &str| -> Vec<usize> {
+            let mut list = Vec::new();
+            for segment in ["__DATA", "__DATA_CONST", "__DATA_DIRTY"] {
+                if let Some(section) = loaded.image.section(segment, name) {
+                    let start = section.address.wrapping_add(loaded.slide) as usize;
+                    list.extend((0..section.size as usize / 8).map(|i| unsafe { read(start + i * 8) }));
+                }
+            }
+            list
+        };
+        unsafe {
+            for class in cells("__objc_classlist") {
+                let meta = (*(class as *const ClassObject)).isa;
+                add_list(&mut out, class, read(((*(class as *const ClassObject)).data & !7) + 32));
+                add_list(&mut out, meta, read(((*(meta as *const ClassObject)).data & !7) + 32));
+            }
+            for category in cells("__objc_catlist") {
+                let class = read(category + 8);
+                let meta = lock().classes.get(&class).map(|r| r.partner).unwrap_or(0);
+                add_list(&mut out, class, read(category + 16));
+                add_list(&mut out, meta, read(category + 24));
+            }
+        }
+        out
+    })
+}
+
+/// The encoding of the method `class` (a metaclass for class methods)
+/// answers `sel` with: found on the class that defines it, from the game's
+/// method lists or our own table. None when no type is known: then there is
+/// no signature (a guess could make NSInvocation copy more bytes than the
+/// caller's buffer holds, or use the wrong registers).
+pub fn method_types(class: Class, sel: Sel) -> Option<String> {
+    let name = lock().sel_name(sel);
+    let mut current = class;
+    for _ in 0..256 {
+        let (defines, class_name, meta, superclass) = {
+            let rt = lock();
+            let rec = rt.classes.get(&current)?;
+            (rec.methods.contains_key(&sel), rec.name.clone(), rec.meta, rec.superclass)
+        };
+        if defines {
+            if let Some(types) = game_types().get(&(current, name.clone())) {
+                return Some(types.clone());
+            }
+            let ours = our_types();
+            return ours
+                .exact
+                .get(&(class_name.as_str(), meta, name.as_str()))
+                .copied()
+                .or_else(|| ours.by_selector.get(&(meta, name.as_str())).copied().flatten())
+                .map(String::from);
         }
         if superclass == 0 {
             return None;
@@ -451,30 +538,20 @@ fn game_method_types(class: Class, sel: Sel) -> Option<String> {
     None
 }
 
-/// Our own methods carry no type encodings: arguments are taken as objects,
-/// and yes/no questions (isX, hasX, canX, shouldX) answer a BOOL, so a
-/// game reading the answer into a BOOL never gets more bytes than it holds.
-fn guessed_types(name: &str) -> String {
-    let arguments = name.matches(':').count();
-    let question = ["is", "has", "can", "should"]
-        .iter()
-        .any(|p| name.strip_prefix(p).and_then(|rest| rest.chars().next()).is_some_and(|c| c.is_ascii_uppercase()));
-    format!("{}@:{}", if question { "B" } else { "@" }, "@".repeat(arguments))
-}
-
-/// The signature for a method of `class` (a metaclass for class methods):
-/// its own encoding for the game's methods, a guess for ours.
+/// The signature for a method of `class` (a metaclass for class methods);
+/// nil when the class has no such method or its types aren't known.
 fn signature_for(class: Class, sel: Sel) -> Id {
     if lock().lookup(class, sel).is_none() {
         return 0;
     }
-    let types = game_method_types(class, sel).unwrap_or_else(|| {
-        let name = lock().sel_name(sel);
-        let types = guessed_types(&name);
-        crate::log!("NSMethodSignature for our {name}: types guessed as {types}");
-        types
-    });
-    make_signature(&types)
+    match method_types(class, sel) {
+        Some(types) => make_signature(&types),
+        None => {
+            let (name, class_name) = { let rt = lock(); (rt.sel_name(sel), rt.class_name(class)) };
+            crate::log!("NSMethodSignature: no type encoding known for {class_name} {name}; nil");
+            0
+        }
+    }
 }
 
 extern "C" fn method_signature_for_selector(this: Id, _: Sel, sel: Sel) -> Id {
@@ -495,6 +572,8 @@ struct Invocation {
     arguments: Vec<Vec<u8>>,
     result: Vec<u8>,
     retained: bool,
+    /// C strings copied by retainArguments (their pointers are in `arguments`).
+    copies: Vec<std::ffi::CString>,
 }
 
 fn invocation(this: Id) -> Option<&'static mut Invocation> {
@@ -514,7 +593,7 @@ extern "C" fn inv_with_signature(class: Class, _: Sel, signature_object: Id) -> 
     let arguments = types.parts[1..].iter().map(|(_, t)| vec![0u8; t.size.max(8)]).collect();
     let result = vec![0u8; types.parts[0].1.size.max(16)];
     let object = runtime::alloc_instance(class);
-    let state = Invocation { signature: signature_object, types, arguments, result, retained: false };
+    let state = Invocation { signature: signature_object, types, arguments, result, retained: false, copies: Vec::new() };
     unsafe { *((object + 8) as *mut *mut Invocation) = Box::into_raw(Box::new(state)) };
     object
 }
@@ -542,6 +621,9 @@ extern "C" fn inv_target(this: Id, _: Sel) -> Id {
 
 extern "C" fn inv_set_target(this: Id, _: Sel, target: Id) {
     set_argument_word(this, 0, target);
+    if let Some(state) = invocation(this) {
+        keep_argument(state, 0);
+    }
 }
 
 extern "C" fn inv_selector(this: Id, _: Sel) -> Sel {
@@ -564,6 +646,7 @@ extern "C" fn inv_set_argument(this: Id, _: Sel, pointer: *const u8, index: isiz
     }
     let source = unsafe { std::slice::from_raw_parts(pointer, size) };
     state.arguments[index as usize][..size].copy_from_slice(source);
+    keep_argument(state, index as usize);
 }
 
 extern "C" fn inv_get_argument(this: Id, _: Sel, pointer: *mut u8, index: isize) {
@@ -593,9 +676,48 @@ extern "C" fn inv_set_return(this: Id, _: Sel, pointer: *const u8) {
     }
 }
 
+/// The type letter of a part, after its qualifiers (const, in, out...).
+fn bare(part: &str) -> &str {
+    part.trim_start_matches(|c| "rnNoORVAj".contains(c))
+}
+
+/// Once arguments are retained (Apple's contract): objects are retained,
+/// blocks copied to the heap and C strings copied, so the invocation still
+/// holds them after the caller's own copies are gone.
+fn keep_argument(state: &mut Invocation, index: usize) {
+    if !state.retained {
+        return;
+    }
+    let Some((part, _)) = state.types.parts.get(index + 1) else { return };
+    let kind = bare(part);
+    let word = usize::from_le_bytes(state.arguments[index][..8].try_into().unwrap());
+    if word == 0 {
+        return;
+    }
+    let kept = if kind.starts_with("@?") {
+        crate::libsystem::mach::block_copy(word as *mut crate::libsystem::mach::BlockHeader) as usize
+    } else if kind.starts_with('@') {
+        runtime::send(word, "retain", &[])
+    } else if kind.starts_with('*') {
+        let text = unsafe { std::ffi::CStr::from_ptr(word as *const libc::c_char) }.to_owned();
+        let pointer = text.as_ptr() as usize;
+        state.copies.push(text);
+        pointer
+    } else {
+        return;
+    };
+    state.arguments[index][..8].copy_from_slice(&kept.to_le_bytes());
+}
+
 extern "C" fn inv_retain_arguments(this: Id, _: Sel) {
     if let Some(state) = invocation(this) {
+        if state.retained {
+            return;
+        }
         state.retained = true;
+        for index in 0..state.arguments.len() {
+            keep_argument(state, index);
+        }
     }
 }
 
@@ -610,10 +732,17 @@ extern "C" fn inv_invoke(this: Id, _: Sel) {
     let mut result = vec![0u8; result_type.size.max(16)];
     call(runtime::ios_objc_msgSend as usize, &types, &state.arguments, &result_type, &mut result);
     state.result = result;
+    // A retained invocation also keeps its object result.
+    if state.retained && bare(&state.types.parts[0].0).starts_with('@') {
+        let object = usize::from_le_bytes(state.result[..8].try_into().unwrap());
+        if object != 0 {
+            runtime::send(object, "retain", &[]);
+        }
+    }
 }
 
 extern "C" fn inv_invoke_with_target(this: Id, s: Sel, target: Id) {
-    set_argument_word(this, 0, target);
+    inv_set_target(this, s, target);
     inv_invoke(this, s);
 }
 
@@ -726,5 +855,22 @@ mod tests {
         call(target as usize, &types, &values, &signature.parts[0].1, &mut result);
         let got: Rect = unsafe { std::ptr::read_unaligned(result.as_ptr() as *const Rect) };
         assert_eq!(got, Rect { x: 32.0, y: -8989.0, w: 11.0, h: 60.0 });
+
+        // Our own methods' encodings come from their Rust signatures.
+        let ours = our_types();
+        assert_eq!(ours.exact.get(&("NSNumber", false, "boolValue")), Some(&"B@:"));
+        assert_eq!(ours.exact.get(&("UIView", false, "setFrame:")), Some(&"v@:{CGRect={CGPoint=dd}{CGSize=dd}}"));
+
+        // retainArguments copies C strings: the caller's buffer may go away.
+        let types = Arc::new(parse_signature("v@:*"));
+        let mut caller = *b"hello\0";
+        let mut state = Invocation { signature: 0, types, arguments: vec![vec![0; 8]; 3], result: vec![0; 16], retained: false, copies: Vec::new() };
+        state.arguments[2][..8].copy_from_slice(&(caller.as_ptr() as usize).to_le_bytes());
+        state.retained = true;
+        keep_argument(&mut state, 2);
+        caller[0] = b'X';
+        let kept = usize::from_le_bytes(state.arguments[2][..8].try_into().unwrap());
+        assert_ne!(kept, caller.as_ptr() as usize);
+        assert_eq!(unsafe { std::ffi::CStr::from_ptr(kept as *const libc::c_char) }.to_str(), Ok("hello"));
     }
 }
