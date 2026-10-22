@@ -5,6 +5,7 @@ pub mod coalesced;
 pub mod collections;
 pub mod crypto;
 pub mod data;
+pub mod dates;
 pub mod eagl;
 pub mod files;
 pub mod foundation;
@@ -65,6 +66,7 @@ pub fn register(r: &mut Registry) {
     gamekit::register(r);
     openal::register(r);
     storekit::register(r);
+    dates::register(r);
     immutable_copies();
 }
 
