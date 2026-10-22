@@ -4,7 +4,7 @@ use crate::fw::object::{class_methods, define_class, methods};
 use crate::fw::{collections, runloop, string};
 use crate::libsystem::mach::{block_copy, call_block, BlockHeader};
 use crate::objc::runtime::{self, lock, Class, Id, Sel};
-use crate::symbols::Registry;
+use crate::symbols::{leak, Registry};
 use std::cell::RefCell;
 
 // ----- NSIndexPath: { isa, *mut Vec<usize> } -----
@@ -158,17 +158,26 @@ extern "C" fn ip_description(this: Id, _: Sel) -> Id {
 crate::libsystem::libc::variadic!(ios_assert_method, 7, ios_assert_method_impl);
 crate::libsystem::libc::variadic!(ios_assert_function, 6, ios_assert_function_impl);
 
-thread_local! {
-    static HANDLER: std::cell::Cell<Id> = const { std::cell::Cell::new(0) };
-}
+/// NSAssertionHandlerKey: the thread dictionary key of a thread's handler.
+const HANDLER_KEY: &str = "NSAssertionHandler";
 
+/// The handler in the current thread's dictionary under NSAssertionHandlerKey
+/// (a game may put its own there); one is made and stored when there is none.
 extern "C" fn assertion_current(class: Class, _: Sel) -> Id {
-    HANDLER.with(|h| {
-        if h.get() == 0 {
-            h.set(runtime::alloc_instance(class));
+    let thread = runtime::send(runtime::class_named("NSThread"), "currentThread", &[]);
+    let dictionary = if thread == 0 { 0 } else { runtime::send(thread, "threadDictionary", &[]) };
+    let key = string::make(HANDLER_KEY);
+    if dictionary != 0 {
+        let handler = runtime::send(dictionary, "objectForKey:", &[key]);
+        if handler != 0 {
+            return handler;
         }
-        h.get()
-    })
+    }
+    let handler = runtime::send(runtime::alloc_instance(class), "init", &[]);
+    if dictionary != 0 {
+        runtime::send(dictionary, "setObject:forKey:", &[handler, key]);
+    }
+    handler
 }
 
 fn assertion_failed(place: String, file: Id, line: isize, description: Id, va: *const u64) -> ! {
@@ -408,15 +417,11 @@ extern "C" fn ca_completion(_: Class, _: Sel) -> usize {
 }
 
 /// Outside any begin/commit the block belongs to the implicit transaction,
-/// which commits at the end of this run loop turn: it is queued at once.
+/// which runs it when it commits; as on Apple, setting another block (or nil)
+/// replaces it.
 extern "C" fn ca_set_completion(_: Class, _: Sel, block: usize) {
     let block = if block == 0 { 0 } else { block_copy(block as *mut BlockHeader) as usize };
-    let explicit = TRANSACTIONS.with(|t| t.borrow().last().map(|top| !top.implicit).unwrap_or(false));
-    if explicit {
-        with_top(|t| t.completion = block);
-    } else if block != 0 {
-        run_completions(vec![block]);
-    }
+    with_top(|t| t.completion = block);
 }
 
 extern "C" fn ca_value_for_key(class: Class, s: Sel, key: Id) -> Id {
@@ -448,7 +453,8 @@ extern "C" fn ca_set_value_for_key(class: Class, s: Sel, value: Id, key: Id) {
     }
 }
 
-pub fn register(_: &mut Registry) {
+pub fn register(r: &mut Registry) {
+    r.data("NSAssertionHandlerKey", leak(string::make(HANDLER_KEY)));
     let index_path_class = define_class("NSIndexPath", "NSObject", 16);
     class_methods(
         index_path_class,
