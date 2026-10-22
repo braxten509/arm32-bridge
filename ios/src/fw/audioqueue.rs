@@ -112,7 +112,7 @@ pub fn write_pcm(samples: &[f32], f: &Asbd, out: &mut [u8]) {
 }
 
 /// Changes the number of channels of interleaved samples.
-fn remap(samples: &[f32], from: usize, to: usize, out: &mut Vec<f32>) {
+pub fn remap(samples: &[f32], from: usize, to: usize, out: &mut Vec<f32>) {
     if from == to || from == 0 {
         out.extend_from_slice(samples);
         return;
@@ -1102,4 +1102,99 @@ pub fn register(r: &mut Registry) {
     r.function("AudioQueueGetCurrentTime", get_current_time as usize);
     r.function("AudioQueueSetOfflineRenderFormat", set_offline_render_format as usize);
     r.function("AudioQueueOfflineRender", offline_render as usize);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A mono 16-bit WAV file: `seconds` of a 441 Hz tone at `rate`.
+    fn wav(rate: u32, seconds: f64) -> Vec<u8> {
+        let frames = (rate as f64 * seconds) as u32;
+        let mut file = b"RIFF".to_vec();
+        file.extend_from_slice(&(36 + frames * 2).to_le_bytes());
+        file.extend_from_slice(b"WAVEfmt ");
+        for v in [16u32.to_le_bytes(), (1u32 | 1 << 16).to_le_bytes(), rate.to_le_bytes(), (rate * 2).to_le_bytes(), (2u32 | 16 << 16).to_le_bytes()] {
+            file.extend_from_slice(&v);
+        }
+        file.extend_from_slice(b"data");
+        file.extend_from_slice(&(frames * 2).to_le_bytes());
+        for i in 0..frames {
+            let v = ((i as f64 / rate as f64 * 441.0 * std::f64::consts::TAU).sin() * 12000.0) as i16;
+            file.extend_from_slice(&v.to_le_bytes());
+        }
+        file
+    }
+
+    struct Feeder {
+        queue: usize,
+        data: Vec<u8>,
+        at: usize,
+        handed_back: usize,
+    }
+
+    /// The game's side, as FMOD does it: each buffer handed back is refilled
+    /// from the file and enqueued again until the file runs out.
+    extern "C" fn refill(user: usize, queue: usize, buffer: usize) {
+        let feeder = unsafe { &mut *(user as *mut Feeder) };
+        feeder.handed_back += 1;
+        fill(feeder, queue, buffer);
+    }
+
+    fn fill(feeder: &mut Feeder, queue: usize, buffer: usize) {
+        let (capacity, data) = unsafe { (*(buffer as *const u32) as usize, *((buffer + 8) as *const usize)) };
+        let take = capacity.min(feeder.data.len() - feeder.at);
+        if take == 0 {
+            return;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(feeder.data[feeder.at..].as_ptr(), data as *mut u8, take);
+            *((buffer + 0x10) as *mut u32) = take as u32;
+        }
+        feeder.at += take;
+        assert_eq!(enqueue_buffer(queue, buffer, 0, std::ptr::null()), 0);
+    }
+
+    #[test]
+    fn offline_render_decodes_resamples_and_hands_buffers_back() {
+        let parsed = audiofile::parse(&wav(22050, 0.5)).unwrap();
+        assert_eq!((parsed.format.rate, parsed.format.channels, parsed.format.bits), (22050.0, 1, 16));
+        let data = parsed.data.clone();
+        let feeder = Box::into_raw(Box::new(Feeder { queue: 0, data, at: 0, handed_back: 0 }));
+        let mut q = 0;
+        assert_eq!(new_output(&parsed.format as *const Asbd as *const u8, refill as usize, feeder as usize, 0, 0, 0, &mut q), 0);
+        unsafe { (*feeder).queue = q };
+        let out = audiofile::pcm(44100.0, 2, 16, false, false);
+        assert_eq!(set_offline_render_format(q, &out as *const Asbd as *const u8, 0), 0);
+        let (mut a, mut b, mut target) = (0, 0, 0);
+        assert_eq!(allocate_buffer(q, 4096, &mut a), 0);
+        assert_eq!(allocate_buffer(q, 4096, &mut b), 0);
+        assert_eq!(allocate_buffer(q, 4096 * 4, &mut target), 0);
+        assert_eq!(start(q, 0), 0);
+        // Primed with zero frames first, as Apple's sample code and FMOD do.
+        assert_eq!(offline_render(q, std::ptr::null(), target, 0), 0);
+        unsafe {
+            fill(&mut *feeder, q, a);
+            fill(&mut *feeder, q, b);
+        }
+        let mut samples: Vec<i16> = Vec::new();
+        loop {
+            assert_eq!(offline_render(q, std::ptr::null(), target, 4096), 0);
+            let (size, data) = unsafe { (*((target + 0x10) as *const u32) as usize, *((target + 8) as *const usize)) };
+            if size == 0 {
+                break;
+            }
+            let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, size) };
+            samples.extend(bytes.chunks_exact(2).map(|s| i16::from_le_bytes([s[0], s[1]])));
+        }
+        let frames = samples.len() / 2;
+        assert!((22000..=22050).contains(&frames), "0.5 s at 44100 Hz: {frames} frames");
+        assert!(samples.chunks_exact(2).all(|f| f[0] == f[1]), "mono goes to both sides");
+        // 441 Hz keeps its pitch through the rate change: ~220 cycles.
+        let crossings = samples.chunks_exact(2).map(|f| f[0]).collect::<Vec<_>>().windows(2).filter(|w| w[0] < 0 && w[1] >= 0).count();
+        assert!((218..=222).contains(&crossings), "{crossings} cycles");
+        let handed_back = unsafe { (*feeder).handed_back };
+        assert!(handed_back >= 5, "every used buffer goes back to the game ({handed_back})");
+        assert_eq!(dispose(q, 1), 0);
+    }
 }

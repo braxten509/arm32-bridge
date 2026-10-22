@@ -269,10 +269,13 @@ extern "C" fn boolean_type_id() -> usize {
 }
 
 extern "C" fn cf_retain(object: Id) -> Id {
+    crate::fw::corevideo::retained(object);
     object
 }
 
-extern "C" fn cf_release(_object: Id) {}
+extern "C" fn cf_release(object: Id) {
+    crate::fw::corevideo::released(object);
+}
 
 pub fn register(r: &mut Registry) {
     r.function("SecItemCopyMatching", copy_matching as usize);

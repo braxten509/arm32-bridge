@@ -3,7 +3,9 @@
 pub mod app;
 pub mod audiofile;
 pub mod audioqueue;
+pub mod avasset;
 pub mod coalesced;
+pub mod corevideo;
 pub mod collections;
 pub mod crypto;
 pub mod data;
@@ -21,6 +23,7 @@ pub mod media;
 pub mod misc;
 pub mod object;
 pub mod paths;
+pub mod photos;
 pub mod pictures;
 pub mod plist;
 pub mod png;
@@ -69,6 +72,9 @@ pub fn register(r: &mut Registry) {
     storekit::register(r);
     audiofile::register(r);
     audioqueue::register(r);
+    corevideo::register(r);
+    avasset::register(r);
+    photos::register(r);
     immutable_copies();
 }
 

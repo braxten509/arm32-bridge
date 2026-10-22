@@ -163,14 +163,14 @@ fn kind_of(d: &[u32; 5]) -> Kind {
     }
 }
 
-/// Makes a unit in `graph` (0: the unit is its own graph, as one made by
+/// Makes a unit in `graph` (None: the unit is its own graph, as one made by
 /// AudioComponentInstanceNew). Returns the unit and its node number.
-fn add_unit(graph: usize, d: [u32; 5]) -> (usize, i32) {
+fn add_unit(graph: Option<usize>, d: [u32; 5]) -> (usize, i32) {
     static NEXT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
     let kind = kind_of(&d);
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     let unit = leak([0usize; 4]);
-    let graph = if graph == 0 { unit } else { graph };
+    let graph = graph.unwrap_or(unit);
     with_graph(|g| {
         g.units.insert(unit, Unit { kind, graph, description: d, inputs: BTreeMap::new(), master: 1.0, max_frames: DEFAULT_MAX_FRAMES });
         g.nodes.insert(id, unit);
@@ -190,7 +190,7 @@ extern "C" fn graph_add_node(graph: usize, description: *const u32, node: *mut i
     }
     let mut d = [0u32; 5];
     d.copy_from_slice(unsafe { std::slice::from_raw_parts(description, 5) });
-    let (_, id) = add_unit(graph, d);
+    let (_, id) = add_unit(Some(graph), d);
     unsafe { *node = id };
     0
 }
@@ -241,7 +241,7 @@ extern "C" fn component_instance_new(component: usize, unit: *mut usize) -> i32 
         return -50;
     }
     let d = unsafe { *(component as *const [u32; 5]) };
-    unsafe { *unit = add_unit(0, d).0 };
+    unsafe { *unit = add_unit(None, d).0 };
     0
 }
 

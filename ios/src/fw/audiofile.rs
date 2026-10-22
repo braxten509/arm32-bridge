@@ -605,7 +605,8 @@ fn parse_mp4(b: &[u8]) -> Result<Parsed, i32> {
             crate::log!("AudioFile: MP4 file not readable ({e})");
             INVALID_FILE
         })?;
-    let track = reader.default_track().ok_or(INVALID_FILE)?.clone();
+    // A movie's sound: its first track with a sample rate (not the picture).
+    let track = reader.tracks().iter().find(|t| t.codec_params.sample_rate.is_some()).ok_or(INVALID_FILE)?.clone();
     let p = &track.codec_params;
     let rate = p.sample_rate.unwrap_or(44100);
     let channels = p.channels.map(|c| c.count() as u32).unwrap_or(2);
