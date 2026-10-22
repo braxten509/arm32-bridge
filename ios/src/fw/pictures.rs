@@ -11,7 +11,8 @@
 //! Places follow UIKit: each view sits at its centre in its parent, turned
 //! and scaled by its transform, its bounds shifting what is inside it; so
 //! sideways launch pictures in older games come out right. Clipping is not
-//! drawn; picture files are PNGs as UIImage reads them here.
+//! drawn; picture files are PNGs as UIImage reads them here. Pictures made
+//! in memory (or turned photos) are shown through an upright PNG made once.
 
 use crate::fw::geometry::{Point, Rect, Transform, IDENTITY};
 use crate::fw::uikit::{property_get, view_state};
@@ -113,10 +114,11 @@ fn snapshot(view: Id, image_view_class: usize, depth: usize) -> Node {
     };
     let picture = if is_image_view {
         let image = property_get(view, "image").unwrap_or(0) as Id;
-        // Pictures made in memory have no file the phone app could show.
-        crate::fw::uikit::image_info(image).filter(|info| !info.path.is_empty()).map(|info| {
+        crate::fw::uikit::image_info(image).map(|_| {
             let mode = property_get(view, "contentMode").unwrap_or(0) as i64;
-            (info.path.clone(), mode, (info.pixels.0 as f64 / info.scale, info.pixels.1 as f64 / info.scale))
+            let size = crate::fw::uikit::image_points(image);
+            // The file is found (or made) only for pictures that end up shown; see `resolve`.
+            (format!("{IMAGE_PREFIX}{image:x}"), mode, (size.width, size.height))
         })
     } else {
         None
@@ -131,6 +133,23 @@ fn snapshot(view: Id, image_view_class: usize, depth: usize) -> Node {
         video: crate::fw::media::shows_video(view),
         children: if depth < 64 { state.subviews.iter().map(|&child| snapshot(child, image_view_class, depth + 1)).collect() } else { Vec::new() },
     }
+}
+
+/// Stands for a UIImage in a snapshot's picture path until `resolve`.
+const IMAGE_PREFIX: &str = "\u{1}uiimage:";
+
+/// Turns the shown pictures' UIImages into files the phone app can draw:
+/// the image's own file, or an upright PNG of a picture made in memory or a
+/// turned photo. Pictures that can't be made into a file are left out.
+fn resolve(pictures: Vec<Picture>) -> Vec<Picture> {
+    pictures
+        .into_iter()
+        .filter_map(|mut p| {
+            let Some(id) = p.path.strip_prefix(IMAGE_PREFIX) else { return Some(p) };
+            p.path = crate::fw::graphics::picture_file(usize::from_str_radix(id, 16).ok()?)?;
+            Some(p)
+        })
+        .collect()
 }
 
 /// The phone app's side: draws the list it's given (see `encode`).
@@ -176,7 +195,7 @@ pub fn tick() {
     let image_view_class = runtime::class_named("UIImageView");
     let mut pictures = Vec::new();
     for window in crate::fw::uikit::windows() {
-        pictures.extend(flatten(&snapshot(window, image_view_class, 0)));
+        pictures.extend(resolve(flatten(&snapshot(window, image_view_class, 0))));
     }
     let (wide, high, _) = crate::fw::uikit::screen_points();
     let text = encode((wide, high), &pictures);

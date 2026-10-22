@@ -1,5 +1,6 @@
 //! NSArray and NSDictionary (and their mutable forms), plus NSNumber.
 //! Arrays: { isa, *mut Vec<Id> }. Dictionaries: { isa, *mut Vec<(key, value)> }.
+//! What goes in is kept (fw/counted.rs `keep`) and never let go.
 
 use crate::fw::object::{class_methods, define_class, methods};
 use crate::objc::runtime::{self, lock, Class, Id, Sel};
@@ -30,6 +31,11 @@ fn items(object: Id) -> &'static mut Vec<Id> {
     }
 }
 
+/// Holds on to objects put in a collection (as Apple's retain does).
+fn keep_all(list: &[Id]) {
+    list.iter().for_each(|&o| crate::fw::counted::keep(o));
+}
+
 fn pairs(object: Id) -> &'static mut Vec<(Id, Id)> {
     unsafe {
         let slot = (object + 8) as *mut *mut Vec<(Id, Id)>;
@@ -42,6 +48,7 @@ fn pairs(object: Id) -> &'static mut Vec<(Id, Id)> {
 
 pub fn array_from(list: &[Id]) -> Id {
     let object = runtime::alloc_instance(classes().array);
+    keep_all(list);
     *items(object) = list.to_vec();
     object
 }
@@ -55,6 +62,7 @@ pub fn array_items(object: Id) -> Vec<Id> {
 
 pub fn dictionary_from(list: &[(Id, Id)]) -> Id {
     let object = runtime::alloc_instance(classes().dictionary);
+    list.iter().for_each(|&(k, v)| keep_all(&[k, v]));
     *pairs(object) = list.to_vec();
     object
 }
@@ -115,6 +123,7 @@ extern "C" fn array_empty(class: Class, _: Sel) -> Id {
 
 extern "C" fn array_with_object(class: Class, _: Sel, item: Id) -> Id {
     let object = runtime::alloc_instance(class);
+    crate::fw::counted::keep(item);
     items(object).push(item);
     object
 }
@@ -122,11 +131,13 @@ extern "C" fn array_with_object(class: Class, _: Sel, item: Id) -> Id {
 extern "C" fn array_with_objects_count(class: Class, _: Sel, list: *const Id, count: usize) -> Id {
     let object = runtime::alloc_instance(class);
     *items(object) = unsafe { std::slice::from_raw_parts(list, count) }.to_vec();
+    keep_all(items(object));
     object
 }
 
 extern "C" fn array_init_with_objects_count(this: Id, _: Sel, list: *const Id, count: usize) -> Id {
     *items(this) = unsafe { std::slice::from_raw_parts(list, count) }.to_vec();
+    keep_all(items(this));
     this
 }
 
@@ -159,6 +170,7 @@ fn nil_terminated(first: Id, va: *const u64) -> Vec<Id> {
         list.push(item);
         index += 1;
     }
+    keep_all(&list);
     list
 }
 
@@ -235,10 +247,12 @@ extern "C" fn array_enumerate(this: Id, _: Sel, state: *mut [usize; 8], buffer: 
 }
 
 extern "C" fn array_add(this: Id, _: Sel, item: Id) {
+    crate::fw::counted::keep(item);
     items(this).push(item);
 }
 
 extern "C" fn array_insert(this: Id, _: Sel, item: Id, index: usize) {
+    crate::fw::counted::keep(item);
     let list = items(this);
     list.insert(index.min(list.len()), item);
 }
@@ -264,6 +278,7 @@ extern "C" fn array_remove_last(this: Id, _: Sel) {
 
 extern "C" fn array_replace(this: Id, _: Sel, index: usize, item: Id) {
     if let Some(slot) = items(this).get_mut(index) {
+        crate::fw::counted::keep(item);
         *slot = item;
     }
 }
@@ -470,6 +485,7 @@ extern "C" fn dict_init_capacity(this: Id, _: Sel, _capacity: usize) -> Id {
 
 extern "C" fn dict_with_object_for_key(class: Class, _: Sel, value: Id, key: Id) -> Id {
     let object = runtime::alloc_instance(class);
+    keep_all(&[key, value]);
     pairs(object).push((key, value));
     object
 }
@@ -485,6 +501,7 @@ extern "C" fn dict_init_objects_keys_count(this: Id, _: Sel, values: *const Id, 
     for index in 0..count {
         let (key, value) = unsafe { (*keys.add(index), *values.add(index)) };
         list.retain(|(k, _)| !keys_equal(*k, key));
+        keep_all(&[key, value]);
         list.push((key, value));
     }
     this
@@ -560,6 +577,7 @@ extern "C" fn dict_all_values(this: Id, _: Sel) -> Id {
 extern "C" fn dict_set(this: Id, _: Sel, value: Id, key: Id) {
     let key = if crate::fw::string::is_string(key) { runtime::send(key, "copy", &[]) } else { key };
     let found = find_key(this, key);
+    keep_all(&[key, value]);
     let list = pairs(this);
     match found.and_then(|f| list.iter_mut().find(|(k, _)| *k == f)) {
         Some(entry) => entry.1 = value,

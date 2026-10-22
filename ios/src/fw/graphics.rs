@@ -10,18 +10,22 @@
 //! flip it so (0, 0) is the top left.
 //!
 //! CG objects are small Objective-C objects ({ isa, *mut state }) so the
-//! game can keep them in arrays and send them retain/release. Images and
-//! contexts count references (CG*Retain/Release, CFRetain/CFRelease) and give
-//! their pixels back at zero; a released object stays readable as an empty
-//! one so a late use can't crash.
+//! game can keep them in arrays and send them retain/release. Images,
+//! contexts and UIImages count references (fw/counted.rs) and give their
+//! pixels back at zero; a released object stays readable as an empty one so
+//! a late use can't crash. Any thread may read, retain and release them at
+//! once: a picture's pixels are shared read-only, a context is locked while
+//! it draws.
 
+use crate::fw::counted;
 use crate::fw::geometry::{self, Point, Rect, Size, Transform, IDENTITY};
 use crate::fw::object::{class_methods, define_class, methods};
 use crate::fw::{data, uikit};
 use crate::objc::runtime::{self, lock, Class, Id, Sel};
 use crate::symbols::Registry;
+use image::ImageDecoder;
 use std::cell::RefCell;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 
 // ----- pixel formats -----
 
@@ -248,17 +252,24 @@ impl Bitmap {
     }
 }
 
+/// The biggest picture read (bytes of pixels), like ImageIO's own limits.
+const MOST_PIXEL_BYTES: usize = 1 << 30;
+
 /// A PNG made by Apple's pngcrush ("CgBI"): raw deflate data, BGRA with
-/// premultiplied alpha. iOS reads it as that format directly.
+/// premultiplied alpha. iOS reads it as that format directly. Broken files
+/// give None (nil), never a crash.
 fn decode_cgbi(bytes: &[u8]) -> Option<Bitmap> {
-    let mut at = 8;
+    let mut at = 8usize;
     let (mut width, mut height, mut idat) = (0usize, 0usize, Vec::new());
-    while at + 12 <= bytes.len() {
+    while at.checked_add(12)? <= bytes.len() {
         let length = u32::from_be_bytes(bytes[at..at + 4].try_into().ok()?) as usize;
         let kind = &bytes[at + 4..at + 8];
-        let body = bytes.get(at + 8..at + 8 + length)?;
+        let body = bytes.get(at + 8..at.checked_add(8 + length)?)?;
         match kind {
             b"IHDR" => {
+                if body.len() < 13 {
+                    return None;
+                }
                 width = u32::from_be_bytes(body[0..4].try_into().ok()?) as usize;
                 height = u32::from_be_bytes(body[4..8].try_into().ok()?) as usize;
                 if body[8] != 8 || body[9] != 6 || body[12] != 0 {
@@ -272,7 +283,11 @@ fn decode_cgbi(bytes: &[u8]) -> Option<Bitmap> {
         }
         at += 12 + length;
     }
-    let raw = miniz_oxide::inflate::decompress_to_vec(&idat).ok()?;
+    let stride = width.checked_mul(4)?;
+    if width == 0 || height == 0 || stride.checked_mul(height)? > MOST_PIXEL_BYTES {
+        return None;
+    }
+    let raw = miniz_oxide::inflate::decompress_to_vec_with_limit(&idat, (stride + 1) * height).ok()?;
     let data = unfilter(&raw, width, height, 4)?;
     Some(Bitmap {
         width,
@@ -287,8 +302,8 @@ fn decode_cgbi(bytes: &[u8]) -> Option<Bitmap> {
 
 /// Undoes PNG's per-row filters.
 fn unfilter(raw: &[u8], width: usize, height: usize, bpp: usize) -> Option<Vec<u8>> {
-    let stride = width * bpp;
-    if width == 0 || height == 0 || raw.len() < height * (stride + 1) {
+    let stride = width.checked_mul(bpp)?;
+    if width == 0 || height == 0 || raw.len() < height.checked_mul(stride + 1)? {
         return None;
     }
     let mut out = vec![0u8; stride * height];
@@ -323,18 +338,41 @@ fn unfilter(raw: &[u8], width: usize, height: usize, bpp: usize) -> Option<Vec<u
     Some(out)
 }
 
+/// UIImageOrientation for an EXIF orientation (1 to 8), as UIImage reads a photo's tag.
+pub fn orientation_from_exif(exif: u8) -> i64 {
+    match exif {
+        2 => 4, // up, mirrored
+        3 => 1, // down
+        4 => 5, // down, mirrored
+        5 => 6, // left, mirrored
+        6 => 3, // right
+        7 => 7, // right, mirrored
+        8 => 2, // left
+        _ => 0, // up
+    }
+}
+
 /// Decodes PNG (also crushed) or JPEG into the formats ImageIO gives on iOS:
 /// RGBA with straight alpha last, RGB with a skipped fourth byte, plain gray.
-pub fn decode(bytes: &[u8]) -> Option<Bitmap> {
+/// Also gives the file's orientation (UIImageOrientation) from its EXIF tag;
+/// the pixels stay as stored, as in the CGImage on iOS.
+pub fn decode(bytes: &[u8]) -> Option<(Bitmap, i64)> {
     if bytes.len() > 16 && &bytes[1..4] == b"PNG" && &bytes[12..16] == b"CgBI" {
-        return decode_cgbi(bytes);
+        return decode_cgbi(bytes).map(|b| (b, 0));
     }
-    let picture = image::load_from_memory(bytes).ok()?;
+    let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?.into_decoder().ok()?;
+    let orientation = decoder.orientation().map_or(0, |o| orientation_from_exif(o.to_exif()));
+    let (w, h) = decoder.dimensions();
+    if (w as usize).checked_mul(h as usize).and_then(|n| n.checked_mul(4)).is_none_or(|n| n > MOST_PIXEL_BYTES) {
+        return None;
+    }
+    let picture = image::DynamicImage::from_decoder(decoder).ok()?;
     let (width, height) = (picture.width() as usize, picture.height() as usize);
     let color = picture.color();
     if !color.has_color() && !color.has_alpha() {
         let data = picture.into_luma8().into_raw();
-        return Some(Bitmap { width, height, bits_per_pixel: 8, bytes_per_row: width, info: ALPHA_NONE, space: Space::Gray, data });
+        let bitmap = Bitmap { width, height, bits_per_pixel: 8, bytes_per_row: width, info: ALPHA_NONE, space: Space::Gray, data };
+        return Some((bitmap, orientation));
     }
     let (info, data) = if color.has_alpha() {
         (ALPHA_LAST, picture.into_rgba8().into_raw())
@@ -342,12 +380,22 @@ pub fn decode(bytes: &[u8]) -> Option<Bitmap> {
         let rgb = picture.into_rgb8().into_raw();
         (NONE_SKIP_LAST, rgb.chunks(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect())
     };
-    Some(Bitmap { width, height, bits_per_pixel: 32, bytes_per_row: width * 4, info, space: Space::Rgb, data })
+    Some((Bitmap { width, height, bits_per_pixel: 32, bytes_per_row: width * 4, info, space: Space::Rgb, data }, orientation))
 }
 
+/// A picture file's orientation (UIImageOrientation) from its EXIF tag, reading only its header.
+pub fn file_orientation(path: &str) -> i64 {
+    image::ImageReader::open(path)
+        .ok()
+        .and_then(|r| r.with_guessed_format().ok())
+        .and_then(|r| r.into_decoder().ok())
+        .and_then(|mut d| d.orientation().ok())
+        .map_or(0, |o| orientation_from_exif(o.to_exif()))
+}
+
+/// A CGImage: its pixels never change; they go (None) when the last reference does.
 struct ImageState {
-    bitmap: Bitmap,
-    references: usize,
+    bitmap: RwLock<Option<Arc<Bitmap>>>,
 }
 
 static CLASSES: OnceLock<Classes> = OnceLock::new();
@@ -367,11 +415,12 @@ fn is_a(object: Id, class: Class) -> bool {
     object != 0 && lock().class_of(object) == class
 }
 
-fn state<T>(object: Id, class: Class) -> Option<&'static mut T> {
+/// The object's state, shared: what changes inside it is behind its own lock.
+fn state<T>(object: Id, class: Class) -> Option<&'static T> {
     if !is_a(object, class) {
         return None;
     }
-    unsafe { (*((object + 8) as *mut *mut T)).as_mut() }
+    unsafe { (*((object + 8) as *const *const T)).as_ref() }
 }
 
 fn wrap<T>(class: Class, value: T) -> Id {
@@ -380,12 +429,22 @@ fn wrap<T>(class: Class, value: T) -> Id {
     object
 }
 
+/// A new CGImage with one reference (the caller's, as CGBitmapContextCreateImage gives).
 pub fn make_image(bitmap: Bitmap) -> Id {
-    wrap(classes().image, ImageState { bitmap, references: 1 })
+    let object = wrap(classes().image, ImageState { bitmap: RwLock::new(Some(Arc::new(bitmap))) });
+    counted::track(object, free_image);
+    object
 }
 
-fn image(object: Id) -> Option<&'static Bitmap> {
-    state::<ImageState>(object, classes().image).map(|s| &s.bitmap)
+fn free_image(object: Id) {
+    if let Some(s) = state::<ImageState>(object, classes().image) {
+        *s.bitmap.write().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+/// The picture's pixels (kept alive while in use, even if released meanwhile).
+fn image(object: Id) -> Option<Arc<Bitmap>> {
+    state::<ImageState>(object, classes().image)?.bitmap.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// Logs the first few uses of a bad object, as Core Graphics does.
@@ -422,42 +481,11 @@ extern "C" fn image_get_color_space(object: Id) -> Id {
     image(object).map_or(0, |b| space_object(b.space))
 }
 
-pub fn retain(object: Id) {
-    if CLASSES.get().is_none() {
-        return;
-    }
-    if let Some(s) = state::<ImageState>(object, classes().image) {
-        s.references += 1;
-    } else if let Some(c) = state::<Canvas>(object, classes().context) {
-        c.references += 1;
-    }
-}
-
-pub fn release(object: Id) {
-    if CLASSES.get().is_none() {
-        return;
-    }
-    if let Some(s) = state::<ImageState>(object, classes().image) {
-        s.references = s.references.saturating_sub(1);
-        if s.references == 0 {
-            s.bitmap.data = Vec::new();
-            s.bitmap.width = 0;
-            s.bitmap.height = 0;
-        }
-    } else if let Some(c) = state::<Canvas>(object, classes().context) {
-        c.references = c.references.saturating_sub(1);
-        if c.references == 0 {
-            c.close();
-        }
-    }
-}
-
 extern "C" fn cf_style_retain(object: Id) -> Id {
-    retain(object);
-    object
+    counted::retain(object)
 }
 extern "C" fn cf_style_release(object: Id) {
-    release(object)
+    counted::release(object)
 }
 
 // ----- colour spaces, colours, gradients -----
@@ -587,8 +615,13 @@ pub struct Canvas {
     owned: Option<Vec<u8>>,
     state: GraphicsState,
     saved: Vec<GraphicsState>,
-    references: usize,
 }
+
+// The memory is the game's or the canvas's own; it's only touched under the context's lock.
+unsafe impl Send for Canvas {}
+
+/// A CGContext: drawn into by one thread at a time.
+struct ContextState(Mutex<Canvas>);
 
 enum Blend {
     Over,
@@ -645,7 +678,6 @@ impl Canvas {
             owned,
             state: GraphicsState { ctm: IDENTITY, fill: [0.0, 0.0, 0.0, 1.0], alpha: 1.0 },
             saved: Vec::new(),
-            references: 1,
         })
     }
 
@@ -814,17 +846,35 @@ fn standard(r: Rect) -> Rect {
     r
 }
 
-fn canvas(function: &str, context: Id) -> Option<&'static mut Canvas> {
-    let found = state::<Canvas>(context, classes().context).filter(|c| !c.data.is_null());
+/// The context locked for this thread's use (any state, even closed).
+fn locked(context: Id) -> Option<MutexGuard<'static, Canvas>> {
+    state::<ContextState>(context, classes().context).map(|s| s.0.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// The context to draw in, or None (logged) when it isn't a live context.
+fn canvas(function: &str, context: Id) -> Option<MutexGuard<'static, Canvas>> {
+    let found = locked(context).filter(|c| !c.data.is_null());
     if found.is_none() {
         complain(function, "context", context);
     }
     found
 }
 
+fn free_context(context: Id) {
+    if let Some(mut c) = locked(context) {
+        c.close();
+    }
+}
+
+fn make_context(canvas: Canvas) -> Id {
+    let object = wrap(classes().context, ContextState(Mutex::new(canvas)));
+    counted::track(object, free_context);
+    object
+}
+
 extern "C" fn bitmap_context_create(data: *mut u8, width: usize, height: usize, bits_per_component: usize, bytes_per_row: usize, space: Id, info: u32) -> Id {
     match Canvas::new(data, width, height, bits_per_component, bytes_per_row, space_of(space), info) {
-        Ok(canvas) => wrap(classes().context, canvas),
+        Ok(canvas) => make_context(canvas),
         Err(reason) => {
             crate::log!("CGBitmapContextCreate: {reason}");
             0
@@ -833,39 +883,38 @@ extern "C" fn bitmap_context_create(data: *mut u8, width: usize, height: usize, 
 }
 
 extern "C" fn bitmap_context_create_image(context: Id) -> Id {
-    match canvas("CGBitmapContextCreateImage", context) {
-        Some(c) => make_image(c.snapshot()),
-        None => 0,
-    }
+    let snapshot = canvas("CGBitmapContextCreateImage", context).map(|mut c| c.snapshot());
+    snapshot.map_or(0, make_image)
 }
 
 extern "C" fn bitmap_context_get_data(context: Id) -> *mut u8 {
-    state::<Canvas>(context, classes().context).map_or(std::ptr::null_mut(), |c| c.data)
+    locked(context).map_or(std::ptr::null_mut(), |c| c.data)
 }
 extern "C" fn bitmap_context_get_width(context: Id) -> usize {
-    state::<Canvas>(context, classes().context).map_or(0, |c| c.width)
+    locked(context).map_or(0, |c| c.width)
 }
 extern "C" fn bitmap_context_get_height(context: Id) -> usize {
-    state::<Canvas>(context, classes().context).map_or(0, |c| c.height)
+    locked(context).map_or(0, |c| c.height)
 }
 extern "C" fn bitmap_context_get_bytes_per_row(context: Id) -> usize {
-    state::<Canvas>(context, classes().context).map_or(0, |c| c.bytes_per_row)
+    locked(context).map_or(0, |c| c.bytes_per_row)
 }
 extern "C" fn bitmap_context_get_bits_per_component(context: Id) -> usize {
-    state::<Canvas>(context, classes().context).map_or(0, |_| 8)
+    locked(context).map_or(0, |_| 8)
 }
 extern "C" fn bitmap_context_get_bits_per_pixel(context: Id) -> usize {
-    state::<Canvas>(context, classes().context).map_or(0, |c| c.bits_per_pixel)
+    locked(context).map_or(0, |c| c.bits_per_pixel)
 }
 extern "C" fn bitmap_context_get_bitmap_info(context: Id) -> u32 {
-    state::<Canvas>(context, classes().context).map_or(0, |c| c.info)
+    locked(context).map_or(0, |c| c.info)
 }
 extern "C" fn bitmap_context_get_color_space(context: Id) -> Id {
-    state::<Canvas>(context, classes().context).map_or(0, |c| space_object(c.space))
+    let space = locked(context).map(|c| c.space);
+    space.map_or(0, space_object)
 }
 
 extern "C" fn context_concat_ctm(context: Id, t: Transform) {
-    if let Some(c) = canvas("CGContextConcatCTM", context) {
+    if let Some(mut c) = canvas("CGContextConcatCTM", context) {
         c.state.ctm = geometry::concat(t, c.state.ctm);
     }
 }
@@ -880,57 +929,65 @@ extern "C" fn context_rotate_ctm(context: Id, angle: f64) {
     context_concat_ctm(context, Transform { a: c, b: s, c: -s, d: c, tx: 0.0, ty: 0.0 });
 }
 extern "C" fn context_get_ctm(context: Id) -> Transform {
-    canvas("CGContextGetCTM", context).map_or(IDENTITY, |c| c.state.ctm)
+    let ctm = canvas("CGContextGetCTM", context).map(|c| c.state.ctm);
+    ctm.unwrap_or(IDENTITY)
 }
 extern "C" fn context_save_gstate(context: Id) {
-    if let Some(c) = canvas("CGContextSaveGState", context) {
-        c.saved.push(c.state);
+    if let Some(mut c) = canvas("CGContextSaveGState", context) {
+        let state = c.state;
+        c.saved.push(state);
     }
 }
 extern "C" fn context_restore_gstate(context: Id) {
-    if let Some(c) = canvas("CGContextRestoreGState", context) {
+    if let Some(mut c) = canvas("CGContextRestoreGState", context) {
         if let Some(saved) = c.saved.pop() {
             c.state = saved;
         }
     }
 }
 extern "C" fn context_set_fill_color_with_color(context: Id, color: Id) {
-    if let (Some(c), Some(rgba)) = (canvas("CGContextSetFillColorWithColor", context), color_rgba(color)) {
+    let Some(rgba) = color_rgba(color) else { return };
+    if let Some(mut c) = canvas("CGContextSetFillColorWithColor", context) {
         c.state.fill = rgba;
     }
 }
 extern "C" fn context_set_rgb_fill_color(context: Id, r: f64, g: f64, b: f64, a: f64) {
-    if let Some(c) = canvas("CGContextSetRGBFillColor", context) {
+    if let Some(mut c) = canvas("CGContextSetRGBFillColor", context) {
         c.state.fill = [r, g, b, a];
     }
 }
 extern "C" fn context_set_alpha(context: Id, alpha: f64) {
-    if let Some(c) = canvas("CGContextSetAlpha", context) {
+    if let Some(mut c) = canvas("CGContextSetAlpha", context) {
         c.state.alpha = alpha.clamp(0.0, 1.0);
     }
 }
 extern "C" fn context_fill_rect(context: Id, rect: Rect) {
-    if let Some(c) = canvas("CGContextFillRect", context) {
+    if let Some(mut c) = canvas("CGContextFillRect", context) {
         c.fill_rect(rect);
     }
 }
 extern "C" fn context_clear_rect(context: Id, rect: Rect) {
-    if let Some(c) = canvas("CGContextClearRect", context) {
+    if let Some(mut c) = canvas("CGContextClearRect", context) {
         c.clear_rect(rect);
     }
 }
 extern "C" fn context_draw_image(context: Id, rect: Rect, picture: Id) {
-    let Some(c) = canvas("CGContextDrawImage", context) else { return };
-    match image(picture) {
-        Some(bitmap) => c.draw_bitmap(rect, bitmap, &|u, v| (u, v)),
-        None => complain("CGContextDrawImage", "image", picture),
+    // The picture first: it may be this same context's picture or need the runtime.
+    let Some(bitmap) = image(picture) else {
+        complain("CGContextDrawImage", "image", picture);
+        return;
+    };
+    if let Some(mut c) = canvas("CGContextDrawImage", context) {
+        c.draw_bitmap(rect, &bitmap, &|u, v| (u, v));
     }
 }
 extern "C" fn context_draw_linear_gradient(context: Id, gradient: Id, start: Point, end: Point, options: u32) {
-    let Some(c) = canvas("CGContextDrawLinearGradient", context) else { return };
-    match state::<Gradient>(gradient, classes().gradient) {
-        Some(g) => c.draw_linear_gradient(g, start, end, options),
-        None => complain("CGContextDrawLinearGradient", "gradient", gradient),
+    let Some(g) = state::<Gradient>(gradient, classes().gradient) else {
+        complain("CGContextDrawLinearGradient", "gradient", gradient);
+        return;
+    };
+    if let Some(mut c) = canvas("CGContextDrawLinearGradient", context) {
+        c.draw_linear_gradient(g, start, end, options);
     }
 }
 
@@ -962,7 +1019,7 @@ extern "C" fn graphics_begin_image_context_with_options(size: Size, opaque: bool
         return;
     }
     let context = bitmap_context_create(std::ptr::null_mut(), width as usize, height as usize, 8, 0, space_object(Space::Rgb), info);
-    if let Some(c) = canvas("UIGraphicsBeginImageContext", context) {
+    if let Some(mut c) = canvas("UIGraphicsBeginImageContext", context) {
         // UIKit's flip: (0, 0) at the top left, one unit per point.
         c.state.ctm = Transform { a: scale, b: 0.0, c: 0.0, d: -scale, tx: 0.0, ty: height };
     }
@@ -990,6 +1047,7 @@ extern "C" fn graphics_pop_context() {
     });
 }
 
+/// An autoreleased UIImage of what the current image context holds (as on iOS).
 extern "C" fn graphics_get_image_from_current_image_context() -> Id {
     let Some((context, scale)) = CONTEXTS.with(|stack| stack.borrow().last().filter(|c| c.own).map(|c| (c.context, c.scale))) else {
         return 0;
@@ -999,8 +1057,8 @@ extern "C" fn graphics_get_image_from_current_image_context() -> Id {
         return 0;
     }
     let made = uikit_image_from_cg(picture, scale, 0);
-    release(picture);
-    made
+    counted::release(picture);
+    counted::autorelease(made)
 }
 
 extern "C" fn graphics_end_image_context() {
@@ -1013,36 +1071,77 @@ extern "C" fn graphics_end_image_context() {
         }
     });
     match ended {
-        Some(ended) => release(ended.context),
+        Some(ended) => counted::release(ended.context),
         None => crate::log!("UIGraphicsEndImageContext: no image context is current"),
     }
 }
 
 // ----- UIImage <-> CGImage -----
 
+/// A new UIImage (one reference, the caller's) holding a reference to `picture`.
 fn uikit_image_from_cg(picture: Id, scale: f64, orientation: i64) -> Id {
     let Some(bitmap) = image(picture) else { return 0 };
-    retain(picture);
+    counted::retain(picture);
     let info = uikit::ImageInfo {
         path: String::new(),
         pixels: (bitmap.width as u32, bitmap.height as u32),
         scale: if scale > 0.0 { scale } else { 1.0 },
         orientation,
         cg: OnceLock::from(picture),
+        picture_file: OnceLock::new(),
     };
     uikit::make_image(info)
+}
+
+/// The UIImage's last reference went: it lets go of its CGImage (the pixels
+/// go once nothing else holds them) and of the file made to show it.
+pub fn ui_image_clean_up(picture: Id) {
+    let Some(info) = uikit::image_info(picture) else { return };
+    if let Some(&cg) = info.cg.get() {
+        counted::release(cg);
+    }
+    if let Some(Some(file)) = info.picture_file.get() {
+        let _ = std::fs::remove_file(file);
+    }
 }
 
 /// The UIImage's CGImage (pictures from files are read the first time it's asked for).
 pub fn image_cg(picture: Id) -> Id {
     let Some(info) = uikit::image_info(picture) else { return 0 };
     *info.cg.get_or_init(|| match std::fs::read(&info.path).ok().and_then(|bytes| decode(&bytes)) {
-        Some(bitmap) => make_image(bitmap),
+        Some((bitmap, _)) => make_image(bitmap),
         None => {
             crate::log!("UIImage {}: can't read its pixels", info.path);
             0
         }
     })
+}
+
+/// A file the phone app can show for this UIImage as UIKit would draw it: the
+/// picture's own file when it is upright, else an upright PNG made once
+/// (pictures made in memory, turned photos). None if it can't be made.
+pub fn picture_file(picture: Id) -> Option<String> {
+    let info = uikit::image_info(picture)?;
+    if info.orientation == 0 && !info.path.is_empty() {
+        return Some(info.path.clone());
+    }
+    let made = info.picture_file.get_or_init(|| {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let (width, height, rgba, alpha) = upright_rgba(picture)?;
+        let bytes = encode_png(width, height, &rgba, alpha)?;
+        let folder = format!("{}/tmp/.gamebridge-pictures", crate::fw::foundation::home());
+        let _ = std::fs::create_dir_all(&folder);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let file = format!("{folder}/{}-{n}.png", std::process::id());
+        match std::fs::write(&file, bytes) {
+            Ok(()) => Some(file),
+            Err(e) => {
+                crate::log!("UIImage {picture:#x}: can't write a picture file to show it: {e}");
+                None
+            }
+        }
+    });
+    made.clone()
 }
 
 extern "C" fn ui_image_cg(this: Id, _: Sel) -> Id {
@@ -1054,10 +1153,10 @@ extern "C" fn ui_image_orientation(this: Id, _: Sel) -> i64 {
 }
 
 extern "C" fn ui_image_with_cg(_: Class, _: Sel, picture: Id) -> Id {
-    uikit_image_from_cg(picture, 1.0, 0)
+    counted::autorelease(uikit_image_from_cg(picture, 1.0, 0))
 }
 extern "C" fn ui_image_with_cg_scale_orientation(_: Class, _: Sel, picture: Id, scale: f64, orientation: i64) -> Id {
-    uikit_image_from_cg(picture, scale, orientation)
+    counted::autorelease(uikit_image_from_cg(picture, scale, orientation))
 }
 extern "C" fn ui_image_init_with_cg(_this: Id, _: Sel, picture: Id) -> Id {
     uikit_image_from_cg(picture, 1.0, 0)
@@ -1066,25 +1165,29 @@ extern "C" fn ui_image_init_with_cg_scale_orientation(_this: Id, _: Sel, picture
     uikit_image_from_cg(picture, scale, orientation)
 }
 
+/// A new UIImage (one reference) from PNG or JPEG bytes, turned as its EXIF tag says.
 fn ui_image_from_data(bytes: Id, scale: f64) -> Id {
     match decode(&data::bytes(bytes)) {
-        Some(bitmap) => {
+        Some((bitmap, orientation)) => {
             let picture = make_image(bitmap);
-            let made = uikit_image_from_cg(picture, scale, 0);
-            release(picture);
+            let made = uikit_image_from_cg(picture, scale, orientation);
+            counted::release(picture);
             made
         }
         None => 0,
     }
 }
 extern "C" fn ui_image_with_data(_: Class, _: Sel, bytes: Id) -> Id {
-    ui_image_from_data(bytes, 1.0)
+    counted::autorelease(ui_image_from_data(bytes, 1.0))
 }
 extern "C" fn ui_image_with_data_scale(_: Class, _: Sel, bytes: Id, scale: f64) -> Id {
-    ui_image_from_data(bytes, scale)
+    counted::autorelease(ui_image_from_data(bytes, scale))
 }
 extern "C" fn ui_image_init_with_data(_this: Id, _: Sel, bytes: Id) -> Id {
     ui_image_from_data(bytes, 1.0)
+}
+extern "C" fn ui_image_init_with_data_scale(_this: Id, _: Sel, bytes: Id, scale: f64) -> Id {
+    ui_image_from_data(bytes, scale)
 }
 
 /// Where a point (u, v from the top left, 0..1) of the image as shown falls
@@ -1105,12 +1208,10 @@ pub fn orient(orientation: i64, u: f64, v: f64) -> (f64, f64) {
 /// -[UIImage drawInRect:]: upright in UIKit's coordinates (top at the
 /// rectangle's min y), turned by the image's orientation.
 fn ui_image_draw(picture: Id, rect: Rect) {
-    let context = current_context();
-    let Some(c) = canvas("-[UIImage drawInRect:]", context) else { return };
-    let cg = image_cg(picture);
+    let Some(bitmap) = image(image_cg(picture)) else { return };
     let orientation = ui_image_orientation(picture, 0);
-    if let Some(bitmap) = image(cg) {
-        c.draw_bitmap(rect, bitmap, &|u, v| orient(orientation, u, 1.0 - v));
+    if let Some(mut c) = canvas("-[UIImage drawInRect:]", current_context()) {
+        c.draw_bitmap(rect, &bitmap, &|u, v| orient(orientation, u, 1.0 - v));
     }
 }
 
@@ -1208,17 +1309,30 @@ pub fn register(r: &mut Registry) {
     let gradient = define_class("CGGradient", "NSObject", 16);
     let _ = CLASSES.set(Classes { image: image_class, context, space, gradient });
     extern "C" fn retain_method(this: Id, _: Sel) -> Id {
-        retain(this);
-        this
+        counted::retain(this)
     }
     extern "C" fn release_method(this: Id, _: Sel) {
-        release(this)
+        counted::release(this)
     }
-    for class in [image_class, context] {
-        methods(class, &[("retain", retain_method as usize), ("release", release_method as usize)]);
+    extern "C" fn autorelease_method(this: Id, _: Sel) -> Id {
+        counted::autorelease(this)
+    }
+    extern "C" fn retain_count_method(this: Id, _: Sel) -> usize {
+        counted::count(this).unwrap_or(1)
+    }
+    let ui_image = runtime::class_named("UIImage");
+    for class in [image_class, context, ui_image] {
+        methods(
+            class,
+            &[
+                ("retain", retain_method as usize),
+                ("release", release_method as usize),
+                ("autorelease", autorelease_method as usize),
+                ("retainCount", retain_count_method as usize),
+            ],
+        );
     }
 
-    let ui_image = runtime::class_named("UIImage");
     class_methods(
         ui_image,
         &[
@@ -1236,6 +1350,7 @@ pub fn register(r: &mut Registry) {
             ("initWithCGImage:", ui_image_init_with_cg as usize),
             ("initWithCGImage:scale:orientation:", ui_image_init_with_cg_scale_orientation as usize),
             ("initWithData:", ui_image_init_with_data as usize),
+            ("initWithData:scale:", ui_image_init_with_data_scale as usize),
             ("drawInRect:", ui_image_draw_in_rect as usize),
             ("drawAtPoint:", ui_image_draw_at_point as usize),
         ],
@@ -1389,5 +1504,28 @@ mod tests {
         // Two rows of one RGBA pixel: "sub" can't apply, "up" adds the row above.
         let raw = [0, 10, 20, 30, 40, 2, 1, 1, 1, 1];
         assert_eq!(unfilter(&raw, 1, 2, 4).unwrap(), [10, 20, 30, 40, 11, 21, 31, 41]);
+        // A broken crushed PNG (header chunk too short) is nil, not a crash.
+        let mut broken = b"\x89PNG\r\n\x1a\n".to_vec();
+        for (kind, body) in [(b"CgBI", [0u8; 4]), (b"IHDR", [0, 0, 0, 1])] {
+            broken.extend_from_slice(&4u32.to_be_bytes());
+            broken.extend_from_slice(kind);
+            broken.extend_from_slice(&body);
+            broken.extend_from_slice(&[0; 4]);
+        }
+        assert!(decode(&broken).is_none());
+    }
+
+    #[test]
+    fn jpeg_exif_orientation_turns_the_image_like_uikit() {
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 90).encode(&[255, 0, 0, 0, 0, 255], 2, 1, image::ExtendedColorType::Rgb8).unwrap();
+        // An EXIF block saying orientation 6 (turned a quarter clockwise), right after the start marker.
+        let exif = [b"Exif\0\0MM\0*\0\0\0\x08\0\x01".as_slice(), &[0x01, 0x12, 0, 3, 0, 0, 0, 1, 0, 6, 0, 0, 0, 0, 0, 0]].concat();
+        let segment = [&[0xFF, 0xE1][..], &((exif.len() + 2) as u16).to_be_bytes(), &exif].concat();
+        jpeg.splice(2..2, segment);
+        let (bitmap, orientation) = decode(&jpeg).unwrap();
+        // UIImageOrientationRight; the CGImage keeps the stored pixels (2 wide, 1 high).
+        assert_eq!((orientation, bitmap.width, bitmap.height), (3, 2, 1));
+        assert_eq!(orientation_from_exif(8), 2);
     }
 }

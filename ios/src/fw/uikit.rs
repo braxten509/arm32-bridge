@@ -18,7 +18,9 @@ pub fn property_get(object: Id, key: &'static str) -> Option<u64> {
 }
 
 pub fn property_set(object: Id, key: &'static str, value: u64) {
-    PROPERTIES.lock().unwrap().get_or_insert_with(HashMap::new).insert((object, key), value);
+    let old = PROPERTIES.lock().unwrap().get_or_insert_with(HashMap::new).insert((object, key), value);
+    // UIKit's object properties retain what they hold (matters for counted objects: pictures).
+    crate::fw::counted::replace(old.unwrap_or(0) as Id, value as Id);
 }
 
 /// Makes a getter and setter pair that keep a value per object.
@@ -756,6 +758,8 @@ pub struct ImageInfo {
     pub orientation: i64,
     /// Its CGImage (see fw/graphics.rs; read from the file when first asked for).
     pub cg: OnceLock<Id>,
+    /// An upright PNG made to show it on the phone screen (see graphics::picture_file).
+    pub picture_file: OnceLock<Option<String>>,
 }
 
 fn png_size(path: &str) -> Option<(u32, u32)> {
@@ -782,12 +786,16 @@ fn image_from_path(path: &str) -> Id {
     } else {
         1.0
     };
-    make_image(ImageInfo { path: path.into(), pixels, scale, orientation: 0, cg: OnceLock::new() })
+    // A photo's EXIF tag turns it, as UIImage reads it (the size is then swapped).
+    let orientation = crate::fw::graphics::file_orientation(path);
+    make_image(ImageInfo { path: path.into(), pixels, scale, orientation, cg: OnceLock::new(), picture_file: OnceLock::new() })
 }
 
+/// A new UIImage with one reference (the caller's); it counts references (fw/counted.rs).
 pub fn make_image(info: ImageInfo) -> Id {
     let object = runtime::alloc_instance(runtime::class_named("UIImage"));
     unsafe { *((object + 8) as *mut *mut ImageInfo) = Box::into_raw(Box::new(info)) };
+    crate::fw::counted::track(object, crate::fw::graphics::ui_image_clean_up);
     object
 }
 
@@ -822,7 +830,18 @@ extern "C" fn image_named(_: Class, _: Sel, name: Id) -> Id {
     };
     for candidate in [format!("{dir}/{stem}@2x.{ext}"), format!("{dir}/{stem}.{ext}"), format!("{dir}/{name}")] {
         if std::path::Path::new(&candidate).exists() {
-            return image_from_path(&candidate);
+            // UIKit keeps named images in its cache (which holds its own reference).
+            static CACHE: Mutex<Option<HashMap<String, Id>>> = Mutex::new(None);
+            let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+            let cache = cache.get_or_insert_with(HashMap::new);
+            if let Some(&image) = cache.get(&candidate) {
+                return image;
+            }
+            let image = image_from_path(&candidate);
+            if image != 0 {
+                cache.insert(candidate, image);
+            }
+            return image;
         }
     }
     crate::log!("imageNamed {name}: not in the app");
@@ -830,7 +849,7 @@ extern "C" fn image_named(_: Class, _: Sel, name: Id) -> Id {
 }
 
 extern "C" fn image_with_contents_of_file(_: Class, _: Sel, path: Id) -> Id {
-    image_from_path(&string::get(path))
+    crate::fw::counted::autorelease(image_from_path(&string::get(path)))
 }
 
 extern "C" fn image_init_with_contents_of_file(_this: Id, _: Sel, path: Id) -> Id {

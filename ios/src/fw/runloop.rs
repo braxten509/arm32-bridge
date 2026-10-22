@@ -70,6 +70,8 @@ fn run_work(work: Work) {
         Work::Message { target, selector, argument, done } => {
             let name = lock().sel_name(selector);
             runtime::send(target, &name, &[argument]);
+            // Let go of the argument kept while the message waited (see perform_on_main).
+            crate::fw::counted::release(argument);
             if let Some(done) = done {
                 *done.0.lock().unwrap() = true;
                 done.1.notify_all();
@@ -105,6 +107,8 @@ fn timer(object: Id) -> std::sync::MutexGuard<'static, TimerState> {
 
 fn make_timer(class: Class, interval: f64, target: Id, selector: Sel, user_info: Id, repeats: bool) -> Id {
     let object = runtime::alloc_instance(class);
+    // The timer holds on to its user info (performSelector:afterDelay:'s argument).
+    crate::fw::counted::keep(user_info);
     let state = TimerState {
         fire_at: now() + interval.max(0.0),
         interval: interval.max(0.0001),
@@ -267,6 +271,8 @@ fn fire_due_timers(run_loop: &'static Loop) -> (usize, Option<f64>) {
 /// With `once`, returns as soon as something was handled. Returns true if anything was.
 fn run_loop_until(run_loop: &'static Loop, until: Option<f64>, once: bool) -> bool {
     let mut handled = false;
+    // Each turn of the loop has its own autorelease pool, as on Apple.
+    let pool = crate::fw::counted::pool_mark();
     loop {
         loop {
             let work = run_loop.queue.lock().unwrap().pop_front();
@@ -280,6 +286,7 @@ fn run_loop_until(run_loop: &'static Loop, until: Option<f64>, once: bool) -> bo
         }
         let (fired, next_timer) = fire_due_timers(run_loop);
         handled |= fired > 0;
+        crate::fw::counted::pool_drain(pool);
         if once && handled {
             return true;
         }
@@ -440,6 +447,8 @@ extern "C" fn perform_on_main(this: Id, _: Sel, selector: Sel, argument: Id, wai
         runtime::send(this, &name, &[argument]);
         return;
     }
+    // Kept until the message has run (Apple retains it too).
+    crate::fw::counted::keep(argument);
     if wait != 0 {
         let done = Arc::new((Mutex::new(false), Condvar::new()));
         post(Work::Message { target: this, selector, argument, done: Some(done.clone()) });

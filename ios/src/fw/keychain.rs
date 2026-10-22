@@ -269,12 +269,11 @@ extern "C" fn boolean_type_id() -> usize {
 }
 
 extern "C" fn cf_retain(object: Id) -> Id {
-    crate::fw::graphics::retain(object);
-    object
+    crate::fw::counted::retain(object)
 }
 
 extern "C" fn cf_release(object: Id) {
-    crate::fw::graphics::release(object);
+    crate::fw::counted::release(object);
 }
 
 pub fn register(r: &mut Registry) {

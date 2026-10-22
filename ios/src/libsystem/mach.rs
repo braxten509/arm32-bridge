@@ -260,12 +260,18 @@ extern "C" fn block_object_assign(destination: *mut usize, object: usize, flags:
         match flags & 0xFF {
             7 => *destination = block_copy(object as *mut BlockHeader) as usize,
             8 | 24 => *destination = byref_copy(object as *mut Byref) as usize,
+            // A captured object: copying the block retains it (counted objects only).
+            3 => *destination = crate::fw::counted::retain(object),
             _ => *destination = object,
         }
     }
 }
 
-extern "C" fn block_object_dispose(_object: usize, _flags: i32) {}
+extern "C" fn block_object_dispose(object: usize, flags: i32) {
+    if flags & 0xFF == 3 {
+        crate::fw::counted::release(object);
+    }
+}
 
 pub unsafe fn call_block(block: usize) {
     let header = block as *const BlockHeader;

@@ -7,11 +7,14 @@ use runtime::{lock, Id, Sel};
 use std::collections::HashMap;
 use std::sync::{Condvar, Mutex};
 
+// Pools only matter for objects with real reference counts (fw/counted.rs).
 extern "C" fn autorelease_pool_push() -> usize {
-    1
+    crate::fw::counted::pool_push()
 }
 
-extern "C" fn autorelease_pool_pop(_: usize) {}
+extern "C" fn autorelease_pool_pop(token: usize) {
+    crate::fw::counted::pool_pop(token)
+}
 
 extern "C" fn get_property(this: Id, _: Sel, offset: isize, _atomic: bool) -> Id {
     if this == 0 {
@@ -30,19 +33,26 @@ extern "C" fn set_property(this: Id, _: Sel, offset: isize, value: Id, _atomic: 
         2 => runtime::send(value, "mutableCopy", &[]),
         _ => runtime::send(value, "copy", &[]),
     };
-    unsafe { *((this as isize + offset) as *mut usize) = stored };
+    if copy == 0 {
+        crate::fw::counted::retain(stored);
+    }
+    let slot = (this as isize + offset) as *mut usize;
+    let old = unsafe { std::mem::replace(&mut *slot, stored) };
+    crate::fw::counted::release(old);
 }
 
 extern "C" fn set_property_plain(this: Id, _: Sel, value: Id, offset: isize) {
     if this != 0 {
-        unsafe { *((this as isize + offset) as *mut usize) = value };
+        let old = unsafe { std::mem::replace(&mut *((this as isize + offset) as *mut usize), value) };
+        crate::fw::counted::replace(old, value);
     }
 }
 
 extern "C" fn set_property_copy(this: Id, _: Sel, value: Id, offset: isize) {
     if this != 0 {
         let copied = runtime::send(value, "copy", &[]);
-        unsafe { *((this as isize + offset) as *mut usize) = copied };
+        let old = unsafe { std::mem::replace(&mut *((this as isize + offset) as *mut usize), copied) };
+        crate::fw::counted::release(old);
     }
 }
 
@@ -223,20 +233,43 @@ extern "C" fn personality() -> i32 {
 }
 
 // ----- ARC entry points (compiler-made calls in ARC code) -----
-// Objects are never freed here (retain/release do nothing), so these only
-// pass objects along and store them; weak references are plain stores.
+// Objects are never freed here (retain/release do nothing), so these mostly
+// pass objects along and store them; weak references are plain stores. Only
+// objects with real counts (pictures, fw/counted.rs) are counted.
 
 extern "C" fn arc_same(object: Id) -> Id {
     object
 }
 
-extern "C" fn arc_release(_object: Id) {}
+extern "C" fn arc_retain(object: Id) -> Id {
+    crate::fw::counted::retain(object)
+}
+
+extern "C" fn arc_release(object: Id) {
+    crate::fw::counted::release(object)
+}
+
+extern "C" fn arc_autorelease(object: Id) -> Id {
+    crate::fw::counted::autorelease(object)
+}
+
+extern "C" fn arc_retain_autorelease(object: Id) -> Id {
+    crate::fw::counted::autorelease(crate::fw::counted::retain(object))
+}
 
 extern "C" fn arc_store(location: *mut Id, object: Id) -> Id {
     if !location.is_null() {
         unsafe { *location = object };
     }
     object
+}
+
+extern "C" fn arc_store_strong(location: *mut Id, object: Id) {
+    if !location.is_null() {
+        crate::fw::counted::retain(object);
+        let old = unsafe { std::mem::replace(&mut *location, object) };
+        crate::fw::counted::release(old);
+    }
 }
 
 extern "C" fn arc_load(location: *const Id) -> Id {
@@ -264,19 +297,15 @@ extern "C" fn arc_retain_block(block: usize) -> usize {
 }
 
 pub fn register(r: &mut Registry) {
-    for name in [
-        "objc_retain",
-        "objc_autorelease",
-        "objc_autoreleaseReturnValue",
-        "objc_retainAutorelease",
-        "objc_retainAutoreleaseReturnValue",
-        "objc_retainAutoreleasedReturnValue",
-        "objc_unsafeClaimAutoreleasedReturnValue",
-    ] {
-        r.function(name, arc_same as usize);
-    }
+    r.function("objc_unsafeClaimAutoreleasedReturnValue", arc_same as usize);
+    r.function("objc_retain", arc_retain as usize);
+    r.function("objc_retainAutoreleasedReturnValue", arc_retain as usize);
+    r.function("objc_autorelease", arc_autorelease as usize);
+    r.function("objc_autoreleaseReturnValue", arc_autorelease as usize);
+    r.function("objc_retainAutorelease", arc_retain_autorelease as usize);
+    r.function("objc_retainAutoreleaseReturnValue", arc_retain_autorelease as usize);
     r.function("objc_release", arc_release as usize);
-    r.function("objc_storeStrong", arc_store as usize);
+    r.function("objc_storeStrong", arc_store_strong as usize);
     r.function("objc_storeWeak", arc_store as usize);
     r.function("objc_initWeak", arc_store as usize);
     r.function("objc_loadWeak", arc_load as usize);

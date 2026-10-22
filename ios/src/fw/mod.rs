@@ -3,6 +3,7 @@
 pub mod app;
 pub mod coalesced;
 pub mod collections;
+pub mod counted;
 pub mod crypto;
 pub mod data;
 pub mod eagl;
@@ -70,10 +71,10 @@ pub fn register(r: &mut Registry) {
     immutable_copies();
 }
 
-/// Objects that never change hand back themselves when copied, as on Apple.
+/// Objects that never change hand back themselves when copied (retained), as on Apple.
 fn immutable_copies() {
     extern "C" fn same(this: crate::objc::runtime::Id, _: crate::objc::runtime::Sel, _zone: usize) -> crate::objc::runtime::Id {
-        this
+        counted::retain(this)
     }
     for name in [
         "NSRegularExpression", "NSTextCheckingResult", "NSDate", "NSURL", "NSUUID", "NSNull", "NSError", "NSLocale",
