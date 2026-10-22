@@ -491,7 +491,10 @@ extern "C" fn unit_get_property(unit: usize, id: u32, scope: u32, element: u32, 
             }
             0
         }
-        _ => -10879,
+        _ => {
+            crate::log!("AudioUnitGetProperty {id} scope {scope}: not known");
+            -10879
+        }
     }
 }
 
