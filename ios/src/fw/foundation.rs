@@ -577,6 +577,7 @@ pub fn register(r: &mut Registry) {
         defaults,
         &[
             ("objectForKey:", defaults_object_for_key as usize),
+            ("valueForKey:", defaults_object_for_key as usize),
             ("stringForKey:", defaults_string_for_key as usize),
             ("arrayForKey:", defaults_typed_object as usize),
             ("dictionaryForKey:", defaults_typed_object as usize),
@@ -716,5 +717,15 @@ mod tests {
         let fresh = runtime::send(runtime::alloc_instance(class), "initWithPath:", &[string::make(&format!("{path}/nothing"))]);
         assert_eq!(fresh, 0);
         std::fs::remove_dir_all(&folder).unwrap();
+    }
+
+    /// Key-value coding on NSUserDefaults reads the defaults themselves.
+    #[test]
+    fn defaults_answer_value_for_key() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let defaults = runtime::send(runtime::class_named("NSUserDefaults"), "standardUserDefaults", &[]);
+        assert!(runtime::responds(defaults, "valueForKey:"), "-[NSUserDefaults valueForKey:] is missing");
+        assert!(runtime::responds(defaults, "setValue:forKey:"));
     }
 }
