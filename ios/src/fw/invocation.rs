@@ -860,6 +860,16 @@ mod tests {
         let ours = our_types();
         assert_eq!(ours.exact.get(&("NSNumber", false, "boolValue")), Some(&"B@:"));
         assert_eq!(ours.exact.get(&("UIView", false, "setFrame:")), Some(&"v@:{CGRect={CGPoint=dd}{CGSize=dd}}"));
+        // Only types known for sure: a Rust helper's loose types (an i64 for
+        // an int, an Id for a BOOL) give no signature rather than a wrong one.
+        let known = |class: &str, meta: bool, selector: &str| {
+            ours.exact.get(&(class, meta, selector)).copied().or_else(|| ours.by_selector.get(&(meta, selector)).copied().flatten())
+        };
+        assert!(matches!(known("NSNumber", false, "intValue"), None | Some("i@:")), "{:?}", known("NSNumber", false, "intValue"));
+        assert!(matches!(known("UIView", false, "endEditing:"), None | Some("B@:B")), "{:?}", known("UIView", false, "endEditing:"));
+        assert_eq!(known("NSOperation", false, "setCompletionBlock:"), Some("v@:@?"));
+        assert_eq!(known("NSString", false, "initWithUTF8String:"), Some("@@:*"));
+        assert_eq!(known("NSDate", false, "copyWithZone:"), Some("@@:^{_NSZone=}"));
 
         // retainArguments copies C strings: the caller's buffer may go away.
         let types = Arc::new(parse_signature("v@:*"));

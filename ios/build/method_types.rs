@@ -34,13 +34,22 @@ pub fn generate() {
             found
         })
         .collect();
-    for ((file, text), local) in sources.iter().zip(&per_file) {
+    // A function serving several selectors is a shared helper whose Rust
+    // types are loose (an Id standing for a BOOL, an i64 for an int): none
+    // of its selectors get types from it.
+    let found: Vec<Vec<(Option<String>, bool, String, String)>> = sources.iter().map(|(file, text)| registrations(file, text)).collect();
+    let mut selectors_of: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+    for (_, _, selector, function) in found.iter().flatten() {
+        selectors_of.entry(function.rsplit("::").next().unwrap().to_string()).or_default().insert(selector.clone());
+    }
+    for (((file, _), local), registered) in sources.iter().zip(&per_file).zip(found) {
         let lookup = |name: &str| -> Option<Signature> {
             let name = name.rsplit("::").next().unwrap();
             local.get(name).cloned().or_else(|| all.get(name).filter(|v| v.len() == 1).map(|v| v[0].clone()))
         };
-        for (class, meta, selector, function) in registrations(file, text) {
-            match lookup(&function).and_then(|s| s.encode()) {
+        for (class, meta, selector, function) in registered {
+            let dedicated = selectors_of.get(function.rsplit("::").next().unwrap()).is_some_and(|s| s.len() == 1);
+            match lookup(&function).filter(|_| dedicated).and_then(|s| s.encode(&selector)) {
                 Some(types) => entries.push((class.unwrap_or_default(), meta, selector, types)),
                 // IOS_TYPES_DEBUG=1 lists the methods left without types.
                 None if std::env::var_os("IOS_TYPES_DEBUG").is_some() => eprintln!("no types: {file} {selector} ({function})"),
@@ -280,41 +289,117 @@ fn expand_macros(text: &str) -> String {
 
 #[derive(Clone)]
 struct Signature {
-    params: Vec<String>,
+    /// (name, Rust type) of each parameter.
+    params: Vec<(String, String)>,
     ret: String,
 }
 
+/// Lower-case words of a name: "copyWithZone" / "_zone" / "at_index" -> words.
+fn words(text: &str) -> Vec<String> {
+    let mut out = vec![String::new()];
+    let chars: Vec<char> = text.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        if c == '_' || c == ':' {
+            out.push(String::new());
+            continue;
+        }
+        // A capital starts a word after a small letter or digit, or ends a
+        // run of capitals ("UTF8String" -> utf8, string; "URLWith" -> url, with).
+        let previous = if i > 0 { chars[i - 1] } else { '_' };
+        let next_small = chars.get(i + 1).is_some_and(|n| n.is_ascii_lowercase());
+        if c.is_ascii_uppercase() && (previous.is_ascii_lowercase() || previous.is_ascii_digit() || (previous.is_ascii_uppercase() && next_small)) {
+            out.push(String::new());
+        }
+        out.last_mut().unwrap().push(c.to_ascii_lowercase());
+    }
+    out.retain(|w| !w.is_empty());
+    out
+}
+
+/// Words that name a count, index or option (NSInteger/NSUInteger).
+const INTEGER_WORDS: &[&str] = &[
+    "index", "indexes", "count", "length", "capacity", "options", "style", "mode", "tag", "location", "limit",
+    "priority", "state", "flags", "mask", "level", "section", "row", "item", "unit", "units", "policy", "behavior",
+    "encoding", "alignment", "orientation", "persistence", "hash", "integer", "position", "seconds", "milliseconds",
+];
+/// Words that name a block.
+const BLOCK_WORDS: &[&str] = &["block", "handler", "completion", "callback"];
+/// Words that name a BOOL argument.
+const BOOL_WORDS: &[&str] = &["animated", "editing", "hidden", "enabled", "flag", "yes"];
+/// Words that name a C string.
+const C_STRING_WORDS: &[&str] = &["utf8", "cstring"];
+
+fn has_word(list: &[String], wanted: &[&str]) -> bool {
+    list.iter().any(|w| wanted.contains(&w.as_str()))
+        || list.windows(2).any(|pair| wanted.contains(&format!("{}{}", pair[0], pair[1]).as_str()))
+}
+
 impl Signature {
-    /// Apple's encoding: return, then every argument (self and _cmd included).
-    fn encode(&self) -> Option<String> {
-        if self.params.len() < 2 {
+    /// Apple's encoding (return, self, _cmd, then each argument) when every
+    /// type is known for sure from the Rust types together with the
+    /// selector's and parameters' names; None otherwise (no signature beats
+    /// a wrong one).
+    fn encode(&self, selector: &str) -> Option<String> {
+        let keywords: Vec<&str> = selector.split(':').collect();
+        let arguments = selector.matches(':').count();
+        if self.params.len() != arguments + 2 {
             return None;
         }
-        let mut out = encode_type(&self.ret)?;
-        for p in &self.params {
-            out.push_str(&encode_type(p)?);
+        let selector_words = words(selector);
+        // A getter's name describes what it returns.
+        let returns = if arguments == 0 { selector_words.clone() } else { Vec::new() };
+        let mut out = encode_type(&self.ret, &returns, selector)?;
+        out.push_str("@:");
+        for (index, (name, rust)) in self.params.iter().enumerate().skip(2) {
+            let mut hints = words(name);
+            hints.extend(words(keywords[index - 2]));
+            if has_word(&hints, BOOL_WORDS) && !matches!(last(rust), "bool" | "u8") {
+                return None;
+            }
+            out.push_str(&encode_type(rust, &hints, selector)?);
         }
         Some(out)
     }
 }
 
-fn encode_type(rust: &str) -> Option<String> {
+fn last(rust: &str) -> &str {
+    rust.rsplit("::").next().unwrap()
+}
+
+/// One type's encoding; `hints` are the words naming it (parameter and
+/// selector keyword, or a getter's name). None when not sure.
+fn encode_type(rust: &str, hints: &[String], selector: &str) -> Option<String> {
     let t: String = rust.chars().filter(|c| !c.is_whitespace()).collect();
     if let Some(inner) = t.strip_prefix("*const").or_else(|| t.strip_prefix("*mut")) {
-        let inner = inner.rsplit("::").next().unwrap();
-        return Some(if inner == "c_char" { "*".into() } else { "^v".into() });
+        let inner = last(inner);
+        if inner == "c_char" || (matches!(inner, "u8" | "i8") && has_word(hints, C_STRING_WORDS)) {
+            return Some("*".into());
+        }
+        return Some(match inner {
+            "c_void" | "u8" => "^v".into(),
+            "Id" => "^@".into(),
+            other => format!("^{}", encode_type(other, &[], selector)?),
+        });
     }
-    let last = t.rsplit("::").next().unwrap();
+    let integer = has_word(hints, INTEGER_WORDS);
     Some(
-        match last {
+        match last(&t) {
             "" | "()" | "!" => "v",
+            // A count or index is never an object.
+            "Id" if integer => return None,
             "Id" => "@",
             "Class" => "#",
             "Sel" => ":",
-            "usize" | "u64" => "Q",
-            "isize" | "i64" => "q",
+            "usize" | "u64" | "isize" | "i64" if has_word(hints, &["zone"]) => "^{_NSZone=}",
+            "usize" | "u64" | "isize" | "i64" if has_word(hints, BLOCK_WORDS) => "@?",
+            "usize" | "u64" | "isize" | "i64" if has_word(hints, C_STRING_WORDS) => "*",
+            "usize" | "u64" if integer => "Q",
+            "isize" | "i64" if integer => "q",
+            "usize" | "u64" | "isize" | "i64" => return None,
             "bool" => "B",
-            "u8" => "C",
+            // BOOL is bool on arm64; an unsigned char says so in the selector.
+            "u8" if selector.contains("Char") => "C",
+            "u8" => "B",
             "i8" => "c",
             "u16" => "S",
             "i16" => "s",
@@ -352,7 +437,7 @@ fn signatures(text: &str) -> HashMap<String, Signature> {
         let Some(close) = closing(text.as_bytes(), paren) else { continue };
         let params = split_top(&text[paren + 1..close - 1])
             .into_iter()
-            .map(|p| p.split_once(':').map(|(_, t)| t.trim().to_string()).unwrap_or_default())
+            .map(|p| p.split_once(':').map(|(n, t)| (n.trim().trim_start_matches("mut ").to_string(), t.trim().to_string())).unwrap_or_default())
             .collect();
         let rest = &text[close..];
         let body = rest.find(['{', ';']).unwrap_or(rest.len());
@@ -431,7 +516,7 @@ fn list_variable(text: &str, name: &str, before: usize) -> Vec<String> {
 /// registered with methods()/class_methods() (and NSObject's own list).
 fn registrations(file: &str, text: &str) -> Vec<(Option<String>, bool, String, String)> {
     // let VAR = ...define_class("Name"... / class_named("Name")
-    let mut bindings: Vec<(usize, String, String)> = Vec::new();
+    let mut bindings: Vec<(usize, String, Vec<String>)> = Vec::new();
     let mut at = 0;
     while let Some(i) = find_word(text, "let ", at) {
         at = i + 4;
@@ -447,14 +532,35 @@ fn registrations(file: &str, text: &str) -> Vec<(Option<String>, bool, String, S
             if let Some(m) = rhs.find(marker) {
                 let name_start = m + marker.len();
                 if let Some(len) = rhs[name_start..].find('"') {
-                    bindings.push((i, var.to_string(), rhs[name_start..name_start + len].to_string()));
+                    bindings.push((i, var.to_string(), vec![rhs[name_start..name_start + len].to_string()]));
                 }
                 break;
             }
         }
+        // class_named(each) inside `for each in ["A", "B"]`: every listed class.
+        if let Some(m) = rhs.find("class_named(") {
+            let argument = rhs[m + "class_named(".len()..].split(')').next().unwrap_or("").trim();
+            if !argument.is_empty() && argument.bytes().all(is_ident) {
+                if let Some(loop_at) = text[..i].rfind(&format!("for {argument} in [")) {
+                    let open = loop_at + format!("for {argument} in ").len();
+                    if let Some(close) = closing(text.as_bytes(), open) {
+                        let names: Vec<String> = split_top(&text[open + 1..close - 1])
+                            .into_iter()
+                            .filter_map(|n| n.trim().strip_prefix('"').and_then(|n| n.strip_suffix('"')).map(String::from))
+                            .collect();
+                        if !names.is_empty() {
+                            bindings.push((i, var.to_string(), names));
+                        }
+                    }
+                }
+            }
+        }
     }
-    let class_at = |var: &str, position: usize| -> Option<String> {
-        bindings.iter().filter(|(p, v, _)| *p < position && v == var).last().map(|(_, _, name)| name.clone())
+    let classes_at = |var: &str, position: usize| -> Vec<Option<String>> {
+        match bindings.iter().filter(|(p, v, _)| *p < position && v == var).last() {
+            Some((_, _, names)) => names.iter().cloned().map(Some).collect(),
+            None => vec![None],
+        }
     };
     let mut out = Vec::new();
     let entries_in = |list: &str, class: Option<String>, meta: bool, out: &mut Vec<_>| {
@@ -481,13 +587,14 @@ fn registrations(file: &str, text: &str) -> Vec<(Option<String>, bool, String, S
             let Some(end) = closing(text.as_bytes(), open) else { continue };
             let args = split_top(&text[open + 1..end - 1]);
             if let [target, list] = args.as_slice() {
-                let class = class_at(target.trim(), i);
-                if let Some(list) = list.strip_prefix("&[").and_then(|l| l.strip_suffix(']')) {
-                    entries_in(list, class, meta, &mut out);
-                } else {
-                    let name = list.trim_start_matches('&').trim();
-                    for entry in list_variable(text, name, i) {
-                        entries_in(&entry, class.clone(), meta, &mut out);
+                for class in classes_at(target.trim(), i) {
+                    if let Some(list) = list.strip_prefix("&[").and_then(|l| l.strip_suffix(']')) {
+                        entries_in(list, class, meta, &mut out);
+                    } else {
+                        let name = list.trim_start_matches('&').trim();
+                        for entry in list_variable(text, name, i) {
+                            entries_in(&entry, class.clone(), meta, &mut out);
+                        }
                     }
                 }
             }
