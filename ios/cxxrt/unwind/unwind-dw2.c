@@ -966,26 +966,26 @@ execute_cfa_program (const unsigned char *insn_ptr,
 	  break;
 
 	case DW_CFA_def_cfa:
-	  insn_ptr = read_uleb128 (insn_ptr, &fs->cfa_reg);
+	  insn_ptr = read_uleb128 (insn_ptr, &fs->regs.cfa_reg);
 	  insn_ptr = read_uleb128 (insn_ptr, &utmp);
-	  fs->cfa_offset = utmp;
-	  fs->cfa_how = CFA_REG_OFFSET;
+	  fs->regs.cfa_offset = utmp;
+	  fs->regs.cfa_how = CFA_REG_OFFSET;
 	  break;
 
 	case DW_CFA_def_cfa_register:
-	  insn_ptr = read_uleb128 (insn_ptr, &fs->cfa_reg);
-	  fs->cfa_how = CFA_REG_OFFSET;
+	  insn_ptr = read_uleb128 (insn_ptr, &fs->regs.cfa_reg);
+	  fs->regs.cfa_how = CFA_REG_OFFSET;
 	  break;
 
 	case DW_CFA_def_cfa_offset:
 	  insn_ptr = read_uleb128 (insn_ptr, &utmp);
-	  fs->cfa_offset = utmp;
+	  fs->regs.cfa_offset = utmp;
 	  /* cfa_how deliberately not set.  */
 	  break;
 
 	case DW_CFA_def_cfa_expression:
-	  fs->cfa_exp = insn_ptr;
-	  fs->cfa_how = CFA_EXP;
+	  fs->regs.cfa_exp = insn_ptr;
+	  fs->regs.cfa_how = CFA_EXP;
 	  insn_ptr = read_uleb128 (insn_ptr, &utmp);
 	  insn_ptr += utmp;
 	  break;
@@ -1009,15 +1009,15 @@ execute_cfa_program (const unsigned char *insn_ptr,
 	  break;
 
 	case DW_CFA_def_cfa_sf:
-	  insn_ptr = read_uleb128 (insn_ptr, &fs->cfa_reg);
-	  insn_ptr = read_sleb128 (insn_ptr, &fs->cfa_offset);
-	  fs->cfa_how = CFA_REG_OFFSET;
-	  fs->cfa_offset *= fs->data_align;
+	  insn_ptr = read_uleb128 (insn_ptr, &fs->regs.cfa_reg);
+	  insn_ptr = read_sleb128 (insn_ptr, &fs->regs.cfa_offset);
+	  fs->regs.cfa_how = CFA_REG_OFFSET;
+	  fs->regs.cfa_offset *= fs->data_align;
 	  break;
 
 	case DW_CFA_def_cfa_offset_sf:
-	  insn_ptr = read_sleb128 (insn_ptr, &fs->cfa_offset);
-	  fs->cfa_offset *= fs->data_align;
+	  insn_ptr = read_sleb128 (insn_ptr, &fs->regs.cfa_offset);
+	  fs->regs.cfa_offset *= fs->data_align;
 	  /* cfa_how deliberately not set.  */
 	  break;
 
@@ -1106,14 +1106,14 @@ gb_compact_frame_state (struct _Unwind_Context *context, _Unwind_FrameState *fs,
   fs->retaddr_column = 30;
   fs->code_align = 4;
   fs->data_align = -8;
-  fs->cfa_how = CFA_REG_OFFSET;
+  fs->regs.cfa_how = CFA_REG_OFFSET;
 
   switch (info->encoding & GB_ARM64_MODE_MASK)
     {
     case GB_ARM64_MODE_FRAME:
       /* fp points at the saved fp and lr; the pairs lie below it.  */
-      fs->cfa_reg = 29;
-      fs->cfa_offset = 16;
+      fs->regs.cfa_reg = 29;
+      fs->regs.cfa_offset = 16;
       fs->regs.reg[29].how = REG_SAVED_OFFSET;
       fs->regs.reg[29].loc.offset = -16;
       fs->regs.reg[30].how = REG_SAVED_OFFSET;
@@ -1124,8 +1124,8 @@ gb_compact_frame_state (struct _Unwind_Context *context, _Unwind_FrameState *fs,
     case GB_ARM64_MODE_FRAMELESS:
       /* The return address is still in lr; the pairs lie at the top of
 	 the function's stack area.  */
-      fs->cfa_reg = 31;
-      fs->cfa_offset = 16 * ((info->encoding & GB_ARM64_FRAMELESS_STACK_MASK)
+      fs->regs.cfa_reg = 31;
+      fs->regs.cfa_offset = 16 * ((info->encoding & GB_ARM64_FRAMELESS_STACK_MASK)
 			     >> GB_ARM64_FRAMELESS_STACK_SHIFT);
       offset = -8;
       break;
@@ -1271,16 +1271,16 @@ uw_update_context_1 (struct _Unwind_Context *context, _Unwind_FrameState *fs)
 #endif
 
   /* Compute this frame's CFA.  */
-  switch (fs->cfa_how)
+  switch (fs->regs.cfa_how)
     {
     case CFA_REG_OFFSET:
-      cfa = _Unwind_GetPtr (&orig_context, fs->cfa_reg);
-      cfa += fs->cfa_offset;
+      cfa = _Unwind_GetPtr (&orig_context, fs->regs.cfa_reg);
+      cfa += fs->regs.cfa_offset;
       break;
 
     case CFA_EXP:
       {
-	const unsigned char *exp = fs->cfa_exp;
+	const unsigned char *exp = fs->regs.cfa_exp;
 	_Unwind_Word len;
 
 	exp = read_uleb128 (exp, &len);

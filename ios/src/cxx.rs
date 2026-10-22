@@ -238,10 +238,13 @@ mod tests {
     /// Real throw/catch in iPhone code (ios/cxxrt/test/throw_test.cc, built
     /// by ios/tools/build-cxx-test.sh): compact unwind frames, LSDAs and the
     /// personality routine bound through the game's GOT, cleanups on the way,
-    /// rethrow, and an exception thrown inside this runtime caught by the game.
+    /// rethrow, an exception thrown inside this runtime caught by the game,
+    /// DWARF-only frames (one with no compact entry at all), and the game's
+    /// own Objective-C exception classes.
     #[test]
     fn game_code_throws_and_catches() {
         crate::symbols::with(|r| {
+            crate::objc::register(r);
             crate::libsystem::register(r);
             super::register(r);
         });
@@ -256,6 +259,9 @@ mod tests {
         assert_eq!(call("_test_rethrow"), 19);
         assert_eq!(call("_test_runtime_throw"), 1);
         assert_eq!(call("_test_no_throw"), 1);
+        assert_eq!(call("_test_remembered_state"), 41, "through a DWARF-only frame with remember/restore_state");
+        assert_eq!(call("_test_failed_throw_not_uncaught"), 1, "uncaught_exception() after a throwing constructor");
+        assert_eq!(call("_test_objc_own_class"), 31, "@catch (GBTestError*) of a GBTestSubError");
         assert_eq!(call("_test_catch_by_base"), 207, "a second round works the same");
     }
 }

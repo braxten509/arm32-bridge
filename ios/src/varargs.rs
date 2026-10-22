@@ -42,8 +42,13 @@ fn host_format(spec: &[u8], value: impl Fn(*mut libc::c_char, usize, *const libc
     }
 }
 
-/// Formats like printf. `objects` turns on %@ (Objective-C objects).
+/// Formats like printf. `objects` turns on %@ (Objective-C objects). Wide
+/// text (%ls, %lc) is converted in the game's LC_CTYPE.
 pub fn format(fmt: &[u8], args: &mut Args, objects: bool) -> Vec<u8> {
+    crate::libsystem::extra::with_guest_ctype(|| format_in_locale(fmt, args, objects))
+}
+
+fn format_in_locale(fmt: &[u8], args: &mut Args, objects: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(fmt.len() + 16);
     let mut i = 0;
     while i < fmt.len() {

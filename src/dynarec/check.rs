@@ -155,7 +155,7 @@ pub fn reference(uc: &mut Uc, pc: u32, end: u32, stop_at: u32) -> Option<Referen
             let word = guest_mem().read_u32(current);
             ((word >> 24) & 0xF == 0xF && word >> 28 != 0xF, 4)
         };
-        if is_svc && !(crate::mem::STUB_BASE..crate::mem::STUB_BASE + crate::mem::STUB_SIZE).contains(&current) {
+        if is_svc && !crate::mem::in_stub_area(current) {
             break (current + size) | thumb;
         }
         let result = uc.emu_start((current | thumb) as u64, stop_at as u64, 0, 1);

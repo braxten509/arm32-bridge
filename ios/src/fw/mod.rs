@@ -2,7 +2,11 @@
 
 pub mod app;
 pub mod cfbridge;
+pub mod audiofile;
+pub mod audioqueue;
+pub mod avasset;
 pub mod coalesced;
+pub mod corevideo;
 pub mod collections;
 pub mod controls;
 pub mod counted;
@@ -28,6 +32,7 @@ pub mod misc;
 pub mod numbers;
 pub mod object;
 pub mod paths;
+pub mod photos;
 pub mod pictures;
 pub mod plist;
 pub mod png;
@@ -88,6 +93,11 @@ pub fn register(r: &mut Registry) {
     operations::register(r);
     smallclasses::register(r);
     exception::register(r);
+    audiofile::register(r);
+    audioqueue::register(r);
+    corevideo::register(r);
+    avasset::register(r);
+    photos::register(r);
     immutable_copies();
 }
 

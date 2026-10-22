@@ -64,6 +64,8 @@ __cxxabiv1::__cxa_throw (void *obj, std::type_info *tinfo,
   header->terminateHandler = __terminate_handler;
   __GXX_INIT_EXCEPTION_CLASS(header->unwindHeader.exception_class);
   header->unwindHeader.exception_cleanup = __gxx_exception_cleanup;
+  // GAME BRIDGE: counted here, not at allocation (see eh_alloc.cc).
+  __cxa_get_globals ()->uncaughtExceptions += 1;
 
 #ifdef _GLIBCXX_SJLJ_EXCEPTIONS
   _Unwind_SjLj_RaiseException (&header->unwindHeader);

@@ -17,6 +17,7 @@
 #include "unwind-pe.h"
 #include "unwind-dw2-fde.h"
 #include <link.h>
+#include <pthread.h>
 #include <stdatomic.h>
 
 /* ----- Entry stubs and the jump ----- */
@@ -108,6 +109,13 @@ __asm__ (".text\n"
 
 /* ----- The game's Mach-O images ----- */
 
+/* The code an FDE covers.  */
+struct gb_fde_range
+{
+  uintptr_t begin, end;
+  const struct dwarf_fde *fde;
+};
+
 struct gb_image
 {
   uintptr_t header;          /* the Mach-O header: compact offsets count from here */
@@ -116,6 +124,11 @@ struct gb_image
   size_t unwind_info_size;
   const uint8_t *eh_frame;
   size_t eh_frame_size;
+  /* The __eh_frame FDEs that pass gb_check_fde, sorted by address; made
+     the first time a function needs them (gb_eh_frame_lookup).  */
+  struct gb_fde_range *ranges;
+  size_t range_count;
+  atomic_int ranges_ready;
 };
 
 #define GB_MAX_IMAGES 16
@@ -138,6 +151,9 @@ gamebridge_unwind_add_image (uintptr_t header, uintptr_t start, uintptr_t end,
   images[n].unwind_info_size = unwind_info_size;
   images[n].eh_frame = eh_frame;
   images[n].eh_frame_size = eh_frame_size;
+  images[n].ranges = NULL;
+  images[n].range_count = 0;
+  atomic_store (&images[n].ranges_ready, 0);
   atomic_store (&image_count, n + 1);
   return 0;
 }
@@ -156,6 +172,175 @@ u16_at (const uint8_t *p)
   uint16_t v;
   memcpy (&v, p, 2);
   return v;
+}
+
+/* ----- Checking a game's __eh_frame records ----- */
+
+/* An unsigned LEB128 number that must end before END; NULL if it doesn't.  */
+static const uint8_t *
+gb_read_uleb (const uint8_t *p, const uint8_t *end, uint64_t *value)
+{
+  uint64_t result = 0;
+  unsigned shift = 0;
+  while (p < end)
+    {
+      uint8_t byte = *p++;
+      if (shift < 64)
+	result |= (uint64_t) (byte & 0x7f) << shift;
+      shift += 7;
+      if ((byte & 0x80) == 0)
+	{
+	  *value = result;
+	  return p;
+	}
+    }
+  return NULL;
+}
+
+/* The size of an address encoded as ENCODING, or 0 if it is not one GCC's
+   reader can take here: fixed size, absolute or pc-relative (a Mach-O
+   __eh_frame has no text, data or function base), indirect only where
+   ALLOW_INDIRECT (personality and LSDA, not code addresses).  */
+static size_t
+gb_encoded_size (unsigned char encoding, int allow_indirect)
+{
+  if (encoding == DW_EH_PE_omit)
+    return 0;
+  if (encoding & DW_EH_PE_indirect)
+    {
+      if (!allow_indirect)
+	return 0;
+      encoding &= ~DW_EH_PE_indirect;
+    }
+  if ((encoding & 0x70) != DW_EH_PE_absptr && (encoding & 0x70) != DW_EH_PE_pcrel)
+    return 0;
+  switch (encoding & 0x0f)
+    {
+    case DW_EH_PE_absptr:
+    case DW_EH_PE_udata8:
+    case DW_EH_PE_sdata8:
+      return 8;
+    case DW_EH_PE_udata4:
+    case DW_EH_PE_sdata4:
+      return 4;
+    case DW_EH_PE_udata2:
+    case DW_EH_PE_sdata2:
+      return 2;
+    default:
+      return 0;
+    }
+}
+
+/* Whether FDE, a record inside IMAGE's __eh_frame, is an FDE that GCC's
+   reader can use without reading outside the section: its size, its CIE's
+   place, size and header, both augmentations and every encoded field are
+   checked first. Sets *BEGIN and *RANGE to the code it covers.  */
+static int
+gb_check_fde (const struct gb_image *image, const uint8_t *fde,
+	      uintptr_t *begin, uintptr_t *range)
+{
+  const uint8_t *start = image->eh_frame, *end = start + image->eh_frame_size;
+  const uint8_t *fde_end, *cie, *cie_end, *p, *aug, *aug_end = NULL;
+  unsigned char address_encoding = DW_EH_PE_absptr;
+  unsigned char lsda_encoding = DW_EH_PE_omit;
+  uint32_t length, delta;
+  uint64_t value;
+  size_t size;
+  _Unwind_Ptr b, r;
+
+  if (start == NULL || fde < start || end - fde < 8)
+    return 0;
+  length = u32_at (fde);
+  delta = u32_at (fde + 4);
+  if (length < 4 || length > (size_t) (end - fde) - 4 || delta == 0)
+    return 0;
+  fde_end = fde + 4 + length;
+
+  /* The CIE: before the FDE (the pointer counts back from itself).  */
+  if (delta > (size_t) (fde + 4 - start))
+    return 0;
+  cie = fde + 4 - delta;
+  if (end - cie < 9)
+    return 0;
+  length = u32_at (cie);
+  if (length < 5 || length > (size_t) (end - cie) - 4 || u32_at (cie + 4) != 0)
+    return 0;
+  cie_end = cie + 4 + length;
+  if (cie[8] != 1 && cie[8] != 3)
+    return 0;
+  aug = cie + 9;
+  p = memchr (aug, 0, cie_end - aug);
+  if (p == NULL)
+    return 0;
+  p++;
+  if ((p = gb_read_uleb (p, cie_end, &value)) == NULL      /* code alignment */
+      || (p = gb_read_uleb (p, cie_end, &value)) == NULL)  /* data alignment */
+    return 0;
+  if (cie[8] == 1)
+    {
+      if (p >= cie_end)                                    /* return address column */
+	return 0;
+      p++;
+    }
+  else if ((p = gb_read_uleb (p, cie_end, &value)) == NULL)
+    return 0;
+  if (aug[0] == 'z')
+    {
+      if ((p = gb_read_uleb (p, cie_end, &value)) == NULL
+	  || value > (uint64_t) (cie_end - p))
+	return 0;
+      aug_end = p + value;
+      for (aug++; *aug; aug++)
+	{
+	  if (*aug == 'R')
+	    {
+	      if (p >= aug_end || gb_encoded_size (*p, 0) == 0)
+		return 0;
+	      address_encoding = *p++;
+	    }
+	  else if (*aug == 'L')
+	    {
+	      if (p >= aug_end)
+		return 0;
+	      lsda_encoding = *p++;
+	      if (lsda_encoding != DW_EH_PE_omit && gb_encoded_size (lsda_encoding, 1) == 0)
+		return 0;
+	    }
+	  else if (*aug == 'P')
+	    {
+	      if (p >= aug_end || (size = gb_encoded_size (*p, 1)) == 0
+		  || size > (size_t) (aug_end - p - 1))
+		return 0;
+	      p += 1 + size;
+	    }
+	  else if (*aug != 'S')
+	    break;              /* GCC's reader skips the rest by its length */
+	}
+    }
+  else if (aug[0] != 0)
+    return 0;               /* only "z..." and "" in a Mach-O __eh_frame */
+
+  /* The FDE's code address and length, then its augmentation data.  */
+  size = gb_encoded_size (address_encoding, 0);
+  p = fde + 8;
+  if ((size_t) (fde_end - p) < 2 * size)
+    return 0;
+  read_encoded_value_with_base (address_encoding, 0, p, &b);
+  read_encoded_value_with_base (address_encoding & 0x0f, 0, p + size, &r);
+  p += 2 * size;
+  if (r == 0 || b + r < b)
+    return 0;
+  if (aug_end != NULL)
+    {
+      if ((p = gb_read_uleb (p, fde_end, &value)) == NULL
+	  || value > (uint64_t) (fde_end - p)
+	  || (lsda_encoding != DW_EH_PE_omit
+	      && value < gb_encoded_size (lsda_encoding, 1)))
+	return 0;
+    }
+  *begin = b;
+  *range = r;
+  return 1;
 }
 
 /* Apple's two-level __unwind_info lookup.  */
@@ -268,7 +453,10 @@ gb_compact_lookup (const struct gb_image *image, uintptr_t pc,
   if ((encoding & GB_ARM64_MODE_MASK) == GB_ARM64_MODE_DWARF)
     {
       uint32_t at = encoding & GB_ARM64_DWARF_SECTION_OFFSET;
-      if (image->eh_frame == NULL || at >= image->eh_frame_size)
+      uintptr_t begin, range;
+      if (image->eh_frame == NULL || at >= image->eh_frame_size
+	  || !gb_check_fde (image, image->eh_frame + at, &begin, &range)
+	  || pc < begin || pc - begin >= range)
 	return GB_UNWIND_NONE;
       info->fde = (const struct dwarf_fde *) (image->eh_frame + at);
       return GB_UNWIND_FDE;
@@ -428,6 +616,105 @@ gb_elf_callback (struct dl_phdr_info *info, size_t size, void *data)
   return 1;
 }
 
+static int
+gb_range_order (const void *a, const void *b)
+{
+  uintptr_t x = ((const struct gb_fde_range *) a)->begin;
+  uintptr_t y = ((const struct gb_fde_range *) b)->begin;
+  return x < y ? -1 : x > y;
+}
+
+/* IMAGE's ranges: every FDE in its __eh_frame that passes gb_check_fde;
+   records that don't are skipped. A record whose own length is broken
+   ends the walk, as nothing after it can be found.  */
+static void
+gb_index_eh_frame (struct gb_image *image)
+{
+  const uint8_t *p = image->eh_frame, *end = p + image->eh_frame_size;
+  struct gb_fde_range *ranges = NULL;
+  size_t count = 0, capacity = 0;
+
+  while (p != NULL && end - p >= 8)
+    {
+      uint64_t length = u32_at (p), header = 4;
+      uintptr_t begin, range;
+      if (length == 0)
+	break;                  /* the end mark */
+      if (length == 0xffffffff)
+	{
+	  /* A 64-bit record (never written for Mach-O): skipped.  */
+	  if (end - p < 12)
+	    break;
+	  memcpy (&length, p + 4, 8);
+	  header = 12;
+	}
+      if (length > (uint64_t) (end - p) - header)
+	break;
+      if (header == 4 && u32_at (p + 4) != 0 && gb_check_fde (image, p, &begin, &range))
+	{
+	  if (count == capacity)
+	    {
+	      size_t more = capacity ? capacity * 2 : 64;
+	      struct gb_fde_range *grown = realloc (ranges, more * sizeof *ranges);
+	      if (grown == NULL)
+		break;
+	      ranges = grown;
+	      capacity = more;
+	    }
+	  ranges[count].begin = begin;
+	  ranges[count].end = begin + range;
+	  ranges[count].fde = (const struct dwarf_fde *) p;
+	  count++;
+	}
+      p += header + length;
+    }
+  if (count > 1)
+    qsort (ranges, count, sizeof *ranges, gb_range_order);
+  image->ranges = ranges;
+  image->range_count = count;
+}
+
+static pthread_mutex_t index_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* A game function the compact table says nothing about (no __unwind_info,
+   as with -no_compact_unwind, or an entry of 0): its FDE in the image's
+   __eh_frame, as Apple's unwinder finds it. The index is made once per
+   image, the first time it is needed.  */
+static int
+gb_eh_frame_lookup (struct gb_image *image, uintptr_t pc,
+		    struct gb_unwind_info *info)
+{
+  size_t lo = 0, hi;
+
+  if (!atomic_load_explicit (&image->ranges_ready, memory_order_acquire))
+    {
+      pthread_mutex_lock (&index_lock);
+      if (!atomic_load_explicit (&image->ranges_ready, memory_order_relaxed))
+	{
+	  gb_index_eh_frame (image);
+	  atomic_store_explicit (&image->ranges_ready, 1, memory_order_release);
+	}
+      pthread_mutex_unlock (&index_lock);
+    }
+
+  /* The last range starting at or before pc.  */
+  hi = image->range_count;
+  while (lo < hi)
+    {
+      size_t mid = lo + (hi - lo) / 2;
+      if (image->ranges[mid].begin <= pc)
+	lo = mid + 1;
+      else
+	hi = mid;
+    }
+  if (lo == 0 || pc >= image->ranges[lo - 1].end)
+    return GB_UNWIND_NONE;
+  memset (info, 0, sizeof *info);
+  info->fde = image->ranges[lo - 1].fde;
+  info->func = image->ranges[lo - 1].begin;
+  return GB_UNWIND_FDE;
+}
+
 int
 gb_find_unwind_info (void *pc_pointer, struct gb_unwind_info *info)
 {
@@ -436,7 +723,12 @@ gb_find_unwind_info (void *pc_pointer, struct gb_unwind_info *info)
 
   for (i = 0; i < n; i++)
     if (pc >= images[i].start && pc < images[i].end)
-      return gb_compact_lookup (&images[i], pc, info);
+      {
+	int found = gb_compact_lookup (&images[i], pc, info);
+	if (found == GB_UNWIND_NONE)
+	  found = gb_eh_frame_lookup (&images[i], pc, info);
+	return found;
+      }
 
   if (pc >= (uintptr_t) gamebridge_cxxrt_text_start
       && pc < (uintptr_t) gamebridge_cxxrt_text_end)

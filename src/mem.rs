@@ -28,7 +28,7 @@ pub const STACK_TOP: u32 = 0xF000_0000;
 pub const KUSER_BASE: u32 = 0xFFFF_0000;
 pub const KUSER_END: u32 = 0xFFFF_1000;
 
-/// Regions handed to Unicorn as (start, end, may hold code). Everything else
+/// The Android regions as (start, end, may hold code). Everything else
 /// faults when touched. Writes to code regions pay for a self-modifying-code
 /// check in Unicorn (see vendor/unicorn-engine-sys); the heap needs it for
 /// code games make while running.
@@ -41,6 +41,158 @@ pub const MAPPED_REGIONS: [(u32, u32, bool); 6] = [
     (STACK_BASE, STACK_TOP, false),
     (KUSER_BASE, KUSER_END, true),
 ];
+
+/// Where the guest address space is mapped and where the phone-function
+/// stand-ins and return traps live. Mapping (host and Unicorn), the
+/// "may code run here" check, the return traps and stub dispatch all read
+/// this one value. Android programs use `MemoryLayout::android()` (the
+/// constants above, unchanged); a program that must sit at fixed low
+/// addresses (32-bit iPhone programs) gets its own regions and a stub area
+/// out of its way. The heap, runtime data and stack keep their Android
+/// places in every layout.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryLayout {
+    /// (start, end, may hold code), page-aligned, sorted, not overlapping.
+    pub regions: Vec<(u32, u32, bool)>,
+    /// Return traps (8 bytes per nesting depth) then stand-ins (8 bytes each).
+    pub stub_base: u32,
+    pub stub_size: u32,
+}
+
+impl MemoryLayout {
+    pub fn android() -> MemoryLayout {
+        MemoryLayout { regions: MAPPED_REGIONS.to_vec(), stub_base: STUB_BASE, stub_size: STUB_SIZE }
+    }
+
+    /// The regions every layout needs besides its program: heap, runtime
+    /// data and stack, plus a code region for the stub area at `stub_base`.
+    pub fn with_program(program: &[(u32, u32, bool)], stub_base: u32, stub_size: u32) -> Result<MemoryLayout, String> {
+        let mut regions = program.to_vec();
+        regions.extend([
+            (HEAP_BASE, HEAP_END, true),
+            (MISC_BASE, MISC_END, false),
+            (stub_base, stub_base.checked_add(stub_size).ok_or("stub area overflows")?, true),
+            (STACK_BASE, STACK_TOP, false),
+        ]);
+        regions.sort_unstable();
+        let layout = MemoryLayout { regions, stub_base, stub_size };
+        layout.validate()?;
+        Ok(layout)
+    }
+
+    /// Page alignment, order, no overlaps, and the stub area inside one code region.
+    pub fn validate(&self) -> Result<(), String> {
+        let mut previous_end = 0u64;
+        for &(start, end, _) in &self.regions {
+            if start % PAGE != 0 || end % PAGE != 0 || start >= end {
+                return Err(format!("region {start:#x}..{end:#x} is empty or not page-aligned"));
+            }
+            if u64::from(start) < previous_end {
+                return Err(format!("region {start:#x}..{end:#x} overlaps or is out of order"));
+            }
+            previous_end = u64::from(end);
+        }
+        if self.stub_size == 0 || self.stub_size % PAGE != 0 {
+            return Err(format!("stub area size {:#x} is not whole pages", self.stub_size));
+        }
+        let stub_end = u64::from(self.stub_base) + u64::from(self.stub_size);
+        let inside = self
+            .regions
+            .iter()
+            .any(|&(start, end, code)| code && start <= self.stub_base && stub_end <= u64::from(end));
+        if !inside {
+            return Err(format!("stub area {:#x}..{stub_end:#x} is not inside one code region", self.stub_base));
+        }
+        Ok(())
+    }
+
+    pub fn executable(&self, address: u32) -> bool {
+        self.regions.iter().any(|&(start, end, code)| code && (start..end).contains(&address))
+    }
+
+    pub fn in_stub_area(&self, address: u32) -> bool {
+        address.wrapping_sub(self.stub_base) < self.stub_size
+    }
+
+    /// The end of the region holding `address`.
+    pub fn region_end(&self, address: u32) -> Option<u32> {
+        self.regions.iter().find(|&&(start, end, _)| (start..end).contains(&address)).map(|&(_, end, _)| end)
+    }
+
+    /// Whether every byte of [start, end) is mapped (it may cross from one
+    /// region into the next when they touch).
+    pub fn mapped(&self, start: u32, end: u64) -> bool {
+        let mut at = u64::from(start);
+        while at < end {
+            match self.region_end(at as u32) {
+                Some(region_end) => at = u64::from(region_end),
+                None => return false,
+            }
+        }
+        true
+    }
+
+    pub fn has_kernel_helpers(&self) -> bool {
+        self.regions.iter().any(|&(start, end, _)| start <= KUSER_BASE && KUSER_END <= end)
+    }
+}
+
+static LAYOUT: std::sync::OnceLock<MemoryLayout> = std::sync::OnceLock::new();
+/// Set once a layout other than Android's is chosen. While it is clear (every
+/// Android run), the hot checks below use the constants, exactly as before
+/// layouts existed; only other layouts walk `layout()`.
+static CUSTOM_LAYOUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Picks the layout for this process. Must come before guest memory is
+/// reserved (runtime::init); afterwards only the same layout is accepted.
+pub fn set_layout(layout: MemoryLayout) -> Result<(), String> {
+    layout.validate()?;
+    let custom = layout != MemoryLayout::android();
+    let current = LAYOUT.get_or_init(|| layout.clone());
+    if *current != layout {
+        return Err("guest memory layout was already chosen".into());
+    }
+    if custom {
+        CUSTOM_LAYOUT.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// This process's layout (Android's unless `set_layout` chose another first).
+pub fn layout() -> &'static MemoryLayout {
+    LAYOUT.get_or_init(MemoryLayout::android)
+}
+
+/// Whether this process uses a layout other than Android's.
+#[inline]
+pub fn custom_layout() -> bool {
+    CUSTOM_LAYOUT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether `address` is in the Android layout's code regions (constant data).
+#[inline]
+pub fn android_executable(address: u32) -> bool {
+    MAPPED_REGIONS.iter().any(|&(start, end, code)| code && (start..end).contains(&address))
+}
+
+#[inline]
+pub fn in_stub_area(address: u32) -> bool {
+    if custom_layout() {
+        layout().in_stub_area(address)
+    } else {
+        address.wrapping_sub(STUB_BASE) < STUB_SIZE
+    }
+}
+
+/// Where the return traps and stand-ins start in this process's layout.
+#[inline]
+pub fn stub_base() -> u32 {
+    if custom_layout() {
+        layout().stub_base
+    } else {
+        STUB_BASE
+    }
+}
 
 /// Read-only segments of loaded libraries, as (start, end). Their bytes never
 /// change, so translated code may use them as constants (literal pools) and
@@ -87,8 +239,13 @@ pub fn fixed(address: u32) -> bool {
 }
 
 /// Whether guest code may run at `address` (a region mapped as code).
+#[inline]
 pub fn executable(address: u32) -> bool {
-    MAPPED_REGIONS.iter().any(|&(start, end, code)| code && (start..end).contains(&address))
+    if custom_layout() {
+        layout().executable(address)
+    } else {
+        android_executable(address)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -117,7 +274,7 @@ impl GuestMem {
         // Addresses outside the mapped regions fault on the host too, as they
         // do in Unicorn (a NULL dereference in translated code must not read 0).
         let mut start = 0usize;
-        for (region_start, region_end, _) in MAPPED_REGIONS {
+        for &(region_start, region_end, _) in &layout().regions {
             if (region_start as usize) > start {
                 unsafe { libc::mprotect((base as *mut u8).add(start).cast(), region_start as usize - start, libc::PROT_NONE) };
             }
@@ -132,6 +289,9 @@ impl GuestMem {
     /// ldrex/strex loops with barriers. Results match the kernel's: 0 and
     /// carry set on success.
     pub fn write_kernel_helpers(&self) {
+        if !layout().has_kernel_helpers() {
+            return; // not a Linux layout: the page isn't mapped
+        }
         const HELPERS: [(u32, &[u32]); 4] = [
             // __kuser_cmpxchg64(const u64 *old, const u64 *new, u64 *ptr)
             (0xFFFF_0F60, &[

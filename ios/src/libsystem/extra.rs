@@ -219,15 +219,50 @@ fn locale_answer(names: &[&'static str; 6], category: i32) -> usize {
     *ANSWERS.lock().unwrap().get_or_insert_with(Default::default).entry(text.clone()).or_insert_with(|| leak_cstr(&text))
 }
 
-/// The system's character handling (wide characters, multibyte text) follows
-/// the game's LC_CTYPE: "UTF-8" or plain "C". False: the system can't.
-fn set_host_ctype(name: &str) -> bool {
-    let candidates: &[&std::ffi::CStr] = if name == "UTF-8" { &[c"C.UTF-8", c"en_US.UTF-8"] } else { &[c"C"] };
-    candidates.iter().any(|candidate| !unsafe { libc::setlocale(libc::LC_CTYPE, candidate.as_ptr()) }.is_null())
+/// The game's LC_CTYPE as a system locale (0: plain C). The system's global
+/// locale is never changed; the game's own character calls (wide-character
+/// classes and case, printf-style formatting) run inside it.
+static GUEST_CTYPE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+extern "C" {
+    fn newlocale(mask: i32, name: *const libc::c_char, base: usize) -> usize;
+    fn uselocale(locale: usize) -> usize;
 }
 
-/// setlocale with Apple's category numbers. Of the system's own locale only
-/// LC_CTYPE changes (this layer formats numbers for the game in the C locale).
+/// LC_CTYPE_MASK (LC_CTYPE is 0 on glibc and Bionic).
+const CTYPE_MASK: i32 = 1;
+
+/// Runs a host call the game made inside the game's LC_CTYPE.
+pub fn with_guest_ctype<T>(work: impl FnOnce() -> T) -> T {
+    let locale = GUEST_CTYPE.load(std::sync::atomic::Ordering::Relaxed);
+    if locale == 0 {
+        return work();
+    }
+    let before = unsafe { uselocale(locale) };
+    let result = work();
+    unsafe { uselocale(before) };
+    result
+}
+
+/// Switches the game's character handling to "UTF-8" or plain "C". False: the system can't.
+fn set_guest_ctype(name: &str) -> bool {
+    static UTF8: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let locale = if name == "UTF-8" {
+        *UTF8.get_or_init(|| {
+            [c"C.UTF-8", c"en_US.UTF-8"].iter().map(|candidate| unsafe { newlocale(CTYPE_MASK, candidate.as_ptr(), 0) }).find(|&l| l != 0).unwrap_or(0)
+        })
+    } else {
+        0
+    };
+    if name == "UTF-8" && locale == 0 {
+        return false;
+    }
+    GUEST_CTYPE.store(locale, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
+/// setlocale with Apple's category numbers. Only LC_CTYPE changes anything
+/// here (this layer formats numbers for the game in the C locale).
 extern "C" fn ios_setlocale(category: i32, asked: *const libc::c_char) -> usize {
     if !(APPLE_LC_ALL..=APPLE_LC_LAST).contains(&category) {
         set_errno(libc::EINVAL);
@@ -247,7 +282,7 @@ extern "C" fn ios_setlocale(category: i32, asked: *const libc::c_char) -> usize 
             wanted[category as usize - 1] = name;
         }
         let ctype = (APPLE_LC_CTYPE - 1) as usize;
-        if wanted[ctype] != names[ctype] && !set_host_ctype(wanted[ctype]) {
+        if wanted[ctype] != names[ctype] && !set_guest_ctype(wanted[ctype]) {
             crate::log!("setlocale: the system has no '{}' character set (answered none)", wanted[ctype]);
             return 0;
         }
@@ -529,10 +564,16 @@ mod tests {
         assert_eq!(name(ios_setlocale(APPLE_LC_CTYPE, c"UTF-8".as_ptr())), "UTF-8");
         assert_eq!(name(ios_setlocale(APPLE_LC_ALL, std::ptr::null())), "C/UTF-8/C/C/C/C");
         let host_ctype = || name(unsafe { libc::setlocale(libc::LC_CTYPE, std::ptr::null()) } as usize);
-        assert!(host_ctype().contains("UTF-8"), "the system's characters stayed in {}", host_ctype());
+        assert_eq!(host_ctype(), "C", "the system's global locale changed");
+        extern "C" {
+            fn mbtowc(out: *mut u32, text: *const libc::c_char, length: usize) -> i32;
+        }
+        let multibyte = || with_guest_ctype(|| unsafe { mbtowc(std::ptr::null_mut(), c"\u{e9}".as_ptr(), 4) });
+        assert_eq!(multibyte(), 2, "the game's characters aren't UTF-8");
         assert_eq!(ios_setlocale(4, c"de_DE".as_ptr()), 0, "a missing locale was accepted");
         assert_eq!(name(ios_setlocale(4, std::ptr::null())), "C");
         assert_eq!(name(ios_setlocale(APPLE_LC_ALL, c"C".as_ptr())), "C");
         assert_eq!(host_ctype(), "C");
+        assert_eq!(multibyte(), -1, "the game's characters stayed UTF-8 after C");
     }
 }

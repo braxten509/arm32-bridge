@@ -13,8 +13,11 @@
 //!   imports <lib.so>
 //!       Load a library without running it and list the phone functions and
 //!       data it imports that the bridge has no handler for (one per line).
+//!   ios32 <Mach-O program> [--arch armv7|armv7s|armv6] [--trace]
+//!       Load a 32-bit iPhone program, start it as dyld would, and run it on
+//!       the translator (never Unicorn) until its first import call.
 
-use arm32_bridge::{elf, imports, runtime};
+use arm32_bridge::{elf, imports, ios32, mem, runtime};
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -26,16 +29,19 @@ struct Options {
     trace: bool,
     verbose: bool,
     jni_onload: bool,
+    arch: Option<String>,
     positional: Vec<String>,
 }
 
 fn parse(arguments: &[String]) -> Options {
-    let mut options = Options { trace: false, verbose: false, jni_onload: false, positional: Vec::new() };
-    for argument in arguments {
+    let mut options = Options { trace: false, verbose: false, jni_onload: false, arch: None, positional: Vec::new() };
+    let mut arguments = arguments.iter();
+    while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--trace" => options.trace = true,
             "--verbose" => options.verbose = true,
             "--jni-onload" => options.jni_onload = true,
+            "--arch" => options.arch = arguments.next().cloned(),
             _ => options.positional.push(argument.clone()),
         }
     }
@@ -219,6 +225,93 @@ fn command_call(options: &Options, timed: bool) -> ExitCode {
     }
 }
 
+fn command_ios32(options: &Options) -> ExitCode {
+    let Some(path) = options.positional.get(1) else {
+        eprintln!("usage: arm32-bridge ios32 <Mach-O program> [--arch armv7|armv7s|armv6] [--trace]");
+        return ExitCode::from(2);
+    };
+    let fail = |message: String| {
+        println!("FAILED: {message}");
+        println!("Unicorn fallbacks: {}", arm32_bridge::dynarec::fallback_count());
+        println!("Result: FAIL");
+        ExitCode::FAILURE
+    };
+    if !arm32_bridge::dynarec::enabled() || arm32_bridge::dynarec::check::enabled() {
+        return fail("ios32 runs only on the translator (ARM64 host, no ARM32_ENGINE=unicorn, no ARM32_CHECK)".into());
+    }
+    let choice = match ios32::slice_choice(options.arch.as_deref()) {
+        Ok(choice) => choice,
+        Err(error) => return fail(error),
+    };
+    let program = match ios32::prepare(Path::new(path), &choice) {
+        Ok(program) => program,
+        Err(error) => return fail(error),
+    };
+    let image = &program.image;
+    println!(
+        "Program: {:?} slice, {}, slide {:#x}",
+        image.slice.subtype,
+        if image.is_pie() { "position-independent" } else { "fixed addresses" },
+        program.plan.slide
+    );
+    for segment in &program.plan.segments {
+        println!("  {:<12} {:#010x}..{:#010x}", segment.name, segment.start, u64::from(segment.start) + u64::from(segment.size));
+    }
+    if let Some(guard) = program.plan.null_guard {
+        println!("  low guard    {:#010x}..{:#010x} (unmapped)", guard.start, guard.end);
+    }
+    println!("Stand-ins and return traps at {:#010x}", program.layout.stub_base);
+    if let Err(error) = mem::set_layout(program.layout.clone()).and_then(|_| runtime::set_platform(&ios32::APPLE32)) {
+        return fail(error);
+    }
+    runtime::init(options.trace);
+    runtime::count_calls();
+    let uc = runtime::engine();
+    let loaded = match ios32::load(&program) {
+        Ok(loaded) => loaded,
+        Err(error) => return fail(error),
+    };
+    println!(
+        "Loaded: {} rebases, {} binds to stand-ins ({} stand-ins), {} binds inside the program, {} missing weak imports set to 0",
+        loaded.rebases, loaded.binds_to_stubs, loaded.stubs, loaded.binds_to_self, loaded.weak_missing
+    );
+    let start = match ios32::start_state(uc, &program, path) {
+        Ok(start) => start,
+        Err(error) => return fail(error),
+    };
+    println!(
+        "Start: {} at {:#010x} ({}), sp {:#010x}, r0-r3 {:#x} {:#x} {:#x} {:#x}",
+        start.kind,
+        start.pc & !1,
+        if start.pc & 1 == 1 { "Thumb" } else { "ARM" },
+        start.sp,
+        start.registers[0],
+        start.registers[1],
+        start.registers[2],
+        start.registers[3]
+    );
+    let result = runtime::start_guest(uc, start.pc, &start.registers, start.sp);
+    let fallbacks = arm32_bridge::dynarec::fallback_count();
+    match (ios32::first_import(), result) {
+        (Some((name, registers, lr)), _) => {
+            println!(
+                "First import call: {name} (r0-r3 {:#x} {:#x} {:#x} {:#x}, returns to {lr:#010x})",
+                registers[0], registers[1], registers[2], registers[3]
+            );
+            println!("Unicorn fallbacks: {fallbacks}");
+            let passed = fallbacks == 0;
+            println!("Result: {}", if passed { "PASS" } else { "FAIL (fallbacks)" });
+            if passed {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        (None, Ok(value)) => fail(format!("the program returned {:#x} without calling an import", value as u32)),
+        (None, Err(error)) => fail(error),
+    }
+}
+
 fn main() -> ExitCode {
     // The command-line tool runs everything on this one thread.
     let _lock = runtime::hold_gil();
@@ -229,8 +322,9 @@ fn main() -> ExitCode {
         Some("call") => command_call(&options, false),
         Some("bench") => command_call(&options, true),
         Some("imports") => command_imports(&options),
+        Some("ios32") => command_ios32(&options),
         _ => {
-            eprintln!("usage: arm32-bridge load|call|bench|imports ... (see src/main.rs)");
+            eprintln!("usage: arm32-bridge load|call|bench|imports|ios32 ... (see src/main.rs)");
             ExitCode::from(2)
         }
     };

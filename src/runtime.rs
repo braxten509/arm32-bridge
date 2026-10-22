@@ -164,6 +164,61 @@ pub enum Ret {
 
 pub type Handler = fn(&mut Uc, &mut Args) -> Ret;
 
+/// What differs between the systems a guest program was built for.
+pub struct PlatformHooks {
+    pub name: &'static str,
+    /// The handler for the stand-in named `name` (None: returns 0 and is listed as missing).
+    pub resolve_stub: fn(&str) -> Option<Handler>,
+    /// A system call made straight from translated guest code (an `svc`
+    /// outside the stub area); game code goes on at `resume` (bit 0 = Thumb).
+    pub syscall: fn(&mut Uc, u32),
+    /// What TPIDRURO (`mrc p15, 0, Rt, c13, c0, 3`) reads for a thread whose
+    /// runtime block is at `tls_block`.
+    pub thread_pointer: fn(u32) -> u32,
+    /// Whether instructions the translator can't handle may run in Unicorn.
+    pub unicorn_allowed: bool,
+}
+
+/// Android: bionic phone functions, Linux system calls, TPIDRURO = the TLS block.
+pub static ANDROID: PlatformHooks = PlatformHooks {
+    name: "Android",
+    resolve_stub: crate::imports::handler_for,
+    syscall: linux_native_syscall,
+    thread_pointer: same_block,
+    unicorn_allowed: true,
+};
+
+fn same_block(tls_block: u32) -> u32 {
+    tls_block
+}
+
+static PLATFORM: OnceLock<&'static PlatformHooks> = OnceLock::new();
+/// Set when a platform other than Android is chosen, so Android's hot paths
+/// can skip the hooks with one predictable branch.
+static OTHER_PLATFORM: AtomicBool = AtomicBool::new(false);
+
+/// Picks the platform before any guest code runs (default: Android).
+pub fn set_platform(hooks: &'static PlatformHooks) -> Result<(), String> {
+    let current = *PLATFORM.get_or_init(|| hooks);
+    if !std::ptr::eq(current, hooks) {
+        return Err(format!("platform already set to {}", current.name));
+    }
+    if !std::ptr::eq(hooks, &ANDROID) {
+        OTHER_PLATFORM.store(true, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+pub fn platform() -> &'static PlatformHooks {
+    PLATFORM.get_or_init(|| &ANDROID)
+}
+
+/// Whether instructions may fall back to Unicorn on this platform.
+#[inline]
+pub fn unicorn_allowed() -> bool {
+    !OTHER_PLATFORM.load(Ordering::Relaxed) || platform().unicorn_allowed
+}
+
 pub struct Stub {
     /// Made once per stub and never freed, so it can be passed around for free.
     pub name: &'static str,
@@ -213,7 +268,7 @@ fn light_kind(name: &str, handler: Option<Handler>) -> Light {
 /// Phone function stand-ins by stub slot (`index - FIRST_STUB`); made once, never freed.
 fn stub_table() -> &'static [AtomicPtr<Stub>] {
     static TABLE: OnceLock<Box<[AtomicPtr<Stub>]>> = OnceLock::new();
-    TABLE.get_or_init(|| (0..mem::STUB_SIZE / 8).map(|_| AtomicPtr::new(std::ptr::null_mut())).collect())
+    TABLE.get_or_init(|| (0..mem::layout().stub_size / 8).map(|_| AtomicPtr::new(std::ptr::null_mut())).collect())
 }
 
 /// The stand-in in stub slot `index`.
@@ -675,15 +730,16 @@ pub fn deliver_for(identity: &Arc<crate::imports::threads::Identity>, target: &R
         thread.errno_slot = target.errno_slot;
         thread.tls_block = target.tls_block;
         thread.depth = 1;
-        let native = thread.native.get_or_insert_with(|| Box::new(crate::dynarec::Native::new(target.tls_block, flag)));
-        native.state.tls = target.tls_block;
+        let pointer = (platform().thread_pointer)(target.tls_block);
+        let native = thread.native.get_or_insert_with(|| Box::new(crate::dynarec::Native::new(pointer, flag)));
+        native.state.tls = pointer;
         for register in 0..15 {
             native.state.r[register] = target.parked[register].load(Ordering::Relaxed);
         }
         native.state.clear_exclusive();
         native.active = true;
     }
-    let _ = uc.reg_write(RegisterARM::C13_C0_3, target.tls_block as u64);
+    let _ = uc.reg_write(RegisterARM::C13_C0_3, (platform().thread_pointer)(target.tls_block) as u64);
     // Signals sent meanwhile poke this helper too.
     *identity.helper_runner.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&uc.get_data().runner));
     let resume_before = std::mem::replace(&mut uc.get_data_mut().resume_at, Some(target.parked[15].load(Ordering::Relaxed)));
@@ -1339,7 +1395,7 @@ fn build_engine() -> Uc {
     let code_generation = CODE_GENERATION.load(Ordering::Acquire);
     let mut uc = Unicorn::new_with_data(Arch::ARM, Mode::ARM, idle_thread(code_generation, None)).expect("start Unicorn");
     uc.ctl_set_cpu_model(ArmCpuModel::CORTEX_A15 as i32).expect("pick Cortex-A15 (ARMv7 + NEON)");
-    for (start, end, code) in mem::MAPPED_REGIONS {
+    for &(start, end, code) in &mem::layout().regions {
         let protection = if code { Prot::ALL } else { Prot::READ | Prot::WRITE };
         unsafe {
             uc.mem_map_ptr(start as u64, (end - start) as u64, protection, memory.host(start).cast())
@@ -1418,33 +1474,40 @@ fn adopt_engine(uc: &mut Uc) {
     }
     CURRENT_RUNNER.with(|current| *current.borrow_mut() = Some(Arc::clone(&thread.runner)));
     *uc.get_data_mut() = thread;
-    // bionic reads the thread pointer from TPIDRURO.
-    uc.reg_write(RegisterARM::C13_C0_3, tls_block as u64).unwrap();
+    // bionic reads the thread pointer from TPIDRURO (so does Apple's libSystem).
+    uc.reg_write(RegisterARM::C13_C0_3, (platform().thread_pointer)(tls_block) as u64).unwrap();
     let _ = uc.reg_write(UC_ARM_REG_EXCLUSIVE_ADDR, u64::MAX);
 }
 
 fn trap_address(depth: u32) -> u32 {
-    mem::STUB_BASE + depth * 8
+    mem::stub_base() + depth * 8
 }
 
 /// The guest address of the stand-in for `name`, creating it on first use.
 pub fn stub_for(name: &str) -> u32 {
+    let stub_base = mem::layout().stub_base;
     let mut shared = shared();
     if let Some(&index) = shared.stub_by_name.get(name) {
-        return mem::STUB_BASE + index * 8;
+        return stub_base + index * 8;
     }
     let index = FIRST_STUB + shared.stub_by_name.len() as u32;
-    assert!(index * 8 < mem::STUB_SIZE, "too many stubs");
+    assert!(index * 8 < mem::layout().stub_size, "too many stubs");
     let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
-    let handler = crate::imports::handler_for(name);
+    let handler = (platform().resolve_stub)(name);
     let light = light_kind(name, handler);
     let stub = Stub { name: leaked, handler, calls: AtomicU64::new(0), used: AtomicBool::new(false), light };
     // Published before its code is written, so a thread calling the code finds it.
     stub_table()[(index - FIRST_STUB) as usize].store(Box::into_raw(Box::new(stub)), Ordering::Release);
     shared.stub_by_name.insert(name.to_string(), index);
-    let address = mem::STUB_BASE + index * 8;
-    mem().write_u32(address, SVC | index);
-    mem().write_u32(address + 4, BX_LR);
+    let address = stub_base + index * 8;
+    // The code is only for Unicorn: the translator's dispatcher runs a stand-in
+    // by its address alone. Platforms without Unicorn leave the 8 bytes zero,
+    // so a stand-in that the program reads as data (an imported variable
+    // bound to it) reads zeros instead of instructions.
+    if unicorn_allowed() {
+        mem().write_u32(address, SVC | index);
+        mem().write_u32(address + 4, BX_LR);
+    }
     address
 }
 
@@ -1485,7 +1548,12 @@ fn on_interrupt(uc: &mut Unicorn<'_, Thread>, interrupt: u32) {
     let pc = uc.pc_read().unwrap() as u32;
     // EXCP_SWI is 2; the PC already points past the svc.
     let svc_address = pc.wrapping_sub(4);
-    let in_stub_area = svc_address >= mem::STUB_BASE && svc_address < mem::STUB_BASE + mem::STUB_SIZE;
+    let in_stub_area = mem::in_stub_area(svc_address);
+    if interrupt == 2 && !in_stub_area && !unicorn_allowed() {
+        // Never reached: such platforms refuse every Unicorn run.
+        stop_with_fault(uc, format!("{} system call at {svc_address:#010x} inside Unicorn", platform().name));
+        return;
+    }
     if interrupt == 2 && !in_stub_area {
         // A Linux system call made straight from game code: number in r7,
         // arguments in r0-r5, result (negative errno) back in r0.
@@ -1519,9 +1587,20 @@ fn on_interrupt(uc: &mut Unicorn<'_, Thread>, interrupt: u32) {
     }
 }
 
+/// A system call from translated game code (an `svc` outside the stub area);
+/// the platform decides what it means. Game code goes on at `resume`.
+pub fn native_syscall(uc: &mut Uc, resume: u32) {
+    // Android calls its Linux handler directly, as before platforms existed.
+    if OTHER_PLATFORM.load(Ordering::Relaxed) {
+        (platform().syscall)(uc, resume)
+    } else {
+        linux_native_syscall(uc, resume)
+    }
+}
+
 /// A Linux system call from translated game code: number in r7, arguments in
 /// r0-r5, result (negative errno) back in r0; game code goes on at `resume`.
-pub fn native_syscall(uc: &mut Uc, resume: u32) {
+pub fn linux_native_syscall(uc: &mut Uc, resume: u32) {
     clear_exclusive(uc);
     let number = uc.reg(7);
     let arguments = [0, 1, 2, 3, 4, 5].map(|index| uc.reg(index));
@@ -1994,7 +2073,7 @@ pub fn call_guest_with(uc: &mut Uc, address: u32, args: &[Arg]) -> Result<u64, S
 /// The same call on the translator: state lives in the thread's `CpuState`.
 fn call_guest_native(uc: &mut Uc, address: u32, args: &[Arg], depth: u32) -> Result<u64, String> {
     if uc.get_data().native.is_none() {
-        let tls = uc.get_data().tls_block;
+        let tls = (platform().thread_pointer)(uc.get_data().tls_block);
         let flag = attention_flag_address(uc);
         uc.get_data_mut().native = Some(Box::new(crate::dynarec::Native::new(tls, flag)));
     }
@@ -2073,6 +2152,49 @@ fn call_guest_native(uc: &mut Uc, address: u32, args: &[Arg], depth: u32) -> Res
     } else {
         leave_guest(uc);
     }
+    if let Err(error) = result {
+        if uc.get_data().fault.is_none() {
+            uc.get_data_mut().fault = Some(error.clone());
+        }
+        return Err(error);
+    }
+    Ok(r0 | (r1 << 32))
+}
+
+/// Starts a program: runs translated guest code at `pc` (bit 0 = Thumb) with
+/// r0-r12 and sp as given and lr at the return trap, until it returns there
+/// or stops (fault, exit, a handler stopping it). Only at the outermost level,
+/// and only on the translator. Returns r0 | r1 << 32 if it returned.
+pub fn start_guest(uc: &mut Uc, pc: u32, registers: &[u32; 13], sp: u32) -> Result<u64, String> {
+    if !crate::dynarec::enabled() {
+        return Err("the translator is off (not ARM64, or ARM32_ENGINE=unicorn)".into());
+    }
+    if uc.get_data().depth != 0 {
+        return Err("start_guest only runs a program's first call".into());
+    }
+    if uc.get_data().native.is_none() {
+        let tls = (platform().thread_pointer)(uc.get_data().tls_block);
+        let flag = attention_flag_address(uc);
+        uc.get_data_mut().native = Some(Box::new(crate::dynarec::Native::new(tls, flag)));
+    }
+    enter_guest(uc);
+    let trap = trap_address(0);
+    let native = uc.get_data_mut().native.as_mut().unwrap();
+    native.state.r[..13].copy_from_slice(registers);
+    native.state.r[SP] = sp;
+    native.state.r[LR] = trap;
+    native.state.clear_exclusive();
+    native.active = true;
+    uc.get_data_mut().depth = 1;
+    let result = crate::dynarec::run(uc, pc, trap);
+    uc.get_data_mut().depth = 0;
+    let native = uc.get_data_mut().native.as_mut().unwrap();
+    let (r0, r1) = (native.state.r[0] as u64, native.state.r[1] as u64);
+    native.active = false;
+    if parallel() {
+        uc.get_data().runner.parked_valid.store(false, Ordering::Relaxed);
+    }
+    leave_guest(uc);
     if let Err(error) = result {
         if uc.get_data().fault.is_none() {
             uc.get_data_mut().fault = Some(error.clone());

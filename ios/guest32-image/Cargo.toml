@@ -1,0 +1,12 @@
+[package]
+name = "guest32-image"
+version = "0.1.0"
+edition = "2021"
+description = "Checked reader and load planner for 32-bit ARM iPhone programs (Mach-O32); no code runs and no guest memory is written"
+publish = false
+
+[lib]
+name = "guest32_image"
+path = "src/lib.rs"
+
+[dependencies]

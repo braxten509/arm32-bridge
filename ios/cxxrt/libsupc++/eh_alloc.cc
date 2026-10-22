@@ -128,11 +128,9 @@ __cxxabiv1::__cxa_allocate_exception(std::size_t thrown_size) throw()
 	std::terminate ();
     }
 
-  // We have an uncaught exception as soon as we allocate memory.  This
-  // yields uncaught_exception() true during the copy-constructor that
-  // initializes the exception object.  See Issue 475.
-  __cxa_eh_globals *globals = __cxa_get_globals ();
-  globals->uncaughtExceptions += 1;
+  // GAME BRIDGE: counted as uncaught in __cxa_throw, not here (as in
+  // later GCC and Apple's libc++abi): an exception whose constructor
+  // throws is freed without ever being thrown, and must not stay counted.
 
   memset (ret, 0, sizeof (__cxa_exception));
 

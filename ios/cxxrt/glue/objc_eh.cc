@@ -20,9 +20,12 @@ extern "C" {
   void gamebridge_objc_uncaught(void* object);
 }
 
-namespace
+namespace __gamebridge
 {
-  // objc4's struct objc_typeinfo: { vtable, name, cls_unremapped }.
+  // objc4's struct objc_typeinfo: { vtable, name, cls_unremapped }. The
+  // records a game's own @catch (MyClass*) clauses make (OBJC_EHTYPE_$_MyClass)
+  // point at objc_ehtype_vtable + 16: this class's vtable, past its offset
+  // and type_info slots.
   class objc_ehtype : public std::type_info
   {
   public:
@@ -33,7 +36,16 @@ namespace
   };
 
   objc_ehtype::~objc_ehtype() { }
+}
 
+__asm__(".globl objc_ehtype_vtable\n"
+	".hidden objc_ehtype_vtable\n"
+	".set objc_ehtype_vtable, _ZTVN12__gamebridge11objc_ehtypeE\n");
+
+using __gamebridge::objc_ehtype;
+
+namespace
+{
   bool is_objc(const std::type_info* type)
   { return dynamic_cast<const objc_ehtype*>(type) != 0; }
 
@@ -44,23 +56,23 @@ namespace
     objc_ehtype type;
   };
 
-  // A @catch (id) clause takes every Objective-C exception, a
-  // @catch (Class*) one those of that class or a subclass. C++ exceptions
-  // never match.
-  bool
-  objc_ehtype::__do_catch(const std::type_info* thrown, void** object, unsigned) const
-  {
-    if (!is_objc(thrown))
-      return false;
-    void* exception = *static_cast<void**>(*object);
-    if (__builtin_strcmp(name(), "id") != 0
-	&& !gamebridge_objc_is_kind_of(exception, name()))
-      return false;
-    *object = exception;
-    return true;
-  }
-
   void objc_exception_destructor(void*) { }   // objects are never freed here
+}
+
+// A @catch (id) clause takes every Objective-C exception, a
+// @catch (Class*) one those of that class or a subclass. C++ exceptions
+// never match.
+bool
+objc_ehtype::__do_catch(const std::type_info* thrown, void** object, unsigned) const
+{
+  if (!is_objc(thrown))
+    return false;
+  void* exception = *static_cast<void**>(*object);
+  if (__builtin_strcmp(name(), "id") != 0
+      && !gamebridge_objc_is_kind_of(exception, name()))
+    return false;
+  *object = exception;
+  return true;
 }
 
 extern "C" {

@@ -595,10 +595,14 @@ fn guest_bytes(first: u32, end: u32) -> Vec<u8> {
 const COPY_AHEAD: u32 = 512;
 
 fn copy_ahead(first: u32) -> Vec<u8> {
-    let region_end = mem::MAPPED_REGIONS
-        .iter()
-        .find(|&&(start, end, _)| (start..end).contains(&first))
-        .map_or(first, |&(_, end, _)| end);
+    let region_end = if mem::custom_layout() {
+        mem::layout().region_end(first).unwrap_or(first)
+    } else {
+        mem::MAPPED_REGIONS
+            .iter()
+            .find(|&&(start, end, _)| (start..end).contains(&first))
+            .map_or(first, |&(_, end, _)| end)
+    };
     let end = region_end.min(first.saturating_add(COPY_AHEAD));
     guest_mem().bytes(first, (end - first) as usize).to_vec()
 }
@@ -846,7 +850,7 @@ fn lookup_block(pc: u32) -> (usize, u32, usize, usize) {
                 if let Some(code) = code {
                     block.code[at] = branch_word(site, code);
                     cache.incoming.entry(target).or_default().push(site);
-                } else if !(mem::STUB_BASE..mem::STUB_BASE + mem::STUB_SIZE).contains(&(target & !1)) {
+                } else if !mem::in_stub_area(target & !1) {
                     cache.pending.entry(target).or_default().push(site);
                 }
             }
@@ -923,6 +927,10 @@ pub fn run(uc: &mut Uc, pc: u32, stop_at: u32) -> Result<(), String> {
     let mut pc = pc;
     // The block that jumped to `pc` (for fault messages).
     let mut came_from = 0u32;
+    // Android (every shipping run) checks against the constants, as before
+    // layouts existed; only other layouts walk theirs.
+    let custom = mem::custom_layout().then(mem::layout);
+    let (stub_base, stub_size) = custom.map_or((mem::STUB_BASE, mem::STUB_SIZE), |l| (l.stub_base, l.stub_size));
     loop {
         if pc & !1 == stop_at {
             return Ok(());
@@ -931,7 +939,7 @@ pub fn run(uc: &mut Uc, pc: u32, stop_at: u32) -> Result<(), String> {
         // waited a whole time slice, the world is stopping, or a signal came.
         runtime::check_in(uc, pc);
         let address = pc & !1;
-        if address >= mem::STUB_BASE && address < mem::STUB_BASE + mem::STUB_SIZE {
+        if address >= stub_base && address < stub_base + stub_size {
             // A phone function: `svc #index; bx lr`.
             if address % 8 == 4 {
                 // The `bx lr` half: a Unicorn fallback stopped right after the
@@ -939,7 +947,7 @@ pub fn run(uc: &mut Uc, pc: u32, stop_at: u32) -> Result<(), String> {
                 pc = uc.reg(LR);
                 continue;
             }
-            let index = (address - mem::STUB_BASE) / 8;
+            let index = (address - stub_base) / 8;
             if index < runtime::FIRST_STUB {
                 return Err(format!("guest returned to a stale return trap at {address:#010x}"));
             }
@@ -963,7 +971,11 @@ pub fn run(uc: &mut Uc, pc: u32, stop_at: u32) -> Result<(), String> {
             pc = fallback(uc, pc, 1, stop_at)?;
             continue;
         }
-        if !mem::executable(address) {
+        let executable = match custom {
+            None => mem::android_executable(address),
+            Some(layout) => layout.executable(address),
+        };
+        if !executable {
             let message = format!(
                 "jumped to {pc:#010x}, which is not code, from the block at {came_from:#010x} (lr {:#010x}, sp {:#010x})",
                 uc.reg(LR),
@@ -1137,8 +1149,42 @@ pub fn seed_from_unicorn(uc: &mut Uc) {
     uc.get_data_mut().native.as_mut().unwrap().state = state;
 }
 
+/// Unicorn fallbacks refused on platforms without Unicorn (Android's are
+/// not counted here, so its fallback path stays as it was).
+static FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+pub fn fallback_count() -> u64 {
+    FALLBACKS.load(Ordering::Relaxed)
+}
+
 /// Runs `count` instructions at `pc` in Unicorn and returns where it stopped.
 fn fallback(uc: &mut Uc, pc: u32, count: u32, stop_at: u32) -> Result<u32, String> {
+    if !runtime::unicorn_allowed() {
+        FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        let address = pc & !1;
+        let layout = mem::layout();
+        let readable = |size: u32| layout.mapped(address, u64::from(address) + u64::from(size));
+        // Only bytes that are mapped are read: the instruction may end a mapped page.
+        let text = if pc & 1 == 1 && readable(2) {
+            let first = guest_mem().read_u16(address);
+            // 0b11101, 0b11110 and 0b11111 start a 32-bit Thumb instruction.
+            if first >> 11 >= 0b11101 && readable(4) {
+                format!("Thumb {first:04x} {:04x}", guest_mem().read_u16(address + 2))
+            } else {
+                format!("Thumb {first:04x}")
+            }
+        } else if pc & 1 == 0 && readable(4) {
+            format!("ARM {:08x}", guest_mem().read_u32(address))
+        } else {
+            "not mapped".to_string()
+        };
+        let message = format!(
+            "the translator can't run the instruction at {address:#010x} ({text}) and {} code may not fall back to Unicorn",
+            runtime::platform().name
+        );
+        uc.get_data_mut().fault = Some(message.clone());
+        return Err(message);
+    }
     if crate::runtime::stats_enabled() {
         let (total, first) = {
             let mut cache = write_cache();
