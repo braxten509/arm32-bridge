@@ -1333,6 +1333,8 @@ pub fn register(r: &mut Registry) {
     );
 
     let controller = define_class("UIViewController", "UIResponder", 8);
+    // The interface always matches the device's orientation: nothing to rotate.
+    class_methods(controller, &[("attemptRotationToDeviceOrientation", nothing as usize)]);
     methods(
         controller,
         &[
@@ -1547,6 +1549,19 @@ extern "C" fn screen_scale_one(_this: Id, _: Sel) -> f64 {
 mod tests {
     use super::*;
     use crate::fw::plist::Value;
+
+    /// Asking to rotate to the device's orientation is fine; the interface is already there.
+    #[test]
+    fn rotation_request_keeps_the_device_orientation() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let class = runtime::class_named("UIViewController");
+        assert!(runtime::responds(class, "attemptRotationToDeviceOrientation"), "+[UIViewController attemptRotationToDeviceOrientation] is missing");
+        runtime::send(class, "attemptRotationToDeviceOrientation", &[]);
+        let controller = runtime::send(runtime::alloc_instance(class), "init", &[]);
+        let device = runtime::send(runtime::class_named("UIDevice"), "currentDevice", &[]);
+        assert_eq!(runtime::send(controller, "interfaceOrientation", &[]), runtime::send(device, "orientation", &[]));
+    }
 
     /// The screen takes one of its own modes back, and keeps its overscan setting.
     #[test]
