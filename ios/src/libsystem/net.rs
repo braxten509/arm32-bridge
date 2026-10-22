@@ -1,9 +1,16 @@
 //! Apple sockets and name lookups. Apple's socket addresses start with a
 //! length byte, its IPv6 family is 30, and its option, flag, poll and
 //! lookup-error numbers differ from Linux/Android, so these translate both ways.
+//!
+//! The game is offline (as everywhere in this layer), like an iPhone in
+//! flight mode: this device itself (loopback, local sockets) works, every
+//! other address is unreachable at once, and names other than "localhost"
+//! are not found, without asking the network. Nothing here can wait on a
+//! network that isn't there.
 
 use crate::libsystem::threads::blocking;
 use crate::symbols::Registry;
+use std::sync::Mutex;
 
 extern "C" {
     fn gethostbyname(name: *const libc::c_char) -> usize;
@@ -87,6 +94,39 @@ unsafe fn host_address(apple: *const u8, length: u32) -> Option<HostAddress> {
     Some(out)
 }
 
+/// Whether an address is on this device: loopback (127.x, ::1, or 127.x
+/// mapped into IPv6), a local socket, or "no address" (AF_UNSPEC).
+fn on_this_device(host: &HostAddress) -> bool {
+    let bytes = host.bytes();
+    let family = u16::from_ne_bytes([bytes[0], bytes[1]]) as i32;
+    match family {
+        libc::AF_INET => bytes.len() >= 8 && bytes[4] == 127,
+        libc::AF_INET6 if bytes.len() >= 24 => {
+            let address = &bytes[8..24];
+            let loopback = address[..15].iter().all(|&b| b == 0) && address[15] == 1;
+            let mapped = address[..10].iter().all(|&b| b == 0) && address[10] == 0xFF && address[11] == 0xFF && address[12] == 127;
+            loopback || mapped
+        }
+        libc::AF_UNIX | libc::AF_UNSPEC => true,
+        _ => false,
+    }
+}
+
+/// The offline answer for an address off this device (ENETUNREACH), logged once per kind.
+fn unreachable(what: &'static str) {
+    log_once(what, "to an address off this device: answered 'network unreachable' (offline)");
+    set_errno(libc::ENETUNREACH);
+}
+
+fn log_once(what: &'static str, message: &str) {
+    static SAID: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+    let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+    if !said.contains(&what) {
+        said.push(what);
+        crate::log!("{what} {message}");
+    }
+}
+
 /// The system's socket address written the Apple way (cut to the room, the
 /// full length reported, as Apple does).
 unsafe fn write_apple_address(host: &HostAddress, out: *mut u8, room: *mut u32) {
@@ -132,6 +172,10 @@ extern "C" fn ios_bind(fd: i32, address: *const u8, length: u32) -> i32 {
 
 extern "C" fn ios_connect(fd: i32, address: *const u8, length: u32) -> i32 {
     let Some(host) = (unsafe { host_address(address, length) }) else { return -1 };
+    if !on_this_device(&host) {
+        unreachable("connect");
+        return -1;
+    }
     let result = blocking(|| unsafe { libc::connect(fd, host.pointer(), host.length) });
     result
 }
@@ -182,7 +226,11 @@ extern "C" fn ios_sendto(fd: i32, data: *const libc::c_void, length: usize, flag
         None
     } else {
         match unsafe { host_address(address, address_length) } {
-            Some(host) => Some(host),
+            Some(host) if on_this_device(&host) => Some(host),
+            Some(_) => {
+                unreachable("sendto");
+                return -1;
+            }
             None => return -1,
         }
     };
@@ -481,6 +529,30 @@ fn apple_lookup_error(host: i32) -> i32 {
     }
 }
 
+/// "localhost" (any case, with or without the final dot) is on this device.
+fn is_localhost(name: &[u8]) -> bool {
+    let name = name.strip_suffix(b".").unwrap_or(name);
+    name.eq_ignore_ascii_case(b"localhost")
+}
+
+fn hints_flags(hints: *const AppleAddrinfo) -> i32 {
+    unsafe { hints.as_ref() }.map_or(0, |h| h.flags)
+}
+
+/// gethostbyname: numbers and "localhost" only (offline: other names aren't found).
+extern "C" fn ios_gethostbyname(name: *const libc::c_char) -> usize {
+    if name.is_null() {
+        return 0;
+    }
+    let mut number = 0u32;
+    let text = unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes();
+    if !is_localhost(text) && unsafe { inet_aton(name, &mut number) } == 0 {
+        log_once("gethostbyname", "of a name: answered 'not found' (offline)");
+        return 0;
+    }
+    unsafe { gethostbyname(name) }
+}
+
 extern "C" fn ios_getaddrinfo(node: *const libc::c_char, service: *const libc::c_char, hints: *const AppleAddrinfo, out: *mut *mut AppleAddrinfo) -> i32 {
     let mut host_hints: libc::addrinfo = unsafe { std::mem::zeroed() };
     if let Some(hints) = unsafe { hints.as_ref() } {
@@ -491,10 +563,62 @@ extern "C" fn ios_getaddrinfo(node: *const libc::c_char, service: *const libc::c
     } else {
         host_hints.ai_flags = libc::AI_V4MAPPED | libc::AI_ADDRCONFIG;
     }
+    let apple_flags = hints_flags(hints);
+    // Offline: only numbers are read, so the system never asks the network.
+    host_hints.ai_flags |= libc::AI_NUMERICHOST;
+    let localhost = !node.is_null() && is_localhost(unsafe { std::ffi::CStr::from_ptr(node) }.to_bytes());
+    if !localhost {
+        let result = host_lookup(node, service, &host_hints, apple_flags);
+        if result == Err(libc::EAI_NONAME) && apple_flags & 0x4 == 0 {
+            log_once("getaddrinfo", "of a name: answered 'not known' (offline)");
+        }
+        return finish_lookup(result, out);
+    }
+    // "localhost" is this device's loopback addresses (IPv6 first, as on Apple),
+    // whether or not any network is set up.
+    host_hints.ai_flags &= !libc::AI_ADDRCONFIG;
+    let numbers: &[&std::ffi::CStr] = match host_hints.ai_family {
+        libc::AF_INET => &[c"127.0.0.1"],
+        libc::AF_INET6 => &[c"::1"],
+        _ => &[c"::1", c"127.0.0.1"],
+    };
+    let mut head: *mut AppleAddrinfo = std::ptr::null_mut();
+    let mut first_error = None;
+    for number in numbers.iter().rev() {
+        match host_lookup(number.as_ptr(), service, &host_hints, apple_flags) {
+            Ok(list) => unsafe {
+                let mut last = list;
+                while !(*last).next.is_null() {
+                    last = (*last).next;
+                }
+                (*last).next = head;
+                head = list;
+            },
+            Err(error) => first_error = first_error.or(Some(error)),
+        }
+    }
+    match (head.is_null(), first_error) {
+        (true, Some(error)) => finish_lookup(Err(error), out),
+        _ => finish_lookup(Ok(head), out),
+    }
+}
+
+fn finish_lookup(result: Result<*mut AppleAddrinfo, i32>, out: *mut *mut AppleAddrinfo) -> i32 {
+    match result {
+        Ok(list) => {
+            unsafe { *out = list };
+            0
+        }
+        Err(error) => apple_lookup_error(error),
+    }
+}
+
+/// The system's getaddrinfo, its answer copied into Apple's layout.
+fn host_lookup(node: *const libc::c_char, service: *const libc::c_char, hints: &libc::addrinfo, apple_flags: i32) -> Result<*mut AppleAddrinfo, i32> {
     let mut found: *mut libc::addrinfo = std::ptr::null_mut();
-    let error = unsafe { libc::getaddrinfo(node, service, &host_hints, &mut found) };
+    let error = unsafe { libc::getaddrinfo(node, service, hints, &mut found) };
     if error != 0 {
-        return apple_lookup_error(error);
+        return Err(error);
     }
     let mut head: *mut AppleAddrinfo = std::ptr::null_mut();
     let mut tail: *mut *mut AppleAddrinfo = &mut head;
@@ -511,7 +635,7 @@ extern "C" fn ios_getaddrinfo(node: *const libc::c_char, service: *const libc::c
             host.length = size as u32;
             let mut room = 128u32;
             write_apple_address(&host, place, &mut room);
-            (*node).flags = hints.as_ref().map_or(0, |h| h.flags);
+            (*node).flags = apple_flags;
             (*node).family = apple_family(entry.ai_family);
             (*node).socktype = entry.ai_socktype;
             (*node).protocol = entry.ai_protocol;
@@ -523,11 +647,8 @@ extern "C" fn ios_getaddrinfo(node: *const libc::c_char, service: *const libc::c
         }
         at = entry.ai_next;
     }
-    unsafe {
-        libc::freeaddrinfo(found);
-        *out = head;
-    }
-    0
+    unsafe { libc::freeaddrinfo(found) };
+    Ok(head)
 }
 
 extern "C" fn ios_freeaddrinfo(mut list: *mut AppleAddrinfo) {
@@ -573,7 +694,15 @@ const APPLE_NI: [(i32, i32); 5] = [
 
 extern "C" fn ios_getnameinfo(address: *const u8, length: u32, host: *mut libc::c_char, host_length: u32, service: *mut libc::c_char, service_length: u32, flags: i32) -> i32 {
     let Some(converted) = (unsafe { host_address(address, length) }) else { return 5 };
-    let host_flags = APPLE_NI.iter().filter(|(a, _)| flags & a != 0).fold(0, |f, (_, h)| f | h);
+    let mut host_flags = APPLE_NI.iter().filter(|(a, _)| flags & a != 0).fold(0, |f, (_, h)| f | h);
+    if !on_this_device(&converted) {
+        // Offline: no name can be looked up for another machine's address.
+        if host_flags & libc::NI_NAMEREQD != 0 && !host.is_null() && host_length > 0 {
+            log_once("getnameinfo", "for an address off this device: answered 'not known' (offline)");
+            return 8;
+        }
+        host_flags |= libc::NI_NUMERICHOST;
+    }
     let error = unsafe { libc::getnameinfo(converted.pointer(), converted.length, host, host_length as _, service, service_length as _, host_flags) };
     apple_lookup_error(error)
 }
@@ -604,7 +733,7 @@ pub fn register(r: &mut Registry) {
     r.function("freeaddrinfo", ios_freeaddrinfo as usize);
     r.function("gai_strerror", ios_gai_strerror as usize);
     r.function("getnameinfo", ios_getnameinfo as usize);
-    r.function("gethostbyname", gethostbyname as usize);
+    r.function("gethostbyname", ios_gethostbyname as usize);
     r.function("inet_addr", inet_addr as usize);
     r.function("inet_aton", inet_aton as usize);
     r.function("inet_ntoa", inet_ntoa as usize);
@@ -641,6 +770,39 @@ mod tests {
         assert_eq!(ios_getsockopt(fd, APPLE_SOL_SOCKET, 0x1008, &mut value as *mut i32 as *mut u8, &mut size), 0);
         assert_eq!(value, libc::SOCK_DGRAM, "SO_TYPE read through Apple's number");
         unsafe { libc::close(fd) };
+    }
+
+    /// Offline like flight mode: another machine is unreachable and a name
+    /// isn't found, both at once; this device still answers.
+    #[test]
+    fn the_network_is_offline_without_waiting() {
+        let started = std::time::Instant::now();
+        let fd = ios_socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+        let mut far = [0u8; 16];
+        far[..8].copy_from_slice(&[16, 2, 0, 80, 192, 0, 2, 1]); // 192.0.2.1:80 (a documentation address)
+        assert_eq!(ios_connect(fd, far.as_ptr(), 16), -1, "connected to another machine");
+        assert_eq!(unsafe { *crate::libsystem::io::error_location() }, 51, "not Apple's ENETUNREACH");
+        unsafe { libc::close(fd) };
+        let mut list = std::ptr::null_mut();
+        assert_eq!(ios_getaddrinfo(c"example.com".as_ptr(), c"80".as_ptr(), std::ptr::null(), &mut list), 8);
+        assert_eq!(ios_gethostbyname(c"example.com".as_ptr()), 0);
+        assert!(started.elapsed() < std::time::Duration::from_millis(100), "offline answers took {:?}", started.elapsed());
+        assert_eq!(ios_getaddrinfo(c"localhost".as_ptr(), c"80".as_ptr(), std::ptr::null(), &mut list), 0, "localhost not found");
+        ios_freeaddrinfo(list);
+        // A loopback listener takes a loopback connection.
+        let server = ios_socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+        let mut near = [0u8; 16];
+        near[..8].copy_from_slice(&[16, 2, 0, 0, 127, 0, 0, 1]);
+        assert_eq!(ios_bind(server, near.as_ptr(), 16), 0);
+        assert_eq!(unsafe { libc::listen(server, 1) }, 0);
+        let mut length = 16u32;
+        assert_eq!(ios_getsockname(server, near.as_mut_ptr(), &mut length), 0);
+        let client = ios_socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+        assert_eq!(ios_connect(client, near.as_ptr(), 16), 0, "loopback refused");
+        unsafe {
+            libc::close(client);
+            libc::close(server);
+        }
     }
 
     #[test]
