@@ -126,15 +126,11 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
     private fun topRefreshRate(): Float = topMode()?.refreshRate ?: 60f
 
     /**
-     * Asks for the screen's fastest mode while a game that can draw faster
-     * than 60 frames a second plays: Unreal Engine 3 games, whose frame
-     * limit the iPhone layer sets to that rate (ios/src/fw/paths.rs). Other
-     * games keep Android's own choice, which suits their 60 (a 60 fps game
-     * on a 90 or 144 Hz screen would show its frames unevenly).
+     * Asks for the screen's fastest mode while a game plays: frame rates are
+     * unlocked, so the display link runs at that rate (ios/src/fw/runloop.rs)
+     * and Unreal Engine 3 games get it as their frame limit (fw/paths.rs).
      */
     private fun useTopRefreshRate() {
-        val app = appFolder(intent) ?: return
-        if (!File(app, "CookedIPhone/UE3CommandLine.txt").exists()) return
         val mode = topMode() ?: return
         window.attributes = window.attributes.apply { preferredDisplayModeId = mode.modeId }
     }

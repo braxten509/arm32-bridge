@@ -130,6 +130,8 @@ pub struct TimerState {
     pub paused: bool,
     /// performSelector:afterDelay: passes its argument, not the timer.
     pub pass_argument: bool,
+    /// CADisplayLink: the frame interval the game asked for.
+    pub frames: isize,
 }
 
 pub struct Timer(Mutex<TimerState>);
@@ -155,6 +157,7 @@ fn make_timer(class: Class, interval: f64, target: Id, selector: Sel, user_info:
         owner: None,
         paused: false,
         pass_argument: false,
+        frames: 1,
     };
     unsafe { *((object + 8) as *mut *const Timer) = Box::into_raw(Box::new(Timer(Mutex::new(state)))) };
     object
@@ -213,14 +216,35 @@ extern "C" fn timer_fire(this: Id, _: Sel) {
     runtime::send(target, &name, &[this]);
 }
 
-// CADisplayLink: a timer at the screen's refresh rate (60 Hz, like the
-// iPhones these games were made for; IOS_REFRESH_HZ=120 to try others).
+// CADisplayLink: a timer at the screen's top refresh rate (IOS_SCREEN_HZ,
+// 120 on the Pixel; 60 when unknown), so no game is held to the 60 Hz of the
+// iPhones it was made for. IOS_REFRESH_HZ=<n> tries another rate.
 fn refresh_seconds() -> f64 {
     static SECONDS: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *SECONDS.get_or_init(|| {
-        let hz = std::env::var("IOS_REFRESH_HZ").ok().and_then(|t| t.parse::<f64>().ok()).filter(|&hz| hz >= 1.0);
-        1.0 / hz.unwrap_or(60.0)
+        let hz = refresh_hz(std::env::var("IOS_REFRESH_HZ").ok().as_deref(), std::env::var("IOS_SCREEN_HZ").ok().as_deref());
+        crate::log!("graphics: display link at {hz} Hz");
+        1.0 / hz
     })
+}
+
+/// The display link's rate: the test switch, else the screen's, else 60.
+fn refresh_hz(test_switch: Option<&str>, screen: Option<&str>) -> f64 {
+    let valid = |text: Option<&str>| text.and_then(|t| t.trim().parse::<f64>().ok()).filter(|&hz| hz >= 1.0);
+    valid(test_switch).or(valid(screen)).unwrap_or(60.0)
+}
+
+/// Seconds between display link calls when the game asks for every
+/// `frames`-th screen refresh. Games asked for 2 to get 30 fps (Unity's
+/// default); frame rates are unlocked, so every refresh calls the game
+/// unless IOS_FRAME_INTERVAL=1 keeps its choice.
+fn link_interval(refresh: f64, frames: isize, keep_game_choice: bool) -> f64 {
+    if keep_game_choice { refresh * frames.max(1) as f64 } else { refresh }
+}
+
+fn keep_frame_interval() -> bool {
+    static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *KEEP.get_or_init(|| std::env::var("IOS_FRAME_INTERVAL").is_ok_and(|v| v == "1"))
 }
 
 extern "C" fn display_link_with_target(class: Class, _: Sel, target: Id, selector: Sel) -> Id {
@@ -232,11 +256,21 @@ extern "C" fn display_link_add_to_run_loop(this: Id, _: Sel, run_loop: Id, _mode
 }
 
 extern "C" fn display_link_set_frame_interval(this: Id, _: Sel, frames: isize) {
-    timer(this).interval = refresh_seconds() * frames.max(1) as f64;
+    let mut state = timer(this);
+    state.frames = frames.max(1);
+    state.interval = link_interval(refresh_seconds(), frames, keep_frame_interval());
 }
 
+/// What the game asked for (it may base its own timing on it).
 extern "C" fn display_link_frame_interval(this: Id, _: Sel) -> isize {
-    (timer(this).interval / refresh_seconds()).round() as isize
+    timer(this).frames
+}
+
+/// iOS 10's way to ask for a lower rate; unlocked like frameInterval.
+extern "C" fn display_link_set_preferred_fps(this: Id, _: Sel, fps: isize) {
+    if fps > 0 && keep_frame_interval() {
+        timer(this).interval = (1.0 / fps as f64).max(refresh_seconds());
+    }
 }
 
 extern "C" fn display_link_set_paused(this: Id, _: Sel, paused: u8) {
@@ -689,6 +723,7 @@ pub fn register(r: &mut Registry) {
             ("invalidate", timer_invalidate as usize),
             ("setFrameInterval:", display_link_set_frame_interval as usize),
             ("frameInterval", display_link_frame_interval as usize),
+            ("setPreferredFramesPerSecond:", display_link_set_preferred_fps as usize),
             ("setPaused:", display_link_set_paused as usize),
             ("isPaused", display_link_paused as usize),
             ("timestamp", display_link_timestamp as usize),
@@ -769,4 +804,24 @@ extern "C" fn yes_class(_: Class, _: Sel) -> bool {
 
 extern "C" fn display_link_remove(this: Id, _: Sel, _loop: Id, _mode: Id) {
     timer(this).valid = false;
+}
+
+#[cfg(test)]
+mod frame_rate_tests {
+    use super::*;
+
+    #[test]
+    fn display_link_runs_at_the_screens_top_rate() {
+        assert_eq!(refresh_hz(None, Some("120")), 120.0);
+        assert_eq!(refresh_hz(Some("90"), Some("120")), 90.0, "the test switch wins");
+        assert_eq!(refresh_hz(None, None), 60.0);
+        assert_eq!(refresh_hz(Some("x"), Some("0")), 60.0);
+    }
+
+    #[test]
+    fn asking_for_every_second_frame_does_not_slow_the_game() {
+        let refresh = 1.0 / 120.0;
+        assert_eq!(link_interval(refresh, 2, false), refresh);
+        assert_eq!(link_interval(refresh, 2, true), 2.0 * refresh, "IOS_FRAME_INTERVAL=1 keeps the game's choice");
+    }
 }
