@@ -181,16 +181,22 @@ fn loopback_number(family: usize) -> &'static [u8] {
 
 /// Offline, the device's only addresses are its loopback ones: binding to
 /// "any address" binds loopback (so nothing off the device can reach the
-/// socket), and binding to any other address isn't possible.
+/// socket), and binding to any other address isn't possible. An IPv6 TCP
+/// socket that also takes IPv4 (the default) keeps "any address", so both
+/// ::1 and 127.0.0.1 clients reach it; accept drops peers off the device.
 extern "C" fn ios_bind(fd: i32, address: *const u8, length: u32) -> i32 {
     let Some(mut host) = (unsafe { host_address(address, length) }) else { return -1 };
+    let mut keep_any = false;
     if let Some(part) = ip_part(&mut host) {
         if part.iter().all(|&b| b == 0) {
-            part.copy_from_slice(loopback_number(part.len()));
-            log_once("bind", "to any address: bound to loopback instead (offline)");
+            keep_any = part.len() == 16 && dual_stack_stream(fd);
+            if !keep_any {
+                part.copy_from_slice(loopback_number(part.len()));
+                log_once("bind", "to any address: bound to loopback instead (offline)");
+            }
         }
     }
-    if !on_this_device(&host) {
+    if !keep_any && !on_this_device(&host) {
         log_once("bind", "to an address off this device: answered 'address not available' (offline)");
         set_errno(libc::EADDRNOTAVAIL);
         return -1;
@@ -198,9 +204,25 @@ extern "C" fn ios_bind(fd: i32, address: *const u8, length: u32) -> i32 {
     unsafe { libc::bind(fd, host.pointer(), host.length) }
 }
 
+/// An IPv6 TCP socket that also takes IPv4 connections.
+fn dual_stack_stream(fd: i32) -> bool {
+    let get = |level: i32, name: i32| {
+        let (mut value, mut size) = (0i32, 4u32);
+        let ok = unsafe { libc::getsockopt(fd, level, name, &mut value as *mut i32 as *mut _, &mut size) } == 0;
+        ok.then_some(value)
+    };
+    get(libc::SOL_SOCKET, libc::SO_TYPE) == Some(libc::SOCK_STREAM)
+        && get(libc::SOL_SOCKET, libc::SO_DOMAIN) == Some(libc::AF_INET6)
+        && get(libc::IPPROTO_IPV6, libc::IPV6_V6ONLY) == Some(0)
+}
+
 /// An IP socket with no address yet gets a loopback one, before the system
-/// would give it "any address" by itself (listen, sendto).
+/// would give it "any address" by itself (listen, sendto). A dual-stack IPv6
+/// TCP socket is left to "any address" (accept filters its peers).
 fn bind_loopback_if_unbound(fd: i32) {
+    if dual_stack_stream(fd) {
+        return;
+    }
     let mut host = HostAddress::empty();
     if unsafe { libc::getsockname(fd, host.pointer_mut(), &mut host.length) } != 0 {
         return;
@@ -411,8 +433,8 @@ extern "C" fn ios_setsockopt(fd: i32, level: i32, name: i32, value: *const u8, l
                     set_errno(libc::EINVAL);
                     return -1;
                 }
-                let ticks = (value.add(4) as *const i32).read_unaligned().max(0);
-                let linger = libc::linger { l_onoff: (value as *const i32).read_unaligned(), l_linger: (ticks + 99) / 100 };
+                let ticks = i64::from((value.add(4) as *const i32).read_unaligned().max(0));
+                let linger = libc::linger { l_onoff: (value as *const i32).read_unaligned(), l_linger: ((ticks + 99) / 100) as i32 };
                 libc::setsockopt(fd, host_level, host_name, &linger as *const _ as *const _, 8)
             }
             Value::Time => {
@@ -563,7 +585,12 @@ fn apple_poll_events(host: i16) -> i16 {
 extern "C" fn ios_poll(fds: *mut libc::pollfd, count: u32, timeout: i32) -> i32 {
     let entries = if fds.is_null() { &mut [][..] } else { unsafe { std::slice::from_raw_parts_mut(fds, count as usize) } };
     let mut host: Vec<libc::pollfd> = entries.iter().map(|e| libc::pollfd { fd: e.fd, events: host_poll_events(e.events), revents: 0 }).collect();
-    let result = blocking(|| unsafe { libc::poll(host.as_mut_ptr(), host.len() as _, timeout) });
+    // A retry after our wake waits only for what is left of the time limit.
+    let deadline = (timeout > 0).then(|| std::time::Instant::now() + std::time::Duration::from_millis(timeout as u64));
+    let result = blocking(|| {
+        let left = deadline.map_or(timeout, |at| at.saturating_duration_since(std::time::Instant::now()).as_millis() as i32);
+        unsafe { libc::poll(host.as_mut_ptr(), host.len() as _, left) }
+    });
     for (entry, done) in entries.iter_mut().zip(&host) {
         entry.revents = apple_poll_events(done.revents);
     }
@@ -906,6 +933,26 @@ mod tests {
         let client = ios_socket(libc::AF_INET, libc::SOCK_STREAM, 0);
         assert_eq!(ios_connect(client, near.as_ptr(), 16), 0, "loopback refused");
         unsafe {
+            libc::close(client);
+            libc::close(server);
+        }
+        // A dual-stack IPv6 server on "any address" still takes a 127.0.0.1 client.
+        let server = ios_socket(APPLE_AF_INET6, libc::SOCK_STREAM, 0);
+        let mut any6 = [0u8; 28];
+        any6[0] = 28;
+        any6[1] = APPLE_AF_INET6 as u8;
+        assert_eq!(ios_bind(server, any6.as_ptr(), 28), 0);
+        assert_eq!(ios_listen(server, 1), 0);
+        let mut length = 28u32;
+        assert_eq!(ios_getsockname(server, any6.as_mut_ptr(), &mut length), 0);
+        let v4 = [16u8, 2, any6[2], any6[3], 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0];
+        let client = ios_socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+        assert_eq!(ios_connect(client, v4.as_ptr(), 16), 0, "dual-stack server refused 127.0.0.1");
+        let mut peer_length = 28u32;
+        let accepted = ios_accept(server, any6.as_mut_ptr(), &mut peer_length);
+        assert!(accepted >= 0, "the 127.0.0.1 client wasn't accepted");
+        unsafe {
+            libc::close(accepted);
             libc::close(client);
             libc::close(server);
         }

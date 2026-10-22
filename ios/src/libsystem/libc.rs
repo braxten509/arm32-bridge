@@ -44,17 +44,6 @@ extern "C" {
     fn wcscspn(a: usize, b: usize) -> usize;
     fn wcspbrk(a: usize, b: usize) -> usize;
     fn wcsnlen(a: usize, n: usize) -> usize;
-    fn wcscasecmp(a: usize, b: usize) -> i32;
-    fn wcsncasecmp(a: usize, b: usize, n: usize) -> i32;
-    fn towlower(c: u32) -> u32;
-    fn towupper(c: u32) -> u32;
-    fn iswspace(c: u32) -> i32;
-    fn iswalpha(c: u32) -> i32;
-    fn iswdigit(c: u32) -> i32;
-    fn iswalnum(c: u32) -> i32;
-    fn iswupper(c: u32) -> i32;
-    fn iswlower(c: u32) -> i32;
-    fn iswpunct(c: u32) -> i32;
     fn wmemcpy(a: usize, b: usize, n: usize) -> usize;
     fn wmemset(a: usize, c: u32, n: usize) -> usize;
     fn wmemmove(a: usize, b: usize, n: usize) -> usize;
@@ -533,10 +522,37 @@ pub fn register(r: &mut Registry) {
     macro_rules! wide {
         ($($name:ident),* $(,)?) => { $( r.function(stringify!($name), $name as usize); )* };
     }
-    wide!(
-        wcstoull, wcstol, wcstoll, wcstof, wcsncat, wcsspn, wcscspn, wcspbrk, wcsnlen, wcscasecmp, wcsncasecmp,
-        towlower, towupper, iswspace, iswalpha, iswdigit, iswalnum, iswupper, iswlower, iswpunct, wmemcpy, wmemset,
-        wmemmove, wmemcmp
+    wide!(wcstoull, wcstol, wcstoll, wcstof, wcsncat, wcsspn, wcscspn, wcspbrk, wcsnlen, wmemcpy, wmemset, wmemmove, wmemcmp);
+    // These depend on the character set, so they run in the game's LC_CTYPE.
+    macro_rules! in_guest_ctype {
+        ($($name:ident($($arg:ident: $ty:ty),*) -> $ret:ty),* $(,)?) => {
+            $(
+                extern "C" fn $name($($arg: $ty),*) -> $ret {
+                    crate::libsystem::extra::with_guest_ctype(|| unsafe { host::$name($($arg),*) })
+                }
+                r.function(stringify!($name), $name as usize);
+            )*
+        };
+    }
+    mod host {
+        extern "C" {
+            pub fn towlower(c: u32) -> u32;
+            pub fn towupper(c: u32) -> u32;
+            pub fn iswspace(c: u32) -> i32;
+            pub fn iswalpha(c: u32) -> i32;
+            pub fn iswdigit(c: u32) -> i32;
+            pub fn iswalnum(c: u32) -> i32;
+            pub fn iswupper(c: u32) -> i32;
+            pub fn iswlower(c: u32) -> i32;
+            pub fn iswpunct(c: u32) -> i32;
+            pub fn wcscasecmp(a: usize, b: usize) -> i32;
+            pub fn wcsncasecmp(a: usize, b: usize, n: usize) -> i32;
+        }
+    }
+    in_guest_ctype!(
+        towlower(c: u32) -> u32, towupper(c: u32) -> u32, iswspace(c: u32) -> i32, iswalpha(c: u32) -> i32,
+        iswdigit(c: u32) -> i32, iswalnum(c: u32) -> i32, iswupper(c: u32) -> i32, iswlower(c: u32) -> i32,
+        iswpunct(c: u32) -> i32, wcscasecmp(a: usize, b: usize) -> i32, wcsncasecmp(a: usize, b: usize, n: usize) -> i32,
     );
     r.function("__sincosf_stret", sincosf_stret as usize);
     r.function("memset_pattern16", memset_pattern16 as usize);
