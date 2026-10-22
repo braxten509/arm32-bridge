@@ -33,7 +33,7 @@ pub fn cf_encoding(ns: u64) -> u32 {
         3 => 0x0920,  // EUC-JP
         4 => CF_UTF8,
         5 => CF_ISO_LATIN1,
-        6 => 0x0006,  // Mac Symbol
+        6 => 0x0021,  // Mac Symbol
         7 => CF_NON_LOSSY_ASCII,
         8 => 0x0A01,  // Shift JIS (Windows)
         9 => 0x0202,  // ISO Latin 2
@@ -54,7 +54,7 @@ fn ns_encoding(cf: u32) -> Option<u64> {
     Some(match cf {
         CF_ASCII => 1,
         CF_UTF8 => 4,
-        CF_ISO_LATIN1 | CF_WINDOWS_LATIN1 | CF_MAC_ROMAN => 5,
+        CF_ISO_LATIN1 => 5,
         CF_UTF16 | CF_UTF16_LE => 0x9400_0100,
         CF_UTF32 | CF_UTF32_LE => 0x9c00_0100,
         CF_UTF16_BE | CF_UTF32_BE | CF_NON_LOSSY_ASCII => return None,
@@ -62,15 +62,48 @@ fn ns_encoding(cf: u32) -> Option<u64> {
     })
 }
 
+/// The characters of bytes 0x80-0xFF in Mac Roman (Apple's mapping, with
+/// the euro sign at 0xDB) and Windows Latin-1 (cp1252; 0 = no character).
+const MAC_ROMAN_HIGH: [u16; 128] = [
+    0x00C4, 0x00C5, 0x00C7, 0x00C9, 0x00D1, 0x00D6, 0x00DC, 0x00E1, 0x00E0, 0x00E2, 0x00E4, 0x00E3, 0x00E5, 0x00E7, 0x00E9, 0x00E8,
+    0x00EA, 0x00EB, 0x00ED, 0x00EC, 0x00EE, 0x00EF, 0x00F1, 0x00F3, 0x00F2, 0x00F4, 0x00F6, 0x00F5, 0x00FA, 0x00F9, 0x00FB, 0x00FC,
+    0x2020, 0x00B0, 0x00A2, 0x00A3, 0x00A7, 0x2022, 0x00B6, 0x00DF, 0x00AE, 0x00A9, 0x2122, 0x00B4, 0x00A8, 0x2260, 0x00C6, 0x00D8,
+    0x221E, 0x00B1, 0x2264, 0x2265, 0x00A5, 0x00B5, 0x2202, 0x2211, 0x220F, 0x03C0, 0x222B, 0x00AA, 0x00BA, 0x03A9, 0x00E6, 0x00F8,
+    0x00BF, 0x00A1, 0x00AC, 0x221A, 0x0192, 0x2248, 0x2206, 0x00AB, 0x00BB, 0x2026, 0x00A0, 0x00C0, 0x00C3, 0x00D5, 0x0152, 0x0153,
+    0x2013, 0x2014, 0x201C, 0x201D, 0x2018, 0x2019, 0x00F7, 0x25CA, 0x00FF, 0x0178, 0x2044, 0x20AC, 0x2039, 0x203A, 0xFB01, 0xFB02,
+    0x2021, 0x00B7, 0x201A, 0x201E, 0x2030, 0x00C2, 0x00CA, 0x00C1, 0x00CB, 0x00C8, 0x00CD, 0x00CE, 0x00CF, 0x00CC, 0x00D3, 0x00D4,
+    0xF8FF, 0x00D2, 0x00DA, 0x00DB, 0x00D9, 0x0131, 0x02C6, 0x02DC, 0x00AF, 0x02D8, 0x02D9, 0x02DA, 0x00B8, 0x02DD, 0x02DB, 0x02C7,
+];
+const WINDOWS_LATIN1_HIGH: [u16; 128] = [
+    0x20AC, 0, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0, 0x017D, 0,
+    0, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014, 0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0, 0x017E, 0x0178,
+    0x00A0, 0x00A1, 0x00A2, 0x00A3, 0x00A4, 0x00A5, 0x00A6, 0x00A7, 0x00A8, 0x00A9, 0x00AA, 0x00AB, 0x00AC, 0x00AD, 0x00AE, 0x00AF,
+    0x00B0, 0x00B1, 0x00B2, 0x00B3, 0x00B4, 0x00B5, 0x00B6, 0x00B7, 0x00B8, 0x00B9, 0x00BA, 0x00BB, 0x00BC, 0x00BD, 0x00BE, 0x00BF,
+    0x00C0, 0x00C1, 0x00C2, 0x00C3, 0x00C4, 0x00C5, 0x00C6, 0x00C7, 0x00C8, 0x00C9, 0x00CA, 0x00CB, 0x00CC, 0x00CD, 0x00CE, 0x00CF,
+    0x00D0, 0x00D1, 0x00D2, 0x00D3, 0x00D4, 0x00D5, 0x00D6, 0x00D7, 0x00D8, 0x00D9, 0x00DA, 0x00DB, 0x00DC, 0x00DD, 0x00DE, 0x00DF,
+    0x00E0, 0x00E1, 0x00E2, 0x00E3, 0x00E4, 0x00E5, 0x00E6, 0x00E7, 0x00E8, 0x00E9, 0x00EA, 0x00EB, 0x00EC, 0x00ED, 0x00EE, 0x00EF,
+    0x00F0, 0x00F1, 0x00F2, 0x00F3, 0x00F4, 0x00F5, 0x00F6, 0x00F7, 0x00F8, 0x00F9, 0x00FA, 0x00FB, 0x00FC, 0x00FD, 0x00FE, 0x00FF,
+];
+
+/// One byte per character through a table for 0x80-0xFF; None when a
+/// character has no byte.
+fn single_byte(text: &str, high: &[u16; 128]) -> Option<Vec<u8>> {
+    text.chars()
+        .map(|c| match c as u32 {
+            ascii @ 0..=0x7F => Some(ascii as u8),
+            code => high.iter().position(|&h| h != 0 && h as u32 == code).map(|i| 0x80 + i as u8),
+        })
+        .collect()
+}
+
 /// A string's bytes in a CF encoding; None when the encoding can't hold it.
 fn encoded(object: Id, cf: u32) -> Option<Vec<u8>> {
     let text = string::get(object);
     match cf {
         CF_ASCII if !text.is_ascii() => return None,
-        CF_ISO_LATIN1 | CF_WINDOWS_LATIN1 | CF_MAC_ROMAN if text.chars().any(|c| c as u32 > 0x7F && (cf != CF_ISO_LATIN1 || c as u32 > 0xFF)) => {
-            // Only Latin-1 maps 0x80-0xFF one to one; the others agree on ASCII.
-            return None;
-        }
+        CF_ISO_LATIN1 if text.chars().any(|c| c as u32 > 0xFF) => return None,
+        CF_MAC_ROMAN => return single_byte(&text, &MAC_ROMAN_HIGH),
+        CF_WINDOWS_LATIN1 => return single_byte(&text, &WINDOWS_LATIN1_HIGH),
         CF_UTF16_BE => return Some(text.encode_utf16().flat_map(|u| u.to_be_bytes()).collect()),
         CF_UTF32_BE => return Some(text.chars().flat_map(|c| (c as u32).to_be_bytes()).collect()),
         _ => {}
@@ -163,6 +196,9 @@ pub unsafe fn number_get_value(integer: Option<i64>, float: f64, kind: isize, ou
         }
     };
     let as_float = || integer.map(|i| i as f64).unwrap_or(float);
+    // Whether the integer survives the trip through the float type (compared
+    // in i128, so values that round to 2^63 don't saturate back to equal).
+    let integer_exact = |back: i128| integer.map(|i| back == i as i128);
     match kind {
         1 | 7 => {
             let (v, exact) = as_int(i8::MIN as i64, i8::MAX as i64);
@@ -185,14 +221,17 @@ pub unsafe fn number_get_value(integer: Option<i64>, float: f64, kind: isize, ou
             exact
         }
         5 | 12 => {
-            let v = as_float();
-            put(out, v as f32);
-            (v as f32) as f64 == v || v.is_nan()
+            let v = match integer {
+                Some(i) => i as f32,
+                None => float as f32,
+            };
+            put(out, v);
+            integer_exact(v as f64 as i128).unwrap_or((v as f64) == float || float.is_nan())
         }
         6 | 13 | 16 => {
             let v = as_float();
             put(out, v);
-            integer.map(|i| (i as f64) as i64 == i).unwrap_or(true)
+            integer_exact(v as i128).unwrap_or(true)
         }
         _ => {
             crate::log!("CFNumberGetValue type {kind} not known");
@@ -264,6 +303,8 @@ mod tests {
 
     #[test]
     fn cf_numbers_and_encodings_convert_like_apple() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
         let mut out = [0u8; 8];
         unsafe {
             assert!(number_get_value(Some(300), 300.0, 9, out.as_mut_ptr()));
@@ -275,7 +316,18 @@ mod tests {
             assert_eq!(i64::from_ne_bytes(out), 2);
             assert!(number_get_value(None, 0.5, 5, out.as_mut_ptr()));
             assert_eq!(f32::from_ne_bytes(out[..4].try_into().unwrap()), 0.5);
+            // 2^53+1 has no exact double or float: the check uses the integer itself.
+            let odd = (1i64 << 53) + 1;
+            assert!(!number_get_value(Some(odd), odd as f64, 5, out.as_mut_ptr()));
+            assert!(!number_get_value(Some(odd), odd as f64, 6, out.as_mut_ptr()));
+            assert!(!number_get_value(Some(i64::MAX), i64::MAX as f64, 6, out.as_mut_ptr()));
+            assert!(number_get_value(Some(1 << 40), (1i64 << 40) as f64, 5, out.as_mut_ptr()));
         }
+        let e = string::make("\u{e9}\u{20ac}");
+        assert_eq!(encoded(e, CF_MAC_ROMAN), Some(vec![0x8E, 0xDB]));
+        assert_eq!(encoded(e, CF_WINDOWS_LATIN1), Some(vec![0xE9, 0x80]));
+        assert_eq!(encoded(e, CF_ISO_LATIN1), None);
+        assert_eq!(cf_encoding(6), 0x21);
         assert_eq!(cf_encoding(4), CF_UTF8);
         assert_eq!(cf_encoding(0x9400_0100), CF_UTF16_LE);
         assert_eq!(cf_encoding(30), CF_MAC_ROMAN);
