@@ -943,7 +943,7 @@ enum Token {
 fn tokens(pattern: &str) -> Vec<Token> {
     let chars: Vec<char> = pattern.chars().collect();
     let mut out: Vec<Token> = Vec::new();
-    let mut push_text = |out: &mut Vec<Token>, text: &str| {
+    let push_text = |out: &mut Vec<Token>, text: &str| {
         if let Some(Token::Text(last)) = out.last_mut() {
             last.push_str(text);
         } else if !text.is_empty() {

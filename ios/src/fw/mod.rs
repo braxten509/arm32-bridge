@@ -18,6 +18,7 @@ pub mod keychain;
 pub mod locks;
 pub mod media;
 pub mod misc;
+pub mod numbers;
 pub mod object;
 pub mod paths;
 pub mod pictures;
@@ -67,6 +68,7 @@ pub fn register(r: &mut Registry) {
     openal::register(r);
     storekit::register(r);
     dates::register(r);
+    numbers::register(r);
     immutable_copies();
 }
 
