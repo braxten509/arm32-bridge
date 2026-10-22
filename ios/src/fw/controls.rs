@@ -292,6 +292,11 @@ extern "C" fn font_family(this: Id, _: Sel) -> Id {
 extern "C" fn font_line_height(this: Id, _: Sel) -> f64 {
     font_size(this) * 1.2
 }
+/// UIFont's leading is only the extra gap between lines:
+/// lineHeight = ascender - descender + leading.
+extern "C" fn font_leading(this: Id, s: Sel) -> f64 {
+    (font_line_height(this, s) - (font_ascender(this, s) - font_descender(this, s))).max(0.0)
+}
 extern "C" fn font_ascender(this: Id, _: Sel) -> f64 {
     font_size(this) * 0.952
 }
@@ -403,10 +408,14 @@ extern "C" fn text_become_first_responder(this: Id, _: Sel) -> bool {
 }
 
 extern "C" fn text_selected_range(this: Id, _: Sel) -> Range {
-    Range { location: property_get(this, "selectedRange").unwrap_or(0) as usize, length: 0 }
+    Range {
+        location: property_get(this, "selectedRange").unwrap_or(0) as usize,
+        length: property_get(this, "selectedRange.length").unwrap_or(0) as usize,
+    }
 }
 extern "C" fn text_set_selected_range(this: Id, _: Sel, range: Range) {
     property_set(this, "selectedRange", range.location as u64);
+    property_set(this, "selectedRange.length", range.length as u64);
 }
 extern "C" fn text_scroll_range(_this: Id, _: Sel, _range: Range) {}
 
@@ -478,21 +487,84 @@ fn control_state(this: Id) -> usize {
     state
 }
 
+/// addTarget:action:forControlEvents: on a target/action pair already
+/// there adds the events to it, as UIKit does.
+fn targets_add(list: &mut Vec<Target>, target: Id, action: Sel, events: usize) {
+    match list.iter_mut().find(|t| t.target == target && t.action == action) {
+        Some(existing) => existing.events |= events,
+        None => list.push(Target { target, action, events }),
+    }
+}
+
+/// removeTarget:action:forControlEvents: takes only the given events off
+/// each matching pair (nil target / NULL action match all); a pair left
+/// with no events is gone.
+fn targets_remove(list: &mut Vec<Target>, target: Id, action: Sel, events: usize) {
+    for t in list.iter_mut() {
+        if (target == 0 || t.target == target) && (action == 0 || t.action == action) {
+            t.events &= !events;
+        }
+    }
+    list.retain(|t| t.events != 0);
+}
+
 extern "C" fn control_add_target(this: Id, _: Sel, target: Id, action: Sel, events: usize) {
     let mut targets = TARGETS.lock().unwrap();
-    let list = targets.get_or_insert_with(HashMap::new).entry(this).or_default();
-    if !list.iter().any(|t| t.target == target && t.action == action && t.events == events) {
-        list.push(Target { target, action, events });
-    }
+    targets_add(targets.get_or_insert_with(HashMap::new).entry(this).or_default(), target, action, events);
 }
 
 extern "C" fn control_remove_target(this: Id, _: Sel, target: Id, action: Sel, events: usize) {
     if let Some(list) = TARGETS.lock().unwrap().get_or_insert_with(HashMap::new).get_mut(&this) {
-        list.retain(|t| {
-            let same_target = target == 0 || t.target == target;
-            let same_action = action == 0 || t.action == action;
-            !(same_target && same_action && t.events & events != 0)
-        });
+        targets_remove(list, target, action, events);
+    }
+}
+
+/// The next responder, as UIKit links them: a controller's view → the
+/// controller → the view's superview; a window → the application → the
+/// application delegate.
+fn next_responder(object: Id) -> Id {
+    let app = runtime::send(runtime::class_named("UIApplication"), "sharedApplication", &[]);
+    if object == app {
+        return runtime::send(app, "delegate", &[]);
+    }
+    if class_is(object, "UIView") {
+        if let Some(controller) = property_get(object, "viewController").filter(|&c| c != 0) {
+            return controller as Id;
+        }
+        let parent = view_state(object).superview;
+        return if parent != 0 { parent } else { app };
+    }
+    if class_is(object, "UIViewController") {
+        let view = get_id(object, "view");
+        let parent = if view != 0 { view_state(view).superview } else { 0 };
+        if parent != 0 {
+            return parent;
+        }
+        let presenting = get_id(object, "presenting");
+        return if presenting != 0 { presenting } else { app };
+    }
+    0
+}
+
+/// Sends an action. With no target UIKit asks the first responder and
+/// then the responder chain; there's no first responder here (no
+/// keyboard), so the search starts at the control itself, as UIKit does
+/// then.
+fn send_action(sender: Id, action: Sel, target: Id, event: Id) {
+    let name = lock().sel_name(action);
+    let mut receiver = target;
+    if receiver == 0 {
+        let mut current = sender;
+        for _ in 0..256 {
+            if current == 0 || runtime::responds(current, &name) {
+                break;
+            }
+            current = next_responder(current);
+        }
+        receiver = current;
+    }
+    if receiver != 0 {
+        runtime::send(receiver, &name, &[sender, event]);
     }
 }
 
@@ -520,19 +592,12 @@ extern "C" fn control_send_actions(this: Id, _: Sel, events: usize) {
         .map(|list| list.iter().filter(|t| t.events & events != 0).map(|t| (t.target, t.action)).collect())
         .unwrap_or_default();
     for (target, action) in calls {
-        if target == 0 {
-            continue; // the responder chain isn't followed here
-        }
-        let name = lock().sel_name(action);
-        runtime::send(target, &name, &[this, 0]);
+        send_action(this, action, target, 0);
     }
 }
 
 extern "C" fn control_send_action(this: Id, _: Sel, action: Sel, target: Id, event: Id) {
-    if target != 0 {
-        let name = lock().sel_name(action);
-        runtime::send(target, &name, &[this, event]);
-    }
+    send_action(this, action, target, event);
 }
 
 property!(control_selected, control_set_selected, "selected", bool, false);
@@ -918,25 +983,44 @@ fn nav_stack(this: Id) -> Vec<Id> {
     collections::array_items(get_id(this, "viewControllers"))
 }
 
-fn nav_set_stack(this: Id, list: &[Id]) {
+/// Replaces the stack: controllers no longer on it lose their
+/// navigationController (as on iOS), and when the top one changes the
+/// delegate hears navigationController:willShowViewController:animated:
+/// now and ...didShowViewController:animated: once the change is done.
+fn nav_set_stack(this: Id, list: &[Id], animated: bool) {
+    let old = nav_stack(this);
+    for &controller in old.iter().filter(|c| !list.contains(c)) {
+        if get_id(controller, "navigationController") == this {
+            property_set(controller, "navigationController", 0);
+        }
+    }
     for &controller in list {
         property_set(controller, "navigationController", this as u64);
     }
     property_set(this, "viewControllers", collections::array_from(list) as u64);
+    let top = list.last().copied().unwrap_or(0);
+    if top != 0 && old.last().copied().unwrap_or(0) != top {
+        let delegate = get_id(this, "delegate");
+        let args = [this, top, animated as usize];
+        tell(delegate, "navigationController:willShowViewController:animated:", &args);
+        later(move || {
+            tell(get_id(this, "delegate"), "navigationController:didShowViewController:animated:", &args);
+        });
+    }
 }
 
 extern "C" fn nav_init(this: Id, _: Sel) -> Id {
-    nav_set_stack(this, &[]);
+    nav_set_stack(this, &[], false);
     this
 }
 
 extern "C" fn nav_init_with_root(this: Id, _: Sel, root: Id) -> Id {
-    nav_set_stack(this, &[root][..usize::from(root != 0)]);
+    nav_set_stack(this, &[root][..usize::from(root != 0)], false);
     this
 }
 
 extern "C" fn nav_init_with_classes(this: Id, _: Sel, bar: Class, toolbar: Class) -> Id {
-    nav_set_stack(this, &[]);
+    nav_set_stack(this, &[], false);
     if bar != 0 {
         property_set(this, "navigationBar", new_view(bar, Rect::default()) as u64);
     }
@@ -951,54 +1035,50 @@ extern "C" fn nav_view_controllers(this: Id, _: Sel) -> Id {
 }
 
 extern "C" fn nav_set_view_controllers(this: Id, _: Sel, list: Id) {
-    nav_set_stack(this, &collections::array_items(list));
+    nav_set_stack(this, &collections::array_items(list), false);
 }
 
-extern "C" fn nav_set_view_controllers_animated(this: Id, s: Sel, list: Id, _animated: u8) {
-    nav_set_view_controllers(this, s, list);
+extern "C" fn nav_set_view_controllers_animated(this: Id, _: Sel, list: Id, animated: u8) {
+    nav_set_stack(this, &collections::array_items(list), animated != 0);
 }
 
-extern "C" fn nav_push(this: Id, _: Sel, controller: Id, _animated: u8) {
+extern "C" fn nav_push(this: Id, _: Sel, controller: Id, animated: u8) {
     if controller == 0 {
         return;
     }
     let mut stack = nav_stack(this);
     stack.push(controller);
-    nav_set_stack(this, &stack);
+    nav_set_stack(this, &stack, animated != 0);
     crate::log!("navigation controller {this:#x} shows {} (not drawn yet)", string::describe_class_of(controller));
 }
 
-extern "C" fn nav_pop(this: Id, _: Sel, _animated: u8) -> Id {
+extern "C" fn nav_pop(this: Id, _: Sel, animated: u8) -> Id {
     let mut stack = nav_stack(this);
     if stack.len() < 2 {
         return 0;
     }
     let popped = stack.pop().unwrap_or(0);
-    property_set(popped, "navigationController", 0);
-    nav_set_stack(this, &stack);
+    nav_set_stack(this, &stack, animated != 0);
     popped
 }
 
-fn nav_pop_to(this: Id, keep: usize) -> Id {
+fn nav_pop_to(this: Id, keep: usize, animated: u8) -> Id {
     let mut stack = nav_stack(this);
     if keep >= stack.len() {
         return collections::array_from(&[]);
     }
     let popped = stack.split_off(keep);
-    for &controller in &popped {
-        property_set(controller, "navigationController", 0);
-    }
-    nav_set_stack(this, &stack);
+    nav_set_stack(this, &stack, animated != 0);
     collections::array_from(&popped)
 }
 
-extern "C" fn nav_pop_to_root(this: Id, _: Sel, _animated: u8) -> Id {
-    nav_pop_to(this, 1)
+extern "C" fn nav_pop_to_root(this: Id, _: Sel, animated: u8) -> Id {
+    nav_pop_to(this, 1, animated)
 }
 
-extern "C" fn nav_pop_to_controller(this: Id, _: Sel, controller: Id, _animated: u8) -> Id {
+extern "C" fn nav_pop_to_controller(this: Id, _: Sel, controller: Id, animated: u8) -> Id {
     match nav_stack(this).iter().position(|&c| c == controller) {
-        Some(index) => nav_pop_to(this, index + 1),
+        Some(index) => nav_pop_to(this, index + 1, animated),
         None => 0,
     }
 }
@@ -1127,7 +1207,61 @@ extern "C" fn table_rows_in_section(this: Id, _: Sel, section: isize) -> isize {
     tell(source, "tableView:numberOfRowsInSection:", &[this, section as usize]).map(|n| n as isize).unwrap_or(0)
 }
 
-extern "C" fn table_select(_this: Id, _: Sel, _path: Id, _animated: u8, _position: isize) {}
+// ----- selected rows / items (tables and collections), set by the game -----
+
+static SELECTED: Mutex<Option<HashMap<Id, Vec<Id>>>> = Mutex::new(None);
+
+fn selected(view: Id) -> Vec<Id> {
+    SELECTED.lock().unwrap().as_ref().and_then(|m| m.get(&view).cloned()).unwrap_or_default()
+}
+
+fn same_path(a: Id, b: Id) -> bool {
+    a == b || runtime::send(a, "isEqual:", &[b]) & 0xFF != 0
+}
+
+/// select...AtIndexPath: a nil path clears the selection; without multiple
+/// selection the new path replaces the old one.
+fn select_path(view: Id, path: Id) {
+    let mut list = selected(view);
+    if path == 0 {
+        list.clear();
+    } else if !list.iter().any(|&p| same_path(p, path)) {
+        if !get_flag(view, "allowsMultipleSelection", false) {
+            list.clear();
+        }
+        list.push(path); // index paths never change; objects aren't freed here
+
+    }
+    SELECTED.lock().unwrap().get_or_insert_with(HashMap::new).insert(view, list);
+}
+
+fn deselect_path(view: Id, path: Id) {
+    let list: Vec<Id> = selected(view).into_iter().filter(|&p| !same_path(p, path)).collect();
+    SELECTED.lock().unwrap().get_or_insert_with(HashMap::new).insert(view, list);
+}
+
+extern "C" fn table_select(this: Id, _: Sel, path: Id, _animated: u8, _position: isize) {
+    select_path(this, path);
+}
+
+extern "C" fn table_deselect(this: Id, _: Sel, path: Id, _animated: u8) {
+    deselect_path(this, path);
+}
+
+extern "C" fn table_selected_row(this: Id, _: Sel) -> Id {
+    selected(this).first().copied().unwrap_or(0)
+}
+
+/// UITableView answers nil when nothing is selected.
+extern "C" fn table_selected_rows(this: Id, _: Sel) -> Id {
+    let list = selected(this);
+    if list.is_empty() {
+        0
+    } else {
+        collections::array_from(&list)
+    }
+}
+
 extern "C" fn table_scroll_to(_this: Id, _: Sel, _path: Id, _position: isize, _animated: u8) {}
 
 extern "C" fn table_controller_init(this: Id, _: Sel) -> Id {
@@ -1330,7 +1464,14 @@ extern "C" fn collection_batch(_this: Id, _: Sel, updates: usize, completion: us
     call_block_later(completion, [1, 0, 0]);
 }
 
-extern "C" fn collection_select(_this: Id, _: Sel, _path: Id, _animated: u8, _position: usize) {}
+extern "C" fn collection_select(this: Id, _: Sel, path: Id, _animated: u8, _position: usize) {
+    select_path(this, path);
+}
+
+/// UICollectionView answers an empty list when nothing is selected.
+extern "C" fn collection_selected_items(this: Id, _: Sel) -> Id {
+    collections::array_from(&selected(this))
+}
 extern "C" fn collection_scroll_to(_this: Id, _: Sel, _path: Id, _position: usize, _animated: u8) {}
 
 extern "C" fn collection_controller_init_layout(this: Id, _: Sel, layout: Id) -> Id {
@@ -1823,7 +1964,7 @@ pub fn register(r: &mut Registry) {
             ("fontName", font_name as usize),
             ("familyName", font_family as usize),
             ("lineHeight", font_line_height as usize),
-            ("leading", font_line_height as usize),
+            ("leading", font_leading as usize),
             ("ascender", font_ascender as usize),
             ("descender", font_descender as usize),
             ("capHeight", font_cap_height as usize),
@@ -2340,12 +2481,12 @@ pub fn register(r: &mut Registry) {
             ("numberOfRowsInSection:", table_rows_in_section as usize),
             ("cellForRowAtIndexPath:", nil_with_id as usize),
             ("indexPathForCell:", nil_with_id as usize),
-            ("indexPathForSelectedRow", zero as usize),
-            ("indexPathsForSelectedRows", zero as usize),
+            ("indexPathForSelectedRow", table_selected_row as usize),
+            ("indexPathsForSelectedRows", table_selected_rows as usize),
             ("indexPathsForVisibleRows", empty_array as usize),
             ("visibleCells", empty_array as usize),
             ("selectRowAtIndexPath:animated:scrollPosition:", table_select as usize),
-            ("deselectRowAtIndexPath:animated:", ignore_id_bool as usize),
+            ("deselectRowAtIndexPath:animated:", table_deselect as usize),
             ("scrollToRowAtIndexPath:atScrollPosition:animated:", table_scroll_to as usize),
         ],
     );
@@ -2437,11 +2578,11 @@ pub fn register(r: &mut Registry) {
             ("numberOfItemsInSection:", collection_items_in_section as usize),
             ("cellForItemAtIndexPath:", nil_with_id as usize),
             ("indexPathForCell:", nil_with_id as usize),
-            ("indexPathsForSelectedItems", empty_array as usize),
+            ("indexPathsForSelectedItems", collection_selected_items as usize),
             ("indexPathsForVisibleItems", empty_array as usize),
             ("visibleCells", empty_array as usize),
             ("selectItemAtIndexPath:animated:scrollPosition:", collection_select as usize),
-            ("deselectItemAtIndexPath:animated:", ignore_id_bool as usize),
+            ("deselectItemAtIndexPath:animated:", table_deselect as usize),
             ("scrollToItemAtIndexPath:atScrollPosition:animated:", collection_scroll_to as usize),
         ],
     );
@@ -2664,6 +2805,25 @@ extern "C" fn ignore_insets(_this: Id, _: Sel, _insets: Insets) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_events_merge_on_add_and_subtract_on_remove() {
+        const DOWN: usize = 1 << 0;
+        const UP_INSIDE: usize = 1 << 6;
+        const CHANGED: usize = 1 << 12;
+        let (a, b, tap, other) = (0x100, 0x200, 0x10, 0x20);
+        let mut list = Vec::new();
+        targets_add(&mut list, a, tap, DOWN | UP_INSIDE);
+        targets_add(&mut list, a, tap, CHANGED); // same pair: events added
+        targets_add(&mut list, b, other, UP_INSIDE);
+        assert_eq!(list.len(), 2);
+        // Removing one event keeps the pair with its other events.
+        targets_remove(&mut list, a, tap, UP_INSIDE);
+        assert_eq!(list[0].events, DOWN | CHANGED);
+        // nil target and NULL action match every pair.
+        targets_remove(&mut list, 0, 0, UP_INSIDE | DOWN);
+        assert_eq!(list.iter().map(|t| (t.target, t.events)).collect::<Vec<_>>(), vec![(a, CHANGED)]);
+    }
 
     #[test]
     fn text_is_measured_wrapped_and_cut_like_uikit() {

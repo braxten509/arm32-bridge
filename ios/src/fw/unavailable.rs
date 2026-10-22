@@ -166,13 +166,31 @@ extern "C" fn class_monitoring_available(_: Class, _: Sel, _region_class: Class)
     false
 }
 
+/// Core Location calls the delegate on the run loop of the thread that
+/// made the manager; init remembers it.
+extern "C" fn location_init(this: Id, _: Sel) -> Id {
+    let run_loop: &'static crate::fw::runloop::Loop = crate::fw::runloop::this_threads_loop();
+    property_set(this, "runLoop", run_loop as *const _ as u64);
+    this
+}
+
+fn later_for_manager(manager: Id, work: impl FnOnce() + Send + 'static) {
+    match property_get(manager, "runLoop") {
+        Some(run_loop) => {
+            let run_loop: &'static crate::fw::runloop::Loop = unsafe { &*(run_loop as *const crate::fw::runloop::Loop) };
+            crate::fw::runloop::post_to(run_loop, crate::fw::runloop::Work::Native(Box::new(work)));
+        }
+        None => later(work),
+    }
+}
+
 /// A new delegate hears the (denied) authorization, as on iOS.
 extern "C" fn location_set_delegate(this: Id, _: Sel, delegate: Id) {
     property_set(this, "delegate", delegate as u64);
     if delegate == 0 {
         return;
     }
-    later(move || {
+    later_for_manager(this, move || {
         if get_id(this, "delegate") == delegate {
             tell(delegate, "locationManager:didChangeAuthorizationStatus:", &[this, AUTHORIZATION_DENIED as usize]);
         }
@@ -182,7 +200,7 @@ extern "C" fn location_set_delegate(this: Id, _: Sel, delegate: Id) {
 /// Starting updates fails with kCLErrorDenied.
 extern "C" fn location_start(this: Id, _: Sel) {
     crate::log!("location asked for: location services are off here, telling the game it was denied");
-    later(move || {
+    later_for_manager(this, move || {
         tell(get_id(this, "delegate"), "locationManager:didFailWithError:", &[this, denied_error()]);
     });
 }
@@ -324,6 +342,7 @@ pub fn register(r: &mut Registry) {
     methods(
         location,
         &[
+            ("init", location_init as usize),
             ("delegate", delegate as usize),
             ("setDelegate:", location_set_delegate as usize),
             ("desiredAccuracy", location_accuracy as usize),

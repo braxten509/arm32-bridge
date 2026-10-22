@@ -63,6 +63,18 @@ pub fn post(work: Work) {
     MAIN_LOOP.wake.notify_all();
 }
 
+/// The calling thread's run loop, for frameworks that answer on the run
+/// loop of the thread that made an object (Core Location does).
+pub fn this_threads_loop() -> &'static Loop {
+    current_loop()
+}
+
+/// Queues work for a given run loop; it runs when that thread runs its loop.
+pub fn post_to(run_loop: &'static Loop, work: Work) {
+    run_loop.queue.lock().unwrap().push_back(work);
+    run_loop.wake.notify_all();
+}
+
 fn run_work(work: Work) {
     match work {
         Work::Block(block) => unsafe { crate::libsystem::mach::call_block(block) },

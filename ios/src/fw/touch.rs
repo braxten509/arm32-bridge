@@ -68,7 +68,24 @@ fn origin_in_window(view: Id) -> Point {
     point
 }
 
-fn takes_touches(view: Id) -> bool {
+/// What hit-testing needs to know about one view.
+struct HitView {
+    /// Hidden, alpha below 0.01 or user interaction off: UIKit skips the
+    /// view and everything inside it.
+    blocks: bool,
+    /// A view we don't draw yet (fw/controls.rs): views inside it can still
+    /// be touched, but it never catches a touch itself, so taps go on to
+    /// the drawn views under it.
+    see_through: bool,
+    /// Top-left corner in window points.
+    origin: Point,
+    size: crate::fw::geometry::Size,
+    is_window: bool,
+    /// Back to front.
+    subviews: Vec<Id>,
+}
+
+fn hit_view(view: Id) -> HitView {
     // As in UIKit, image views (and labels) ignore touches unless the game
     // turns them on; other views take them.
     let default = || {
@@ -78,34 +95,46 @@ fn takes_touches(view: Id) -> bool {
         });
         !plain
     };
-    // Views we don't draw yet (fw/controls.rs) must not catch taps meant
-    // for the game underneath them.
-    property_get(view, "notDrawn").is_none()
-        && property_get(view, "hidden").unwrap_or(0) == 0
-        && property_get(view, "userInteraction").map(|v| v != 0).unwrap_or_else(default)
+    let hidden = property_get(view, "hidden").unwrap_or(0) != 0;
+    let alpha = property_get(view, "alpha").map(f64::from_bits).unwrap_or(1.0);
+    let interaction = property_get(view, "userInteraction").map(|v| v != 0).unwrap_or_else(default);
+    let state = view_state(view);
+    HitView {
+        blocks: hidden || alpha < 0.01 || !interaction,
+        see_through: property_get(view, "notDrawn").is_some(),
+        origin: origin_in_window(view),
+        size: state.frame.size,
+        is_window: state.superview == 0,
+        subviews: state.subviews.clone(),
+    }
 }
 
-/// The deepest visible view under the point (window points), as UIKit's hitTest finds it.
-fn hit_test(window: Id, point: Point) -> Id {
-    fn inside(view: Id, point: Point) -> Option<Id> {
-        if !takes_touches(view) {
-            return None;
+/// UIKit's hitTest:withEvent: from `view` down: the front-most, deepest view
+/// under the point (window points), skipping views that block and views
+/// outside their parent's bounds, as pointInside:withEvent: does.
+fn hit_search(view: Id, point: Point, info: &dyn Fn(Id) -> HitView) -> Option<Id> {
+    let node = info(view);
+    if node.blocks {
+        return None;
+    }
+    let local = Point { x: point.x - node.origin.x, y: point.y - node.origin.y };
+    if !node.is_window && (local.x < 0.0 || local.y < 0.0 || local.x >= node.size.width || local.y >= node.size.height) {
+        return None;
+    }
+    for &child in node.subviews.iter().rev() {
+        if let Some(found) = hit_search(child, point, info) {
+            return Some(found);
         }
-        let origin = origin_in_window(view);
-        let size = view_state(view).frame.size;
-        let local = Point { x: point.x - origin.x, y: point.y - origin.y };
-        let is_window = view_state(view).superview == 0;
-        if !is_window && (local.x < 0.0 || local.y < 0.0 || local.x >= size.width || local.y >= size.height) {
-            return None;
-        }
-        for &child in view_state(view).subviews.iter().rev() {
-            if let Some(found) = inside(child, point) {
-                return Some(found);
-            }
-        }
+    }
+    if node.see_through {
+        None
+    } else {
         Some(view)
     }
-    inside(window, point).unwrap_or(window)
+}
+
+fn hit_test(window: Id, point: Point) -> Id {
+    hit_search(window, point, &hit_view).unwrap_or(window)
 }
 
 extern "C" fn touch_location_in_view(this: Id, _: Sel, view: Id) -> Point {
@@ -334,6 +363,28 @@ pub fn register(_: &mut Registry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn touches_reach_views_inside_and_under_undrawn_views() {
+        use crate::fw::geometry::Size;
+        // Window 1 holds the game view 2 (full screen) and, in front, an
+        // undrawn scroll view 3 (0,0 200x200) holding a drawn view 4
+        // (10,10 50x50). View 5 sits in front of everything but is hidden.
+        let node = |id: Id| {
+            let (x, y, w, h, subviews, see_through, blocks) = match id {
+                1 => (0.0, 0.0, 568.0, 320.0, vec![2, 3, 5], false, false),
+                2 => (0.0, 0.0, 568.0, 320.0, vec![], false, false),
+                3 => (0.0, 0.0, 200.0, 200.0, vec![4], true, false),
+                4 => (10.0, 10.0, 50.0, 50.0, vec![], false, false),
+                _ => (0.0, 0.0, 568.0, 320.0, vec![], false, true),
+            };
+            HitView { blocks, see_through, origin: Point { x, y }, size: Size { width: w, height: h }, is_window: id == 1, subviews }
+        };
+        let at = |x, y| hit_search(1, Point { x, y }, &node);
+        assert_eq!(at(20.0, 20.0), Some(4), "drawn view inside the undrawn scroll view");
+        assert_eq!(at(100.0, 100.0), Some(2), "undrawn scroll view lets the tap through");
+        assert_eq!(at(300.0, 100.0), Some(2));
+    }
 
     #[test]
     fn window_pixels_map_through_the_letterbox() {

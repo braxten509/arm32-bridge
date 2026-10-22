@@ -669,44 +669,69 @@ fn complete_later(completion: usize) {
     }
 }
 
-extern "C" fn controller_present(this: Id, _: Sel, controller: Id, _animated: u8) {
+/// Links `controller` as shown by `this` (it isn't drawn yet).
+fn present(this: Id, controller: Id) {
     crate::log!(
         "view controller {this:#x} shows {} {controller:#x} on top (not drawn yet)",
         crate::fw::string::describe_class_of(controller)
     );
     property_set(this, "presented", controller as u64);
-    if controller == 0 {
-        return;
+    if controller != 0 {
+        property_set(controller, "presenting", this as u64);
     }
-    property_set(controller, "presenting", this as u64);
-    // Screens for services this phone doesn't offer answer the way iOS does
-    // when the user closes them (see fw/controls.rs).
-    if runtime::responds(controller, "gamebridgeAnswerShown") {
+}
+
+/// Screens for services this phone doesn't offer answer the way iOS does
+/// when the user closes them (see fw/controls.rs), once they are shown.
+fn answer_shown_later(controller: Id) {
+    if controller != 0 && runtime::responds(controller, "gamebridgeAnswerShown") {
         crate::fw::runloop::post(crate::fw::runloop::Work::Native(Box::new(move || {
             runtime::send(controller, "gamebridgeAnswerShown", &[]);
         })));
     }
 }
 
-extern "C" fn controller_present_completion(this: Id, s: Sel, controller: Id, animated: u8, completion: usize) {
-    controller_present(this, s, controller, animated);
-    complete_later(completion);
+extern "C" fn controller_present(this: Id, _: Sel, controller: Id, _animated: u8) {
+    present(this, controller);
+    answer_shown_later(controller);
 }
 
-/// Sent to the presenting controller it dismisses what it shows; sent to the
-/// shown controller itself it is passed to the one that presented it.
-extern "C" fn controller_dismiss(this: Id, _: Sel, _animated: u8) {
+extern "C" fn controller_present_completion(this: Id, _: Sel, controller: Id, _animated: u8, completion: usize) {
+    present(this, controller);
+    // As on iOS: the presentation finishes (completion block) before the
+    // user can close the screen. The run loop keeps this order.
+    complete_later(completion);
+    answer_shown_later(controller);
+}
+
+/// dismissViewControllerAnimated: sent to the presenting controller closes
+/// what it shows and everything shown on top of that; sent to the shown
+/// controller itself (nothing on top) it is passed to the one that
+/// presented it.
+fn dismiss(this: Id) {
     let owner = match property_get(this, "presented") {
         Some(shown) if shown != 0 => this,
         _ => property_get(this, "presenting").unwrap_or(0) as Id,
     };
-    if owner != 0 {
-        let shown = property_get(owner, "presented").unwrap_or(0) as Id;
-        property_set(owner, "presented", 0);
-        if shown != 0 {
-            property_set(shown, "presenting", 0);
-        }
+    if owner == 0 {
+        return;
     }
+    let mut shown = property_get(owner, "presented").unwrap_or(0) as Id;
+    property_set(owner, "presented", 0);
+    // Walk up the stack: A shows B shows C; dismissing from A closes B and C.
+    for _ in 0..64 {
+        if shown == 0 {
+            break;
+        }
+        let next = property_get(shown, "presented").unwrap_or(0) as Id;
+        property_set(shown, "presenting", 0);
+        property_set(shown, "presented", 0);
+        shown = next;
+    }
+}
+
+extern "C" fn controller_dismiss(this: Id, _: Sel, _animated: u8) {
+    dismiss(this);
 }
 
 extern "C" fn controller_dismiss_completion(this: Id, s: Sel, animated: u8, completion: usize) {
@@ -1354,6 +1379,27 @@ mod tests {
         let (w, h) = fit_points((2424.0, 1080.0), aspect);
         assert_eq!((w, h), (958.0, 540.0)); // 1916x1080 pixels, side bars
         assert!(w / h > 1.7 && w / h < 1.8);
+    }
+
+    #[test]
+    fn dismissing_closes_the_whole_stack_shown_on_top() {
+        // A shows B shows C (stand-in ids; only the stored links are used).
+        let (a, b, c) = (0x7a00, 0x7b00, 0x7c00);
+        for (from, to) in [(a, b), (b, c)] {
+            property_set(from, "presented", to as u64);
+            property_set(to, "presenting", from as u64);
+        }
+        dismiss(a);
+        for (object, key) in [(a, "presented"), (b, "presented"), (b, "presenting"), (c, "presenting")] {
+            assert_eq!(property_get(object, key), Some(0), "{object:#x} {key}");
+        }
+        // Sent to the top screen (nothing on top), it closes only that one.
+        property_set(a, "presented", b as u64);
+        property_set(b, "presenting", a as u64);
+        property_set(b, "presented", c as u64);
+        property_set(c, "presenting", b as u64);
+        dismiss(c);
+        assert_eq!((property_get(b, "presented"), property_get(a, "presented")), (Some(0), Some(b as u64)));
     }
 
     #[test]
