@@ -6,6 +6,7 @@ pub mod io;
 pub mod libc;
 pub mod mach;
 pub mod net;
+pub mod suspend;
 pub mod threads;
 pub mod timers;
 
@@ -17,6 +18,7 @@ pub fn register(r: &mut Registry) {
     io::register(r);
     threads::register(r);
     mach::register(r);
+    suspend::register(r);
     extra::register(r);
     net::register(r);
     timers::register(r);

@@ -196,8 +196,8 @@ fails!(
     mach_port_allocate, mach_port_deallocate, mach_port_insert_right, mach_port_mod_refs,
     mach_port_move_member, mach_port_request_notification, mach_msg, task_get_exception_ports,
     task_swap_exception_ports, thread_get_exception_ports, thread_swap_exception_ports, task_threads,
-    thread_suspend, thread_resume, thread_get_state, thread_info, exception_raise,
-    exception_raise_state, exception_raise_state_identity, vm_map, mach_make_memory_entry_64
+    thread_info, exception_raise, exception_raise_state, exception_raise_state_identity, vm_map,
+    mach_make_memory_entry_64
 );
 
 extern "C" fn thread_policy_set() -> i32 {
@@ -835,8 +835,8 @@ pub fn register(r: &mut Registry) {
         mach_port_allocate, mach_port_deallocate, mach_port_insert_right, mach_port_mod_refs,
         mach_port_move_member, mach_port_request_notification, mach_msg, task_get_exception_ports,
         task_swap_exception_ports, thread_get_exception_ports, thread_swap_exception_ports, task_threads,
-        thread_suspend, thread_resume, thread_get_state, thread_info, exception_raise,
-        exception_raise_state, exception_raise_state_identity, vm_map, mach_make_memory_entry_64
+        thread_info, exception_raise, exception_raise_state, exception_raise_state_identity, vm_map,
+        mach_make_memory_entry_64
     );
     r.data("mach_task_self_", leak(0x103u32));
     r.data("vm_page_size", leak(16384usize));
