@@ -119,6 +119,7 @@ pub fn finish(code: i32) -> ! {
         }
         *done = true;
     }
+    crate::output::drain();
     let mut summary = String::new();
     if let Some(report) = crate::loader::LOAD_REPORT.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
         summary += &format!(

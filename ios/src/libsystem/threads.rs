@@ -789,7 +789,23 @@ extern "C" fn thread_entry(start: *mut libc::c_void) -> *mut libc::c_void {
 extern "C" fn ios_pthread_create(thread: *mut libc::pthread_t, attr: *const libc::pthread_attr_t, start: usize, arg: usize) -> i32 {
     let noted = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let boxed = Box::into_raw(Box::new(Start { start, arg, noted: noted.clone() }));
-    let r = unsafe { libc::pthread_create(thread, attr, thread_entry, boxed as *mut _) };
+    let mut r = unsafe { libc::pthread_create(thread, attr, thread_entry, boxed as *mut _) };
+    if r == libc::EPERM && !attr.is_null() {
+        // Android refuses real-time scheduling to apps (Apple allows it, Linux
+        // ignores the policy by default); FMOD asks for it for its mixer. The
+        // thread starts at normal priority instead, from a copy of the settings.
+        let mut normal = unsafe { *attr };
+        let priority = libc::sched_param { sched_priority: 0 };
+        unsafe {
+            pthread_attr_setschedpolicy(&mut normal, 0);
+            crate::libsystem::host::pthread_attr_setschedparam(&mut normal, &priority);
+        }
+        r = unsafe { libc::pthread_create(thread, &normal, thread_entry, boxed as *mut _) };
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if r == 0 && !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            crate::log!("threads: a game thread asked for real-time priority, which Android keeps from apps; it runs at normal priority");
+        }
+    }
     if r != 0 {
         drop(unsafe { Box::from_raw(boxed) });
     } else {
@@ -872,6 +888,31 @@ pub fn register(r: &mut Registry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FMOD asks for a real-time audio thread. Apple (and Linux, which ignores the
+    /// policy unless asked not to) start it; Android refuses real-time for apps.
+    /// The thread must still start, and the game's settings stay as they were.
+    #[test]
+    fn real_time_thread_still_starts() {
+        extern "C" fn body(arg: *mut libc::c_void) -> *mut libc::c_void {
+            arg
+        }
+        unsafe {
+            let mut attr: libc::pthread_attr_t = std::mem::zeroed();
+            libc::pthread_attr_init(&mut attr);
+            assert_eq!(attr_setschedpolicy(&mut attr, 4), 0);
+            let param = libc::sched_param { sched_priority: 50 };
+            assert_eq!(crate::libsystem::host::pthread_attr_setschedparam(&mut attr, &param), 0);
+            let mut thread: libc::pthread_t = std::mem::zeroed();
+            assert_eq!(ios_pthread_create(&mut thread, &attr, body as usize, 7), 0, "the thread was refused");
+            let mut out = std::ptr::null_mut();
+            libc::pthread_join(thread, &mut out);
+            assert_eq!(out as usize, 7);
+            let mut policy = 0;
+            crate::libsystem::host::pthread_attr_getschedpolicy(&attr, &mut policy);
+            assert_eq!(policy, libc::SCHED_FIFO);
+        }
+    }
 
     /// Apple takes any stack size that is a whole number of its 16 KiB pages, from
     /// 16 KiB up (FMOD asks for 16-64 KiB); a thread made with it runs.

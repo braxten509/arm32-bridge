@@ -305,13 +305,26 @@ extern "C" fn ios_mkstemp(template: *mut libc::c_char) -> i32 {
 
 // ----- mmap -----
 
-extern "C" fn ios_mmap(address: usize, length: usize, protection: i32, apple_flags: i32, fd: i32, offset: i64) -> usize {
+pub(crate) extern "C" fn ios_mmap(address: usize, length: usize, protection: i32, apple_flags: i32, fd: i32, offset: i64) -> usize {
     let mut flags = apple_flags & (libc::MAP_SHARED | libc::MAP_PRIVATE | libc::MAP_FIXED);
     if apple_flags & 0x1000 != 0 {
         flags |= libc::MAP_ANONYMOUS;
     }
     let protection = protection & (libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC);
+    // Plain memory goes in the near stretch, with the game's malloc blocks.
+    if flags & (libc::MAP_ANONYMOUS | libc::MAP_FIXED) == libc::MAP_ANONYMOUS && flags & libc::MAP_SHARED == 0 {
+        if let Some(address) = super::near::map(length, protection, 0) {
+            return address;
+        }
+    }
     unsafe { libc::mmap(address as *mut _, length, protection, flags, if flags & libc::MAP_ANONYMOUS != 0 { -1 } else { fd }, offset) as usize }
+}
+
+pub(crate) extern "C" fn ios_munmap(address: usize, length: usize) -> i32 {
+    if super::near::unmap(address, length) {
+        return 0;
+    }
+    unsafe { libc::munmap(address as *mut _, length) }
 }
 
 // ----- system information -----
@@ -448,9 +461,8 @@ extern "C" fn ios_gethostname(name: *mut libc::c_char, length: usize) -> i32 {
 
 pub fn register(r: &mut Registry) {
     let stdin = unsafe { libc::fdopen(0, c"r".as_ptr()) } as usize;
-    let stdout = unsafe { libc::fdopen(1, c"w".as_ptr()) } as usize;
-    let stderr = unsafe { libc::fdopen(2, c"w".as_ptr()) } as usize;
-    unsafe { libc::setvbuf(stdout as *mut _, std::ptr::null_mut(), libc::_IOLBF, 0) };
+    let stdout = crate::output::game_file(1) as usize;
+    let stderr = crate::output::game_file(2) as usize;
     let stdout_cell = leak(stdout);
     STDOUT_CELL.0.store(stdout_cell, std::sync::atomic::Ordering::Relaxed);
     r.data("__stdinp", leak(stdin));
@@ -476,7 +488,7 @@ pub fn register(r: &mut Registry) {
     r.function("utimes", ios_utimes as usize);
     r.function("mkstemp", ios_mkstemp as usize);
     r.function("mmap", ios_mmap as usize);
-    r.function("munmap", libc::munmap as usize);
+    r.function("munmap", ios_munmap as usize);
     r.function("mprotect", libc::mprotect as usize);
     r.function("close", libc::close as usize);
     r.function("lseek", libc::lseek as usize);

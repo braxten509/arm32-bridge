@@ -327,6 +327,7 @@ dependencies = [
  "cc",
  "cipher",
  "des",
+ "dlmalloc",
  "image",
  "jni-sys 0.3.1",
  "libc",

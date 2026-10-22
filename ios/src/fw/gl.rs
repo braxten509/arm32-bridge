@@ -291,8 +291,12 @@ const COMPRESSED_TEXTURE_FORMATS: Enum = 0x86A3;
 const MAX_TEXTURE_SIZE: Enum = 0x0D33;
 const MAX_CUBE_MAP_TEXTURE_SIZE: Enum = 0x851C;
 const MAX_RENDERBUFFER_SIZE: Enum = 0x84E8;
+const NUM_PROGRAM_BINARY_FORMATS: Enum = 0x87FE;
+const PROGRAM_BINARY_FORMATS: Enum = 0x87FF;
 
-/// Like the iPhone 5s: its four PVRTC formats, and sizes up to 4096.
+/// Like the iPhone 5s: its four PVRTC formats, sizes up to 4096, and no way
+/// to save built shader programs (Unity's shader cache, which it turns on when
+/// there is one, names its files so that different shaders share a file).
 extern "C" fn get_integerv(name: Enum, out: *mut i32) {
     if out.is_null() {
         return;
@@ -305,6 +309,8 @@ extern "C" fn get_integerv(name: Enum, out: *mut i32) {
                     *out.add(i) = format as i32;
                 }
             }
+            NUM_PROGRAM_BINARY_FORMATS => *out = 0,
+            PROGRAM_BINARY_FORMATS => {}
             MAX_TEXTURE_SIZE | MAX_CUBE_MAP_TEXTURE_SIZE | MAX_RENDERBUFFER_SIZE => {
                 glGetIntegerv(name, out);
                 *out = (*out).min(4096);
@@ -1096,6 +1102,18 @@ pub fn register(r: &mut Registry) {
 #[cfg(test)]
 mod merged_tests {
     use super::*;
+
+    #[test]
+    fn no_saved_shader_programs_like_the_iphone() {
+        // Unity turns on a shader cache when there are formats; its file names
+        // aren't unique, so shaders got each other's programs.
+        let mut count = 5;
+        get_integerv(NUM_PROGRAM_BINARY_FORMATS, &mut count);
+        assert_eq!(count, 0);
+        let mut formats = [7; 2];
+        get_integerv(PROGRAM_BINARY_FORMATS, formats.as_mut_ptr());
+        assert_eq!(formats, [7, 7], "no formats are written");
+    }
 
     #[test]
     fn merged_list_and_astc_sizes() {

@@ -5,6 +5,7 @@ pub mod heap;
 pub mod io;
 pub mod libc;
 pub mod mach;
+pub mod near;
 pub mod net;
 pub mod suspend;
 pub mod threads;
@@ -43,5 +44,6 @@ pub mod host {
         pub fn srand(seed: u32);
         pub fn pthread_attr_setschedparam(attr: *mut ::libc::pthread_attr_t, param: *const ::libc::sched_param) -> i32;
         pub fn pthread_attr_getschedparam(attr: *const ::libc::pthread_attr_t, param: *mut ::libc::sched_param) -> i32;
+        pub fn pthread_attr_getschedpolicy(attr: *const ::libc::pthread_attr_t, policy: *mut i32) -> i32;
     }
 }

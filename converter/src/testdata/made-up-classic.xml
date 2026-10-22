@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A made-up manifest shaped like an older 32-bit game's (Play licensing,
+     expansion-file downloader, a few services). Compiled to
+     made-up-classic.axml by make-axml.sh. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="dev.braxten.testgame.classic.android.gplay" android:versionCode="117" android:versionName="1.1.7"
+    android:installLocation="auto">
+    <uses-sdk android:minSdkVersion="16" android:targetSdkVersion="26" />
+    <uses-feature android:glEsVersion="0x00020000" android:required="true" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="18" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="18" />
+    <uses-permission android:name="com.android.vending.CHECK_LICENSE" />
+    <uses-permission android:name="com.android.vending.BILLING" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.GET_ACCOUNTS" />
+    <application android:label="Test Crafter" android:icon="@android:drawable/sym_def_app_icon"
+        android:allowBackup="true" android:debuggable="false" android:largeHeap="true"
+        android:name="dev.braxten.testgame.classic.GameApplication">
+        <activity android:name="dev.braxten.testgame.classic.SplashActivity" android:label="Test Crafter"
+            android:screenOrientation="portrait" android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+            android:configChanges="keyboardHidden|orientation|screenSize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <activity android:name="dev.braxten.testgame.classic.GameActivity" android:screenOrientation="portrait"
+            android:launchMode="singleTask" android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+            android:configChanges="keyboard|keyboardHidden|orientation|screenSize|screenLayout|uiMode">
+            <meta-data android:name="android.app.lib_name" android:value="game" />
+        </activity>
+        <activity android:name="dev.braxten.testgame.classic.DownloaderActivity" android:screenOrientation="portrait" />
+        <activity android:name="dev.braxten.sdk.social.WebDialogActivity" android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+        <service android:name="dev.braxten.testgame.classic.DownloaderService" />
+        <service android:name="dev.braxten.sdk.billing.BillingService" />
+        <receiver android:name="dev.braxten.testgame.classic.AlarmReceiver" />
+        <receiver android:name="dev.braxten.sdk.billing.BillingReceiver">
+            <intent-filter>
+                <action android:name="com.android.vending.billing.IN_APP_NOTIFY" />
+                <action android:name="com.android.vending.billing.RESPONSE_CODE" />
+                <action android:name="com.android.vending.billing.PURCHASE_STATE_CHANGED" />
+            </intent-filter>
+        </receiver>
+        <receiver android:name="dev.braxten.sdk.analytics.InstallReceiver" android:exported="true">
+            <intent-filter>
+                <action android:name="com.android.vending.INSTALL_REFERRER" />
+            </intent-filter>
+        </receiver>
+        <meta-data android:name="dev.braxten.sdk.version" android:value="4030500" />
+        <meta-data android:name="dev.braxten.sdk.social.ApplicationId" android:value="000000000000000" />
+    </application>
+</manifest>

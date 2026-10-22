@@ -7,6 +7,7 @@
 pub mod macho;
 
 #[cfg(target_arch = "aarch64")]
+pub mod output;
 pub mod report;
 #[cfg(target_arch = "aarch64")]
 pub mod fw;

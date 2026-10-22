@@ -20,6 +20,7 @@ cast5 = "0.11"
 cipher = "0.4"
 des = "0.8"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+dlmalloc = "0.2.14"
 libc = "0.2.190"
 miniz_oxide = "0.8"
 libsqlite3-sys = { version = "0.38.2", features = ["bundled"] }

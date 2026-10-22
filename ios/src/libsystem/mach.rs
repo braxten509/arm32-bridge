@@ -129,9 +129,15 @@ extern "C" fn task_info(_task: u32, flavor: i32, info: *mut u8, count: *mut u32)
     KERN_SUCCESS
 }
 
-extern "C" fn vm_allocate(_task: u32, address: *mut usize, size: usize, flags: i32) -> i32 {
+pub(crate) extern "C" fn vm_allocate(_task: u32, address: *mut usize, size: usize, flags: i32) -> i32 {
     unsafe {
         let fixed = flags & 1 == 0;
+        if !fixed {
+            if let Some(near) = super::near::map(size, libc::PROT_READ | libc::PROT_WRITE, 16384) {
+                *address = near;
+                return KERN_SUCCESS;
+            }
+        }
         let want = if fixed { *address } else { 0 };
         let extra = if fixed { 0 } else { 16384 };
         let raw = libc::mmap(
@@ -162,7 +168,7 @@ extern "C" fn vm_allocate(_task: u32, address: *mut usize, size: usize, flags: i
 }
 
 extern "C" fn vm_deallocate(_task: u32, address: usize, size: usize) -> i32 {
-    unsafe { libc::munmap(address as *mut _, size) };
+    super::io::ios_munmap(address, size);
     KERN_SUCCESS
 }
 

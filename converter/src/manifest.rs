@@ -785,7 +785,7 @@ mod tests {
 
     #[test]
     fn adding_twice_changes_nothing() {
-        for before in [build_manifest(true, true, true), include_bytes!("testdata/tavern-unity64.axml").to_vec()] {
+        for before in [build_manifest(true, true, true), include_bytes!("testdata/made-up-unity.axml").to_vec()] {
             let once = add_provider(&before, CLASS, AUTHORITY).unwrap();
             assert_eq!(add_provider(&once, CLASS, AUTHORITY).unwrap(), once);
             // A provider with another name is still added.
@@ -794,10 +794,10 @@ mod tests {
     }
 
     #[test]
-    fn adds_provider_to_real_manifests() {
-        let tavern = include_bytes!("testdata/tavern-unity64.axml");
-        let puzzlecraft = include_bytes!("testdata/puzzlecraft2.axml");
-        for before in [&tavern[..], &puzzlecraft[..]] {
+    fn adds_provider_to_full_size_manifests() {
+        let unity = include_bytes!("testdata/made-up-unity.axml");
+        let classic = include_bytes!("testdata/made-up-classic.axml");
+        for before in [&unity[..], &classic[..]] {
             let after = add_and_check(before);
             assert_eq!(value(&after, TARGET_SDK_VERSION), value(before, TARGET_SDK_VERSION));
             assert_eq!(value(&after, MIN_SDK_VERSION), value(before, MIN_SDK_VERSION));
@@ -806,11 +806,11 @@ mod tests {
 
     #[test]
     fn reads_package_name() {
-        let tavern = include_bytes!("testdata/tavern-unity64.axml");
-        let puzzlecraft = include_bytes!("testdata/puzzlecraft2.axml");
-        assert_eq!(package_name(tavern).as_deref(), Some("com.firechariotstudios.fantasytavern"));
-        assert_eq!(package_name(puzzlecraft).as_deref(), Some("com.chillingo.puzzlecraft2.android.gplay"));
-        assert_eq!(package_name(&add_provider(tavern, CLASS, AUTHORITY).unwrap()), package_name(tavern));
+        let unity = include_bytes!("testdata/made-up-unity.axml");
+        let classic = include_bytes!("testdata/made-up-classic.axml");
+        assert_eq!(package_name(unity).as_deref(), Some("dev.braxten.testgame.unity"));
+        assert_eq!(package_name(classic).as_deref(), Some("dev.braxten.testgame.classic.android.gplay"));
+        assert_eq!(package_name(&add_provider(unity, CLASS, AUTHORITY).unwrap()), package_name(unity));
         // The built manifest has no package attribute.
         assert_eq!(package_name(&build_manifest(true, false, true)), None);
         assert_eq!(package_name(b"<manifest/>"), None);
