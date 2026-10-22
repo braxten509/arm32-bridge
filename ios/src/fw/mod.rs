@@ -8,6 +8,7 @@ pub mod crypto;
 pub mod data;
 pub mod dates;
 pub mod eagl;
+pub mod exception;
 pub mod files;
 pub mod foundation;
 pub mod gamekit;
@@ -79,6 +80,7 @@ pub fn register(r: &mut Registry) {
     invocation::register(r);
     operations::register(r);
     smallclasses::register(r);
+    exception::register(r);
     immutable_copies();
 }
 
