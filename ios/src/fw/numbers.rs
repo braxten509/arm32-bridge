@@ -267,6 +267,49 @@ impl Settings {
     }
 }
 
+/// A number to format or a number read: whole numbers stay exact integers
+/// (a double has only 53 bits, so 2^63-1 would lose digits).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Amount {
+    Integer(i128),
+    Float(f64),
+}
+
+impl Amount {
+    fn float(self) -> f64 {
+        match self {
+            Amount::Integer(i) => i as f64,
+            Amount::Float(f) => f,
+        }
+    }
+
+    fn negative(self) -> bool {
+        match self {
+            Amount::Integer(i) => i < 0,
+            Amount::Float(f) => f < 0.0,
+        }
+    }
+
+    /// Times a multiplier, staying exact when both are whole.
+    fn times(self, multiplier: f64) -> Amount {
+        match self {
+            Amount::Integer(i) if multiplier.fract() == 0.0 && multiplier.abs() < 1e18 => {
+                i.checked_mul(multiplier as i128).map(Amount::Integer).unwrap_or(Amount::Float(i as f64 * multiplier))
+            }
+            other => Amount::Float(other.float() * multiplier),
+        }
+    }
+}
+
+/// |amount| rounded to `places` fraction digits, as decimal text "123.4500".
+fn amount_text(amount: Amount, places: usize, mode: i64) -> String {
+    match amount {
+        Amount::Integer(i) if places == 0 => i.unsigned_abs().to_string(),
+        Amount::Integer(i) => format!("{}.{}", i.unsigned_abs(), "0".repeat(places)),
+        Amount::Float(f) => rounded_text(f, places, mode),
+    }
+}
+
 /// |value| rounded to `places` fraction digits, as decimal text "123.4500".
 fn rounded_text(value: f64, places: usize, mode: i64) -> String {
     let value = value.abs();
@@ -315,14 +358,14 @@ fn group_digits(digits: &str, separator: &str, size: usize) -> String {
 }
 
 /// The digits of |value|: integer and fraction parts, grouped.
-fn number_body(value: f64, s: &Settings) -> (String, bool) {
+fn number_body(value: Amount, s: &Settings) -> (String, bool) {
     // Ceiling rounds negative numbers toward zero and floor away from it.
-    let mode = match (s.rounding, value < 0.0) {
+    let mode = match (s.rounding, value.negative()) {
         (0, true) => 2,
         (1, true) => 3,
         (mode, _) => mode,
     };
-    let text = rounded_text(value, s.max_fraction, mode);
+    let text = amount_text(value, s.max_fraction, mode);
     let (integer, fraction) = text.split_once('.').unwrap_or((&text, ""));
     let mut fraction = fraction.to_string();
     while fraction.len() > s.min_fraction && fraction.ends_with('0') {
@@ -379,17 +422,25 @@ fn ordinal_suffix(n: i64) -> &'static str {
 }
 
 pub fn format_number(value: f64, s: &Settings) -> String {
-    if value.is_nan() {
+    format_amount(Amount::Float(value), s)
+}
+
+pub fn format_amount(amount: Amount, s: &Settings) -> String {
+    if amount.float().is_nan() {
         return s.not_a_number.clone();
     }
-    let value = value * s.multiplier.unwrap_or(if s.style == STYLE_PERCENT { 100.0 } else { 1.0 });
+    let amount = amount.times(s.multiplier.unwrap_or(if s.style == STYLE_PERCENT { 100.0 } else { 1.0 }));
+    let value = amount.float();
     if value.is_infinite() {
         return if value < 0.0 { format!("{}{}", s.minus, s.infinity) } else { s.infinity.clone() };
     }
     match s.style {
         STYLE_SPELL_OUT => {
             let whole = value.abs().trunc();
-            let mut text = spell_integer(whole as u64);
+            let mut text = match amount {
+                Amount::Integer(i) => spell_integer(u64::try_from(i.unsigned_abs()).unwrap_or(u64::MAX)),
+                Amount::Float(_) => spell_integer(whole as u64),
+            };
             let fraction = rounded_text(value.abs() - whole, 6, 4);
             let digits = fraction.split_once('.').map(|(_, f)| f.trim_end_matches('0')).unwrap_or("");
             if !digits.is_empty() {
@@ -402,8 +453,11 @@ pub fn format_number(value: f64, s: &Settings) -> String {
             return if value < 0.0 { format!("minus {text}") } else { text };
         }
         STYLE_ORDINAL => {
-            let n = value.round() as i64;
-            return format!("{n}{}", ordinal_suffix(n));
+            let n = match amount {
+                Amount::Integer(i) => i,
+                Amount::Float(f) => f.round() as i128,
+            };
+            return format!("{n}{}", ordinal_suffix((n % 100) as i64));
         }
         STYLE_SCIENTIFIC => {
             if value == 0.0 {
@@ -411,19 +465,19 @@ pub fn format_number(value: f64, s: &Settings) -> String {
             }
             let exponent = value.abs().log10().floor() as i32;
             let mantissa = value / 10f64.powi(exponent);
-            let (body, _) = number_body(mantissa, s);
+            let (body, _) = number_body(Amount::Float(mantissa), s);
             let sign = if value < 0.0 { s.minus.as_str() } else { "" };
             return format!("{sign}{body}E{exponent}");
         }
         _ => {}
     }
-    let (body, is_zero) = number_body(value, s);
+    let (body, is_zero) = number_body(amount, s);
     if is_zero {
         if let Some(zero) = &s.zero_symbol {
             return zero.clone();
         }
     }
-    let negative = value < 0.0 && !is_zero;
+    let negative = amount.negative() && !is_zero;
     let space = if s.symbol_space { "\u{a0}" } else { "" };
     let decorated = match s.style {
         STYLE_CURRENCY | STYLE_CURRENCY_ACCOUNTING => {
@@ -474,6 +528,11 @@ fn strip_affixes(decorated: &str, s: &Settings) -> String {
 
 /// numberFromString:'s reading; None when the text isn't a number.
 pub fn parse_number(text: &str, s: &Settings, lenient: bool) -> Option<f64> {
+    parse_amount(text, s, lenient).map(Amount::float)
+}
+
+/// Like parse_number; whole numbers come back as exact integers.
+pub fn parse_amount(text: &str, s: &Settings, lenient: bool) -> Option<Amount> {
     let mut t = text.trim().replace('\u{202f}', "\u{a0}");
     let mut negative = false;
     if t.starts_with('(') && t.ends_with(')') {
@@ -531,12 +590,17 @@ pub fn parse_number(text: &str, s: &Settings, lenient: bool) -> Option<f64> {
         }
         i += 1;
     }
+    let divide = s.multiplier.unwrap_or(if s.style == STYLE_PERCENT { 100.0 } else { 1.0 });
+    if !seen_decimal && !seen_exponent && divide == 1.0 {
+        if let Ok(whole) = plain.parse::<i128>() {
+            return Some(Amount::Integer(if negative { -whole } else { whole }));
+        }
+    }
     let mut value: f64 = plain.parse().ok()?;
     if negative {
         value = -value;
     }
-    let divide = s.multiplier.unwrap_or(if s.style == STYLE_PERCENT { 100.0 } else { 1.0 });
-    Some(value / divide)
+    Some(Amount::Float(value / divide))
 }
 
 /// Reads "#,##0.00" style patterns into the settings: digit counts,
@@ -637,10 +701,6 @@ fn settings(f: &Formatter) -> Settings {
         s.max_fraction = v;
         s.min_fraction = s.min_fraction.min(v);
     }
-    if f.allows_floats == Some(false) {
-        s.max_fraction = 0;
-        s.min_fraction = 0;
-    }
     if let Some(v) = f.grouping {
         s.grouping = v;
     }
@@ -675,12 +735,13 @@ fn settings(f: &Formatter) -> Settings {
     s
 }
 
-/// The value of an NSNumber or NSDecimalNumber-like object.
-fn number_value(number: Id) -> f64 {
+/// The value of an NSNumber or NSDecimalNumber-like object; integers exact.
+fn number_value(number: Id) -> Amount {
     if collections::is_number(number) {
-        collections::number_as_f64(number)
+        let (integer, float) = (collections::number_as_i64(number), collections::number_as_f64(number));
+        if integer as f64 == float { Amount::Integer(integer as i128) } else { Amount::Float(float) }
     } else {
-        call_f64(number, "doubleValue")
+        Amount::Float(call_f64(number, "doubleValue"))
     }
 }
 
@@ -693,7 +754,7 @@ extern "C" fn nf_string_from_number(this: Id, _: Sel, number: Id) -> Id {
     if number == 0 {
         return 0;
     }
-    string::make(&format_number(number_value(number), &settings(formatter(this))))
+    string::make(&format_amount(number_value(number), &settings(formatter(this))))
 }
 
 extern "C" fn nf_string_for_object(this: Id, s: Sel, object: Id) -> Id {
@@ -714,16 +775,18 @@ extern "C" fn nf_number_from_string(this: Id, _: Sel, text: Id) -> Id {
         return 0;
     }
     let f = formatter(this);
-    let Some(value) = parse_number(&string::get(text), &settings(f), f.lenient) else {
+    let Some(amount) = parse_amount(&string::get(text), &settings(f), f.lenient) else {
         return 0;
     };
-    if f.allows_floats == Some(false) && value.fract() != 0.0 {
-        return 0;
-    }
-    if value.fract() == 0.0 && value.abs() < 9.0e15 {
-        collections::number_int(value as i64)
-    } else {
-        collections::number_float(value)
+    // allowsFloats only limits reading: text with a fraction is rejected.
+    match amount {
+        Amount::Integer(i) => match i64::try_from(i) {
+            Ok(i) => collections::number_int(i),
+            Err(_) => collections::number_float(i as f64),
+        },
+        Amount::Float(value) if f.allows_floats == Some(false) && value.fract() != 0.0 => 0,
+        Amount::Float(value) if value.fract() == 0.0 && value.abs() < 9.0e15 => collections::number_int(value as i64),
+        Amount::Float(value) => collections::number_float(value),
     }
 }
 
@@ -866,7 +929,7 @@ extern "C" fn nf_multiplier(this: Id, _: Sel) -> Id {
 }
 
 extern "C" fn nf_set_multiplier(this: Id, _: Sel, value: Id) {
-    formatter(this).multiplier = if value == 0 { None } else { Some(number_value(value)) };
+    formatter(this).multiplier = if value == 0 { None } else { Some(number_value(value).float()) };
 }
 
 extern "C" fn nf_localized_string(class: Class, _: Sel, number: Id, style: usize) -> Id {
@@ -987,6 +1050,9 @@ mod tests {
         assert_eq!(format_number(1200.0, &settings_for(STYLE_CURRENCY, "ja_JP")), "￥1,200");
         assert_eq!(format_number(5.0, &settings_for(STYLE_CURRENCY, "en_CA@currency=CAD")), "$5.00");
         assert_eq!(format_number(5.0, &settings_for(STYLE_CURRENCY, "en_US@currency=CAD")), "CA$5.00");
+        // Integers keep every digit.
+        assert_eq!(format_amount(Amount::Integer(i64::MAX as i128), &us(STYLE_DECIMAL)), "9,223,372,036,854,775,807");
+        assert_eq!(format_amount(Amount::Integer(-(1 << 53) - 1), &us(STYLE_NONE)), "-9007199254740993");
         let mut pattern = us(STYLE_DECIMAL);
         apply_pattern("#,##0.00", &mut pattern, false);
         assert_eq!(format_number(1234.0, &pattern), "1,234.00");
@@ -999,5 +1065,6 @@ mod tests {
         assert_eq!(parse_number("-42", &settings_for(STYLE_DECIMAL, "en_US"), false), Some(-42.0));
         assert_eq!(parse_number("50%", &settings_for(STYLE_PERCENT, "en_US"), false), Some(0.5));
         assert_eq!(parse_number("12abc", &settings_for(STYLE_DECIMAL, "en_US"), false), None);
+        assert_eq!(parse_amount("9,007,199,254,740,993", &settings_for(STYLE_DECIMAL, "en_US"), false), Some(Amount::Integer((1 << 53) + 1)));
     }
 }
