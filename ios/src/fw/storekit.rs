@@ -76,7 +76,50 @@ extern "C" fn request_cancel(this: Id, _: Sel) {
     property_set(this, "cancelled", 1);
 }
 
-pub fn register(_r: &mut Registry) {
+extern "C" fn receipt_request_init(this: Id, _: Sel, properties: Id) -> Id {
+    property_set(this, "receiptProperties", properties as u64);
+    this
+}
+
+extern "C" fn receipt_properties(this: Id, _: Sel) -> Id {
+    property_get(this, "receiptProperties").unwrap_or(0) as Id
+}
+
+/// SKStoreProductViewController: the product page can't load (no store);
+/// the completion block hears NO with the error, and once shown the
+/// controller says it finished, as when the user taps Done.
+extern "C" fn product_load(_this: Id, _: Sel, _parameters: Id, completion: usize) {
+    crate::log!("store: product page asked for; answering 'not available'");
+    let error = crate::fw::misc::error("SKErrorDomain", SK_ERROR_UNKNOWN, "Cannot connect to iTunes Store");
+    crate::fw::controls::call_block_later(completion, [0, error, 0]);
+}
+
+extern "C" fn product_answer_shown(this: Id, _: Sel) {
+    crate::log!("store page shown: not available here, telling the game it was closed");
+    let delegate = property_get(this, "delegate").unwrap_or(0) as Id;
+    crate::fw::controls::tell(delegate, "productViewControllerDidFinish:", &[this]);
+}
+
+pub fn register(r: &mut Registry) {
+    for (name, value) in [
+        ("SKStoreProductParameterITunesItemIdentifier", "id"),
+        ("SKStoreProductParameterAffiliateToken", "at"),
+        ("SKStoreProductParameterCampaignToken", "ct"),
+        ("SKStoreProductParameterProviderToken", "pt"),
+    ] {
+        r.data(name, crate::symbols::leak(crate::fw::string::make(value)));
+    }
+    let product_screen = define_class("SKStoreProductViewController", "UIViewController", 8);
+    methods(
+        product_screen,
+        &[
+            ("delegate", request_delegate as usize),
+            ("setDelegate:", request_set_delegate as usize),
+            ("loadProductWithParameters:completionBlock:", product_load as usize),
+            ("gamebridgeAnswerShown", product_answer_shown as usize),
+        ],
+    );
+
     let queue = define_class("SKPaymentQueue", "NSObject", 8);
     class_methods(queue, &[("defaultQueue", default_queue as usize), ("canMakePayments", class_no as usize)]);
     methods(
@@ -115,4 +158,10 @@ pub fn register(_r: &mut Registry) {
     );
     let products = define_class("SKProductsRequest", "SKRequest", 8);
     methods(products, &[("initWithProductIdentifiers:", request_init as usize)]);
+    // A receipt refresh fails like a product request (start is SKRequest's).
+    let receipt = define_class("SKReceiptRefreshRequest", "SKRequest", 8);
+    methods(
+        receipt,
+        &[("initWithReceiptProperties:", receipt_request_init as usize), ("receiptProperties", receipt_properties as usize)],
+    );
 }
