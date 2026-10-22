@@ -428,6 +428,41 @@ gb_elf_callback (struct dl_phdr_info *info, size_t size, void *data)
   return 1;
 }
 
+/* A game function the compact table says nothing about (no __unwind_info,
+   as with -no_compact_unwind, or an entry of 0): its FDE, searched for in
+   the image's __eh_frame, as Apple's unwinder does.  */
+static int
+gb_eh_frame_lookup (const struct gb_image *image, uintptr_t pc,
+		    struct gb_unwind_info *info)
+{
+  const uint8_t *p = image->eh_frame, *end = p + image->eh_frame_size;
+
+  while (p != NULL && p + 8 <= end)
+    {
+      uint32_t length = u32_at (p);
+      const struct dwarf_fde *f = (const struct dwarf_fde *) p;
+      if (length == 0 || length == 0xffffffff || p + 4 + length > end)
+	break;                  /* the end, or a 64-bit record (never in Mach-O) */
+      if (u32_at (p + 4) != 0)
+	{
+	  unsigned char encoding = gb_fde_encoding (f);
+	  _Unwind_Ptr begin, range;
+	  const unsigned char *q
+	    = read_encoded_value_with_base (encoding, 0, f->pc_begin, &begin);
+	  read_encoded_value_with_base (encoding & 0x0f, 0, q, &range);
+	  if (pc >= begin && pc - begin < range)
+	    {
+	      memset (info, 0, sizeof *info);
+	      info->fde = f;
+	      info->func = begin;
+	      return GB_UNWIND_FDE;
+	    }
+	}
+      p += 4 + length;
+    }
+  return GB_UNWIND_NONE;
+}
+
 int
 gb_find_unwind_info (void *pc_pointer, struct gb_unwind_info *info)
 {
@@ -436,7 +471,12 @@ gb_find_unwind_info (void *pc_pointer, struct gb_unwind_info *info)
 
   for (i = 0; i < n; i++)
     if (pc >= images[i].start && pc < images[i].end)
-      return gb_compact_lookup (&images[i], pc, info);
+      {
+	int found = gb_compact_lookup (&images[i], pc, info);
+	if (found == GB_UNWIND_NONE)
+	  found = gb_eh_frame_lookup (&images[i], pc, info);
+	return found;
+      }
 
   if (pc >= (uintptr_t) gamebridge_cxxrt_text_start
       && pc < (uintptr_t) gamebridge_cxxrt_text_end)
