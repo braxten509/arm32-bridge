@@ -122,6 +122,175 @@ extern "C" fn set_score_value(this: Id, _: Sel, value: i64) {
 
 extern "C" fn ignore_u64(_this: Id, _: Sel, _value: u64) {}
 
+// ----- Game Center screens, challenges, matches and voice chat -----
+
+const NOT_AUTHENTICATED: isize = 6;
+
+fn not_signed_in_error() -> Id {
+    crate::fw::misc::error("GKErrorDomain", NOT_AUTHENTICATED, "The requested operation could not be completed because local player has not been authenticated.")
+}
+
+macro_rules! object_property {
+    ($get:ident, $set:ident, $key:literal) => {
+        extern "C" fn $get(this: Id, _: Sel) -> Id {
+            property_get(this, $key).unwrap_or(0) as Id
+        }
+        extern "C" fn $set(this: Id, _: Sel, value: Id) {
+            property_set(this, $key, value as u64);
+        }
+    };
+}
+macro_rules! number_property {
+    ($get:ident, $set:ident, $key:literal, $default:expr) => {
+        extern "C" fn $get(this: Id, _: Sel) -> isize {
+            property_get(this, $key).map_or($default, |v| v as isize)
+        }
+        extern "C" fn $set(this: Id, _: Sel, value: isize) {
+            property_set(this, $key, value as u64);
+        }
+    };
+}
+
+object_property!(gc_delegate, gc_set_delegate, "gameCenterDelegate");
+object_property!(achievements_delegate, achievements_set_delegate, "achievementDelegate");
+object_property!(leaderboard_delegate, leaderboard_set_delegate, "leaderboardDelegate");
+object_property!(matchmaker_delegate, matchmaker_set_delegate, "matchmakerDelegate");
+object_property!(compose_delegate, compose_set_delegate, "composeViewDelegate");
+object_property!(category, set_category, "category");
+object_property!(match_request, set_match_request, "matchRequest");
+number_property!(view_state, set_view_state, "viewState", 0);
+number_property!(time_scope, set_time_scope, "timeScope", 2);
+
+/// Shown, a Game Center screen does what iOS does once the player closes it
+/// (offline it only says Game Center is unavailable): the delegate hears
+/// it finished.
+fn finish_screen(this: Id, delegate_key: &'static str, message: &str) {
+    crate::log!("Game Center screen shown: not available here, telling the game it was closed");
+    let delegate = property_get(this, delegate_key).unwrap_or(0) as Id;
+    if delegate != 0 && runtime::responds(delegate, message) {
+        runtime::send(delegate, message, &[this]);
+    }
+}
+
+extern "C" fn gc_answer_shown(this: Id, _: Sel) {
+    finish_screen(this, "gameCenterDelegate", "gameCenterViewControllerDidFinish:");
+}
+extern "C" fn achievements_answer_shown(this: Id, _: Sel) {
+    finish_screen(this, "achievementDelegate", "achievementViewControllerDidFinish:");
+}
+extern "C" fn leaderboard_answer_shown(this: Id, _: Sel) {
+    finish_screen(this, "leaderboardDelegate", "leaderboardViewControllerDidFinish:");
+}
+extern "C" fn friend_request_answer_shown(this: Id, _: Sel) {
+    finish_screen(this, "composeViewDelegate", "friendRequestComposeViewControllerDidFinish:");
+}
+/// The matchmaker screen is cancelled (its delegate must handle that one).
+extern "C" fn matchmaker_answer_shown(this: Id, _: Sel) {
+    finish_screen(this, "matchmakerDelegate", "matchmakerViewControllerWasCancelled:");
+}
+
+extern "C" fn matchmaker_init_with_request(this: Id, _: Sel, request: Id) -> Id {
+    property_set(this, "matchRequest", request as u64);
+    this
+}
+
+extern "C" fn class_maximum_players(_: Class, _: Sel, kind: usize) -> usize {
+    // GKMatchTypePeerToPeer 4, GKMatchTypeHosted 16, GKMatchTypeTurnBased 16.
+    if kind == 0 { 4 } else { 16 }
+}
+
+number_property!(request_min, request_set_min, "minPlayers", 2);
+number_property!(request_max, request_set_max, "maxPlayers", 4);
+number_property!(request_default, request_set_default, "defaultNumberOfPlayers", 2);
+number_property!(request_group, request_set_group, "playerGroup", 0);
+number_property!(request_attributes, request_set_attributes, "playerAttributes", 0);
+object_property!(request_invitees, request_set_invitees, "playersToInvite");
+object_property!(request_recipients, request_set_recipients, "recipients");
+object_property!(request_message, request_set_message, "inviteMessage");
+
+extern "C" fn shared_matchmaker(_: Class, _: Sel) -> Id {
+    static SHARED: std::sync::OnceLock<Id> = std::sync::OnceLock::new();
+    *SHARED.get_or_init(|| runtime::alloc_instance(runtime::class_named("GKMatchmaker")))
+}
+
+object_property!(invite_handler, set_invite_handler_raw, "inviteHandler");
+
+extern "C" fn set_invite_handler(this: Id, s: Sel, handler: usize) {
+    // Kept, never called: no invitations can arrive.
+    let handler = if handler != 0 { crate::libsystem::mach::block_copy(handler as *mut _) as usize } else { 0 };
+    set_invite_handler_raw(this, s, handler);
+}
+
+/// Matchmaking requests fail at once: the player isn't signed in.
+extern "C" fn one_object_then_signed_out(_this: Id, _: Sel, _request: Id, handler: usize) {
+    answer_later(handler, [0, not_signed_in_error(), 0]);
+}
+extern "C" fn two_objects_then_signed_out(_this: Id, _: Sel, _a: Id, _b: Id, handler: usize) {
+    answer_later(handler, [not_signed_in_error(), 0, 0]);
+}
+extern "C" fn count_then_signed_out(_this: Id, _: Sel, handler: usize) {
+    answer_later(handler, [0, not_signed_in_error(), 0]);
+}
+extern "C" fn group_count_then_signed_out(_this: Id, _: Sel, _group: usize, handler: usize) {
+    answer_later(handler, [0, not_signed_in_error(), 0]);
+}
+extern "C" fn class_one_object_then_signed_out(_: Class, _: Sel, _request: Id, handler: usize) {
+    answer_later(handler, [0, not_signed_in_error(), 0]);
+}
+extern "C" fn class_signed_out(_: Class, _: Sel, handler: usize) {
+    answer_later(handler, [0, not_signed_in_error(), 0]);
+}
+
+/// GKNotificationBanner: nothing is drawn, so the banner is over at once
+/// and its completion handler runs.
+extern "C" fn banner_show(_: Class, _: Sel, title: Id, message: Id, handler: usize) {
+    crate::fw::controls::not_drawn(&format!(
+        "Game Center banner \"{}\" / \"{}\"",
+        crate::fw::string::describe(title),
+        crate::fw::string::describe(message)
+    ));
+    answer_later(handler, [0, 0, 0]);
+}
+extern "C" fn banner_show_duration(class: Class, s: Sel, title: Id, message: Id, _duration: f64, handler: usize) {
+    banner_show(class, s, title, message, handler);
+}
+
+extern "C" fn challenge_handler(_: Class, _: Sel) -> Id {
+    static SHARED: std::sync::OnceLock<Id> = std::sync::OnceLock::new();
+    *SHARED.get_or_init(|| runtime::alloc_instance(runtime::class_named("GKChallengeEventHandler")))
+}
+
+object_property!(handler_delegate, handler_set_delegate, "delegate");
+
+extern "C" fn zero_state(_this: Id, _: Sel) -> isize {
+    0
+}
+
+extern "C" fn voip_allowed(_: Class, _: Sel) -> bool {
+    false
+}
+
+extern "C" fn default_voice_service(_: Class, _: Sel) -> Id {
+    static SHARED: std::sync::OnceLock<Id> = std::sync::OnceLock::new();
+    *SHARED.get_or_init(|| runtime::alloc_instance(runtime::class_named("GKVoiceChatService")))
+}
+
+object_property!(voice_client, voice_set_client, "client");
+
+/// startVoiceChatWithParticipantID:error: says NO with the error.
+extern "C" fn voice_start(_this: Id, _: Sel, _participant: Id, error: *mut Id) -> bool {
+    if !error.is_null() {
+        unsafe { *error = crate::fw::misc::error("GKVoiceChatServiceErrorDomain", 32005, "Voice chat is not available.") };
+    }
+    false
+}
+
+extern "C" fn ignore_two(_this: Id, _: Sel, _a: Id, _b: Id) {}
+extern "C" fn ignore_float(_this: Id, _: Sel, _value: f32) {}
+extern "C" fn zero_float(_this: Id, _: Sel) -> f32 {
+    0.0
+}
+
 pub fn register(_r: &mut Registry) {
     define_class("GKPlayer", "NSObject", 8);
     let local = define_class("GKLocalPlayer", "GKPlayer", 8);
@@ -199,4 +368,243 @@ pub fn register(_r: &mut Registry) {
         ],
     );
     methods(leaderboard, &[("loadScoresWithCompletionHandler:", nothing_then_error as usize)]);
+    class_methods(runtime::class_named("GKPlayer"), &[("loadPlayersForIdentifiers:withCompletionHandler:", class_one_object_then_signed_out as usize)]);
+
+    let gc = define_class("GKGameCenterViewController", "UINavigationController", 8);
+    methods(
+        gc,
+        &[
+            ("gameCenterDelegate", gc_delegate as usize),
+            ("setGameCenterDelegate:", gc_set_delegate as usize),
+            ("viewState", view_state as usize),
+            ("setViewState:", set_view_state as usize),
+            ("leaderboardTimeScope", time_scope as usize),
+            ("setLeaderboardTimeScope:", set_time_scope as usize),
+            ("leaderboardCategory", category as usize),
+            ("setLeaderboardCategory:", set_category as usize),
+            ("leaderboardIdentifier", category as usize),
+            ("setLeaderboardIdentifier:", set_category as usize),
+            ("gamebridgeAnswerShown", gc_answer_shown as usize),
+        ],
+    );
+    let achievements = define_class("GKAchievementViewController", "GKGameCenterViewController", 8);
+    methods(
+        achievements,
+        &[
+            ("achievementDelegate", achievements_delegate as usize),
+            ("setAchievementDelegate:", achievements_set_delegate as usize),
+            ("gamebridgeAnswerShown", achievements_answer_shown as usize),
+        ],
+    );
+    let leaderboards = define_class("GKLeaderboardViewController", "GKGameCenterViewController", 8);
+    methods(
+        leaderboards,
+        &[
+            ("leaderboardDelegate", leaderboard_delegate as usize),
+            ("setLeaderboardDelegate:", leaderboard_set_delegate as usize),
+            ("timeScope", time_scope as usize),
+            ("setTimeScope:", set_time_scope as usize),
+            ("category", category as usize),
+            ("setCategory:", set_category as usize),
+            ("gamebridgeAnswerShown", leaderboard_answer_shown as usize),
+        ],
+    );
+    let friend_request = define_class("GKFriendRequestComposeViewController", "UINavigationController", 8);
+    class_methods(friend_request, &[("maxNumberOfRecipients", class_max_recipients as usize)]);
+    methods(
+        friend_request,
+        &[
+            ("composeViewDelegate", compose_delegate as usize),
+            ("setComposeViewDelegate:", compose_set_delegate as usize),
+            ("setMessage:", ignore as usize),
+            ("addRecipientsWithEmailAddresses:", ignore as usize),
+            ("addRecipientsWithPlayerIDs:", ignore as usize),
+            ("addRecipientPlayers:", ignore as usize),
+            ("gamebridgeAnswerShown", friend_request_answer_shown as usize),
+        ],
+    );
+    let matchmaker_screen = define_class("GKMatchmakerViewController", "UINavigationController", 8);
+    methods(
+        matchmaker_screen,
+        &[
+            ("initWithMatchRequest:", matchmaker_init_with_request as usize),
+            ("initWithInvite:", matchmaker_init_with_request as usize),
+            ("matchmakerDelegate", matchmaker_delegate as usize),
+            ("setMatchmakerDelegate:", matchmaker_set_delegate as usize),
+            ("matchRequest", match_request as usize),
+            ("setHosted:", ignore_bool as usize),
+            ("isHosted", no as usize),
+            ("addPlayersToMatch:", ignore as usize),
+            ("setHostedPlayer:connected:", ignore_two as usize),
+            ("gamebridgeAnswerShown", matchmaker_answer_shown as usize),
+        ],
+    );
+    let _ = set_match_request;
+
+    let request = define_class("GKMatchRequest", "NSObject", 8);
+    class_methods(request, &[("maxPlayersAllowedForMatchOfType:", class_maximum_players as usize)]);
+    methods(
+        request,
+        &[
+            ("minPlayers", request_min as usize),
+            ("setMinPlayers:", request_set_min as usize),
+            ("maxPlayers", request_max as usize),
+            ("setMaxPlayers:", request_set_max as usize),
+            ("defaultNumberOfPlayers", request_default as usize),
+            ("setDefaultNumberOfPlayers:", request_set_default as usize),
+            ("playerGroup", request_group as usize),
+            ("setPlayerGroup:", request_set_group as usize),
+            ("playerAttributes", request_attributes as usize),
+            ("setPlayerAttributes:", request_set_attributes as usize),
+            ("playersToInvite", request_invitees as usize),
+            ("setPlayersToInvite:", request_set_invitees as usize),
+            ("recipients", request_recipients as usize),
+            ("setRecipients:", request_set_recipients as usize),
+            ("inviteMessage", request_message as usize),
+            ("setInviteMessage:", request_set_message as usize),
+            ("setRecipientResponseHandler:", ignore as usize),
+            ("setInviteeResponseHandler:", ignore as usize),
+        ],
+    );
+    let matchmaker = define_class("GKMatchmaker", "NSObject", 8);
+    class_methods(matchmaker, &[("sharedMatchmaker", shared_matchmaker as usize)]);
+    methods(
+        matchmaker,
+        &[
+            ("inviteHandler", invite_handler as usize),
+            ("setInviteHandler:", set_invite_handler as usize),
+            ("findMatchForRequest:withCompletionHandler:", one_object_then_signed_out as usize),
+            ("findPlayersForHostedMatchRequest:withCompletionHandler:", one_object_then_signed_out as usize),
+            ("findPlayersForHostedRequest:withCompletionHandler:", one_object_then_signed_out as usize),
+            ("matchForInvite:completionHandler:", one_object_then_signed_out as usize),
+            ("addPlayersToMatch:matchRequest:completionHandler:", two_objects_then_signed_out as usize),
+            ("queryActivityWithCompletionHandler:", count_then_signed_out as usize),
+            ("queryPlayerGroupActivity:withCompletionHandler:", group_count_then_signed_out as usize),
+            ("cancel", ignore_none as usize),
+            ("cancelInviteToPlayer:", ignore as usize),
+            ("cancelPendingInviteToPlayer:", ignore as usize),
+            ("finishMatchmakingForMatch:", ignore as usize),
+            ("stopBrowsingForNearbyPlayers", ignore_none as usize),
+        ],
+    );
+
+    let banner = define_class("GKNotificationBanner", "NSObject", 8);
+    class_methods(
+        banner,
+        &[
+            ("showBannerWithTitle:message:completionHandler:", banner_show as usize),
+            ("showBannerWithTitle:message:duration:completionHandler:", banner_show_duration as usize),
+        ],
+    );
+
+    let challenge = define_class("GKChallenge", "NSObject", 8);
+    class_methods(challenge, &[("loadReceivedChallengesWithCompletionHandler:", class_signed_out as usize)]);
+    methods(
+        challenge,
+        &[
+            ("issuingPlayerID", nothing as usize),
+            ("receivingPlayerID", nothing as usize),
+            ("issuingPlayer", nothing as usize),
+            ("receivingPlayer", nothing as usize),
+            ("state", zero_state as usize),
+            ("issueDate", nothing as usize),
+            ("completionDate", nothing as usize),
+            ("message", nothing as usize),
+            ("decline", ignore_none as usize),
+        ],
+    );
+    let score_challenge = define_class("GKScoreChallenge", "GKChallenge", 8);
+    methods(score_challenge, &[("score", nothing as usize)]);
+    let achievement_challenge = define_class("GKAchievementChallenge", "GKChallenge", 8);
+    methods(achievement_challenge, &[("achievement", nothing as usize)]);
+    let event_handler = define_class("GKChallengeEventHandler", "NSObject", 8);
+    class_methods(event_handler, &[("challengeEventHandler", challenge_handler as usize)]);
+    methods(event_handler, &[("delegate", handler_delegate as usize), ("setDelegate:", handler_set_delegate as usize)]);
+
+    let turn_based = define_class("GKTurnBasedMatch", "NSObject", 8);
+    class_methods(
+        turn_based,
+        &[
+            ("loadMatchesWithCompletionHandler:", class_signed_out as usize),
+            ("findMatchForRequest:withCompletionHandler:", class_one_object_then_signed_out as usize),
+            ("loadMatchWithID:withCompletionHandler:", class_one_object_then_signed_out as usize),
+        ],
+    );
+    methods(
+        turn_based,
+        &[
+            ("matchID", nothing as usize),
+            ("participants", nothing as usize),
+            ("currentParticipant", nothing as usize),
+            ("matchData", nothing as usize),
+            ("message", nothing as usize),
+            ("creationDate", nothing as usize),
+            ("status", zero_state as usize),
+            ("loadMatchDataWithCompletionHandler:", nothing_then_error as usize),
+            ("removeWithCompletionHandler:", error_only as usize),
+        ],
+    );
+    let participant = define_class("GKTurnBasedParticipant", "NSObject", 8);
+    methods(
+        participant,
+        &[
+            ("playerID", nothing as usize),
+            ("player", nothing as usize),
+            ("lastTurnDate", nothing as usize),
+            ("timeoutDate", nothing as usize),
+            ("status", zero_state as usize),
+            ("matchOutcome", zero_state as usize),
+        ],
+    );
+
+    let voice_chat = define_class("GKVoiceChat", "NSObject", 8);
+    class_methods(voice_chat, &[("isVoIPAllowed", voip_allowed as usize)]);
+    methods(
+        voice_chat,
+        &[
+            ("start", ignore_none as usize),
+            ("stop", ignore_none as usize),
+            ("isActive", no as usize),
+            ("setActive:", ignore_bool as usize),
+            ("name", nothing as usize),
+            ("volume", zero_float as usize),
+            ("setVolume:", ignore_float as usize),
+            ("setMute:forPlayer:", ignore_bool_id as usize),
+            ("setPlayerStateUpdateHandler:", ignore as usize),
+            ("playerIDs", nothing as usize),
+        ],
+    );
+    let voice_service = define_class("GKVoiceChatService", "NSObject", 8);
+    class_methods(
+        voice_service,
+        &[("defaultVoiceChatService", default_voice_service as usize), ("isVoIPAllowed", voip_allowed as usize)],
+    );
+    methods(
+        voice_service,
+        &[
+            ("client", voice_client as usize),
+            ("setClient:", voice_set_client as usize),
+            ("startVoiceChatWithParticipantID:error:", voice_start as usize),
+            ("stopVoiceChatWithParticipantID:", ignore as usize),
+            ("acceptCallID:error:", voice_accept as usize),
+            ("denyCallID:", ignore_u64 as usize),
+            ("receivedData:fromParticipantID:", ignore_two as usize),
+            ("receivedRealTimeData:fromParticipantID:", ignore_two as usize),
+            ("setMicrophoneMuted:", ignore_bool as usize),
+            ("isMicrophoneMuted", no as usize),
+            ("setRemoteParticipantVolume:", ignore_float as usize),
+            ("setOutputMeteringEnabled:", ignore_bool as usize),
+            ("setInputMeteringEnabled:", ignore_bool as usize),
+        ],
+    );
+}
+
+extern "C" fn class_max_recipients(_: Class, _: Sel) -> usize {
+    1
+}
+
+extern "C" fn ignore_bool_id(_this: Id, _: Sel, _flag: u8, _player: Id) {}
+
+extern "C" fn voice_accept(_this: Id, _: Sel, _call: u64, error: *mut Id) -> bool {
+    voice_start(0, 0, 0, error)
 }

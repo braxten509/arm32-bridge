@@ -34,6 +34,7 @@ pub mod string;
 pub mod system;
 pub mod touch;
 pub mod uikit;
+pub mod unavailable;
 pub mod web;
 
 use crate::symbols::Registry;
@@ -48,6 +49,7 @@ pub fn register(r: &mut Registry) {
     app::register(r);
     uikit::register(r);
     controls::register(r);
+    unavailable::register(r);
     runloop::register(r);
     media::register(r);
     keychain::register(r);
