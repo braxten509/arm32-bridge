@@ -1,6 +1,7 @@
 //! Stand-ins for Apple's Foundation and UIKit classes.
 
 pub mod app;
+pub mod cfbridge;
 pub mod coalesced;
 pub mod collections;
 pub mod crypto;
@@ -71,6 +72,7 @@ pub fn register(r: &mut Registry) {
     dates::register(r);
     numbers::register(r);
     scanner::register(r);
+    cfbridge::register(r);
     immutable_copies();
 }
 
