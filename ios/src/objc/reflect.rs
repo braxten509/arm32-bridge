@@ -393,16 +393,17 @@ extern "C" fn protocol_get_method_description(protocol: usize, sel: Sel, require
     }
 }
 
-/// A malloc'd array of `items` 8-byte words, or 0 for none (the caller
-/// frees it with free()).
-fn malloc_list(items: &[usize], count: *mut u32) -> usize {
+/// A malloc'd array of records of `record_words` 8-byte words each, ended by
+/// one all-zero record as Apple's lists are (callers without a count walk to
+/// it), or 0 for none. The caller frees it with free().
+fn malloc_list(items: &[usize], record_words: usize, count: *mut u32) -> usize {
     if !count.is_null() {
-        unsafe { *count = items.len() as u32 };
+        unsafe { *count = (items.len() / record_words) as u32 };
     }
     if items.is_empty() {
         return 0;
     }
-    let list = unsafe { libc::malloc(items.len() * 8) } as *mut usize;
+    let list = unsafe { libc::calloc(items.len() + record_words, 8) } as *mut usize;
     for (index, &item) in items.iter().enumerate() {
         unsafe { *list.add(index) = item };
     }
@@ -413,7 +414,7 @@ fn malloc_list(items: &[usize], count: *mut u32) -> usize {
 /// includes) as objc_method_description { SEL name; char *types; } pairs.
 extern "C" fn protocol_copy_method_descriptions(protocol: usize, required: u8, instance: u8, count: *mut u32) -> usize {
     if protocol == 0 {
-        return malloc_list(&[], count);
+        return malloc_list(&[], 2, count);
     }
     let offset = match (required != 0, instance != 0) {
         (true, true) => 24,
@@ -434,11 +435,7 @@ extern "C" fn protocol_copy_method_descriptions(protocol: usize, required: u8, i
             }
         }
     }
-    let list = malloc_list(&words, std::ptr::null_mut());
-    if !count.is_null() {
-        unsafe { *count = (words.len() / 2) as u32 };
-    }
-    list
+    malloc_list(&words, 2, count)
 }
 
 /// The protocols this one includes, as the runtime knows them by name.
@@ -456,7 +453,7 @@ extern "C" fn protocol_copy_protocols(protocol: usize, count: *mut u32) -> usize
             }
         }
     }
-    malloc_list(&found, count)
+    malloc_list(&found, 1, count)
 }
 
 /// Adds a protocol unless the class itself already takes it on.
@@ -746,8 +743,20 @@ mod tests {
     /// compiler-laid-out root class can be read in.
     #[test]
     fn root_classes_keep_their_own_hierarchy() {
-        let root = new_class("ReflectTestRootA", 0);
+        let root_name = CString::new("ReflectTestRootA").unwrap();
+        let root = allocate_class_pair(0, root_name.as_ptr(), 0);
+        let sizes = |c: Class| unsafe { (read::<u32>(class_ro(c) + 4), read::<u32>(class_ro(c) + 8)) };
+        let first_meta = lock().classes[&root].partner;
+        assert_eq!(sizes(root), (0, 8));
+        assert_eq!(sizes(first_meta), (40, 40));
+        // The root metaclass grows (as class_addIvar on it would); its
+        // children's metaclasses start and end where it ends.
+        unsafe { *((class_ro(first_meta) + 8) as *mut u32) = 64 };
+        register_class_pair(root);
         let child = new_class("ReflectTestRootAChild", root);
+        let child_meta = lock().classes[&child].partner;
+        assert_eq!(sizes(child_meta), (64, 64));
+        assert_eq!(object_get_indexed_ivars(child), child + 64);
         let other = new_class("ReflectTestRootB", 0);
         let (root_meta, child_meta, other_meta) = {
             let rt = lock();
@@ -808,15 +817,16 @@ mod tests {
         let list = protocol_copy_method_descriptions(protocol, 1, 1, &mut count);
         assert_eq!(count, 2);
         unsafe {
-            let pairs = std::slice::from_raw_parts(list as *const usize, 4);
-            assert_eq!(pairs, [runtime::sel("reflectFirst"), first[1], runtime::sel("reflectSecond:"), second[1]]);
+            // Two pairs, then the zeroed pair that ends the list.
+            let pairs = std::slice::from_raw_parts(list as *const usize, 6);
+            assert_eq!(pairs, [runtime::sel("reflectFirst"), first[1], runtime::sel("reflectSecond:"), second[1], 0, 0]);
             libc::free(list as *mut _);
         }
         assert_eq!(protocol_copy_method_descriptions(protocol, 0, 1, &mut count), 0);
         assert_eq!(count, 0);
         let list = protocol_copy_protocols(protocol, &mut count);
         assert_eq!(count, 1);
-        assert_eq!(unsafe { *(list as *const usize) }, child);
+        assert_eq!(unsafe { std::slice::from_raw_parts(list as *const usize, 2) }, [child, 0]);
         unsafe { libc::free(list as *mut _) };
     }
 

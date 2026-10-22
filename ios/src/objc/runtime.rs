@@ -251,11 +251,11 @@ impl Runtime {
     pub fn build_class_pair(&mut self, class: Class, meta: Class, name: &str, superclass: Class, instance_size: usize) {
         let name_c = leak_cstr(name);
         let super_meta = self.classes.get(&superclass).map(|r| r.partner).unwrap_or(0);
-        let (start, meta_start) = match self.classes.get(&superclass) {
-            Some(rec) => (rec.instance_size, self.classes.get(&super_meta).map(|r| r.instance_size).unwrap_or(40)),
-            None => (0, 0),
-        };
+        let start = self.classes.get(&superclass).map(|r| r.instance_size).unwrap_or(0);
         let size = instance_size.max(start).max(8);
+        // A metaclass has no fields of its own yet: it starts and ends where
+        // the parent metaclass ends (a root metaclass is one class object).
+        let meta_size = self.classes.get(&super_meta).map(|r| r.instance_size).unwrap_or(40).max(40);
         let make_ro = |meta: bool, start: usize, size: usize| {
             leak(ClassRo {
                 flags: if meta { 1 } else { 0 } | if superclass == 0 { 2 } else { 0 },
@@ -278,7 +278,7 @@ impl Runtime {
             );
             std::ptr::write(
                 meta as *mut ClassObject,
-                ClassObject { isa: 0, superclass: 0, cache: 0, vtable: 0, data: make_ro(true, meta_start, 40) },
+                ClassObject { isa: 0, superclass: 0, cache: 0, vtable: 0, data: make_ro(true, meta_size, meta_size) },
             );
         }
         let (meta_isa, meta_super) = if superclass == 0 {
@@ -316,7 +316,7 @@ impl Runtime {
                 meta: true,
                 partner: class,
                 methods: HashMap::new(),
-                instance_size: 40,
+                instance_size: meta_size,
                 protocols: Vec::new(),
                 from_game: false,
                 placeholder: false,
