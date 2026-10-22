@@ -176,6 +176,7 @@ pub fn load(app_dir: &str, program_path: &str) -> Result<&'static Loaded, String
     };
     LOADED.set(loaded).map_err(|_| "a game is already loaded")?;
     let loaded = self::loaded();
+    crate::cxx::add_image(loaded);
 
     crate::objc::runtime::load_image(loaded)?;
 

@@ -301,6 +301,7 @@ dependencies = [
  "aes",
  "blowfish",
  "cast5",
+ "cc",
  "cipher",
  "des",
  "jni-sys 0.3.1",
