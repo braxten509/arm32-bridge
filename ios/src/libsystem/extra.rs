@@ -282,13 +282,6 @@ extern "C" fn getpagesize() -> i32 {
     16384
 }
 
-extern "C" fn malloc_size(pointer: *mut libc::c_void) -> usize {
-    if pointer.is_null() {
-        return 0;
-    }
-    unsafe { libc::malloc_usable_size(pointer) }
-}
-
 extern "C" fn call_exit_function(function: usize) {
     let f: extern "C" fn() = unsafe { std::mem::transmute(function) };
     f();
@@ -468,7 +461,7 @@ pub fn register(r: &mut Registry) {
     host!(
         sin, cos, tan, acos, asin, atan, atan2, exp, exp2, log, log10, pow, modf, modff, lrintf, log2f,
         clearerr, feof, ferror, fileno, fputc, getc, strncat, bsearch, clock, localtime, strftime, getcwd,
-        strlcpy, bcopy, getpagesize, malloc_size, hash_create, hash_search
+        strlcpy, bcopy, getpagesize, hash_create, hash_search
     );
     r.function("flock", libc::flock as usize);
     r.function("ftruncate", libc::ftruncate as usize);

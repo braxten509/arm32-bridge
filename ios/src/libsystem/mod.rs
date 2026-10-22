@@ -1,6 +1,7 @@
 //! Apple's C library (libSystem) for the game.
 
 pub mod extra;
+pub mod heap;
 pub mod io;
 pub mod libc;
 pub mod mach;
@@ -12,6 +13,7 @@ use crate::symbols::Registry;
 
 pub fn register(r: &mut Registry) {
     libc::register(r);
+    heap::register(r);
     io::register(r);
     threads::register(r);
     mach::register(r);

@@ -211,7 +211,7 @@ extern "C" fn string_with_capacity(class: Class, s: Sel, _capacity: usize) -> Id
 extern "C" fn init_with_bytes_no_copy(this: Id, s: Sel, bytes: *mut u8, length: usize, encoding: usize, free_when_done: u8) -> Id {
     let result = init_with_bytes(this, s, bytes, length, encoding);
     if free_when_done != 0 && !bytes.is_null() {
-        unsafe { libc::free(bytes as *mut _) };
+        crate::libsystem::heap::free(bytes as *mut _);
     }
     result
 }
