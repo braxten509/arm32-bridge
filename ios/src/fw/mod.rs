@@ -26,6 +26,7 @@ pub mod plist;
 pub mod png;
 pub mod pvrtc;
 pub mod regex;
+pub mod scanner;
 pub mod runloop;
 pub mod sqlite;
 pub mod storekit;
@@ -69,6 +70,7 @@ pub fn register(r: &mut Registry) {
     storekit::register(r);
     dates::register(r);
     numbers::register(r);
+    scanner::register(r);
     immutable_copies();
 }
 
