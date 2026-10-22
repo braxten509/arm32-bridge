@@ -866,11 +866,11 @@ extern "C" fn nav_item_set_hides_back_animated(this: Id, _: Sel, hides: u8, _ani
 }
 extern "C" fn nav_item_right_items(this: Id, _: Sel) -> Id {
     let item = get_id(this, "rightBarButtonItem");
-    collections::array_from(if item != 0 { &[item][..] } else { &[] })
+    collections::array_from(&[item][..usize::from(item != 0)])
 }
 extern "C" fn nav_item_left_items(this: Id, _: Sel) -> Id {
     let item = get_id(this, "leftBarButtonItem");
-    collections::array_from(if item != 0 { &[item][..] } else { &[] })
+    collections::array_from(&[item][..usize::from(item != 0)])
 }
 extern "C" fn nav_item_set_right_items(this: Id, _: Sel, items: Id) {
     property_set(this, "rightBarButtonItem", collections::array_items(items).first().copied().unwrap_or(0) as u64);
@@ -931,7 +931,7 @@ extern "C" fn nav_init(this: Id, _: Sel) -> Id {
 }
 
 extern "C" fn nav_init_with_root(this: Id, _: Sel, root: Id) -> Id {
-    nav_set_stack(this, if root != 0 { &[root][..] } else { &[] });
+    nav_set_stack(this, &[root][..usize::from(root != 0)]);
     this
 }
 
