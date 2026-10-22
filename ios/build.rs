@@ -1,12 +1,14 @@
 // Builds the C++ runtime that games linking Apple's GNU libstdc++ use
-// (ios/cxxrt: Apple's libstdc++ 104.1 sources and GCC 4.2.1's libsupc++,
-// GPL with the runtime exception, adapted to Apple's arm64 layouts).
+// (ios/cxxrt: Apple's libstdc++ 104.1 sources, GCC 4.2.1's libsupc++ and
+// DWARF unwinder, GPL with the runtime exception, adapted to Apple's arm64
+// layouts; see ios/cxxrt/README.md).
 //
 // Every object is joined into one, and all of its own names are made local,
-// so nothing in it can meet the host's C++ library (or anything else) at
-// link or load time. The only name left visible is the table
-// `gamebridge_cxxrt_exports`: Apple name -> address, generated here from
-// ios/cxxrt/exports.txt (ios/tools/cxxrt-exports.sh makes that list).
+// so nothing in it can meet the host's C++ library or unwinder (or anything
+// else) at link or load time. The names left visible are the table
+// `gamebridge_cxxrt_exports` (Apple name -> address, generated here from
+// ios/cxxrt/exports.txt, which ios/tools/cxxrt-exports.sh makes) and
+// `gamebridge_unwind_add_image`.
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
