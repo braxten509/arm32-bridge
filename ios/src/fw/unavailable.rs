@@ -174,14 +174,46 @@ extern "C" fn location_init(this: Id, _: Sel) -> Id {
     this
 }
 
+/// How long an answer waits for a thread that has never run its run loop
+/// before it goes to the main run loop instead.
+const UNRUN_LOOP_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
 fn later_for_manager(manager: Id, work: impl FnOnce() + Send + 'static) {
-    match property_get(manager, "runLoop") {
-        Some(run_loop) => {
-            let run_loop: &'static crate::fw::runloop::Loop = unsafe { &*(run_loop as *const crate::fw::runloop::Loop) };
-            crate::fw::runloop::post_to(run_loop, crate::fw::runloop::Work::Native(Box::new(work)));
-        }
-        None => later(work),
+    use crate::fw::runloop::{post_to, Loop, Work};
+    let Some(run_loop) = property_get(manager, "runLoop") else {
+        later(work);
+        return;
+    };
+    let run_loop: &'static Loop = unsafe { &*(run_loop as *const Loop) };
+    if run_loop.runs() {
+        post_to(run_loop, Work::Native(Box::new(work)));
+        return;
     }
+    // The thread that made the manager hasn't run its loop (yet). Post it
+    // there, and if it still hasn't been taken a moment later, answer on
+    // the main run loop rather than lose it.
+    type Pending = std::sync::Arc<std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+    let pending: Pending = std::sync::Arc::new(std::sync::Mutex::new(Some(Box::new(work))));
+    let on_thread = pending.clone();
+    post_to(
+        run_loop,
+        Work::Native(Box::new(move || {
+            let work = on_thread.lock().unwrap().take();
+            if let Some(work) = work {
+                work();
+            }
+        })),
+    );
+    std::thread::spawn(move || {
+        std::thread::sleep(UNRUN_LOOP_WAIT);
+        later(move || {
+            let work = pending.lock().unwrap().take();
+            if let Some(work) = work {
+                crate::log!("location: the thread that made the location manager never ran its run loop; answering on the main run loop");
+                work();
+            }
+        });
+    });
 }
 
 /// A new delegate hears the (denied) authorization, as on iOS.

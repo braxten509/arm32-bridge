@@ -97,16 +97,37 @@ fn hit_view(view: Id) -> HitView {
     };
     let hidden = property_get(view, "hidden").unwrap_or(0) != 0;
     let alpha = property_get(view, "alpha").map(f64::from_bits).unwrap_or(1.0);
+    // The GL picture is shown whatever the view's alpha (fw/eagl.rs), so a
+    // see-through view holding it keeps its touches: what's seen is what's
+    // touched. UIKit pictures (fw/pictures.rs) do skip see-through views.
+    let invisible = alpha < 0.01 && !holds_gl_picture(view);
     let interaction = property_get(view, "userInteraction").map(|v| v != 0).unwrap_or_else(default);
     let state = view_state(view);
     HitView {
-        blocks: hidden || alpha < 0.01 || !interaction,
+        blocks: hidden || invisible || !interaction,
         see_through: property_get(view, "notDrawn").is_some(),
         origin: origin_in_window(view),
         size: state.frame.size,
         is_window: state.superview == 0,
         subviews: state.subviews.clone(),
     }
+}
+
+/// Whether the view or one inside it shows a GL picture (a CAEAGLLayer).
+fn holds_gl_picture(view: Id) -> bool {
+    let gl_layer = runtime::class_named("CAEAGLLayer");
+    fn search(view: Id, gl_layer: crate::objc::runtime::Class, depth: usize) -> bool {
+        let state = view_state(view);
+        let layer = state.layer;
+        if layer != 0 && gl_layer != 0 && {
+            let rt = lock();
+            rt.is_subclass(rt.class_of(layer), gl_layer)
+        } {
+            return true;
+        }
+        depth < 64 && state.subviews.clone().into_iter().any(|child| search(child, gl_layer, depth + 1))
+    }
+    search(view, gl_layer, 0)
 }
 
 /// UIKit's hitTest:withEvent: from `view` down: the front-most, deepest view

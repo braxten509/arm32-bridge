@@ -556,6 +556,91 @@ extern "C" fn view_gesture_recognizers(_this: Id, _: Sel) -> Id {
     collections::array_from(&[])
 }
 
+// ----- block animations: nothing moves on screen here, so the changes the
+// animations block makes take effect at once and the completion block is
+// told the animation finished (YES) on the next turn of the main run loop,
+// as UIKit calls it after the animation. -----
+
+/// Runs `animations` now and hands the completion call to `later`.
+fn animate_with(animations: usize, completion: usize, later: impl FnOnce(Box<dyn FnOnce() + Send>)) {
+    if animations != 0 {
+        unsafe { crate::libsystem::mach::call_block(animations) };
+    }
+    if completion != 0 {
+        let block = crate::libsystem::mach::block_copy(completion as *mut _) as usize;
+        later(Box::new(move || {
+            let header = block as *const crate::libsystem::mach::BlockHeader;
+            let invoke: extern "C" fn(usize, u8) = unsafe { std::mem::transmute((*header).invoke) };
+            invoke(block, 1);
+        }));
+    }
+}
+
+fn animate(animations: usize, completion: usize) {
+    animate_with(animations, completion, |work| crate::fw::runloop::post(crate::fw::runloop::Work::Native(work)));
+}
+
+extern "C" fn animate_simple(_: Class, _: Sel, _duration: f64, animations: usize) {
+    animate(animations, 0);
+}
+
+extern "C" fn animate_completion(_: Class, _: Sel, _duration: f64, animations: usize, completion: usize) {
+    animate(animations, completion);
+}
+
+extern "C" fn animate_delay(_: Class, _: Sel, _duration: f64, _delay: f64, _options: usize, animations: usize, completion: usize) {
+    animate(animations, completion);
+}
+
+#[allow(clippy::too_many_arguments)]
+extern "C" fn animate_spring(
+    _: Class,
+    _: Sel,
+    _duration: f64,
+    _delay: f64,
+    _damping: f64,
+    _velocity: f64,
+    _options: usize,
+    animations: usize,
+    completion: usize,
+) {
+    animate(animations, completion);
+}
+
+extern "C" fn transition_with_view(_: Class, _: Sel, _view: Id, _duration: f64, _options: usize, animations: usize, completion: usize) {
+    animate(animations, completion);
+}
+
+/// UIViewAnimationOptionShowHideTransitionViews: hide/show instead of
+/// removing/adding.
+const SHOW_HIDE_TRANSITION_VIEWS: usize = 1 << 8;
+
+/// transitionFromView:toView:: toView takes fromView's place in its
+/// superview (or, with ShowHideTransitionViews, one is hidden and the other shown).
+extern "C" fn transition_from_view(_: Class, _: Sel, from: Id, to: Id, _duration: f64, options: usize, completion: usize) {
+    if options & SHOW_HIDE_TRANSITION_VIEWS != 0 {
+        property_set(from, "hidden", 1);
+        property_set(to, "hidden", 0);
+    } else {
+        let parent = view_state(from).superview;
+        if parent != 0 && to != 0 {
+            let index = view_state(parent).subviews.iter().position(|&v| v == from);
+            attach(parent, to, index.map(|i| i + 1));
+        }
+        runtime::send(from, "removeFromSuperview", &[]);
+    }
+    animate(0, completion);
+}
+
+extern "C" fn perform_without_animation(_: Class, _: Sel, actions: usize) {
+    animate(actions, 0);
+}
+
+extern "C" fn ignore_class_bool(_: Class, _: Sel, _value: u8) {}
+extern "C" fn class_yes(_: Class, _: Sel) -> bool {
+    true
+}
+
 // ----- windows -----
 
 static KEY_WINDOW: Mutex<Id> = Mutex::new(0);
@@ -597,6 +682,15 @@ extern "C" fn window_set_root_controller(this: Id, _: Sel, controller: Id) {
             }
             attach(this, view, None);
         }
+        put_on_screen(controller);
+    }
+}
+
+/// Tells a controller of ours (fw/controls.rs: navigation controllers) that
+/// it is now on screen.
+fn put_on_screen(controller: Id) {
+    if controller != 0 && runtime::responds(controller, "gamebridgeShown") {
+        runtime::send(controller, "gamebridgeShown", &[]);
     }
 }
 
@@ -632,6 +726,8 @@ extern "C" fn controller_view(this: Id, _: Sel) -> Id {
         let f: extern "C" fn(Id, Sel, Rect) -> Id = unsafe { std::mem::transmute(imp) };
         let view = f(view, s, screen_bounds());
         property_set(this, "view", view as u64);
+        // The view's next responder is its controller, as with setView:.
+        property_set(view, "viewController", this as u64);
     }
     runtime::send(this, "viewDidLoad", &[]);
     property_get(this, "view").unwrap_or(0) as Id
@@ -678,6 +774,7 @@ fn present(this: Id, controller: Id) {
     property_set(this, "presented", controller as u64);
     if controller != 0 {
         property_set(controller, "presenting", this as u64);
+        put_on_screen(controller);
     }
 }
 
@@ -726,6 +823,7 @@ fn dismiss(this: Id) {
         let next = property_get(shown, "presented").unwrap_or(0) as Id;
         property_set(shown, "presenting", 0);
         property_set(shown, "presented", 0);
+        property_set(shown, "onScreen", 0); // shown again later: announced again
         shown = next;
     }
 }
@@ -1069,7 +1167,25 @@ pub fn register(r: &mut Registry) {
     );
 
     let view = define_class("UIView", "UIResponder", 16);
-    class_methods(view, &[("layerClass", layer_class as usize)]);
+    class_methods(
+        view,
+        &[
+            ("layerClass", layer_class as usize),
+            ("animateWithDuration:animations:", animate_simple as usize),
+            ("animateWithDuration:animations:completion:", animate_completion as usize),
+            ("animateWithDuration:delay:options:animations:completion:", animate_delay as usize),
+            ("animateKeyframesWithDuration:delay:options:animations:completion:", animate_delay as usize),
+            (
+                "animateWithDuration:delay:usingSpringWithDamping:initialSpringVelocity:options:animations:completion:",
+                animate_spring as usize,
+            ),
+            ("transitionWithView:duration:options:animations:completion:", transition_with_view as usize),
+            ("transitionFromView:toView:duration:options:completion:", transition_from_view as usize),
+            ("performWithoutAnimation:", perform_without_animation as usize),
+            ("setAnimationsEnabled:", ignore_class_bool as usize),
+            ("areAnimationsEnabled", class_yes as usize),
+        ],
+    );
     methods(
         view,
         &[
@@ -1382,7 +1498,7 @@ mod tests {
     }
 
     #[test]
-    fn dismissing_closes_the_whole_stack_shown_on_top() {
+    fn dismissing_closes_the_stack_and_animations_complete() {
         // A shows B shows C (stand-in ids; only the stored links are used).
         let (a, b, c) = (0x7a00, 0x7b00, 0x7c00);
         for (from, to) in [(a, b), (b, c)] {
@@ -1400,6 +1516,37 @@ mod tests {
         property_set(c, "presenting", b as u64);
         dismiss(c);
         assert_eq!((property_get(b, "presented"), property_get(a, "presented")), (Some(0), Some(b as u64)));
+
+        // Block animations: the changes apply at once; completion(YES) waits
+        // for the next run-loop turn.
+        static RAN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        static FINISHED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let animations = crate::fw::media::make_callback(5, |n| RAN.store(n, std::sync::atomic::Ordering::SeqCst));
+        #[repr(C)]
+        struct Completion {
+            isa: usize,
+            flags: i32,
+            reserved: i32,
+            invoke: usize,
+            descriptor: usize,
+        }
+        extern "C" fn completion_invoke(_block: usize, finished: u8) {
+            FINISHED.store(1 + finished as usize, std::sync::atomic::Ordering::SeqCst);
+        }
+        static DESCRIPTOR: [usize; 2] = [0, std::mem::size_of::<Completion>()];
+        let completion = leak(Completion {
+            isa: 0,
+            flags: 1 << 28, // a global block: copying keeps it
+            reserved: 0,
+            invoke: completion_invoke as usize,
+            descriptor: DESCRIPTOR.as_ptr() as usize,
+        });
+        let mut queued: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
+        animate_with(animations, completion, |work| queued.push(work));
+        assert_eq!(RAN.load(std::sync::atomic::Ordering::SeqCst), 5, "animations block runs at once");
+        assert_eq!((FINISHED.load(std::sync::atomic::Ordering::SeqCst), queued.len()), (0, 1), "completion waits");
+        queued.pop().unwrap()();
+        assert_eq!(FINISHED.load(std::sync::atomic::Ordering::SeqCst), 2, "completion told finished = YES");
     }
 
     #[test]

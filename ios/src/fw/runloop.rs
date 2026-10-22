@@ -27,11 +27,24 @@ pub struct Loop {
     queue: Mutex<VecDeque<Work>>,
     timers: Mutex<Vec<Id>>,
     wake: Condvar,
+    /// Set once its thread has run it (the main loop always counts).
+    ran: std::sync::atomic::AtomicBool,
 }
 
 impl Loop {
     const fn new() -> Self {
-        Loop { queue: Mutex::new(VecDeque::new()), timers: Mutex::new(Vec::new()), wake: Condvar::new() }
+        Loop {
+            queue: Mutex::new(VecDeque::new()),
+            timers: Mutex::new(Vec::new()),
+            wake: Condvar::new(),
+            ran: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Whether work posted here will be run: the main loop, or a loop its
+    /// thread has run at least once.
+    pub fn runs(&self) -> bool {
+        std::ptr::eq(self, &MAIN_LOOP) || self.ran.load(Ordering::Relaxed)
     }
 
     fn notify(&self) {
@@ -278,6 +291,7 @@ fn fire_due_timers(run_loop: &'static Loop) -> (usize, Option<f64>) {
 /// Runs a loop's queued work and due timers until `until` (or forever).
 /// With `once`, returns as soon as something was handled. Returns true if anything was.
 fn run_loop_until(run_loop: &'static Loop, until: Option<f64>, once: bool) -> bool {
+    run_loop.ran.store(true, Ordering::Relaxed);
     let mut handled = false;
     loop {
         loop {

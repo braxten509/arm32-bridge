@@ -554,14 +554,19 @@ fn send_action(sender: Id, action: Sel, target: Id, event: Id) {
     let name = lock().sel_name(action);
     let mut receiver = target;
     if receiver == 0 {
+        // The first object up the chain that handles the action; none
+        // (or a chain too long to be real) means the action is dropped.
         let mut current = sender;
         for _ in 0..256 {
-            if current == 0 || runtime::responds(current, &name) {
+            if current == 0 {
+                break;
+            }
+            if runtime::responds(current, &name) {
+                receiver = current;
                 break;
             }
             current = next_responder(current);
         }
-        receiver = current;
     }
     if receiver != 0 {
         runtime::send(receiver, &name, &[sender, event]);
@@ -983,10 +988,33 @@ fn nav_stack(this: Id) -> Vec<Id> {
     collections::array_items(get_id(this, "viewControllers"))
 }
 
+/// The delegate hears navigationController:willShowViewController:animated:
+/// now and ...didShowViewController:animated: once the change is done; the
+/// same delegate gets both, so they always come in pairs.
+fn nav_tell_shown(this: Id, top: Id, animated: bool) {
+    let delegate = get_id(this, "delegate");
+    if delegate == 0 || top == 0 {
+        return;
+    }
+    let args = [this, top, animated as usize];
+    tell(delegate, "navigationController:willShowViewController:animated:", &args);
+    later(move || {
+        tell(delegate, "navigationController:didShowViewController:animated:", &args);
+    });
+}
+
+/// Called (from fw/uikit.rs) when the navigation controller is first put on
+/// screen, presented or as a window's root: its top controller is shown then.
+extern "C" fn nav_shown(this: Id, _: Sel) {
+    if !get_flag(this, "onScreen", false) {
+        property_set(this, "onScreen", 1);
+        nav_tell_shown(this, nav_stack(this).last().copied().unwrap_or(0), false);
+    }
+}
+
 /// Replaces the stack: controllers no longer on it lose their
-/// navigationController (as on iOS), and when the top one changes the
-/// delegate hears navigationController:willShowViewController:animated:
-/// now and ...didShowViewController:animated: once the change is done.
+/// navigationController (as on iOS). Once the navigation controller is on
+/// screen, a new top controller is announced to the delegate.
 fn nav_set_stack(this: Id, list: &[Id], animated: bool) {
     let old = nav_stack(this);
     for &controller in old.iter().filter(|c| !list.contains(c)) {
@@ -999,13 +1027,8 @@ fn nav_set_stack(this: Id, list: &[Id], animated: bool) {
     }
     property_set(this, "viewControllers", collections::array_from(list) as u64);
     let top = list.last().copied().unwrap_or(0);
-    if top != 0 && old.last().copied().unwrap_or(0) != top {
-        let delegate = get_id(this, "delegate");
-        let args = [this, top, animated as usize];
-        tell(delegate, "navigationController:willShowViewController:animated:", &args);
-        later(move || {
-            tell(get_id(this, "delegate"), "navigationController:didShowViewController:animated:", &args);
-        });
+    if get_flag(this, "onScreen", false) && old.last().copied().unwrap_or(0) != top {
+        nav_tell_shown(this, top, animated);
     }
 }
 
@@ -1194,6 +1217,7 @@ extern "C" fn table_dequeue_for_path(this: Id, _: Sel, identifier: Id, _path: Id
 }
 
 extern "C" fn table_reload(this: Id, _: Sel) {
+    clear_selection(this);
     not_drawn(&format!("table {this:#x} contents"));
 }
 
@@ -1215,29 +1239,63 @@ fn selected(view: Id) -> Vec<Id> {
     SELECTED.lock().unwrap().as_ref().and_then(|m| m.get(&view).cloned()).unwrap_or_default()
 }
 
+/// Two index paths are the same when they name the same section and row
+/// (or item), whichever NSIndexPath class made them; else isEqual: decides.
 fn same_path(a: Id, b: Id) -> bool {
-    a == b || runtime::send(a, "isEqual:", &[b]) & 0xFF != 0
+    if a == b {
+        return true;
+    }
+    if a == 0 || b == 0 {
+        return false;
+    }
+    let parts = |path: Id| -> Option<(usize, usize, usize)> {
+        let length = if runtime::responds(path, "length") { runtime::send(path, "length", &[]) } else { 2 };
+        if runtime::responds(path, "section") && runtime::responds(path, "row") {
+            Some((length, runtime::send(path, "section", &[]), runtime::send(path, "row", &[])))
+        } else {
+            None
+        }
+    };
+    match (parts(a), parts(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => runtime::send(a, "isEqual:", &[b]) & 0xFF != 0,
+    }
 }
 
 /// select...AtIndexPath: a nil path clears the selection; without multiple
-/// selection the new path replaces the old one.
-fn select_path(view: Id, path: Id) {
-    let mut list = selected(view);
+/// selection the new path replaces the old one; an equal path is kept once.
+fn select_in(list: &mut Vec<Id>, path: Id, multiple: bool, same: &dyn Fn(Id, Id) -> bool) {
     if path == 0 {
         list.clear();
-    } else if !list.iter().any(|&p| same_path(p, path)) {
-        if !get_flag(view, "allowsMultipleSelection", false) {
+    } else if !list.iter().any(|&p| same(p, path)) {
+        if !multiple {
             list.clear();
         }
         list.push(path); // index paths never change; objects aren't freed here
-
     }
+}
+
+fn deselect_in(list: &mut Vec<Id>, path: Id, same: &dyn Fn(Id, Id) -> bool) {
+    list.retain(|&p| !same(p, path));
+}
+
+fn select_path(view: Id, path: Id) {
+    let mut list = selected(view);
+    select_in(&mut list, path, get_flag(view, "allowsMultipleSelection", false), &same_path);
     SELECTED.lock().unwrap().get_or_insert_with(HashMap::new).insert(view, list);
 }
 
 fn deselect_path(view: Id, path: Id) {
-    let list: Vec<Id> = selected(view).into_iter().filter(|&p| !same_path(p, path)).collect();
+    let mut list = selected(view);
+    deselect_in(&mut list, path, &same_path);
     SELECTED.lock().unwrap().get_or_insert_with(HashMap::new).insert(view, list);
+}
+
+/// reloadData forgets the selection, as UIKit does.
+fn clear_selection(view: Id) {
+    if let Some(map) = SELECTED.lock().unwrap().as_mut() {
+        map.remove(&view);
+    }
 }
 
 extern "C" fn table_select(this: Id, _: Sel, path: Id, _animated: u8, _position: isize) {
@@ -1443,6 +1501,7 @@ extern "C" fn collection_dequeue_supplementary(this: Id, _: Sel, kind: Id, ident
 }
 
 extern "C" fn collection_reload(this: Id, _: Sel) {
+    clear_selection(this);
     not_drawn(&format!("collection view {this:#x} contents"));
 }
 
@@ -2408,6 +2467,7 @@ pub fn register(r: &mut Registry) {
         nav,
         &[
             ("init", nav_init as usize),
+            ("gamebridgeShown", nav_shown as usize),
             ("initWithRootViewController:", nav_init_with_root as usize),
             ("initWithNavigationBarClass:toolbarClass:", nav_init_with_classes as usize),
             ("viewControllers", nav_view_controllers as usize),
@@ -2807,7 +2867,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn control_events_merge_on_add_and_subtract_on_remove() {
+    fn control_targets_and_selection_bookkeeping_follow_uikit() {
         const DOWN: usize = 1 << 0;
         const UP_INSIDE: usize = 1 << 6;
         const CHANGED: usize = 1 << 12;
@@ -2823,6 +2883,25 @@ mod tests {
         // nil target and NULL action match every pair.
         targets_remove(&mut list, 0, 0, UP_INSIDE | DOWN);
         assert_eq!(list.iter().map(|t| (t.target, t.events)).collect::<Vec<_>>(), vec![(a, CHANGED)]);
+
+        // Selection: index path objects 1 and 2 both name section 0 row 3,
+        // 4 names row 4 (stand-in ids compared like same_path does).
+        let index = |path: Id| match path {
+            1 | 2 => (0, 3),
+            _ => (0, 4),
+        };
+        let same = |x: Id, y: Id| index(x) == index(y);
+        let mut rows = Vec::new();
+        select_in(&mut rows, 1, true, &same);
+        select_in(&mut rows, 2, true, &same); // an equal path isn't added twice
+        select_in(&mut rows, 4, true, &same);
+        assert_eq!(rows, vec![1, 4]);
+        deselect_in(&mut rows, 2, &same); // removed through an equal path
+        assert_eq!(rows, vec![4]);
+        select_in(&mut rows, 1, false, &same); // single selection replaces
+        assert_eq!(rows, vec![1]);
+        select_in(&mut rows, 0, false, &same); // nil clears
+        assert!(rows.is_empty());
     }
 
     #[test]
