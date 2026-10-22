@@ -130,8 +130,18 @@ extern "C" __attribute__((noinline)) void throw_big_problem(int code)
 // the linker keeps a DWARF FDE for it): the early return comes first and
 // changes the CFA; the throwing call after it is back on the remembered
 // CFA (sp + 32). Returns 0 when code is 0, else throws BigProblem(code).
+// Before it, a frame that is never unwound, whose FDE build-cxx-test.sh
+// breaks after linking (its CIE pointer points far outside __eh_frame):
+// the unwinder must skip that record and still find remembered_frame's.
 extern "C" int remembered_frame(int code);
 __asm__(".text\n"
+	".p2align 2\n"
+	"_broken_fde_frame:\n"
+	".cfi_startproc\n"
+	".cfi_remember_state\n"
+	".cfi_restore_state\n"
+	"ret\n"
+	".cfi_endproc\n"
 	".p2align 2\n"
 	"_remembered_frame:\n"
 	".cfi_startproc\n"
