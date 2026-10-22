@@ -12,6 +12,7 @@ pub mod files;
 pub mod foundation;
 pub mod gamekit;
 pub mod openal;
+pub mod operations;
 pub mod geometry;
 pub mod gl;
 pub mod invocation;
@@ -30,6 +31,7 @@ pub mod pvrtc;
 pub mod regex;
 pub mod scanner;
 pub mod runloop;
+pub mod smallclasses;
 pub mod sqlite;
 pub mod storekit;
 pub mod services;
@@ -75,6 +77,8 @@ pub fn register(r: &mut Registry) {
     scanner::register(r);
     cfbridge::register(r);
     invocation::register(r);
+    operations::register(r);
+    smallclasses::register(r);
     immutable_copies();
 }
 

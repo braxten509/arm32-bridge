@@ -257,7 +257,7 @@ pub fn call(function: usize, types: &[Type], values: &[Vec<u8>], result_type: &T
     let mut stack: Vec<u8> = Vec::new();
     let (mut next_x, mut next_d) = (0usize, 0usize);
     let mut big_copies: Vec<Vec<u8>> = Vec::new();
-    let mut on_stack = |stack: &mut Vec<u8>, bytes: &[u8], align: usize| {
+    let on_stack = |stack: &mut Vec<u8>, bytes: &[u8], align: usize| {
         let at = (stack.len() + align - 1) / align * align;
         stack.resize(at, 0);
         stack.extend_from_slice(bytes);
@@ -451,16 +451,28 @@ fn game_method_types(class: Class, sel: Sel) -> Option<String> {
     None
 }
 
+/// Our own methods carry no type encodings: arguments are taken as objects,
+/// and yes/no questions (isX, hasX, canX, shouldX) answer a BOOL, so a
+/// game reading the answer into a BOOL never gets more bytes than it holds.
+fn guessed_types(name: &str) -> String {
+    let arguments = name.matches(':').count();
+    let question = ["is", "has", "can", "should"]
+        .iter()
+        .any(|p| name.strip_prefix(p).and_then(|rest| rest.chars().next()).is_some_and(|c| c.is_ascii_uppercase()));
+    format!("{}@:{}", if question { "B" } else { "@" }, "@".repeat(arguments))
+}
+
 /// The signature for a method of `class` (a metaclass for class methods):
-/// its own encoding for the game's methods; for ours, objects in and out.
+/// its own encoding for the game's methods, a guess for ours.
 fn signature_for(class: Class, sel: Sel) -> Id {
     if lock().lookup(class, sel).is_none() {
         return 0;
     }
     let types = game_method_types(class, sel).unwrap_or_else(|| {
         let name = lock().sel_name(sel);
-        let arguments = name.matches(':').count();
-        format!("@@:{}", "@".repeat(arguments))
+        let types = guessed_types(&name);
+        crate::log!("NSMethodSignature for our {name}: types guessed as {types}");
+        types
     });
     make_signature(&types)
 }
