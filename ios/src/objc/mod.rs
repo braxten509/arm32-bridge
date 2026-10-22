@@ -1,5 +1,6 @@
 //! Apple's Objective-C runtime functions the game imports.
 
+pub mod reflect;
 pub mod runtime;
 
 use crate::symbols::{leak, Registry};
@@ -316,6 +317,7 @@ pub fn register(r: &mut Registry) {
     r.function("protocol_copyMethodDescriptionList", protocol_copy_methods as usize);
     r.function("protocol_copyProtocolList", protocol_copy_protocols as usize);
     r.function("__objc_personality_v0", personality as usize);
+    reflect::register(r);
     r.data("_objc_empty_cache", leak([0usize; 4]));
     r.data("_objc_empty_vtable", leak([0usize; 4]));
     // Exception type records; only read while an exception is in flight.
