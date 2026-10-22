@@ -233,6 +233,8 @@ extern "C" fn screen_available_modes(this: Id, s: Sel) -> Id {
     collections::array_from(&[screen_current_mode(this, s)])
 }
 
+property!(screen_overscan, screen_set_overscan, "overscanCompensation", isize, 0);
+
 extern "C" fn current_device(_: Class, _: Sel) -> Id {
     *CURRENT_DEVICE.get_or_init(|| runtime::alloc_instance(runtime::class_named("UIDevice")))
 }
@@ -1177,6 +1179,10 @@ pub fn register(r: &mut Registry) {
             ("currentMode", screen_current_mode as usize),
             ("preferredMode", screen_current_mode as usize),
             ("availableModes", screen_available_modes as usize),
+            // The only mode there is (availableModes) stays the current one.
+            ("setCurrentMode:", ignore_id as usize),
+            ("overscanCompensation", screen_overscan as usize),
+            ("setOverscanCompensation:", screen_set_overscan as usize),
             ("mirroredScreen", zero as usize),
         ],
     );
@@ -1541,6 +1547,22 @@ extern "C" fn screen_scale_one(_this: Id, _: Sel) -> f64 {
 mod tests {
     use super::*;
     use crate::fw::plist::Value;
+
+    /// The screen takes one of its own modes back, and keeps its overscan setting.
+    #[test]
+    fn screen_takes_its_mode_and_overscan_setting() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let screen = runtime::send(runtime::class_named("UIScreen"), "mainScreen", &[]);
+        let mode = runtime::send(screen, "preferredMode", &[]);
+        assert!(runtime::responds(screen, "setCurrentMode:"), "-[UIScreen setCurrentMode:] is missing");
+        runtime::send(screen, "setCurrentMode:", &[mode]);
+        assert_eq!(runtime::send(screen, "currentMode", &[]), mode);
+        assert_eq!(runtime::send(screen, "overscanCompensation", &[]), 0);
+        runtime::send(screen, "setOverscanCompensation:", &[2]);
+        assert_eq!(runtime::send(screen, "overscanCompensation", &[]), 2);
+        runtime::send(screen, "setOverscanCompensation:", &[0]);
+    }
 
     #[test]
     fn old_app_keeps_its_launch_image_shape_at_the_display_height() {
