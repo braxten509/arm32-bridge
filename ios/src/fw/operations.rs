@@ -2,19 +2,25 @@
 //! The main queue runs its operations one at a time on the main thread's run
 //! loop. Other queues run each ready operation on a thread of its own, up to
 //! maxConcurrentOperationCount at once (no limit by default, as on Apple).
-//! An operation is ready when every operation it depends on has finished.
+//! As on Apple, everything goes through the operation's own methods (isReady,
+//! isFinished, queuePriority, start), so subclasses can override them: an
+//! operation is done when its isFinished says so, which the queue learns from
+//! didChangeValueForKey:@"isFinished" (the KVO notice Apple requires) or,
+//! for subclasses that don't send it, by asking isFinished every 20 ms.
 
 use crate::fw::object::{class_methods, define_class, methods};
-use crate::fw::{collections, runloop, string};
+use crate::fw::{collections, object, runloop, string};
 use crate::libsystem::mach::{block_copy, call_block, BlockHeader};
 use crate::objc::runtime::{self, Class, Id, Sel};
 use crate::symbols::Registry;
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::Duration;
 
 /// NSOperationQueueDefaultMaxConcurrentOperationCount.
 const NO_LIMIT: isize = -1;
+const POLL: Duration = Duration::from_millis(20);
 
 // ----- NSOperation: { isa, *mut Operation } -----
 
@@ -23,6 +29,10 @@ struct Operation {
     cancelled: bool,
     executing: bool,
     finished: bool,
+    /// The finish was handled: queue slot freed, waiters woken, completion run.
+    done: bool,
+    /// The queue it was added to (0: none).
+    queue: Id,
     completion: usize,
     dependencies: Vec<Id>,
     priority: isize,
@@ -31,9 +41,10 @@ struct Operation {
     name: Id,
 }
 
-/// Every operation's state sits behind this one lock.
+/// Every operation's state sits behind this one lock. Lock order: QUEUE_LOCK,
+/// then STATE; no game code runs while either is held.
 static STATE: Mutex<()> = Mutex::new(());
-/// Signalled whenever an operation finishes.
+/// Signalled (with STATE) whenever an operation's finish is handled.
 static FINISHED: Condvar = Condvar::new();
 
 fn operation(object: Id) -> &'static mut Operation {
@@ -51,13 +62,66 @@ fn with_state<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
-fn is_finished(object: Id) -> bool {
-    with_state(|| operation(object).finished)
+/// A BOOL answer from the operation's own method (overridable).
+fn ask(op: Id, selector: &str) -> bool {
+    runtime::send(op, selector, &[]) & 0xFF != 0
 }
 
-fn is_ready(object: Id) -> bool {
-    let dependencies = with_state(|| operation(object).dependencies.clone());
-    dependencies.iter().all(|&d| is_finished(d))
+fn kvo(op: Id, key: &str, value: bool) {
+    object::kvo_notify(op, key, collections::number_bool(value));
+}
+
+/// Called whenever the operation may have finished: once its isFinished says
+/// YES, frees its queue slot, wakes waiters, starts what can start, and then
+/// runs its completion block on a thread of its own (as Apple usually does).
+fn finished_now(op: Id) -> bool {
+    if !ask(op, "isFinished") {
+        return false;
+    }
+    let first = with_state(|| {
+        let state = operation(op);
+        let first = !state.done;
+        state.done = true;
+        first.then_some((state.queue, state.completion))
+    });
+    let Some((queue_object, completion)) = first else { return true };
+    if queue_object != 0 {
+        with_queue(queue_object, |q| q.running.retain(|&o| o != op));
+        QUEUE_CHANGED.notify_all();
+    }
+    drop(STATE.lock().unwrap_or_else(|e| e.into_inner()));
+    FINISHED.notify_all();
+    // Operations waiting on this one may be ready now.
+    for queue_object in all_queues() {
+        schedule(queue_object);
+    }
+    if completion != 0 {
+        std::thread::spawn(move || unsafe { call_block(completion) });
+    }
+    true
+}
+
+/// Started operations that haven't said they're finished yet (they finish
+/// later on their own: asynchronous ones, or subclasses with their own start).
+static PENDING: Mutex<Vec<Id>> = Mutex::new(Vec::new());
+
+fn watch(op: Id) {
+    let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    let start_poller = pending.is_empty();
+    pending.push(op);
+    drop(pending);
+    if start_poller {
+        std::thread::spawn(|| loop {
+            std::thread::sleep(POLL);
+            let list: Vec<Id> = PENDING.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let done: Vec<Id> = list.into_iter().filter(|&op| finished_now(op)).collect();
+            let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+            pending.retain(|op| !done.contains(op));
+            if pending.is_empty() {
+                return;
+            }
+        });
+    }
 }
 
 extern "C" fn op_init(this: Id, _: Sel) -> Id {
@@ -65,7 +129,8 @@ extern "C" fn op_init(this: Id, _: Sel) -> Id {
     this
 }
 
-/// -start: runs -main unless cancelled, then marks the operation finished.
+/// -start: runs -main unless cancelled, then marks the operation finished
+/// (with the KVO notices Apple sends).
 extern "C" fn op_start(this: Id, _: Sel) {
     let cancelled = with_state(|| {
         let op = operation(this);
@@ -81,37 +146,54 @@ extern "C" fn op_start(this: Id, _: Sel) {
             return;
         }
         Some(false) => {
+            kvo(this, "isExecuting", true);
             runtime::send(this, "main", &[]);
         }
         Some(true) => {}
     }
-    finish(this);
-}
-
-fn finish(this: Id) {
-    let completion = with_state(|| {
+    with_state(|| {
         let op = operation(this);
         op.executing = false;
         op.finished = true;
-        op.completion
     });
-    FINISHED.notify_all();
-    if completion != 0 {
-        unsafe { call_block(completion) };
+    if cancelled == Some(false) {
+        kvo(this, "isExecuting", false);
     }
-    // Operations waiting on this one may be ready now.
-    for queue in all_queues() {
-        schedule(queue);
+    kvo(this, "isFinished", true);
+    finished_now(this);
+}
+
+/// Subclasses tell the queue about their own state through KVO notices,
+/// which also go on to the operation's observers.
+extern "C" fn op_did_change(this: Id, _: Sel, key: Id) {
+    let key = string::get(key);
+    if matches!(key.as_str(), "isFinished" | "isExecuting" | "isCancelled" | "isReady") {
+        kvo(this, &key, ask(this, &key));
+    }
+    match key.as_str() {
+        "isFinished" => {
+            finished_now(this);
+        }
+        "isReady" => {
+            for queue_object in all_queues() {
+                schedule(queue_object);
+            }
+        }
+        _ => {}
     }
 }
 
 extern "C" fn op_main(_this: Id, _: Sel) {}
 
 extern "C" fn op_cancel(this: Id, _: Sel) {
-    with_state(|| operation(this).cancelled = true);
-    // A cancelled operation still waiting is ready at once (it only finishes).
-    for queue in all_queues() {
-        schedule(queue);
+    let first = with_state(|| !std::mem::replace(&mut operation(this).cancelled, true));
+    if first {
+        kvo(this, "isCancelled", true);
+        // A cancelled operation still waiting is ready at once (it only finishes).
+        kvo(this, "isReady", true);
+        for queue_object in all_queues() {
+            schedule(queue_object);
+        }
     }
 }
 
@@ -124,11 +206,13 @@ extern "C" fn op_is_executing(this: Id, _: Sel) -> bool {
 }
 
 extern "C" fn op_is_finished(this: Id, _: Sel) -> bool {
-    is_finished(this)
+    with_state(|| operation(this).finished)
 }
 
+/// Ready when every dependency's isFinished says YES, or once cancelled.
 extern "C" fn op_is_ready(this: Id, _: Sel) -> bool {
-    is_ready(this)
+    let (cancelled, dependencies) = with_state(|| (operation(this).cancelled, operation(this).dependencies.clone()));
+    cancelled || dependencies.iter().all(|&d| ask(d, "isFinished"))
 }
 
 extern "C" fn op_is_concurrent(_this: Id, _: Sel) -> bool {
@@ -143,8 +227,8 @@ extern "C" fn op_add_dependency(this: Id, _: Sel, other: Id) {
 
 extern "C" fn op_remove_dependency(this: Id, _: Sel, other: Id) {
     with_state(|| operation(this).dependencies.retain(|&d| d != other));
-    for queue in all_queues() {
-        schedule(queue);
+    for queue_object in all_queues() {
+        schedule(queue_object);
     }
 }
 
@@ -179,11 +263,18 @@ extern "C" fn op_set_name(this: Id, _: Sel, name: Id) {
     with_state(|| operation(this).name = name);
 }
 
-/// -waitUntilFinished
+/// -waitUntilFinished: until the operation's isFinished says YES.
 extern "C" fn op_wait(this: Id, _: Sel) {
-    let mut guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    while !operation(this).finished {
-        guard = FINISHED.wait(guard).unwrap_or_else(|e| e.into_inner());
+    loop {
+        if ask(this, "isFinished") {
+            finished_now(this);
+            return;
+        }
+        let guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        if operation(this).done {
+            return;
+        }
+        drop(FINISHED.wait_timeout(guard, POLL).unwrap_or_else(|e| e.into_inner()));
     }
 }
 
@@ -229,13 +320,14 @@ struct Queue {
     name: Id,
     limit: isize,
     suspended: bool,
-    /// Added and not yet finished, in the order added.
+    /// Added and not yet started, in the order added.
     waiting: VecDeque<Id>,
+    /// Started and not yet finished.
     running: Vec<Id>,
 }
 
 static QUEUES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
-/// Every queue's state sits behind this lock. Order: this lock, then STATE.
+/// Every queue's state sits behind this lock.
 static QUEUE_LOCK: Mutex<()> = Mutex::new(());
 /// Signalled (with QUEUE_LOCK) whenever a queue's operation finishes.
 static QUEUE_CHANGED: Condvar = Condvar::new();
@@ -276,42 +368,43 @@ fn with_queue<R>(object: Id, f: impl FnOnce(&mut Queue) -> R) -> R {
     f(queue(object))
 }
 
-/// Starts every operation the queue may run now.
+fn has_room(q: &Queue) -> bool {
+    !q.suspended && (q.limit < 0 || q.running.len() < q.limit as usize)
+}
+
+/// Starts every operation the queue may run now: the ready ones (isReady),
+/// highest queuePriority first, then in the order added.
 fn schedule(object: Id) {
     loop {
-        let next = with_queue(object, |q| {
-            if q.suspended {
-                return None;
+        let candidates = with_queue(object, |q| if has_room(q) { q.waiting.iter().copied().collect() } else { Vec::new() });
+        // The operations' own methods run with no lock held.
+        let mut best: Option<(Id, isize)> = None;
+        for op in candidates {
+            if !ask(op, "isReady") {
+                continue;
             }
-            let limit = if q.limit < 0 { usize::MAX } else { q.limit as usize };
-            if q.running.len() >= limit {
-                return None;
+            let priority = runtime::send(op, "queuePriority", &[]) as isize;
+            if best.map(|(_, p)| priority > p).unwrap_or(true) {
+                best = Some((op, priority));
             }
-            // Highest priority first among the ready ones, then the order added.
-            let mut best: Option<(usize, isize)> = None;
-            for (index, &op) in q.waiting.iter().enumerate() {
-                let cancelled = with_state(|| operation(op).cancelled);
-                if !cancelled && !is_ready(op) {
-                    continue;
-                }
-                let priority = with_state(|| operation(op).priority);
-                if best.map(|(_, p)| priority > p).unwrap_or(true) {
-                    best = Some((index, priority));
-                }
+        }
+        let Some((op, _)) = best else { return };
+        let claimed = with_queue(object, |q| match q.waiting.iter().position(|&o| o == op) {
+            Some(index) if has_room(q) => {
+                q.waiting.remove(index);
+                q.running.push(op);
+                Some(q.main)
             }
-            let (index, _) = best?;
-            let op = q.waiting.remove(index)?;
-            q.running.push(op);
-            Some((op, q.main))
+            _ => None,
         });
-        let Some((op, main)) = next else { return };
+        let Some(main) = claimed else { continue };
         let run = move || {
             let before = CURRENT.with(|c| c.replace(object));
             runtime::send(op, "start", &[]);
             CURRENT.with(|c| c.set(before));
-            with_queue(object, |q| q.running.retain(|&o| o != op));
-            QUEUE_CHANGED.notify_all();
-            schedule(object);
+            if !finished_now(op) {
+                watch(op);
+            }
         };
         if main {
             runloop::post(runloop::Work::Native(Box::new(run)));
@@ -346,12 +439,13 @@ fn add(this: Id, op: Id) -> bool {
     if op == 0 {
         return false;
     }
-    let (finished, executing) = with_state(|| (operation(op).finished, operation(op).executing));
-    let already_queued = all_queues().into_iter().any(|q| with_queue(q, |q| q.waiting.contains(&op) || q.running.contains(&op)));
+    let (finished, executing) = (ask(op, "isFinished"), ask(op, "isExecuting"));
+    let already_queued = with_state(|| operation(op).queue != 0);
     if finished || executing || already_queued {
         crate::log!("NSOperationQueue: operation already queued, running or finished (NSInvalidArgumentException on iOS); not added");
         return false;
     }
+    with_state(|| operation(op).queue = this);
     with_queue(this, |q| q.waiting.push_back(op));
     true
 }
@@ -389,17 +483,17 @@ extern "C" fn queue_operation_count(this: Id, _: Sel) -> usize {
     with_queue(this, |q| q.running.len() + q.waiting.len())
 }
 
-extern "C" fn queue_cancel_all(this: Id, s: Sel) {
+extern "C" fn queue_cancel_all(this: Id, _: Sel) {
     let list: Vec<Id> = with_queue(this, |q| q.running.iter().chain(q.waiting.iter()).copied().collect());
     for op in list {
         runtime::send(op, "cancel", &[]);
     }
-    let _ = s;
+    schedule(this);
 }
 
-
-/// Waits until the queue has nothing left (the main queue can't wait for
-/// itself on the main thread, so there it runs nothing and returns).
+/// Waits until every operation the queue holds has finished, as Apple does
+/// (a suspended queue with operations waits until it is resumed). The main
+/// queue can't wait for itself on the main thread, so there it returns.
 extern "C" fn queue_wait_all(this: Id, _: Sel) {
     if with_queue(this, |q| q.main) && runloop::is_main_thread() {
         crate::log!("NSOperationQueue waitUntilAllOperationsAreFinished on the main queue from the main thread; returned at once");
@@ -408,7 +502,7 @@ extern "C" fn queue_wait_all(this: Id, _: Sel) {
     let mut guard = QUEUE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     loop {
         let q = queue(this);
-        if q.running.is_empty() && (q.waiting.is_empty() || q.suspended) {
+        if q.running.is_empty() && q.waiting.is_empty() {
             return;
         }
         // The timeout covers operations whose dependencies finish on another queue.
@@ -477,6 +571,7 @@ pub fn register(_: &mut Registry) {
             ("name", op_name as usize),
             ("setName:", op_set_name as usize),
             ("waitUntilFinished", op_wait as usize),
+            ("didChangeValueForKey:", op_did_change as usize),
         ],
     );
     let block_op = define_class("NSBlockOperation", "NSOperation", 16);
@@ -506,4 +601,60 @@ pub fn register(_: &mut Registry) {
             ("setName:", queue_set_name as usize),
         ],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[repr(C)]
+    struct TestBlock {
+        header: BlockHeader,
+        queue: Id,
+    }
+
+    fn block(invoke: extern "C" fn(usize), queue: Id) -> usize {
+        // A global block: block_copy hands back the same one.
+        let header = BlockHeader { isa: 0, flags: 1 << 28, reserved: 0, invoke: invoke as usize, descriptor: std::ptr::null() };
+        Box::leak(Box::new(TestBlock { header, queue })) as *mut TestBlock as usize
+    }
+
+    static SECOND_RAN: AtomicBool = AtomicBool::new(false);
+    static COMPLETION_DONE: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn nothing(_block: usize) {}
+
+    extern "C" fn second(_block: usize) {
+        SECOND_RAN.store(true, Ordering::SeqCst);
+    }
+
+    /// The first operation's completion block adds a second one to the same
+    /// serial queue and waits for it: the first must have left its slot.
+    extern "C" fn completion(block: usize) {
+        let queue_object = unsafe { (*(block as *const TestBlock)).queue };
+        let op = block_operation(runtime::class_named("NSBlockOperation"), self::block(second, 0));
+        queue_add_operations(queue_object, 0, collections::array_from(&[op]), 1);
+        COMPLETION_DONE.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn completion_runs_after_the_operation_leaves_its_serial_queue() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let class = runtime::class_named("NSOperationQueue");
+        let queue_object = runtime::send(runtime::send(class, "alloc", &[]), "init", &[]);
+        queue_set_limit(queue_object, 0, 1);
+        let first = block_operation(runtime::class_named("NSBlockOperation"), block(nothing, 0));
+        op_set_completion_block(first, 0, block(completion, queue_object));
+        queue_add_operation(queue_object, 0, first);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !COMPLETION_DONE.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(COMPLETION_DONE.load(Ordering::SeqCst), "the completion block waited forever on its own queue");
+        assert!(SECOND_RAN.load(Ordering::SeqCst));
+        queue_wait_all(queue_object, 0);
+        assert_eq!(queue_operation_count(queue_object, 0), 0);
+    }
 }
