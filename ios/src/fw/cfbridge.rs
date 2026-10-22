@@ -191,7 +191,9 @@ pub unsafe fn number_get_value(integer: Option<i64>, float: f64, kind: isize, ou
             None => {
                 let truncated = float.trunc();
                 let value = if float.is_nan() { 0 } else { truncated.clamp(min as f64, max as f64) as i64 };
-                (value, float.fract() == 0.0 && truncated >= min as f64 && truncated <= max as f64)
+                // In i128: max as f64 rounds i64::MAX up to 2^63.
+                let whole = truncated as i128;
+                (value, float.fract() == 0.0 && whole >= min as i128 && whole <= max as i128)
             }
         }
     };
@@ -245,9 +247,9 @@ extern "C" fn cf_number_get_value(number: Id, kind: isize, out: *mut u8) -> bool
         return false;
     }
     let (integer, float) = if collections::is_number(number) {
-        let (i, f) = (collections::number_as_i64(number), collections::number_as_f64(number));
-        // Whole numbers are kept as integers; others as doubles.
-        (if (i as f64) == f { Some(i) } else { None }, f)
+        // The number's own kind: a double stays a double even when whole.
+        let float = collections::number_as_f64(number);
+        ((!collections::number_is_float(number)).then(|| collections::number_as_i64(number)), float)
     } else {
         (None, dates::call_f64(number, "doubleValue"))
     };
@@ -323,6 +325,10 @@ mod tests {
             assert!(!number_get_value(Some(i64::MAX), i64::MAX as f64, 6, out.as_mut_ptr()));
             assert!(number_get_value(Some(1 << 40), (1i64 << 40) as f64, 5, out.as_mut_ptr()));
         }
+        // A double of 2^63 doesn't fit a 64-bit integer: lossy.
+        let mut wide = [0u8; 8];
+        assert!(!cf_number_get_value(collections::number_float(9_223_372_036_854_775_808.0), 4, wide.as_mut_ptr()));
+        assert!(cf_number_get_value(collections::number_int(i64::MAX), 4, wide.as_mut_ptr()));
         let e = string::make("\u{e9}\u{20ac}");
         assert_eq!(encoded(e, CF_MAC_ROMAN), Some(vec![0x8E, 0xDB]));
         assert_eq!(encoded(e, CF_WINDOWS_LATIN1), Some(vec![0xE9, 0x80]));

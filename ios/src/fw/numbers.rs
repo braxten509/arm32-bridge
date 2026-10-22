@@ -738,8 +738,11 @@ fn settings(f: &Formatter) -> Settings {
 /// The value of an NSNumber or NSDecimalNumber-like object; integers exact.
 fn number_value(number: Id) -> Amount {
     if collections::is_number(number) {
-        let (integer, float) = (collections::number_as_i64(number), collections::number_as_f64(number));
-        if integer as f64 == float { Amount::Integer(integer as i128) } else { Amount::Float(float) }
+        if collections::number_is_float(number) {
+            Amount::Float(collections::number_as_f64(number))
+        } else {
+            Amount::Integer(collections::number_as_i64(number) as i128)
+        }
     } else {
         Amount::Float(call_f64(number, "doubleValue"))
     }
@@ -1050,6 +1053,12 @@ mod tests {
         assert_eq!(format_number(1200.0, &settings_for(STYLE_CURRENCY, "ja_JP")), "￥1,200");
         assert_eq!(format_number(5.0, &settings_for(STYLE_CURRENCY, "en_CA@currency=CAD")), "$5.00");
         assert_eq!(format_number(5.0, &settings_for(STYLE_CURRENCY, "en_US@currency=CAD")), "CA$5.00");
+        // A double of 2^63 stays a double (it is not i64::MAX).
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let two_63 = 9_223_372_036_854_775_808.0f64;
+        assert_eq!(number_value(collections::number_float(two_63)), Amount::Float(two_63));
+        assert_eq!(number_value(collections::number_int(i64::MAX)), Amount::Integer(i64::MAX as i128));
         // Integers keep every digit.
         assert_eq!(format_amount(Amount::Integer(i64::MAX as i128), &us(STYLE_DECIMAL)), "9,223,372,036,854,775,807");
         assert_eq!(format_amount(Amount::Integer(-(1 << 53) - 1), &us(STYLE_NONE)), "-9007199254740993");

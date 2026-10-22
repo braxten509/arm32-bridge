@@ -812,6 +812,11 @@ pub fn number_is_bool(object: Id) -> bool {
     number_parts(object).0 == KIND_BOOL
 }
 
+/// Made from a float or double (not an integer or a BOOL).
+pub fn number_is_float(object: Id) -> bool {
+    number_parts(object).0 == KIND_FLOAT
+}
+
 pub fn number_as_f64(object: Id) -> f64 {
     let (kind, bits) = number_parts(object);
     if kind == KIND_FLOAT { f64::from_bits(bits) } else { bits as i64 as f64 }
