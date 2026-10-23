@@ -751,6 +751,9 @@ fn process() {
             if let Some(value) = crate::libsystem::io::sysctl_name(&parts).and_then(sysctl_value32) {
                 return sysctl_answer(uc, &value, old, old_length);
             }
+            if let Some(value) = crate::libsystem::io::sysctl_numeric(&parts) {
+                return sysctl_answer(uc, &value, old, old_length);
+            }
             if let [1, 14, ..] = parts.as_slice() {
                 // Process information (a debugger check): all zero = not traced.
                 return sysctl_answer(uc, &[0u8; 492], old, old_length);
