@@ -40,6 +40,8 @@ pub trait GuestSide: Sync {
     fn alloc_permanent(&self, size: u32) -> u32;
     fn host_address(&self, addr: u32) -> usize;
     fn guest_address(&self, host: usize) -> Option<u32>;
+    /// The guest address of the runtime function `name` (objc_msgSend, ...).
+    fn function_address(&self, name: &str) -> u32;
     /// Runs guest code at `imp` (bit 0 = Thumb) with argument words; r0 | r1 << 32.
     fn call(&self, imp: u32, words: &[u32]) -> Result<u64, String>;
     /// Runs `wait` without this thread holding the guest lock (so other
@@ -47,6 +49,14 @@ pub trait GuestSide: Sync {
     fn without_guest_lock(&self, wait: &mut dyn FnMut()) {
         wait()
     }
+}
+
+/// The function a framework method's guest IMP is: objc_msgSend's stand-in,
+/// or objc_msgSend_stret's when its result (by `types`, the method's
+/// encoding) comes back through a hidden first pointer.
+pub fn message_stub(g: &dyn GuestSide, types: Option<&str>) -> u32 {
+    let in_memory = types.and_then(|t| Signature::parse_method(t).ok()).is_some_and(|sig| sig.ret.guest_returns_in_memory());
+    g.function_address(if in_memory { "objc_msgSend_stret" } else { "objc_msgSend" })
 }
 
 fn u32_at(g: &dyn GuestSide, addr: u32) -> u32 {
@@ -266,8 +276,6 @@ pub struct Bridge {
     buffers: HashMap<usize, (u32, u32)>,
     /// Host object -> guest copies of its `host-bytes` results.
     kept_copies: HashMap<usize, Vec<u32>>,
-    /// Guest address of the objc_msgSend stand-in (imp of framework Methods).
-    pub msg_send_stub: u32,
     /// Classes whose +initialize is running (on which thread) or done.
     init_state: HashMap<u32, InitState>,
     /// The game has a category +initialize on a framework class, so
@@ -299,7 +307,6 @@ impl Bridge {
             specials: HashMap::new(),
             buffers: HashMap::new(),
             kept_copies: HashMap::new(),
-            msg_send_stub: 0,
             init_state: HashMap::new(),
         })
     }
@@ -1024,19 +1031,18 @@ pub fn send_from_guest(
             Ok(GuestRet { r0: r as u32, r1: (r >> 32) as u32 })
         }
         Target::Host { class, meta, via_super } => {
-            // +instanceMethodForSelector: / -methodForSelector: of a game class:
-            // the game calls the answer itself, so it is the game's own function
-            // (for a framework method, objc_msgSend's stub, which reaches it alike).
+            // +instanceMethodForSelector: / -methodForSelector:: the game calls
+            // the answer itself, so it is guest code: a game method's own
+            // function, else objc_msgSend's stub (stret's for struct results),
+            // which reaches the method alike. (The host's answer is host code.)
             if matches!(name.as_str(), "instanceMethodForSelector:" | "methodForSelector:") {
                 let owner = if name == "instanceMethodForSelector:" { receiver } else { u32_at(g, receiver) };
-                if b.classes.class(owner).is_some() {
-                    let asked = b.selector_name(g, get(first + 2));
-                    let imp = match b.classes.lookup(owner, &asked) {
-                        Lookup::Guest(m) => m.imp,
-                        Lookup::Framework { .. } | Lookup::Missing => b.msg_send_stub,
-                    };
-                    return Ok(GuestRet { r0: imp, r1: 0 });
-                }
+                let asked = b.selector_name(g, get(first + 2));
+                let imp = match b.classes.lookup(owner, &asked) {
+                    Lookup::Guest(m) => m.imp,
+                    Lookup::Framework { .. } | Lookup::Missing => message_stub(g, FrameworkSelectors::builtin().get(&asked).map(|e| e.encoding)),
+                };
+                return Ok(GuestRet { r0: imp, r1: 0 });
             }
             // NSException's -raise and +raise:format: from game code: thrown in
             // the guest, as objc_exception_throw throws (the host's own raise

@@ -542,11 +542,11 @@ fn method(c: &Ctx, class: u32, sel: u32) -> Result<u64, String> {
     let found = if b.classes.class(class).is_some() {
         match b.classes.lookup(class, &name) {
             Lookup::Guest(m) => Some((m.imp, m.types.clone())),
-            Lookup::Framework { .. } => FrameworkSelectors::builtin().get(&name).map(|e| (b.msg_send_stub, e.encoding.to_string())),
+            Lookup::Framework { .. } => FrameworkSelectors::builtin().get(&name).map(|e| (super::bridge::message_stub(c.g, Some(e.encoding)), e.encoding.to_string())),
             Lookup::Missing => None,
         }
     } else {
-        FrameworkSelectors::builtin().get(&name).map(|e| (b.msg_send_stub, e.encoding.to_string()))
+        FrameworkSelectors::builtin().get(&name).map(|e| (super::bridge::message_stub(c.g, Some(e.encoding)), e.encoding.to_string()))
     };
     let Some((imp, types)) = found else { return ok(0) };
     let mut cache = METHODS.lock().unwrap_or_else(|e| e.into_inner());

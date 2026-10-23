@@ -412,6 +412,8 @@ fn method_for_selector_gives_the_games_own_function() {
         let meta = rt.classes[&class].partner;
         let sel = rt.sel("alloc");
         rt.add_method(meta, sel, alloc as usize);
+        let sel = rt.sel("bounds");
+        rt.add_method(class, sel, plain_root_bounds as usize);
         class
     };
     let _ = host_class;
@@ -444,7 +446,20 @@ fn method_for_selector_gives_the_games_own_function() {
     let object = call("objc_msgSend", &[class, sel("alloc")]);
     assert_eq!(call("objc_msgSend", &[class, sel("instanceMethodForSelector:"), sel("update:")]), 0x3101);
     assert_eq!(call("objc_msgSend", &[object, sel("methodForSelector:"), sel("update:")]), 0x3101);
-    bridge.lock().unwrap().msg_send_stub = 0x3201;
+    // A framework method: objc_msgSend's own stub, or for a struct result
+    // (CGRect, returned through a hidden first pointer) objc_msgSend_stret's.
     let stub = call("objc_msgSend", &[class, sel("instanceMethodForSelector:"), sel("description")]);
-    assert_eq!(stub, 0x3201, "a framework method: the stub");
+    assert_eq!((stub, g.function_at(stub).as_deref()), (g.function_address("objc_msgSend"), Some("objc_msgSend")));
+    let stret = call("objc_msgSend", &[object, sel("methodForSelector:"), sel("bounds")]);
+    assert_eq!(g.function_at(stret).as_deref(), Some("objc_msgSend_stret"), "a CGRect result");
+    // Called as the game calls it: result pointer, receiver, selector.
+    let result = g.alloc_permanent(16);
+    let w = |words: Vec<u32>| move |i: u32| words.get(i as usize).copied().unwrap_or(0);
+    call_function(&ctx, &g.function_at(stret).unwrap(), &w(vec![result, object, sel("bounds")])).unwrap();
+    let floats: Vec<f32> = (0..4).map(|i| f32::from_bits(g.u32_at(result + 4 * i))).collect();
+    assert_eq!(floats, [1.0, 2.0, 3.0, 4.0]);
+}
+
+extern "C" fn plain_root_bounds(_: Id, _: Sel) -> crate::fw::geometry::Rect {
+    crate::fw::geometry::Rect::new(1.0, 2.0, 3.0, 4.0)
 }

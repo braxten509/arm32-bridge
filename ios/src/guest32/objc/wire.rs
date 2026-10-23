@@ -47,6 +47,9 @@ impl GuestSide for Translator {
         let base = memory.host(0) as usize;
         (host >= base && host - base < 1 << 32).then(|| memory.guest(host as *const u8))
     }
+    fn function_address(&self, name: &str) -> u32 {
+        runtime::stub_for(name)
+    }
     fn call(&self, imp: u32, words: &[u32]) -> Result<u64, String> {
         let _gil = runtime::hold_gil();
         let current = CURRENT_UC.with(|c| c.get());
