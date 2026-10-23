@@ -1,6 +1,7 @@
 #!/bin/bash
 # Checks ApplePng.kt (Game Bridge) on the PC: a made-up Apple "crushed" PNG (CgBI chunk, raw deflate,
-# BGRA, premultiplied alpha, every PNG row filter) must come back as a normal PNG with the same pixels.
+# BGRA, premultiplied alpha, every PNG row filter) must come back as a normal PNG with the same pixels,
+# a normal PNG must stay as it is, and the game screen's pictures must be read that way.
 # Needs python3 with Pillow and the Kotlin compiler jars from the Gradle cache (kotlinc isn't installed).
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -56,13 +57,23 @@ EOF
 cat > "$WORK/Check.kt" <<'EOF'
 import java.io.File
 fun main(args: Array<String>) {
-    val fixed = dev.braxten.gamebridge.ApplePng.uncrush(File(args[0]).readBytes()) ?: error("not converted")
+    // The game's picture files are read through readable(), which uncrushes them and leaves normal ones alone.
+    val fixed = dev.braxten.gamebridge.ApplePng.readable(File(args[0]))
     File(args[1]).writeBytes(fixed)
+    val normal = File(args[2])
+    check(dev.braxten.gamebridge.ApplePng.readable(normal).contentEquals(normal.readBytes())) { "a normal PNG was changed" }
 }
 EOF
 java -cp "$COMPILER" org.jetbrains.kotlin.cli.jvm.K2JVMCompiler -no-stdlib -cp "$STDLIB" -d "$WORK/out.jar" \
     "$ROOT/android/app/src/main/java/dev/braxten/gamebridge/ApplePng.kt" "$WORK/Check.kt" 2>&1 | grep -v '^warning' || true
-java -cp "$WORK/out.jar:$STDLIB" CheckKt "$WORK/crushed.png" "$WORK/fixed.png"
+java -cp "$WORK/out.jar:$STDLIB" CheckKt "$WORK/crushed.png" "$WORK/fixed.png" "$WORK/expected.png"
+
+# The game screen's pictures (IosPicturesView) must be read the same way: Android can't read crushed ones,
+# so a plain decodeFile shows nothing for most of a game's pictures.
+VIEW=$ROOT/android/app/src/main/java/dev/braxten/gamebridge/IosPicturesView.kt
+if grep -q 'decodeFile' "$VIEW" || ! grep -q 'ApplePng.readable' "$VIEW"; then
+    echo "IosPicturesView reads picture files without ApplePng.readable" >&2; exit 1
+fi
 
 python3 -I - "$WORK" <<'EOF'
 import sys

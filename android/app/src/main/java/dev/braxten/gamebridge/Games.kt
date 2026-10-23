@@ -572,7 +572,7 @@ object Games {
         }.map { File(folder, it) }.filter { it.isFile }
         val files = listed.ifEmpty { folder.listFiles().orEmpty().filter { it.name.startsWith("Icon", true) && it.name.endsWith(".png", true) } }
         // Most games ship Apple's "crushed" PNGs, which Android can't read: ApplePng turns them back into normal ones.
-        fun png(file: File): ByteArray = file.readBytes().let { ApplePng.uncrush(it) ?: it }
+        fun png(file: File): ByteArray = ApplePng.readable(file)
         // Width from the PNG header; a crushed one has its 16-byte CgBI chunk before the header.
         fun width(file: File) = runCatching {
             val head = java.nio.ByteBuffer.wrap(file.inputStream().use { it.readNBytes(36) })
