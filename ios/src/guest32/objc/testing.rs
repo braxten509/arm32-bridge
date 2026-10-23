@@ -6,6 +6,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 pub const BASE: u32 = 0x10_0000;
+/// Where the made-up runtime functions' addresses start (no memory there).
+const FUNCTIONS: u32 = 0x9000_0000;
 const SIZE: usize = 0x10_0000;
 
 type Code = Arc<dyn Fn(&[u32]) -> u64 + Send + Sync>;
@@ -14,6 +16,7 @@ pub struct Fake {
     memory: *mut u8,
     next: Mutex<u32>,
     code: Mutex<HashMap<u32, Code>>,
+    functions: Mutex<Vec<String>>,
     pub freed: Mutex<Vec<u32>>,
 }
 
@@ -27,6 +30,7 @@ impl Fake {
             memory,
             next: Mutex::new(BASE + 0x1000),
             code: Mutex::new(HashMap::new()),
+            functions: Mutex::new(Vec::new()),
             freed: Mutex::new(Vec::new()),
         }))
     }
@@ -43,6 +47,11 @@ impl Fake {
         let at = self.alloc_permanent(words.len() as u32 * 4);
         self.put_words(at, words);
         at
+    }
+    /// The runtime function a `function_address` answer stands for.
+    pub fn function_at(&self, addr: u32) -> Option<String> {
+        let index = addr.checked_sub(FUNCTIONS)? / 8;
+        (addr % 8 == 0).then(|| self.functions.lock().unwrap().get(index as usize).cloned()).flatten()
     }
     pub fn text(&self, s: &str) -> u32 {
         let at = self.alloc_permanent(s.len() as u32 + 1);
@@ -78,6 +87,14 @@ impl GuestSide for Fake {
     fn guest_address(&self, host: usize) -> Option<u32> {
         let start = self.memory as usize;
         (host >= start && host < start + SIZE).then(|| BASE + (host - start) as u32)
+    }
+    fn function_address(&self, name: &str) -> u32 {
+        let mut functions = self.functions.lock().unwrap();
+        let index = functions.iter().position(|f| f == name).unwrap_or_else(|| {
+            functions.push(name.to_string());
+            functions.len() - 1
+        });
+        FUNCTIONS + index as u32 * 8
     }
     fn call(&self, imp: u32, words: &[u32]) -> Result<u64, String> {
         let code = self.code.lock().unwrap().get(&imp).cloned().ok_or(format!("no fake code at {imp:#x}"))?;

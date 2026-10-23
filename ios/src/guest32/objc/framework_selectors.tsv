@@ -5,11 +5,14 @@
 # How the list was made (2026-10-22): for each 32-bit game, the selectors in
 # __objc_selrefs minus every selector the game's own classes and categories
 # implement (`inspect <binary> --framework-selectors` in ios/guest32-image);
-# both lists merged and sorted. Selectors a game implements need no row: the
-# game's own method types are used. Encodings follow Apple's SDK headers for
-# armv7: id/Class/SEL/pointers/NSInteger/NSUInteger/long 4 bytes, CGFloat
-# float, BOOL signed char ('c'), NSTimeInterval double. Stack offsets are left
-# out ("v@:@" instead of "v12@0:4@8").
+# both lists merged and sorted. A selector the game implements needs no row
+# for the game's own calls (its method types are used), but it does need one
+# when a framework class answers that name too: the types are looked up by
+# selector name, and Apple's method may take a C float where the game's takes
+# a CGFloat (AVAudioPlayer's -setVolume:, below). Encodings follow Apple's
+# SDK headers for armv7: id/Class/SEL/pointers/NSInteger/NSUInteger/long are
+# 4 bytes, CGFloat float, BOOL signed char ('c'), NSTimeInterval double.
+# Stack offsets are left out ("v@:@" instead of "v12@0:4@8").
 #
 # Columns: selector, encoding (return type, then self, _cmd, arguments),
 # and an optional note:
@@ -26,15 +29,22 @@
 #   in-array     id-pointer arguments are arrays of as many ids as the last
 #                integer argument says, read before the call;
 #   out-array    the same, filled by the host (not read first).
+#   host-bytes   the result points to host bytes, as many as the integer
+#                out-parameter says: the guest gets its own copy, kept until
+#                the receiver is announced as finished
+#                (runtime::object_finished).
 # Several notes are separated by commas.
 #
 # A selector missing here stops the game with its name when a framework
 # object receives it (never guessed).
+abortParsing	v@:
 absoluteString	@@:
 acceleration	{CMAcceleration=ddd}@:	ambiguous:CMAccelerometerData
 accountsWithAccountType:	@@:@
 accountTypeWithAccountTypeIdentifier:	@@:@
 addArcWithCenter:radius:startAngle:endAngle:clockwise:	v@:{CGPoint=ff}fffc
+addAttribute:value:range:	v@:@@{_NSRange=II}
+addAttributes:range:	v@:@{_NSRange=II}
 addButtonWithTitle:	i@:@
 addCharactersInString:	v@:@
 addChildViewController:	v@:@
@@ -49,11 +59,15 @@ addSubview:	v@:@
 addTarget:action:forControlEvents:	v@:@:I
 addToRunLoop:forMode:	v@:@@
 addTransactionObserver:	v@:@
+adjustsImageWhenDisabled	c@:
+adjustsImageWhenHighlighted	c@:
 advertisingIdentifier	@@:
+alertViewStyle	i@:
 allHeaderFields	@@:
 allKeys	@@:
 allKeysForObject:	@@:@
 anyObject	@@:
+appendAttributedString:	v@:@
 appendBytes:length:	v@:r^vI
 appendData:	v@:@
 appendFormat:	v@:@	format
@@ -66,25 +80,39 @@ arrayWithContentsOfFile:	@@:@
 arrayWithObject:	@@:@
 arrayWithObjects:	@@:@	nil-list
 arrayWithObjects:count:	@@:^@I	in-array
+attribute:atIndex:effectiveRange:	@@:@I^{_NSRange=II}
+attributedText	@@:
+attributedTitleForState:	@@:I
+attributesAtIndex:effectiveRange:	@@:I^{_NSRange=II}
 authenticateWithCompletionHandler:	v@:@?
 autorelease	@@:
+awakeFromNib	v@:
+backgroundColor	@@:
+becomeFirstResponder	c@:
 beginAnimations:context:	v@:@^v
 beginBackgroundTaskWithExpirationHandler:	I@:@?
+beginTrackingWithTouch:withEvent:	c@:@@
 bezierPath	@@:
 blackColor	@@:
 boldSystemFontOfSize:	@@:f
 boolForKey:	c@:@
 boolValue	c@:
+borderStyle	i@:
 bounds	{CGRect={CGPoint=ff}{CGSize=ff}}@:
 bundleIdentifier	@@:
 bundlePath	@@:
+buttonTitleAtIndex:	@@:i
 buttonWithType:	@@:i
 bytes	r^v@:
+canBecomeFirstResponder	c@:
+cancelButtonIndex	i@:
 cancelPreviousPerformRequestsWithTarget:	v@:@
 cancelPreviousPerformRequestsWithTarget:selector:object:	v@:@:@
+cancelTrackingWithEvent:	v@:@
 canMakePayments	c@:
 canSendMail	c@:
 canSendTweet	c@:
+capInsets	{UIEdgeInsets=ffff}@:
 capitalizedString	@@:
 caseInsensitiveCompare:	i@:@
 ccTouchCancelled:withEvent:	v@:@@
@@ -102,6 +130,7 @@ characterIsMember:	c@:S
 characterSetWithRange:	@@:{_NSRange=II}
 class	#@:
 clearColor	@@:
+clipsToBounds	c@:
 code	i@:
 colorWithRed:green:blue:alpha:	@@:ffff
 commitAnimations	v@:
@@ -111,7 +140,9 @@ componentsFromLocaleIdentifier:	@@:@
 componentsJoinedByString:	@@:@
 componentsSeparatedByCharactersInSet:	@@:@
 componentsSeparatedByString:	@@:@
+containsValueForKey:	c@:@
 contentScaleFactor	f@:
+continueTrackingWithTouch:withEvent:	c@:@@
 convertPoint:toView:	{CGPoint=ff}@:{CGPoint=ff}@
 convertRect:fromView:	{CGRect={CGPoint=ff}{CGSize=ff}}@:{CGRect={CGPoint=ff}{CGSize=ff}}@
 convertRect:toView:	{CGRect={CGPoint=ff}{CGSize=ff}}@:{CGRect={CGPoint=ff}{CGSize=ff}}@
@@ -122,6 +153,7 @@ countByEnumeratingWithState:objects:count:	I@:^{NSFastEnumerationState=I^@^I[5I]
 createDirectoryAtPath:withIntermediateDirectories:attributes:error:	c@:@c@^@
 createFileAtPath:contents:attributes:	c@:@@@
 cStringUsingEncoding:	r*@:I
+currentAttributedTitle	@@:
 currentContext	@@:
 currentDevice	@@:
 currentHandler	@@:
@@ -131,6 +163,7 @@ currentRunLoop	@@:
 currentThread	@@:
 currentTime	d@:
 dataForKey:	@@:@
+dataFromPropertyList:format:errorDescription:	@@:@I^@
 dataUsingEncoding:	@@:I
 dataWithBytes:length:	@@:r^vI
 dataWithContentsOfFile:	@@:@
@@ -142,9 +175,15 @@ dateWithTimeIntervalSince1970:	@@:d
 dateWithTimeIntervalSinceNow:	@@:d
 decimalNumberWithString:	@@:@
 decodeBoolForKey:	c@:@
+decodeBytesForKey:returnedLength:	^C@:@^I	host-bytes
+decodeCGPointForKey:	{CGPoint=ff}@:@
+decodeCGRectForKey:	{CGRect={CGPoint=ff}{CGSize=ff}}@:@
+decodeCGSizeForKey:	{CGSize=ff}@:@
 decodeDoubleForKey:	d@:@
-decodeFloatForKey:	f@:@
+decodeFloatForKey:	f@:@	float
+decodeInt32ForKey:	i@:@
 decodeInt64ForKey:	q@:@
+decodeIntegerForKey:	i@:@
 decodeIntForKey:	i@:@
 decodeObjectForKey:	@@:@
 defaultCenter	@@:
@@ -170,6 +209,7 @@ didChangeValueForKey:	v@:@
 didMoveToParentViewController:	v@:@
 dismissModalViewControllerAnimated:	v@:c
 dismissViewControllerAnimated:completion:	v@:c@?
+dismissWithClickedButtonIndex:animated:	v@:ic
 displayLinkWithTarget:selector:	@@:@:
 distantFuture	@@:
 distantPast	@@:
@@ -188,12 +228,14 @@ encodeInt64:forKey:	v@:q@
 encodeInt:forKey:	v@:i@
 encodeObject:forKey:	v@:@@
 endBackgroundTask:	v@:I
+endTrackingWithTouch:withEvent:	v@:@@
 errorWithDomain:code:userInfo:	@@:@i@
 exceptionWithName:reason:userInfo:	@@:@@@
 fileExistsAtPath:	c@:@
 fileSystemRepresentation	r*@:
 fileURLWithPath:	@@:@
 finishTransaction:	v@:@
+firstOtherButtonIndex	i@:
 floatValue	f@:
 font	@@:
 fontWithName:size:	@@:@f
@@ -207,6 +249,7 @@ handleFailureInMethod:object:file:lineNumber:description:	v@::@@i@	format
 hash	I@:
 hasPrefix:	c@:@
 hasSuffix:	c@:@
+highlightedImage	@@:
 hour	i@:
 hudWasHidden:	v@:@
 identifier	@@:
@@ -219,6 +262,7 @@ infoDictionary	@@:
 initWithActivityIndicatorStyle:	@@:i
 initWithAPI:	@@:I
 initWithAPI:sharegroup:	@@:I@
+initWithAttributedString:	@@:@
 initWithBytes:length:	@@:r^vI
 initWithBytes:length:encoding:	@@:r^vII
 initWithBytesNoCopy:length:encoding:freeWhenDone:	@@:^vIIc
@@ -227,6 +271,8 @@ initWithCapacity:	@@:I
 initWithCategory:	@@:@
 initWithCGImage:	@@:^{CGImage=}
 initWithCGImage:scale:orientation:	@@:^{CGImage=}fi
+initWithCoder:	@@:@
+initWithContentsOfURL:	@@:@
 initWithContentsOfURL:error:	@@:@^@
 initWithCString:encoding:	@@:r*I
 initWithData:	@@:@
@@ -234,20 +280,26 @@ initWithData:encoding:	@@:@I
 initWithFloat:	@@:f	float
 initWithFormat:	@@:@	format
 initWithIdentifier:	@@:@
+initWithIdentifier:source:destination:	@@:@@@
 initWithImage:	@@:@
 initWithInt:	@@:i
 initWithNibName:bundle:	@@:@@
 initWithObjects:	@@:@	nil-list
+initWithProgressViewStyle:	@@:i
 initWithRed:green:blue:alpha:	@@:ffff
 initWithRequest:delegate:	@@:@@
 initWithRequest:delegate:startImmediately:	@@:@@c
 initWithString:	@@:@
+initWithString:attributes:	@@:@@
 initWithTitle:message:delegate:cancelButtonTitle:otherButtonTitles:	@@:@@@@@	nil-list
 initWithURL:cachePolicy:timeoutInterval:	@@:@Id
 initWithURL:parameters:requestMethod:	@@:@@i
 initWithWhite:alpha:	@@:ff
 insertObject:atIndex:	v@:@I
 instanceMethodForSelector:	^?@::
+instantiateInitialViewController	@@:
+instantiateViewControllerWithIdentifier:	@@:@
+instantiateWithOwner:options:	@@:@@
 integerValue	i@:
 intValue	i@:
 invalidate	v@:
@@ -255,25 +307,38 @@ invocationWithMethodSignature:	@@:@
 invoke	v@:
 isAbsolutePath	c@:
 isAuthenticated	c@:
+isEditing	c@:
+isEnabled	c@:
 isEqual:	c@:@
+isEqualToAttributedString:	c@:@
 isEqualToString:	c@:@
 isFileURL	c@:
 isFirstResponder	c@:
 isHidden	c@:
+isHighlighted	c@:
 isKindOfClass:	c@:#
 isMainThread	c@:
 isMultitaskingSupported	c@:
+isPlaying	c@:
+isSecureTextEntry	c@:
+isTouchInside	c@:
+isTracking	c@:
 isViewLoaded	c@:
+isVisible	c@:
 keyEnumerator	@@:
 keyWindow	@@:
 lastObject	@@:
 lastPathComponent	@@:
 layer	@@:
+leftCapWidth	i@:
 length	I@:
 lengthOfBytesUsingEncoding:	I@:I
 lineBreakMode	i@:
+lineNumber	i@:
 loadAchievementsWithCompletionHandler:	v@:@?
+loadNibNamed:owner:options:	@@:@@@
 loadRequest:	v@:@
+loadView	v@:
 localeIdentifier	@@:
 localizedDescription	@@:
 localizedFailureReason	@@:
@@ -288,16 +353,24 @@ mainBundle	@@:
 mainRunLoop	@@:
 mainScreen	@@:
 makeKeyAndVisible	v@:
+message	@@:
 methodForSelector:	^?@::
 methodSignatureForSelector:	@@::
+modalTransitionStyle	i@:
 moveItemAtPath:toPath:error:	c@:@@^@
 mutableCopy	@@:
+mutableString	@@:
 name	@@:
 new	@@:
 newlineCharacterSet	@@:
 nextObject	@@:
+nibBundle	@@:
+nibName	@@:
+nibWithData:bundle:	@@:@@
+nibWithNibName:bundle:	@@:@@
 null	@@:
 numberFromString:	@@:@
+numberOfButtons	i@:
 numberWithBool:	@@:c
 numberWithDouble:	@@:d
 numberWithFloat:	@@:f	float
@@ -314,6 +387,7 @@ openURL:	c@:@
 orangeColor	@@:
 originalTransaction	@@:
 parse	c@:
+parserError	@@:
 pasteboardWithName:create:	@@:@c
 path	@@:
 pathComponents	@@:
@@ -324,20 +398,25 @@ pathWithComponents:	@@:@
 payment	@@:
 paymentWithProductIdentifier:	@@:@
 percentComplete	d@:
+perform	v@:
 performBlock:waitUntilDone:	v@:@?c
 performBlock:withObject:waitUntilDone:	v@:@?@c
 performRequestWithHandler:	v@:@?
 performSegueWithIdentifier:sender:	v@:@@
 performSelector:	@@::
+performSelector:onThread:withObject:waitUntilDone:modes:	v@::@@c@
 performSelectorOnMainThread:withObject:waitUntilDone:	v@::@c
 performSelector:onThread:withObject:waitUntilDone:	v@::@@c
 performSelector:withObject:	@@::@
 performSelector:withObject:afterDelay:	v@::@d
 performSelector:withObject:withObject:	@@::@@
+placeholder	@@:
+play	c@:	ambiguous:AVAudioPlayer
 postNotification:	v@:@
 postNotificationName:object:	v@:@@
 postNotificationName:object:userInfo:	v@:@@@
 predicateWithFormat:	@@:@	format
+prepareForSegue:sender:	v@:@@
 prepareToPlay	c@:
 presentModalViewController:animated:	v@:@c
 presentRenderbuffer:	c@:I
@@ -345,6 +424,13 @@ presentViewController:animated:completion:	v@:@c@?
 price	@@:
 priceLocale	@@:
 productIdentifier	@@:
+progress	f@:
+progressImage	@@:
+progressTintColor	@@:
+progressViewStyle	i@:
+propertyList:isValidForFormat:	c@:@I
+propertyListFromData:mutabilityOption:format:errorDescription:	@@:@I^I^@
+propertyListWithData:options:format:error:	@@:@I^I^@
 proposedCredential	@@:
 proxyForJson	@@:
 raise:format:	v@:@@	format
@@ -355,6 +441,7 @@ reason	@@:
 redColor	@@:
 release	v@:
 reloadData	v@:
+removeAttribute:range:	v@:@{_NSRange=II}
 removeFromSuperview	v@:
 removeItemAtPath:error:	c@:@^@
 removeLastObject	v@:
@@ -366,12 +453,15 @@ removeObserver:	v@:@
 removeObserver:forKeyPath:	v@:@@
 removeObserver:name:object:	v@:@@@
 renderbufferStorage:fromDrawable:	c@:I@
+replaceCharactersInRange:withString:	v@:{_NSRange=II}@
 reportAchievementWithCompletionHandler:	v@:@?
 reportScoreWithCompletionHandler:	v@:@?
 requestAccessToAccountsWithType:withCompletionHandler:	v@:@@?
 requestWithURL:	@@:@
 requestWithURL:cachePolicy:timeoutInterval:	@@:@Id
+resignFirstResponder	c@:
 resizableImageWithCapInsets:	@@:{UIEdgeInsets=ffff}
+resizableImageWithCapInsets:resizingMode:	@@:{UIEdgeInsets=ffff}i
 resourceSpecifier	@@:
 respondsToSelector:	c@::
 restoreCompletedTransactions	v@:
@@ -389,8 +479,11 @@ scanString:intoString:	c@:@^@
 scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:	@@:d@:@c
 scheduleInRunLoop:forMode:	v@:@@
 scheme	@@:
+segueWithIdentifier:source:destination:performHandler:	@@:@@@@?
 selectRowAtIndexPath:animated:scrollPosition:	v@:@ci
 self	@@:
+sendAction:to:forEvent:	v@::@@
+sendActionsForControlEvents:	v@:I
 sender	@@:
 sendSubviewToBack:	v@:@
 set	@@:
@@ -399,6 +492,8 @@ setAccount:	v@:@
 setActive:error:	c@:c^@
 setActivityIndicatorViewStyle:	v@:i
 setAdjustsFontSizeToFitWidth:	v@:c
+setAdjustsImageWhenDisabled:	v@:c
+setAdjustsImageWhenHighlighted:	v@:c
 setAlertViewStyle:	v@:i
 setAllHTTPHeaderFields:	v@:@
 setAlpha:	v@:f
@@ -407,14 +502,23 @@ setAnimationDelegate:	v@:@
 setAnimationDidStopSelector:	v@::
 setAnimationDuration:	v@:d
 setArgument:atIndex:	v@:^vi
+setAttributedText:	v@:@
+setAttributedTitle:forState:	v@:@I
+setAttributes:range:	v@:@{_NSRange=II}
+setAutocapitalizationType:	v@:i
+setAutocorrectionType:	v@:i
 setAutoresizesSubviews:	v@:c
 setAutoresizingMask:	v@:I
+setBackgroundColor:	v@:@
 setBackgroundImage:forState:	v@:@I
 setBool:forKey:	v@:c@
+setBorderStyle:	v@:i
 setBounds:	v@:{CGRect={CGPoint=ff}{CGSize=ff}}
 setCachePolicy:	v@:I
+setCancelButtonIndex:	v@:i
 setCategory:error:	c@:@^@
 setCenter:	v@:{CGPoint=ff}
+setClearsOnBeginEditing:	v@:c
 setClipsToBounds:	v@:c
 setCompletionHandler:	v@:@?
 setContentMode:	v@:i
@@ -426,24 +530,31 @@ setData:forPasteboardType:	v@:@@
 setDateFormat:	v@:@
 setDictionary:	v@:@
 setDrawableProperties:	v@:@
+setEnabled:	v@:c
 setFill	v@:
+setFloat:forKey:	v@:f@	float
 setFont:	v@:@
 setFormatterBehavior:	v@:I
 setFrame:	v@:{CGRect={CGPoint=ff}{CGSize=ff}}
 setFrameInterval:	v@:i
 setGameCenterDelegate:	v@:@
 setHidden:	v@:c
+setHighlighted:	v@:c
+setHighlightedImage:	v@:@
 setHTTPBody:	v@:@
 setHTTPMethod:	v@:@
 setHTTPShouldHandleCookies:	v@:c
 setImage:	v@:@
 setImage:forState:	v@:@I
 setInitialText:	c@:@
+setKeyboardType:	v@:i
 setLineCapStyle:	v@:i
 setLineWidth:	v@:f
 setLocale:	v@:@
 setMailComposeDelegate:	v@:@
+setMessage:	v@:@
 setMessageBody:isHTML:	v@:@c
+setModalTransitionStyle:	v@:i
 setMultipleTouchEnabled:	v@:c
 setNeedsDisplay	v@:
 setNeedsLayout	v@:
@@ -454,13 +565,24 @@ setObject:atIndexedSubscript:	v@:@I
 setObject:forKey:	v@:@@
 setObject:forKeyedSubscript:	v@:@@
 setOpaque:	v@:c
+setPan:	v@:f	float
 setPercentComplete:	v@:d
 setPersistent:	v@:c
+setPlaceholder:	v@:@
 setPredicate:	v@:@
+setProgress:	v@:f	float
+setProgress:animated:	v@:fc	float
 setProgressImage:	v@:@
+setProgressTintColor:	v@:@
+setProgressViewStyle:	v@:i
+setRate:	v@:f	float
+setRemoteParticipantVolume:	v@:f	float
+setReturnKeyType:	v@:i
 setRootViewController:	v@:@
 setSearchScopes:	v@:@
+setSecureTextEntry:	v@:c
 setSelector:	v@::
+setShadowOpacity:	v@:f	float
 setShouldProcessNamespaces:	v@:c
 setShouldReportNamespacePrefixes:	v@:c
 setShouldResolveExternalEntities:	v@:c
@@ -469,18 +591,25 @@ setShowsTouchWhenHighlighted:	v@:c
 setStatusBarHidden:	v@:c
 setStroke	v@:
 setSubject:	v@:@
+setTag:	v@:i
 setTarget:	v@:@
 setText:	v@:@
+setTextAlignment:	v@:i
+setTextColor:	v@:@
 setTitle:	v@:@
 setTitleColor:forState:	v@:@I
 setTitle:forState:	v@:@I
 setToRecipients:	v@:@
 setTrackImage:	v@:@
+setTrackTintColor:	v@:@
 setTransform:	v@:{CGAffineTransform=ffffff}
 setValue:	v@:f	float,ambiguous:UISlider
 setValue:forHTTPHeaderField:	v@:@@
 setValue:forKey:	v@:@@
 setView:	v@:@
+setVolume:	v@:f	float
+setVolume:atTime:	v@:f{?=qiIq}	float
+setVolumeRampFromStartVolume:toEndVolume:timeRange:	v@:ff{?={?=qiIq}{?=qiIq}}	float
 setWithCapacity:	@@:I
 setWithObjects:	@@:@	nil-list
 sharedAccelerometer	@@:
@@ -488,6 +617,7 @@ sharedApplication	@@:
 sharedHTTPCookieStorage	@@:
 sharedInstance	@@:
 sharegroup	@@:
+shouldPerformSegueWithIdentifier:sender:	c@:@@
 sizeToFit	v@:
 sizeWithFont:	{CGSize=ff}@:@
 sizeWithFont:constrainedToSize:	{CGSize=ff}@:@{CGSize=ff}
@@ -497,6 +627,7 @@ sleepForTimeInterval:	v@:d
 smallSystemFontSize	f@:
 sortedArrayUsingComparator:	@@:@?
 sortedArrayUsingSelector:	@@::
+sourceViewController	@@:
 standardUserDefaults	@@:
 startAccelerometerUpdatesToQueue:withHandler:	v@:@@?
 startAnimating	v@:
@@ -506,6 +637,9 @@ statusBarOrientation	i@:
 statusBarOrientationAnimationDuration	d@:
 stopAccelerometerUpdates	v@:
 stopAnimating	v@:
+storyboard	@@:
+storyboardWithName:bundle:	@@:@@
+stretchableImageWithLeftCapWidth:topCapHeight:	@@:ii
 stringByAppendingFormat:	@@:@	format
 stringByAppendingPathComponent:	@@:@
 stringByAppendingPathExtension:	@@:@
@@ -536,13 +670,22 @@ superview	@@:
 synchronize	c@:
 systemFontOfSize:	@@:f
 systemVersion	@@:
+tag	i@:
 text	@@:
 textFieldAtIndex:	@@:i
 timeIntervalSince1970	d@:
 timeIntervalSinceDate:	d@:@
 timeIntervalSinceNow	d@:
 timestamp	d@:
+titleForState:	@@:I
+topCapHeight	i@:
 topViewController	@@:
+touchesBegan:withEvent:	v@:@@
+touchesCancelled:withEvent:	v@:@@
+touchesEnded:withEvent:	v@:@@
+touchesMoved:withEvent:	v@:@@
+trackImage	@@:
+trackTintColor	@@:
 transactionState	i@:
 tryLock	c@:
 unarchiveObjectWithFile:	@@:@
@@ -563,6 +706,10 @@ valueForAttribute:	@@:@
 valueForKey:	@@:@
 valueForPasteboardType:	@@:@
 view	@@:
+viewDidAppear:	v@:c
+viewDidDisappear:	v@:c
+viewWillAppear:	v@:c
+viewWillDisappear:	v@:c
 visibleRect	{CGRect={CGPoint=ff}{CGSize=ff}}@:
 whiteColor	@@:
 whitespaceCharacterSet	@@:

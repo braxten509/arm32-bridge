@@ -30,6 +30,9 @@ pub struct FrameworkSelector {
     pub varargs: Varargs,
     pub real_float: bool,
     pub arrays: IdArrays,
+    /// The result points to host bytes, as many as the integer
+    /// out-parameter says (`host-bytes`).
+    pub host_bytes: bool,
 }
 
 pub struct FrameworkSelectors {
@@ -74,7 +77,8 @@ impl FrameworkSelectors {
             } else {
                 IdArrays::None
             };
-            let entry = FrameworkSelector { encoding, signature, varargs, real_float: notes.contains(&"float"), arrays };
+            let (real_float, host_bytes) = (notes.contains(&"float"), notes.contains(&"host-bytes"));
+            let entry = FrameworkSelector { encoding, signature, varargs, real_float, arrays, host_bytes };
             if map.insert(selector, entry).is_some() {
                 return Err(format!("line {}: {selector} is listed twice", number + 1));
             }

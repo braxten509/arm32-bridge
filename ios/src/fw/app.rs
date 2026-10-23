@@ -50,6 +50,10 @@ extern "C" fn ui_application_main(_argc: i32, _argv: usize, principal: Id, deleg
     let class_name = lock().class_name(delegate_class);
     crate::log!("UIApplicationMain: app {app:#x}, delegate {class_name} {delegate_object:#x}");
 
+    // Apple's launch order: the main storyboard (window, root view
+    // controller) first, then willFinish..., didFinish..., and the window
+    // is shown after them unless the app showed one.
+    let storyboard_window = crate::fw::storyboard::load_main_interface(delegate_object);
     for name in ["application:willFinishLaunchingWithOptions:", "application:didFinishLaunchingWithOptions:"] {
         if let Some(imp) = runtime::imp_for(delegate_object, runtime::sel(name)) {
             let place = crate::loader::describe_address(imp);
@@ -70,6 +74,7 @@ extern "C" fn ui_application_main(_argc: i32, _argv: usize, principal: Id, deleg
             runtime::send(delegate_object, "applicationDidFinishLaunching:", &[app]);
         }
     }
+    crate::fw::storyboard::show_main_window(delegate_object, storyboard_window);
     crate::fw::foundation::post("UIApplicationDidFinishLaunchingNotification", app, 0);
     if runtime::responds(delegate_object, "applicationDidBecomeActive:") {
         crate::log!("calling -[{class_name} applicationDidBecomeActive:]");
@@ -79,6 +84,7 @@ extern "C" fn ui_application_main(_argc: i32, _argv: usize, principal: Id, deleg
     let seconds: f64 = std::env::var("IOS_RUN_SECONDS").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
     crate::report::reached_run_loop();
     crate::fw::touch::schedule_test_taps();
+    crate::fw::typing::schedule_test_typing();
     if seconds > 0.0 {
         crate::log!("run loop running for {seconds} s");
         let end = {

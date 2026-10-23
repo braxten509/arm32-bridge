@@ -759,6 +759,10 @@ extern "C" fn file_system_representation(this: Id, s: Sel) -> usize {
     utf8_string(this, s)
 }
 
+extern "C" fn is_absolute_path(this: Id, _: Sel) -> bool {
+    get(this).starts_with(['/', '~'])
+}
+
 extern "C" fn by_standardizing_path(this: Id, _: Sel) -> Id {
     this
 }
@@ -853,6 +857,7 @@ pub fn register(r: &mut Registry) {
             ("stringByDeletingLastPathComponent", by_deleting_last_path_component as usize),
             ("pathExtension", path_extension as usize),
             ("stringByDeletingPathExtension", by_deleting_path_extension as usize),
+            ("isAbsolutePath", is_absolute_path as usize),
             ("stringByStandardizingPath", by_standardizing_path as usize),
             ("stringByExpandingTildeInPath", by_standardizing_path as usize),
             ("componentsSeparatedByString:", components_separated_by_string as usize),
@@ -899,5 +904,14 @@ mod tests {
         assert!(crate::objc::runtime::responds(text, "capitalizedString"), "-[NSString capitalizedString] is missing");
         let result = crate::objc::runtime::send(text, "capitalizedString", &[]);
         assert_eq!(get(result), "Hello World\tFoo-bar\nSuccess 1st");
+    }
+
+    /// Paths from the root or the home folder (~) are absolute.
+    #[test]
+    fn paths_from_the_root_or_home_are_absolute() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let absolute = |path: &str| crate::objc::runtime::send(make(path), "isAbsolutePath", &[]) as u8 != 0;
+        assert_eq!([absolute("/a/b.tmx"), absolute("~/a"), absolute("a/b.tmx"), absolute("")], [true, true, false, false]);
     }
 }

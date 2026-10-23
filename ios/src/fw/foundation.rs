@@ -681,7 +681,10 @@ pub fn register(r: &mut Registry) {
         "NSMetadataQueryUbiquitousDocumentsScope",
         "NSMetadataQueryUbiquitousDataScope",
         "NSURLUbiquitousItemIsDownloadedKey",
-    ] {
+    ]
+    .into_iter()
+    .chain(crate::fw::typing::NOTIFICATIONS)
+    {
         named_constant(r, name);
     }
     for (name, value) in [

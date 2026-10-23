@@ -48,6 +48,8 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
     private var videoLeftAt = -1
     /** The game's UIKit pictures, drawn over the game and its video. */
     private lateinit var pictures: IosPicturesView
+    /** Takes the phone keyboard's letters while the game edits text. */
+    private lateinit var keyboard: KeyboardInput
     /** The pipe the "game stopped" byte comes down, kept so it stays open. */
     private var stopPipe: ParcelFileDescriptor? = null
 
@@ -62,7 +64,11 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
         root.addView(view)
         pictures = IosPicturesView(this)
         root.addView(pictures)
+        keyboard = KeyboardInput(this) { if (started) nativeType(it) }
+        root.addView(keyboard, FrameLayout.LayoutParams(1, 1))
         setContentView(root)
+        // The keyboard covers the game's lower part; the game's window keeps its size.
+        window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING)
         useTopRefreshRate()
         window.insetsController?.let {
             it.hide(WindowInsets.Type.systemBars())
@@ -282,6 +288,12 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
         runOnUiThread { pictures.show(list) }
     }
 
+    /** Called by the game (any thread): it started (true) or stopped (false) editing text. */
+    @Suppress("unused")
+    fun showKeyboard(up: Boolean) {
+        runOnUiThread { keyboard.show(up) }
+    }
+
     /** Called by the game (any thread): hold the video where it is. */
     @Suppress("unused")
     fun pauseVideo(token: Long) {
@@ -325,6 +337,7 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
 
     private external fun nativeStart(surface: android.view.Surface, app: String, home: String, width: Int, height: Int): Boolean
     private external fun nativeTouch(finger: Int, phase: Int, x: Float, y: Float)
+    private external fun nativeType(text: String)
     private external fun nativeResize(width: Int, height: Int)
     private external fun nativePause()
     private external fun nativeNoticeFd(): Int

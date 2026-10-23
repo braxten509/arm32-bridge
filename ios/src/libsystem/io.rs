@@ -404,10 +404,40 @@ pub fn sysctl_name(parts: &[i32]) -> Option<&'static str> {
     }
 }
 
+/// A numeric entry whose answer depends on the numbers: an interface's
+/// link-level address (CTL_NET, PF_ROUTE, 0, AF_LINK, NET_RT_IFLIST,
+/// index), as games read the "MAC address".
+pub fn sysctl_numeric(parts: &[i32]) -> Option<Vec<u8>> {
+    let [4, 17, 0, 18, 3, index] = *parts else { return None };
+    // struct if_msghdr (the same on armv7 and arm64): length, version 5,
+    // RTM_IFINFO, addresses RTA_IFP, flags up/broadcast/running/multicast, index.
+    let mut entry = vec![0u8; 112];
+    entry[2] = 5;
+    entry[3] = 0xe;
+    entry[4..8].copy_from_slice(&0x10i32.to_le_bytes());
+    entry[8..12].copy_from_slice(&0x8863i32.to_le_bytes());
+    entry[12..14].copy_from_slice(&(index as u16).to_le_bytes());
+    // struct sockaddr_dl: length 20, AF_LINK, index, IFT_ETHER, "en0" then the
+    // address iOS has given apps since iOS 7.
+    let mut link = vec![20, 18];
+    link.extend((index as u16).to_le_bytes());
+    link.extend([6, 3, 6, 0]);
+    link.extend(b"en0");
+    link.extend([2, 0, 0, 0, 0, 0]);
+    link.extend([0; 3]);
+    entry.extend(link);
+    let length = entry.len() as u16;
+    entry[0..2].copy_from_slice(&length.to_le_bytes());
+    Some(entry)
+}
+
 extern "C" fn ios_sysctl(mib: *const i32, count: u32, old: *mut u8, old_length: *mut usize, _new: usize, _new_length: usize) -> i32 {
     let parts: Vec<i32> = (0..count as usize).map(|i| unsafe { *mib.add(i) }).collect();
     if let Some(name) = sysctl_name(&parts) {
         return unsafe { answer(&sysctl_value(name).unwrap(), old, old_length) };
+    }
+    if let Some(value) = sysctl_numeric(&parts) {
+        return unsafe { answer(&value, old, old_length) };
     }
     if let [1, 14, ..] = parts.as_slice() {
         // Process information (used to check for a debugger): all zero = not traced.
@@ -511,4 +541,23 @@ pub fn register(r: &mut Registry) {
     r.function("getprogname", ios_getprogname as usize);
     r.function("_NSGetExecutablePath", ios_ns_get_executable_path as usize);
     r.function("gethostname", ios_gethostname as usize);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An interface's link address entry: an if_msghdr (112 bytes) then a
+    /// sockaddr_dl naming en0 with the address iOS gives apps (02:00:00:00:00:00).
+    #[test]
+    fn the_link_address_entry_reads_like_darwins() {
+        let entry = sysctl_numeric(&[4, 17, 0, 18, 3, 2]).expect("an answer");
+        assert_eq!(u16::from_le_bytes([entry[0], entry[1]]) as usize, entry.len());
+        assert_eq!(&entry[12..14], &2u16.to_le_bytes(), "the interface's index");
+        let link = &entry[112..];
+        assert_eq!((link[1], link[5], link[6]), (18, 3, 6), "AF_LINK, name and address lengths");
+        assert_eq!(&link[8..11], b"en0");
+        assert_eq!(&link[11..17], &[2, 0, 0, 0, 0, 0]);
+        assert!(sysctl_numeric(&[4, 17, 0, 18, 1, 2]).is_none());
+    }
 }

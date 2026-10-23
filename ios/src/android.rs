@@ -87,6 +87,7 @@ pub unsafe extern "C" fn Java_dev_braxten_gamebridge_IosGameActivity_nativeStart
         *JAVA.lock().unwrap() = Some((vm as usize, activity as usize));
         crate::fw::media::set_video_screen(crate::fw::media::VideoScreen { show: show_video, pause: pause_video, resume: resume_video, stop: stop_video });
         crate::fw::pictures::set_picture_screen(crate::fw::pictures::PictureScreen { show: show_pictures });
+        crate::fw::typing::set_keyboard_screen(show_keyboard);
     }
     crate::log!("phone app: starting {app} ({width}x{height} window)");
     let started = std::thread::Builder::new().name("ios-main".into()).stack_size(16 << 20).spawn(move || {
@@ -209,6 +210,13 @@ pub extern "C" fn Java_dev_braxten_gamebridge_IosGameActivity_nativeTouch(
     };
     let (window_width, window_height) = (WINDOW_WIDTH.load(Ordering::Relaxed) as f32, WINDOW_HEIGHT.load(Ordering::Relaxed) as f32);
     crate::fw::touch::deliver(finger, phase, x, y, window_width, window_height);
+}
+
+/// The game is editing text (true) or stopped (false): the phone's keyboard comes up or goes.
+fn show_keyboard(up: bool) {
+    unsafe {
+        call_activity(c"showKeyboard", c"(Z)V", &[jvalue { z: up as jboolean }]);
+    }
 }
 
 /// Detaches a thread this bridge attached to Java, when the thread ends.

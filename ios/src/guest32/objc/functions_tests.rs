@@ -399,3 +399,67 @@ fn a_game_objects_dealloc_releases_its_associated_objects_and_clears_weak_refere
     assert_eq!(call("objc_loadWeak", &[moved_to]), 0, "including a moved one");
     assert_eq!(call("objc_loadWeak", &[other]), survivor, "a weak reference to another object stays");
 }
+
+/// +instanceMethodForSelector: and -methodForSelector: of a game class give
+/// the game's own function, which the game then calls itself (cocos2d's
+/// scheduler does); a framework method gives objc_msgSend's stub, which
+/// reaches it the same way.
+#[test]
+fn method_for_selector_gives_the_games_own_function() {
+    let host_class = {
+        let mut rt = runtime::lock();
+        let class = rt.define_class("G32PlainRoot", 0, 16);
+        let meta = rt.classes[&class].partner;
+        let sel = rt.sel("alloc");
+        rt.add_method(meta, sel, alloc as usize);
+        let sel = rt.sel("bounds");
+        rt.add_method(class, sel, plain_root_bounds as usize);
+        class
+    };
+    let _ = host_class;
+    let g = Fake::new();
+    let (class, meta) = (g.alloc_permanent(20), g.alloc_permanent(20));
+    g.put_words(class, &[meta]);
+    let md = ObjcMetadata32 {
+        classes: vec![ObjcClass32 {
+            address: class,
+            name: "G32Timer".into(),
+            superclass: ClassTarget::External("G32PlainRoot".into()),
+            meta_address: meta,
+            meta_isa: ClassTarget::External("G32PlainRoot".into()),
+            meta_superclass: ClassTarget::External("G32PlainRoot".into()),
+            instance: ClassRo32 { instance_start: 8, instance_size: 8, ..Default::default() },
+            meta: ClassRo32 { flags: 1, ..Default::default() },
+        }],
+        ..Default::default()
+    };
+    let bridge: &'static Mutex<Bridge> = Box::leak(Box::new(Mutex::new(Bridge::new(&md).unwrap())));
+    install(bridge, g, &md).unwrap();
+    let ctx = Ctx { bridge, g };
+    let call = |name: &str, words: &[u32]| {
+        let w = |i: u32| words.get(i as usize).copied().unwrap_or(0);
+        call_function(&ctx, name, &w).unwrap() as u32
+    };
+    let sel = |name: &str| bridge.lock().unwrap().guest_selector(g, name);
+    g.code(0x3101, |w| u64::from(w[2]) * 2);
+    assert_eq!(call("class_addMethod", &[class, sel("update:"), 0x3101, g.text("v12@0:4f8")]), 1);
+    let object = call("objc_msgSend", &[class, sel("alloc")]);
+    assert_eq!(call("objc_msgSend", &[class, sel("instanceMethodForSelector:"), sel("update:")]), 0x3101);
+    assert_eq!(call("objc_msgSend", &[object, sel("methodForSelector:"), sel("update:")]), 0x3101);
+    // A framework method: objc_msgSend's own stub, or for a struct result
+    // (CGRect, returned through a hidden first pointer) objc_msgSend_stret's.
+    let stub = call("objc_msgSend", &[class, sel("instanceMethodForSelector:"), sel("description")]);
+    assert_eq!((stub, g.function_at(stub).as_deref()), (g.function_address("objc_msgSend"), Some("objc_msgSend")));
+    let stret = call("objc_msgSend", &[object, sel("methodForSelector:"), sel("bounds")]);
+    assert_eq!(g.function_at(stret).as_deref(), Some("objc_msgSend_stret"), "a CGRect result");
+    // Called as the game calls it: result pointer, receiver, selector.
+    let result = g.alloc_permanent(16);
+    let w = |words: Vec<u32>| move |i: u32| words.get(i as usize).copied().unwrap_or(0);
+    call_function(&ctx, &g.function_at(stret).unwrap(), &w(vec![result, object, sel("bounds")])).unwrap();
+    let floats: Vec<f32> = (0..4).map(|i| f32::from_bits(g.u32_at(result + 4 * i))).collect();
+    assert_eq!(floats, [1.0, 2.0, 3.0, 4.0]);
+}
+
+extern "C" fn plain_root_bounds(_: Id, _: Sel) -> crate::fw::geometry::Rect {
+    crate::fw::geometry::Rect::new(1.0, 2.0, 3.0, 4.0)
+}

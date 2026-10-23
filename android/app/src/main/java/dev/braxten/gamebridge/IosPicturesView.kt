@@ -20,7 +20,10 @@ class IosPicturesView(context: Context) : View(context) {
     private class Picture(
         /** The view's own points to screen points. */
         val place: Matrix,
-        val area: RectF, val alpha: Float, val mode: Int, val width: Float, val height: Float, val path: String,
+        val area: RectF, val alpha: Float, val mode: Int, val width: Float, val height: Float,
+        /** The screen area (points) it may draw in: its clipping views' bounds. */
+        val clip: RectF,
+        val path: String,
     )
 
     private var screenWidth = 0f
@@ -37,12 +40,13 @@ class IosPicturesView(context: Context) : View(context) {
         screenWidth = screen.getOrNull(0)?.toFloatOrNull() ?: return
         screenHeight = screen.getOrNull(1)?.toFloatOrNull() ?: return
         pictures = lines.drop(1).mapNotNull { line ->
-            val f = line.split('\t', limit = 13)
-            if (f.size < 13) return@mapNotNull null
-            val n = f.take(12).map { it.toFloatOrNull() ?: return@mapNotNull null }
+            val f = line.split('\t', limit = 17)
+            if (f.size < 17) return@mapNotNull null
+            val n = f.take(16).map { it.toFloatOrNull() ?: return@mapNotNull null }
             // a, b, c, d, tx, ty as Apple writes them: x' = a x + c y + tx, y' = b x + d y + ty.
             val place = Matrix().apply { setValues(floatArrayOf(n[0], n[2], n[4], n[1], n[3], n[5], 0f, 0f, 1f)) }
-            Picture(place, RectF(0f, 0f, n[6], n[7]), n[8], n[9].toInt(), n[10], n[11], f[12])
+            val clip = RectF(n[12], n[13], n[12] + n[14], n[13] + n[15])
+            Picture(place, RectF(0f, 0f, n[6], n[7]), n[8], n[9].toInt(), n[10], n[11], clip, f[16])
         }
         // Pictures no longer shown are let go of.
         val shown = pictures.map { it.path }.toSet()
@@ -69,6 +73,7 @@ class IosPicturesView(context: Context) : View(context) {
             canvas.save()
             canvas.translate(left, top)
             canvas.scale(scale, scale)
+            canvas.clipRect(picture.clip)
             canvas.concat(picture.place)
             when (picture.mode) {
                 0 -> canvas.drawBitmap(bitmap, source, area, paint)

@@ -1121,6 +1121,14 @@ extern "C" fn player_play(this: Id, _: Sel) -> bool {
     player.ensure_worker();
     player.playing.store(true, Ordering::Relaxed);
     player.wake.notify_all();
+    // The music players report themselves once, so a log says whether a
+    // game's background music started and how loud it is set.
+    static FIRST: std::sync::Once = std::sync::Once::new();
+    FIRST.call_once(|| {
+        let volume = f32::from_bits(player.volume.load(Ordering::Relaxed));
+        let loops = player.queue().loops;
+        crate::log!("music: first player playing (volume {volume}, loops {loops})");
+    });
     true
 }
 

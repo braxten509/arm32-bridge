@@ -1,6 +1,7 @@
 //! Stand-ins for Apple's Foundation and UIKit classes.
 
 pub mod app;
+pub mod attributed;
 pub mod cfbridge;
 pub mod audiofile;
 pub mod extaudiofile;
@@ -30,12 +31,14 @@ pub mod keychain;
 pub mod locks;
 pub mod media;
 pub mod misc;
+pub mod nib;
 pub mod numbers;
 pub mod object;
 pub mod paths;
 pub mod photos;
 pub mod pictures;
 pub mod plist;
+pub mod progress;
 pub mod png;
 pub mod pvrtc;
 pub mod regex;
@@ -44,28 +47,39 @@ pub mod runloop;
 pub mod smallclasses;
 pub mod sqlite;
 pub mod storekit;
+pub mod storyboard;
 pub mod services;
 pub mod sound;
 pub mod string;
 pub mod system;
+pub mod tables;
 pub mod touch;
+pub mod typing;
 pub mod uikit;
 pub mod unavailable;
 pub mod web;
+pub mod xml;
 
 use crate::symbols::Registry;
 
 pub fn register(r: &mut Registry) {
     object::define(r);
     string::register(r);
+    attributed::register(r);
     collections::register(r);
     data::register(r);
+    plist::register(r);
     misc::register(r);
     foundation::register(r);
     app::register(r);
     uikit::register(r);
     controls::register(r);
+    progress::register(r);
+    typing::register(r);
+    tables::register(r);
+    nib::register(r);
     unavailable::register(r);
+    storyboard::register(r);
     graphics::register(r);
     runloop::register(r);
     media::register(r);
@@ -75,6 +89,7 @@ pub fn register(r: &mut Registry) {
     files::register(r);
     services::register(r);
     web::register(r);
+    xml::register(r);
     sqlite::register(r);
     regex::register(r);
     locks::register(r);
