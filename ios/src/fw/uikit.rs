@@ -115,30 +115,50 @@ pub fn screen_points() -> (f64, f64, f64) {
         let files: Vec<String> = std::fs::read_dir(&app_dir)
             .map(|list| list.filter_map(|e| e.ok()?.file_name().into_string().ok()).collect())
             .unwrap_or_default();
-        let aspect = app_aspect(display, info.as_ref(), &files);
-        let (w, h) = fit_points(display, aspect);
-        crate::log!("screen: display {}x{}, app shape {aspect:.3}, told {w}x{h} points at {SCALE}x", display.0, display.1);
-        (w, h, SCALE)
+        let unreal = std::path::Path::new(&format!("{app_dir}/CookedIPhone")).is_dir();
+        let (w, h, scale) = told_screen(display, info.as_ref(), &files, unreal);
+        crate::log!("screen: display {}x{}, told {w}x{h} points at {scale}x", display.0, display.1);
+        (w, h, scale)
     })
 }
 
-/// The scale every screen is reported at (an iPhone 5s, the device the
-/// games are told they run on).
+/// The screen an app is told it has on this display (points, scale).
+/// Apps with a launch storyboard fill the display at its own pixels, and
+/// so do Unreal games (`unreal`: the app has CookedIPhone/), which draw well
+/// at any size. Other old apps get the screen of a real iPhone of their
+/// shape (an iPhone 5's 568x320 for Default-568h), as iOS gives them on
+/// newer iPhones: some only know those exact sizes (TownCraft says "unknown
+/// device" and draws nothing at others). The window stretches the picture.
+fn told_screen(display: (f64, f64), info: Option<&crate::fw::plist::Value>, files: &[String], unreal: bool) -> (f64, f64, f64) {
+    let aspect = app_aspect(display, info, files);
+    if has_storyboard(info) || unreal {
+        let (w, h) = fit_points(display, aspect);
+        return (w, h, SCALE);
+    }
+    let (long, short) = launch_sizes(info, files)
+        .into_iter()
+        .filter(|&(long, short)| (long / short - aspect).abs() < 1e-9)
+        .fold((480.0, 320.0), |best, size| if size.0 > best.0 { size } else { best });
+    // The Plus and X iPhones (736 and 812 points long) are 3x screens.
+    let scale = if long == 736.0 || long == 812.0 { 3.0 } else { 2.0 };
+    (long, short, scale)
+}
+
+/// The scale screens are reported at when they fill the display (an
+/// iPhone 5s's).
 const SCALE: f64 = 2.0;
 
-/// The widest landscape shape (long side / short side) this app said it
-/// can fill, as iOS decides it: an app with a launch storyboard fills any
-/// screen; otherwise it gets the tallest iPhone launch image it ships
-/// (Default-568h@2x.png, or a UILaunchImages size), and with none a 3:2
-/// screen (the 3.5-inch iPhones), with black bars around it.
-fn app_aspect(display: (f64, f64), info: Option<&crate::fw::plist::Value>, files: &[String]) -> f64 {
-    use crate::fw::plist::Value;
-    let display_aspect = display.0.max(display.1) / display.0.min(display.1);
+fn has_storyboard(info: Option<&crate::fw::plist::Value>) -> bool {
     let has = |key: &str| info.and_then(|i| i.get(key)).is_some();
-    if has("UILaunchStoryboardName") || has("UILaunchStoryboardName~iphone") {
-        return display_aspect;
-    }
-    let mut shapes: Vec<f64> = vec![1.5];
+    has("UILaunchStoryboardName") || has("UILaunchStoryboardName~iphone")
+}
+
+/// The iPhone screens (long side, short side in points) an old app ships
+/// launch images for (Default-568h@2x.png, or UILaunchImages sizes), plus
+/// the 3.5-inch iPhones' 480x320 every app can run on.
+fn launch_sizes(info: Option<&crate::fw::plist::Value>, files: &[String]) -> Vec<(f64, f64)> {
+    use crate::fw::plist::Value;
+    let mut sizes: Vec<(f64, f64)> = vec![(480.0, 320.0)];
     // Default-568h@2x.png style names: the long side in points, iPhones
     // with that height have these short sides.
     for name in files {
@@ -154,7 +174,7 @@ fn app_aspect(display: (f64, f64), info: Option<&crate::fw::plist::Value>, files
             736 | 896 => 414.0,
             _ => continue,
         };
-        shapes.push(long / short);
+        sizes.push((long, short));
     }
     // UILaunchImages: [{UILaunchImageSize: "{320, 568}", ...}, ...]
     for key in ["UILaunchImages", "UILaunchImages~iphone"] {
@@ -168,11 +188,24 @@ fn app_aspect(display: (f64, f64), info: Option<&crate::fw::plist::Value>, files
                 .collect();
             if let [a, b] = numbers[..] {
                 if a > 0.0 && b > 0.0 {
-                    shapes.push(a.max(b) / a.min(b));
+                    sizes.push((a.max(b), a.min(b)));
                 }
             }
         }
     }
+    sizes
+}
+
+/// The widest landscape shape (long side / short side) this app said it
+/// can fill, as iOS decides it: an app with a launch storyboard fills any
+/// screen; otherwise it gets the tallest iPhone launch image it ships, and
+/// with none a 3:2 screen (the 3.5-inch iPhones), with black bars around it.
+fn app_aspect(display: (f64, f64), info: Option<&crate::fw::plist::Value>, files: &[String]) -> f64 {
+    let display_aspect = display.0.max(display.1) / display.0.min(display.1);
+    if has_storyboard(info) {
+        return display_aspect;
+    }
+    let shapes: Vec<f64> = launch_sizes(info, files).into_iter().map(|(long, short)| long / short).collect();
     // The widest one that fits; on a squarer display, the narrowest one
     // (fitted by width, bars above and below).
     let fits = shapes.iter().copied().filter(|&s| s <= display_aspect + 0.001).fold(0.0, f64::max);
@@ -1792,6 +1825,20 @@ mod tests {
         let info = Value::Dict(vec![("UILaunchStoryboardName".into(), Value::String("Launch".into()))]);
         let aspect = app_aspect((2424.0, 1080.0), Some(&info), &[]);
         assert_eq!(fit_points((2424.0, 1080.0), aspect), (1212.0, 540.0));
+    }
+
+    #[test]
+    fn old_apps_get_a_real_iphone_size_unreal_and_storyboard_apps_the_display() {
+        let display = (2424.0, 1080.0);
+        let tall = ["Default-568h@2x.png".to_string()];
+        // Old app (TownCraft): an iPhone 5's screen, stretched by the window.
+        assert_eq!(told_screen(display, None, &tall, false), (568.0, 320.0, 2.0));
+        // Nothing declared: the first iPhones' screen.
+        assert_eq!(told_screen(display, None, &[], false), (480.0, 320.0, 2.0));
+        // Unreal games draw well at any size: the shape at the display's pixels.
+        assert_eq!(told_screen(display, None, &tall, true), (958.0, 540.0, 2.0));
+        let info = Value::Dict(vec![("UILaunchStoryboardName".into(), Value::String("Launch".into()))]);
+        assert_eq!(told_screen(display, Some(&info), &[], false), (1212.0, 540.0, 2.0));
     }
 
     #[test]
