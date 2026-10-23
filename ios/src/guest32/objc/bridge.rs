@@ -20,10 +20,10 @@
 //! guest or host code runs (both may send messages back).
 
 use super::classes::{GuestClasses, Lookup};
-use super::convert::{self, Boundary, GuestRet, HostFrame};
+use super::convert::{self, Boundary, GuestRet, HostCallOptions, HostFrame};
 use super::encoding::Signature;
 use super::mirror;
-use super::selectors::{FrameworkSelectors, Varargs};
+use super::selectors::FrameworkSelectors;
 use crate::objc::runtime;
 use guest32_image::ObjcMetadata32;
 use std::collections::HashMap;
@@ -115,6 +115,8 @@ pub struct Bridge {
     specials: HashMap<u32, Special>,
     /// Host block wrappers -> the guest (heap) blocks they run.
     host_blocks: HashMap<usize, u32>,
+    /// Host object -> guest copy of its -bytes (address, capacity).
+    buffers: HashMap<usize, (u32, u32)>,
     /// Guest address of the objc_msgSend stand-in (imp of framework Methods).
     pub msg_send_stub: u32,
 }
@@ -139,6 +141,7 @@ impl Bridge {
             sel_guest: HashMap::new(),
             specials: HashMap::new(),
             host_blocks: HashMap::new(),
+            buffers: HashMap::new(),
             msg_send_stub: 0,
         })
     }
@@ -160,6 +163,22 @@ impl Bridge {
     /// The host mirror class of a game class.
     pub fn mirror_of(&self, guest_class: u32) -> Option<usize> {
         self.mirrors.get(&guest_class).copied()
+    }
+
+    /// A guest buffer of at least `length` bytes kept for host object `host`
+    /// (the copy of its -bytes), grown when needed.
+    fn guest_buffer(&mut self, g: &dyn GuestSide, host: usize, length: u32) -> u32 {
+        match self.buffers.get(&host) {
+            Some(&(address, capacity)) if capacity >= length.max(1) => address,
+            old => {
+                if let Some(&(address, _)) = old {
+                    g.free(address);
+                }
+                let address = g.alloc(length.max(1));
+                self.buffers.insert(host, (address, length.max(1)));
+                address
+            }
+        }
     }
 
     /// Text of a guest string object.
@@ -503,12 +522,13 @@ pub fn install(bridge: &Mutex<Bridge>, g: &dyn GuestSide, md: &ObjcMetadata32) -
 
 /// Type encoding for a message the host answers: the framework table, else
 /// the game's own method of the same name (an override has the same types).
-fn host_signature(b: &Bridge, class: &str, meta: bool, sel: &str) -> Result<(Signature, bool, Varargs), String> {
+fn host_signature(b: &Bridge, class: &str, meta: bool, sel: &str) -> Result<(Signature, HostCallOptions), String> {
     if let Some(entry) = FrameworkSelectors::builtin().get(sel) {
-        return Ok((entry.signature.clone(), entry.real_float, entry.varargs));
+        let options = HostCallOptions { real_float: entry.real_float, varargs: entry.varargs, arrays: entry.arrays };
+        return Ok((entry.signature.clone(), options));
     }
     if let Some(types) = b.classes.types_for_selector(sel) {
-        return Ok((Signature::parse(types)?, false, Varargs::None));
+        return Ok((Signature::parse(types)?, HostCallOptions::default()));
     }
     Err(format!(
         "{}[{class} {sel}]: no type encoding for this framework selector (add it to framework_selectors.tsv)",
@@ -576,7 +596,7 @@ pub fn send_from_guest(
             Ok(GuestRet { r0: r as u32, r1: (r >> 32) as u32 })
         }
         Target::Host { class, meta, via_super } => {
-            let (sig, real_float, varargs) = host_signature(&b, &class, meta, &name)?;
+            let (sig, options) = host_signature(&b, &class, meta, &name)?;
             // The host may keep a block argument: stack blocks move to the heap first.
             let mut replaced: Vec<(u32, u32)> = Vec::new();
             let block_words: Vec<u32> = sig
@@ -599,7 +619,7 @@ pub fn send_from_guest(
                 b = lock(bridge);
             }
             let get = |i: u32| replaced.iter().find(|r| r.0 == i).map(|r| r.1).unwrap_or_else(|| get(i));
-            let call = convert::prepare_host_call(&sig, real_float, varargs, &get, &mut Session { bridge: &mut b, g })?;
+            let call = convert::prepare_host_call(&sig, options, &get, &mut Session { bridge: &mut b, g })?;
             let host_receiver = call.args.x[0] as usize;
             let host_sel = runtime::sel(&name);
             drop(b);
@@ -610,8 +630,17 @@ pub fn send_from_guest(
                 runtime::imp_for(host_receiver, host_sel)
             };
             let imp = imp.ok_or_else(|| format!("{}[{class} {name}] is not implemented by the host layer", if meta { "+" } else { "-" }))?;
-            let ret = mirror::call_host(imp, &call.args);
+            let mut ret = mirror::call_host(imp, &call.args);
             let mut b = lock(bridge);
+            // -bytes / -mutableBytes point into host memory: hand the guest a copy
+            // (writes through a mutableBytes copy do not reach the host object).
+            let pointer = ret.x[0] as usize;
+            if matches!(name.as_str(), "bytes" | "mutableBytes") && pointer != 0 && g.guest_address(pointer).is_none() {
+                let length = runtime::send(host_receiver, "length", &[]);
+                let copy = b.guest_buffer(g, host_receiver, length as u32);
+                g.write(copy, unsafe { std::slice::from_raw_parts(pointer as *const u8, length) });
+                ret.x[0] = g.host_address(copy) as u64;
+            }
             let result = convert::finish_host_call(call, &ret, &mut Session { bridge: &mut b, g })?;
             if via_super && name == "dealloc" {
                 b.forget(g, receiver);

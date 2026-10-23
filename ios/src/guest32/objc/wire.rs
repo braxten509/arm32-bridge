@@ -163,8 +163,17 @@ pub fn register_program(program: &Program) -> Result<(), String> {
             super::super::data(&c_name, move || with_bridge(|b| b.framework_class(&Translator, &class).1));
         }
     }
+    // String literals' isa: the guest copy of NSString, so messages, isa
+    // checks and class names work; a literal not seen before gets a host
+    // string with its text.
+    super::super::data("__CFConstantStringClassReference", || {
+        with_bridge(|b| {
+            let class = b.framework_class(&Translator, "NSString").0;
+            b.set_special(class, Special::ConstantString);
+            class
+        })
+    });
     for (symbol, kind) in [
-        ("__CFConstantStringClassReference", Special::ConstantString),
         ("_NSConcreteStackBlock", Special::StackBlock),
         ("_NSConcreteMallocBlock", Special::MallocBlock),
         ("_NSConcreteGlobalBlock", Special::GlobalBlock),
@@ -175,11 +184,45 @@ pub fn register_program(program: &Program) -> Result<(), String> {
             isa
         });
     }
+    // Object constants (NSString *const UIApplicationDidBecomeActiveNotification,
+    // NSLocalizedDescriptionKey, ...): when the host has the variable and it
+    // holds a host object, the guest variable holds that object's proxy.
+    let mut names: Vec<&str> = program.image.binds.iter().map(|b| b.symbol.as_str()).collect();
+    names.sort_unstable();
+    names.dedup();
+    for symbol in names {
+        let c_name = arm32_bridge::ios32::c_name(symbol).to_string();
+        if symbol.starts_with("_OBJC_") || arm32_bridge::ios32::provides_data(&c_name) {
+            continue;
+        }
+        let Some(object) = host_object_constant(symbol) else { continue };
+        super::super::data(&c_name, move || {
+            let variable = super::super::alloc_permanent(4, 4);
+            let guest = with_bridge(|b| b.guest_object(&Translator, object)).unwrap_or(0);
+            runtime::mem().write_u32(variable, guest);
+            variable
+        });
+    }
     // Exception type records and the empty method cache: read, never written.
     for symbol in ["_objc_empty_cache", "_objc_empty_vtable", "OBJC_EHTYPE_id", "OBJC_EHTYPE_$_NSException"] {
         super::super::data_words(symbol, vec![0; 4]);
     }
     Ok(())
+}
+
+/// The host object a host data symbol holds, if it is a variable holding an
+/// object (checked as a plausible pointer before its class is read).
+fn host_object_constant(symbol: &str) -> Option<usize> {
+    let (address, kind) = crate::symbols::lookup(symbol)?;
+    if kind != crate::symbols::Kind::Data || address == 0 {
+        return None;
+    }
+    let value = unsafe { *(address as *const usize) };
+    if value < 0x10000 || value >= 1 << 48 || value % 8 != 0 {
+        return None;
+    }
+    let rt = crate::objc::runtime::lock();
+    rt.classes.contains_key(&rt.class_of(value)).then_some(value)
 }
 
 fn with_bridge<R>(f: impl FnOnce(&mut Bridge) -> R) -> R {

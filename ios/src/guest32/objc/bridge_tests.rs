@@ -41,6 +41,16 @@ extern "C" fn host_object_at_index(this: Id, _: Sel, index: usize) -> Id {
     }
 }
 
+static HOST_BYTES: [u8; 4] = [1, 2, 3, 4];
+
+extern "C" fn host_bytes(_: Id, _: Sel) -> *const u8 {
+    HOST_BYTES.as_ptr()
+}
+
+extern "C" fn host_length(_: Id, _: Sel) -> usize {
+    HOST_BYTES.len()
+}
+
 fn host_class(name: &str) -> Class {
     let mut rt = runtime::lock();
     let class = rt.define_class(name, 0, 16);
@@ -51,6 +61,9 @@ fn host_class(name: &str) -> Class {
     rt.add_method(class, alpha, host_set_alpha as usize);
     rt.add_method(class, frame, host_frame as usize);
     rt.add_method(class, at, host_object_at_index as usize);
+    let (bytes, length) = (rt.sel("bytes"), rt.sel("length"));
+    rt.add_method(class, bytes, host_bytes as usize);
+    rt.add_method(class, length, host_length as usize);
     class
 }
 
@@ -139,6 +152,10 @@ fn guest_messages_reach_game_code_host_code_and_super() {
     assert_eq!(floats, [1.0, 2.0, 30.0, 40.0]);
     let at = bridge_ref.lock().unwrap().guest_selector(fake, "objectAtIndex:");
     assert_eq!(send(bridge_ref, fake, &[object, at, 0]).unwrap() as u32, object);
+    // -bytes points into host memory: the guest gets a copy in guest memory.
+    let bytes = bridge_ref.lock().unwrap().guest_selector(fake, "bytes");
+    let copy = send(bridge_ref, fake, &[object, bytes]).unwrap() as u32;
+    assert_eq!(fake.read(copy, 4), HOST_BYTES);
 
     // A class method of the game runs on the guest class object.
     fake.code(0x2021, move |w| u64::from(w[0]));

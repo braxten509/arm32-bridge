@@ -23,6 +23,9 @@
 #                Struct fields of CGPoint/CGSize/CGRect/CGAffineTransform/
 #                UIEdgeInsets are always CGFloat. Float returns need no
 #                mark: the host's return register tells float from double.
+#   in-array     id-pointer arguments are arrays of as many ids as the last
+#                integer argument says, read before the call;
+#   out-array    the same, filled by the host (not read first).
 # Several notes are separated by commas.
 #
 # A selector missing here stops the game with its name when a framework
@@ -62,7 +65,7 @@ arrayWithArray:	@@:@
 arrayWithContentsOfFile:	@@:@
 arrayWithObject:	@@:@
 arrayWithObjects:	@@:@	nil-list
-arrayWithObjects:count:	@@:^@I
+arrayWithObjects:count:	@@:^@I	in-array
 authenticateWithCompletionHandler:	v@:@?
 autorelease	@@:
 beginAnimations:context:	v@:@^v
@@ -115,7 +118,7 @@ convertRect:toView:	{CGRect={CGPoint=ff}{CGSize=ff}}@:{CGRect={CGPoint=ff}{CGSiz
 cookiesForURL:	@@:@
 copy	@@:
 count	I@:
-countByEnumeratingWithState:objects:count:	I@:^{NSFastEnumerationState=I^@^I[5I]}^@I
+countByEnumeratingWithState:objects:count:	I@:^{NSFastEnumerationState=I^@^I[5I]}^@I	out-array
 createDirectoryAtPath:withIntermediateDirectories:attributes:error:	c@:@c@^@
 createFileAtPath:contents:attributes:	c@:@@@
 cStringUsingEncoding:	r*@:I

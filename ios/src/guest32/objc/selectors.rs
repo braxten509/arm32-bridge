@@ -4,11 +4,23 @@
 use super::encoding::Signature;
 use std::collections::HashMap;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Varargs {
+    #[default]
     None,
     Format,
     NilList,
+}
+
+/// Pointer-to-id arguments of a counted message (`objects:count:`): they
+/// hold as many ids as the message's last integer argument says, read
+/// before the call (`in-array`) or filled by it (`out-array`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IdArrays {
+    #[default]
+    None,
+    In,
+    Out,
 }
 
 #[derive(Clone, Debug)]
@@ -17,6 +29,7 @@ pub struct FrameworkSelector {
     pub signature: Signature,
     pub varargs: Varargs,
     pub real_float: bool,
+    pub arrays: IdArrays,
 }
 
 pub struct FrameworkSelectors {
@@ -54,7 +67,14 @@ impl FrameworkSelectors {
             } else {
                 Varargs::None
             };
-            let entry = FrameworkSelector { encoding, signature, varargs, real_float: notes.contains(&"float") };
+            let arrays = if notes.contains(&"in-array") {
+                IdArrays::In
+            } else if notes.contains(&"out-array") {
+                IdArrays::Out
+            } else {
+                IdArrays::None
+            };
+            let entry = FrameworkSelector { encoding, signature, varargs, real_float: notes.contains(&"float"), arrays };
             if map.insert(selector, entry).is_some() {
                 return Err(format!("line {}: {selector} is listed twice", number + 1));
             }

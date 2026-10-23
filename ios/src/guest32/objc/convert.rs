@@ -13,7 +13,7 @@
 //! [`Boundary`], so this file runs without the translator.
 
 use super::encoding::{align_up, Signature, Ty};
-use super::selectors::Varargs;
+use super::selectors::{IdArrays, Varargs};
 
 /// What the conversion needs from the world around it.
 pub trait Boundary {
@@ -558,7 +558,84 @@ struct OutParam {
     guest: u32,
     pointee: Ty,
     hty: HostTy,
+    /// Elements (more than one for counted id arrays).
+    count: u32,
+    write_back: bool,
     temp: Box<[u64]>,
+}
+
+impl OutParam {
+    /// The guest address a host pointer into this temporary stands for.
+    fn guest_address(&self, host: usize) -> Option<u32> {
+        let (start, step) = (self.temp.as_ptr() as usize, self.hty.size() as usize);
+        let offset = host.checked_sub(start).filter(|o| *o < step * self.count as usize)?;
+        let inner = guest_offset(&self.pointee, &self.hty, (offset % step) as u32)?;
+        Some(self.guest + (offset / step) as u32 * self.pointee.guest_size() + inner)
+    }
+}
+
+/// The guest offset of the field at host offset `offset` (it must start there).
+fn guest_offset(ty: &Ty, hty: &HostTy, offset: u32) -> Option<u32> {
+    let (guest_fields, host_fields): (Vec<&Ty>, _) = match (ty, hty) {
+        (Ty::Struct { fields, .. }, HostTy::Struct { fields: host_fields, .. }) => (fields.iter().collect(), host_fields),
+        (Ty::Array { element, count }, HostTy::Struct { fields: host_fields, .. }) => {
+            (std::iter::repeat_n(&**element, *count as usize).collect(), host_fields)
+        }
+        _ => return (offset == 0).then_some(0),
+    };
+    let mut guest = 0;
+    for (f, (host, hf)) in guest_fields.into_iter().zip(host_fields) {
+        guest = align_up(guest, f.guest_align());
+        if (*host..host + hf.size()).contains(&offset) {
+            return Some(guest + guest_offset(f, hf, offset - host)?);
+        }
+        guest += f.guest_size();
+    }
+    None
+}
+
+/// The boundary with pointers into out-parameter temporaries mapped back to
+/// the guest memory they stand for (fast enumeration's itemsPtr and
+/// mutationsPtr point into them).
+struct TempMap<'a> {
+    b: &'a mut dyn Boundary,
+    outs: &'a [OutParam],
+}
+
+impl Boundary for TempMap<'_> {
+    fn read(&self, addr: u32, len: u32) -> Vec<u8> {
+        self.b.read(addr, len)
+    }
+    fn write(&mut self, addr: u32, data: &[u8]) {
+        self.b.write(addr, data)
+    }
+    fn alloc(&mut self, size: u32) -> u32 {
+        self.b.alloc(size)
+    }
+    fn free(&mut self, addr: u32) {
+        self.b.free(addr)
+    }
+    fn host_address(&self, addr: u32) -> usize {
+        self.b.host_address(addr)
+    }
+    fn guest_address(&self, host: usize) -> Option<u32> {
+        self.outs.iter().find_map(|o| o.guest_address(host)).or_else(|| self.b.guest_address(host))
+    }
+    fn id_to_host(&mut self, guest: u32) -> Result<usize, String> {
+        self.b.id_to_host(guest)
+    }
+    fn id_to_guest(&mut self, host: usize) -> Result<u32, String> {
+        self.b.id_to_guest(host)
+    }
+    fn sel_to_host(&mut self, guest: u32) -> Result<usize, String> {
+        self.b.sel_to_host(guest)
+    }
+    fn sel_to_guest(&mut self, host: usize) -> Result<u32, String> {
+        self.b.sel_to_guest(host)
+    }
+    fn object_text(&mut self, guest: u32) -> Option<String> {
+        self.b.object_text(guest)
+    }
 }
 
 /// Pointees that need a temporary: anything holding ids, pointers or
@@ -594,39 +671,64 @@ pub struct PreparedHostCall {
     outs: Vec<OutParam>,
 }
 
+/// What the framework selector table says about a message beyond its types.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HostCallOptions {
+    /// A scalar `f` is a C float rather than CGFloat.
+    pub real_float: bool,
+    pub varargs: Varargs,
+    pub arrays: IdArrays,
+}
+
+/// The most ids one counted array may hold (a bad count fails, not the heap).
+const MAX_ID_ARRAY: u32 = 1 << 20;
+
 /// Converts a guest message (`words`: r0-r3 then the guest stack, by word
-/// index) into host registers. `real_float`/`varargs` come from the
-/// framework selector table.
+/// index) into host registers.
 pub fn prepare_host_call(
     sig: &Signature,
-    real_float: bool,
-    varargs: Varargs,
+    options: HostCallOptions,
     words: &dyn Fn(u32) -> u32,
     b: &mut dyn Boundary,
 ) -> Result<PreparedHostCall, String> {
     let mut args = HostArgs::default();
     let mut outs = Vec::new();
+    let array_count = match options.arrays {
+        IdArrays::None => None,
+        _ => sig.args.iter().zip(sig.guest_arg_words()).filter(|(t, _)| matches!(t, Ty::Int { .. })).last().map(|(_, at)| words(at)),
+    };
     for (ty, at) in sig.args.iter().zip(sig.guest_arg_words()) {
         let guest = guest_bytes(words, at, ty.guest_size());
         if let Ty::Pointer(pointee) = ty {
             let address = guest_u32(&guest);
             if let (Some(hty), true) = (out_param_type(pointee), address != 0) {
-                let mut host = vec![0u8; (hty.size() as usize).div_ceil(8) * 8];
-                let current = b.read(address, pointee.guest_size());
-                to_host(pointee, &hty, &current, &mut host[..hty.size() as usize], b)?;
+                let (count, read, write_back) = match (array_count, **pointee == Ty::Object) {
+                    (Some(n), true) if n > MAX_ID_ARRAY => return Err(format!("an id array of {n} elements")),
+                    (Some(n), true) => (n.max(1), options.arrays == IdArrays::In, options.arrays == IdArrays::Out),
+                    _ => (1, true, true),
+                };
+                let (step, guest_step) = (hty.size() as usize, pointee.guest_size() as usize);
+                let mut host = vec![0u8; (step * count as usize).div_ceil(8) * 8];
+                if read {
+                    let current = b.read(address, (guest_step * count as usize) as u32);
+                    for i in 0..count as usize {
+                        let element = &current[i * guest_step..(i + 1) * guest_step];
+                        to_host(pointee, &hty, element, &mut host[i * step..(i + 1) * step], b)?;
+                    }
+                }
                 let temp = words_of(&host).into_boxed_slice();
                 args.push(&HostTy::Ptr, &(temp.as_ptr() as u64).to_le_bytes());
-                outs.push(OutParam { guest: address, pointee: (**pointee).clone(), hty, temp });
+                outs.push(OutParam { guest: address, pointee: (**pointee).clone(), hty, count, write_back, temp });
                 continue;
             }
         }
-        let hty = host_ty(ty, real_float)?;
+        let hty = host_ty(ty, options.real_float)?;
         let mut host = vec![0u8; (hty.size() as usize).max(8)];
         to_host(ty, &hty, &guest, &mut host[..hty.size() as usize], b)?;
         args.push(&hty, &host);
     }
     let next = sig.guest_total_words();
-    match varargs {
+    match options.varargs {
         Varargs::None => {}
         Varargs::NilList => {
             for i in next.. {
@@ -683,12 +785,18 @@ pub fn prepare_host_call(
 
 /// Converts the host's result (and out-parameters) back for the guest.
 pub fn finish_host_call(call: PreparedHostCall, ret: &HostRet, b: &mut dyn Boundary) -> Result<GuestRet, String> {
-    for out in &call.outs {
+    let mut mapped = TempMap { b, outs: &call.outs };
+    for out in call.outs.iter().filter(|o| o.write_back) {
         let host: Vec<u8> = out.temp.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let mut guest = vec![0u8; out.pointee.guest_size() as usize];
-        to_guest(&out.pointee, &out.hty, &host, &mut guest, b)?;
-        b.write(out.guest, &guest);
+        let (step, guest_step) = (out.hty.size() as usize, out.pointee.guest_size() as usize);
+        let mut guest = vec![0u8; guest_step * out.count as usize];
+        for i in 0..out.count as usize {
+            let element = &host[i * step..(i + 1) * step];
+            to_guest(&out.pointee, &out.hty, element, &mut guest[i * guest_step..(i + 1) * guest_step], &mut mapped)?;
+        }
+        mapped.write(out.guest, &guest);
     }
+    let b = mapped.b;
     if call.ret == Ty::Void {
         return Ok(GuestRet { r0: 0, r1: 0 });
     }

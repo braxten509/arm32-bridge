@@ -2,7 +2,7 @@
 
 use super::convert::*;
 use super::encoding::Signature;
-use super::selectors::Varargs;
+use super::selectors::{IdArrays, Varargs};
 use std::collections::HashMap;
 
 const BASE: u32 = 0x1_0000;
@@ -72,6 +72,10 @@ fn words(list: &[u32]) -> impl Fn(u32) -> u32 + '_ {
     move |i| list.get(i as usize).copied().unwrap_or(0)
 }
 
+fn plain() -> HostCallOptions {
+    HostCallOptions::default()
+}
+
 fn f(v: f32) -> u32 {
     v.to_bits()
 }
@@ -82,14 +86,14 @@ fn guest_arguments_land_in_aapcs64_registers() {
     // -[UIView initWithFrame:]: self, _cmd, CGRect (floats) -> x0, x1, d0-d3 as doubles.
     let sig = Signature::parse("@@:{CGRect={CGPoint=ff}{CGSize=ff}}").unwrap();
     let w = [0x100, 0x200, f(1.5), f(2.0), f(320.0), f(480.0)];
-    let call = prepare_host_call(&sig, false, Varargs::None, &words(&w), &mut b).unwrap();
+    let call = prepare_host_call(&sig, plain(), &words(&w), &mut b).unwrap();
     assert_eq!(&call.args.x[..2], &[(HOST_ID + 0x100) as u64, (HOST_SEL + 0x200) as u64]);
     let d: Vec<f64> = call.args.d[..4].iter().map(|b| f64::from_bits(*b)).collect();
     assert_eq!(d, [1.5, 2.0, 320.0, 480.0]);
     // Integers and doubles use separate register files; a double spans two guest words.
     let sig = Signature::parse("v@:ciqd").unwrap();
     let w = [0x100, 0x200, 1, (-5i32) as u32, 7, 0, 0, 0x4000_0000];
-    let call = prepare_host_call(&sig, false, Varargs::None, &words(&w), &mut b).unwrap();
+    let call = prepare_host_call(&sig, plain(), &words(&w), &mut b).unwrap();
     assert_eq!(call.args.x[2], 1);
     assert_eq!(call.args.x[3] as i64, -5);
     assert_eq!(call.args.x[4], 7);
@@ -97,9 +101,9 @@ fn guest_arguments_land_in_aapcs64_registers() {
     // A scalar 'f' is CGFloat (double) unless the row says it is a real float.
     let sig = Signature::parse("@@:f").unwrap();
     let w = [0x100, 0x200, f(0.25)];
-    let cg = prepare_host_call(&sig, false, Varargs::None, &words(&w), &mut b).unwrap();
+    let cg = prepare_host_call(&sig, plain(), &words(&w), &mut b).unwrap();
     assert_eq!(f64::from_bits(cg.args.d[0]), 0.25);
-    let real = prepare_host_call(&sig, true, Varargs::None, &words(&w), &mut b).unwrap();
+    let real = prepare_host_call(&sig, HostCallOptions { real_float: true, ..plain() }, &words(&w), &mut b).unwrap();
     assert_eq!(real.args.d[0], u64::from(f(0.25)));
 }
 
@@ -110,7 +114,7 @@ fn struct_returns_and_float_returns_convert_back() {
     let sig = Signature::parse("{CGRect={CGPoint=ff}{CGSize=ff}}@:").unwrap();
     let out = b.alloc(16);
     let w = [out, 0x100, 0x200];
-    let call = prepare_host_call(&sig, false, Varargs::None, &words(&w), &mut b).unwrap();
+    let call = prepare_host_call(&sig, plain(), &words(&w), &mut b).unwrap();
     assert_eq!(call.args.x[0], (HOST_ID + 0x100) as u64);
     let ret = HostRet { x: [0; 2], d: [1.0f64.to_bits(), 2.0f64.to_bits(), 3.0f64.to_bits(), 4.0f64.to_bits()] };
     let r = finish_host_call(call, &ret, &mut b).unwrap();
@@ -120,23 +124,23 @@ fn struct_returns_and_float_returns_convert_back() {
     // NSRange is two NSUIntegers: x0/x1 on the host, 8 guest bytes via stret.
     let sig = Signature::parse("{_NSRange=II}@:@").unwrap();
     let out = b.alloc(8);
-    let call = prepare_host_call(&sig, false, Varargs::None, &words(&[out, 1, 2, 3]), &mut b).unwrap();
+    let call = prepare_host_call(&sig, plain(), &words(&[out, 1, 2, 3]), &mut b).unwrap();
     let r = finish_host_call(call, &HostRet { x: [5, 9], d: [0; 4] }, &mut b).unwrap();
     assert_eq!((r.r0, b.get(out, 8)), (out, [5, 0, 0, 0, 9, 0, 0, 0].to_vec()));
     // Float returns: a host float (s0, upper bits zero) and a host CGFloat (d0) both arrive.
     let sig = Signature::parse("f@:").unwrap();
     for d0 in [u64::from(f(0.5)), 0.5f64.to_bits()] {
-        let call = prepare_host_call(&sig, false, Varargs::None, &words(&[1, 2]), &mut b).unwrap();
+        let call = prepare_host_call(&sig, plain(), &words(&[1, 2]), &mut b).unwrap();
         let r = finish_host_call(call, &HostRet { x: [0; 2], d: [d0, 0, 0, 0] }, &mut b).unwrap();
         assert_eq!(f32::from_bits(r.r0), 0.5);
     }
     // A double comes back in r0:r1, an id is mapped.
     let sig = Signature::parse("d@:").unwrap();
-    let call = prepare_host_call(&sig, false, Varargs::None, &words(&[1, 2]), &mut b).unwrap();
+    let call = prepare_host_call(&sig, plain(), &words(&[1, 2]), &mut b).unwrap();
     let r = finish_host_call(call, &HostRet { x: [0; 2], d: [2.5f64.to_bits(), 0, 0, 0] }, &mut b).unwrap();
     assert_eq!(f64::from_bits(u64::from(r.r0) | u64::from(r.r1) << 32), 2.5);
     let sig = Signature::parse("@@:").unwrap();
-    let call = prepare_host_call(&sig, false, Varargs::None, &words(&[1, 2]), &mut b).unwrap();
+    let call = prepare_host_call(&sig, plain(), &words(&[1, 2]), &mut b).unwrap();
     let r = finish_host_call(call, &HostRet { x: [(HOST_ID + 0x4444) as u64, 0], d: [0; 4] }, &mut b).unwrap();
     assert_eq!(r.r0, 0x4444);
 }
@@ -147,30 +151,69 @@ fn c_strings_and_out_parameters_cross_into_guest_memory() {
     // UTF8String: the host's bytes are copied into guest memory.
     let text = std::ffi::CString::new("héllo").unwrap();
     let sig = Signature::parse("r*@:").unwrap();
-    let call = prepare_host_call(&sig, false, Varargs::None, &words(&[1, 2]), &mut b).unwrap();
+    let call = prepare_host_call(&sig, plain(), &words(&[1, 2]), &mut b).unwrap();
     let r = finish_host_call(call, &HostRet { x: [text.as_ptr() as u64, 0], d: [0; 4] }, &mut b).unwrap();
     assert_eq!(b.get(r.r0, 7), text.as_bytes_with_nul());
     // A guest C string argument is passed as its host address.
     b.put(BASE + 0x100, b"abc\0");
     let sig = Signature::parse("@@:r*").unwrap();
-    let call = prepare_host_call(&sig, false, Varargs::None, &words(&[1, 2, BASE + 0x100]), &mut b).unwrap();
+    let call = prepare_host_call(&sig, plain(), &words(&[1, 2, BASE + 0x100]), &mut b).unwrap();
     assert_eq!(call.args.x[2] as usize, b.host_address(BASE + 0x100));
     // NSError **: the host writes a 64-bit id into a temporary; the guest's
     // 4-byte slot gets the mapped id after the call.
     let slot = BASE + 0x200;
     b.put(slot, &0u32.to_le_bytes());
     let sig = Signature::parse("c@:@^@").unwrap();
-    let call = prepare_host_call(&sig, false, Varargs::None, &words(&[1, 2, 3, slot]), &mut b).unwrap();
+    let call = prepare_host_call(&sig, plain(), &words(&[1, 2, 3, slot]), &mut b).unwrap();
     let temp = call.args.x[3] as *mut u64;
     unsafe { *temp = (HOST_ID + 0x5150) as u64 };
     let r = finish_host_call(call, &HostRet { x: [1, 0], d: [0; 4] }, &mut b).unwrap();
     assert_eq!((r.r0, b.get(slot, 4)), (1, 0x5150u32.to_le_bytes().to_vec()));
     // NSInteger *: an 8-byte temporary, the low half written back.
     let sig = Signature::parse("c@:^i").unwrap();
-    let call = prepare_host_call(&sig, false, Varargs::None, &words(&[1, 2, slot]), &mut b).unwrap();
+    let call = prepare_host_call(&sig, plain(), &words(&[1, 2, slot]), &mut b).unwrap();
     unsafe { *(call.args.x[2] as *mut i64) = -42 };
     finish_host_call(call, &HostRet { x: [1, 0], d: [0; 4] }, &mut b).unwrap();
     assert_eq!(b.get(slot, 4), (-42i32).to_le_bytes().to_vec());
+}
+
+#[test]
+fn counted_id_arrays_and_fast_enumeration() {
+    let mut b = Fake::new();
+    // +arrayWithObjects:count: reads `count` ids from the pointer.
+    let list = BASE + 0x300;
+    b.put(list, &[0x11u32.to_le_bytes(), 0x22u32.to_le_bytes(), 0x33u32.to_le_bytes()].concat());
+    let sig = Signature::parse("@@:^@I").unwrap();
+    let options = HostCallOptions { arrays: IdArrays::In, ..plain() };
+    let call = prepare_host_call(&sig, options, &words(&[1, 2, list, 3]), &mut b).unwrap();
+    let ids = unsafe { std::slice::from_raw_parts(call.args.x[2] as *const u64, 3) };
+    assert_eq!(ids, [(HOST_ID + 0x11) as u64, (HOST_ID + 0x22) as u64, (HOST_ID + 0x33) as u64]);
+    assert_eq!(call.args.x[3], 3);
+
+    // -countByEnumeratingWithState:objects:count: fills up to `count` ids
+    // (the guest buffer is not read first) and points the state's itemsPtr
+    // and mutationsPtr into the temporaries; the guest gets its own buffer
+    // and its own state back.
+    let (state, buffer) = (BASE + 0x400, BASE + 0x500);
+    b.put(buffer, &[0xee; 16 * 4]);
+    let sig = Signature::parse("I@:^{NSFastEnumerationState=I^@^I[5I]}^@I").unwrap();
+    let options = HostCallOptions { arrays: IdArrays::Out, ..plain() };
+    let call = prepare_host_call(&sig, options, &words(&[1, 2, state, buffer, 16]), &mut b).unwrap();
+    let host_state = call.args.x[2] as *mut u64;
+    let host_buffer = call.args.x[3] as *mut u64;
+    unsafe {
+        *host_buffer.add(15) = (HOST_ID + 0x99) as u64;
+        *host_buffer = (HOST_ID + 0x44) as u64;
+        *host_state = 16;
+        *host_state.add(1) = host_buffer as u64;
+        *host_state.add(2) = host_state.add(3) as u64;
+    }
+    let r = finish_host_call(call, &HostRet { x: [16, 0], d: [0; 4] }, &mut b).unwrap();
+    assert_eq!(r.r0, 16);
+    assert_eq!(b.get(buffer, 4), 0x44u32.to_le_bytes());
+    assert_eq!(b.get(buffer + 60, 4), 0x99u32.to_le_bytes());
+    let fields: Vec<u32> = b.get(state, 12).chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    assert_eq!(fields, [16, buffer, state + 12]);
 }
 
 #[test]
@@ -180,7 +223,7 @@ fn variadic_arguments_go_to_stack_slots() {
     let sig = Signature::parse("@@:@").unwrap();
     let double = 1.25f64.to_bits();
     let w = [1, 2, 0x300, (-3i32) as u32, 0x400, double as u32, (double >> 32) as u32, 9, 0, BASE + 0x10];
-    let call = prepare_host_call(&sig, false, Varargs::Format, &words(&w), &mut b).unwrap();
+    let call = prepare_host_call(&sig, HostCallOptions { varargs: Varargs::Format, ..plain() }, &words(&w), &mut b).unwrap();
     assert_eq!(call.args.x[2], (HOST_ID + 0x300) as u64);
     assert_eq!(call.args.stack[0] as i32, -3);
     assert_eq!(call.args.stack[1], (HOST_ID + 0x400) as u64);
@@ -188,7 +231,7 @@ fn variadic_arguments_go_to_stack_slots() {
     assert_eq!(call.args.stack[3], 9);
     assert_eq!(call.args.stack[4] as usize, b.host_address(BASE + 0x10));
     // nil-ended object lists end with a 0 slot.
-    let call = prepare_host_call(&sig, false, Varargs::NilList, &words(&[1, 2, 0x10, 0x20, 0x30, 0]), &mut b).unwrap();
+    let call = prepare_host_call(&sig, HostCallOptions { varargs: Varargs::NilList, ..plain() }, &words(&[1, 2, 0x10, 0x20, 0x30, 0]), &mut b).unwrap();
     assert_eq!(call.args.stack, [(HOST_ID + 0x20) as u64, (HOST_ID + 0x30) as u64, 0]);
 }
 
