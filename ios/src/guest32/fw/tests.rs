@@ -263,3 +263,11 @@ fn unshared_eagl_contexts_keep_their_bindings_and_mappings() {
     make_current(a);
     assert_eq!(gles::bound_buffer(GL_ARRAY_BUFFER), buffer, "the first context kept its binding");
 }
+
+#[test]
+fn indexed_gl_queries_reach_the_guest_registry() {
+    setup();
+    for name in ["glGetIntegeri_v", "glGetInteger64i_v", "glGetBooleani_v"] {
+        assert!(ios32::provides_function(name), "{name} is registered");
+    }
+}

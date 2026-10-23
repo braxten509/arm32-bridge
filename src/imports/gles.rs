@@ -62,7 +62,7 @@ pub fn names() -> Vec<&'static str> {
         .flat_map(|source| source.lines())
         .filter_map(|line| line.split_once("=>").map(|(arms, _)| arms))
         .flat_map(|arms| arms.split('"').skip(1).step_by(2))
-        .filter(|name| name.starts_with("gl") && name.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .filter(|name| name.starts_with("gl") && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
         .filter(|name| handler(name).is_some())
         .collect();
     names.sort_unstable();
