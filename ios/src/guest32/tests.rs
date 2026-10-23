@@ -299,6 +299,129 @@ fn cxx_runtime_keeps_nothing_in_r9_across_game_code() {
     assert_eq!(mem().bytes(out, text.len()), text.as_bytes());
 }
 
+/// What a program's import of `name` binds to (`ios32::load`: guest
+/// libraries' exports first, then this layer's functions).
+fn program_import(name: &str) -> u32 {
+    let export = runtime::shared().guest_exports.get(name).copied();
+    export.unwrap_or_else(|| {
+        assert!(ios32::provides_function(name), "nothing provides {name}");
+        runtime::stub_for(name)
+    })
+}
+
+#[test]
+fn zlib_keeps_nothing_in_r9_across_game_callbacks() {
+    // Android's libz keeps values in r9 across the game's callbacks:
+    // deflateInit2_ its memLevel across zalloc, inflate's updatewindow the
+    // output end across zalloc, inflateBack its output pointer across in and
+    // out. Apple's armv7 code may change r9 in any call; these stand-ins do.
+    // 24 as memLevel asks for more memory than zalloc gives (Z_MEM_ERROR).
+    const CHANGED_R9: u32 = 24;
+    fn zalloc(uc: &mut runtime::Uc, a: &mut Args) -> runtime::Ret {
+        let (_opaque, items, size) = (a.u32(), a.u32(), a.u32());
+        let bytes = items as u64 * size as u64;
+        let address = if bytes > 1 << 24 { 0 } else { super::alloc(bytes as u32) };
+        if address != 0 {
+            mem().write_bytes(address, &vec![0; bytes as usize]);
+        }
+        uc.set_reg(9, CHANGED_R9);
+        runtime::Ret::U32(address)
+    }
+    fn zfree(uc: &mut runtime::Uc, a: &mut Args) -> runtime::Ret {
+        let (_opaque, address) = (a.u32(), a.u32());
+        super::free(address);
+        uc.set_reg(9, CHANGED_R9);
+        runtime::Ret::Void
+    }
+    // in(descriptor {data, length}, &next): all the input at once.
+    fn input(uc: &mut runtime::Uc, a: &mut Args) -> runtime::Ret {
+        let (descriptor, next) = (a.u32(), a.u32());
+        let length = mem().read_u32(descriptor + 4);
+        mem().write_u32(next, mem().read_u32(descriptor));
+        mem().write_u32(descriptor + 4, 0);
+        uc.set_reg(9, CHANGED_R9);
+        runtime::Ret::U32(length)
+    }
+    // out(descriptor {output, written}, data, length): appended.
+    fn output(uc: &mut runtime::Uc, a: &mut Args) -> runtime::Ret {
+        let (descriptor, data, length) = (a.u32(), a.u32(), a.u32());
+        let written = mem().read_u32(descriptor + 4);
+        let bytes = mem().bytes(data, length as usize).to_vec();
+        mem().write_bytes(mem().read_u32(descriptor) + written, &bytes);
+        mem().write_u32(descriptor + 4, written + length);
+        uc.set_reg(9, CHANGED_R9);
+        runtime::Ret::U32(0)
+    }
+    setup();
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _gil = runtime::hold_gil();
+        super::zlib::open(runtime::engine()).expect("libz loads");
+    });
+    let handlers: [(&str, runtime::Handler); 4] =
+        [("test_zalloc_changing_r9", zalloc), ("test_zfree_changing_r9", zfree), ("test_in_changing_r9", input), ("test_out_changing_r9", output)];
+    for (name, handler) in handlers {
+        ios32::register_function(name, handler);
+    }
+    let text: Vec<u8> = (0..20000u32).map(|i| b"zlib keeps r9? "[(i % 15) as usize] ^ (i / 997) as u8).collect();
+    let length = text.len() as u32;
+    let plain = alloc(length);
+    mem().write_bytes(plain, &text);
+    let version = cstring("1.2.11");
+    // z_stream (56 bytes): next_in 0, avail_in 4, next_out 0xc, avail_out 0x10, total_out 0x14, zalloc 0x20, zfree 0x24.
+    let stream = || {
+        let stream = alloc(56);
+        mem().write_bytes(stream, &[0; 56]);
+        mem().write_u32(stream + 0x20, runtime::stub_for("test_zalloc_changing_r9"));
+        mem().write_u32(stream + 0x24, runtime::stub_for("test_zfree_changing_r9"));
+        stream
+    };
+    let (deflating, inflating, back) = (stream(), stream(), stream());
+    let (packed, unpacked, unpacked_back, window) = (alloc(length + 64), alloc(length), alloc(length), alloc(1 << 15));
+    let (input_descriptor, output_descriptor) = (alloc(8), alloc(8));
+    let (input, output) = (runtime::stub_for("test_in_changing_r9"), runtime::stub_for("test_out_changing_r9"));
+    let _gil = runtime::hold_gil();
+    let uc = runtime::engine();
+    let mut zlib = |name: &str, args: &[u32]| runtime::call_guest(uc, program_import(name), args).unwrap() as u32 as i32;
+    let raw = (-15i32) as u32;
+
+    assert_eq!(zlib("deflateInit2_", &[deflating, 6, 8, raw, 8, 0, version, 56]), 0, "deflateInit2_ (-4: memLevel lost)");
+    for (offset, value) in [(0, plain), (4, length), (0xc, packed), (0x10, length + 64)] {
+        mem().write_u32(deflating + offset, value);
+    }
+    assert_eq!(zlib("deflate", &[deflating, 4]), 1, "deflate finishes");
+    let packed_length = mem().read_u32(deflating + 0x14);
+    assert_eq!(zlib("deflateEnd", &[deflating]), 0);
+
+    // In 1000-byte pieces: inflate keeps a window (updatewindow).
+    assert_eq!(zlib("inflateInit2_", &[inflating, raw, version, 56]), 0);
+    mem().write_u32(inflating, packed);
+    mem().write_u32(inflating + 4, packed_length);
+    let mut result = 0;
+    for _ in 0..100 {
+        let done = mem().read_u32(inflating + 0x14);
+        mem().write_u32(inflating + 0xc, unpacked + done);
+        mem().write_u32(inflating + 0x10, (length - done).min(1000));
+        result = zlib("inflate", &[inflating, 0]);
+        if result != 0 {
+            break;
+        }
+    }
+    assert_eq!(result, 1, "inflate reaches the end");
+    assert!(mem().bytes(unpacked, text.len()) == text, "inflate gives the text back");
+    assert_eq!(zlib("inflateEnd", &[inflating]), 0);
+
+    assert_eq!(zlib("inflateBackInit_", &[back, 15, window, version, 56]), 0);
+    mem().write_u32(input_descriptor, packed);
+    mem().write_u32(input_descriptor + 4, packed_length);
+    mem().write_u32(output_descriptor, unpacked_back);
+    mem().write_u32(output_descriptor + 4, 0);
+    assert_eq!(zlib("inflateBack", &[back, input, input_descriptor, output, output_descriptor]), 1, "inflateBack reaches the end");
+    assert_eq!(mem().read_u32(output_descriptor + 4), length);
+    assert!(mem().bytes(unpacked_back, text.len()) == text, "inflateBack gives the text back");
+    assert_eq!(zlib("inflateBackEnd", &[back]), 0);
+}
+
 #[test]
 fn exit_runs_static_destructors_first() {
     static RAN_WITH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
