@@ -741,7 +741,10 @@ extern "C" fn control_touches_began(this: Id, _: Sel, touches: Id, event: Id) {
     let tracking = ask_tracking(this, "beginTrackingWithTouch:withEvent:", touch, event);
     property_set(this, "tracking", tracking as u64);
     set_pressed(this, true);
-    send_actions(this, TOUCH_DOWN, event);
+    // A control that refuses tracking sends no actions for this touch.
+    if tracking {
+        send_actions(this, TOUCH_DOWN, event);
+    }
 }
 
 extern "C" fn control_touches_moved(this: Id, _: Sel, touches: Id, event: Id) {
@@ -753,11 +756,16 @@ extern "C" fn control_touches_moved(this: Id, _: Sel, touches: Id, event: Id) {
     let was_inside = get_flag(this, "touchInside", false);
     let inside = finger_inside(this, touch);
     property_set(this, "touchInside", inside as u64);
-    if get_flag(this, "tracking", false) {
-        let going_on = ask_tracking(this, "continueTrackingWithTouch:withEvent:", touch, event);
-        property_set(this, "tracking", going_on as u64);
-    }
     set_pressed(this, inside);
+    if !get_flag(this, "tracking", false) {
+        return;
+    }
+    // continueTracking NO ends the tracking: no more actions for this touch.
+    let going_on = ask_tracking(this, "continueTrackingWithTouch:withEvent:", touch, event);
+    property_set(this, "tracking", going_on as u64);
+    if !going_on {
+        return;
+    }
     let crossed = match (was_inside, inside) {
         (true, false) => TOUCH_DRAG_EXIT,
         (false, true) => TOUCH_DRAG_ENTER,
@@ -775,11 +783,12 @@ pub(crate) extern "C" fn control_touches_ended(this: Id, _: Sel, touches: Id, ev
     let inside = finger_inside(this, touch);
     property_set(this, "touchInside", inside as u64);
     set_pressed(this, false);
-    if get_flag(this, "tracking", false) {
-        runtime::send(this, "endTrackingWithTouch:withEvent:", &[touch, event]);
-    }
+    let tracking = get_flag(this, "tracking", false);
     property_set(this, "tracking", 0);
-    send_actions(this, if inside { TOUCH_UP_INSIDE } else { TOUCH_UP_OUTSIDE }, event);
+    if tracking {
+        runtime::send(this, "endTrackingWithTouch:withEvent:", &[touch, event]);
+        send_actions(this, if inside { TOUCH_UP_INSIDE } else { TOUCH_UP_OUTSIDE }, event);
+    }
 }
 
 extern "C" fn control_touches_cancelled(this: Id, _: Sel, touches: Id, event: Id) {
@@ -788,11 +797,12 @@ extern "C" fn control_touches_cancelled(this: Id, _: Sel, touches: Id, event: Id
         return;
     }
     set_pressed(this, false);
-    if get_flag(this, "tracking", false) {
-        runtime::send(this, "cancelTrackingWithEvent:", &[event]);
-    }
+    let tracking = get_flag(this, "tracking", false);
     property_set(this, "tracking", 0);
-    send_actions(this, TOUCH_CANCEL, event);
+    if tracking {
+        runtime::send(this, "cancelTrackingWithEvent:", &[event]);
+        send_actions(this, TOUCH_CANCEL, event);
+    }
 }
 
 extern "C" fn control_begin_tracking(_this: Id, _: Sel, _touch: Id, _event: Id) -> bool {

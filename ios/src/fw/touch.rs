@@ -538,6 +538,42 @@ mod tests {
                 "TouchTestControl endTrackingWithTouch:withEvent:"
             ]
         );
+        // A control that refuses tracking (beginTracking NO) sends no actions;
+        // one that stops it (continueTracking NO) sends none after that.
+        extern "C" fn refuse(this: Id, s: Sel, touch: Id, event: Id) -> bool {
+            tracking(this, s, touch, event);
+            false
+        }
+        let refusing = define_class("TouchTestRefusingControl", "UIControl", 8);
+        methods(refusing, &[("beginTrackingWithTouch:withEvent:", refuse as usize), ("endTrackingWithTouch:withEvent:", note as usize)]);
+        let stopping = define_class("TouchTestStoppingControl", "UIControl", 8);
+        methods(
+            stopping,
+            &[
+                ("beginTrackingWithTouch:withEvent:", tracking as usize),
+                ("continueTrackingWithTouch:withEvent:", refuse as usize),
+                ("endTrackingWithTouch:withEvent:", note as usize),
+            ],
+        );
+        for (class, x) in [("TouchTestRefusingControl", 400.0), ("TouchTestStoppingControl", 470.0)] {
+            let control = new_view(class, Rect::new(x, 100.0, 50.0, 50.0));
+            runtime::send(game, "addSubview:", &[control]);
+            for (name, events) in [("down:event:", 1usize), ("upInside:event:", 1 << 6), ("upOutside:event:", 1 << 7)] {
+                runtime::send(control, "addTarget:action:forControlEvents:", &[listener, runtime::sel(name), events]);
+            }
+            touch(Phase::Began, x + 10.0, 110.0);
+            touch(Phase::Moved, x + 12.0, 112.0);
+            touch(Phase::Ended, x + 12.0, 112.0);
+        }
+        assert_eq!(
+            heard(),
+            [
+                "TouchTestRefusingControl beginTrackingWithTouch:withEvent:",
+                "TouchTestStoppingControl beginTrackingWithTouch:withEvent:",
+                "TouchTestTarget down:event:",
+                "TouchTestStoppingControl continueTrackingWithTouch:withEvent:",
+            ]
+        );
     }
 
     #[test]
