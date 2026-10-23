@@ -202,7 +202,8 @@ pub fn run(app_dir: &str, program_path: &str) -> Result<(), String> {
     register_all();
     objc::wire::register_program(&program)?;
     ios32::set_keep_going(env_on("IOS_KEEP_GOING") || crate::trap::KEEP_GOING.load(std::sync::atomic::Ordering::Relaxed));
-    runtime::init(false);
+    // IOS_TRACE_CALLS=1 (test switch): logs every stand-in call (very slow).
+    runtime::init(env_on("IOS_TRACE_CALLS"));
     let _gil = runtime::hold_gil();
     let uc = runtime::engine();
     arm32_bridge::elf::open_built_in(uc, "libz.so")?;

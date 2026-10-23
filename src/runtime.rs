@@ -1623,6 +1623,17 @@ pub fn recent_calls() -> Vec<&'static str> {
     unsafe { &*engine }.get_data().recent.iter().copied().collect()
 }
 
+/// This thread's guest registers r0-r15 as last stored (for crash reports;
+/// inside a phone function: the registers of its call).
+pub fn guest_registers() -> Option<[u32; 16]> {
+    let engine = ENGINE.with(|e| e.get());
+    if engine.is_null() {
+        return None;
+    }
+    let uc = unsafe { &*engine };
+    Some(std::array::from_fn(|register| uc.reg(register)))
+}
+
 /// Hooks get the engine with a borrowed lifetime; ours is always `'static`.
 fn as_static<'a, 'b>(uc: &'a mut Unicorn<'b, Thread>) -> &'a mut Uc {
     unsafe { std::mem::transmute::<&'a mut Unicorn<'b, Thread>, &'a mut Uc>(uc) }
@@ -1889,7 +1900,7 @@ pub fn call_stub(uc: &mut Uc, index: u32) {
     let mut args = Args::from_registers(uc);
     if trace {
         let r = args.registers;
-        crate::log::line(&format!("[call t{}] {name}({:#x}, {:#x}, {:#x}, {:#x})", uc.get_data().id, r[0], r[1], r[2], r[3]));
+        crate::log::line(&format!("[call t{}] {name}({:#x}, {:#x}, {:#x}, {:#x}) from {:#x}", uc.get_data().id, r[0], r[1], r[2], r[3], uc.reg(LR)));
     }
     let started = ticks();
     let resume = uc.reg(LR);
