@@ -105,11 +105,15 @@ armv7 slice; addresses are the file's).
 
 ## Interface with the 32-bit runner (the core helper's side)
 
-The runner, before binding the game (`ios32::load`):
-1. registers its C table, then calls `elf::open(uc, <path>/libguest32cxx.so,
-   false)`: it loads the library, binds its imports, runs its constructors
-   (iostream objects), and puts its exports into `shared().guest_exports`
-   under C names;
+`ios/build.rs` runs `build.sh` when `$GUEST32_CXX_OUT/libguest32cxx.so` is
+missing and embeds the library into the iPhone layer (rebuild by hand after
+changing the sources; the next cargo build embeds the new file). The runner
+(`ios/src/guest32`), before binding the game (`ios32::load`):
+1. registers its C table, then calls `elf::open_bytes(uc,
+   "libguest32cxx.so", <embedded>, true)` (`true`: Apple ABI, so its imports
+   use the iPhone table, not Android's): it loads the library, binds its
+   imports, runs its constructors (iostream objects), and puts its exports
+   into `shared().guest_exports` under C names;
 2. `ios32::load` then binds each game import whose C name is in
    `guest_exports` to the library (the core branch already does this, before
    registered data and functions).

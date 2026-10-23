@@ -41,7 +41,7 @@ const REUSED: &[&str] = &[
     "time", "gettimeofday", "clock", "localtime", "localtime_r", "gmtime", "gmtime_r", "mktime", "difftime",
     "strftime", "nanosleep", "usleep", "sleep", "sched_yield",
     // process
-    "getpid", "getuid", "geteuid", "getgid", "getegid", "getenv", "setenv", "exit", "_exit", "abort",
+    "getpid", "getuid", "geteuid", "getgid", "getegid", "getenv", "setenv", "_exit", "abort",
     "__stack_chk_fail", "setjmp", "_setjmp", "longjmp", "_longjmp", "sigsetjmp", "siglongjmp", "arc4random_buf",
     "gethostname", "getpagesize",
     // math
@@ -85,6 +85,11 @@ macro_rules! bionic {
         static HANDLER: OnceLock<Handler> = OnceLock::new();
         *HANDLER.get_or_init(|| imports::handler_for($name).expect($name))
     }};
+}
+
+/// A loaded guest library's export (the C++ runtime's `__cxa_atexit`, ...).
+fn guest_export(name: &str) -> Option<u32> {
+    shared().guest_exports.get(name).copied()
 }
 
 fn host_c(guest: u32) -> *mut libc::c_char {
@@ -308,6 +313,21 @@ fn write_text(buffer: u32, size: Option<u32>, text: &[u8]) -> Ret {
     Ret::U32(text.len() as u32)
 }
 
+/// The _chk printf calls, as Apple's Libc checks them against the object
+/// size the compiler knew (-1: unknown): a max length larger than the
+/// object, or text that doesn't fit it, ends the program (__chk_fail).
+fn write_checked_text(uc: &mut Uc, buffer: u32, size: Option<u32>, object_size: u32, text: &[u8]) -> Ret {
+    let overflows = match size {
+        Some(size) => size > object_size,
+        None => text.len() as u64 + 1 > u64::from(object_size),
+    };
+    if object_size != u32::MAX && overflows {
+        stop_with_fault(uc, format!("buffer overflow detected ({}: object of {object_size} bytes)", uc.get_data().current_call));
+        return Ret::Void;
+    }
+    write_text(buffer, size, text)
+}
+
 /// Darwin's text for a Darwin errno number.
 fn darwin_strerror(darwin: i32) -> String {
     let linux = (1..134).find(|&linux| darwin_errno(linux) == darwin).unwrap_or(darwin);
@@ -320,8 +340,9 @@ fn text() {
     function(
         "__sprintf_chk",
         handler!(|uc, a| {
-            let (buffer, _flags, _size, format) = (a.u32(), a.u32(), a.u32(), a.u32());
-            write_text(buffer, None, &arm32_bridge::imports::printf::format(mem(), format, a))
+            let (buffer, _flags, object_size, format) = (a.u32(), a.u32(), a.u32(), a.u32());
+            let text = arm32_bridge::imports::printf::format(mem(), format, a);
+            write_checked_text(uc, buffer, None, object_size, &text)
         })
         .unwrap(),
     );
@@ -329,24 +350,27 @@ fn text() {
     function(
         "__snprintf_chk",
         handler!(|uc, a| {
-            let (buffer, size, _flags, _object_size, format) = (a.u32(), a.u32(), a.u32(), a.u32(), a.u32());
-            write_text(buffer, Some(size), &arm32_bridge::imports::printf::format(mem(), format, a))
+            let (buffer, size, _flags, object_size, format) = (a.u32(), a.u32(), a.u32(), a.u32(), a.u32());
+            let text = arm32_bridge::imports::printf::format(mem(), format, a);
+            write_checked_text(uc, buffer, Some(size), object_size, &text)
         })
         .unwrap(),
     );
     function(
         "__vsprintf_chk",
         handler!(|uc, a| {
-            let (buffer, _flags, _size, format, list) = (a.u32(), a.u32(), a.u32(), a.u32(), a.u32());
-            write_text(buffer, None, &arm32_bridge::imports::printf::format(mem(), format, &mut VaList { pointer: list }))
+            let (buffer, _flags, object_size, format, list) = (a.u32(), a.u32(), a.u32(), a.u32(), a.u32());
+            let text = arm32_bridge::imports::printf::format(mem(), format, &mut VaList { pointer: list });
+            write_checked_text(uc, buffer, None, object_size, &text)
         })
         .unwrap(),
     );
     function(
         "__vsnprintf_chk",
         handler!(|uc, a| {
-            let (buffer, size, _flags, _object_size, format, list) = (a.u32(), a.u32(), a.u32(), a.u32(), a.u32(), a.u32());
-            write_text(buffer, Some(size), &arm32_bridge::imports::printf::format(mem(), format, &mut VaList { pointer: list }))
+            let (buffer, size, _flags, object_size, format, list) = (a.u32(), a.u32(), a.u32(), a.u32(), a.u32(), a.u32());
+            let text = arm32_bridge::imports::printf::format(mem(), format, &mut VaList { pointer: list });
+            write_checked_text(uc, buffer, Some(size), object_size, &text)
         })
         .unwrap(),
     );
@@ -390,6 +414,22 @@ fn text() {
         handler!(|uc, a| {
             let number = a.i32();
             Ret::U32(shared().cached_cstr(format!("darwin-strerror:{number}"), &darwin_strerror(number)))
+        })
+        .unwrap(),
+    );
+    // POSIX strerror_r(Darwin number, buffer, length): 0, or ERANGE (34) if cut short.
+    function(
+        "strerror_r",
+        handler!(|uc, a| {
+            let (number, buffer, length) = (a.i32(), a.u32(), a.u32());
+            let text = darwin_strerror(number);
+            if length == 0 {
+                return Ret::U32(34);
+            }
+            let copy = text.len().min(length as usize - 1);
+            mem().write_bytes(buffer, &text.as_bytes()[..copy]);
+            mem().write_u8(buffer + copy as u32, 0);
+            Ret::U32(if copy < text.len() { 34 } else { 0 })
         })
         .unwrap(),
     );
@@ -740,12 +780,96 @@ fn process() {
         })
         .unwrap(),
     );
+    // As Apple's Libc: atexit is __cxa_atexit(routine, NULL, NULL) (the C++
+    // runtime's), and exit first runs __cxa_finalize(NULL): every routine
+    // and static destructor, newest first. _exit runs none.
     function(
         "atexit",
         handler!(|uc, a| {
             let routine = a.u32();
-            shared().state.at_exit.push((routine, 0));
+            let Some(register) = guest_export("__cxa_atexit") else {
+                shared().state.at_exit.push((routine, 0));
+                return Ret::U32(0);
+            };
+            match call_guest(uc, register, &[routine, 0, 0]) {
+                Ok(result) => Ret::U32(result as u32),
+                Err(error) => {
+                    stop_with_fault(uc, error);
+                    Ret::Void
+                }
+            }
+        })
+        .unwrap(),
+    );
+    function(
+        "exit",
+        handler!(|uc, a| {
+            static FINALIZING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            let code = a.u32();
+            if let Some(finalize) = guest_export("__cxa_finalize") {
+                if !FINALIZING.swap(true, Ordering::SeqCst) {
+                    if let Err(error) = call_guest(uc, finalize, &[0]) {
+                        stop_with_fault(uc, error);
+                        return Ret::Void;
+                    }
+                }
+            }
+            forward(uc, bionic!("exit"), [code, 0, 0, 0])
+        })
+        .unwrap(),
+    );
+    // Apple's clock ids.
+    function(
+        "clock_gettime",
+        handler!(|uc, a| {
+            let (clock, out) = (a.u32(), a.u32());
+            let host = match clock {
+                0 => libc::CLOCK_REALTIME,
+                4 | 8 => libc::CLOCK_MONOTONIC_RAW, // MONOTONIC_RAW, UPTIME_RAW
+                5 | 9 => libc::CLOCK_MONOTONIC,     // their _APPROX forms
+                6 => libc::CLOCK_BOOTTIME,          // MONOTONIC: counts sleep too
+                12 => libc::CLOCK_PROCESS_CPUTIME_ID,
+                16 => libc::CLOCK_THREAD_CPUTIME_ID,
+                _ => {
+                    mem().write_u32(uc.get_data().errno_slot, 22); // EINVAL
+                    return Ret::U32(u32::MAX);
+                }
+            };
+            let mut now: libc::timespec = unsafe { std::mem::zeroed() };
+            if unsafe { libc::clock_gettime(host, &mut now) } != 0 {
+                return checked(uc, -1);
+            }
+            mem().write_u32(out, now.tv_sec as u32);
+            mem().write_u32(out + 4, now.tv_nsec as u32);
             Ret::U32(0)
+        })
+        .unwrap(),
+    );
+    // Libraries a 32-bit game could open are already loaded: RTLD_NOLOAD
+    // (0x10) asks whether one is (libc++ asks about GCC's libstdc++), and
+    // isn't answered yes; other opens behave as on Android.
+    function(
+        "dlopen",
+        handler!(|uc, a| {
+            let (name, flags) = (a.u32(), a.u32());
+            if name != 0 && flags & 0x10 != 0 {
+                return Ret::U32(0);
+            }
+            forward(uc, bionic!("dlopen"), [name, flags, 0, 0])
+        })
+        .unwrap(),
+    );
+    // dlsym(handle, C name): guest libraries' exports, then this layer's table.
+    function(
+        "dlsym",
+        handler!(|uc, a| {
+            let (_handle, name) = (a.u32(), a.u32());
+            let name = mem().string(name);
+            let address = guest_export(&name)
+                .or_else(|| ios32::data_address(&name))
+                .or_else(|| ios32::provides_function(&name).then(|| runtime::stub_for(&name)))
+                .unwrap_or(0);
+            Ret::U32(address)
         })
         .unwrap(),
     );

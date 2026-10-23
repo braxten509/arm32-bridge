@@ -184,9 +184,10 @@ pub struct PlatformHooks {
     /// The guest's errno number for a host (Linux) one.
     pub errno_from_host: fn(i32) -> i32,
     /// Where a 32-bit ELF library's import goes when neither the library nor
-    /// another loaded library defines it: (name, marked as data, weak) ->
+    /// another loaded library defines it: (name, marked as data, weak,
+    /// library built for the platform's own C library rather than bionic) ->
     /// address. None: Android's own rules (imports::handler_for / data_import).
-    pub library_import: Option<fn(&str, bool, bool) -> u32>,
+    pub library_import: Option<fn(&str, bool, bool, bool) -> u32>,
 }
 
 /// Android: bionic phone functions, Linux system calls, TPIDRURO = the TLS block.
@@ -212,15 +213,50 @@ fn same_errno(errno: i32) -> i32 {
 /// Whether 64-bit arguments are packed (see `PlatformHooks::packed_pairs`).
 #[inline]
 pub fn packed_pairs() -> bool {
-    OTHER_PLATFORM.load(Ordering::Relaxed) && platform().packed_pairs
+    OTHER_PLATFORM.load(Ordering::Relaxed) && platform().packed_pairs && !ANDROID_RULES.with(Cell::get)
 }
 
 /// The guest's errno number for host errno `errno` (the same on Android).
 pub fn guest_errno(errno: i32) -> i32 {
-    if OTHER_PLATFORM.load(Ordering::Relaxed) {
+    if OTHER_PLATFORM.load(Ordering::Relaxed) && !ANDROID_RULES.with(Cell::get) {
         (platform().errno_from_host)(errno)
     } else {
         errno
+    }
+}
+
+thread_local! {
+    /// On another platform, the call being handled came from a guest library
+    /// built against bionic (an ELF library such as libz): its arguments and
+    /// errno numbers follow Android's rules, not the platform's.
+    static ANDROID_RULES: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Runs a handler for a call from bionic-built guest code under Android's
+/// argument and errno rules. Guest code it calls back runs under the
+/// platform's rules again (see `call_guest_with`).
+pub fn with_android_rules<R>(f: impl FnOnce() -> R) -> R {
+    let outer = ANDROID_RULES.with(|rules| rules.replace(true));
+    let result = f();
+    ANDROID_RULES.with(|rules| rules.set(outer));
+    result
+}
+
+/// While guest code runs, its own stand-ins decide the rules: a callback
+/// from an Android-rules handler doesn't inherit them. (Nothing on Android.)
+struct GuestRules(Option<bool>);
+
+impl GuestRules {
+    fn enter() -> GuestRules {
+        GuestRules(other_platform().then(|| ANDROID_RULES.with(|rules| rules.replace(false))))
+    }
+}
+
+impl Drop for GuestRules {
+    fn drop(&mut self) {
+        if let Some(outer) = self.0 {
+            ANDROID_RULES.with(|rules| rules.set(outer));
+        }
     }
 }
 
@@ -2062,12 +2098,15 @@ pub fn call_guest_with(uc: &mut Uc, address: u32, args: &[Arg]) -> Result<u64, S
     if depth >= MAX_DEPTH {
         return Err("guest calls nested too deeply".into());
     }
+    // Arguments as the caller's rules lay them out; the guest code then runs under its own.
+    let packed = packed_pairs();
+    let _rules = GuestRules::enter();
     // The translator runs top-level calls and calls made from its own
     // handlers; calls made while Unicorn is running stay in Unicorn.
     // In parallel mode every call runs there (G4): a Unicorn run could not
     // stop for a stopped world.
     if crate::dynarec::enabled() && (depth == 0 || live_native(uc).is_some() || parallel()) {
-        return call_guest_native(uc, address, args, depth);
+        return call_guest_native(uc, address, args, packed, depth);
     }
     let saved = if depth > 0 {
         let mut context = uc.context_alloc().map_err(|e| format!("{e:?}"))?;
@@ -2077,7 +2116,7 @@ pub fn call_guest_with(uc: &mut Uc, address: u32, args: &[Arg]) -> Result<u64, S
         None
     };
 
-    let (registers, stack_words) = lay_out_arguments(args, packed_pairs());
+    let (registers, stack_words) = lay_out_arguments(args, packed);
     let mut sp = if depth > 0 {
         (uc.reg_read(RegisterARM::SP).unwrap() as u32 - 256) & !7
     } else {
@@ -2150,7 +2189,7 @@ pub fn call_guest_with(uc: &mut Uc, address: u32, args: &[Arg]) -> Result<u64, S
 }
 
 /// The same call on the translator: state lives in the thread's `CpuState`.
-fn call_guest_native(uc: &mut Uc, address: u32, args: &[Arg], depth: u32) -> Result<u64, String> {
+fn call_guest_native(uc: &mut Uc, address: u32, args: &[Arg], packed: bool, depth: u32) -> Result<u64, String> {
     if uc.get_data().native.is_none() {
         let tls = (platform().thread_pointer)(uc.get_data().tls_block);
         let flag = attention_flag_address(uc);
@@ -2182,7 +2221,7 @@ fn call_guest_native(uc: &mut Uc, address: u32, args: &[Arg], depth: u32) -> Res
     if unicorn_live {
         crate::dynarec::seed_from_unicorn(uc);
     }
-    let (registers, stack_words) = lay_out_arguments(args, packed_pairs());
+    let (registers, stack_words) = lay_out_arguments(args, packed);
     let stack_top = uc.get_data().stack_top;
     let native = uc.get_data_mut().native.as_mut().unwrap();
     let was_active = native.active;

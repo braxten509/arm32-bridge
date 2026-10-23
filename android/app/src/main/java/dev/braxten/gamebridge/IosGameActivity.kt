@@ -20,7 +20,8 @@ import android.widget.VideoView
 import java.io.File
 
 /**
- * Runs a 64-bit iPhone game (an unpacked .app folder) full screen. Started with
+ * Runs an iPhone game (an unpacked .app folder; 64-bit, or 32-bit on the iPhone
+ * layer's translator) full screen. Started with
  * the folder in the "app" extra; the game's own writable files go to this app's
  * files/ios/<folder name>. Runs in its own process, so a game that stops can't
  * take Game Bridge down with it.

@@ -363,10 +363,23 @@ pub fn missing_calls() -> Vec<String> {
 const BIONIC_PREFIX: &str = "bionic:";
 
 fn resolve_stub(name: &str) -> Option<Handler> {
-    if let Some(bionic) = name.strip_prefix(BIONIC_PREFIX) {
-        return Some(crate::imports::handler_for(bionic).unwrap_or(missing_function));
+    if name.starts_with(BIONIC_PREFIX) {
+        return Some(bionic_call);
     }
     Some(registry(|r| r.functions.get(name).copied()).unwrap_or(missing_function))
+}
+
+/// A call from a bionic-built guest library: Android's handler, under
+/// Android's argument (EABI pairs) and errno rules, named by its plain name
+/// while it runs (some handlers tell calls apart by name).
+fn bionic_call(uc: &mut Uc, args: &mut Args) -> Ret {
+    let stand_in = uc.get_data().current_call;
+    let name = stand_in.strip_prefix(BIONIC_PREFIX).unwrap_or(stand_in);
+    let handler = crate::imports::handler_for(name).unwrap_or(missing_function);
+    uc.get_data_mut().current_call = name;
+    let result = runtime::with_android_rules(|| handler(uc, args));
+    uc.get_data_mut().current_call = stand_in;
+    result
 }
 
 /// A function no one provides: stops the program and names it (or, when
@@ -393,18 +406,33 @@ fn missing_function(uc: &mut Uc, args: &mut Args) -> Ret {
     Ret::Void
 }
 
-/// For 32-bit ELF guest libraries (libz, libc++) loaded into an iPhone
-/// program. They are built against bionic, so their C library calls keep
-/// bionic's layouts (open flags, off_t, struct stat, errno numbers): names
-/// Android's handlers know go there (own stand-ins, "bionic:name"), data
-/// Android knows comes from Android's table. Other names go to what the
-/// embedder registered (Objective-C runtime, ...); then weak ones are 0.
-fn library_import(name: &str, object: bool, weak: bool) -> u32 {
-    if crate::imports::known_data_import(name) {
-        return crate::imports::data_import(name);
-    }
-    if !object && crate::imports::handler_for(name).is_some() {
-        return runtime::stub_for(&format!("{BIONIC_PREFIX}{name}"));
+/// Imports of Apple-ABI guest libraries that nothing provided at load time.
+static LIBRARY_MISSING: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Imports of Apple-ABI guest libraries (libc++) that nothing provides, in load order.
+pub fn missing_library_imports() -> Vec<String> {
+    LIBRARY_MISSING.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// For 32-bit ELF guest libraries loaded into an iPhone program.
+///
+/// Built for Apple's ABI (`apple`: the C++ runtime, compiled with Darwin
+/// headers): every name goes to what the embedder registered, exactly like
+/// the program's own imports; nothing registered: weak ones are 0, the rest
+/// listed (`missing_library_imports`) and stop the program if called.
+///
+/// Built against bionic (the built-in libz): their C library calls keep
+/// bionic's layouts (open flags, off_t, struct stat, errno numbers), so names
+/// Android's handlers know go there (own stand-ins, "bionic:name") and data
+/// Android knows comes from Android's table; other names as above.
+fn library_import(name: &str, object: bool, weak: bool, apple: bool) -> u32 {
+    if !apple {
+        if crate::imports::known_data_import(name) {
+            return crate::imports::data_import(name);
+        }
+        if !object && crate::imports::handler_for(name).is_some() {
+            return runtime::stub_for(&format!("{BIONIC_PREFIX}{name}"));
+        }
     }
     if let Some(address) = data_address(name) {
         return address;
@@ -414,6 +442,12 @@ fn library_import(name: &str, object: bool, weak: bool) -> u32 {
     }
     if weak {
         return 0;
+    }
+    if apple {
+        let mut missing = LIBRARY_MISSING.lock().unwrap_or_else(|e| e.into_inner());
+        if !missing.iter().any(|known| known == name) {
+            missing.push(name.to_string());
+        }
     }
     if object {
         return unknown_data(name);
@@ -766,6 +800,15 @@ pub fn run_initializers(uc: &mut Uc, program: &Program, start: &Start) -> Result
     Ok(functions.len())
 }
 
+/// Where the start words (argc, argv, envp, apple) go near the main
+/// thread's `stack_top`, and the stack top later guest calls on this thread
+/// start from (start-up functions run through `call_guest`, before the entry
+/// point reads the block): (block, top for guest calls).
+pub fn start_block(stack_top: u32, words: usize) -> (u32, u32) {
+    let block = (stack_top - 256 - words as u32 * 4) & !15;
+    (block, block)
+}
+
 /// Builds the start state dyld would leave. `argv0` is the program's path.
 /// LC_MAIN: called like main(argc, argv, envp, apple), returning to the trap.
 /// LC_UNIXTHREAD: the thread state's registers, argc at [sp], then argv,
@@ -777,8 +820,8 @@ pub fn start_state(uc: &mut Uc, program: &Program, argv0: &str) -> Result<Start,
         (shared.misc_cstr(argv0), shared.misc_cstr(&format!("executable_path={argv0}")))
     };
     let words = startup_words(&[path], &[], &[apple_text]);
-    let stack_top = uc.get_data().stack_top;
-    let block = (stack_top - 256 - words.len() as u32 * 4) & !15;
+    let (block, guest_calls_top) = start_block(uc.get_data().stack_top, words.len());
+    uc.get_data_mut().stack_top = guest_calls_top;
     let memory = runtime::mem();
     for (i, word) in words.iter().enumerate() {
         memory.write_u32(block + i as u32 * 4, *word);

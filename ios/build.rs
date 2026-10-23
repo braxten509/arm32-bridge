@@ -22,6 +22,7 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("aarch64") {
         return;
     }
+    guest32_cxx();
     let root = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("cxxrt");
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("cxxrt");
     std::fs::create_dir_all(&out).unwrap();
@@ -123,6 +124,26 @@ fn main() {
     run(command, "archiving the C++ runtime");
     println!("cargo:rustc-link-search=native={}", out.display());
     println!("cargo:rustc-link-lib=static=gamebridge_cxxrt");
+}
+
+/// The C++ runtime of 32-bit games (guest32-cxx/README.md): a 32-bit ARM
+/// library embedded into this layer. It is a build output, not in the repo:
+/// built here by guest32-cxx/build.sh when missing (rebuild it by hand after
+/// changing its sources; this build then embeds the new one).
+fn guest32_cxx() {
+    println!("cargo:rerun-if-env-changed=GUEST32_CXX_OUT");
+    let out = std::env::var("GUEST32_CXX_OUT").map(PathBuf::from).unwrap_or_else(|_| {
+        PathBuf::from(std::env::var("HOME").unwrap()).join(".cache/gamebridge/guest32-cxx/out")
+    });
+    let library = out.join("libguest32cxx.so");
+    if !library.exists() {
+        let script = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("guest32-cxx/build.sh");
+        let mut command = Command::new("bash");
+        command.arg(&script).env("GUEST32_CXX_OUT", &out);
+        run(command, "building the 32-bit C++ runtime (guest32-cxx/build.sh)");
+    }
+    println!("cargo:rerun-if-changed={}", library.display());
+    println!("cargo:rustc-env=GUEST32_CXX_LIBRARY={}", library.display());
 }
 
 fn run(mut command: Command, what: &str) {

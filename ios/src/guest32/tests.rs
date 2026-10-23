@@ -4,7 +4,7 @@
 
 use super::libsystem::{RUNE_ALPHA, RUNE_LOWER, RUNE_LOWER_MAP, RUNE_TYPES, RUNE_XDIGIT};
 use arm32_bridge::ios32;
-use arm32_bridge::runtime::{self, mem, Args, GuestCpu};
+use arm32_bridge::runtime::{self, mem, ArgSource, Args, GuestCpu};
 
 fn setup() {
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -37,6 +37,23 @@ fn call(name: &str, registers: [u32; 4], stack: &[u32]) -> (u32, u32) {
     let handler = ios32::function(name).unwrap_or_else(|| panic!("{name} is not registered"));
     uc.get_data_mut().current_call = Box::leak(name.to_string().into_boxed_str());
     let result = handler(uc, &mut Args::new(registers, sp));
+    runtime::write_result(uc, result);
+    (uc.reg(0), uc.reg(1))
+}
+
+/// Calls the stand-in for `name` as translated code would (with its stand-in name).
+fn call_stub(name: &str, registers: [u32; 4], stack: &[u32]) -> (u32, u32) {
+    setup();
+    let address = runtime::stub_for(name);
+    let stub = runtime::stub((address - arm32_bridge::mem::stub_base()) / 8).unwrap();
+    let sp = alloc(64 + stack.len() as u32 * 4);
+    for (i, word) in stack.iter().enumerate() {
+        mem().write_u32(sp + i as u32 * 4, *word);
+    }
+    let _gil = runtime::hold_gil();
+    let uc = runtime::engine();
+    uc.get_data_mut().current_call = stub.name;
+    let result = stub.handler.unwrap()(uc, &mut Args::new(registers, sp));
     runtime::write_result(uc, result);
     (uc.reg(0), uc.reg(1))
 }
@@ -116,6 +133,182 @@ fn unknown_data_is_zeroed_memory_that_names_itself_when_called() {
     let slot = (address - arm32_bridge::mem::stub_base()) / 8;
     assert_eq!(runtime::stub(slot).map(|stub| stub.name), Some("glMadeUpEntryPoint"));
     assert_eq!(ios32::unknown_data("glMadeUpEntryPoint"), address, "one block per name");
+}
+
+#[test]
+fn bionic_library_calls_keep_androids_rules() {
+    // The built-in libz is built against bionic: its lseek64(fd, off64_t,
+    // whence) has the offset in r2:r3 (EABI pair), whence on the stack.
+    let base = std::env::temp_dir().join(format!("guest32-bionic-{}", std::process::id()));
+    std::fs::create_dir_all(base.join("full/inside")).unwrap();
+    let file = base.join("data");
+    std::fs::write(&file, [7u8; 2000]).unwrap();
+    let fd = call_stub("bionic:open", [cstring(file.to_str().unwrap()), 0, 0, 0], &[]).0;
+    assert_eq!(call_stub("bionic:lseek64", [fd, 0xDEAD, 1024, 0], &[0]), (1024, 0));
+    call_stub("bionic:close", [fd, 0, 0, 0], &[]);
+    // Its errno numbers are Linux's: ENOTEMPTY is 39 (Darwin's is 66).
+    assert_eq!(call_stub("bionic:rmdir", [cstring(base.join("full").to_str().unwrap()), 0, 0, 0], &[]).0 as i32, -1);
+    assert_eq!(errno(), 39);
+    // Handlers that tell calls apart by name see the plain name: feof is not clearerr.
+    let stream = call_stub("bionic:fopen", [cstring(file.to_str().unwrap()), cstring("r"), 0, 0], &[]).0;
+    call_stub("bionic:fseek", [stream, 0, 2, 0], &[]);
+    assert_eq!(call_stub("bionic:fgetc", [stream, 0, 0, 0], &[]).0 as i32, -1);
+    assert_ne!(call_stub("bionic:feof", [stream, 0, 0, 0], &[]).0, 0, "at the end of the file");
+    call_stub("bionic:fclose", [stream, 0, 0, 0], &[]);
+    std::fs::remove_dir_all(&base).unwrap();
+    // The program's own (Apple) calls still use Apple's rules.
+    let x = 0.25f64.to_bits();
+    let out = alloc(16);
+    call("__sincos_stret", [out, x as u32, (x >> 32) as u32, 0], &[]);
+    assert_eq!(f64::from_bits(mem().read_u64(out)), 0.25f64.sin());
+}
+
+#[test]
+fn checked_printf_stops_at_the_object_size() {
+    // __sprintf_chk(buffer, flags, object size, format, ...): Apple's
+    // __chk_fail stops the program instead of writing past the object.
+    let buffer = alloc(16);
+    mem().write_bytes(buffer, &[0xEE; 16]);
+    call("__sprintf_chk", [buffer, 0, 4, cstring("%s")], &[cstring("abcdef")]);
+    let _gil = runtime::hold_gil();
+    let uc = runtime::engine();
+    let fault = uc.get_data_mut().fault.take();
+    assert!(fault.is_some_and(|f| f.contains("overflow")), "stopped");
+    assert_eq!(mem().bytes(buffer + 4, 12), [0xEE; 12], "nothing written past the object");
+    drop(_gil);
+    // __snprintf_chk(buffer, max length, flags, object size, format, ...) with max length > object size.
+    call("__snprintf_chk", [buffer, 8, 0, 4], &[cstring("%s"), cstring("ab")]);
+    let _gil = runtime::hold_gil();
+    assert!(runtime::engine().get_data_mut().fault.take().is_some(), "max length larger than the object stops");
+}
+
+#[test]
+fn streaming_cryptor_round_trip() {
+    // AES-128 CBC with PKCS7 padding (options 1), in two pieces each way.
+    let (key, iv) = (alloc(16), alloc(16));
+    mem().write_bytes(key, &[7; 16]);
+    mem().write_bytes(iv, &[9; 16]);
+    let plain: Vec<u8> = (0..40u8).collect();
+    let input = alloc(48);
+    mem().write_bytes(input, &plain);
+    let crypt = |decrypt: u32, input: u32, length: u32, out: u32| -> u32 {
+        let reference = alloc(4);
+        assert_eq!(call("CCCryptorCreate", [decrypt, 0, 1, key], &[16, iv, reference]).0, 0);
+        let cryptor = mem().read_u32(reference);
+        let moved = alloc(4);
+        let half = length / 2;
+        assert_eq!(call("CCCryptorUpdate", [cryptor, input, half, out], &[64, moved]).0, 0);
+        let mut total = mem().read_u32(moved);
+        assert_eq!(call("CCCryptorUpdate", [cryptor, input + half, length - half, out + total], &[64, moved]).0, 0);
+        total += mem().read_u32(moved);
+        // Too little room for the last piece: kCCBufferTooSmall.
+        assert_eq!(call("CCCryptorFinal", [cryptor, out + total, 0, moved], &[]).0 as i32, -4301);
+        assert_eq!(call("CCCryptorFinal", [cryptor, out + total, 64, moved], &[]).0, 0);
+        total += mem().read_u32(moved);
+        assert_eq!(call("CCCryptorRelease", [cryptor, 0, 0, 0], &[]).0, 0);
+        total
+    };
+    let encrypted = alloc(64);
+    let length = crypt(0, input, 40, encrypted);
+    let expected = crate::fw::crypto::crypt(false, 0, 1, &[7; 16], Some(&[9; 16]), &plain).unwrap();
+    assert_eq!(mem().bytes(encrypted, length as usize), &expected[..]);
+    let decrypted = alloc(64);
+    let length = crypt(1, encrypted, length, decrypted);
+    assert_eq!(mem().bytes(decrypted, length as usize), &plain[..]);
+}
+
+/// The C++ runtime loaded once, as `run` loads it (call before holding the GIL).
+fn cxx() {
+    setup();
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _gil = runtime::hold_gil();
+        super::open_cxx_library(runtime::engine()).expect("the C++ runtime loads");
+    });
+}
+
+fn guest_export(name: &str) -> u32 {
+    *runtime::shared().guest_exports.get(name).unwrap_or_else(|| panic!("no guest export {name}"))
+}
+
+#[test]
+fn cxx_runtime_imports_are_all_provided() {
+    cxx();
+    assert_eq!(ios32::missing_library_imports(), Vec::<String>::new());
+}
+
+#[test]
+fn cxx_runtime_checks_pass_on_this_c_library() {
+    // guest32-cxx/test/cxxtest.cpp (exceptions through the SjLj unwinder,
+    // streams, locale, guards, threads' keys), built by `build.sh test`,
+    // here on this layer's C functions instead of its stand-in C library.
+    fn no_locks_counted(_uc: &mut runtime::Uc, _a: &mut Args) -> runtime::Ret {
+        runtime::Ret::U32(0)
+    }
+    cxx();
+    ios32::register_function("testc_mutexes_held", no_locks_counted);
+    let out = std::env::var("GUEST32_CXX_OUT").map(std::path::PathBuf::from).unwrap_or_else(|_| {
+        std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".cache/gamebridge/guest32-cxx/out")
+    });
+    let path = out.join("test/libcxxtest.so");
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e} (run guest32-cxx/build.sh test)", path.display()));
+    let _gil = runtime::hold_gil();
+    let uc = runtime::engine();
+    let index = arm32_bridge::elf::open_bytes(uc, "libcxxtest.so", &bytes, true).unwrap();
+    let run_all = arm32_bridge::elf::with_loader(|loader| loader.libraries[index].export(uc, "run_all")).unwrap();
+    let failed = runtime::call_guest(uc, run_all, &[]).unwrap() as u32;
+    assert_eq!(failed, 0, "run_all: one bit per failed check");
+}
+
+#[test]
+fn exit_runs_static_destructors_first() {
+    static RAN_WITH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    fn destructor(_uc: &mut runtime::Uc, a: &mut Args) -> runtime::Ret {
+        RAN_WITH.store(a.u32(), std::sync::atomic::Ordering::SeqCst);
+        runtime::Ret::Void
+    }
+    cxx();
+    ios32::register_function("test_static_destructor", destructor);
+    {
+        let _gil = runtime::hold_gil();
+        let uc = runtime::engine();
+        let function = runtime::stub_for("test_static_destructor");
+        runtime::call_guest(uc, guest_export("__cxa_atexit"), &[function, 7, 0]).unwrap();
+    }
+    call("exit", [3, 0, 0, 0], &[]);
+    let _gil = runtime::hold_gil();
+    let uc = runtime::engine();
+    assert_eq!(uc.get_data().exit_code, Some(3));
+    uc.get_data_mut().exit_code = None;
+    assert_eq!(RAN_WITH.load(std::sync::atomic::Ordering::SeqCst), 7, "__cxa_finalize(NULL) ran the destructor");
+}
+
+#[test]
+fn clocks_use_apples_ids_and_libstdcxx_is_absent() {
+    let out = alloc(8);
+    // CLOCK_UPTIME_RAW (8; Linux's 8 is CLOCK_REALTIME_ALARM): time since boot.
+    assert_eq!(call("clock_gettime", [8, out, 0, 0], &[]).0, 0);
+    let uptime = mem().read_u32(out);
+    assert_eq!(call("clock_gettime", [0, out, 0, 0], &[]).0, 0);
+    assert!(uptime < mem().read_u32(out) / 2, "uptime, not the date");
+    // CLOCK_THREAD_CPUTIME_ID is 16 (not a Linux clock id).
+    assert_eq!(call("clock_gettime", [16, out, 0, 0], &[]).0, 0);
+    // libc++ asks with RTLD_NOLOAD whether GCC's libstdc++ is loaded: it isn't.
+    assert_eq!(call("dlopen", [cstring("/usr/lib/libstdc++.6.dylib"), 0x10, 0, 0], &[]).0, 0);
+}
+
+#[test]
+fn sjlj_slot_stays_the_unwinders() {
+    // Slot 18 of the thread block holds each thread's SjLj context list,
+    // read and written by guest code: zero at thread start, never a key's.
+    for _ in 0..24 {
+        let out = alloc(4);
+        assert_eq!(call("pthread_key_create", [out, 0, 0, 0], &[]).0, 0);
+        assert_eq!(call("pthread_setspecific", [mem().read_u32(out), 0xBAD, 0, 0], &[]).0, 0);
+    }
+    let _gil = runtime::hold_gil();
+    let block = runtime::engine().get_data().tls_block;
+    assert_eq!(mem().read_u32(block + 18 * 4), 0);
 }
 
 #[test]

@@ -57,12 +57,15 @@
 //!
 //! **Stopping**: `arm32_bridge::runtime::stop_with_fault(uc, message)`.
 //!
-//! Guest ELF libraries (the built-in libz, the C++ helper's libc++) are
-//! built against bionic: their C library imports use Android's handlers
-//! (bionic layouts and errno numbers), everything else goes through this
-//! table. Their exports bind directly to the program's imports of the same name.
+//! Guest ELF libraries: the C++ runtime (libguest32cxx.so, guest32-cxx/) is
+//! built for Apple's ABI, so all its imports go through this table like the
+//! program's; the built-in libz is bionic's, so its C library imports use
+//! Android's handlers (bionic layouts and errno numbers). Their exports bind
+//! directly to the program's imports of the same name.
 
+mod crypto;
 mod libsystem;
+mod locale;
 pub mod objc;
 #[cfg(test)]
 mod tests;
@@ -149,7 +152,20 @@ pub fn call(uc: &mut Uc, address: u32, args: &[u32]) -> Result<u64, String> {
 /// Every name the 32-bit layer provides, registered before loading.
 pub fn register_all() {
     libsystem::register();
+    locale::register();
+    crypto::register();
     objc::wire::register();
+}
+
+/// libc++, libc++abi and the SjLj unwinder for Apple's armv7 ABI
+/// (guest32-cxx/README.md), built by build.rs.
+const CXX_LIBRARY: &[u8] = include_bytes!(env!("GUEST32_CXX_LIBRARY"));
+
+/// Loads the C++ runtime into guest memory and runs its constructors; its
+/// exports then bind the program's C++ imports. Its own imports use this
+/// layer's table (registered first).
+pub fn open_cxx_library(uc: &mut Uc) -> Result<(), String> {
+    arm32_bridge::elf::open_bytes(uc, "libguest32cxx.so", CXX_LIBRARY, true).map(|_| ())
 }
 
 /// The loaded program's header address and slide (dyld image functions).
@@ -188,6 +204,7 @@ pub fn run(app_dir: &str, program_path: &str) -> Result<(), String> {
     let _gil = runtime::hold_gil();
     let uc = runtime::engine();
     arm32_bridge::elf::open_built_in(uc, "libz.so")?;
+    open_cxx_library(uc)?;
     let loaded = ios32::load(&program)?;
     objc::wire::install_program()?;
     let header = program.image.header_address().unwrap_or(0).wrapping_add(program.plan.slide);
@@ -212,6 +229,7 @@ pub fn run(app_dir: &str, program_path: &str) -> Result<(), String> {
         crate::log!("missing functions: {}", loaded.missing_functions.join(" "));
         crate::log!("missing data: {}", loaded.missing_data.join(" "));
         crate::log!("weak imports left empty: {}", loaded.weak_left_empty.join(" "));
+        crate::log!("C++ runtime imports nothing provides: {}", ios32::missing_library_imports().join(" "));
     }
     let start = ios32::start_state(uc, &program, program_path)?;
     crate::log!("32-bit start: {} at {:#010x} ({})", start.kind, start.pc & !1, if start.pc & 1 == 1 { "Thumb" } else { "ARM" });

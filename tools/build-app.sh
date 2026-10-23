@@ -31,7 +31,8 @@ OUT=$ROOT/target/aarch64-linux-android/release
 cp "$OUT/libarm32_bridge.so" "$LIBS/libarm32_bridge.so"
 # The frame helper for 64-bit games: the converter copies it into each one, so it travels small.
 "$BIN/llvm-strip" -o "$LIBS/libgamebridge_pacer.so" "$OUT/libgamebridge_pacer.so"
-# The iPhone layer (64-bit iPhone games), loaded by the iPhone game screen.
+# The iPhone layer, loaded by the iPhone game screen: 64-bit iPhone games run
+# directly, 32-bit (ARMv7) ones on the translator built into it.
 "$BIN/llvm-strip" -o "$LIBS/libgamebridge_ios.so" "$OUT/libgamebridge_ios.so"
 # Android only unpacks lib*.so files, so the converter program travels under that name.
 "$BIN/llvm-strip" -o "$LIBS/libapkconvert.so" "$OUT/apk-convert"
