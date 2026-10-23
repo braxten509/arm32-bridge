@@ -1,5 +1,5 @@
 //! Property lists (Apple's settings file format), XML and binary, read into
-//! our NSDictionary/NSArray/NSString/NSNumber objects and written as XML.
+//! our NSDictionary/NSArray/NSString/NSNumber objects and written back.
 
 use crate::fw::{collections, string};
 use crate::objc::runtime::{Class, Id, Sel};
@@ -333,8 +333,14 @@ pub fn from_object(object: Id) -> Option<Value> {
         return Some(Value::Array(collections::array_items(object).into_iter().filter_map(from_object).collect()));
     }
     if collections::is_number(object) {
-        let value = collections::number_as_f64(object);
-        return Some(if value.fract() == 0.0 { Value::Integer(value as i64) } else { Value::Real(value) });
+        // The number's own kind and exact value (integers don't pass through a double).
+        return Some(if collections::number_is_bool(object) {
+            Value::Bool(collections::number_as_i64(object) != 0)
+        } else if collections::number_is_float(object) {
+            Value::Real(collections::number_as_f64(object))
+        } else {
+            Value::Integer(collections::number_as_i64(object))
+        });
     }
     if crate::fw::data::is_data(object) {
         return Some(Value::Data(crate::fw::data::bytes(object)));
@@ -380,6 +386,107 @@ pub fn to_xml(value: &Value) -> String {
     out
 }
 
+/// A list in Apple's binary format (bplist00): every value an object in
+/// the table (none shared), the top one first.
+pub fn to_binary(value: &Value) -> Vec<u8> {
+    enum Node {
+        Bytes(Vec<u8>),
+        Array(Vec<usize>),
+        Dict(Vec<usize>, Vec<usize>),
+    }
+    fn header(marker: u8, length: usize, out: &mut Vec<u8>) {
+        if length < 15 {
+            out.push(marker | length as u8);
+        } else {
+            out.push(marker | 0xF);
+            out.extend(integer(length as i64));
+        }
+    }
+    fn integer(n: i64) -> Vec<u8> {
+        match n {
+            0..=0xFF => vec![0x10, n as u8],
+            0x100..=0xFFFF => [vec![0x11], (n as u16).to_be_bytes().to_vec()].concat(),
+            0x1_0000..=0xFFFF_FFFF => [vec![0x12], (n as u32).to_be_bytes().to_vec()].concat(),
+            _ => [vec![0x13], n.to_be_bytes().to_vec()].concat(),
+        }
+    }
+    fn text(s: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        if s.is_ascii() {
+            header(0x50, s.len(), &mut out);
+            out.extend(s.as_bytes());
+        } else {
+            let units: Vec<u16> = s.encode_utf16().collect();
+            header(0x60, units.len(), &mut out);
+            out.extend(units.iter().flat_map(|u| u.to_be_bytes()));
+        }
+        out
+    }
+    fn add(value: &Value, nodes: &mut Vec<Node>) -> usize {
+        let index = nodes.len();
+        nodes.push(Node::Bytes(Vec::new()));
+        let node = match value {
+            Value::Dict(entries) => {
+                let keys = entries.iter().map(|(key, _)| add(&Value::String(key.clone()), nodes)).collect();
+                let values = entries.iter().map(|(_, value)| add(value, nodes)).collect();
+                Node::Dict(keys, values)
+            }
+            Value::Array(items) => Node::Array(items.iter().map(|item| add(item, nodes)).collect()),
+            Value::String(s) => Node::Bytes(text(s)),
+            Value::Integer(n) => Node::Bytes(integer(*n)),
+            Value::Real(f) => Node::Bytes([vec![0x23], f.to_be_bytes().to_vec()].concat()),
+            Value::Bool(b) => Node::Bytes(vec![if *b { 0x09 } else { 0x08 }]),
+            Value::Data(bytes) => {
+                let mut out = Vec::new();
+                header(0x40, bytes.len(), &mut out);
+                out.extend(bytes);
+                Node::Bytes(out)
+            }
+            Value::Date(seconds) => Node::Bytes([vec![0x33], seconds.to_be_bytes().to_vec()].concat()),
+            Value::Uid(n) => Node::Bytes([vec![0x87], n.to_be_bytes().to_vec()].concat()),
+        };
+        nodes[index] = node;
+        index
+    }
+    let mut nodes = Vec::new();
+    add(value, &mut nodes);
+    let width = |largest: usize| match largest {
+        0..=0xFF => 1,
+        0x100..=0xFFFF => 2,
+        0x1_0000..=0xFFFF_FFFF => 4,
+        _ => 8,
+    };
+    let ref_size = width(nodes.len());
+    let reference = |n: usize, out: &mut Vec<u8>| out.extend(&(n as u64).to_be_bytes()[8 - ref_size..]);
+    let mut out = b"bplist00".to_vec();
+    let mut offsets = Vec::with_capacity(nodes.len());
+    for node in &nodes {
+        offsets.push(out.len());
+        match node {
+            Node::Bytes(bytes) => out.extend(bytes),
+            Node::Array(items) => {
+                header(0xA0, items.len(), &mut out);
+                items.iter().for_each(|&n| reference(n, &mut out));
+            }
+            Node::Dict(keys, values) => {
+                header(0xD0, keys.len(), &mut out);
+                keys.iter().chain(values).for_each(|&n| reference(n, &mut out));
+            }
+        }
+    }
+    let table = out.len();
+    let offset_size = width(table);
+    for offset in offsets {
+        out.extend(&(offset as u64).to_be_bytes()[8 - offset_size..]);
+    }
+    out.extend([0; 6]);
+    out.extend([offset_size as u8, ref_size as u8]);
+    out.extend((nodes.len() as u64).to_be_bytes());
+    out.extend(0u64.to_be_bytes());
+    out.extend((table as u64).to_be_bytes());
+    out
+}
+
 // ----- NSPropertyListSerialization -----
 
 /// NSPropertyListXMLFormat_v1_0 and NSPropertyListBinaryFormat_v1_0.
@@ -392,10 +499,14 @@ fn put<T>(out: *mut T, value: T) {
     }
 }
 
-/// A list as data; it is always written as XML, which every reader of
-/// either format (ours and Apple's) takes.
-fn to_data(list: Id) -> Option<Id> {
-    from_object(list).map(|value| crate::fw::data::make(to_xml(&value).as_bytes()))
+/// A list as data in the format asked for (XML or binary; OpenStep can't be written).
+fn to_data(list: Id, format: usize) -> Option<Id> {
+    let value = from_object(list)?;
+    match format {
+        XML_FORMAT => Some(crate::fw::data::make(to_xml(&value).as_bytes())),
+        BINARY_FORMAT => Some(crate::fw::data::make(&to_binary(&value))),
+        _ => None,
+    }
 }
 
 fn from_data(data: Id, format: *mut usize) -> Option<Id> {
@@ -408,15 +519,15 @@ fn from_data(data: Id, format: *mut usize) -> Option<Id> {
     Some(to_object(&value))
 }
 
-extern "C" fn serialize(_: Class, _: Sel, list: Id, _format: usize, _options: usize, error: *mut Id) -> Id {
-    to_data(list).unwrap_or_else(|| {
+extern "C" fn serialize(_: Class, _: Sel, list: Id, format: usize, _options: usize, error: *mut Id) -> Id {
+    to_data(list, format).unwrap_or_else(|| {
         put(error, crate::fw::misc::error("NSCocoaErrorDomain", 3851, "The property list can't be written."));
         0
     })
 }
 
-extern "C" fn serialize_old(_: Class, _: Sel, list: Id, _format: usize, description: *mut Id) -> Id {
-    to_data(list).unwrap_or_else(|| {
+extern "C" fn serialize_old(_: Class, _: Sel, list: Id, format: usize, description: *mut Id) -> Id {
+    to_data(list, format).unwrap_or_else(|| {
         put(description, string::make("Property list invalid for format"));
         0
     })
@@ -499,9 +610,40 @@ mod tests {
         assert!(runtime::send(back, "isEqual:", &[hero]) & 0xFF != 0);
         assert_eq!(description, 0);
 
+        // The format asked for is the one written (OpenStep, 1, can't be written).
+        let written = |format: usize| {
+            let mut error: Id = 0;
+            let data = runtime::send(class, "dataWithPropertyList:format:options:error:", &[hero, format, 0, &mut error as *mut Id as usize]);
+            (if data == 0 { Vec::new() } else { crate::fw::data::bytes(data) }, error)
+        };
+        assert!(written(BINARY_FORMAT).0.starts_with(b"bplist00"), "binary asked for");
+        assert!(written(XML_FORMAT).0.starts_with(b"<?xml"));
+        let (nothing, refused) = written(1);
+        assert!(nothing.is_empty() && refused != 0, "OpenStep: an error, not XML");
+
         let junk = crate::fw::data::make(b"not a list");
         let back = runtime::send(class, "propertyListWithData:options:format:error:", &[junk, 0, 0, &mut error as *mut Id as usize]);
         assert_eq!(back, 0);
         assert!(error != 0, "an error for data that isn't a list");
+    }
+
+    /// Numbers keep their kind and exact value through a list, both formats:
+    /// integers past 2^53, doubles with no fraction, booleans.
+    #[test]
+    fn numbers_keep_their_exact_values_and_kinds() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let class = runtime::class_named("NSPropertyListSerialization");
+        let big = 9_007_199_254_740_993i64;
+        let list = collections::array_from(&[collections::number_int(big), collections::number_int(-5), collections::number_float(2.0), collections::number_bool(true)]);
+        for format in [XML_FORMAT, BINARY_FORMAT] {
+            let mut error: Id = 0;
+            let data = runtime::send(class, "dataWithPropertyList:format:options:error:", &[list, format, 0, &mut error as *mut Id as usize]);
+            let back = runtime::send(class, "propertyListWithData:options:format:error:", &[data, 0, 0, &mut error as *mut Id as usize]);
+            let items = collections::array_items(back);
+            assert_eq!((collections::number_as_i64(items[0]), collections::number_as_i64(items[1])), (big, -5), "format {format}");
+            assert!(collections::number_is_float(items[2]) && collections::number_as_f64(items[2]) == 2.0, "format {format}: a double stays one");
+            assert!(collections::number_is_bool(items[3]) && collections::number_as_i64(items[3]) == 1, "format {format}: a boolean stays one");
+        }
     }
 }
