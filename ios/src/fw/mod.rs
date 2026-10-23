@@ -3,6 +3,7 @@
 pub mod app;
 pub mod cfbridge;
 pub mod audiofile;
+pub mod extaudiofile;
 pub mod audioqueue;
 pub mod avasset;
 pub mod coalesced;
@@ -94,6 +95,7 @@ pub fn register(r: &mut Registry) {
     smallclasses::register(r);
     exception::register(r);
     audiofile::register(r);
+    extaudiofile::register(r);
     audioqueue::register(r);
     corevideo::register(r);
     avasset::register(r);
