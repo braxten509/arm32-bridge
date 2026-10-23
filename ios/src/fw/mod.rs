@@ -30,6 +30,7 @@ pub mod keychain;
 pub mod locks;
 pub mod media;
 pub mod misc;
+pub mod nib;
 pub mod numbers;
 pub mod object;
 pub mod paths;
@@ -65,6 +66,7 @@ pub fn register(r: &mut Registry) {
     app::register(r);
     uikit::register(r);
     controls::register(r);
+    nib::register(r);
     unavailable::register(r);
     graphics::register(r);
     runloop::register(r);

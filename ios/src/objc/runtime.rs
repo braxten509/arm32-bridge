@@ -1016,6 +1016,27 @@ pub fn protocol_matches(protocol: usize, target: &str, depth: usize) -> bool {
     }
 }
 
+// ---------- objects finished with ----------
+
+static FINISHED_LISTENERS: Mutex<Vec<fn(Id)>> = Mutex::new(Vec::new());
+
+/// Asks to hear of objects their owner is done with (see object_finished).
+pub fn on_object_finished(listener: fn(Id)) {
+    let mut listeners = FINISHED_LISTENERS.lock().unwrap_or_else(|e| e.into_inner());
+    if !listeners.iter().any(|&l| l as usize == listener as usize) {
+        listeners.push(listener);
+    }
+}
+
+/// Tells the listeners that `object` is done with, so what they keep for it
+/// can go (the 32-bit bridge frees the guest copies of its data).
+pub fn object_finished(object: Id) {
+    let listeners = FINISHED_LISTENERS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    for listener in listeners {
+        listener(object);
+    }
+}
+
 pub fn alloc_instance(class: Class) -> Id {
     let size = lock().classes.get(&class).map(|r| r.instance_size).unwrap_or(16).max(16);
     let object = unsafe { libc::calloc(1, size) } as usize;
