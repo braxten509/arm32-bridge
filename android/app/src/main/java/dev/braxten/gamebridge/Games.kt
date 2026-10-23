@@ -529,9 +529,14 @@ object Games {
             listOf("$base.png", "$base@2x.png", "$base@3x.png", "$base@2x~ipad.png", "$base~ipad.png")
         }.map { File(folder, it) }.filter { it.isFile }
         val files = listed.ifEmpty { folder.listFiles().orEmpty().filter { it.name.startsWith("Icon", true) && it.name.endsWith(".png", true) } }
-        fun width(file: File) = BitmapFactory.Options().apply { inJustDecodeBounds = true }.also { BitmapFactory.decodeFile(file.path, it) }.outWidth
-        // Apple's "crushed" PNGs don't decode here: they read as width -1 and are passed over.
-        return files.sortedByDescending(::width).firstNotNullOfOrNull { BitmapFactory.decodeFile(it.path) }
+        // Most games ship Apple's "crushed" PNGs, which Android can't read: ApplePng turns them back into normal ones.
+        fun png(file: File): ByteArray = file.readBytes().let { ApplePng.uncrush(it) ?: it }
+        // Width from the PNG header; a crushed one has its 16-byte CgBI chunk before the header.
+        fun width(file: File) = runCatching {
+            val head = java.nio.ByteBuffer.wrap(file.inputStream().use { it.readNBytes(36) })
+            if (head.getInt(12) == 0x43674249) head.getInt(32) else head.getInt(16)
+        }.getOrDefault(-1)
+        return files.sortedByDescending(::width).firstNotNullOfOrNull { file -> png(file).let { BitmapFactory.decodeByteArray(it, 0, it.size) } }
     }
 
     /** The converter looks inside (the pieces' file lists) and copies the base APK out for its name and icon. */
