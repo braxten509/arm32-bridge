@@ -17,6 +17,12 @@ fn host_gl(name: &str) -> usize {
 
 pub fn register() {
     gles::set_host_lookup(host_gl);
+    // 32-bit EAGL = the iPhone layer's host EAGLContext (ios/src/fw/eagl.rs):
+    // tell the translator's GLES handlers which EGL context is current and
+    // which sharegroup a new one belongs to, so bindings and mapped buffers
+    // are tracked per context and per sharegroup as on the phone.
+    gles::set_current_context_source(crate::fw::eagl::current_egl_context);
+    crate::fw::eagl::set_context_created_observer(gles::context_created);
     for name in gles::names() {
         if let Some(handler) = gles::handler(name) {
             super::super::function(name, handler);

@@ -35,6 +35,7 @@ system! {
     eglQueryString(display: Display, name: i32) -> *const libc::c_char;
     eglGetError() -> i32;
     eglGetCurrentSurface(which: i32) -> Surface;
+    eglGetCurrentContext() -> Context;
     eglSwapInterval(display: Display, interval: i32) -> u32;
     eglDestroySurface(display: Display, surface: Surface) -> u32;
 }
@@ -69,6 +70,21 @@ struct Egl {
 }
 
 static WINDOW: AtomicUsize = AtomicUsize::new(0);
+
+/// Told when a context is made, with its share context (the 32-bit layer's
+/// GLES sharegroup tracking).
+static CONTEXT_CREATED: OnceLock<fn(usize, usize)> = OnceLock::new();
+
+/// The 32-bit layer's observer, told of every context and its share context.
+pub fn set_context_created_observer(observer: fn(usize, usize)) {
+    let _ = CONTEXT_CREATED.set(observer);
+}
+
+/// The host EGL context current on this thread (0 = none).
+pub fn current_egl_context() -> usize {
+    unsafe { eglGetCurrentContext() }
+}
+
 /// The window surface frames are shown in; 0 while the app is away.
 static WINDOW_SURFACE: AtomicUsize = AtomicUsize::new(0);
 /// The surface the window's context last drew with (to know when it let go).
@@ -241,6 +257,9 @@ extern "C" fn init_with_api_sharegroup(this: Id, _: Sel, api: usize, sharegroup:
     }
     property_set(this, "api", api as u64);
     state_of(this).lock().unwrap().egl = context;
+    if let Some(observer) = CONTEXT_CREATED.get() {
+        observer(context, share);
+    }
     crate::log!("graphics: OpenGL ES {api} context {this:#x} made");
     this
 }

@@ -3,6 +3,7 @@
 //! through the hidden pointer, host objects and handles seen as guest
 //! words, and 32-bit struct layouts that hold pointers.
 
+use arm32_bridge::imports::gles;
 use arm32_bridge::ios32;
 use arm32_bridge::runtime::{self, mem, Args, GuestCpu};
 
@@ -176,4 +177,89 @@ fn xml_text_writer_writes_the_file() {
     let text = std::fs::read_to_string(&path).unwrap();
     std::fs::remove_file(&path).unwrap();
     assert_eq!(text, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<save a=\"1 &lt; 2 &amp; &quot;x&quot;\" b=\"7-x\"><item/></save>");
+}
+
+// ----- GL contexts -----
+
+const GL_ARRAY_BUFFER: u32 = 0x8892;
+const GL_STATIC_DRAW: u32 = 0x88E4;
+const GL_MAP_READ_BIT: u32 = 0x0001;
+const GL_MAP_WRITE_BIT: u32 = 0x0002;
+
+/// A host EAGLContext, made the way the game's messages make one.
+fn eagl_context(sharegroup: usize) -> usize {
+    let class = crate::objc::runtime::class_named("EAGLContext");
+    assert_ne!(class, 0, "the iPhone layer defines EAGLContext");
+    let context = crate::objc::runtime::send(class, "alloc", &[]);
+    let context = crate::objc::runtime::send(context, "initWithAPI:sharegroup:", &[2, sharegroup]);
+    assert_ne!(context, 0, "an OpenGL ES 2 context was made");
+    context
+}
+
+fn make_current(context: usize) {
+    let class = crate::objc::runtime::class_named("EAGLContext");
+    assert_ne!(crate::objc::runtime::send(class, "setCurrentContext:", &[context]), 0, "the context becomes current");
+}
+
+/// A filled 8-byte array buffer; returns (name, contents).
+fn filled_buffer() -> (u32, [u8; 8]) {
+    let names = alloc(4);
+    call("glGenBuffers", [1, names, 0, 0], &[]);
+    let name = mem().read_u32(names);
+    assert_ne!(name, 0, "a buffer was made");
+    call("glBindBuffer", [GL_ARRAY_BUFFER, name, 0, 0], &[]);
+    let contents = [1, 2, 3, 4, 5, 6, 7, 8];
+    let data = alloc(8);
+    for (i, byte) in contents.iter().enumerate() {
+        mem().write_u8(data + i as u32, *byte);
+    }
+    call("glBufferData", [GL_ARRAY_BUFFER, 8, data, GL_STATIC_DRAW], &[]);
+    (name, contents)
+}
+
+#[test]
+fn shared_eagl_contexts_share_mappings_but_not_bindings() {
+    setup();
+    let a = eagl_context(0);
+    let b = eagl_context(a);
+    make_current(a);
+    let (buffer, _) = filled_buffer();
+    let copy = call("glMapBufferRange", [GL_ARRAY_BUFFER, 0, 8, GL_MAP_WRITE_BIT], &[]).0;
+    assert_ne!(copy, 0, "the buffer mapped");
+    let written = [11, 12, 13, 14, 15, 16, 17, 18];
+    for (i, byte) in written.iter().enumerate() {
+        mem().write_u8(copy + i as u32, *byte);
+    }
+
+    make_current(b);
+    assert_eq!(gles::bound_buffer(GL_ARRAY_BUFFER), 0, "a shared context keeps its own bindings");
+    call("glBindBuffer", [GL_ARRAY_BUFFER, buffer, 0, 0], &[]);
+    assert_eq!(call("glUnmapBuffer", [GL_ARRAY_BUFFER, 0, 0, 0], &[]).0, 1, "the sharegroup finds the mapping");
+    let read_back = call("glMapBufferRange", [GL_ARRAY_BUFFER, 0, 8, GL_MAP_READ_BIT], &[]).0;
+    assert_ne!(read_back, 0);
+    assert_eq!(mem().bytes(read_back, 8), written, "the write made in the other context reached GL");
+    call("glUnmapBuffer", [GL_ARRAY_BUFFER, 0, 0, 0], &[]);
+    make_current(a);
+}
+
+#[test]
+fn unshared_eagl_contexts_keep_their_bindings_and_mappings() {
+    setup();
+    let a = eagl_context(0);
+    let b = eagl_context(0);
+    make_current(a);
+    let (buffer, contents) = filled_buffer();
+    let copy = call("glMapBufferRange", [GL_ARRAY_BUFFER, 0, 8, GL_MAP_WRITE_BIT], &[]).0;
+    assert_ne!(copy, 0, "the buffer mapped");
+    for (i, byte) in contents.iter().enumerate() {
+        mem().write_u8(copy + i as u32, *byte);
+    }
+
+    make_current(b);
+    // A name the other context made is not bound here unless the game binds it.
+    call("glBindBuffer", [GL_ARRAY_BUFFER, buffer, 0, 0], &[]);
+    assert_eq!(gles::bound_buffer(GL_ARRAY_BUFFER), buffer);
+    assert_eq!(call("glUnmapBuffer", [GL_ARRAY_BUFFER, 0, 0, 0], &[]).0, 0, "a mapping from another context is not found");
+    make_current(a);
+    assert_eq!(gles::bound_buffer(GL_ARRAY_BUFFER), buffer, "the first context kept its binding");
 }
