@@ -340,26 +340,35 @@ fn object_at(coder: Id, index: usize) -> Id {
             if class == "NSMutableData" { runtime::send(bytes, "mutableCopy", &[]) } else { bytes }
         }
         "NSNull" => runtime::send(runtime::class_named("NSNull"), "null", &[]),
-        "NSArray" | "NSMutableArray" | "NSSet" | "NSMutableSet" | "NSOrderedSet" | "NSMutableOrderedSet" => {
-            let items: Vec<Id> = archive.items(index).into_iter().map(|item| object_at(coder, item)).collect();
-            let array = collections::array_from(&items);
-            match class.as_str() {
-                "NSArray" => array,
-                "NSSet" | "NSMutableSet" => runtime::send(runtime::class_named(&class), "setWithArray:", &[array]),
-                _ => runtime::send(array, "mutableCopy", &[]),
-            }
-        }
-        "NSDictionary" | "NSMutableDictionary" => {
-            let items: Vec<Id> = archive.items(index).into_iter().map(|item| object_at(coder, item)).collect();
-            let pairs: Vec<(Id, Id)> = items.chunks_exact(2).map(|pair| (pair[0], pair[1])).collect();
-            let dictionary = collections::dictionary_from(&pairs);
-            if class == "NSMutableDictionary" { runtime::send(dictionary, "mutableCopy", &[]) } else { dictionary }
-        }
+        "NSArray" | "NSMutableArray" | "NSSet" | "NSMutableSet" | "NSDictionary" | "NSMutableDictionary" | "NSOrderedSet"
+        | "NSMutableOrderedSet" => return collection(coder, &archive, index, &class),
         "UIProxyObject" => placeholder(coder, &archive, index),
         _ => return make_instance(coder, &archive, index, &class),
     };
     remember(coder, index, made);
     made
+}
+
+/// A list, set or dictionary: made and remembered empty first, then filled,
+/// so an item that refers back to the collection gets the collection itself.
+fn collection(coder: Id, archive: &Archive, index: usize, class_name: &str) -> Id {
+    // NSOrderedSet is not one of ours: an array keeps the order.
+    let made_as = match class_name {
+        "NSOrderedSet" => "NSArray",
+        "NSMutableOrderedSet" => "NSMutableArray",
+        other => other,
+    };
+    let object = runtime::alloc_instance(runtime::class_named(made_as));
+    remember(coder, index, object);
+    let items: Vec<Id> = archive.items(index).into_iter().map(|item| object_at(coder, item)).collect();
+    let filled = if made_as.ends_with("Dictionary") {
+        let pairs: Vec<(Id, Id)> = items.chunks_exact(2).map(|pair| (pair[0], pair[1])).collect();
+        runtime::send(object, "initWithDictionary:", &[collections::dictionary_from(&pairs)])
+    } else {
+        runtime::send(object, "initWithArray:", &[collections::array_from(&items)])
+    };
+    remember(coder, index, filled);
+    filled
 }
 
 /// The object a UIProxyObject stands for.
@@ -757,7 +766,20 @@ fn instantiate(file: &NibFile, owner: Id, options: Id) -> Id {
         }
     }
     let top: Vec<Id> = top.into_iter().filter(|o| real(o)).collect();
+    finish_coder(coder);
     crate::fw::counted::autorelease(collections::array_from(&top))
+}
+
+/// Lets a coder go once its nib is made: its state is dropped (a late
+/// message reads nothing; bytes it handed out are gone, as on Apple) and it
+/// is announced as finished, so the 32-bit bridge frees its guest copies.
+fn finish_coder(coder: Id) {
+    let slot = (coder + 8) as *mut *mut Mutex<Decoding>;
+    let state = unsafe { std::ptr::replace(slot, std::ptr::null_mut()) };
+    if !state.is_null() {
+        drop(unsafe { Box::from_raw(state) });
+    }
+    runtime::object_finished(coder);
 }
 
 extern "C" fn nib_instantiate(this: Id, _: Sel, owner: Id, options: Id) -> Id {
@@ -1149,6 +1171,8 @@ mod tests {
         thing: Id,
         /// Order of -awakeFromNib among all objects (0: never woken).
         awake_order: usize,
+        /// The coder its -initWithCoder: was given.
+        coder: Id,
         partner_when_woken: Id,
         targets: Vec<(Id, String, usize)>,
     }
@@ -1191,6 +1215,7 @@ mod tests {
         r.table = collections::dictionary_pairs(table).into_iter().map(|(k, v)| (string::get(k), string::get(v))).collect();
         r.shared = ask::<Id>(coder, "decodeObjectForKey:", "shared");
         r.image = ask::<Id>(coder, "decodeObjectForKey:", "image");
+        r.coder = coder;
         r.has_count = ask::<bool>(coder, "containsValueForKey:", "count");
         r.has_missing = ask::<bool>(coder, "containsValueForKey:", "missing");
         let blob = ask::<Id>(coder, "decodeObjectForKey:", "missing");
@@ -1562,6 +1587,156 @@ mod tests {
         std::fs::remove_dir_all(&folder).unwrap();
     }
 
+    // ----- the coder seen from a 32-bit game, through the bridge -----
+
+    use crate::guest32::objc::bridge::{install, send_from_guest, Bridge, GuestSide, SendKind};
+    use crate::guest32::objc::testing::Fake;
+
+    /// A coder reading the root object of `b`'s archive.
+    fn coder_for(b: &Builder) -> Id {
+        test_classes();
+        new_coder(Arc::new(parse(&b.bytes()).unwrap()), 0, 0, 0)
+    }
+
+    struct Guest {
+        fake: &'static Fake,
+        bridge: &'static Mutex<Bridge>,
+    }
+
+    impl Guest {
+        fn new() -> Guest {
+            let fake = Fake::new();
+            let md = guest32_image::ObjcMetadata32::default();
+            let bridge: &'static Mutex<Bridge> = Box::leak(Box::new(Mutex::new(Bridge::new(&md).unwrap())));
+            install(bridge, fake, &md).unwrap();
+            Guest { fake, bridge }
+        }
+
+        fn object(&self, host: Id) -> u32 {
+            self.bridge.lock().unwrap().guest_object(self.fake, host).unwrap()
+        }
+
+        /// [receiver selector argument...] sent by guest code; r0 | r1 << 32.
+        fn send(&self, kind: SendKind, words: &[u32]) -> u64 {
+            let get = |i: u32| words.get(i as usize).copied().unwrap_or(0);
+            let result = send_from_guest(self.bridge, self.fake, kind, &get).unwrap();
+            u64::from(result.r0) | u64::from(result.r1) << 32
+        }
+
+        fn selector(&self, name: &str) -> u32 {
+            self.bridge.lock().unwrap().guest_selector(self.fake, name)
+        }
+
+        fn key(&self, name: &str) -> u32 {
+            self.object(string::make(name))
+        }
+    }
+
+    /// Numbers and structs reach 32-bit code as armv7 values (a C float in
+    /// r0, a double in r0 and r1, a CGRect of floats in memory).
+    #[test]
+    fn nib_coder_values_cross_the_32_bit_bridge() {
+        let mut b = Builder::new();
+        b.root(vec![
+            ("alpha", Put::F32(0.5)),
+            ("size", Put::F64(12.5)),
+            ("count", Put::I16(-300)),
+            ("flag", Put::True),
+            ("UIBounds", Put::Data(floats(6, &[1.0, 2.0, 30.0, 40.0]))),
+        ]);
+        let coder = coder_for(&b);
+        let guest = Guest::new();
+        let receiver = guest.object(coder);
+        let float = guest.send(SendKind::Normal, &[receiver, guest.selector("decodeFloatForKey:"), guest.key("alpha")]);
+        assert_eq!(f32::from_bits(float as u32), 0.5, "decodeFloatForKey: gives a C float");
+        let double = guest.send(SendKind::Normal, &[receiver, guest.selector("decodeDoubleForKey:"), guest.key("size")]);
+        assert_eq!(f64::from_bits(double), 12.5);
+        let count = guest.send(SendKind::Normal, &[receiver, guest.selector("decodeIntegerForKey:"), guest.key("count")]);
+        assert_eq!(count as u32 as i32, -300);
+        let flag = guest.send(SendKind::Normal, &[receiver, guest.selector("decodeBoolForKey:"), guest.key("flag")]);
+        assert_eq!(flag as u8, 1);
+        let out = guest.fake.alloc_permanent(16);
+        guest.send(SendKind::Stret, &[out, receiver, guest.selector("decodeCGRectForKey:"), guest.key("UIBounds")]);
+        let fields: Vec<f32> = guest.fake.read(out, 16).chunks(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+        assert_eq!(fields, [1.0, 2.0, 30.0, 40.0]);
+    }
+
+    /// The bytes are copied into guest memory and stay there while the coder
+    /// lives (each key its own copy); the length is a 4-byte guest value.
+    #[test]
+    fn nib_coder_bytes_cross_the_32_bit_bridge() {
+        let mut b = Builder::new();
+        b.root(vec![("blob", Put::Data(vec![1, 2, 0, 4, 5])), ("other", Put::Data(vec![9, 8]))]);
+        let coder = coder_for(&b);
+        let guest = Guest::new();
+        let receiver = guest.object(coder);
+        let length = guest.fake.words(&[0xAAAA_AAAA, 0xBBBB_BBBB]);
+        let selector = guest.selector("decodeBytesForKey:returnedLength:");
+        let first = guest.send(SendKind::Normal, &[receiver, selector, guest.key("blob"), length]) as u32;
+        assert_ne!(first, 0);
+        assert_eq!(guest.fake.read(first, 5), [1, 2, 0, 4, 5]);
+        assert_eq!(guest.fake.u32_at(length), 5);
+        assert_eq!(guest.fake.u32_at(length + 4), 0xBBBB_BBBB, "only the 4-byte length is written");
+        let second = guest.send(SendKind::Normal, &[receiver, selector, guest.key("other"), length]) as u32;
+        assert_eq!(guest.fake.read(second, 2), [9, 8]);
+        assert_eq!(guest.fake.u32_at(length), 2);
+        assert_eq!(guest.fake.read(first, 5), [1, 2, 0, 4, 5], "the first copy is still there");
+        let missing = guest.send(SendKind::Normal, &[receiver, selector, guest.key("missing"), length]) as u32;
+        assert_eq!((missing, guest.fake.u32_at(length)), (0, 0));
+        // When the coder is finished with, its copies go back to the guest heap.
+        guest.bridge.lock().unwrap().release_host_copies(guest.fake, coder);
+        let freed = guest.fake.freed.lock().unwrap().clone();
+        assert!(freed.contains(&first) && freed.contains(&second), "freed {freed:x?}");
+    }
+
+    /// A list or dictionary that holds itself is one object, not endless.
+    #[test]
+    fn nib_collections_that_hold_themselves_decode() {
+        let mut b = Builder::new();
+        let name = b.string("name");
+        let list = b.objects.len();
+        b.object("NSMutableArray", vec![("NSInlinedValue", Put::True), ("UINibEncoderEmptyKey", Put::Ref(list)), ("UINibEncoderEmptyKey", Put::Ref(name))]);
+        let table = b.objects.len();
+        b.object("NSMutableDictionary", vec![("NSInlinedValue", Put::True), ("UINibEncoderEmptyKey", Put::Ref(name)), ("UINibEncoderEmptyKey", Put::Ref(table))]);
+        b.root(vec![("list", Put::Ref(list)), ("table", Put::Ref(table))]);
+        let coder = coder_for(&b);
+        let array = decode_object(coder, 0, string::make("list"));
+        let items = collections::array_items(array);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0], array);
+        assert_eq!(string::get(items[1]), "name");
+        assert_eq!(class_of(array), "NSMutableArray");
+        let dictionary = decode_object(coder, 0, string::make("table"));
+        assert_eq!(collections::dictionary_pairs(dictionary), [(items[1], dictionary)]);
+        assert_eq!(class_of(dictionary), "NSMutableDictionary");
+    }
+
+    static FINISHED: Mutex<Vec<Id>> = Mutex::new(Vec::new());
+
+    fn note_finished(object: Id) {
+        FINISHED.lock().unwrap().push(object);
+    }
+
+    /// After -instantiateWithOwner:options: the coder is let go: its state is
+    /// gone, it is announced as finished (the 32-bit bridge frees its copies),
+    /// and a late message to it reads nothing.
+    #[test]
+    fn nib_coder_is_let_go_after_instantiation() {
+        test_classes();
+        runtime::on_object_finished(note_finished);
+        let mut b = Builder::new();
+        let thing = b.object("NibTestRecorder", vec![("count", Put::I8(4))]);
+        b.standard_root(&[thing], &[thing], &[]);
+        let top = collections::array_items(runtime::send(nib_from(&b.bytes()), "instantiateWithOwner:options:", &[0, 0]));
+        let r = record(top[0]);
+        assert_eq!(r.count, 4);
+        assert_ne!(r.coder, 0);
+        assert_eq!(unsafe { *((r.coder + 8) as *const usize) }, 0, "the coder's state was dropped");
+        assert!(FINISHED.lock().unwrap().contains(&r.coder), "the coder was announced as finished");
+        assert_eq!(ask::<i64>(r.coder, "decodeIntegerForKey:", "count"), 0);
+        assert_eq!(ask::<Id>(r.coder, "decodeObjectForKey:", "count"), 0);
+    }
+
     /// 32-bit games reach the coder and UINib through the bridge's table.
     #[test]
     fn nib_messages_have_32_bit_encodings() {
@@ -1581,5 +1756,9 @@ mod tests {
             let entry = table.get(selector).unwrap_or_else(|| panic!("{selector} is in framework_selectors.tsv"));
             assert_eq!(entry.encoding, encoding, "{selector}");
         }
+        // The coder answers -decodeFloatForKey: with a C float, not CGFloat.
+        assert!(table.get("decodeFloatForKey:").unwrap().real_float, "decodeFloatForKey: is marked float");
+        let bytes = table.get("decodeBytesForKey:returnedLength:").expect("decodeBytesForKey:returnedLength: is listed");
+        assert!(bytes.host_bytes, "its result is copied into guest memory");
     }
 }

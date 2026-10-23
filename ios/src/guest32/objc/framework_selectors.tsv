@@ -29,6 +29,10 @@
 #   in-array     id-pointer arguments are arrays of as many ids as the last
 #                integer argument says, read before the call;
 #   out-array    the same, filled by the host (not read first).
+#   host-bytes   the result points to host bytes, as many as the integer
+#                out-parameter says: the guest gets its own copy, kept until
+#                the receiver is announced as finished
+#                (runtime::object_finished).
 # Several notes are separated by commas.
 #
 # A selector missing here stops the game with its name when a framework
@@ -146,11 +150,12 @@ dateWithTimeIntervalSince1970:	@@:d
 dateWithTimeIntervalSinceNow:	@@:d
 decimalNumberWithString:	@@:@
 decodeBoolForKey:	c@:@
+decodeBytesForKey:returnedLength:	^C@:@^I	host-bytes
 decodeCGPointForKey:	{CGPoint=ff}@:@
 decodeCGRectForKey:	{CGRect={CGPoint=ff}{CGSize=ff}}@:@
 decodeCGSizeForKey:	{CGSize=ff}@:@
 decodeDoubleForKey:	d@:@
-decodeFloatForKey:	f@:@
+decodeFloatForKey:	f@:@	float
 decodeInt32ForKey:	i@:@
 decodeInt64ForKey:	q@:@
 decodeIntegerForKey:	i@:@
