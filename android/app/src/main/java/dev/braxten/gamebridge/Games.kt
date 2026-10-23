@@ -72,6 +72,9 @@ class Game(
     val dataInPlace get() = dataFile == null || Games.dataInPlace(packageName, versionCode, looseData)
 }
 
+/** What a search found: the games, and the spare copies the owner keeps in Game Bridge/Originals (each its own card). */
+class Found(val games: List<Game>, val originals: List<Game>)
+
 object Games {
     /** At the top of a drive, "Android" holds other apps' private files, never games to convert. */
     private val skipped = setOf("Android")
@@ -86,13 +89,23 @@ object Games {
      * 64-bit), other bundles that run here as they are, plus converted games that are installed
      * without a file on the phone, by name.
      * Only each APK's file list and manifest are read (for a bundle, its base APK is copied out to read them).
+     * Game Bridge/Originals is searched on its own (it is small), for the spare copies' cards.
      */
-    fun scan(context: Context): List<Game> {
+    fun scan(context: Context): Found {
         val started = System.currentTimeMillis()
         val readBefore = reads
-        val found = storageRoots(context).flatMap { (root, name) ->
+        val roots = storageRoots(context)
+        val found = roots.flatMap { (root, name) ->
             files(root).sortedBy { it.path.lowercase() }.map { it to place(root, name, it) }
         }
+        // Its spare data files get no cards.
+        val spareFiles = roots.flatMap { (root, name) ->
+            files(File(File(root, FOLDER), ORIGINALS)).filter { !it.name.endsWith(".obb", ignoreCase = true) && !isZip(it) }
+                .sortedBy { it.path.lowercase() }.map { it to place(root, name, it) }
+        }
+        val originals = spareFiles
+            .mapNotNull { (file, place) -> remembered(file) { read(context, file, place) }?.let { named(context, it) } }
+            .sortedBy { it.label.lowercase() }
         val (dataFiles, gameFiles) = found.partition { (file, _) -> file.name.endsWith(".obb", ignoreCase = true) || isZip(file) }
         val loose = dataFiles.map { (file, _) -> file }
         // The same game and version found twice shows once: the file already in Game Bridge/Android or
@@ -105,11 +118,12 @@ object Games {
         val withFiles = games.map { it.packageName }.toSet()
         val installed = installed(context, loose)
         // Files that are gone (deleted, or a game's old APK after an update) are forgotten.
-        seen.keys.retainAll((gameFiles.map { (file, _) -> file.path } + installed.map { it.second }).toSet())
+        seen.keys.retainAll(((gameFiles + spareFiles).map { (file, _) -> file.path } + installed.map { it.second }).toSet())
         val list = (games + installed.map { it.first }.filter { it.packageName !in withFiles }).sortedBy { it.label.lowercase() }
-        runCatching { save(context, list) }
-        android.util.Log.i("GameBridge", "Search: ${list.size} games, ${found.size} files (${reads - readBefore} read) in ${System.currentTimeMillis() - started} ms")
-        return list
+        val result = Found(list, originals)
+        runCatching { save(context, result) }
+        android.util.Log.i("GameBridge", "Search: ${list.size} games, ${originals.size} originals, ${found.size + spareFiles.size} files (${reads - readBefore} read) in ${System.currentTimeMillis() - started} ms")
+        return result
     }
 
     /**
@@ -117,7 +131,7 @@ object Games {
      * again. Also fills in what was read about each file, so that search reads only new and
      * changed files. Null before the first search finishes.
      */
-    fun saved(context: Context): List<Game>? = runCatching {
+    fun saved(context: Context): Found? = runCatching {
         val saved = JSONObject(savedFile(context).readText())
         val icons = iconFolder(context)
         // What an older app read is read again: a newer one may read more (icons, names, kinds).
@@ -127,9 +141,11 @@ object Games {
             val path = entry.getString("path")
             seen.putIfAbsent(path, Seen(entry.getLong("length"), entry.getLong("modified"), entry.optJSONObject("game")?.let { gameFrom(it, icons) }))
         }
-        val games = saved.getJSONArray("games")
         // A file deleted while the app was closed shows no card, not even until the search ends.
-        (0 until games.length()).map { named(context, gameFrom(games.getJSONObject(it), icons)) }.filter { it.file?.exists() != false }
+        fun list(name: String) = saved.optJSONArray(name)?.let { games ->
+            (0 until games.length()).map { named(context, gameFrom(games.getJSONObject(it), icons)) }.filter { it.file?.exists() != false }
+        }.orEmpty()
+        Found(list("games"), list("originals"))
     }.getOrNull()
 
     private fun savedFile(context: Context) = File(context.filesDir, "games.json")
@@ -137,8 +153,8 @@ object Games {
     private fun appInstalled(context: Context) = context.packageManager.getPackageInfo(context.packageName, 0).lastUpdateTime
     private fun iconFolder(context: Context) = File(context.filesDir, "icons")
 
-    /** Keeps `games` and `seen` for [saved]. Each icon is a picture file of its own, written once. */
-    private fun save(context: Context, games: List<Game>) {
+    /** Keeps `found` and `seen` for [saved]. Each icon is a picture file of its own, written once. */
+    private fun save(context: Context, found: Found) {
         val icons = iconFolder(context).apply { mkdirs() }
         val kept = mutableSetOf<String>()
         fun json(game: Game) = jsonOf(game, icons)?.also { (_, icon) -> icon?.let(kept::add) }?.first
@@ -147,7 +163,8 @@ object Games {
             seenJson.put(JSONObject().put("path", path).put("length", entry.length).put("modified", entry.modified)
                 .put("game", entry.game?.let(::json) ?: JSONObject.NULL))
         }
-        val saved = JSONObject().put("games", JSONArray(games.mapNotNull(::json))).put("seen", seenJson).put("app", appInstalled(context))
+        val saved = JSONObject().put("games", JSONArray(found.games.mapNotNull(::json))).put("originals", JSONArray(found.originals.mapNotNull(::json)))
+            .put("seen", seenJson).put("app", appInstalled(context))
         val file = savedFile(context)
         val part = File(file.path + ".part")
         part.writeText(saved.toString())
@@ -349,7 +366,7 @@ object Games {
         }
     }
 
-    /** Game Bridge/Originals holds spare copies the owner keeps: never searched, so they show no cards. */
+    /** Game Bridge/Originals holds spare copies the owner keeps: left out of the search for games ([scan] reads it on its own). */
     private fun isOriginals(folder: File) = folder.name == ORIGINALS && folder.parentFile?.let { it.name == FOLDER && isRoot(it.parentFile ?: it) } == true
 
     private fun isRoot(folder: File) = folder == Environment.getExternalStorageDirectory() ||
@@ -402,9 +419,22 @@ object Games {
      * its name (a game data file is found by its name, an iPhone game's saves go by its folder's), so
      * a name already taken there goes in a numbered folder inside it ("2", "3", …).
      */
-    fun move(context: Context, game: Game): String? {
+    fun move(context: Context, game: Game): String? = move(context, moves(game))
+
+    /** The card's file alone, with the folder of `kind` on its drive it goes to. */
+    private fun alone(game: Game, kind: (File) -> String): List<Pair<File, File>> =
+        listOfNotNull(game.file?.takeIf { it.exists() }?.let { file -> folderFor(file, kind(file))?.let { file to it } })
+
+    /** Moves the card's file (only it, not its data file or copies) into Game Bridge/Originals, as a spare copy. */
+    fun moveToOriginals(context: Context, game: Game): String? = move(context, alone(game) { ORIGINALS })
+
+    /** Moves a spare copy out of Game Bridge/Originals to Game Bridge/Android or /iPhone, where it is a game's card again. */
+    fun moveBack(context: Context, game: Game): String? = move(context, alone(game) { if (isIphone(it)) IPHONE else ANDROID })
+
+    /** Moves each file into its folder, with the rules above. */
+    private fun move(context: Context, moves: List<Pair<File, File>>): String? {
         val problems = mutableListOf<String>()
-        for ((file, folder) in moves(game)) {
+        for ((file, folder) in moves) {
             // Moved already (a data file two versions share).
             if (!file.exists()) continue
             val target = generateSequence(1) { it + 1 }.map { File(if (it == 1) folder else File(folder, "$it"), file.name) }.first { !it.exists() }
