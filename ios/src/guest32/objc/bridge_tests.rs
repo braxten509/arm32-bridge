@@ -181,6 +181,27 @@ fn guest_messages_reach_game_code_host_code_and_super() {
     assert_eq!(ret.x[0] as u32, 15);
 }
 
+static HOST_POINTS: Mutex<Vec<(f64, f64)>> = Mutex::new(Vec::new());
+
+extern "C" fn host_pick(object: Id, x: f64, y: f64) -> Id {
+    HOST_POINTS.lock().unwrap().push((x, y));
+    object
+}
+
+#[test]
+fn c_functions_reach_host_functions_with_converted_types() {
+    let host = runtime::alloc_instance(host_class("G32HostThing"));
+    let fake = Fake::new();
+    let bridge = Mutex::new(Bridge::new(&ObjcMetadata32::default()).unwrap());
+    let proxy = bridge.lock().unwrap().guest_object(fake, host).unwrap();
+    // id f(id, CGPoint): the proxy becomes the host object, the point two doubles.
+    let words = [proxy, 1.5f32.to_bits(), (-2.0f32).to_bits()];
+    let get = |i: u32| words[i as usize];
+    let sig = super::encoding::Signature::parse("@@{CGPoint=ff}").unwrap();
+    let r = call_host_function(&bridge, fake, host_pick as usize, &sig, Default::default(), &get).unwrap();
+    assert_eq!((r.r0, HOST_POINTS.lock().unwrap().clone()), (proxy, vec![(1.5, -2.0)]));
+}
+
 #[test]
 fn framework_classes_are_built_in_guest_memory_with_their_chain() {
     host_class("G32HostBase");

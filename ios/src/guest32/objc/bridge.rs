@@ -650,6 +650,22 @@ pub fn send_from_guest(
     }
 }
 
+/// A guest call to a C function the host layer implements (`address`),
+/// converted by `sig` (its arguments only, no self/_cmd).
+pub fn call_host_function(
+    bridge: &Mutex<Bridge>,
+    g: &dyn GuestSide,
+    address: usize,
+    sig: &Signature,
+    options: HostCallOptions,
+    get: &dyn Fn(u32) -> u32,
+) -> Result<GuestRet, String> {
+    let call = convert::prepare_host_call(sig, options, get, &mut Session { bridge: &mut lock(bridge), g })?;
+    // Unlocked: the host may message game objects (NSLog's %@ asks for -description).
+    let ret = mirror::call_host(address, &call.args);
+    convert::finish_host_call(call, &ret, &mut Session { bridge: &mut lock(bridge), g })
+}
+
 impl Bridge {
     fn resolve_from(&self, class: u32, sel: &str) -> Result<Target, String> {
         self.resolve(class, sel)

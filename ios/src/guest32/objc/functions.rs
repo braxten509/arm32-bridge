@@ -11,11 +11,13 @@
 //! __block variables: { isa, forwarding, flags, size, [keep, destroy], ... }.
 
 use super::bridge::{
-    send_from_guest, Bridge, GuestSide, SendKind, Special, BLOCK_HAS_COPY_DISPOSE, BLOCK_IS_GLOBAL, BLOCK_NEEDS_FREE,
+    call_host_function, send_from_guest, Bridge, GuestSide, SendKind, Special, BLOCK_HAS_COPY_DISPOSE, BLOCK_IS_GLOBAL, BLOCK_NEEDS_FREE,
     BLOCK_REFCOUNT_MASK,
 };
 use super::classes::{Lookup, Super};
-use super::selectors::FrameworkSelectors;
+use super::convert::HostCallOptions;
+use super::encoding::Signature;
+use super::selectors::{FrameworkSelectors, Varargs};
 use crate::objc::runtime;
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
@@ -182,6 +184,15 @@ pub fn functions() -> &'static [(&'static str, ObjcFn)] {
         ("ivar_getOffset", |c, w| ok(c.word(c.word(w(0))))),
         ("ivar_getName", |c, w| ok(c.word(w(0) + 4))),
         ("ivar_getTypeEncoding", |c, w| ok(c.word(w(0) + 8))),
+        // Plain stores and loads at the ivar's offset (no retain, like Apple's
+        // for ivars without a known ownership).
+        ("object_getIvar", |c, w| ok(if w(0) == 0 || w(1) == 0 { 0 } else { c.word(w(0) + c.word(c.word(w(1)))) })),
+        ("object_setIvar", |c, w| {
+            if w(0) != 0 && w(1) != 0 {
+                c.set_word(w(0) + c.word(c.word(w(1))), w(2));
+            }
+            ok(0)
+        }),
         // Layouts only matter for garbage collection, which iOS never had.
         ("class_getIvarLayout", |_, _| ok(0)),
         ("class_addMethod", add_method),
@@ -199,11 +210,29 @@ pub fn functions() -> &'static [(&'static str, ObjcFn)] {
 }
 
 /// Calls the function named `name` (C name).
+/// Foundation C functions that take or return objects, answered by the
+/// host layer's function of the same name with converted types: name,
+/// armv7 encoding of the result then the arguments (as in
+/// framework_selectors.tsv, without self/_cmd), variadic arguments.
+pub const HOST_FUNCTIONS: &[(&str, &str, Varargs)] = &[
+    ("NSLog", "v@", Varargs::Format),
+    // (NSSearchPathDirectory, NSSearchPathDomainMask, BOOL expandTilde)
+    ("NSSearchPathForDirectoriesInDomains", "@IIc", Varargs::None),
+];
+
 pub fn call_function(ctx: &Ctx, name: &str, words: Words) -> Result<u64, String> {
     static TABLE: std::sync::OnceLock<HashMap<&'static str, ObjcFn>> = std::sync::OnceLock::new();
     let table = TABLE.get_or_init(|| functions().iter().copied().collect());
-    let f = table.get(name).ok_or_else(|| format!("{name} is not an Objective-C runtime function"))?;
-    f(ctx, words)
+    if let Some(f) = table.get(name) {
+        return f(ctx, words);
+    }
+    let &(_, encoding, varargs) =
+        HOST_FUNCTIONS.iter().find(|f| f.0 == name).ok_or_else(|| format!("{name} is not an Objective-C runtime function"))?;
+    let (address, _) = crate::symbols::lookup(&format!("_{name}")).ok_or_else(|| format!("the host layer has no {name}"))?;
+    let sig = Signature::parse(encoding)?;
+    let options = HostCallOptions { varargs, ..Default::default() };
+    let r = call_host_function(ctx.bridge, ctx.g, address, &sig, options, words)?;
+    Ok(u64::from(r.r0) | u64::from(r.r1) << 32)
 }
 
 fn send(c: &Ctx, w: Words, kind: SendKind) -> Result<u64, String> {

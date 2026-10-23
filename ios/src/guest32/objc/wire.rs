@@ -4,7 +4,7 @@
 //! constants bind to, and setting up the game's classes after loading.
 
 use super::bridge::{dispatch_from_host, install, Bridge, GuestSide, Special};
-use super::functions::{call_function, functions, Ctx};
+use super::functions::{call_function, functions, Ctx, HOST_FUNCTIONS};
 use super::mirror;
 use arm32_bridge::ios32::Program;
 use arm32_bridge::runtime::{self, ArgSource, Args, Ret, Uc};
@@ -127,7 +127,7 @@ fn ui_application_main(uc: &mut Uc, args: &mut Args) -> Ret {
 
 /// Registers the Objective-C runtime functions (before loading).
 pub fn register() {
-    for (name, _) in functions() {
+    for name in functions().iter().map(|f| f.0).chain(HOST_FUNCTIONS.iter().map(|f| f.0)) {
         super::super::function(name, objc_handler);
     }
     super::super::function("UIApplicationMain", ui_application_main);

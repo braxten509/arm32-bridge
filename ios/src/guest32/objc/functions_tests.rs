@@ -124,6 +124,9 @@ fn runtime_functions_retain_store_properties_classes_and_ivars() {
     assert_eq!(call("ivar_getOffset", &[ivar]), 8);
     assert_eq!(g.read(call("ivar_getName", &[ivar]), 7), b"_thing\0");
     assert_eq!(call("class_getInstanceSize", &[class]), 16);
+    // object_setIvar stores without retaining; object_getIvar reads it back.
+    call("object_setIvar", &[object, ivar, proxy]);
+    assert_eq!((g.u32_at(object + 8), call("object_getIvar", &[object, ivar])), (proxy, proxy));
 
     // class_addMethod: the new method answers guest and host messages.
     g.code(0x3001, |w| u64::from(w[2]) + 1);
