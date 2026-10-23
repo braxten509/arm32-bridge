@@ -8,6 +8,18 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
+/// Runs a wait without the guest lock: a 32-bit game's thread waiting here
+/// must let the threads it waits for run game code (GIL mode: Unicorn, the
+/// checker, ARM32_PARALLEL=0). With threads running in parallel, just waits.
+fn waiting<R>(wait: impl FnOnce() -> R) -> R {
+    use arm32_bridge::runtime::{gil_held, parallel, without_gil};
+    if !parallel() && gil_held() {
+        without_gil(wait)
+    } else {
+        wait()
+    }
+}
+
 fn now() -> f64 {
     let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
@@ -384,7 +396,8 @@ fn run_loop_until(run_loop: &'static Loop, until: Option<f64>, once: bool) -> bo
         }
         let guard = run_loop.queue.lock().unwrap();
         if guard.is_empty() && wait_until > current {
-            let _ = run_loop.wake.wait_timeout(guard, std::time::Duration::from_secs_f64((wait_until - current).min(0.25)));
+            let seconds = (wait_until - current).min(0.25);
+            waiting(|| drop(run_loop.wake.wait_timeout(guard, std::time::Duration::from_secs_f64(seconds))));
         }
     }
 }
@@ -398,6 +411,12 @@ pub fn run_main_loop(until: Option<f64>) {
 #[cfg(test)]
 pub fn run_main_loop_briefly() {
     run_loop_until(&MAIN_LOOP, Some(now() + 0.05), true);
+}
+
+/// For tests: runs the calling thread's loop once (at most a moment).
+#[cfg(test)]
+pub fn run_this_threads_loop_briefly() {
+    run_loop_until(current_loop(), Some(now() + 0.02), true);
 }
 
 pub fn timers_fired() -> usize {
@@ -466,7 +485,7 @@ extern "C" fn run_loop_add_timer(this: Id, _: Sel, timer_object: Id, _mode: Id) 
 
 fn sleep_seconds(seconds: f64) {
     if seconds > 0.0 {
-        std::thread::sleep(std::time::Duration::from_secs_f64(seconds.min(3600.0)));
+        waiting(|| std::thread::sleep(std::time::Duration::from_secs_f64(seconds.min(3600.0))));
     }
 }
 
@@ -537,10 +556,7 @@ extern "C" fn perform_on_main(this: Id, _: Sel, selector: Sel, argument: Id, wai
     if wait != 0 {
         let done = Arc::new((Mutex::new(false), Condvar::new()));
         post(Work::Message { target: this, selector, argument, done: Some(done.clone()) });
-        let mut finished = done.0.lock().unwrap();
-        while !*finished {
-            finished = done.1.wait(finished).unwrap();
-        }
+        wait_until_done(&done);
     } else {
         post(Work::Message { target: this, selector, argument, done: None });
     }
@@ -563,11 +579,19 @@ extern "C" fn perform_on_thread(this: Id, _: Sel, selector: Sel, thread: Id, arg
     let done = (wait != 0).then(|| Arc::new((Mutex::new(false), Condvar::new())));
     post_to(run_loop, Work::Message { target: this, selector, argument, done: done.clone() });
     if let Some(done) = done {
+        wait_until_done(&done);
+    }
+}
+
+/// The caller's side of waitUntilDone:YES (without the guest lock, which the
+/// thread doing the work may need).
+fn wait_until_done(done: &(Mutex<bool>, Condvar)) {
+    waiting(|| {
         let mut finished = done.0.lock().unwrap();
         while !*finished {
             finished = done.1.wait(finished).unwrap();
         }
-    }
+    });
 }
 
 extern "C" fn perform_on_thread_modes(this: Id, s: Sel, selector: Sel, thread: Id, argument: Id, wait: u8, _modes: Id) {

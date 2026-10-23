@@ -735,3 +735,56 @@ fn dispatch_runs_guest_blocks_once_and_in_queue_order() {
     let main = ios32::data_address("_dispatch_main_q").expect("_dispatch_main_q");
     assert_eq!(super::fw::handle_to_host(main), crate::symbols::lookup("__dispatch_main_q").unwrap().0);
 }
+
+/// GIL mode (Unicorn, the checker, ARM32_PARALLEL=0), one thread running
+/// game code at a time: a thread waiting in performSelector:onThread:
+/// withObject:waitUntilDone:YES, or idling in its run loop, lets go of the
+/// guest lock, so the thread it waits for can run game code.
+#[test]
+#[ignore = "GIL mode: test-pc.sh runs it with ARM32_PARALLEL=0"]
+fn gil_mode_waiting_threads_let_others_run_game_code() {
+    use crate::fw::object::{define_class, methods};
+    use crate::objc::runtime::{self as objc, Id, Sel};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static CALLS: AtomicU32 = AtomicU32::new(0);
+    fn callback(_uc: &mut runtime::Uc, _: &mut Args) -> runtime::Ret {
+        CALLS.fetch_add(1, Ordering::SeqCst);
+        runtime::Ret::Void
+    }
+    /// A game method: it runs guest code, so it needs the guest lock.
+    extern "C" fn game_code(_: Id, _: Sel, _: Id) {
+        use super::objc::bridge::GuestSide;
+        super::objc::wire::Translator.call(runtime::stub_for("test_gil_callback"), &[]).unwrap();
+    }
+    /// A thread serving its run loop, entered from game code (holding the
+    /// guest lock) when `from_game` is set.
+    extern "C" fn serve(_: Id, _: Sel, from_game: Id) {
+        let _gil = (from_game != 0).then(runtime::hold_gil);
+        loop {
+            crate::fw::runloop::run_this_threads_loop_briefly();
+        }
+    }
+    setup();
+    assert!(!runtime::parallel(), "run with ARM32_PARALLEL=0 (test-pc.sh does)");
+    ios32::register_function("test_gil_callback", callback);
+    let class = define_class("GilModeTarget", "NSObject", 8);
+    methods(class, &[("gameCode:", game_code as usize), ("serve:", serve as usize)]);
+    let target = objc::send(objc::send(class, "alloc", &[]), "init", &[]);
+    for (round, from_game) in [(1, 0), (2, 1)] {
+        let thread_class = objc::class_named("NSThread");
+        let worker = objc::send(objc::send(thread_class, "alloc", &[]), "initWithTarget:selector:object:", &[target, objc::sel("serve:"), from_game]);
+        objc::send(worker, "start", &[]);
+        // From game code (holding the guest lock), waiting until it was done.
+        let (finished, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _gil = runtime::hold_gil();
+            let s = objc::sel("performSelector:onThread:withObject:waitUntilDone:");
+            let perform: extern "C" fn(Id, Sel, Sel, Id, Id, u8) = unsafe { std::mem::transmute(objc::imp_for(target, s).unwrap()) };
+            perform(target, s, objc::sel("gameCode:"), worker, 0, 1);
+            let _ = finished.send(());
+        });
+        let serving = if from_game != 0 { "a run loop entered from game code" } else { "a thread's run loop" };
+        done.recv_timeout(std::time::Duration::from_secs(20)).unwrap_or_else(|_| panic!("deadlock: waiting for {serving} kept the guest lock"));
+        assert_eq!(CALLS.load(Ordering::SeqCst), round);
+    }
+}

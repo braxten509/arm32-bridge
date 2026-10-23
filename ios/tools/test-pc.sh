@@ -13,3 +13,5 @@ export CMAKE_SYSTEM_NAME=Linux CMAKE_SYSTEM_PROCESSOR=aarch64
 export BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu="--target=aarch64-linux-gnu --sysroot=$HOME/.cache/aarch64-sysroot"
 cd "$(dirname "$0")/../.."
 cargo test --release --target aarch64-unknown-linux-gnu --target-dir "${TARGET_DIR:-$X/target}" -p gamebridge-ios --lib -- "$@"
+# The ignored tests are GIL mode's (Unicorn, the checker): one thread runs game code at a time.
+ARM32_PARALLEL=0 cargo test --release --target aarch64-unknown-linux-gnu --target-dir "${TARGET_DIR:-$X/target}" -p gamebridge-ios --lib -- --ignored "$@"
