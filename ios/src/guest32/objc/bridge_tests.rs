@@ -304,6 +304,42 @@ fn load_runs_parents_first_then_categories_and_initialize_runs_once_before_first
     assert_eq!(*calls.lock().unwrap(), [(0x2301, base_class), (0x2301, sub_class)]);
 }
 
+#[test]
+fn framework_categories_reach_subclasses_from_guest_and_host() {
+    let parent = host_class("G32HostObj");
+    let sub = runtime::lock().define_class("G32HostStr", parent, 16);
+    let fake = Fake::new();
+    // A game category on G32HostObj adds -twice:; G32HostStr inherits it.
+    let category = ObjcCategory32 {
+        address: fake.alloc_permanent(4),
+        name: "Twice".into(),
+        class: ClassTarget::External("G32HostObj".into()),
+        instance_methods: vec![method("twice:", "i12@0:4i8", 0x2401)],
+        class_methods: vec![],
+        protocols: vec![],
+        instance_properties: vec![],
+    };
+    let md = ObjcMetadata32 { categories: vec![category], ..Default::default() };
+    let bridge: &'static Mutex<Bridge> = Box::leak(Box::new(Mutex::new(Bridge::new(&md).unwrap())));
+    install(bridge, fake, &md).unwrap();
+    fake.code(0x2401, |w| u64::from(w[2] * 2));
+    let host = runtime::alloc_instance(sub);
+    let proxy = bridge.lock().unwrap().guest_object(fake, host).unwrap();
+    // From the guest: found on the parent class.
+    let twice = bridge.lock().unwrap().guest_selector(fake, "twice:");
+    assert_eq!(send(bridge, fake, &[proxy, twice, 21]).unwrap(), 42);
+    // From the host: the host class answers through the trampoline.
+    let _hook = mirror::DISPATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    mirror::set_dispatch(Box::new(move |frame: &mut HostFrame| {
+        dispatch_from_host(bridge, fake, frame).unwrap();
+    }));
+    let sel = runtime::sel("twice:");
+    let imp = runtime::imp_for(host, sel).expect("the host class has the category method");
+    let mut args = super::convert::HostArgs::default();
+    args.x[..3].copy_from_slice(&[host as u64, sel as u64, 8]);
+    assert_eq!(mirror::call_host(imp, &args).x[0] as u32, 16);
+}
+
 static HOST_CG: Mutex<Vec<Id>> = Mutex::new(Vec::new());
 
 extern "C" fn host_cg_image(this: Id, _: Sel) -> Id {

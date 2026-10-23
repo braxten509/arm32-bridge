@@ -469,7 +469,11 @@ fn add_method(c: &Ctx, w: Words) -> Result<u64, String> {
         let ro = c.word(class + 16) & !3;
         (c.cstr(c.word(ro + 16)), c.word(ro) & 1 != 0)
     };
-    ok(u32::from(b.classes.add_framework_method(&framework.0, framework.1, &name, imp, &types)))
+    let added = b.classes.add_framework_method(&framework.0, framework.1, &name, imp, &types);
+    if added {
+        super::mirror::add_mirror_method(Bridge::host_class_named(&framework.0, framework.1), &name);
+    }
+    ok(u32::from(added))
 }
 
 /// class_getInstanceMethod: a guest method_t { name, types, imp } copy.

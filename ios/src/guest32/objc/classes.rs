@@ -196,6 +196,14 @@ impl GuestClasses {
         self.framework_categories.get(&(class.to_string(), meta))?.get(sel)
     }
 
+    /// Every game method on a framework class: (class name, meta, selector).
+    pub fn framework_category_entries(&self) -> Vec<(String, bool, String)> {
+        self.framework_categories
+            .iter()
+            .flat_map(|((class, meta), methods)| methods.keys().map(move |sel| (class.clone(), *meta, sel.clone())))
+            .collect()
+    }
+
     /// The selectors a class (or metaclass) itself answers.
     pub fn selectors_of(&self, class: u32) -> Vec<&str> {
         self.classes.get(&class).map(|c| c.methods.keys().map(String::as_str).collect()).unwrap_or_default()

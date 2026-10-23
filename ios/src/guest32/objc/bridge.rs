@@ -256,7 +256,7 @@ impl Bridge {
         }
     }
 
-    fn host_class_named(name: &str, meta: bool) -> usize {
+    pub(super) fn host_class_named(name: &str, meta: bool) -> usize {
         runtime::existing_class(name, meta).unwrap_or_else(|| runtime::placeholder_class(name, meta))
     }
 
@@ -432,12 +432,31 @@ impl Bridge {
         }
     }
 
-    /// A framework class answers, unless the game added a category method to it.
+    /// A framework class answers, unless the game added a category method
+    /// to it or to one of its host superclasses.
     fn framework_target(&self, class: &str, meta: bool, sel: &str, via_super: bool) -> Result<Target, String> {
-        if let Some(m) = self.classes.framework_category_method(class, meta, sel) {
-            return Ok(Target::Guest { imp: m.imp, types: m.types.clone() });
+        if let Some((imp, types)) = self.framework_category(class, meta, sel) {
+            return Ok(Target::Guest { imp, types });
         }
         Ok(Target::Host { class: class.to_string(), meta, via_super })
+    }
+
+    /// The game's category method `sel` on framework class `class` or the
+    /// nearest host superclass that has one: (imp, types).
+    fn framework_category(&self, class: &str, meta: bool, sel: &str) -> Option<(u32, String)> {
+        let mut name = class.to_string();
+        loop {
+            if let Some(m) = self.classes.framework_category_method(&name, meta, sel) {
+                return Some((m.imp, m.types.clone()));
+            }
+            let host = runtime::existing_class(&name, false)?;
+            let rt = runtime::lock();
+            let superclass = rt.classes.get(&host)?.superclass;
+            if superclass == 0 {
+                return None;
+            }
+            name = rt.class_name(superclass);
+        }
     }
 
     fn describe(&self, isa: u32) -> String {
@@ -544,6 +563,12 @@ pub fn install(bridge: &Mutex<Bridge>, g: &dyn GuestSide, md: &ObjcMetadata32) -
         let class: Vec<&str> = class.iter().map(String::as_str).collect();
         let mirror = mirror::define_mirror_class(&name, host_super, address, &instance, &class)?;
         b.mirrors.insert(address, mirror);
+    }
+    // Game category methods on framework classes answer host messages too.
+    for (class, meta, sel) in b.classes.framework_category_entries() {
+        if !matches!(sel.as_str(), "load" | "initialize") {
+            mirror::add_mirror_method(Bridge::host_class_named(&class, meta), &sel);
+        }
     }
     for r in &md.selector_refs {
         let current = u32_at(g, r.slot);
@@ -835,9 +860,17 @@ pub fn dispatch_from_host(bridge: &Mutex<Bridge>, g: &dyn GuestSide, frame: &mut
         initialize(bridge, g, class)?;
         b = lock(bridge);
     }
-    let (imp, types) = match b.classes.lookup(isa, &name) {
-        Lookup::Guest(m) => (m.imp, m.types.clone()),
-        _ => return Err(format!("host sent {name} to game object {guest_self:#x}, which has no such method")),
+    // A game method, or a game category method on a framework class (the
+    // receiver's own framework class or one its game class inherits from).
+    let found = match b.classes.lookup(isa, &name) {
+        Lookup::Guest(m) => Some((m.imp, m.types.clone())),
+        Lookup::Framework { class, meta } => b.framework_category(&class, meta, &name),
+        Lookup::Missing => {
+            b.framework_by_guest.get(&isa).cloned().and_then(|(class, meta)| b.framework_category(&class, meta, &name))
+        }
+    };
+    let Some((imp, types)) = found else {
+        return Err(format!("host sent {name} to guest object {guest_self:#x}, which has no such method"));
     };
     let sig = Signature::parse_method(&types)?;
     let call = convert::prepare_guest_call(&sig, frame, &mut Session { bridge: &mut b, g })?;
