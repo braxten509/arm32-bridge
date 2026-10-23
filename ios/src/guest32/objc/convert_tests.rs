@@ -299,3 +299,31 @@ fn host_calls_into_guest_methods_convert_both_ways() {
     finish_guest_call(call, 1, 0, &mut frame, &mut b).unwrap();
     assert_eq!(frame.ret.x[0] & 0xff, 1);
 }
+
+#[test]
+fn host_pointer_arguments_reach_guest_methods_as_typed_temporaries() {
+    let mut b = Fake::new();
+    // -getResourceValue:(id *)value forKey:(id)key error:(NSError **)error,
+    // called by the host with slots in host memory.
+    let sig = Signature::parse("c@:^@@^@").unwrap();
+    let (mut value, mut error) = (0u64, 0u64);
+    let mut frame = HostFrame::default();
+    frame.x[..5].copy_from_slice(&[(HOST_ID + 1) as u64, (HOST_SEL + 2) as u64, &mut value as *mut u64 as u64, (HOST_ID + 3) as u64, &mut error as *mut u64 as u64]);
+    let call = prepare_guest_call(&sig, &frame, &mut b).unwrap();
+    let (value_temp, error_temp) = (call.words[2], call.words[4]);
+    assert_eq!((b.get(value_temp, 4), b.get(error_temp, 4)), (vec![0; 4], vec![0; 4]), "guest temporaries start with the host's values");
+    // The guest method stores its outputs and returns YES.
+    b.put(value_temp, &0x77u32.to_le_bytes());
+    b.put(error_temp, &0x88u32.to_le_bytes());
+    finish_guest_call(call, 1, 0, &mut frame, &mut b).unwrap();
+    assert_eq!((value, error), ((HOST_ID + 0x77) as u64, (HOST_ID + 0x88) as u64));
+    // BOOL *stop: one host byte; its neighbour stays.
+    let sig = Signature::parse("v@:^c").unwrap();
+    let mut flags = [0u8, 0xaa];
+    let mut frame = HostFrame::default();
+    frame.x[2] = flags.as_mut_ptr() as u64;
+    let call = prepare_guest_call(&sig, &frame, &mut b).unwrap();
+    b.put(call.words[2], &[1]);
+    finish_guest_call(call, 0, 0, &mut frame, &mut b).unwrap();
+    assert_eq!(flags, [1, 0xaa]);
+}

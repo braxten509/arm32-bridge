@@ -911,6 +911,65 @@ pub struct PreparedGuestCall {
     pub words: Vec<u32>,
     ret: Ty,
     stret: Option<u32>,
+    outs: Vec<GuestOut>,
+}
+
+/// A host pointer argument (NSError **, id *, BOOL *, CGRect *, ...) of a
+/// guest method: the guest gets a temporary of the pointee's guest type,
+/// copied back into the host's memory after the call.
+struct GuestOut {
+    host: usize,
+    temp: u32,
+    pointee: Ty,
+    hty: HostTy,
+    /// The host bytes before the call (8 for an int: it may be NSInteger).
+    before: Vec<u8>,
+}
+
+/// Pointees with a known layout; others (void, opaque structs, functions)
+/// stay opaque handles.
+fn typed_pointee(pointee: &Ty) -> bool {
+    match pointee {
+        Ty::Struct { fields, .. } => !fields.is_empty(),
+        Ty::Void | Ty::Unknown | Ty::Union { .. } => false,
+        _ => true,
+    }
+}
+
+impl GuestOut {
+    fn new(pointee: &Ty, host: usize, b: &mut dyn Boundary) -> Result<GuestOut, String> {
+        let hty = host_ty_in(pointee, Ctx::default())?;
+        let size = if matches!(pointee, Ty::Int { .. }) { 8 } else { hty.size() as usize };
+        let before = unsafe { std::slice::from_raw_parts(host as *const u8, size) }.to_vec();
+        let mut guest = vec![0u8; pointee.guest_size() as usize];
+        // An id slot starts nil: the host's may be uninitialized (NSError *e;).
+        if !pointee.is_object() && to_guest(pointee, &hty, &before, &mut guest, b).is_err() {
+            guest.fill(0);
+        }
+        let temp = b.alloc(guest.len() as u32);
+        b.write(temp, &guest);
+        Ok(GuestOut { host, temp, pointee: pointee.clone(), hty, before })
+    }
+
+    fn copy_back(&self, b: &mut dyn Boundary) -> Result<(), String> {
+        let guest = b.read(self.temp, self.pointee.guest_size());
+        b.free(self.temp);
+        let mut host = vec![0u8; (self.hty.size() as usize).max(8)];
+        to_host(&self.pointee, &self.hty, &guest, &mut host[..self.hty.size() as usize], b)?;
+        let mut out = host[..self.hty.size() as usize].to_vec();
+        if matches!(self.pointee, Ty::Int { .. }) {
+            // int or NSInteger: the upper half follows only when it held the
+            // sign extension of the lower half before (a 64-bit NSInteger).
+            let low = |bytes: &[u8]| i32::from_le_bytes(bytes[..4].try_into().unwrap());
+            let extended = |v: i32| (i64::from(v) as u64 >> 32) as u32;
+            let upper_before = u32::from_le_bytes(self.before[4..8].try_into().unwrap());
+            if upper_before == extended(low(&self.before)) {
+                out.extend_from_slice(&extended(low(&out)).to_le_bytes());
+            }
+        }
+        unsafe { std::ptr::copy_nonoverlapping(out.as_ptr(), self.host as *mut u8, out.len()) };
+        Ok(())
+    }
 }
 
 /// Converts a host call (registers in `frame`) into guest words by the
@@ -918,9 +977,19 @@ pub struct PreparedGuestCall {
 pub fn prepare_guest_call(sig: &Signature, frame: &HostFrame, b: &mut dyn Boundary) -> Result<PreparedGuestCall, String> {
     let mut words = vec![0u32; sig.guest_total_words() as usize];
     let mut reader = ArgReader { frame, ngrn: 0, nsrn: 0, slot: 0 };
+    let mut outs = Vec::new();
     for (ty, at) in sig.args.iter().zip(sig.guest_arg_words()) {
         let hty = host_ty(ty, false)?;
         let host = reader.take(&hty, is_float_scalar(ty));
+        if let Ty::Pointer(pointee) = ty {
+            let h = host_u64(&host) as usize;
+            if h != 0 && b.guest_address(h).is_none() && typed_pointee(pointee) {
+                let out = GuestOut::new(pointee, h, b)?;
+                words[at as usize] = out.temp;
+                outs.push(out);
+                continue;
+            }
+        }
         let mut guest = vec![0u8; (ty.guest_size() as usize).div_ceil(4).max(1) * 4];
         let size = ty.guest_size() as usize;
         to_guest(ty, &hty, &host, &mut guest[..size], b)?;
@@ -932,12 +1001,15 @@ pub fn prepare_guest_call(sig: &Signature, frame: &HostFrame, b: &mut dyn Bounda
     if let Some(address) = stret {
         words[0] = address;
     }
-    Ok(PreparedGuestCall { words, ret: sig.ret.clone(), stret })
+    Ok(PreparedGuestCall { words, ret: sig.ret.clone(), stret, outs })
 }
 
 /// Converts the guest method's result (r0/r1 or its stret buffer) into the
 /// host's result registers.
 pub fn finish_guest_call(call: PreparedGuestCall, r0: u32, r1: u32, frame: &mut HostFrame, b: &mut dyn Boundary) -> Result<(), String> {
+    for out in &call.outs {
+        out.copy_back(b)?;
+    }
     if call.ret == Ty::Void {
         return Ok(());
     }
