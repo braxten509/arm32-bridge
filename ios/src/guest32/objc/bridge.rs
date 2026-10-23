@@ -264,6 +264,8 @@ pub struct Bridge {
     specials: HashMap<u32, Special>,
     /// Host object -> guest copy of its -bytes (address, capacity).
     buffers: HashMap<usize, (u32, u32)>,
+    /// Host object -> guest copies of its `host-bytes` results.
+    kept_copies: HashMap<usize, Vec<u32>>,
     /// Guest address of the objc_msgSend stand-in (imp of framework Methods).
     pub msg_send_stub: u32,
     /// Classes whose +initialize is running (on which thread) or done.
@@ -296,6 +298,7 @@ impl Bridge {
             sel_guest: HashMap::new(),
             specials: HashMap::new(),
             buffers: HashMap::new(),
+            kept_copies: HashMap::new(),
             msg_send_stub: 0,
             init_state: HashMap::new(),
         })
@@ -333,6 +336,14 @@ impl Bridge {
                 self.buffers.insert(host, (address, length.max(1)));
                 address
             }
+        }
+    }
+
+    /// Frees the guest copies of `host-bytes` results kept for host object
+    /// `host` (it is finished with).
+    pub fn release_host_copies(&mut self, g: &dyn GuestSide, host: usize) {
+        for copy in self.kept_copies.remove(&host).unwrap_or_default() {
+            g.free(copy);
         }
     }
 
@@ -927,7 +938,8 @@ pub fn set_block_owner(g: &'static dyn GuestSide) {
 /// the game's own method of the same name (an override has the same types).
 fn host_signature(b: &Bridge, class: &str, meta: bool, sel: &str) -> Result<(Signature, HostCallOptions), String> {
     if let Some(entry) = FrameworkSelectors::builtin().get(sel) {
-        let options = HostCallOptions { real_float: entry.real_float, varargs: entry.varargs, arrays: entry.arrays };
+        let options =
+            HostCallOptions { real_float: entry.real_float, varargs: entry.varargs, arrays: entry.arrays, host_bytes: entry.host_bytes };
         return Ok((entry.signature.clone(), options));
     }
     if let Some(types) = b.classes.types_for_selector(sel) {
@@ -1086,12 +1098,23 @@ pub fn send_from_guest(
             // (writes through a mutableBytes copy do not reach the host object).
             // -length first, unlocked: a game subclass may answer it in guest code.
             let pointer = ret.x[0] as usize;
-            let host_bytes = matches!(name.as_str(), "bytes" | "mutableBytes") && pointer != 0 && g.guest_address(pointer).is_none();
+            let in_host = pointer != 0 && g.guest_address(pointer).is_none();
+            let host_bytes = matches!(name.as_str(), "bytes" | "mutableBytes") && in_host;
             let length = if host_bytes { runtime::send(host_receiver, "length", &[]) } else { 0 };
+            // A `host-bytes` result (-decodeBytesForKey:returnedLength:): the
+            // count is in the out-parameter; each call gets its own copy, kept
+            // until the receiver is finished with (see release_host_copies).
+            let counted_length = (options.host_bytes && in_host).then(|| call.first_out_value().unwrap_or(0) as usize);
             let mut b = lock(bridge);
             if host_bytes {
                 let copy = b.guest_buffer(g, host_receiver, length as u32);
                 g.write(copy, unsafe { std::slice::from_raw_parts(pointer as *const u8, length) });
+                ret.x[0] = g.host_address(copy) as u64;
+            }
+            if let Some(length) = counted_length {
+                let copy = g.alloc(length.max(1) as u32);
+                g.write(copy, unsafe { std::slice::from_raw_parts(pointer as *const u8, length) });
+                b.kept_copies.entry(host_receiver).or_default().push(copy);
                 ret.x[0] = g.host_address(copy) as u64;
             }
             let result = convert::finish_host_call(call, &ret, &mut Session { bridge: &mut b, g })?;

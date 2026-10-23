@@ -305,6 +305,8 @@ pub fn install_program() -> Result<(), String> {
     let (bridge, md) = (bridge().ok_or("no Objective-C bridge")?, METADATA.get().ok_or("no metadata")?);
     install(bridge, &Translator, md)?;
     super::bridge::set_block_owner(&Translator);
+    // Guest copies kept for a host object go when it is finished with.
+    crate::objc::runtime::on_object_finished(|host| with_bridge(|b| b.release_host_copies(&Translator, host)));
     mirror::set_dispatch(Box::new(|frame| {
         let Some(bridge) = BRIDGE.get() else { return };
         if let Err(error) = dispatch_from_host(bridge, &Translator, frame) {

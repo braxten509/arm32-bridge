@@ -275,7 +275,7 @@ extern "C" fn construct_instance(class: Class, bytes: usize) -> Id {
 // ----- instance variables -----
 
 /// ivar_t { int32_t *offset; const char *name; const char *type; u32 alignment; u32 size; }
-extern "C" fn get_instance_variable(class: Class, name: *const libc::c_char) -> usize {
+pub(crate) extern "C" fn get_instance_variable(class: Class, name: *const libc::c_char) -> usize {
     if class == 0 || name.is_null() {
         return 0;
     }

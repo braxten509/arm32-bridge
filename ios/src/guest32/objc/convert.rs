@@ -700,6 +700,9 @@ pub struct HostCallOptions {
     pub real_float: bool,
     pub varargs: Varargs,
     pub arrays: IdArrays,
+    /// The result points to host bytes, as many as the integer out-parameter
+    /// says (the bridge copies them into guest memory).
+    pub host_bytes: bool,
 }
 
 /// The most ids one counted array may hold (a bad count fails, not the heap).
@@ -806,6 +809,14 @@ pub fn prepare_host_call(
     }
     let stret = sig.ret.guest_returns_in_memory().then(|| words(0));
     Ok(PreparedHostCall { args, ret: sig.ret.clone(), ret_hty, indirect, stret, outs })
+}
+
+impl PreparedHostCall {
+    /// What the host wrote to the call's first out-parameter (its first
+    /// host word), before it is converted back; None if the guest passed none.
+    pub fn first_out_value(&self) -> Option<u64> {
+        self.outs.first().map(|out| out.temp[0])
+    }
 }
 
 /// Converts the host's result (and out-parameters) back for the guest.
