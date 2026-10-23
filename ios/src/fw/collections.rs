@@ -851,6 +851,24 @@ pub fn number_float(value: f64) -> Id {
     number(KIND_FLOAT, value.to_bits())
 }
 
+/// An NSDecimalNumber (store prices), kept like an NSNumber.
+pub fn decimal_number(value: i64) -> Id {
+    let object = runtime::alloc_instance(runtime::class_named("NSDecimalNumber"));
+    unsafe {
+        *((object + 8) as *mut usize) = KIND_INT;
+        *((object + 16) as *mut i64) = value;
+    }
+    object
+}
+
+extern "C" fn decimal_zero(_: Class, _: Sel) -> Id {
+    decimal_number(0)
+}
+
+extern "C" fn decimal_one(_: Class, _: Sel) -> Id {
+    decimal_number(1)
+}
+
 pub fn is_number(object: Id) -> bool {
     let rt = lock();
     object != 0 && rt.is_subclass(rt.class_of(object), classes().number)
@@ -957,6 +975,8 @@ pub fn register(_: &mut Registry) {
     let mutable_dictionary = define_class("NSMutableDictionary", "NSDictionary", 16);
     let value = define_class("NSValue", "NSObject", 24);
     let number = define_class("NSNumber", "NSValue", 24);
+    let decimal = define_class("NSDecimalNumber", "NSNumber", 24);
+    class_methods(decimal, &[("zero", decimal_zero as usize), ("one", decimal_one as usize)]);
     class_methods(
         value,
         &[("valueWithPointer:", value_with_pointer as usize), ("valueWithNonretainedObject:", value_with_pointer as usize)],

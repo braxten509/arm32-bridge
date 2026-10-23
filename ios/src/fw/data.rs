@@ -91,6 +91,11 @@ extern "C" fn data_length(this: Id, _: Sel) -> usize {
     store(this).len()
 }
 
+/// -base64EncodedStringWithOptions: (no line breaks; options ignored).
+extern "C" fn data_base64(this: Id, _: Sel, _options: usize) -> Id {
+    crate::fw::string::make(&crate::fw::plist::base64_encode(store(this)))
+}
+
 extern "C" fn data_write_to_file(this: Id, _: Sel, path: Id, _atomically: bool) -> bool {
     let path = crate::fw::string::get(path);
     let temporary = format!("{path}.part");
@@ -176,6 +181,7 @@ pub fn register(_: &mut Registry) {
             ("initWithContentsOfFile:", data_init_with_contents_of_file as usize),
             ("bytes", data_bytes as usize),
             ("length", data_length as usize),
+            ("base64EncodedStringWithOptions:", data_base64 as usize),
             ("writeToFile:atomically:", data_write_to_file as usize),
             ("copyWithZone:", data_copy as usize),
             ("mutableCopyWithZone:", data_mutable_copy as usize),
