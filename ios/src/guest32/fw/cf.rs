@@ -3,7 +3,7 @@
 //! pointer-sized results converted; also the framework string and number
 //! constants the games bind as data.
 
-use super::{host_fn, host_functions, object_to_guest, object_to_host, register_all, Bool, CStr, Long, Obj, Ptr, Word, U32};
+use super::{host_fn, host_functions, object_to_guest, object_to_host, register_all, Bool, CStr, Handle, Long, Obj, Ptr, Word, U32};
 use arm32_bridge::handler;
 use arm32_bridge::runtime::{mem, ArgSource, Ret};
 
@@ -35,6 +35,15 @@ pub fn register() {
         "CFBitVectorSetCount" => fn(vector: Obj, count: Long);
         "CFBitVectorGetBitAtIndex" => fn(vector: Obj, index: Long) -> U32;
         "CFBitVectorSetBitAtIndex" => fn(vector: Obj, index: Long, value: U32);
+        "NSSearchPathForDirectoriesInDomains" => fn(directory: Word, domains: Word, expand: Bool) -> Obj;
+        // SystemConfiguration: the layer reports no network and never calls the callback.
+        "SCNetworkReachabilityCreateWithName" => fn(allocator: Ptr, name: Ptr) -> Handle;
+        "SCNetworkReachabilityCreateWithAddress" => fn(allocator: Ptr, address: Ptr) -> Handle;
+        "SCNetworkReachabilityGetFlags" => fn(target: Handle, flags: Ptr) -> Bool;
+        "SCNetworkReachabilitySetCallback" => fn(target: Handle, callout: Word, context: Ptr) -> Bool;
+        "SCNetworkReachabilityScheduleWithRunLoop" => fn(target: Handle, run_loop: Obj, mode: Obj) -> Bool;
+        "SCNetworkReachabilityUnscheduleFromRunLoop" => fn(target: Handle, run_loop: Obj, mode: Obj) -> Bool;
+        "SCNetworkReachabilitySetDispatchQueue" => fn(target: Handle, queue: Word) -> Bool;
     });
     // CFNumberGetValue(number, type, out): the long-sized types are 4 bytes
     // here and CGFloat a float, 8 bytes in the host.
@@ -74,25 +83,45 @@ pub fn register() {
         })
         .unwrap(),
     );
-    super::word_constant("kCFAllocatorDefault");
-    for name in STRING_CONSTANTS {
+    for name in WORD_CONSTANTS {
+        if super::host_data(name).is_some() {
+            super::word_constant(name);
+        }
+    }
+    for name in OBJECT_CONSTANTS {
         if super::host_data(name).is_some() {
             super::object_constant(name);
         }
     }
 }
 
+/// Pointer-sized number constants.
+const WORD_CONSTANTS: &[&str] = &["kCFAllocatorDefault", "UIBackgroundTaskInvalid"];
+
 /// Framework object constants (strings, booleans) bound as data: each is a
 /// guest variable holding the guest form of this layer's object.
-const STRING_CONSTANTS: &[&str] = &[
-    "kCFRunLoopDefaultMode", "kCFRunLoopCommonModes", "kCFBooleanTrue", "kCFBooleanFalse", "NSDefaultRunLoopMode",
-    "NSRunLoopCommonModes", "UIApplicationDidBecomeActiveNotification", "UIApplicationWillResignActiveNotification",
+const OBJECT_CONSTANTS: &[&str] = &[
+    // Core Foundation
+    "kCFRunLoopDefaultMode", "kCFRunLoopCommonModes", "kCFBooleanTrue", "kCFBooleanFalse", "kCFBundleIdentifierKey",
+    "kCFBundleVersionKey", "kCFLocaleCurrencySymbol",
+    // Foundation
+    "NSDefaultRunLoopMode", "NSRunLoopCommonModes", "NSInternalInconsistencyException", "NSInvalidArgumentException",
+    "NSLocalizedDescriptionKey", "NSLocalizedFailureReasonErrorKey", "NSUnderlyingErrorKey", "NSPOSIXErrorDomain",
+    "NSURLErrorDomain", "NSLocaleLanguageCode", "NSLocaleCountryCode", "NSLocaleCurrencyCode", "NSLocaleCurrencySymbol",
+    "NSGregorianCalendar", "NSCalendarIdentifierGregorian", "NSMetadataItemFSNameKey", "NSMetadataItemFSCreationDateKey",
+    "NSMetadataItemURLKey", "NSMetadataQueryDidFinishGatheringNotification", "NSMetadataQueryUbiquitousDocumentsScope",
+    "NSURLUbiquitousItemIsDownloadedKey", "NSFileSystemFreeSize", "NSFileSystemSize",
+    // UIKit
+    "UIApplicationDidBecomeActiveNotification", "UIApplicationWillResignActiveNotification",
     "UIApplicationWillTerminateNotification", "UIApplicationDidEnterBackgroundNotification",
-    "UIApplicationWillEnterForegroundNotification", "UIApplicationDidReceiveMemoryWarningNotification",
-    "UIDeviceOrientationDidChangeNotification", "UIKeyboardWillShowNotification", "UIKeyboardDidShowNotification",
-    "UIKeyboardWillHideNotification", "UIKeyboardDidHideNotification", "UIKeyboardFrameBeginUserInfoKey",
-    "UIKeyboardFrameEndUserInfoKey", "UIKeyboardAnimationDurationUserInfoKey", "UIKeyboardAnimationCurveUserInfoKey",
+    "UIApplicationWillEnterForegroundNotification", "UIApplicationDidFinishLaunchingNotification",
+    "UIApplicationLaunchOptionsURLKey", "UIDeviceOrientationDidChangeNotification", "UIKeyboardWillShowNotification",
+    "UIKeyboardDidShowNotification", "UIKeyboardWillHideNotification", "UIKeyboardDidHideNotification",
+    "UIKeyboardWillChangeFrameNotification", "UIKeyboardFrameBeginUserInfoKey", "UIKeyboardFrameEndUserInfoKey",
+    "UIKeyboardAnimationDurationUserInfoKey", "UIKeyboardAnimationCurveUserInfoKey",
+    // AVFoundation, OpenGL ES (EAGL), Accounts
     "AVAudioSessionCategoryAmbient", "AVAudioSessionCategorySoloAmbient", "AVAudioSessionCategoryPlayback",
     "AVAudioSessionCategoryRecord", "AVAudioSessionCategoryPlayAndRecord", "kEAGLDrawablePropertyColorFormat",
     "kEAGLDrawablePropertyRetainedBacking", "kEAGLColorFormatRGBA8", "kEAGLColorFormatRGB565",
+    "ACAccountTypeIdentifierTwitter", "ACAccountTypeIdentifierFacebook",
 ];
