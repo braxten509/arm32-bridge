@@ -126,6 +126,9 @@ pub struct Bridge {
     pub msg_send_stub: u32,
     /// Classes whose +initialize is running (on which thread) or done.
     init_state: HashMap<u32, InitState>,
+    /// The game has a category +initialize on a framework class, so
+    /// framework classes (their guest copies) are initialized too.
+    framework_initializers: bool,
 }
 
 /// Where a message goes.
@@ -136,8 +139,11 @@ enum Target {
 
 impl Bridge {
     pub fn new(md: &ObjcMetadata32) -> Result<Bridge, String> {
+        let classes = GuestClasses::from_metadata(md)?;
+        let framework_initializers = classes.framework_category_entries().iter().any(|(_, meta, sel)| *meta && sel == "initialize");
         Ok(Bridge {
-            classes: GuestClasses::from_metadata(md)?,
+            framework_initializers,
+            classes,
             to_host: HashMap::new(),
             to_guest: HashMap::new(),
             game_instances: HashMap::new(),
@@ -581,7 +587,9 @@ pub fn install(bridge: &Mutex<Bridge>, g: &dyn GuestSide, md: &ObjcMetadata32) -
     }
     // Game category methods on framework classes answer host messages too.
     for (class, meta, sel) in b.classes.framework_category_entries() {
-        if !matches!(sel.as_str(), "load" | "initialize") {
+        // +initialize too: the host runtime's own +initialize of a host class
+        // then reaches the bridge, which runs it once (dispatch_from_host).
+        if sel != "load" {
             mirror::add_mirror_method(Bridge::host_class_named(&class, meta), &sel);
         }
     }
@@ -648,23 +656,36 @@ enum InitState {
 /// Wakes threads waiting for some class's +initialize to finish.
 static INIT_DONE: (Mutex<()>, std::sync::Condvar) = (Mutex::new(()), std::sync::Condvar::new());
 
-/// The game class a message to an object whose isa is `isa` must initialize
-/// first, if its +initialize isn't done.
+/// The class (a game class, or a framework class's guest copy when the game
+/// has framework category initializers) whose +initialize must be done
+/// before a message to an object whose isa is `isa`.
 fn class_to_initialize(b: &Bridge, isa: u32) -> Option<u32> {
-    let c = b.classes.class(isa)?;
-    let class = if c.meta { c.partner } else { isa };
+    let class = match b.classes.class(isa) {
+        Some(c) if c.meta => c.partner,
+        Some(_) => isa,
+        None if b.framework_initializers => b.framework.get(&b.framework_by_guest.get(&isa)?.0)?.0,
+        None => return None,
+    };
     (b.init_state.get(&class) != Some(&InitState::Done)).then_some(class)
 }
 
-/// Sends +initialize to a game class once, its game superclasses first. Like
-/// Apple's runtime it is a message: a class without its own +initialize runs
-/// its superclass's. The thread running it may message the class again;
-/// other threads wait until it is done (holding neither the bridge lock nor
-/// the guest lock).
+/// What +initialize of a class resolves through.
+enum Initializer {
+    /// A game class: its metaclass's chain, then framework categories.
+    Game(u32),
+    /// A framework class: game categories on it or its host superclasses.
+    Framework(String),
+}
+
+/// Sends +initialize to a class once, its superclasses first. Like Apple's
+/// runtime it is a message: a class without its own +initialize runs its
+/// superclass's (a game category's on a framework class included). The
+/// thread running it may message the class again; other threads wait until
+/// it is done (holding neither the bridge lock nor the guest lock).
 fn initialize(bridge: &Mutex<Bridge>, g: &dyn GuestSide, class: u32) -> Result<(), String> {
     let me = std::thread::current().id();
     let state = |b: &Bridge| b.init_state.get(&class).copied();
-    let (superclass, meta, sel) = loop {
+    let (parent, initializer, sel) = loop {
         let mut b = lock(bridge);
         match state(&b) {
             Some(InitState::Done) => return Ok(()),
@@ -679,20 +700,45 @@ fn initialize(bridge: &Mutex<Bridge>, g: &dyn GuestSide, class: u32) -> Result<(
                 });
             }
             None => {
-                let c = b.classes.class(class).ok_or_else(|| format!("+initialize of unknown class {class:#x}"))?;
-                let (superclass, meta) = (c.superclass.clone(), c.partner);
+                let framework_parent = |b: &mut Bridge, name: &str| b.framework_initializers.then(|| b.framework_class(g, name).0);
+                let (parent, initializer) = if let Some(c) = b.classes.class(class) {
+                    let (superclass, meta) = (c.superclass.clone(), c.partner);
+                    let parent = match superclass {
+                        super::classes::Super::Game(parent) => Some(parent),
+                        super::classes::Super::Framework(name) => framework_parent(&mut b, &name),
+                        super::classes::Super::None => None,
+                    };
+                    (parent, Initializer::Game(meta))
+                } else if let Some((name, _)) = b.framework_by_guest.get(&class).cloned() {
+                    let host = runtime::existing_class(&name, false).unwrap_or(0);
+                    let superclass = {
+                        let rt = runtime::lock();
+                        rt.classes.get(&host).map(|r| r.superclass).filter(|s| *s != 0).map(|s| rt.class_name(s))
+                    };
+                    let parent = superclass.and_then(|s| framework_parent(&mut b, &s));
+                    (parent, Initializer::Framework(name))
+                } else {
+                    return Err(format!("+initialize of unknown class {class:#x}"));
+                };
                 b.init_state.insert(class, InitState::Running(me));
-                break (superclass, meta, b.guest_selector(g, "initialize"));
+                break (parent, initializer, b.guest_selector(g, "initialize"));
             }
         }
     };
     let result = (|| {
-        if let super::classes::Super::Game(parent) = superclass {
+        if let Some(parent) = parent {
             initialize(bridge, g, parent)?;
         }
-        let imp = match lock(bridge).classes.lookup(meta, "initialize") {
-            Lookup::Guest(m) => Some(m.imp),
-            _ => None,
+        let imp = {
+            let b = lock(bridge);
+            match &initializer {
+                Initializer::Game(meta) => match b.classes.lookup(*meta, "initialize") {
+                    Lookup::Guest(m) => Some(m.imp),
+                    Lookup::Framework { class, meta } => b.framework_category(&class, meta, "initialize").map(|m| m.0),
+                    Lookup::Missing => None,
+                },
+                Initializer::Framework(name) => b.framework_category(name, true, "initialize").map(|m| m.0),
+            }
         };
         if let Some(imp) = imp {
             g.call(imp, &[class, sel])?;
@@ -906,6 +952,10 @@ pub fn dispatch_from_host(bridge: &Mutex<Bridge>, g: &dyn GuestSide, frame: &mut
         drop(b);
         initialize(bridge, g, class)?;
         b = lock(bridge);
+    }
+    // The host runtime's own +initialize: run once through the state above.
+    if name == "initialize" {
+        return Ok(());
     }
     // A game method, or a game category method on a framework class (the
     // receiver's own framework class or one its game class inherits from).

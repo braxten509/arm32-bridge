@@ -350,6 +350,53 @@ fn other_threads_wait_for_initialize_and_the_owner_may_reenter() {
     assert!(log[end + 1..].contains(&2) && log[end + 1..].contains(&0));
 }
 
+#[test]
+fn a_framework_category_initialize_runs_for_the_class_and_its_subclasses() {
+    let root = host_class("G32HostRootC");
+    let leaf = runtime::lock().define_class("G32HostLeafC", root, 16);
+    let fake = Fake::new();
+    // A game category on G32HostRootC with +initialize; G32Kid : G32HostRootC has none.
+    let category = ObjcCategory32 {
+        address: fake.alloc_permanent(4),
+        name: "Setup".into(),
+        class: ClassTarget::External("G32HostRootC".into()),
+        instance_methods: vec![],
+        class_methods: vec![method("initialize", "v8@0:4", 0x2701)],
+        protocols: vec![],
+        instance_properties: vec![],
+    };
+    let kid = class32(fake, "G32Kid", ClassTarget::External("G32HostRootC".into()), "G32HostRootC", vec![]);
+    let kid_class = kid.address;
+    let md = ObjcMetadata32 { classes: vec![kid], categories: vec![category], ..Default::default() };
+    let bridge: &'static Mutex<Bridge> = Box::leak(Box::new(Mutex::new(Bridge::new(&md).unwrap())));
+    install(bridge, fake, &md).unwrap();
+    let calls: &'static Mutex<Vec<u32>> = Box::leak(Box::new(Mutex::new(Vec::new())));
+    fake.code(0x2701, move |w| {
+        calls.lock().unwrap().push(w[0]);
+        0
+    });
+    let root_guest = bridge.lock().unwrap().framework_class(fake, "G32HostRootC").0;
+    // The game subclass's first message: the framework class, then the subclass
+    // (inheriting the category's +initialize).
+    let alloc = bridge.lock().unwrap().guest_selector(fake, "alloc");
+    send(bridge, fake, &[kid_class, alloc]).unwrap();
+    send(bridge, fake, &[kid_class, alloc]).unwrap();
+    assert_eq!(*calls.lock().unwrap(), [root_guest, kid_class]);
+    // The host runtime's own +initialize of a host subclass reaches it once.
+    let _hook = mirror::DISPATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    mirror::set_dispatch(Box::new(move |frame: &mut HostFrame| {
+        dispatch_from_host(bridge, fake, frame).unwrap();
+    }));
+    let initialize = runtime::sel("initialize");
+    let imp = runtime::imp_for(leaf, initialize).expect("the category's +initialize is on the host class");
+    let mut args = super::convert::HostArgs::default();
+    args.x[..2].copy_from_slice(&[leaf as u64, initialize as u64]);
+    mirror::call_host(imp, &args);
+    mirror::call_host(imp, &args);
+    let leaf_guest = bridge.lock().unwrap().framework_class(fake, "G32HostLeafC").0;
+    assert_eq!(*calls.lock().unwrap(), [root_guest, kid_class, leaf_guest]);
+}
+
 extern "C" fn host_label(_: Id, _: Sel) -> usize {
     7
 }
