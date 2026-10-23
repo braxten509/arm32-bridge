@@ -193,3 +193,25 @@ fn blocks_copy_to_the_heap_and_run_when_the_host_calls_them() {
     assert_eq!(call("objc_msgSend", &[heap, copy_sel]), heap);
     assert_eq!(g.u32_at(heap + 4) & 0xffff, 4);
 }
+
+#[test]
+fn autorelease_pools_belong_to_their_thread() {
+    // Thread A pushes, thread B pushes, A pops, then B pops: B's pool is still its own.
+    fn pool(name: &str, token: u32) -> Result<u64, String> {
+        let bridge: &'static Mutex<Bridge> = Box::leak(Box::new(Mutex::new(Bridge::new(&ObjcMetadata32::default()).unwrap())));
+        let words = [token];
+        call_function(&Ctx { bridge, g: Fake::new() }, name, &|i| words.get(i as usize).copied().unwrap_or(0))
+    }
+    let a = pool("objc_autoreleasePoolPush", 0).unwrap() as u32;
+    let (pushed, popped) = (std::sync::mpsc::channel(), std::sync::mpsc::channel::<()>());
+    let b = std::thread::spawn(move || {
+        let token = pool("objc_autoreleasePoolPush", 0).unwrap() as u32;
+        pushed.0.send(()).unwrap();
+        popped.1.recv().unwrap();
+        pool("objc_autoreleasePoolPop", token)
+    });
+    pushed.1.recv().unwrap();
+    pool("objc_autoreleasePoolPop", a).unwrap();
+    popped.0.send(()).unwrap();
+    assert!(b.join().unwrap().is_ok(), "thread B's pool survived thread A's pop");
+}

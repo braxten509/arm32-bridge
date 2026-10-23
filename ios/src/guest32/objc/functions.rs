@@ -277,8 +277,14 @@ fn set_property_with(c: &Ctx, object: u32, offset: u32, value: u32, copy: i8) ->
     ok(0)
 }
 
-/// Host autorelease pool tokens are 64-bit: the guest gets an index.
-static POOLS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+/// Host autorelease pool tokens are 64-bit: the guest gets a number of its
+/// own. Pools nest per thread, like Apple's.
+static NEXT_POOL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+thread_local! {
+    /// This thread's pools, innermost last: (guest token, host token).
+    static POOLS: std::cell::RefCell<Vec<(u32, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 
 fn host_function(name: &str) -> Option<usize> {
     crate::symbols::lookup(name).map(|s| s.0)
@@ -289,21 +295,23 @@ fn pool_push(_: &Ctx, _: Words) -> Result<u64, String> {
         Some(f) => super::mirror::call_host(f, &Default::default()).x[0] as usize,
         None => 0,
     };
-    let mut pools = POOLS.lock().unwrap_or_else(|e| e.into_inner());
-    pools.push(token);
-    ok(pools.len() as u32)
+    let guest = NEXT_POOL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    POOLS.with(|p| p.borrow_mut().push((guest, token)));
+    ok(guest)
 }
 
+/// Pops this thread's pool `w(0)` and every pool pushed after it.
 fn pool_pop(_: &Ctx, w: Words) -> Result<u64, String> {
-    let index = w(0) as usize;
-    let token = {
-        let mut pools = POOLS.lock().unwrap_or_else(|e| e.into_inner());
-        if index == 0 || index > pools.len() {
-            return Err(format!("objc_autoreleasePoolPop: unknown pool {index}"));
-        }
-        let token = pools[index - 1];
-        pools.truncate(index - 1);
-        token
+    let guest = w(0);
+    let token = POOLS.with(|p| {
+        let mut pools = p.borrow_mut();
+        let at = pools.iter().rposition(|(g, _)| *g == guest)?;
+        let token = pools[at].1;
+        pools.truncate(at);
+        Some(token)
+    });
+    let Some(token) = token else {
+        return Err(format!("objc_autoreleasePoolPop: pool {guest} is not one of this thread's"));
     };
     if let Some(f) = host_function("_objc_autoreleasePoolPop") {
         let mut args = super::convert::HostArgs::default();
