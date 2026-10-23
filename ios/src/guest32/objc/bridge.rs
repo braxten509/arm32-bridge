@@ -634,6 +634,18 @@ impl Bridge {
         }
     }
 
+    /// The name of the class the guest sees for a receiver's isa, and whether
+    /// that isa is a metaclass (the receiver is the class itself).
+    fn class_display(&self, isa: u32) -> (String, bool) {
+        if let Some(c) = self.classes.class(isa) {
+            return (c.name.clone(), c.meta);
+        }
+        match self.framework_by_guest.get(&isa) {
+            Some((name, meta)) => (name.clone(), *meta),
+            None => (format!("isa {isa:#x}"), false),
+        }
+    }
+
     fn describe(&self, isa: u32) -> String {
         match self.classes.class(isa) {
             Some(c) => format!("{}[{} ", if c.meta { "+" } else { "-" }, c.name),
@@ -981,6 +993,14 @@ pub fn send_from_guest(
             (receiver, target)
         }
     };
+    // Test switch IOS_TRACE_MESSAGES: the same "-[Class selector]" lines the
+    // host's messages get, with the guest's class names.
+    if runtime::message_trace_on() {
+        let (class_name, class_is_meta) = b.class_display(u32_at(g, receiver));
+        if let Some(text) = runtime::traced_message_text(&class_name, class_is_meta, &name) {
+            crate::log!("32-bit message {text}");
+        }
+    }
     let receiver_word = first;
     let get = |i: u32| if i == receiver_word { receiver } else { words(i) };
     match target {

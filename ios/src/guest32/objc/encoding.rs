@@ -353,4 +353,17 @@ mod tests {
         assert!(table.get("numberWithFloat:").unwrap().real_float && !table.get("setAlpha:").unwrap().real_float);
         assert!(table.get("noSuchSelector:").is_none());
     }
+
+    #[test]
+    fn host_methods_taking_a_c_float_have_float_rows() {
+        // Our framework methods that take a C float (f32), not a CGFloat. A
+        // game may implement the same selector name on its own class (the
+        // game's types then say only 'f', read as CGFloat), so each needs a
+        // row marked float or the host reads half of a double (1.0 becomes 0).
+        let table = super::super::selectors::FrameworkSelectors::builtin();
+        for sel in ["setVolume:", "setPan:", "setRate:", "setFloat:forKey:", "setShadowOpacity:", "setRemoteParticipantVolume:"] {
+            let row = table.get(sel).unwrap_or_else(|| panic!("{sel} has no row"));
+            assert!(row.real_float, "{sel} is not marked float");
+        }
+    }
 }

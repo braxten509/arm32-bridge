@@ -607,24 +607,60 @@ fn message_trace() -> Option<&'static regex::Regex> {
         .as_ref()
 }
 
-fn trace_message(pattern: &regex::Regex, isa: Class, is_class: bool, sel: Sel, caller: usize) {
+/// How many times one message is logged before it is left out.
+const TRACE_LIMIT: u32 = 50;
+
+/// Whether `text` is the next message to log: the pattern names it and this
+/// exact message has not been logged `limit` times yet.
+fn trace_wants(pattern: &regex::Regex, limit: u32, text: &str) -> bool {
     static COUNTS: Mutex<Option<HashMap<String, u32>>> = Mutex::new(None);
+    if !pattern.is_match(text) {
+        return false;
+    }
+    let mut counts = COUNTS.lock().unwrap_or_else(|e| e.into_inner());
+    let count = counts.get_or_insert_with(HashMap::new).entry(text.to_string()).or_default();
+    *count += 1;
+    *count <= limit
+}
+
+/// Whether the test switch IOS_TRACE_MESSAGES is set at all (a caller with
+/// work to do before asking for the message's text checks this first).
+pub(crate) fn message_trace_on() -> bool {
+    message_trace().is_some()
+}
+
+/// The "-[Class selector]" text of a message, when the test switch wants it
+/// logged. The 32-bit bridge asks for the same text with the guest class's
+/// name, so one switch traces both kinds of game.
+pub(crate) fn traced_message_text(class: &str, is_class: bool, sel: &str) -> Option<String> {
+    let pattern = message_trace()?;
+    let text = format!("{}[{class} {sel}]", if is_class { "+" } else { "-" });
+    trace_wants(pattern, TRACE_LIMIT, &text).then_some(text)
+}
+
+fn trace_message(pattern: &regex::Regex, isa: Class, is_class: bool, sel: Sel, caller: usize) {
     let text = {
         let rt = lock();
         format!("{}[{} {}]", if is_class { "+" } else { "-" }, rt.class_name(isa), rt.sel_name(sel))
     };
-    if !pattern.is_match(&text) {
+    if !trace_wants(pattern, TRACE_LIMIT, &text) {
         return;
     }
-    {
-        let mut counts = COUNTS.lock().unwrap_or_else(|e| e.into_inner());
-        let count = counts.get_or_insert_with(HashMap::new).entry(text.clone()).or_default();
-        *count += 1;
-        if *count > 50 {
-            return;
-        }
-    }
     crate::log!("message {text} from {}", crate::loader::describe_address(caller));
+}
+
+#[cfg(test)]
+mod trace_tests {
+    use super::*;
+
+    #[test]
+    fn a_traced_message_is_logged_up_to_the_limit() {
+        let pattern = regex::Regex::new(r"^-\[CDAudioManager ").unwrap();
+        let wanted = "-[CDAudioManager playBackgroundMusic:loop:]";
+        let logged = (1..=TRACE_LIMIT + 5).filter(|_| trace_wants(&pattern, TRACE_LIMIT, wanted)).count();
+        assert_eq!(logged, TRACE_LIMIT as usize, "one message logged {logged} times");
+        assert!(!trace_wants(&pattern, TRACE_LIMIT, "-[CCDirector run]"), "a message the pattern does not name");
+    }
 }
 
 #[no_mangle]

@@ -358,7 +358,8 @@ back without. A save written by the old stand-in is 8 bytes (version
 4, 0xC0DEDBAD, no data) and IB1 crashes reading it (emulator
 reproduces it); the Pixel's was renamed `SwordSave.bin.empty-from-old-build`
 so the game starts a new save. Test switch `IOS_TRACE_MESSAGES=<regex>` logs matching
-Objective-C messages ("-[Class sel]", 50 each, with the caller); on
+Objective-C messages ("-[Class sel]", 50 each, with the caller; 32-bit
+games' messages come out as "32-bit message -[Class sel]"); on
 Android through `debug.gamebridge.ios.env` (92 characters at most).
 
 UIKit pictures (owner's choice, 2026-10-19, for every game): after a

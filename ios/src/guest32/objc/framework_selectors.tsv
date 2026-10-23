@@ -5,11 +5,14 @@
 # How the list was made (2026-10-22): for each 32-bit game, the selectors in
 # __objc_selrefs minus every selector the game's own classes and categories
 # implement (`inspect <binary> --framework-selectors` in ios/guest32-image);
-# both lists merged and sorted. Selectors a game implements need no row: the
-# game's own method types are used. Encodings follow Apple's SDK headers for
-# armv7: id/Class/SEL/pointers/NSInteger/NSUInteger/long 4 bytes, CGFloat
-# float, BOOL signed char ('c'), NSTimeInterval double. Stack offsets are left
-# out ("v@:@" instead of "v12@0:4@8").
+# both lists merged and sorted. A selector the game implements needs no row
+# for the game's own calls (its method types are used), but it does need one
+# when a framework class answers that name too: the types are looked up by
+# selector name, and Apple's method may take a C float where the game's takes
+# a CGFloat (AVAudioPlayer's -setVolume:, below). Encodings follow Apple's
+# SDK headers for armv7: id/Class/SEL/pointers/NSInteger/NSUInteger/long are
+# 4 bytes, CGFloat float, BOOL signed char ('c'), NSTimeInterval double.
+# Stack offsets are left out ("v@:@" instead of "v12@0:4@8").
 #
 # Columns: selector, encoding (return type, then self, _cmd, arguments),
 # and an optional note:
@@ -427,6 +430,7 @@ setDateFormat:	v@:@
 setDictionary:	v@:@
 setDrawableProperties:	v@:@
 setFill	v@:
+setFloat:forKey:	v@:f@	float
 setFont:	v@:@
 setFormatterBehavior:	v@:I
 setFrame:	v@:{CGRect={CGPoint=ff}{CGSize=ff}}
@@ -454,13 +458,17 @@ setObject:atIndexedSubscript:	v@:@I
 setObject:forKey:	v@:@@
 setObject:forKeyedSubscript:	v@:@@
 setOpaque:	v@:c
+setPan:	v@:f	float
 setPercentComplete:	v@:d
 setPersistent:	v@:c
 setPredicate:	v@:@
 setProgressImage:	v@:@
+setRate:	v@:f	float
+setRemoteParticipantVolume:	v@:f	float
 setRootViewController:	v@:@
 setSearchScopes:	v@:@
 setSelector:	v@::
+setShadowOpacity:	v@:f	float
 setShouldProcessNamespaces:	v@:c
 setShouldReportNamespacePrefixes:	v@:c
 setShouldResolveExternalEntities:	v@:c
@@ -481,6 +489,7 @@ setValue:	v@:f	float,ambiguous:UISlider
 setValue:forHTTPHeaderField:	v@:@@
 setValue:forKey:	v@:@@
 setView:	v@:@
+setVolume:	v@:f	float
 setWithCapacity:	@@:I
 setWithObjects:	@@:@	nil-list
 sharedAccelerometer	@@:

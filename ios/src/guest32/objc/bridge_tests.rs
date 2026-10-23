@@ -482,6 +482,62 @@ fn cg_objects_from_getters_cross_as_their_proxies() {
     assert_eq!(*HOST_CG.lock().unwrap(), [cg]);
 }
 
+static HOST_VOLUME: Mutex<Vec<(Id, f32)>> = Mutex::new(Vec::new());
+
+extern "C" fn host_set_volume(this: Id, _: Sel, volume: f32) {
+    HOST_VOLUME.lock().unwrap().push((this, volume));
+}
+
+/// Host class `G32Player` with +alloc and -setVolume: taking a C float.
+fn host_volume_class() -> Class {
+    let mut rt = runtime::lock();
+    let class = rt.define_class("G32Player", 0, 16);
+    let meta = rt.classes[&class].partner;
+    let (alloc, volume) = (rt.sel("alloc"), rt.sel("setVolume:"));
+    rt.add_method(meta, alloc, host_alloc as usize);
+    rt.add_method(class, volume, host_set_volume as usize);
+    class
+}
+
+#[test]
+fn a_float_host_property_reaches_the_host_as_a_float() {
+    // The game's CDLongAudioSource has its own -setVolume: (v12@0:4f8) and
+    // forwards it to AVAudioPlayer's, whose volume is a C float on the
+    // iPhone. Every message is looked up by selector name, so the player's
+    // -setVolume: must learn from the table that the value is a float, not
+    // from the game's method types: sent as a CGFloat (double), the player
+    // reads half of it and gets 0, and the music stays silent.
+    let player = host_volume_class();
+    let fake = Fake::new();
+    let (class, meta) = (fake.alloc_permanent(20), fake.alloc_permanent(20));
+    fake.write(class, &meta.to_le_bytes());
+    let md = ObjcMetadata32 {
+        classes: vec![ObjcClass32 {
+            address: class,
+            name: "G32AudioSource".into(),
+            superclass: ClassTarget::External("NSObject".into()),
+            meta_address: meta,
+            meta_isa: ClassTarget::External("NSObject".into()),
+            meta_superclass: ClassTarget::External("NSObject".into()),
+            instance: ClassRo32 {
+                instance_start: 8,
+                instance_size: 16,
+                methods: vec![method("setVolume:", "v12@0:4f8", 0x3001)],
+                ..Default::default()
+            },
+            meta: ClassRo32 { flags: 1, ..Default::default() },
+        }],
+        ..Default::default()
+    };
+    let bridge = Mutex::new(Bridge::new(&md).unwrap());
+    install(&bridge, fake, &md).unwrap();
+    let host = runtime::alloc_instance(player);
+    let proxy = bridge.lock().unwrap().guest_object(fake, host).unwrap();
+    let volume = bridge.lock().unwrap().guest_selector(fake, "setVolume:");
+    send(&bridge, fake, &[proxy, volume, 1.0f32.to_bits()]).unwrap();
+    assert_eq!(HOST_VOLUME.lock().unwrap().clone(), vec![(host, 1.0f32)]);
+}
+
 static HOST_POINTS: Mutex<Vec<(f64, f64)>> = Mutex::new(Vec::new());
 
 extern "C" fn host_pick(object: Id, x: f64, y: f64) -> Id {
