@@ -28,6 +28,7 @@ use std::cell::RefCell;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 
 mod shapes;
+mod text;
 
 // ----- pixel formats -----
 
@@ -614,6 +615,8 @@ struct GraphicsState {
     blend_mode: i32,
     /// How much of each device pixel (rows from the bottom) drawing may touch.
     clip: Option<Arc<Vec<f32>>>,
+    /// CGTextDrawingMode: fill, stroke or both (fw/graphics/text.rs).
+    text_mode: i32,
 }
 
 impl GraphicsState {
@@ -628,6 +631,7 @@ impl GraphicsState {
             stroke_space: Space::Rgb,
             blend_mode: 0,
             clip: None,
+            text_mode: 0,
         }
     }
 }
@@ -1503,6 +1507,7 @@ pub fn register(r: &mut Registry) {
     r.function("UIImageJPEGRepresentation", ui_image_jpeg_representation as usize);
     r.function("UIImageWriteToSavedPhotosAlbum", ui_image_write_to_saved_photos_album as usize);
     shapes::register(r);
+    text::register();
 }
 
 #[cfg(test)]

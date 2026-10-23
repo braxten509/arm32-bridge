@@ -36,14 +36,14 @@ impl Outline {
         }
     }
 
-    fn move_to(&mut self, p: (f64, f64)) {
+    pub(super) fn move_to(&mut self, p: (f64, f64)) {
         match self.figures.last_mut() {
             Some(figure) if figure.points.len() == 1 && !figure.closed => figure.points[0] = p,
             _ => self.figures.push(Figure { points: vec![p], closed: false }),
         }
     }
 
-    fn line_to(&mut self, p: (f64, f64)) {
+    pub(super) fn line_to(&mut self, p: (f64, f64)) {
         match self.figures.last_mut() {
             Some(figure) if !figure.closed => figure.points.push(p),
             Some(figure) => {
@@ -54,7 +54,7 @@ impl Outline {
         }
     }
 
-    fn close(&mut self) {
+    pub(super) fn close(&mut self) {
         if let Some(figure) = self.figures.last_mut() {
             figure.closed = true;
         }
@@ -269,12 +269,12 @@ impl Canvas {
         }
     }
 
-    fn fill_outline(&mut self, outline: &Outline, even_odd: bool) {
+    pub(super) fn fill_outline(&mut self, outline: &Outline, even_odd: bool) {
         let mask = coverage(&outline.edges(), even_odd, self.width, self.height);
         self.paint_mask(&mask, self.state.fill);
     }
 
-    fn stroke_outline(&mut self, outline: &Outline) {
+    pub(super) fn stroke_outline(&mut self, outline: &Outline) {
         let ctm = self.state.ctm;
         let half = self.state.line_width / 2.0 * (ctm.a * ctm.d - ctm.b * ctm.c).abs().sqrt();
         let (lines, corners) = outline.lines();
@@ -568,7 +568,11 @@ extern "C" fn set_shadow(_context: Id, _offset: Size, _blur: f64) {
 extern "C" fn set_shadow_with_color(_context: Id, _offset: Size, _blur: f64, _color: Id) {
     shadows_not_drawn();
 }
-extern "C" fn set_text_drawing_mode(_context: Id, _mode: i32) {}
+extern "C" fn set_text_drawing_mode(context: Id, mode: i32) {
+    if let Some(mut c) = canvas("CGContextSetTextDrawingMode", context) {
+        c.state.text_mode = mode;
+    }
+}
 /// A transparency layer draws straight into the context (same result
 /// without shadows or group alpha); its settings end with it.
 extern "C" fn begin_transparency_layer(context: Id, _auxiliary: Id) {
