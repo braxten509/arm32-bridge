@@ -653,32 +653,68 @@ extern "C" fn path_close_subpath(path: Id) {
 
 // ----- data providers and CGImageCreate -----
 
-/// Bytes the game owns. CGImageCreate copies them, so the provider gives
-/// them back (`release`: info, data, size) when the game releases it.
+/// Bytes the game owns, given back (`release`: info, data, size) when the
+/// last reference goes. Providers count with the other CG objects
+/// (fw/counted.rs): CFRetain/CFRelease, retain/release messages, ARC calls
+/// and autorelease pools all reach the same count. CGImageCreate copies the
+/// bytes, so pictures don't hold a reference.
 struct Provider {
     info: usize,
     data: usize,
     size: usize,
-    release: std::sync::atomic::AtomicUsize,
+    release: usize,
 }
 
 fn provider_state(provider: Id) -> Option<&'static Provider> {
     state::<Provider>(provider, classes().provider)
 }
 
+/// The clean-up counted runs at the last reference.
+fn free_provider(provider: Id) {
+    let Some(p) = provider_state(provider) else { return };
+    if p.release != 0 {
+        let release: extern "C" fn(usize, usize, usize) = unsafe { std::mem::transmute(p.release) };
+        release(p.info, p.data, p.size);
+    }
+}
+
 extern "C" fn data_provider_create_with_data(info: usize, data: *const u8, size: usize, release: usize) -> Id {
-    wrap(classes().provider, Provider { info, data: data as usize, size, release: release.into() })
+    let provider = wrap(classes().provider, Provider { info, data: data as usize, size, release });
+    counted::track(provider, free_provider);
+    provider
+}
+/// +1 on a data provider; false for anything else.
+pub fn retain_provider(provider: Id) -> bool {
+    if provider_state(provider).is_none() {
+        return false;
+    }
+    counted::retain(provider);
+    true
+}
+/// -1 on a data provider, running the release callback at zero; false for
+/// anything else.
+pub fn release_provider(provider: Id) -> bool {
+    if provider_state(provider).is_none() {
+        return false;
+    }
+    counted::release(provider);
+    true
 }
 extern "C" fn data_provider_retain(provider: Id) -> Id {
+    counted::retain(provider);
     provider
 }
 extern "C" fn data_provider_release(provider: Id) {
-    let Some(p) = provider_state(provider) else { return };
-    let release = p.release.swap(0, std::sync::atomic::Ordering::Relaxed);
-    if release != 0 {
-        let release: extern "C" fn(usize, usize, usize) = unsafe { std::mem::transmute(release) };
-        release(p.info, p.data, p.size);
-    }
+    counted::release(provider);
+}
+extern "C" fn provider_retain_method(this: Id, _: Sel) -> Id {
+    counted::retain(this)
+}
+extern "C" fn provider_release_method(this: Id, _: Sel) {
+    counted::release(this)
+}
+extern "C" fn provider_retain_count_method(this: Id, _: Sel) -> usize {
+    counted::count(this).unwrap_or(0)
 }
 
 /// A picture from a provider's bytes (copied: the picture never changes).
@@ -699,6 +735,14 @@ extern "C" fn image_create(width: usize, height: usize, bits_per_component: usiz
 }
 
 pub fn register(r: &mut Registry) {
+    methods(
+        classes().provider,
+        &[
+            ("retain", provider_retain_method as usize),
+            ("release", provider_release_method as usize),
+            ("retainCount", provider_retain_count_method as usize),
+        ],
+    );
     for (name, function) in [
         ("CGContextBeginPath", begin_path as usize),
         ("CGContextMoveToPoint", move_to_point as usize),
@@ -785,5 +829,50 @@ mod tests {
         arc.arc((0.0, 0.0), 1.0, 0.0, -std::f64::consts::FRAC_PI_2, true, &|p| p);
         let end = arc.current().unwrap();
         assert!(end.0.abs() < 1e-9 && (end.1 + 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_closed_context_lets_go_of_its_clip_saved_states_and_path() {
+        let mut c = Canvas::new(std::ptr::null_mut(), 64, 64, 8, 0, Space::Rgb, PREMULTIPLIED_LAST).unwrap();
+        c.state.clip = Some(Arc::new(vec![1.0; 64 * 64]));
+        c.saved.push(c.state.clone());
+        c.path.move_to((1.0, 1.0));
+        c.close();
+        assert!(c.state.clip.is_none());
+        assert!(c.saved.is_empty());
+        assert!(c.path.figures.is_empty());
+    }
+
+    #[test]
+    fn a_data_provider_gives_its_bytes_back_on_the_last_release_only() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        static RELEASED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        extern "C" fn on_release(_info: usize, _data: usize, _size: usize) {
+            RELEASED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let bytes = [255u8; 16];
+        let provider = data_provider_create_with_data(0, bytes.as_ptr(), 16, on_release as usize);
+        assert_eq!(counted::count(provider), Some(1));
+        // CFRetain, an ARC retain and a release message share the one count.
+        data_provider_retain(provider);
+        counted::retain(provider);
+        assert_eq!(counted::count(provider), Some(3));
+        data_provider_release(provider);
+        runtime::send(provider, "release", &[]);
+        assert_eq!(counted::count(provider), Some(1));
+        let picture = image_create(2, 2, 8, 32, 8, space_create_rgb(), PREMULTIPLIED_LAST, provider, std::ptr::null(), false, 0);
+        assert_ne!(picture, 0);
+        data_provider_release(provider);
+        assert_eq!(RELEASED.load(std::sync::atomic::Ordering::Relaxed), 1);
+        data_provider_release(provider);
+        assert_eq!(RELEASED.load(std::sync::atomic::Ordering::Relaxed), 1, "once only");
+        // An autorelease pool releases it like any other counted object.
+        RELEASED.store(0, std::sync::atomic::Ordering::Relaxed);
+        let pooled = data_provider_create_with_data(0, bytes.as_ptr(), 16, on_release as usize);
+        let mark = counted::pool_mark();
+        counted::autorelease(pooled);
+        counted::pool_drain(mark);
+        assert_eq!(RELEASED.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 }

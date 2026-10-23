@@ -10,7 +10,6 @@ use arm32_bridge::runtime::{mem, ArgSource, Ret};
 pub fn register() {
     register_all(host_functions! {
         "CFRetain" => fn(object: Obj) -> Obj;
-        "CFRelease" => fn(object: Obj);
         "CFGetTypeID" => fn(object: Obj) -> Word;
         "CFRunLoopGetCurrent" => fn() -> Obj;
         "CFUUIDCreate" => fn(allocator: Ptr) -> Obj;
@@ -45,6 +44,21 @@ pub fn register() {
         "SCNetworkReachabilityUnscheduleFromRunLoop" => fn(target: Handle, run_loop: Obj, mode: Obj) -> Bool;
         "SCNetworkReachabilitySetDispatchQueue" => fn(target: Handle, queue: Word) -> Bool;
     });
+    // CFRelease(object): a data provider's release callback is guest code
+    // the host runs from inside the release, before this returns.
+    super::super::function(
+        "CFRelease",
+        handler!(|_uc, a| {
+            let object = object_to_host(a.u32());
+            if object != 0 {
+                if let Some(release) = host_fn!("CFRelease": unsafe extern "C" fn(usize)) {
+                    unsafe { release(object) };
+                }
+            }
+            Ret::Void
+        })
+        .unwrap(),
+    );
     // CFNumberGetValue(number, type, out): the long-sized types are 4 bytes
     // here and CGFloat a float, 8 bytes in the host.
     super::super::function(

@@ -715,6 +715,10 @@ impl Canvas {
 
     fn close(&mut self) {
         self.owned = None;
+        // A clip mask is as big as the pixels: nothing of the context's stays.
+        self.state = GraphicsState::new();
+        self.saved = Vec::new();
+        self.path = shapes::Outline::default();
         self.data = std::ptr::null_mut();
         self.width = 0;
         self.height = 0;
@@ -1373,6 +1377,18 @@ extern "C" fn ui_image_write_to_saved_photos_album(picture: Id, target: Id, sele
     })));
 }
 
+/// CFRetain on a data provider counts here (CF objects count with CFRetain);
+/// false for every other object.
+pub fn cf_retain_provider(object: Id) -> bool {
+    shapes::retain_provider(object)
+}
+
+/// CFRelease on a data provider: its bytes go back at the last reference
+/// (CF objects count with CFRelease); false for every other object.
+pub fn cf_release_provider(object: Id) -> bool {
+    shapes::release_provider(object)
+}
+
 pub fn register(r: &mut Registry) {
     let image_class = define_class("CGImage", "NSObject", 16);
     let context = define_class("CGContext", "NSObject", 16);
@@ -1394,6 +1410,7 @@ pub fn register(r: &mut Registry) {
         counted::count(this).unwrap_or(1)
     }
     let ui_image = runtime::class_named("UIImage");
+    counted::count_class(provider);
     for class in [image_class, context, ui_image] {
         counted::count_class(class);
         methods(

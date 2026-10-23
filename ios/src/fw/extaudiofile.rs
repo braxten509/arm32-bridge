@@ -118,12 +118,20 @@ pub fn convert(samples: &[f32], from: u32, from_rate: f64, to: u32, to_rate: f64
     out
 }
 
-/// Whether this layer writes the client format (linear PCM, 8/16/32-bit integers or 32-bit floats).
+/// Whether this layer writes the client format: linear PCM as 32-bit
+/// floats, signed 16/32-bit integers or 8-bit integers (unsigned 16/32-bit
+/// samples are refused, as Apple's converter refuses them).
 fn writable(client: &Asbd) -> bool {
+    let signed = client.flags & FLAG_SIGNED != 0;
     client.format == LINEAR_PCM
         && client.channels > 0
         && client.flags & FLAG_BIG_ENDIAN == 0
-        && matches!((client.flags & FLAG_FLOAT != 0, client.bits), (true, 32) | (false, 8 | 16 | 32))
+        && match (client.flags & FLAG_FLOAT != 0, client.bits) {
+            (true, bits) => bits == 32,
+            (false, 8) => true,
+            (false, 16 | 32) => signed,
+            _ => false,
+        }
 }
 
 /// One sample in the client's format, little-endian.
@@ -150,13 +158,41 @@ impl ExtFile {
         self.converted.len() / self.client.channels.max(1) as usize
     }
 
+    /// The buffers a read fills: one interleaved, or one per channel.
+    fn buffers(&self) -> usize {
+        if self.client.flags & FLAG_NON_INTERLEAVED != 0 { self.client.channels.max(1) as usize } else { 1 }
+    }
+
+    /// Bytes one frame takes in each buffer.
+    fn frame_bytes(&self) -> usize {
+        let sample = self.client.bits.div_ceil(8).max(1) as usize;
+        if self.buffers() == 1 { sample * self.client.channels.max(1) as usize } else { sample }
+    }
+
+    /// Seeks to `frame` of the file (file frames, as Apple counts them);
+    /// past the end reads give nothing.
+    fn seek(&mut self, frame: i64) -> Result<(), i32> {
+        if frame < 0 {
+            return Err(PARAMETER);
+        }
+        let client = (frame as f64 * self.client.rate / self.rate).round() as usize;
+        self.position = client.min(self.frames());
+        Ok(())
+    }
+
+    /// The position in file frames.
+    fn tell(&self) -> i64 {
+        (self.position as f64 * self.rate / self.client.rate).round() as i64
+    }
+
     /// Up to `wanted` frames from the current position, encoded: one block
     /// per buffer (one interleaved block, or one per channel).
     fn read(&mut self, wanted: usize) -> (usize, Vec<Vec<u8>>) {
         let channels = self.client.channels.max(1) as usize;
-        let count = wanted.min(self.frames().saturating_sub(self.position));
-        let frames = &self.converted[self.position * channels..(self.position + count) * channels];
-        self.position += count;
+        let start = self.position.min(self.frames());
+        let count = wanted.min(self.frames() - start);
+        let frames = &self.converted[start * channels..(start + count) * channels];
+        self.position = start + count;
         let blocks = if self.client.flags & FLAG_NON_INTERLEAVED != 0 {
             (0..channels)
                 .map(|channel| {
@@ -257,37 +293,52 @@ extern "C" fn set_property(id: usize, property: u32, size: u32, data: *const u8)
 pub const BUFFER_LIST_FIRST: usize = 8;
 pub const BUFFER_SIZE: usize = 16;
 
-/// ExtAudioFileRead(file, *frames, list): fills the list's buffers, sets
-/// their byte counts and *frames (0 at the end).
+/// ExtAudioFileRead(file, *frames, list): fills the list's buffers with the
+/// whole frames they hold (up to *frames), sets their byte counts and
+/// *frames (0 at the end). The list must have one buffer with memory per
+/// interleaved stream (one, or one per channel).
 extern "C" fn read(id: usize, frames: *mut u32, list: *mut u8) -> i32 {
     if frames.is_null() || list.is_null() {
         return PARAMETER;
     }
     let wanted = unsafe { *frames } as usize;
-    let Some((count, blocks)) = with_file(id, |f| f.read(wanted)) else { return PARAMETER };
-    unsafe {
-        let buffers = *(list as *const u32) as usize;
-        for (i, block) in blocks.iter().enumerate().take(buffers) {
-            let buffer = list.add(BUFFER_LIST_FIRST + i * BUFFER_SIZE);
-            let room = *(buffer.add(4) as *const u32) as usize;
-            let data = *(buffer.add(8) as *const *mut u8);
-            let length = block.len().min(room);
-            if !data.is_null() {
-                std::ptr::copy_nonoverlapping(block.as_ptr(), data, length);
-            }
-            *(buffer.add(4) as *mut u32) = length as u32;
+    let buffer = |i: usize| unsafe { list.add(BUFFER_LIST_FIRST + i * BUFFER_SIZE) };
+    let count = unsafe { *(list as *const u32) } as usize;
+    let rooms: Vec<(usize, *mut u8)> = (0..count).map(|i| unsafe { (*(buffer(i).add(4) as *const u32) as usize, *(buffer(i).add(8) as *const *mut u8)) }).collect();
+    let result = with_file(id, |f| {
+        if rooms.len() != f.buffers() || rooms.iter().any(|(_, data)| data.is_null()) {
+            return Err(PARAMETER);
         }
-        *frames = count as u32;
+        let fit = rooms.iter().map(|(room, _)| room / f.frame_bytes()).min().unwrap_or(0);
+        Ok(f.read(wanted.min(fit)))
+    });
+    let (read, blocks) = match result {
+        Some(Ok(done)) => done,
+        Some(Err(status)) => return status,
+        None => return PARAMETER,
+    };
+    for (i, (block, (_, data))) in blocks.iter().zip(&rooms).enumerate() {
+        unsafe {
+            std::ptr::copy_nonoverlapping(block.as_ptr(), *data, block.len());
+            *(buffer(i).add(4) as *mut u32) = block.len() as u32;
+        }
     }
+    unsafe { *frames = read as u32 };
     0
 }
 
+/// ExtAudioFileSeek(file, frame): `frame` counts the file's frames.
 extern "C" fn seek(id: usize, frame: i64) -> i32 {
-    with_file(id, |f| f.position = frame.max(0) as usize).map_or(PARAMETER, |_| 0)
+    match with_file(id, |f| f.seek(frame)) {
+        Some(Ok(())) => 0,
+        Some(Err(status)) => status,
+        None => PARAMETER,
+    }
 }
 
+/// ExtAudioFileTell(file, *frame): the position in the file's frames.
 extern "C" fn tell(id: usize, out: *mut i64) -> i32 {
-    match with_file(id, |f| f.position) {
+    match with_file(id, |f| f.tell()) {
         Some(position) if !out.is_null() => {
             unsafe { *out = position as i64 };
             0
@@ -325,5 +376,86 @@ mod tests {
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0], [0x00, 0x40, 0xff, 0x7f]);
         assert_eq!(file.read(5).0, 0, "nothing left");
+    }
+
+    /// An open file (as ExtAudioFileOpenURL makes) holding these frames.
+    fn add(rate: f64, channels: u32, decoded: Vec<f32>) -> usize {
+        let client = file_format(rate, channels);
+        let file = ExtFile { rate, channels, converted: decoded.clone(), decoded, client, position: 0 };
+        let id = crate::symbols::leak(0u64);
+        FILES.lock().unwrap().get_or_insert_with(HashMap::new).insert(id, file);
+        id
+    }
+
+    /// Reads up to `wanted` frames into one buffer of `room` bytes: (status, frames, bytes, data).
+    fn read_into(id: usize, wanted: u32, room: u32) -> (i32, u32, u32, Vec<u8>) {
+        let mut data = vec![0u8; room as usize];
+        let mut list = [0u64; 3];
+        let bytes = list.as_mut_ptr() as *mut u8;
+        unsafe {
+            *(bytes as *mut u32) = 1;
+            *(bytes.add(8) as *mut u32) = 1;
+            *(bytes.add(12) as *mut u32) = room;
+            *(bytes.add(16) as *mut *mut u8) = data.as_mut_ptr();
+        }
+        let mut frames = wanted;
+        let status = read(id, &mut frames, bytes);
+        (status, frames, unsafe { *(bytes.add(12) as *const u32) }, data)
+    }
+
+    fn set_client(id: usize, client: Asbd) -> i32 {
+        set_property(id, CLIENT_DATA_FORMAT, 40, asbd_bytes(&client).as_ptr())
+    }
+
+    #[test]
+    fn reads_past_the_end_give_no_frames() {
+        let id = add(100.0, 1, vec![0.25; 10]);
+        assert_eq!(seek(id, 11), 0);
+        assert_eq!(read_into(id, 5, 64).1, 0);
+        assert_eq!(seek(id, 10), 0);
+        assert_eq!(read_into(id, 5, 64).1, 0);
+    }
+
+    #[test]
+    fn seek_and_tell_count_file_frames() {
+        // 2 s at 22050 Hz, read at 44100 Hz: file frame 22050 is 1.0 s in.
+        let ramp: Vec<f32> = (0..44100).map(|i| i as f32 / 44100.0).collect();
+        let id = add(22050.0, 1, ramp);
+        assert_eq!(set_client(id, crate::fw::audiofile::pcm(44100.0, 1, 32, true, false)), 0);
+        assert_eq!(seek(id, 22050), 0);
+        let mut at = 0i64;
+        assert_eq!(tell(id, &mut at), 0);
+        assert_eq!(at, 22050);
+        let (_, frames, _, data) = read_into(id, 1, 4);
+        assert_eq!(frames, 1);
+        assert!((f32::from_le_bytes(data[..4].try_into().unwrap()) - 0.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn reads_stop_at_what_the_buffers_hold() {
+        let id = add(100.0, 1, vec![0.0; 100]);
+        // Room for 10 16-bit frames out of the 100 asked for.
+        let (status, frames, bytes, _) = read_into(id, 100, 20);
+        assert_eq!((status, frames, bytes), (0, 10, 20));
+        let mut at = 0i64;
+        tell(id, &mut at);
+        assert_eq!(at, 10);
+        // A buffer without memory is refused.
+        let mut list = [0u64; 3];
+        unsafe { *(list.as_mut_ptr() as *mut u32) = 1 };
+        let mut wanted = 4;
+        assert_eq!(read(id, &mut wanted, list.as_mut_ptr() as *mut u8), PARAMETER);
+    }
+
+    #[test]
+    fn unsigned_wide_samples_are_refused() {
+        let id = add(100.0, 1, vec![0.0; 4]);
+        let mut client = crate::fw::audiofile::pcm(100.0, 1, 16, false, false);
+        client.flags &= !FLAG_SIGNED;
+        assert_eq!(set_client(id, client), FORMAT_UNSUPPORTED);
+        client.bits = 32;
+        assert_eq!(set_client(id, client), FORMAT_UNSUPPORTED);
+        // 8-bit samples are unsigned in WAV files and stay allowed.
+        assert_eq!(set_client(id, crate::fw::audiofile::pcm(100.0, 1, 8, false, false)), 0);
     }
 }
