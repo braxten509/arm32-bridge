@@ -67,6 +67,7 @@ mod crypto;
 pub mod fw;
 mod libsystem;
 mod locale;
+pub mod objc;
 #[cfg(test)]
 mod tests;
 
@@ -76,13 +77,23 @@ use arm32_bridge::runtime::{self, Handler, Uc};
 
 pub use arm32_bridge::runtime::{mem as guest_memory, Arg, ArgSource, Args, Ret};
 
+#[cfg(test)]
+thread_local! {
+    /// Every (kind, name) registered on this thread, for the duplicate test.
+    static REGISTERED: std::cell::RefCell<Vec<(&'static str, String)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Registers C function `name` (see the module notes).
 pub fn function(name: &str, handler: Handler) {
+    #[cfg(test)]
+    REGISTERED.with(|names| names.borrow_mut().push(("function", name.to_string())));
     ios32::register_function(name, handler);
 }
 
 /// Registers data import `name`: `make` returns the guest address of its object.
 pub fn data(name: &str, make: impl Fn() -> u32 + Send + Sync + 'static) {
+    #[cfg(test)]
+    REGISTERED.with(|names| names.borrow_mut().push(("data", name.to_string())));
     ios32::register_data(name, Box::new(make));
 }
 
@@ -155,6 +166,7 @@ pub fn register_all() {
     fw::register();
     locale::register();
     crypto::register();
+    objc::wire::register();
 }
 
 /// libc++, libc++abi and the SjLj unwinder for Apple's armv7 ABI
@@ -198,6 +210,7 @@ pub fn run(app_dir: &str, program_path: &str) -> Result<(), String> {
     mem::set_layout(program.layout.clone())?;
     runtime::set_platform(&ios32::APPLE32)?;
     register_all();
+    objc::wire::register_program(&program)?;
     ios32::set_keep_going(env_on("IOS_KEEP_GOING") || crate::trap::KEEP_GOING.load(std::sync::atomic::Ordering::Relaxed));
     runtime::init(false);
     let _gil = runtime::hold_gil();
@@ -205,6 +218,7 @@ pub fn run(app_dir: &str, program_path: &str) -> Result<(), String> {
     arm32_bridge::elf::open_built_in(uc, "libz.so")?;
     open_cxx_library(uc)?;
     let loaded = ios32::load(&program)?;
+    objc::wire::install_program()?;
     let header = program.image.header_address().unwrap_or(0).wrapping_add(program.plan.slide);
     let _ = IMAGE.set((header, program.plan.slide, program_path.to_string()));
     crate::log!(
@@ -231,7 +245,7 @@ pub fn run(app_dir: &str, program_path: &str) -> Result<(), String> {
     }
     let start = ios32::start_state(uc, &program, program_path)?;
     crate::log!("32-bit start: {} at {:#010x} ({})", start.kind, start.pc & !1, if start.pc & 1 == 1 { "Thumb" } else { "ARM" });
-    let result = ios32::run_initializers(uc, &program, &start).and_then(|count| {
+    let result = objc::wire::run_loads().and_then(|_| ios32::run_initializers(uc, &program, &start)).and_then(|count| {
         crate::log!("32-bit start-up functions run: {count}");
         runtime::start_guest(uc, start.pc, &start.registers, start.sp)
     });

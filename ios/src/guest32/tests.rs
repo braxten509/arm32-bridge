@@ -360,3 +360,21 @@ fn statically_initialized_mutexes_work() {
     assert_eq!(call("pthread_mutex_trylock", [normal, 0, 0, 0], &[]).0, 16);
     assert_eq!(call("pthread_mutex_unlock", [normal, 0, 0, 0], &[]).0, 0);
 }
+
+/// Each name is registered once across all modules: a second registration
+/// silently replaces the first, so the winner would depend on the order in
+/// `register_all`.
+#[test]
+fn register_all_names_each_function_and_data_once() {
+    setup();
+    super::REGISTERED.with(|names| names.borrow_mut().clear());
+    super::register_all();
+    let names = super::REGISTERED.with(|names| std::mem::take(&mut *names.borrow_mut()));
+    assert!(names.len() > 100, "registrations were not recorded");
+    let mut seen = std::collections::HashSet::new();
+    let mut twice: Vec<String> =
+        names.iter().filter(|(_, name)| !seen.insert(name.as_str())).map(|(kind, name)| format!("{kind} {name}")).collect();
+    twice.sort();
+    twice.dedup();
+    assert!(twice.is_empty(), "registered more than once: {twice:?}");
+}
