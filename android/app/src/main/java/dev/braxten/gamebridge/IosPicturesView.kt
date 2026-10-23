@@ -77,24 +77,11 @@ class IosPicturesView(context: Context) : View(context) {
             canvas.scale(scale, scale)
             canvas.clipRect(picture.clip)
             canvas.concat(picture.place)
-            when (picture.mode) {
-                0 -> canvas.drawBitmap(bitmap, source, area, paint)
-                1, 2 -> {
-                    // Fit inside, or fill and crop, keeping the picture's shape.
-                    val ratio = if (picture.mode == 1) minOf(area.width() / bitmap.width, area.height() / bitmap.height)
-                        else maxOf(area.width() / bitmap.width, area.height() / bitmap.height)
-                    val w = bitmap.width * ratio
-                    val h = bitmap.height * ratio
-                    canvas.clipRect(area)
-                    canvas.drawBitmap(bitmap, source, RectF(area.centerX() - w / 2, area.centerY() - h / 2, area.centerX() + w / 2, area.centerY() + h / 2), paint)
-                }
-                else -> {
-                    // Its own size, in the middle.
-                    val w = picture.width
-                    val h = picture.height
-                    canvas.drawBitmap(bitmap, source, RectF(area.centerX() - w / 2, area.centerY() - h / 2, area.centerX() + w / 2, area.centerY() + h / 2), paint)
-                }
-            }
+            // Fit inside, or fill and crop, keep the picture's shape (by its pixels); the rest place it by its points.
+            val (w, h) = if (picture.mode == 1 || picture.mode == 2) bitmap.width.toFloat() to bitmap.height.toFloat() else picture.width to picture.height
+            val (l, t, r, b) = ContentMode.place(picture.mode, area.width(), area.height(), w, h).toList()
+            if (picture.mode == 2) canvas.clipRect(area)
+            canvas.drawBitmap(bitmap, source, RectF(area.left + l, area.top + t, area.left + r, area.top + b), paint)
             canvas.restore()
         }
         canvas.restore()
