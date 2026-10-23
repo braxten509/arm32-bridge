@@ -155,13 +155,13 @@ fn payment_for(identifier: &str) -> Id {
 
 /// A transaction for `payment`'s product: purchased or restored ones carry
 /// the original purchase and an empty receipt; failed ones the error.
+/// `downloads` stays nil (no hosted content), as Apple answers.
 fn transaction(identifier: &str, state: isize, payment: Id) -> Id {
     let now = crate::fw::misc::now_since_2001();
     let mut values = vec![
         ("payment", payment),
         ("transactionState", state as Id),
         ("transactionDate", crate::fw::misc::date(now)),
-        ("downloads", collections::array_from(&[])),
     ];
     if state == FAILED {
         let error = crate::fw::misc::error("SKErrorDomain", SK_ERROR_UNKNOWN, "Cannot connect to iTunes Store");
@@ -175,7 +175,6 @@ fn transaction(identifier: &str, state: isize, payment: Id) -> Id {
                 ("transactionIdentifier", string::make(&original_number(identifier))),
                 ("transactionDate", crate::fw::misc::date(now)),
                 ("transactionReceipt", crate::fw::data::make(&[])),
-                ("downloads", collections::array_from(&[])),
             ],
         );
         values.extend([
@@ -192,6 +191,11 @@ struct Queue {
     observers: Vec<Id>,
     /// Transactions the game hasn't finished yet.
     unfinished: Vec<Id>,
+    /// (observer, transaction) pairs already told; a transaction never
+    /// changes here, so each observer hears it once.
+    told: Vec<(Id, Id)>,
+    /// A restore whose end no observer has heard yet.
+    restore_pending: bool,
 }
 
 static QUEUES: Mutex<Option<HashMap<Id, Queue>>> = Mutex::new(None);
@@ -200,17 +204,52 @@ fn with_queue<T>(queue: Id, f: impl FnOnce(&mut Queue) -> T) -> T {
     f(QUEUES.lock().unwrap().get_or_insert_with(HashMap::new).entry(queue).or_default())
 }
 
-/// Tells the queue's observers (those there when it runs, on the main run
-/// loop as StoreKit does) about `transactions`, then sends `then`.
-fn tell_later(queue: Id, only: Option<Id>, message: &'static str, transactions: Vec<Id>, then: Option<&'static str>) {
+fn listening(queue: Id, observer: Id) -> bool {
+    with_queue(queue, |q| q.observers.contains(&observer))
+}
+
+/// Brings the queue's observers up to date on the main run loop, as
+/// StoreKit does: each hears the unfinished transactions (as they were when
+/// this runs) it hasn't heard yet, then the end of a waiting restore. One
+/// that stops listening meanwhile hears nothing more; a restore that ends
+/// with nobody listening waits for the first observer.
+fn tell_later(queue: Id) {
     post(Work::Native(Box::new(move || {
-        let observers = with_queue(queue, |q| q.observers.clone());
-        for observer in observers.into_iter().filter(|&o| only.map_or(true, |only| only == o)) {
-            if !transactions.is_empty() && runtime::responds(observer, message) {
-                runtime::send(observer, message, &[queue, collections::array_from(&transactions)]);
+        let (observers, unfinished, restore_ended) = with_queue(queue, |q| {
+            let restore_ended = q.restore_pending && !q.observers.is_empty();
+            if restore_ended {
+                q.restore_pending = false;
             }
-            if let Some(then) = then.filter(|&then| runtime::responds(observer, then)) {
-                runtime::send(observer, then, &[queue]);
+            (q.observers.clone(), q.unfinished.clone(), restore_ended)
+        });
+        for observer in observers {
+            let news: Vec<Id> = with_queue(queue, |q| {
+                if !q.observers.contains(&observer) {
+                    return Vec::new();
+                }
+                let news: Vec<Id> = unfinished.iter().copied().filter(|&t| !q.told.contains(&(observer, t))).collect();
+                q.told.extend(news.iter().map(|&t| (observer, t)));
+                news
+            });
+            let updated = "paymentQueue:updatedTransactions:";
+            if !news.is_empty() && runtime::responds(observer, updated) {
+                runtime::send(observer, updated, &[queue, collections::array_from(&news)]);
+            }
+            let finished = "paymentQueueRestoreCompletedTransactionsFinished:";
+            if restore_ended && listening(queue, observer) && runtime::responds(observer, finished) {
+                runtime::send(observer, finished, &[queue]);
+            }
+        }
+    })));
+}
+
+/// paymentQueue:removedTransactions: for the observers still listening.
+fn tell_removed_later(queue: Id, transaction: Id) {
+    post(Work::Native(Box::new(move || {
+        let removed = "paymentQueue:removedTransactions:";
+        for observer in with_queue(queue, |q| q.observers.clone()) {
+            if listening(queue, observer) && runtime::responds(observer, removed) {
+                runtime::send(observer, removed, &[queue, collections::array_from(&[transaction])]);
             }
         }
     })));
@@ -226,30 +265,44 @@ extern "C" fn can_make_payments(_: Class, _: Sel) -> bool {
     !owned().is_empty()
 }
 
-/// -addTransactionObserver: an observer added while transactions wait hears them.
+/// -addTransactionObserver: added once; it hears the transactions waiting
+/// (and a restore that ended with nobody listening).
 extern "C" fn add_observer(this: Id, _: Sel, observer: Id) {
-    let waiting = with_queue(this, |q| {
-        if observer != 0 && !q.observers.contains(&observer) {
-            q.observers.push(observer);
-        }
-        q.unfinished.clone()
-    });
-    if observer != 0 && !waiting.is_empty() {
-        tell_later(this, Some(observer), "paymentQueue:updatedTransactions:", waiting, None);
+    let added = observer != 0
+        && with_queue(this, |q| {
+            let new = !q.observers.contains(&observer);
+            if new {
+                q.observers.push(observer);
+            }
+            new
+        });
+    if added {
+        tell_later(this);
     }
 }
 
+/// -removeTransactionObserver: it hears nothing more; added again, it hears
+/// the waiting transactions again, as on iOS.
 extern "C" fn remove_observer(this: Id, _: Sel, observer: Id) {
-    with_queue(this, |q| q.observers.retain(|&o| o != observer));
+    with_queue(this, |q| {
+        q.observers.retain(|&o| o != observer);
+        q.told.retain(|&(o, _)| o != observer);
+    });
 }
 
 /// -addPayment: an owned product is handed over again (purchased); nothing
 /// else can be bought here (failed, as when the store can't be reached).
+/// The payment is copied first, as StoreKit does, so a mutable one changed
+/// afterwards changes nothing.
 extern "C" fn add_payment(this: Id, _: Sel, payment: Id) {
     if payment == 0 {
         return;
     }
     let identifier = string::get(runtime::send(payment, "productIdentifier", &[]));
+    let copy = payment_for(&identifier);
+    property_set(copy, "quantity", runtime::send(payment, "quantity", &[]) as u64);
+    field_set(copy, "applicationUsername", copied(runtime::send(payment, "applicationUsername", &[])));
+    field_set(copy, "requestData", runtime::send(payment, "requestData", &[]));
     let state = if owned().contains(&identifier) {
         crate::log!("store: game buys {identifier}: owned, so it is handed over again");
         PURCHASED
@@ -257,9 +310,9 @@ extern "C" fn add_payment(this: Id, _: Sel, payment: Id) {
         crate::log!("store: game buys {identifier}: not owned, answered 'cannot connect'");
         FAILED
     };
-    let made = transaction(&identifier, state, payment);
+    let made = transaction(&identifier, state, copy);
     with_queue(this, |q| q.unfinished.push(made));
-    tell_later(this, None, "paymentQueue:updatedTransactions:", vec![made], None);
+    tell_later(this);
 }
 
 /// -restoreCompletedTransactions (also ...WithApplicationUsername:): every
@@ -268,8 +321,11 @@ extern "C" fn restore(this: Id, _: Sel) {
     let owned = owned();
     crate::log!("store: game restores purchases: {} owned ({})", owned.len(), owned.join(", "));
     let made: Vec<Id> = owned.iter().map(|identifier| transaction(identifier, RESTORED, payment_for(identifier))).collect();
-    with_queue(this, |q| q.unfinished.extend(&made));
-    tell_later(this, None, "paymentQueue:updatedTransactions:", made, Some("paymentQueueRestoreCompletedTransactionsFinished:"));
+    with_queue(this, |q| {
+        q.unfinished.extend(&made);
+        q.restore_pending = true;
+    });
+    tell_later(this);
 }
 
 extern "C" fn restore_for_user(this: Id, sel: Sel, _user: Id) {
@@ -280,10 +336,11 @@ extern "C" fn finish_transaction(this: Id, _: Sel, transaction: Id) {
     let was_there = with_queue(this, |q| {
         let before = q.unfinished.len();
         q.unfinished.retain(|&t| t != transaction);
+        q.told.retain(|&(_, t)| t != transaction);
         q.unfinished.len() != before
     });
     if was_there {
-        tell_later(this, None, "paymentQueue:removedTransactions:", vec![transaction], None);
+        tell_removed_later(this, transaction);
     }
 }
 
@@ -350,6 +407,8 @@ extern "C" fn products_request_start(this: Id, sel: Sel) {
         if delegate != 0 && runtime::responds(delegate, "productsRequest:didReceiveResponse:") {
             runtime::send(delegate, "productsRequest:didReceiveResponse:", &[request, response]);
         }
+        // Read again: the game may let go of (or replace) it while answering.
+        let delegate = property_get(request, "delegate").unwrap_or(0) as Id;
         if delegate != 0 && runtime::responds(delegate, "requestDidFinish:") {
             runtime::send(delegate, "requestDidFinish:", &[request]);
         }
@@ -558,6 +617,20 @@ mod tests {
         HEARD.lock().unwrap().push((this, "failed", error));
     }
 
+    /// The rude one finishes what it hears and stops listening at once.
+    extern "C" fn rude_updated(this: Id, _: Sel, queue: Id, transactions: Id) {
+        HEARD.lock().unwrap().push((this, "updated", transactions));
+        for transaction in collections::array_items(transactions) {
+            runtime::send(queue, "finishTransaction:", &[transaction]);
+        }
+        runtime::send(queue, "removeTransactionObserver:", &[this]);
+    }
+    /// ...and lets go of a request as soon as it answers.
+    extern "C" fn rude_response(this: Id, _: Sel, request: Id, response: Id) {
+        HEARD.lock().unwrap().push((this, "response", response));
+        runtime::send(request, "setDelegate:", &[0]);
+    }
+
     /// Sets up the layer, owns two products, and gives a new listener.
     fn start() -> (std::sync::MutexGuard<'static, ()>, Id) {
         let guard = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
@@ -573,6 +646,16 @@ mod tests {
                     ("productsRequest:didReceiveResponse:", heard_response as usize),
                     ("requestDidFinish:", heard_finish as usize),
                     ("request:didFailWithError:", heard_failure as usize),
+                ],
+            );
+            let rude = define_class("StoreTestRude", "NSObject", 8);
+            methods(
+                rude,
+                &[
+                    ("paymentQueue:updatedTransactions:", rude_updated as usize),
+                    ("paymentQueueRestoreCompletedTransactionsFinished:", heard_restore_finished as usize),
+                    ("productsRequest:didReceiveResponse:", rude_response as usize),
+                    ("requestDidFinish:", heard_finish as usize),
                 ],
             );
         });
@@ -614,6 +697,50 @@ mod tests {
         assert!(collections::is_number(price) && collections::number_as_f64(price) == 0.0);
         assert_ne!(runtime::send(product, "priceLocale", &[]), 0);
         assert_eq!(runtime::send(product, "isDownloadable", &[]) & 0xFF, 0);
+
+        // A delegate that lets go of the request while hearing the answer
+        // isn't told it finished.
+        let rude = runtime::alloc_instance(runtime::class_named("StoreTestRude"));
+        let request = runtime::send(runtime::alloc_instance(runtime::class_named("SKProductsRequest")), "initWithProductIdentifiers:", &[asked]);
+        runtime::send(request, "setDelegate:", &[rude]);
+        runtime::send(request, "start", &[]);
+        assert_eq!(heard_by(rude).iter().map(|h| h.0).collect::<Vec<_>>(), ["response"]);
+    }
+
+    #[test]
+    fn observers_hear_each_transaction_once_while_they_listen() {
+        let (_guard, listener) = start();
+        let rude_class = runtime::class_named("StoreTestRude");
+        // The first observer finishes what it hears and leaves; one added
+        // (twice) before the news arrives hears it once, and no replay of
+        // what was finished meanwhile.
+        let queue = runtime::alloc_instance(runtime::class_named("SKPaymentQueue"));
+        let rude = runtime::alloc_instance(rude_class);
+        runtime::send(queue, "addTransactionObserver:", &[rude]);
+        let payment = runtime::send(runtime::class_named("SKPayment"), "paymentWithProductIdentifier:", &[string::make("com.game.dlc1")]);
+        runtime::send(queue, "addPayment:", &[payment]);
+        runtime::send(queue, "addTransactionObserver:", &[listener]);
+        runtime::send(queue, "addTransactionObserver:", &[listener]);
+        assert_eq!(heard_by(listener).iter().map(|h| h.0).collect::<Vec<_>>(), ["updated"]);
+        assert_eq!(heard_by(rude).iter().map(|h| h.0).collect::<Vec<_>>(), ["updated"]);
+        assert!(collections::array_items(runtime::send(queue, "transactions", &[])).is_empty());
+
+        // One that leaves while hearing a restore doesn't hear it finish.
+        let queue = runtime::alloc_instance(runtime::class_named("SKPaymentQueue"));
+        let rude = runtime::alloc_instance(rude_class);
+        runtime::send(queue, "addTransactionObserver:", &[rude]);
+        runtime::send(queue, "restoreCompletedTransactions", &[]);
+        assert_eq!(heard_by(rude).iter().map(|h| h.0).collect::<Vec<_>>(), ["updated"]);
+
+        // A restore nobody heard goes to the first observer that comes.
+        let queue = runtime::alloc_instance(runtime::class_named("SKPaymentQueue"));
+        runtime::send(queue, "restoreCompletedTransactions", &[]);
+        crate::fw::runloop::run_main_loop(Some(0.0));
+        let late = runtime::alloc_instance(runtime::class_named("StoreTestListener"));
+        runtime::send(queue, "addTransactionObserver:", &[late]);
+        let heard = heard_by(late);
+        assert_eq!(heard.iter().map(|h| h.0).collect::<Vec<_>>(), ["updated", "restore finished"]);
+        assert_eq!(collections::array_items(heard[0].1).len(), 2);
     }
 
     #[test]
@@ -650,19 +777,25 @@ mod tests {
         runtime::send(queue, "addTransactionObserver:", &[observer]);
         runtime::send(queue, "addTransactionObserver:", &[gone]);
         runtime::send(queue, "removeTransactionObserver:", &[gone]);
-        let payment_class = runtime::class_named("SKPayment");
-        for product in ["com.game.coins", "com.game.dlc2"] {
-            let payment = runtime::send(payment_class, "paymentWithProductIdentifier:", &[string::make(product)]);
-            runtime::send(queue, "addPayment:", &[payment]);
-        }
+        let coins = runtime::send(runtime::class_named("SKPayment"), "paymentWithProductIdentifier:", &[string::make("com.game.coins")]);
+        runtime::send(queue, "addPayment:", &[coins]);
+        // A mutable payment changed after it was added still buys what it named then.
+        let changed = runtime::send(runtime::alloc_instance(runtime::class_named("SKMutablePayment")), "init", &[]);
+        runtime::send(changed, "setProductIdentifier:", &[string::make("com.game.dlc2")]);
+        runtime::send(queue, "addPayment:", &[changed]);
+        runtime::send(changed, "setProductIdentifier:", &[string::make("com.game.coins")]);
         let heard = heard_by(observer);
-        assert_eq!(heard.iter().map(|h| h.0).collect::<Vec<_>>(), ["updated", "updated"]);
-        let coins = collections::array_items(heard[0].1)[0];
+        assert!(heard.iter().all(|h| h.0 == "updated"));
+        let told: Vec<Id> = heard.iter().flat_map(|h| collections::array_items(h.1)).collect();
+        assert_eq!(told.len(), 2);
+        let coins = told[0];
         assert_eq!((product_of(coins).as_str(), runtime::send(coins, "transactionState", &[])), ("com.game.coins", 2), "failed");
         let error = runtime::send(coins, "error", &[]);
         assert_eq!(string::get(runtime::send(error, "domain", &[])), "SKErrorDomain");
-        let map = collections::array_items(heard[1].1)[0];
+        let map = told[1];
         assert_eq!((product_of(map).as_str(), runtime::send(map, "transactionState", &[])), ("com.game.dlc2", 1), "purchased");
+        // No hosted content: nil, as Apple answers.
+        assert_eq!(runtime::send(map, "downloads", &[]), 0);
         assert!(heard_by(gone).is_empty(), "a removed observer hears nothing");
         // Owning nothing: no payments, as before.
         set_owned(parse_owned("# nothing yet\n"));
