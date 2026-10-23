@@ -69,7 +69,7 @@ mod libsystem;
 mod locale;
 pub mod objc;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use arm32_bridge::ios32;
 use arm32_bridge::mem;
@@ -217,6 +217,7 @@ pub fn run(app_dir: &str, program_path: &str) -> Result<(), String> {
     let uc = runtime::engine();
     arm32_bridge::elf::open_built_in(uc, "libz.so")?;
     open_cxx_library(uc)?;
+    objc::exceptions::setup(uc)?;
     let loaded = ios32::load(&program)?;
     objc::wire::install_program()?;
     let header = program.image.header_address().unwrap_or(0).wrapping_add(program.plan.slide);

@@ -8,13 +8,7 @@ use arm32_bridge::ios32;
 use arm32_bridge::runtime::{self, mem, Args, GuestCpu};
 
 fn setup() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        crate::run::setup();
-        let _ = runtime::set_platform(&ios32::APPLE32);
-        crate::guest32::register_all();
-        runtime::init(false);
-    });
+    crate::guest32::tests::setup();
 }
 
 fn alloc(size: u32) -> u32 {

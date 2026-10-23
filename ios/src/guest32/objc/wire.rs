@@ -5,7 +5,7 @@
 
 use super::bridge::{dispatch_from_host, install, is_host_object, run_loads as run_guest_loads, Bridge, GuestSide, Special};
 use super::functions::{call_function, functions, Ctx, HOST_FUNCTIONS};
-use super::mirror;
+use super::{exceptions, mirror};
 use arm32_bridge::ios32::Program;
 use arm32_bridge::runtime::{self, ArgSource, Args, Ret, Uc};
 use guest32_image::{read_objc, ImageMemory, ObjcMetadata32, ObjcSections};
@@ -60,6 +60,12 @@ impl GuestSide for Translator {
 
 fn bridge() -> Option<&'static Mutex<Bridge>> {
     BRIDGE.get()
+}
+
+/// The runner's bridge for tests: one with no game classes.
+#[cfg(test)]
+pub fn test_bridge() -> &'static Mutex<Bridge> {
+    BRIDGE.get_or_init(|| Mutex::new(Bridge::new(&ObjcMetadata32::default()).unwrap()))
 }
 
 /// Runs `f` with this handler's engine remembered for nested guest calls.
@@ -128,12 +134,48 @@ fn ui_application_main(uc: &mut Uc, args: &mut Args) -> Ret {
     Ret::U32(result.x[0] as u32)
 }
 
+/// Runs an engine-level handler with a bridge context (nested guest calls
+/// from the bridge use this handler's engine).
+fn with_context(uc: &mut Uc, work: impl FnOnce(&mut Uc, &Ctx) -> Ret) -> Ret {
+    let Some(bridge) = bridge() else {
+        let name = uc.get_data().current_call;
+        runtime::stop_with_fault(uc, format!("{name} called before the Objective-C bridge was set up"));
+        return Ret::Void;
+    };
+    let engine = uc as *mut Uc;
+    with_engine(uc, || work(unsafe { &mut *engine }, &Ctx { bridge, g: &Translator }))
+}
+
+fn exception_throw(uc: &mut Uc, args: &mut Args) -> Ret {
+    let object = args.u32();
+    with_context(uc, |uc, c| exceptions::throw(uc, c, object))
+}
+
+fn exception_do_catch(uc: &mut Uc, args: &mut Args) -> Ret {
+    let (catch_type, thrown_type, adjusted) = (args.u32(), args.u32(), args.u32());
+    with_context(uc, |_, c| Ret::U32(u32::from(exceptions::do_catch(c, catch_type, thrown_type, adjusted))))
+}
+
+fn exception_terminate(uc: &mut Uc, _: &mut Args) -> Ret {
+    with_context(uc, exceptions::terminate)
+}
+
 /// Registers the Objective-C runtime functions (before loading).
 pub fn register() {
     for name in functions().iter().map(|f| f.0).chain(HOST_FUNCTIONS.iter().map(|f| f.0)) {
         super::super::function(name, objc_handler);
     }
     super::super::function("UIApplicationMain", ui_application_main);
+    super::super::function(exceptions::THROW, exception_throw);
+    super::super::function(exceptions::ANSWER_FALSE, |_, _| Ret::U32(0));
+    super::super::function(exceptions::DO_CATCH, exception_do_catch);
+    super::super::function(exceptions::TERMINATE, exception_terminate);
+    super::super::data("objc_ehtype_vtable", exceptions::vtable);
+    super::super::data("OBJC_EHTYPE_id", exceptions::id_type);
+    super::super::data("OBJC_EHTYPE_$_NSException", || {
+        exceptions::framework_type("NSException", with_bridge(|b| b.framework_class(&Translator, "NSException").0))
+    });
+    super::super::data("_dispatch_main_q", super::dispatch::main_queue);
 }
 
 /// Reads the program's Objective-C metadata and registers the data its
@@ -207,8 +249,8 @@ pub fn register_program(program: &Program) -> Result<(), String> {
             variable
         });
     }
-    // Exception type records and the empty method cache: read, never written.
-    for symbol in ["_objc_empty_cache", "_objc_empty_vtable", "OBJC_EHTYPE_id", "OBJC_EHTYPE_$_NSException"] {
+    // The empty method cache: read, never written.
+    for symbol in ["_objc_empty_cache", "_objc_empty_vtable"] {
         super::super::data_words(symbol, vec![0; 4]);
     }
     Ok(())

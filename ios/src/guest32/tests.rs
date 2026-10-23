@@ -6,9 +6,12 @@ use super::libsystem::{RUNE_ALPHA, RUNE_LOWER, RUNE_LOWER_MAP, RUNE_TYPES, RUNE_
 use arm32_bridge::ios32;
 use arm32_bridge::runtime::{self, mem, ArgSource, Args, GuestCpu};
 
-fn setup() {
+/// The host layer's symbols and the 32-bit layer's names, registered once
+/// for every 32-bit test module.
+pub(crate) fn setup() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
+        crate::run::setup();
         let _ = runtime::set_platform(&ios32::APPLE32);
         super::register_all();
         runtime::init(false);
@@ -254,7 +257,9 @@ fn cxx() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let _gil = runtime::hold_gil();
-        super::open_cxx_library(runtime::engine()).expect("the C++ runtime loads");
+        let uc = runtime::engine();
+        super::open_cxx_library(uc).expect("the C++ runtime loads");
+        super::objc::exceptions::setup(uc).expect("Objective-C exceptions set up");
     });
 }
 
@@ -377,4 +382,141 @@ fn register_all_names_each_function_and_data_once() {
     twice.sort();
     twice.dedup();
     assert!(twice.is_empty(), "registered more than once: {twice:?}");
+}
+
+// ----- Objective-C exceptions and dispatch queues -----
+
+/// A host NSException's guest object, through the runner's bridge.
+fn guest_exception(name: &str, reason: &str) -> u32 {
+    use crate::fw::string::make;
+    let class = crate::objc::runtime::class_named("NSException");
+    let host = crate::objc::runtime::send(class, "exceptionWithName:reason:userInfo:", &[make(name), make(reason), 0]);
+    super::objc::wire::test_bridge().lock().unwrap().guest_object(&super::objc::wire::Translator, host).unwrap()
+}
+
+#[test]
+fn an_uncaught_objc_exception_runs_the_games_handler_then_stops() {
+    static HANDLED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    fn handler(_uc: &mut runtime::Uc, a: &mut Args) -> runtime::Ret {
+        HANDLED.store(a.u32(), std::sync::atomic::Ordering::SeqCst);
+        runtime::Ret::Void
+    }
+    cxx();
+    let exception = guest_exception("TestException", "thrown on purpose");
+    ios32::register_function("test_uncaught_handler", handler);
+    let handler = runtime::stub_for("test_uncaught_handler");
+    call("NSSetUncaughtExceptionHandler", [handler, 0, 0, 0], &[]);
+    assert_eq!(call("NSGetUncaughtExceptionHandler", [0; 4], &[]).0, handler);
+    let _gil = runtime::hold_gil();
+    let uc = runtime::engine();
+    // objc_exception_throw goes on into the guest's __cxa_throw, which finds no
+    // catch and calls the terminate handler the runtime installed.
+    let result = runtime::call_guest(uc, runtime::stub_for("objc_exception_throw"), &[exception]);
+    uc.get_data_mut().fault = None;
+    let error = result.expect_err("an uncaught exception stops the program");
+    assert!(error.contains("uncaught Objective-C exception: TestException: thrown on purpose"), "{error}");
+    assert_eq!(HANDLED.load(std::sync::atomic::Ordering::SeqCst), exception, "the game's handler ran first, with the exception");
+}
+
+#[test]
+fn objc_catch_clauses_match_by_class_and_hand_over_the_object() {
+    use super::objc::wire::{test_bridge, Translator};
+    cxx();
+    let exception = guest_exception("Caught", "by class");
+    let class_of = |name: &str| test_bridge().lock().unwrap().framework_class(&Translator, name).0;
+    let memory = mem();
+    let vtable = ios32::data_address("objc_ehtype_vtable").expect("objc_ehtype_vtable") + 8;
+    let type_info = |name: &str, class: u32| {
+        let at = alloc(12);
+        for (i, word) in [vtable, cstring(name), class].iter().enumerate() {
+            memory.write_u32(at + 4 * i as u32, *word);
+        }
+        at
+    };
+    // What objc_exception_throw throws: { object, its type_info }.
+    let record = alloc(16);
+    for (i, word) in [exception, vtable, cstring("NSException"), memory.read_u32(exception)].iter().enumerate() {
+        memory.write_u32(record + 4 * i as u32, *word);
+    }
+    let _gil = runtime::hold_gil();
+    let uc = runtime::engine();
+    // libc++abi asks a catch clause's type_info through its vtable's slot 4
+    // (can_catch), with the thrown type and the thrown object's address.
+    let can_catch = memory.read_u32(vtable + 16);
+    let mut check = |catch_type: u32, thrown_type: u32| {
+        let adjusted = alloc(4);
+        memory.write_u32(adjusted, record);
+        let caught = runtime::call_guest(uc, can_catch, &[catch_type, thrown_type, adjusted]).unwrap() as u32 & 0xff;
+        (caught, memory.read_u32(adjusted))
+    };
+    let thrown = record + 4;
+    assert_eq!(check(ios32::data_address("OBJC_EHTYPE_id").unwrap(), thrown), (1, exception), "@catch (id e) gets the object");
+    assert_eq!(check(ios32::data_address("OBJC_EHTYPE_$_NSException").unwrap(), thrown).0, 1);
+    assert_eq!(check(type_info("NSObject", class_of("NSObject")), thrown).0, 1, "a superclass's clause catches");
+    assert_eq!(check(type_info("NSString", class_of("NSString")), thrown).0, 0, "another class's does not");
+    assert_eq!(check(type_info("NSException", 0), thrown).0, 1, "a clause whose class is unknown matches by name");
+    // Unwinding through @try code: its personality is the C++ one.
+    assert_eq!(guest_export("__objc_personality_v0"), guest_export("__gxx_personality_sj0"));
+    // A C++ exception is not an Objective-C one.
+    let cxx_thrown = guest_export("_ZTISt9exception");
+    assert_eq!(check(ios32::data_address("OBJC_EHTYPE_id").unwrap(), cxx_thrown), (0, record));
+}
+
+#[test]
+fn dispatch_runs_guest_blocks_once_and_in_queue_order() {
+    use super::objc::bridge::{dispatch_from_host, set_block_owner, Bridge, Special};
+    use super::objc::functions::{call_function, Ctx};
+    use super::objc::{mirror, testing::Fake};
+    use std::sync::Mutex;
+    setup();
+    let g = Fake::new();
+    let bridge: &'static Mutex<Bridge> = Box::leak(Box::new(Mutex::new(Bridge::new(&Default::default()).unwrap())));
+    let stack_isa = g.words(&[0; 5]);
+    let malloc_isa = g.words(&[0; 5]);
+    bridge.lock().unwrap().set_special(stack_isa, Special::StackBlock);
+    bridge.lock().unwrap().set_special(malloc_isa, Special::MallocBlock);
+    let _hook = mirror::DISPATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    mirror::set_dispatch(Box::new(move |frame| dispatch_from_host(bridge, g, frame).unwrap()));
+    set_block_owner(g);
+    let ctx = Ctx { bridge, g };
+    let call = |name: &str, words: &[u32]| {
+        let w = |i: u32| words.get(i as usize).copied().unwrap_or(0);
+        call_function(&ctx, name, &w).unwrap() as u32
+    };
+    // void (^)(void) blocks capturing a number; each run notes it and its thread.
+    let runs: &'static Mutex<Vec<(u32, std::thread::ThreadId)>> = Box::leak(Box::new(Mutex::new(Vec::new())));
+    g.code(0x5001, move |w| {
+        runs.lock().unwrap().push((g.u32_at(w[0] + 20), std::thread::current().id()));
+        0
+    });
+    let descriptor = g.words(&[0, 24, g.text("v4@?0")]);
+    let block = |n: u32| g.words(&[stack_isa, 1 << 30, 0, 0x5001, descriptor, n]);
+    let numbers = || runs.lock().unwrap().iter().map(|r| r.0).collect::<Vec<_>>();
+
+    // dispatch_once: Apple's 32-bit predicate is one word (the next stays as it was).
+    let predicate = g.words(&[0, 0x1234_5678]);
+    call("dispatch_once", &[predicate, block(1)]);
+    call("dispatch_once", &[predicate, block(2)]);
+    assert_eq!(numbers(), [1]);
+    assert_eq!((g.u32_at(predicate), g.u32_at(predicate + 4)), (!0, 0x1234_5678));
+
+    // A serial queue runs async blocks in order on its own thread; sync waits its turn.
+    let queue = call("dispatch_queue_create", &[g.text("test"), 0]);
+    assert_ne!(queue, 0);
+    for n in 10..13 {
+        call("dispatch_async", &[queue, block(n)]);
+    }
+    call("dispatch_sync", &[queue, block(13)]);
+    assert_eq!(numbers(), [1, 10, 11, 12, 13]);
+    let me = std::thread::current().id();
+    assert!(runs.lock().unwrap()[1..4].iter().all(|r| r.1 != me), "async blocks ran on the queue's thread");
+    call("dispatch_release", &[queue]);
+    // A global queue's sync block runs before dispatch_sync returns.
+    let global = call("dispatch_get_global_queue", &[0, 0]);
+    assert_ne!(global, 0);
+    call("dispatch_sync", &[global, block(20)]);
+    assert_eq!(numbers().last(), Some(&20));
+    // dispatch_get_main_queue() is &_dispatch_main_q: that address is the host's main queue.
+    let main = ios32::data_address("_dispatch_main_q").expect("_dispatch_main_q");
+    assert_eq!(super::fw::handle_to_host(main), crate::symbols::lookup("__dispatch_main_q").unwrap().0);
 }

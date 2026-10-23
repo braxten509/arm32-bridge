@@ -12,9 +12,11 @@ pub mod classes;
 #[cfg(test)]
 mod classes_tests;
 pub mod convert;
+pub mod dispatch;
 #[cfg(test)]
 mod convert_tests;
 pub mod encoding;
+pub mod exceptions;
 pub mod functions;
 #[cfg(test)]
 mod functions_tests;

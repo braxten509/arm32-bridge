@@ -189,6 +189,15 @@ fn end_wrapper_scope(g: &dyn GuestSide, mark: usize) -> Result<(), String> {
     Ok(())
 }
 
+/// Runs `work` as one bridge call: the block wrappers it makes go (with
+/// their guest references) when it ends. Call without the bridge lock held.
+pub fn in_wrapper_scope<R>(g: &dyn GuestSide, work: impl FnOnce() -> Result<R, String>) -> Result<R, String> {
+    let mark = wrapper_mark();
+    let result = work();
+    end_wrapper_scope(g, mark)?;
+    result
+}
+
 pub struct Bridge {
     pub classes: GuestClasses,
     to_host: HashMap<u32, usize>,

@@ -34,20 +34,20 @@ impl Ctx<'_> {
     fn lock(&self) -> MutexGuard<'_, Bridge> {
         self.bridge.lock().unwrap_or_else(|e| e.into_inner())
     }
-    fn word(&self, addr: u32) -> u32 {
+    pub(super) fn word(&self, addr: u32) -> u32 {
         u32::from_le_bytes(self.g.read(addr, 4).try_into().unwrap())
     }
-    fn set_word(&self, addr: u32, value: u32) {
+    pub(super) fn set_word(&self, addr: u32, value: u32) {
         self.g.write(addr, &value.to_le_bytes())
     }
-    fn cstr(&self, addr: u32) -> String {
+    pub(super) fn cstr(&self, addr: u32) -> String {
         if addr == 0 {
             return String::new();
         }
         unsafe { runtime::cstr(self.g.host_address(addr)) }
     }
     /// One guest C string per text (shared with selector names).
-    fn name(&self, text: &str) -> u32 {
+    pub(super) fn name(&self, text: &str) -> u32 {
         self.lock().guest_selector(self.g, text)
     }
     /// Sends `name` to a guest object from the bridge itself.
@@ -133,11 +133,20 @@ pub fn functions() -> &'static [(&'static str, ObjcFn)] {
         ("objc_sync_enter", |c, w| host_object_call(c, "_objc_sync_enter", w(0))),
         ("objc_sync_exit", |c, w| host_object_call(c, "_objc_sync_exit", w(0))),
         ("objc_enumerationMutation", |_, _| Err("a collection changed while it was being enumerated".into())),
-        ("objc_exception_throw", exception_throw),
-        ("objc_exception_rethrow", |_, _| Err("objc_exception_rethrow: Objective-C exceptions are not supported yet".into())),
-        ("objc_begin_catch", |_, _| Err("objc_begin_catch: Objective-C exceptions are not supported yet".into())),
-        ("objc_end_catch", |_, _| Err("objc_end_catch: Objective-C exceptions are not supported yet".into())),
-        ("objc_terminate", |_, _| Err("objc_terminate called".into())),
+        // objc_exception_throw needs the engine (exceptions.rs, registered by
+        // wire.rs); catching and rethrowing bind to the guest C++ runtime.
+        ("NSSetUncaughtExceptionHandler", |_, w| {
+            super::exceptions::set_uncaught_handler(w(0));
+            ok(0)
+        }),
+        ("NSGetUncaughtExceptionHandler", |_, _| ok(super::exceptions::uncaught_handler())),
+        ("dispatch_once", super::dispatch::once),
+        ("dispatch_async", super::dispatch::run_async),
+        ("dispatch_sync", super::dispatch::run_sync),
+        ("dispatch_get_global_queue", super::dispatch::global_queue),
+        ("dispatch_queue_create", super::dispatch::queue_create),
+        ("dispatch_release", |_, _| ok(0)),
+        ("dispatch_retain", |_, _| ok(0)),
         ("objc_getAssociatedObject", |_, w| ok(with_associated(|m| m.get(&(w(0), w(1))).map_or(0, |v| v.0)))),
         ("objc_setAssociatedObject", set_associated),
         ("objc_removeAssociatedObjects", |c, w| {
@@ -336,11 +345,11 @@ fn host_object_call(c: &Ctx, name: &str, object: u32) -> Result<u64, String> {
     ok(super::mirror::call_host(f, &args).x[0] as u32)
 }
 
-fn exception_throw(c: &Ctx, w: Words) -> Result<u64, String> {
-    let exception = w(0);
+/// "Name: reason" of a guest exception object.
+pub(super) fn describe_exception(c: &Ctx, exception: u32) -> String {
     let name = c.send(exception, "name", &[]).ok().and_then(|n| c.lock().object_text(c.g, n)).unwrap_or_default();
     let reason = c.send(exception, "reason", &[]).ok().and_then(|r| c.lock().object_text(c.g, r)).unwrap_or_default();
-    Err(format!("the game threw an Objective-C exception: {name}: {reason}"))
+    format!("{name}: {reason}")
 }
 
 /// (object, key) -> (value, policy) for objc_setAssociatedObject.
@@ -384,7 +393,7 @@ fn class_named(c: &Ctx, name: &str) -> u32 {
     0
 }
 
-fn class_name(c: &Ctx, class: u32) -> String {
+pub(super) fn class_name(c: &Ctx, class: u32) -> String {
     let b = c.lock();
     if let Some(k) = b.classes.class(class) {
         return k.name.clone();
@@ -398,7 +407,7 @@ fn class_name(c: &Ctx, class: u32) -> String {
     c.cstr(c.word(ro + 16))
 }
 
-fn superclass(c: &Ctx, class: u32) -> u32 {
+pub(super) fn superclass(c: &Ctx, class: u32) -> u32 {
     if class == 0 {
         return 0;
     }
