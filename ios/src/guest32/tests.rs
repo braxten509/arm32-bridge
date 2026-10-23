@@ -217,6 +217,37 @@ fn streaming_cryptor_round_trip() {
     assert_eq!(mem().bytes(decrypted, length as usize), &plain[..]);
 }
 
+#[test]
+fn cryptor_final_measures_the_unpadded_output() {
+    // One plaintext byte, AES-CBC with PKCS7 padding: one 16-byte cipher block.
+    let (key, iv) = (alloc(16), alloc(16));
+    mem().write_bytes(key, &[7; 16]);
+    mem().write_bytes(iv, &[9; 16]);
+    let cipher = crate::fw::crypto::crypt(false, 0, 1, &[7; 16], Some(&[9; 16]), &[0x5A]).unwrap();
+    let input = alloc(16);
+    mem().write_bytes(input, &cipher);
+    let decrypt = || {
+        let reference = alloc(4);
+        assert_eq!(call("CCCryptorCreate", [1, 0, 1, key], &[16, iv, reference]).0, 0);
+        let cryptor = mem().read_u32(reference);
+        let moved = alloc(4);
+        assert_eq!(call("CCCryptorUpdate", [cryptor, input, 16, alloc(16)], &[16, moved]).0, 0);
+        assert_eq!(mem().read_u32(moved), 0, "the block is held back for Final");
+        (cryptor, moved)
+    };
+    // Final with room for the one byte it really gives back.
+    let (cryptor, moved) = decrypt();
+    let out = alloc(4);
+    assert_eq!(call("CCCryptorFinal", [cryptor, out, 1, moved], &[]).0, 0);
+    assert_eq!((mem().read_u32(moved), mem().read_u8(out)), (1, 0x5A));
+    // No room: kCCBufferTooSmall, and the cryptor still has its block for a retry.
+    let (cryptor, moved) = decrypt();
+    assert_eq!(call("CCCryptorFinal", [cryptor, out, 0, moved], &[]).0 as i32, -4301);
+    mem().write_u8(out, 0);
+    assert_eq!(call("CCCryptorFinal", [cryptor, out, 16, moved], &[]).0, 0);
+    assert_eq!((mem().read_u32(moved), mem().read_u8(out)), (1, 0x5A));
+}
+
 /// The C++ runtime loaded once, as `run` loads it (call before holding the GIL).
 fn cxx() {
     setup();

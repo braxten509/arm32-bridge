@@ -86,16 +86,19 @@ pub fn register() {
         "CCCryptorFinal",
         handler!(|uc, a| {
             let (reference, out, available, moved) = (a.u32(), a.u32(), a.u32(), a.u32());
+            // As Apple's: the room is checked against the real output (after
+            // padding is removed); when it is too small the cryptor is left as
+            // it was, so the caller can try again with more.
             let status = with_cryptor(reference, |cryptor| {
-                let room = cryptor.output_length(0, true) as u32;
-                if room > available {
-                    if moved != 0 {
-                        mem().write_u32(moved, room);
+                let mut finished = cryptor.clone();
+                match finished.finish() {
+                    Ok(output) => {
+                        let status = hand_out(&output, out, available, moved);
+                        if status == 0 {
+                            *cryptor = finished;
+                        }
+                        status
                     }
-                    return BUFFER_TOO_SMALL;
-                }
-                match cryptor.finish() {
-                    Ok(output) => hand_out(&output, out, available, moved),
                     Err(status) => status,
                 }
             });

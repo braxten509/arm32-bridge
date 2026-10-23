@@ -283,6 +283,7 @@ const ECB_MODE: u32 = 2;
 const ALGORITHM_NAMES: [&str; 7] = ["AES", "DES", "3DES", "CAST", "RC4", "RC2", "Blowfish"];
 
 /// A block cipher with its key set.
+#[derive(Clone)]
 enum BlockCipher {
     Aes128(aes::Aes128),
     Aes192(aes::Aes192),
@@ -344,6 +345,7 @@ impl BlockCipher {
 
 /// RC4: a key stream XORed over the data (the same both ways), which
 /// carries on from piece to piece.
+#[derive(Clone)]
 struct Rc4 {
     state: Vec<u8>,
     i: u8,
@@ -443,6 +445,7 @@ pub fn crypt(decrypt: bool, algorithm: u32, options: u32, key: &[u8], iv: Option
 
 /// A streaming CCCryptor (CCCryptorCreate / Update / Final): the same
 /// ciphers, modes and padding as `crypt`, fed in pieces.
+#[derive(Clone)]
 pub struct Cryptor {
     decrypt: bool,
     padded: bool,
