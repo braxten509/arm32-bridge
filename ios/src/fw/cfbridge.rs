@@ -260,7 +260,111 @@ extern "C" fn cf_number_get_value(number: Id, kind: isize, out: *mut u8) -> bool
 const CF_VERSION: f64 = 1142.16;
 const FOUNDATION_VERSION: f64 = 1142.14;
 
+/// CFStringCompare: the CFStringCompareFlags are NSStringCompareOptions' values.
+extern "C" fn cf_string_compare(a: Id, b: Id, flags: usize) -> isize {
+    crate::objc::runtime::send(a, "compare:options:", &[b, flags]) as isize
+}
+
+/// A new string (the caller's reference) or NULL when there is no extension.
+extern "C" fn cf_url_copy_path_extension(url: Id) -> Id {
+    let extension = crate::objc::runtime::send(url, "pathExtension", &[]);
+    if extension == 0 || string::get(extension).is_empty() {
+        return 0;
+    }
+    string::make(&string::get(extension))
+}
+
+extern "C" fn cf_string_append_characters(text: Id, characters: *const u16, count: isize) {
+    if characters.is_null() || count <= 0 {
+        return;
+    }
+    let units = unsafe { std::slice::from_raw_parts(characters, count as usize) };
+    let more = string::make(&String::from_utf16_lossy(units));
+    crate::objc::runtime::send(text, "appendString:", &[more]);
+}
+
+/// CFPropertyListCreateFromXMLData(allocator, data, options, &errorString):
+/// any property list format, read by this layer's reader.
+extern "C" fn cf_property_list_create_from_xml_data(_allocator: usize, data: Id, _options: usize, error: *mut Id) -> Id {
+    let bytes = crate::fw::data::bytes(data);
+    match crate::fw::plist::parse(&bytes) {
+        Some(value) => crate::fw::plist::to_object(&value),
+        None => {
+            if !error.is_null() {
+                unsafe { *error = string::make("not a property list") };
+            }
+            0
+        }
+    }
+}
+
+// ----- CFBitVector: bits numbered from the top bit of the first byte -----
+
+static BIT_VECTOR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+fn bit_vector(object: Id) -> Option<&'static std::sync::Mutex<Vec<bool>>> {
+    let class = *BIT_VECTOR.get()?;
+    if object == 0 || crate::objc::runtime::lock().class_of(object) != class {
+        return None;
+    }
+    unsafe { (*((object + 8) as *const *const std::sync::Mutex<Vec<bool>>)).as_ref() }
+}
+
+fn make_bit_vector(bits: Vec<bool>) -> Id {
+    let Some(&class) = BIT_VECTOR.get() else { return 0 };
+    let object = crate::objc::runtime::alloc_instance(class);
+    unsafe { *((object + 8) as *mut *mut std::sync::Mutex<Vec<bool>>) = Box::into_raw(Box::new(std::sync::Mutex::new(bits))) };
+    object
+}
+
+extern "C" fn cf_bit_vector_create(_allocator: usize, bytes: *const u8, count: isize) -> Id {
+    let count = count.max(0) as usize;
+    let bits = (0..count).map(|i| !bytes.is_null() && unsafe { *bytes.add(i / 8) } & (0x80 >> (i % 8)) != 0).collect();
+    make_bit_vector(bits)
+}
+extern "C" fn cf_bit_vector_create_copy(_allocator: usize, vector: Id) -> Id {
+    bit_vector(vector).map_or(0, |v| make_bit_vector(v.lock().unwrap_or_else(|e| e.into_inner()).clone()))
+}
+extern "C" fn cf_bit_vector_create_mutable_copy(allocator: usize, _capacity: isize, vector: Id) -> Id {
+    cf_bit_vector_create_copy(allocator, vector)
+}
+extern "C" fn cf_bit_vector_create_mutable(_allocator: usize, _capacity: isize) -> Id {
+    make_bit_vector(Vec::new())
+}
+extern "C" fn cf_bit_vector_get_count(vector: Id) -> isize {
+    bit_vector(vector).map_or(0, |v| v.lock().unwrap_or_else(|e| e.into_inner()).len() as isize)
+}
+extern "C" fn cf_bit_vector_set_count(vector: Id, count: isize) {
+    if let Some(v) = bit_vector(vector) {
+        v.lock().unwrap_or_else(|e| e.into_inner()).resize(count.max(0) as usize, false);
+    }
+}
+extern "C" fn cf_bit_vector_get_bit_at_index(vector: Id, index: isize) -> u32 {
+    bit_vector(vector).map_or(0, |v| v.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).copied().unwrap_or(false) as u32)
+}
+extern "C" fn cf_bit_vector_set_bit_at_index(vector: Id, index: isize, value: u32) {
+    if let Some(v) = bit_vector(vector) {
+        if let Some(bit) = v.lock().unwrap_or_else(|e| e.into_inner()).get_mut(index as usize) {
+            *bit = value != 0;
+        }
+    }
+}
+
 pub fn register(r: &mut Registry) {
+    let class = crate::fw::object::define_class("__CFBitVector", "NSObject", 16);
+    let _ = BIT_VECTOR.set(class);
+    r.function("CFStringCompare", cf_string_compare as usize);
+    r.function("CFURLCopyPathExtension", cf_url_copy_path_extension as usize);
+    r.function("CFStringAppendCharacters", cf_string_append_characters as usize);
+    r.function("CFPropertyListCreateFromXMLData", cf_property_list_create_from_xml_data as usize);
+    r.function("CFBitVectorCreate", cf_bit_vector_create as usize);
+    r.function("CFBitVectorCreateCopy", cf_bit_vector_create_copy as usize);
+    r.function("CFBitVectorCreateMutable", cf_bit_vector_create_mutable as usize);
+    r.function("CFBitVectorCreateMutableCopy", cf_bit_vector_create_mutable_copy as usize);
+    r.function("CFBitVectorGetCount", cf_bit_vector_get_count as usize);
+    r.function("CFBitVectorSetCount", cf_bit_vector_set_count as usize);
+    r.function("CFBitVectorGetBitAtIndex", cf_bit_vector_get_bit_at_index as usize);
+    r.function("CFBitVectorSetBitAtIndex", cf_bit_vector_set_bit_at_index as usize);
     r.function("CFStringGetCString", cf_string_get_c_string as usize);
     r.function("CFStringGetCStringPtr", cf_string_get_c_string_ptr as usize);
     r.function("CFStringCreateWithCharacters", cf_string_create_with_characters as usize);

@@ -64,6 +64,7 @@
 //! directly to the program's imports of the same name.
 
 mod crypto;
+pub mod fw;
 mod libsystem;
 mod locale;
 pub mod objc;
@@ -154,6 +155,7 @@ pub fn register_all() {
     libsystem::register();
     locale::register();
     crypto::register();
+    fw::register();
     objc::wire::register();
 }
 
