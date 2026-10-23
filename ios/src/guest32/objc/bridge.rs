@@ -131,6 +131,44 @@ thread_local! {
     /// This thread's wrappers made by the bridge, dropped when the bridge
     /// call that made them ends (see end_wrapper_scope).
     static SCOPED_WRAPPERS: std::cell::RefCell<Vec<Box<HostBlock>>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Game objects whose guest form was just made on this thread and whose
+    /// C++ ivars still need constructing (see construct_pending).
+    static UNCONSTRUCTED: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+const CXX_CONSTRUCT: &str = ".cxx_construct";
+const CXX_DESTRUCT: &str = ".cxx_destruct";
+
+/// Apple's object_cxxConstructFromClass for the game objects made since the
+/// last call: each game class's own .cxx_construct, superclass first. Runs
+/// before guest code next sees them (the bridge lock is not held then).
+fn construct_pending(bridge: &Mutex<Bridge>, g: &dyn GuestSide) -> Result<(), String> {
+    loop {
+        let Some(object) = UNCONSTRUCTED.with(|u| u.borrow_mut().pop()) else { return Ok(()) };
+        let (sel, constructors) = {
+            let mut b = lock(bridge);
+            (b.guest_selector(g, CXX_CONSTRUCT), b.own_methods_up(u32_at(g, object), CXX_CONSTRUCT))
+        };
+        for imp in constructors.into_iter().rev() {
+            if g.call(imp, &[object, sel])? as u32 == 0 {
+                crate::log!("32-bit Objective-C: a .cxx_construct of object {object:#x} failed");
+                break;
+            }
+        }
+    }
+}
+
+/// Apple's object_cxxDestructFromClass: each game class's own
+/// .cxx_destruct, subclass first (at the framework's -dealloc).
+fn destruct(bridge: &Mutex<Bridge>, g: &dyn GuestSide, object: u32) -> Result<(), String> {
+    let (sel, destructors) = {
+        let mut b = lock(bridge);
+        (b.guest_selector(g, CXX_DESTRUCT), b.own_methods_up(u32_at(g, object), CXX_DESTRUCT))
+    };
+    for imp in destructors {
+        g.call(imp, &[object, sel])?;
+    }
+    Ok(())
 }
 
 fn live_wrappers<R>(f: impl FnOnce(&mut HashSet<usize>) -> R) -> R {
@@ -343,6 +381,20 @@ impl Bridge {
         self.to_guest.insert(host, guest);
     }
 
+    /// The imps of the game classes' own `sel` methods from `class` up
+    /// through its game superclasses, nearest first (not inherited ones).
+    fn own_methods_up(&self, mut class: u32, sel: &str) -> Vec<u32> {
+        let mut found = Vec::new();
+        while let Some(c) = self.classes.class(class) {
+            found.extend(c.methods.get(sel).map(|m| m.imp));
+            match c.superclass {
+                super::classes::Super::Game(parent) => class = parent,
+                _ => break,
+            }
+        }
+        found
+    }
+
     /// Forgets a game object whose host form was deallocated; frees its guest memory.
     pub fn forget(&mut self, g: &dyn GuestSide, guest: u32) {
         if let Some(host) = self.to_host.remove(&guest) {
@@ -443,6 +495,9 @@ impl Bridge {
                 g.write(object, &vec![0u8; size as usize]);
                 g.write(object, &guest_class.to_le_bytes());
                 self.game_instances.insert(object, ());
+                if !self.own_methods_up(guest_class, CXX_CONSTRUCT).is_empty() {
+                    UNCONSTRUCTED.with(|u| u.borrow_mut().push(object));
+                }
                 object
             }
             None => {
@@ -924,6 +979,13 @@ pub fn send_from_guest(
             Ok(GuestRet { r0: r as u32, r1: (r >> 32) as u32 })
         }
         Target::Host { class, meta, via_super } => {
+            // The framework's -dealloc of a game object: its C++ ivars go first.
+            let game_dealloc = name == "dealloc" && b.classes.class(u32_at(g, receiver)).is_some_and(|c| !c.meta);
+            if game_dealloc {
+                drop(b);
+                destruct(bridge, g, receiver)?;
+                b = lock(bridge);
+            }
             let mark = wrapper_mark();
             let (sig, options) = host_signature(&b, &class, meta, &name)?;
             // The host may keep a block argument: stack blocks move to the heap first.
@@ -973,10 +1035,11 @@ pub fn send_from_guest(
                 ret.x[0] = g.host_address(copy) as u64;
             }
             let result = convert::finish_host_call(call, &ret, &mut Session { bridge: &mut b, g })?;
-            if via_super && name == "dealloc" {
+            if game_dealloc {
                 b.forget(g, receiver);
             }
             drop(b);
+            construct_pending(bridge, g)?;
             // The heap copies made above: a host wrapper holds its own reference.
             let ctx = super::functions::Ctx { bridge, g };
             for (_, copy) in replaced {
@@ -1004,6 +1067,7 @@ pub fn call_host_function(
     let ret = mirror::call_host(address, &call.args);
     let result = convert::finish_host_call(call, &ret, &mut Session { bridge: &mut lock(bridge), g });
     end_wrapper_scope(g, mark)?;
+    construct_pending(bridge, g)?;
     result
 }
 
@@ -1037,6 +1101,7 @@ pub fn dispatch_from_host(bridge: &Mutex<Bridge>, g: &dyn GuestSide, frame: &mut
         let invoke = u32_at(g, block + 12);
         let call = convert::prepare_guest_call(&sig, frame, &mut Session { bridge: &mut b, g })?;
         drop(b);
+        construct_pending(bridge, g)?;
         let r = g.call(invoke, &call.words)?;
         let mut b = lock(bridge);
         return convert::finish_guest_call(call, r as u32, (r >> 32) as u32, frame, &mut Session { bridge: &mut b, g });
@@ -1068,6 +1133,8 @@ pub fn dispatch_from_host(bridge: &Mutex<Bridge>, g: &dyn GuestSide, frame: &mut
     let sig = Signature::parse_method(&types)?;
     let call = convert::prepare_guest_call(&sig, frame, &mut Session { bridge: &mut b, g })?;
     drop(b);
+    // Constructed before its first method runs (-init sent by the host's +new).
+    construct_pending(bridge, g)?;
     let r = g.call(imp, &call.words)?;
     let mut b = lock(bridge);
     convert::finish_guest_call(call, r as u32, (r >> 32) as u32, frame, &mut Session { bridge: &mut b, g })

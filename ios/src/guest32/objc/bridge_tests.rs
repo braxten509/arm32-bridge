@@ -529,3 +529,89 @@ fn framework_classes_are_built_in_guest_memory_with_their_chain() {
     assert_eq!(bridge.lock().unwrap().host_object(proxy), Some(object));
     let _ = fake.text("");
 }
+
+static CXX_EVENTS: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+
+extern "C" fn host_new(class: Class, _: Sel) -> Id {
+    let object = runtime::send(class, "alloc", &[]);
+    runtime::send(object, "init", &[])
+}
+
+extern "C" fn host_dealloc(_: Id, _: Sel) {
+    CXX_EVENTS.lock().unwrap().push("host dealloc");
+}
+
+#[test]
+fn cxx_constructors_run_after_alloc_parents_first_and_destructors_at_dealloc_children_first() {
+    {
+        let mut rt = runtime::lock();
+        let class = rt.define_class("G32HostCxxRoot", 0, 16);
+        let meta = rt.classes[&class].partner;
+        let (alloc, new, dealloc) = (rt.sel("alloc"), rt.sel("new"), rt.sel("dealloc"));
+        rt.add_method(meta, alloc, host_alloc as usize);
+        rt.add_method(meta, new, host_new as usize);
+        rt.add_method(class, dealloc, host_dealloc as usize);
+    }
+    let fake = Fake::new();
+    // G32CxxLeaf : G32CxxBase : G32HostCxxRoot. Both game classes have C++
+    // ivars (.cxx_construct / .cxx_destruct); the leaf has -init and a
+    // -dealloc that calls [super dealloc].
+    let base = class32(
+        fake,
+        "G32CxxBase",
+        ClassTarget::External("G32HostCxxRoot".into()),
+        "G32HostCxxRoot",
+        vec![method(".cxx_construct", "@8@0:4", 0x2401), method(".cxx_destruct", "v8@0:4", 0x2402)],
+    );
+    let leaf = class32(
+        fake,
+        "G32CxxLeaf",
+        ClassTarget::Local(base.address),
+        "G32HostCxxRoot",
+        vec![
+            method(".cxx_construct", "@8@0:4", 0x2411),
+            method(".cxx_destruct", "v8@0:4", 0x2412),
+            method("init", "@8@0:4", 0x2413),
+            method("dealloc", "v8@0:4", 0x2414),
+        ],
+    );
+    let leaf_class = leaf.address;
+    let md = ObjcMetadata32 { classes: vec![base, leaf], ..Default::default() };
+    let bridge: &'static Mutex<Bridge> = Box::leak(Box::new(Mutex::new(Bridge::new(&md).unwrap())));
+    install(bridge, fake, &md).unwrap();
+    let note = |event: &'static str| move |w: &[u32]| {
+        CXX_EVENTS.lock().unwrap().push(event);
+        u64::from(w[0])
+    };
+    fake.code(0x2401, note("construct base"));
+    fake.code(0x2411, note("construct leaf"));
+    fake.code(0x2402, note("destruct base"));
+    fake.code(0x2412, note("destruct leaf"));
+    fake.code(0x2413, note("init"));
+    let super_struct = fake.alloc_permanent(8);
+    fake.code(0x2414, move |w| {
+        CXX_EVENTS.lock().unwrap().push("dealloc");
+        fake.write(super_struct, &[w[0].to_le_bytes(), leaf_class.to_le_bytes()].concat());
+        let words = [super_struct, w[1]];
+        send_from_guest(bridge, fake, SendKind::Super2, &|i| words[i as usize]).unwrap();
+        0
+    });
+    let _hook = mirror::DISPATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    mirror::set_dispatch(Box::new(move |frame: &mut HostFrame| {
+        dispatch_from_host(bridge, fake, frame).unwrap();
+    }));
+    let sel = |name: &str| bridge.lock().unwrap().guest_selector(fake, name);
+    let events = || std::mem::take(&mut *CXX_EVENTS.lock().unwrap());
+
+    // +alloc: the constructors run, superclass first, before the guest sees the object.
+    let object = send(bridge, fake, &[leaf_class, sel("alloc")]).unwrap() as u32;
+    assert_eq!(events(), ["construct base", "construct leaf"]);
+    // +new (alloc then init in the host): constructed before -init runs.
+    send(bridge, fake, &[leaf_class, sel("new")]).unwrap();
+    assert_eq!(events(), ["construct base", "construct leaf", "init"]);
+    // -dealloc: the game's body, then at [super dealloc] the destructors,
+    // subclass first, then the framework's dealloc; the guest memory goes.
+    send(bridge, fake, &[object, sel("dealloc")]).unwrap();
+    assert_eq!(events(), ["dealloc", "destruct leaf", "destruct base", "host dealloc"]);
+    assert!(fake.freed.lock().unwrap().contains(&object));
+}
