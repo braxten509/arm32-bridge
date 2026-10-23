@@ -191,12 +191,12 @@ fn discard(work: Work) {
     }
 }
 
-/// When a started thread ends: its run loop (if it had one) takes no more
-/// work, and what was still queued is let go of.
+/// When a started thread ends: its run loop takes no more work, and what was
+/// still queued is let go of. A thread that never had one gets one marked
+/// ended (under the lock loops are made with), so work sent to it later is
+/// let go of at once too.
 fn end_thread_loop(thread: Id) {
-    let object = THREAD_RUN_LOOPS.lock().unwrap().iter().find(|(t, _)| *t == thread).map(|&(_, object)| object);
-    let Some(object) = object else { return };
-    let run_loop = loop_of(object);
+    let run_loop = loop_of(run_loop_of_thread(thread));
     let left: Vec<Work> = {
         let mut queue = run_loop.queue.lock().unwrap();
         run_loop.ended.store(true, Ordering::Relaxed);
@@ -768,6 +768,7 @@ fn spawn(thread: Id, target: Id, selector: Sel, argument: Id, why: &str) {
             runtime::send(target, &name, &[argument]);
             crate::fw::counted::release(argument);
             end_thread_loop(thread);
+            crate::fw::uikit::property_set(thread, "finished", 1);
         })
         .expect("can't start a thread");
 }
@@ -857,6 +858,10 @@ extern "C" fn thread_set_name(this: Id, _: Sel, name: Id) {
 
 extern "C" fn thread_name(this: Id, _: Sel) -> Id {
     crate::fw::uikit::property_get(this, "name").unwrap_or(0) as Id
+}
+
+extern "C" fn thread_is_finished(this: Id, _: Sel) -> bool {
+    crate::fw::uikit::property_get(this, "finished").is_some()
 }
 
 extern "C" fn ignore_size(_this: Id, _: Sel, _size: usize) {}
@@ -965,7 +970,7 @@ pub fn register(r: &mut Registry) {
             ("setStackSize:", ignore_size as usize),
             ("setThreadPriority:", thread_set_priority as usize),
             ("isCancelled", no as usize),
-            ("isFinished", no as usize),
+            ("isFinished", thread_is_finished as usize),
         ],
     );
 }
@@ -1185,6 +1190,43 @@ mod perform_tests {
         END_NOW.store(true, Ordering::SeqCst);
         assert!(wait_for(|| (count_of(target), count_of(argument)) == baseline), "work queued for an ended thread still holds its objects");
         // Asked after it ended, waiting: the caller goes on.
+        let (finished, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            perform(target, s, runtime::sel("neverRun:"), worker, argument, 1);
+            let _ = finished.send(());
+        });
+        assert!(done.recv_timeout(std::time::Duration::from_secs(5)).is_ok(), "a caller waiting for an ended thread never went on");
+        assert_eq!((count_of(target), count_of(argument)), baseline);
+        assert!(!RAN_FOR_ENDED.load(Ordering::SeqCst), "an ended thread ran work");
+    }
+
+    extern "C" fn end_now(_this: Id, _: Sel, _: Id) {}
+
+    /// The same for a thread that ended before anything was sent to it.
+    #[test]
+    fn work_for_a_thread_that_ended_before_any_was_sent_is_let_go_of() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let class = define_class("PerformEarlyEndTarget", "NSObject", 8);
+        methods(
+            class,
+            &[("retain", counted_retain as usize), ("release", counted_release as usize), ("neverRun:", never_run as usize), ("endNow:", end_now as usize)],
+        );
+        let make = || {
+            let object = runtime::send(runtime::send(class, "alloc", &[]), "init", &[]);
+            change(object, 1);
+            object
+        };
+        let (target, argument) = (make(), make());
+        let thread_class = runtime::class_named("NSThread");
+        let worker = runtime::send(runtime::send(thread_class, "alloc", &[]), "initWithTarget:selector:object:", &[target, runtime::sel("endNow:"), 0]);
+        runtime::send(worker, "start", &[]);
+        assert!(wait_for(|| runtime::send(worker, "isFinished", &[]) & 0xFF != 0), "the thread never finished");
+        let baseline = (count_of(target), count_of(argument));
+        let s = runtime::sel("performSelector:onThread:withObject:waitUntilDone:");
+        let perform: extern "C" fn(Id, Sel, Sel, Id, Id, u8) = unsafe { std::mem::transmute(runtime::imp_for(target, s).unwrap()) };
+        perform(target, s, runtime::sel("neverRun:"), worker, argument, 0);
+        assert_eq!((count_of(target), count_of(argument)), baseline, "work for an ended thread holds its objects");
         let (finished, done) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             perform(target, s, runtime::sel("neverRun:"), worker, argument, 1);
