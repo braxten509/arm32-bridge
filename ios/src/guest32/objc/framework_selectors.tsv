@@ -111,6 +111,7 @@ componentsFromLocaleIdentifier:	@@:@
 componentsJoinedByString:	@@:@
 componentsSeparatedByCharactersInSet:	@@:@
 componentsSeparatedByString:	@@:@
+containsValueForKey:	c@:@
 contentScaleFactor	f@:
 convertPoint:toView:	{CGPoint=ff}@:{CGPoint=ff}@
 convertRect:fromView:	{CGRect={CGPoint=ff}{CGSize=ff}}@:{CGRect={CGPoint=ff}{CGSize=ff}}@
@@ -142,9 +143,14 @@ dateWithTimeIntervalSince1970:	@@:d
 dateWithTimeIntervalSinceNow:	@@:d
 decimalNumberWithString:	@@:@
 decodeBoolForKey:	c@:@
+decodeCGPointForKey:	{CGPoint=ff}@:@
+decodeCGRectForKey:	{CGRect={CGPoint=ff}{CGSize=ff}}@:@
+decodeCGSizeForKey:	{CGSize=ff}@:@
 decodeDoubleForKey:	d@:@
 decodeFloatForKey:	f@:@
+decodeInt32ForKey:	i@:@
 decodeInt64ForKey:	q@:@
+decodeIntegerForKey:	i@:@
 decodeIntForKey:	i@:@
 decodeObjectForKey:	@@:@
 defaultCenter	@@:
@@ -248,6 +254,7 @@ initWithURL:parameters:requestMethod:	@@:@@i
 initWithWhite:alpha:	@@:ff
 insertObject:atIndex:	v@:@I
 instanceMethodForSelector:	^?@::
+instantiateWithOwner:options:	@@:@@
 integerValue	i@:
 intValue	i@:
 invalidate	v@:
@@ -273,6 +280,7 @@ length	I@:
 lengthOfBytesUsingEncoding:	I@:I
 lineBreakMode	i@:
 loadAchievementsWithCompletionHandler:	v@:@?
+loadNibNamed:owner:options:	@@:@@@
 loadRequest:	v@:@
 localeIdentifier	@@:
 localizedDescription	@@:
@@ -296,6 +304,8 @@ name	@@:
 new	@@:
 newlineCharacterSet	@@:
 nextObject	@@:
+nibWithData:bundle:	@@:@@
+nibWithNibName:bundle:	@@:@@
 null	@@:
 numberFromString:	@@:@
 numberWithBool:	@@:c
