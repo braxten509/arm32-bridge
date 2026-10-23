@@ -55,7 +55,7 @@ impl FrameworkSelectors {
                 return Err(format!("line {}: needs a selector and an encoding", number + 1));
             };
             let notes: Vec<&str> = columns.next().map(|n| n.split(',').collect()).unwrap_or_default();
-            let signature = Signature::parse(encoding).map_err(|e| format!("line {}: {e}", number + 1))?;
+            let signature = Signature::parse_method(encoding).map_err(|e| format!("line {}: {e}", number + 1))?;
             let colons = selector.matches(':').count();
             if signature.args.len() != colons + 2 {
                 return Err(format!("line {}: {selector} takes {colons} arguments, encoding has {}", number + 1, signature.args.len() - 2));

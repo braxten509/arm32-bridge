@@ -528,7 +528,7 @@ fn host_signature(b: &Bridge, class: &str, meta: bool, sel: &str) -> Result<(Sig
         return Ok((entry.signature.clone(), options));
     }
     if let Some(types) = b.classes.types_for_selector(sel) {
-        return Ok((Signature::parse(types)?, HostCallOptions::default()));
+        return Ok((Signature::parse_method(types)?, HostCallOptions::default()));
     }
     Err(format!(
         "{}[{class} {sel}]: no type encoding for this framework selector (add it to framework_selectors.tsv)",
@@ -590,7 +590,7 @@ pub fn send_from_guest(
     match target {
         Target::Guest { imp, types } => {
             drop(b);
-            let sig = Signature::parse(&types)?;
+            let sig = Signature::parse_method(&types)?;
             let call_words: Vec<u32> = (0..sig.guest_total_words()).map(get).collect();
             let r = g.call(imp, &call_words)?;
             Ok(GuestRet { r0: r as u32, r1: (r >> 32) as u32 })
@@ -700,7 +700,7 @@ pub fn dispatch_from_host(bridge: &Mutex<Bridge>, g: &dyn GuestSide, frame: &mut
         Lookup::Guest(m) => (m.imp, m.types.clone()),
         _ => return Err(format!("host sent {name} to game object {guest_self:#x}, which has no such method")),
     };
-    let sig = Signature::parse(&types)?;
+    let sig = Signature::parse_method(&types)?;
     let call = convert::prepare_guest_call(&sig, frame, &mut Session { bridge: &mut b, g })?;
     drop(b);
     let r = g.call(imp, &call.words)?;

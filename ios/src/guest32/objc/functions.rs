@@ -210,14 +210,13 @@ pub fn functions() -> &'static [(&'static str, ObjcFn)] {
 }
 
 /// Calls the function named `name` (C name).
-/// Foundation C functions that take or return objects, answered by the
+/// Foundation C functions that take or return objects (and that the C
+/// framework layer, guest32::fw, does not provide), answered by the
 /// host layer's function of the same name with converted types: name,
 /// armv7 encoding of the result then the arguments (as in
 /// framework_selectors.tsv, without self/_cmd), variadic arguments.
 pub const HOST_FUNCTIONS: &[(&str, &str, Varargs)] = &[
     ("NSLog", "v@", Varargs::Format),
-    // (NSSearchPathDirectory, NSSearchPathDomainMask, BOOL expandTilde)
-    ("NSSearchPathForDirectoriesInDomains", "@IIc", Varargs::None),
 ];
 
 pub fn call_function(ctx: &Ctx, name: &str, words: Words) -> Result<u64, String> {

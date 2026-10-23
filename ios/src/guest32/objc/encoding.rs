@@ -116,6 +116,7 @@ pub struct Signature {
 }
 
 impl Signature {
+    /// Any type string: a method's, a C function's or a block's.
     pub fn parse(text: &str) -> Result<Signature, String> {
         let mut p = Parser { s: text.as_bytes(), i: 0 };
         let ret = p.ty()?;
@@ -125,10 +126,16 @@ impl Signature {
             args.push(p.ty()?);
             p.skip_offset();
         }
-        if args.len() < 2 {
+        Ok(Signature { ret, args })
+    }
+
+    /// A method type string: it must have self and _cmd.
+    pub fn parse_method(text: &str) -> Result<Signature, String> {
+        let sig = Signature::parse(text)?;
+        if sig.args.len() < 2 {
             return Err(format!("method type {text:?} lacks self and _cmd"));
         }
-        Ok(Signature { ret, args })
+        Ok(sig)
     }
 
     /// Word offset (from r0) of each argument on armv7: arguments are laid
@@ -300,7 +307,12 @@ mod tests {
         let e = Signature::parse("I@:^{NSFastEnumerationState=I^@^I[5I]}^@I").unwrap();
         let Ty::Pointer(state) = &e.args[2] else { panic!() };
         assert_eq!(state.guest_size(), 32);
-        assert!(Signature::parse("v@").is_err());
+        // C functions (NSLog's "v@") and blocks ("v4@?0") have no self/_cmd;
+        // only method types must have them.
+        assert_eq!(Signature::parse("v@").unwrap().args, [Ty::Object]);
+        assert_eq!(Signature::parse("v4@?0").unwrap().args, [Ty::Block]);
+        assert!(Signature::parse_method("v@").is_err());
+        assert!(Signature::parse_method("v@:").is_ok());
         assert!(Signature::parse("v@:{CGPoint=ff").is_err());
     }
 
