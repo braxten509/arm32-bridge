@@ -285,6 +285,7 @@ initWithImage:	@@:@
 initWithInt:	@@:i
 initWithNibName:bundle:	@@:@@
 initWithObjects:	@@:@	nil-list
+initWithProgressViewStyle:	@@:i
 initWithRed:green:blue:alpha:	@@:ffff
 initWithRequest:delegate:	@@:@@
 initWithRequest:delegate:startImmediately:	@@:@@c
@@ -422,6 +423,10 @@ presentViewController:animated:completion:	v@:@c@?
 price	@@:
 priceLocale	@@:
 productIdentifier	@@:
+progress	f@:
+progressImage	@@:
+progressTintColor	@@:
+progressViewStyle	i@:
 propertyList:isValidForFormat:	c@:@I
 propertyListFromData:mutabilityOption:format:errorDescription:	@@:@I^I^@
 propertyListWithData:options:format:error:	@@:@I^I^@
@@ -564,7 +569,11 @@ setPercentComplete:	v@:d
 setPersistent:	v@:c
 setPlaceholder:	v@:@
 setPredicate:	v@:@
+setProgress:	v@:f
+setProgress:animated:	v@:fc
 setProgressImage:	v@:@
+setProgressTintColor:	v@:@
+setProgressViewStyle:	v@:i
 setRate:	v@:f	float
 setRemoteParticipantVolume:	v@:f	float
 setReturnKeyType:	v@:i
@@ -591,6 +600,7 @@ setTitleColor:forState:	v@:@I
 setTitle:forState:	v@:@I
 setToRecipients:	v@:@
 setTrackImage:	v@:@
+setTrackTintColor:	v@:@
 setTransform:	v@:{CGAffineTransform=ffffff}
 setValue:	v@:f	float,ambiguous:UISlider
 setValue:forHTTPHeaderField:	v@:@@
@@ -673,6 +683,8 @@ touchesBegan:withEvent:	v@:@@
 touchesCancelled:withEvent:	v@:@@
 touchesEnded:withEvent:	v@:@@
 touchesMoved:withEvent:	v@:@@
+trackImage	@@:
+trackTintColor	@@:
 transactionState	i@:
 tryLock	c@:
 unarchiveObjectWithFile:	@@:@

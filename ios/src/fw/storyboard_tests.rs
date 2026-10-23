@@ -451,6 +451,25 @@ fn a_view_reads_its_place_look_and_subviews_from_a_coder() {
     assert!(!flag(plain, "isHidden"));
 }
 
+/// A progress bar's progress, style and colours from a nib.
+#[test]
+fn a_progress_bar_reads_its_progress_from_a_coder() {
+    setup();
+    let red = runtime::send(runtime::class_named("UIColor"), "redColor", &[]);
+    let bar = decoded(
+        "UIProgressView",
+        vec![
+            ("UIBounds", Held::Rect(Rect::new(0.0, 0.0, 127.0, 9.0))),
+            ("UIProgress", Held::Double(0.5)),
+            ("UIProgressViewStyle", Held::Integer(1)),
+            ("UIProgressTintColor", Held::Object(red)),
+        ],
+    );
+    assert_eq!(call::<Rect>(bar, "frame").size, Size { width: 127.0, height: 9.0 });
+    assert_eq!((call::<f32>(bar, "progress"), call::<isize>(bar, "progressViewStyle")), (0.5, 1));
+    assert_eq!(runtime::send(bar, "progressTintColor", &[]), red);
+}
+
 /// -[UIView initWithCoder:] doesn't run -initWithFrame: overrides of the
 /// game's classes (iOS never calls it while decoding), but our own classes'
 /// setup still happens (a label doesn't take touches by default).

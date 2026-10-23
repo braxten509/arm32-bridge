@@ -38,6 +38,7 @@ pub mod paths;
 pub mod photos;
 pub mod pictures;
 pub mod plist;
+pub mod progress;
 pub mod png;
 pub mod pvrtc;
 pub mod regex;
@@ -73,6 +74,7 @@ pub fn register(r: &mut Registry) {
     app::register(r);
     uikit::register(r);
     controls::register(r);
+    progress::register(r);
     typing::register(r);
     tables::register(r);
     nib::register(r);

@@ -245,6 +245,7 @@ struct Classes {
     text_field: Class,
     table: Class,
     cell: Class,
+    progress: Class,
     gl_layer: Class,
 }
 
@@ -257,6 +258,7 @@ impl Classes {
             text_field: runtime::class_named("UITextField"),
             table: runtime::class_named("UITableView"),
             cell: runtime::class_named("UITableViewCell"),
+            progress: runtime::class_named("UIProgressView"),
             gl_layer: runtime::class_named("CAEAGLLayer"),
         }
     }
@@ -326,6 +328,29 @@ fn snapshot(view: Id, classes: &Classes, depth: usize) -> Node {
         }
         if let Some((look, rect)) = parts.title {
             pictures.extend(text_shown(Some(look), rect));
+        }
+    }
+    if Classes::is(view, classes.progress) {
+        // The track over the bounds, the part done from the left: each its picture or colour.
+        let ((track_image, track_color), (done_image, done_color)) = crate::fw::progress::parts(view);
+        let done = Rect { size: crate::fw::geometry::Size { width: bounds.size.width * crate::fw::progress::progress(view), ..bounds.size }, ..bounds };
+        for (image, color, plain, rect) in [(track_image, track_color, crate::fw::progress::TRACK, bounds), (done_image, done_color, crate::fw::progress::DONE, done)] {
+            if rect.size.width <= 0.0 {
+                continue;
+            }
+            match image_shown(image, 0, rect) {
+                Some(shown) => pictures.push(shown),
+                None => pictures.push(Shown {
+                    path: color_path(crate::fw::graphics::color_rgba(color).unwrap_or(plain)),
+                    mode: 0,
+                    size: (1.0, 1.0),
+                    rect,
+                    caps: None,
+                    tile: false,
+                    text: None,
+                    alpha: 1.0,
+                }),
+            }
         }
     }
     let mut background = crate::fw::graphics::color_rgba(property_get(view, "background").unwrap_or(0) as Id);
@@ -774,6 +799,25 @@ mod tests {
         runtime::send(button, "setContentHorizontalAlignment:", &[3]);
         send_struct(button, "setImageEdgeInsets:", crate::fw::controls::Insets { top: 2.0, left: 4.0, bottom: 6.0, right: 8.0 });
         assert_eq!(image_rect(), rect(4.0, 2.0, 88.0, 32.0));
+    }
+
+    /// A progress bar shows its track over its bounds and the part done
+    /// from the left, in their colours (or pictures); its progress stays
+    /// between 0 and 1.
+    #[test]
+    fn progress_bars_show_how_far_along_they_are() {
+        setup();
+        assert_ne!(runtime::class_named("UIProgressView"), 0, "no UIProgressView");
+        let bar = new_view("UIProgressView", rect(0.0, 0.0, 100.0, 9.0));
+        send_struct(bar, "setProgress:", 0.25f32);
+        runtime::send(bar, "setProgressTintColor:", &[runtime::send(runtime::class_named("UIColor"), "redColor", &[])]);
+        let shown = || snapshot(bar, &Classes::find(), 0).pictures.into_iter().map(|p| (p.path, p.rect)).collect::<Vec<_>>();
+        let track = color_path(crate::fw::progress::TRACK);
+        assert_eq!(shown(), [(track.clone(), rect(0.0, 0.0, 100.0, 9.0)), (color_path([1.0, 0.0, 0.0, 1.0]), rect(0.0, 0.0, 25.0, 9.0))]);
+        send_struct(bar, "setProgress:", 3.0f32);
+        assert_eq!(shown()[1].1, rect(0.0, 0.0, 100.0, 9.0));
+        send_struct(bar, "setProgress:", 0.0f32);
+        assert_eq!(shown(), [(track, rect(0.0, 0.0, 100.0, 9.0))]);
     }
 
     /// A white picture made in memory (one reference, the caller's).

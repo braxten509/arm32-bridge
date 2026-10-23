@@ -317,6 +317,31 @@ extern "C" fn image_view_init_with_coder(this: Id, _: Sel, coder: Id) -> Id {
     this
 }
 
+/// -[UIProgressView initWithCoder:]
+extern "C" fn progress_init_with_coder(this: Id, _: Sel, coder: Id) -> Id {
+    let this = super_init_with_coder(this, "UIProgressView", coder);
+    if this == 0 {
+        return 0;
+    }
+    if let Some(progress) = double_for(coder, "UIProgress") {
+        crate::fw::progress::set_progress(this, runtime::sel("setProgress:"), progress as f32);
+    }
+    if let Some(style) = integer_for(coder, "UIProgressViewStyle") {
+        property_set(this, "progressViewStyle", style as u64);
+    }
+    for (key, set) in [
+        ("UIProgressTintColor", crate::fw::progress::set_progress_tint as extern "C" fn(Id, Sel, Id)),
+        ("UITrackTintColor", crate::fw::progress::set_track_tint),
+        ("UIProgressImage", crate::fw::progress::set_progress_image),
+        ("UITrackImage", crate::fw::progress::set_track_image),
+    ] {
+        if let Some(value) = object_for(coder, key) {
+            set(this, runtime::sel(key), value);
+        }
+    }
+    this
+}
+
 extern "C" fn image_view_highlighted_image(this: Id, _: Sel) -> Id {
     get_id(this, "highlightedImage")
 }
@@ -1039,6 +1064,7 @@ pub fn register(_r: &mut Registry) {
     methods(runtime::class_named("UILabel"), &[("initWithCoder:", label_init_with_coder as usize)]);
     methods(runtime::class_named("UITableView"), &[("initWithCoder:", table_init_with_coder as usize)]);
     methods(runtime::class_named("UITableViewCell"), &[("initWithCoder:", cell_init_with_coder as usize)]);
+    methods(runtime::class_named("UIProgressView"), &[("initWithCoder:", progress_init_with_coder as usize)]);
     methods(
         runtime::class_named("UIImageView"),
         &[
