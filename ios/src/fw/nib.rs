@@ -837,7 +837,7 @@ pub fn register(_: &mut Registry) {
     let event = define_class("UIRuntimeEventConnection", "UIRuntimeConnection", 40);
     methods(event, &[("connect", event_connect as usize), ("eventMask", connection_event_mask as usize)]);
 
-    let image_placeholder = define_class("UIImageNibPlaceholder", "NSObject", 8);
+    let image_placeholder = define_class("UIImageNibPlaceholder", "UIImage", 16);
     methods(image_placeholder, &[("initWithCoder:", image_placeholder_init_with_coder as usize)]);
 
     let nib = define_class("UINib", "NSObject", 16);
@@ -1669,6 +1669,193 @@ mod tests {
         assert_eq!(record(controller).thing, storyboard, "-setStoryboard: got the placeholder's object");
         assert_eq!(record(scene).partner, controller, "-setSceneViewController: on the owner");
         assert_ne!(record(controller).awake_order, 0);
+    }
+
+    // ----- a whole storyboard, through UIStoryboard (fw/storyboard.rs) and this reader -----
+
+    /// A scene's controller nib: a UIClassSwapper of `class` with its view
+    /// nib's name and segue templates, as Xcode writes one.
+    fn storyboard_scene(class: &str, view_nib: &str, segues: &[(&str, &str)]) -> Vec<u8> {
+        let mut b = Builder::new();
+        let owner = b.proxy("IBFilesOwner");
+        let storyboard = b.proxy("UIStoryboardPlaceholder");
+        let class_name = b.string(class);
+        let original = b.string("UIViewController");
+        let view_name = b.string(view_nib);
+        let mut templates = Vec::new();
+        for (identifier, destination) in segues {
+            let identifier = b.string(identifier);
+            let destination = b.string(destination);
+            templates.push(b.object(
+                "UIStoryboardModalSegueTemplate",
+                vec![("UIIdentifier", Put::Ref(identifier)), ("UIDestinationViewControllerIdentifier", Put::Ref(destination))],
+            ));
+        }
+        let template_list = b.list("NSArray", &templates);
+        let controller = b.object(
+            "UIClassSwapper",
+            vec![
+                ("UINibName", Put::Ref(view_name)),
+                ("UIStoryboardSegueTemplates", Put::Ref(template_list)),
+                ("UIClassName", Put::Ref(class_name)),
+                ("UIOriginalClassName", Put::Ref(original)),
+            ],
+        );
+        let outlet = |b: &mut Builder, label: &str, source: usize, destination: usize| {
+            let label = b.string(label);
+            b.object(
+                "UIRuntimeOutletConnection",
+                vec![("UILabel", Put::Ref(label)), ("UISource", Put::Ref(source)), ("UIDestination", Put::Ref(destination))],
+            )
+        };
+        let mut connections = vec![outlet(&mut b, "storyboard", controller, storyboard), outlet(&mut b, "sceneViewController", owner, controller)];
+        for &template in &templates {
+            connections.push(outlet(&mut b, "viewController", template, controller));
+        }
+        let mut objects = vec![controller, owner, storyboard];
+        objects.extend(&templates);
+        b.standard_root(&objects, &[controller, owner, storyboard], &connections);
+        b.bytes()
+    }
+
+    /// A scene's view nib: a view holding a label and a button; outlets for
+    /// the view and the label, the button's action to the controller.
+    fn storyboard_view() -> Vec<u8> {
+        let mut b = Builder::new();
+        let owner = b.proxy("IBFilesOwner");
+        let red = b.object(
+            "UIColor",
+            vec![
+                ("UIColorComponentCount", Put::I8(4)),
+                ("UIRed", Put::F32(1.0)),
+                ("UIGreen", Put::F32(0.25)),
+                ("UIBlue", Put::F32(0.0)),
+                ("UIAlpha", Put::F32(1.0)),
+            ],
+        );
+        let font_name = b.string("Helvetica");
+        let font = b.object("UIFont", vec![("UIFontName", Put::Ref(font_name)), ("UIFontPointSize", Put::F64(17.0))]);
+        let text = b.object("NSMutableString", vec![("NS.bytes", Put::Data(b"Select your hero".to_vec()))]);
+        let label = b.object(
+            "UILabel",
+            vec![
+                ("UIBounds", Put::Data(floats(6, &[0.0, 0.0, 200.0, 30.0]))),
+                ("UICenter", Put::Data(floats(6, &[240.0, 40.0]))),
+                ("UIText", Put::Ref(text)),
+                ("UIFont", Put::Ref(font)),
+                ("UITextColor", Put::Ref(red)),
+                ("UIShadowOffset", Put::Data(floats(6, &[0.0, -1.0]))),
+            ],
+        );
+        let normal = b.object("NSNumber", vec![("NS.intval", Put::I8(0))]);
+        let title = b.string("Play");
+        let content = b.object("UIButtonContent", vec![("UITitle", Put::Ref(title))]);
+        let states = b.list("NSMutableDictionary", &[normal, content]);
+        let button = b.object(
+            "UIButton",
+            vec![
+                ("UIBounds", Put::Data(floats(6, &[0.0, 0.0, 100.0, 40.0]))),
+                ("UICenter", Put::Data(floats(6, &[240.0, 280.0]))),
+                ("UIButtonStatefulContent", Put::Ref(states)),
+                ("UITitleShadowOffset", Put::Data(floats(6, &[1.0, 1.0]))),
+            ],
+        );
+        let subviews = b.list("NSMutableArray", &[label, button]);
+        let view = b.object(
+            "UIView",
+            vec![
+                ("UIBounds", Put::Data(floats(6, &[0.0, 0.0, 480.0, 320.0]))),
+                ("UICenter", Put::Data(floats(6, &[240.0, 160.0]))),
+                ("UISubviews", Put::Ref(subviews)),
+                ("UIBackgroundColor", Put::Ref(red)),
+            ],
+        );
+        let mut connections = Vec::new();
+        for (name, destination) in [("view", view), ("titleLabel", label)] {
+            let name = b.string(name);
+            connections.push(b.object(
+                "UIRuntimeOutletConnection",
+                vec![("UILabel", Put::Ref(name)), ("UISource", Put::Ref(owner)), ("UIDestination", Put::Ref(destination))],
+            ));
+        }
+        let action = b.string("play:");
+        connections.push(b.object(
+            "UIRuntimeEventConnection",
+            vec![("UILabel", Put::Ref(action)), ("UISource", Put::Ref(button)), ("UIDestination", Put::Ref(owner)), ("UIEventMask", Put::I8(64))],
+        ));
+        b.standard_root(&[view, owner, label, button], &[view, owner], &connections);
+        b.bytes()
+    }
+
+    /// Main.storyboard compiled the way Xcode does, in en.lproj: a menu scene
+    /// (the game's own controller class) with a segue to a second scene.
+    fn write_storyboard(app: &std::path::Path) {
+        let folder = app.join("en.lproj/Main.storyboardc");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            folder.join("Info.plist"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>UIStoryboardDesignatedEntryPointIdentifier</key><string>UIViewController-1</string>
+<key>UIStoryboardVersion</key><integer>1</integer>
+<key>UIViewControllerIdentifiersToNibNames</key><dict>
+<key>UIViewController-1</key><string>UIViewController-1</string>
+<key>UIViewController-2</key><string>UIViewController-2</string>
+</dict></dict></plist>"#,
+        )
+        .unwrap();
+        std::fs::write(folder.join("UIViewController-1.nib"), storyboard_scene("NibTestMenuController", "1-view-1", &[("ShowNext", "UIViewController-2")])).unwrap();
+        std::fs::write(folder.join("1-view-1.nib"), storyboard_view()).unwrap();
+        std::fs::write(folder.join("UIViewController-2.nib"), storyboard_scene("UIViewController", "2-view-2", &[])).unwrap();
+        std::fs::write(folder.join("2-view-2.nib"), storyboard_view()).unwrap();
+    }
+
+    fn rect_of(object: Id, selector: &str) -> Rect {
+        let sel = runtime::sel(selector);
+        let imp = runtime::imp_for(object, sel).unwrap_or_else(|| panic!("no {selector}"));
+        let f: extern "C" fn(Id, Sel) -> Rect = unsafe { std::mem::transmute(imp) };
+        f(object, sel)
+    }
+
+    #[test]
+    fn storyboard_scenes_load_through_the_nib_reader() {
+        test_classes();
+        let menu = runtime::existing_class("NibTestMenuController", false)
+            .unwrap_or_else(|| object::define_class("NibTestMenuController", "UIViewController", 16));
+        object::methods(menu, &[("setTitleLabel:", recorder_set_thing as usize)]);
+        let folder = std::env::temp_dir().join(format!("gamebridge-nib-storyboard-{}", std::process::id()));
+        let app = folder.join("Game.app");
+        write_storyboard(&app);
+        let bundle = runtime::send(runtime::class_named("NSBundle"), "bundleWithPath:", &[string::make(&app.to_string_lossy())]);
+        let storyboard = runtime::send(runtime::class_named("UIStoryboard"), "storyboardWithName:bundle:", &[string::make("Main"), bundle]);
+        assert_ne!(storyboard, 0, "the storyboard opens");
+        let controller = runtime::send(storyboard, "instantiateInitialViewController", &[]);
+        assert_ne!(controller, 0, "the first scene makes its controller");
+        assert_eq!(class_of(controller), "NibTestMenuController", "the game's own class, through UIClassSwapper");
+        assert_eq!(runtime::send(controller, "storyboard", &[]), storyboard, "the storyboard outlet reached -setStoryboard:");
+        // The view comes from the scene's view nib, its outlets and action set.
+        let view = runtime::send(controller, "view", &[]);
+        assert_ne!(view, 0);
+        assert_eq!(class_of(view), "UIView");
+        assert_eq!(rect_of(view, "frame"), Rect::new(0.0, 0.0, 480.0, 320.0));
+        let subviews = collections::array_items(runtime::send(view, "subviews", &[]));
+        assert_eq!(subviews.len(), 2);
+        let (label, button) = (subviews[0], subviews[1]);
+        assert_eq!(record(controller).thing, label, "the titleLabel outlet reached the game's setter");
+        assert_eq!(rect_of(label, "frame"), Rect::new(140.0, 25.0, 200.0, 30.0));
+        assert_eq!(string::get(runtime::send(label, "text", &[])), "Select your hero");
+        let sel = runtime::sel("shadowOffset");
+        let shadow: extern "C" fn(Id, Sel) -> Size = unsafe { std::mem::transmute(runtime::imp_for(label, sel).unwrap()) };
+        assert_eq!(shadow(label, sel), Size { width: 0.0, height: -1.0 });
+        let targets = collections::array_items(runtime::send(runtime::send(button, "allTargets", &[]), "allObjects", &[]));
+        assert_eq!(targets, [controller], "the button's action goes to the controller");
+        // The segue's template knows its controller; performing it shows scene 2.
+        runtime::send(controller, "performSegueWithIdentifier:sender:", &[string::make("ShowNext"), 0]);
+        let shown = runtime::send(controller, "presentedViewController", &[]);
+        assert_ne!(shown, 0, "the segue presented the second scene");
+        assert_eq!(class_of(shown), "UIViewController");
+        assert_eq!(runtime::send(shown, "storyboard", &[]), storyboard);
+        std::fs::remove_dir_all(&folder).unwrap();
     }
 
     /// A nib inside a nib (a table's cell nib) becomes a UINib.

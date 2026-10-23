@@ -1289,6 +1289,13 @@ extern "C" fn image_init_with_contents_of_file(_this: Id, _: Sel, path: Id) -> I
     image_from_path(&string::get(path))
 }
 
+/// -resizableImageWithCapInsets: (UIEdgeInsets: top, left, bottom, right):
+/// the same picture (images don't change); stretching only the middle
+/// between the caps is not drawn yet, so it scales whole.
+extern "C" fn image_resizable(this: Id, _: Sel, _top: f64, _left: f64, _bottom: f64, _right: f64) -> Id {
+    this
+}
+
 extern "C" fn image_size(this: Id, _: Sel) -> Size {
     image_points(this)
 }
@@ -1709,6 +1716,7 @@ pub fn register(r: &mut Registry) {
             ("initWithContentsOfFile:", image_init_with_contents_of_file as usize),
             ("size", image_size as usize),
             ("scale", image_scale as usize),
+            ("resizableImageWithCapInsets:", image_resizable as usize),
         ],
     );
     let spinner = define_class("UIActivityIndicatorView", "UIView", 16);
@@ -1820,6 +1828,28 @@ mod tests {
         let controller = runtime::send(runtime::alloc_instance(class), "init", &[]);
         let device = runtime::send(runtime::class_named("UIDevice"), "currentDevice", &[]);
         assert_eq!(runtime::send(controller, "interfaceOrientation", &[]), runtime::send(device, "orientation", &[]));
+    }
+
+    /// A stretchable copy of a picture (button backgrounds) is a picture of
+    /// the same file and size.
+    #[test]
+    fn resizable_images_keep_the_picture() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let folder = std::env::temp_dir().join(format!("gamebridge-resizable-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("button.png");
+        std::fs::write(&path, crate::fw::png::encode(6, 4, &[200; 6 * 4 * 4], false)).unwrap();
+        let image = image_from_path(&path.to_string_lossy());
+        assert_ne!(image, 0);
+        let sel = runtime::sel("resizableImageWithCapInsets:");
+        let imp = runtime::imp_for(image, sel).expect("-[UIImage resizableImageWithCapInsets:] is missing");
+        let resizable: extern "C" fn(Id, Sel, f64, f64, f64, f64) -> Id = unsafe { std::mem::transmute(imp) };
+        let stretched = resizable(image, sel, 1.0, 2.0, 1.0, 2.0);
+        assert_ne!(stretched, 0);
+        assert_eq!(image_points(stretched), Size { width: 6.0, height: 4.0 });
+        assert_eq!(image_info(stretched).map(|info| info.path.clone()), Some(path.to_string_lossy().into_owned()));
+        std::fs::remove_dir_all(&folder).unwrap();
     }
 
     /// The screen takes one of its own modes back, and keeps its overscan setting.

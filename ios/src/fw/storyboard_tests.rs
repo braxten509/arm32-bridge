@@ -147,10 +147,12 @@ fn nib_loads(name: &str) -> Vec<NibLoad> {
 }
 
 extern "C" fn test_nib_with_name(_: Class, _: Sel, name: Id, bundle: Id) -> Id {
-    let name = string::get(name);
-    if !NIBS.lock().unwrap().iter().any(|(known, _)| *known == name) {
-        return 0;
+    let text = string::get(name);
+    if !NIBS.lock().unwrap().iter().any(|(known, _)| *known == text) {
+        // Not one of these tests' nibs: the real reader's (other tests use it).
+        return runtime::send(runtime::class_named("UINib"), "nibWithNibName:bundle:", &[name, bundle]);
     }
+    let name = text;
     let nib = runtime::alloc_instance(runtime::class_named(TEST_NIB_CLASS));
     property_set(nib, "testNibName", string::make(&name) as u64);
     property_set(nib, "testNibBundle", bundle as u64);

@@ -470,17 +470,6 @@ extern "C" fn font_init_with_coder(_this: Id, _: Sel, coder: Id) -> Id {
     crate::fw::controls::font(&name, size)
 }
 
-/// -[UIImageNibPlaceholder initWithCoder:]: a nib keeps a picture as its
-/// name in the app; the picture is what +[UIImage imageNamed:] gives.
-extern "C" fn image_placeholder_init_with_coder(_this: Id, _: Sel, coder: Id) -> Id {
-    let Some(name) = text_for(coder, "UIResourceName") else { return 0 };
-    let image = runtime::send(runtime::class_named("UIImage"), "imageNamed:", &[string::make(&name)]);
-    if image == 0 {
-        crate::log!("nib picture {name}: not in the app");
-    }
-    image
-}
-
 /// -[NSObject awakeFromNib]: nothing by default.
 extern "C" fn awake_from_nib(_this: Id, _: Sel) {}
 
@@ -1001,8 +990,7 @@ pub fn register(_r: &mut Registry) {
     methods(button_content, &[("initWithCoder:", button_content_init_with_coder as usize)]);
     methods(runtime::class_named("UIColor"), &[("initWithCoder:", color_init_with_coder as usize)]);
     methods(runtime::class_named("UIFont"), &[("initWithCoder:", font_init_with_coder as usize)]);
-    let placeholder = define_class("UIImageNibPlaceholder", "UIImage", 16);
-    methods(placeholder, &[("initWithCoder:", image_placeholder_init_with_coder as usize)]);
+    // UIImageNibPlaceholder (a picture named in a nib) is in fw/nib.rs.
 
     // initWithNibName:bundle:, loadView and the modal transition style are
     // in fw/uikit.rs's own list (registering them twice would let a second

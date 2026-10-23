@@ -165,7 +165,32 @@ pub fn set_picture_screen(screen: PictureScreen) {
 
 /// Whether there is a phone screen to draw pictures on (the main loop then wakes often enough).
 pub fn active() -> bool {
-    SCREEN.get().is_some()
+    screen().is_some()
+}
+
+/// The phone's screen; on a PC run with IOS_FRAMES_DIR, the lists are kept
+/// in that folder instead (pictures-NNNNN.txt) to see what it would show.
+fn screen() -> Option<&'static PictureScreen> {
+    static FILE_SCREEN: OnceLock<Option<PictureScreen>> = OnceLock::new();
+    SCREEN.get().or_else(|| {
+        FILE_SCREEN.get_or_init(|| std::env::var("IOS_FRAMES_DIR").ok().map(|_| PictureScreen { show: save_list })).as_ref()
+    })
+}
+
+fn save_list(text: &str) {
+    if let Ok(folder) = std::env::var("IOS_FRAMES_DIR") {
+        save_list_in(&folder, text);
+    }
+}
+
+fn save_list_in(folder: &str, text: &str) {
+    static NUMBER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let number = NUMBER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let path = format!("{folder}/pictures-{number:05}.txt");
+    let _ = std::fs::create_dir_all(folder);
+    if let Err(error) = std::fs::write(&path, text) {
+        crate::log!("pictures: list not saved to {path}: {error}");
+    }
 }
 
 /// The list as the phone app reads it: the screen's size in points, then one
@@ -186,7 +211,7 @@ pub fn encode(screen: (f64, f64), pictures: &[Picture]) -> String {
 
 /// From the main loop: sends the pictures when they changed (at most 20 times a second).
 pub fn tick() {
-    let Some(screen) = SCREEN.get() else { return };
+    let Some(screen) = screen() else { return };
     static LAST: Mutex<Option<(std::time::Instant, String)>> = Mutex::new(None);
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
     if last.as_ref().is_some_and(|(at, _)| at.elapsed().as_millis() < 50) {
@@ -234,6 +259,22 @@ mod tests {
     fn at(p: &Picture, x: f64, y: f64) -> (f64, f64) {
         let t = p.place;
         ((t.a * x + t.c * y + t.tx).round(), (t.b * x + t.d * y + t.ty).round())
+    }
+
+    /// PC runs without a phone screen keep each list in the frames folder,
+    /// numbered, to see what the phone would show.
+    #[test]
+    fn lists_are_kept_in_the_frames_folder_on_the_pc() {
+        let folder = std::env::temp_dir().join(format!("gamebridge-pictures-{}", std::process::id()));
+        let folder_text = folder.to_string_lossy().into_owned();
+        save_list_in(&folder_text, "480\t320\n");
+        save_list_in(&folder_text, "480\t320\nsecond\n");
+        let mut names: Vec<String> = std::fs::read_dir(&folder).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        names.sort();
+        assert_eq!(names.len(), 2);
+        assert!(names[0].starts_with("pictures-") && names[0].ends_with(".txt"), "{names:?}");
+        assert_eq!(std::fs::read_to_string(folder.join(&names[1])).unwrap(), "480\t320\nsecond\n");
+        std::fs::remove_dir_all(&folder).unwrap();
     }
 
     #[test]
