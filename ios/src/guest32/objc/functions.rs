@@ -138,10 +138,16 @@ pub fn functions() -> &'static [(&'static str, ObjcFn)] {
         ("objc_begin_catch", |_, _| Err("objc_begin_catch: Objective-C exceptions are not supported yet".into())),
         ("objc_end_catch", |_, _| Err("objc_end_catch: Objective-C exceptions are not supported yet".into())),
         ("objc_terminate", |_, _| Err("objc_terminate called".into())),
-        ("objc_getAssociatedObject", |_, w| ok(with_associated(|m| m.get(&(w(0), w(1))).copied().unwrap_or(0)))),
+        ("objc_getAssociatedObject", |_, w| ok(with_associated(|m| m.get(&(w(0), w(1))).map_or(0, |v| v.0)))),
         ("objc_setAssociatedObject", set_associated),
-        ("objc_removeAssociatedObjects", |_, w| {
-            with_associated(|m| m.retain(|k, _| k.0 != w(0)));
+        ("objc_removeAssociatedObjects", |c, w| {
+            let removed: Vec<(u32, u32)> = with_associated(|m| {
+                let keys: Vec<_> = m.keys().filter(|k| k.0 == w(0)).copied().collect();
+                keys.iter().filter_map(|k| m.remove(k)).collect()
+            });
+            for old in removed {
+                release_associated(c, old)?;
+            }
             ok(0)
         }),
         ("objc_getClass", |c, w| ok(class_named(c, &c.cstr(w(0))))),
@@ -337,10 +343,18 @@ fn exception_throw(c: &Ctx, w: Words) -> Result<u64, String> {
     Err(format!("the game threw an Objective-C exception: {name}: {reason}"))
 }
 
-/// (object, key) -> value for objc_setAssociatedObject.
-fn with_associated<R>(f: impl FnOnce(&mut HashMap<(u32, u32), u32>) -> R) -> R {
-    static MAP: Mutex<Option<HashMap<(u32, u32), u32>>> = Mutex::new(None);
+/// (object, key) -> (value, policy) for objc_setAssociatedObject.
+fn with_associated<R>(f: impl FnOnce(&mut HashMap<(u32, u32), (u32, u32)>) -> R) -> R {
+    static MAP: Mutex<Option<HashMap<(u32, u32), (u32, u32)>>> = Mutex::new(None);
     f(MAP.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new))
+}
+
+/// A replaced or removed value is released by the policy it was set with.
+fn release_associated(c: &Ctx, (value, policy): (u32, u32)) -> Result<(), String> {
+    if matches!(policy & 0xff, 1 | 3) {
+        c.release(value)?;
+    }
+    Ok(())
 }
 
 /// objc_setAssociatedObject(object, key, value, policy)
@@ -351,9 +365,9 @@ fn set_associated(c: &Ctx, w: Words) -> Result<u64, String> {
         3 => c.send(value, "copy", &[])?,
         _ => value,
     };
-    let old = with_associated(|m| if new == 0 { m.remove(&(object, key)) } else { m.insert((object, key), new) });
-    if let (Some(old), 1 | 3) = (old, policy & 0xff) {
-        c.release(old)?;
+    let old = with_associated(|m| if new == 0 { m.remove(&(object, key)) } else { m.insert((object, key), (new, policy)) });
+    if let Some(old) = old {
+        release_associated(c, old)?;
     }
     ok(0)
 }

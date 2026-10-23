@@ -311,6 +311,68 @@ fn freed_eagl_contexts_leave_the_gles_tracking() {
 }
 
 #[test]
+fn game_retains_autoreleases_and_releases_reach_the_eagl_context_count() {
+    use crate::guest32::objc::bridge::Bridge;
+    use crate::guest32::objc::functions::{call_function, Ctx};
+    use crate::guest32::objc::testing::Fake;
+    setup();
+    let g = Fake::new();
+    let bridge: &'static std::sync::Mutex<Bridge> =
+        Box::leak(Box::new(std::sync::Mutex::new(Bridge::new(&guest32_image::ObjcMetadata32::default()).unwrap())));
+    let ctx = Ctx { bridge, g };
+    let call = |name: &str, words: &[u32]| {
+        let w = |i: u32| words.get(i as usize).copied().unwrap_or(0);
+        call_function(&ctx, name, &w).unwrap() as u32
+    };
+    let sel = |name: &str| bridge.lock().unwrap().guest_selector(g, name);
+    // [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES2] from game code.
+    let class = bridge.lock().unwrap().framework_class(g, "EAGLContext").0;
+    let context = call("objc_msgSend", &[call("objc_msgSend", &[class, sel("alloc")]), sel("initWithAPI:"), 2]);
+    let host = bridge.lock().unwrap().host_object(context).expect("a host EAGLContext");
+    let count = || crate::fw::counted::count(host);
+    assert_eq!(count(), Some(1));
+
+    // ARC, a retain message and CFRetain (the host function the guest's reaches) all count.
+    call("objc_retain", &[context]);
+    call("objc_msgSend", &[context, sel("retain")]);
+    let (cf_retain, _) = crate::symbols::lookup("_CFRetain").expect("CFRetain");
+    let cf_retain: extern "C" fn(usize) -> usize = unsafe { std::mem::transmute(cf_retain) };
+    cf_retain(host);
+    assert_eq!(count(), Some(4));
+    // Autoreleases wait for their pool, then each is one release.
+    let pool = call("objc_autoreleasePoolPush", &[]);
+    call("objc_autorelease", &[context]);
+    call("objc_msgSend", &[context, sel("autorelease")]);
+    call("objc_autoreleaseReturnValue", &[context]);
+    assert_eq!(count(), Some(4), "autoreleased, not yet released");
+    call("objc_autoreleasePoolPop", &[pool]);
+    assert_eq!(count(), Some(1));
+    // Strong stores and retained associated objects hold it until let go.
+    let slot = g.words(&[0]);
+    call("objc_storeStrong", &[slot, context]);
+    let holder = g.words(&[0]);
+    call("objc_setAssociatedObject", &[holder, 0x77, context, 0x301]);
+    assert_eq!(count(), Some(3));
+    call("objc_storeStrong", &[slot, 0]);
+    call("objc_removeAssociatedObjects", &[holder]);
+    assert_eq!(count(), Some(1), "removed associated objects are released");
+    call("objc_setAssociatedObject", &[holder, 0x78, context, 1]);
+    call("objc_setAssociatedObject", &[holder, 0x78, 0, 0]);
+    assert_eq!(count(), Some(1), "a value set back to nil is released by its own policy");
+
+    // Being current holds it: the game's last release leaves it alive and working.
+    assert_eq!(call("objc_msgSend", &[class, sel("setCurrentContext:"), context]) & 0xff, 1);
+    let egl = crate::fw::eagl::current_egl_context();
+    call("objc_msgSend", &[context, sel("release")]);
+    assert_eq!(count(), Some(1), "the current context survives the game's release");
+    assert!(gles::context_tracked(egl));
+    assert_eq!(call("objc_msgSend", &[class, sel("currentContext")]), context);
+    call("objc_msgSend", &[class, sel("setCurrentContext:"), 0]);
+    assert_eq!(count(), None, "then goes once it is no longer current");
+    assert!(!gles::context_tracked(egl), "its EGL context went with it");
+}
+
+#[test]
 fn indexed_gl_queries_reach_the_guest_registry() {
     setup();
     for name in ["glGetIntegeri_v", "glGetInteger64i_v", "glGetBooleani_v"] {

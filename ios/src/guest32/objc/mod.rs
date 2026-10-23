@@ -22,4 +22,4 @@ pub mod mirror;
 pub mod selectors;
 pub mod wire;
 #[cfg(test)]
-mod testing;
+pub(crate) mod testing;
