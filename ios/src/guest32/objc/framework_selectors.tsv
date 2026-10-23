@@ -570,8 +570,8 @@ setPercentComplete:	v@:d
 setPersistent:	v@:c
 setPlaceholder:	v@:@
 setPredicate:	v@:@
-setProgress:	v@:f
-setProgress:animated:	v@:fc
+setProgress:	v@:f	float
+setProgress:animated:	v@:fc	float
 setProgressImage:	v@:@
 setProgressTintColor:	v@:@
 setProgressViewStyle:	v@:i

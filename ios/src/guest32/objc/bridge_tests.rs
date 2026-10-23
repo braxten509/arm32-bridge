@@ -815,3 +815,22 @@ fn cxx_constructors_run_after_alloc_parents_first_and_destructors_at_dealloc_chi
     assert_eq!(events(), ["dealloc", "destruct leaf", "destruct base", "host dealloc"]);
     assert!(fake.freed.lock().unwrap().contains(&object));
 }
+
+/// UIProgressView's progress is a C float: a 32-bit game's setProgress:
+/// (and setProgress:animated:) reach it with the value it sent.
+#[test]
+fn progress_bars_get_their_float_progress_from_32_bit_games() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(crate::run::setup);
+    let bar = runtime::send(runtime::send(runtime::class_named("UIProgressView"), "alloc", &[]), "init", &[]);
+    let fake = Fake::new();
+    let bridge = Mutex::new(Bridge::new(&ObjcMetadata32::default()).unwrap());
+    let proxy = bridge.lock().unwrap().guest_object(fake, bar).unwrap();
+    let sel = |name: &str| bridge.lock().unwrap().guest_selector(fake, name);
+    send(&bridge, fake, &[proxy, sel("setProgress:"), 0.5f32.to_bits()]).unwrap();
+    assert_eq!(crate::fw::progress::progress(bar), 0.5);
+    send(&bridge, fake, &[proxy, sel("setProgress:animated:"), 0.25f32.to_bits(), 1]).unwrap();
+    assert_eq!(crate::fw::progress::progress(bar), 0.25);
+    let back = send(&bridge, fake, &[proxy, sel("progress")]).unwrap() as u32;
+    assert_eq!(f32::from_bits(back), 0.25, "read back as a float");
+}
