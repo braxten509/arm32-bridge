@@ -137,8 +137,19 @@ EXPORT int pthread_setspecific(pthread_key_t key, const void *value) {
 }
 /* A mutex or condition must carry Apple's signature, as the library's static ones do. */
 static int checked(long sig) { return sig == _PTHREAD_MUTEX_SIG_init || sig == _PTHREAD_RECURSIVE_MUTEX_SIG_init ? 0 : EINVAL; }
-EXPORT int pthread_mutex_lock(pthread_mutex_t *m) { return checked(m->__sig); }
-EXPORT int pthread_mutex_unlock(pthread_mutex_t *m) { return checked(m->__sig); }
+/* How many locks are held right now, so a test can see code runs unlocked. */
+static int held;
+EXPORT int testc_mutexes_held(void) { return held; }
+EXPORT int pthread_mutex_lock(pthread_mutex_t *m) {
+    int result = checked(m->__sig);
+    held += result == 0;
+    return result;
+}
+EXPORT int pthread_mutex_unlock(pthread_mutex_t *m) {
+    int result = checked(m->__sig);
+    held -= result == 0;
+    return result;
+}
 EXPORT int pthread_mutex_destroy(pthread_mutex_t *m) { (void)m; return 0; }
 EXPORT int pthread_cond_broadcast(pthread_cond_t *c) { return c->__sig == _PTHREAD_COND_SIG_init ? 0 : EINVAL; }
 EXPORT int pthread_cond_signal(pthread_cond_t *c) { return c->__sig == _PTHREAD_COND_SIG_init ? 0 : EINVAL; }

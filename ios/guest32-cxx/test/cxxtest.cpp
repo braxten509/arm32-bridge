@@ -168,6 +168,14 @@ void count_finalize(void* by) { finalized += *static_cast<int*>(by); }
 
 extern "C" int __cxa_atexit(void (*)(void*), void*, void*);
 extern "C" void __cxa_finalize(void*);
+extern "C" int testc_mutexes_held(); // test/testc.c
+
+namespace {
+// A destructor may join a thread that registers one of its own: the
+// registration lock must not be held while destructors run.
+int held_during_destructor = -1;
+void note_locks(void*) { held_during_destructor = testc_mutexes_held(); }
+} // namespace
 
 namespace {
 void at_exit() {
@@ -181,6 +189,10 @@ void at_exit() {
     CHECK(13, finalized == 1);
     __cxa_finalize(&other_image);
     CHECK(13, finalized == 11);
+
+    __cxa_atexit(note_locks, nullptr, &this_image);
+    __cxa_finalize(&this_image);
+    CHECK(14, held_during_destructor == 0);
 }
 } // namespace
 

@@ -17,10 +17,13 @@ BIN=${BIN:-$HOME/.cache/aarch64-cross/target-g32cxx/aarch64-unknown-linux-gnu/re
 
 run=("$BIN")
 [ "$(uname -m)" = aarch64 ] || run=(qemu-aarch64 -L "$HOME/.cache/aarch64-sysroot" "$BIN")
-output=$(ARM32_STATS=1 timeout 600 "${run[@]}" call "$OUT/test/libcxxtest.so" run_all 2>&1) || true
+status=0
+output=$(ARM32_STATS=1 timeout 600 "${run[@]}" call "$OUT/test/libcxxtest.so" run_all 2>&1) || status=$?
 echo "$output" | grep -E 'run_all|fallbacks|handler|FAIL' || echo "$output" | tail -20
-# Every instruction translated: no Unicorn fallbacks (32-bit iPhone code has no Unicorn).
-if echo "$output" | grep -q '^run_all returned 0 (0x0)$' && echo "$output" | grep -q ' 0 fallbacks at 0 sites'; then
+[ $status = 0 ] || echo "test.sh: the runner exited with status $status (124: timed out)" >&2
+# The runner must also end cleanly (a crash or hang after run_all fails), and
+# every instruction be translated: no Unicorn fallbacks (32-bit iPhone code has no Unicorn).
+if [ $status = 0 ] && echo "$output" | grep -q '^run_all returned 0 (0x0)$' && echo "$output" | grep -q ' 0 fallbacks at 0 sites'; then
     echo "test.sh: PASS"
 else
     echo "test.sh: FAIL" >&2

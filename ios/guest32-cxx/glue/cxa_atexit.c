@@ -20,7 +20,7 @@ struct block {
     struct entry entries[32];
 };
 
-static pthread_mutex_t lock = PTHREAD_RECURSIVE_MUTEX_INITIALIZER;
+static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static struct block *newest;
 
 EXPORT int __cxa_atexit(void (*function)(void *), void *argument, void *dso) {
@@ -40,8 +40,10 @@ EXPORT int __cxa_atexit(void (*function)(void *), void *argument, void *dso) {
 }
 
 /* Runs the not-yet-run entries of `dso` (all of them for NULL), newest
- * first, each once. A handler may register more; those run too. The lock is
- * recursive and held across calls so a handler may call these again. */
+ * first, each once. As Apple's Libc atexit.c: an entry is claimed under the
+ * lock, then called with the lock released, so a destructor may register
+ * more (they run too) or wait for a thread that does. Entries never move:
+ * blocks are only added. */
 EXPORT void __cxa_finalize(void *dso) {
     pthread_mutex_lock(&lock);
     for (;;) {
@@ -53,7 +55,11 @@ EXPORT void __cxa_finalize(void *dso) {
         if (!next)
             break;
         next->done = 1;
-        next->function(next->argument);
+        void (*function)(void *) = next->function;
+        void *argument = next->argument;
+        pthread_mutex_unlock(&lock);
+        function(argument);
+        pthread_mutex_lock(&lock);
     }
     pthread_mutex_unlock(&lock);
 }

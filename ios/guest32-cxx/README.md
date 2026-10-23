@@ -22,8 +22,13 @@ into guest memory, so this code runs translated like the game's own.
 
 The built library (1.2 MB) is not committed: it is a build output, rebuilt
 exactly from the pinned sources in about a minute, and the repo keeps no
-other binaries. Needs clang, llc, ld.lld, llvm-objcopy/readelf/nm (LLVM 23
-was used), git and network once.
+other binaries. Needs clang, llc, ld.lld, llvm-objcopy/readelf/nm, git and
+network once. **Only the sources are pinned, not the tools**: the build uses
+whatever LLVM is installed. Used and tested: clang/llc/lld/llvm-objcopy
+23.1.1 (Arch/CachyOS packages). A different LLVM may produce different code;
+rerun `test.sh` after a toolchain update. `fetch.sh` refuses a source tree
+with changed, extra (untracked) or ignored files, since `build.sh` compiles
+whole folders by pattern.
 
 ## How it is built
 
@@ -143,19 +148,23 @@ What the library needs from the core side:
   for GCC's empty-string storage when copying exception messages).
 - **`__cxa_atexit` / `__cxa_finalize`** are exported by the library (pure
   guest code). If the runner's `exit()` should run static destructors, it
-  calls `__cxa_finalize(NULL)` first.
+  calls `__cxa_finalize(NULL)` first. Destructors run with the registration
+  lock released (as Apple's Libc), so one may join a thread that registers more.
 
 ## Tests
 
 `test.sh` (PC: needs the ARM64 cross build of arm32-bridge, `BIN=` to
 point elsewhere): loads `libtestc.so`, `libguest32cxx.so` and
-`libcxxtest.so` with the Android loader and calls `run_all`: 14 checks,
+`libcxxtest.so` with the Android loader and calls `run_all`: 15 checks,
 one bit each (string layout bytes, growth, exceptions thrown inside the
 library and caught across a frame with a cleanup, catch by base class,
 rethrow, `std::logic_error`, static guard, `dynamic_cast`/`typeid`,
-`ostringstream`/`istringstream`, the hand-made APCS call, `__cxa_atexit`).
-Passes with run_all = 0 and 0 translator fallbacks. Without the library it
-stops at `_Znwm`.
+`ostringstream`/`istringstream`, the hand-made APCS call, `__cxa_atexit`,
+destructors run with the registration lock released). Passes when run_all
+= 0, the runner exits cleanly within the time limit, and there are 0
+translator fallbacks. Without the library it stops at `_Znwm`. This is a
+PC unit test (qemu-aarch64); game tests run on the Pixel only, never on
+Android emulators.
 
 `check-game-imports.sh` on TownCraft: all 114 C++ runtime imports exported;
 Dungeon Plunder: all 3.

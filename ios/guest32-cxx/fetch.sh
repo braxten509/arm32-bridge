@@ -38,6 +38,8 @@ for folder in "${folders[@]}"; do
     have=$(git -C "$SRC" rev-parse "HEAD:$folder")
     [ "$have" = "${TREES[$folder]}" ] || { echo "fetch.sh: $folder tree $have, expected ${TREES[$folder]}" >&2; exit 1; }
 done
-# Nothing in the checked-out folders may differ from the commit.
-git -C "$SRC" diff --quiet HEAD -- "${folders[@]}" || { echo "fetch.sh: $SRC has local changes" >&2; exit 1; }
+# Nothing in the checked-out folders may differ from the commit: no changed
+# files, and no extra ones (build.sh compiles whole folders by pattern).
+extra=$(git -C "$SRC" status --porcelain --untracked-files=all --ignored -- "${folders[@]}")
+[ -z "$extra" ] || { echo "fetch.sh: $SRC differs from $COMMIT:" >&2; echo "$extra" >&2; exit 1; }
 echo "$SRC"
