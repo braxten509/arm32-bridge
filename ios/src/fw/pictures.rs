@@ -61,6 +61,9 @@ pub struct Shown {
     /// A stretchable picture's caps in points (top, left, bottom, right):
     /// filling its rect, they keep their size and the middle stretches.
     pub caps: Option<[f64; 4]>,
+    /// The parts between the caps are repeated at their size, not stretched
+    /// (UIImageResizingModeTile).
+    pub tile: bool,
     /// Text to show instead of a picture file (`path` is then empty).
     pub text: Option<TextLook>,
     /// How see-through it is drawn, on top of the view's own alpha (dimmed pictures).
@@ -161,13 +164,19 @@ fn walk(node: &Node, parent: Option<Transform>, parent_alpha: f64, clip: Rect, o
         size: (1.0, 1.0),
         rect: Rect { origin: Point::default(), size },
         caps: None,
+        tile: false,
         text: None,
         alpha: 1.0,
     });
     for shown in background.iter().chain(&node.pictures) {
-        for (path, rect, picture_size) in parts(shown) {
+        for (path, rect, picture_size, cut) in parts(shown) {
             if rect.size.width > 0.0 && rect.size.height > 0.0 {
                 let place = then(moved(node.bounds_origin.x + rect.origin.x, node.bounds_origin.y + rect.origin.y), own);
+                // A tile reaching past its stretch is cut off at its end.
+                let clip = match cut {
+                    Some(area) => meet(clip, screen_box(own, Rect { origin: Point { x: node.bounds_origin.x + area.origin.x, y: node.bounds_origin.y + area.origin.y }, size: area.size })),
+                    None => clip,
+                };
                 let seen = meet(screen_box(place, Rect { origin: Point::default(), size: rect.size }), clip);
                 if seen.size.width <= 0.0 || seen.size.height <= 0.0 {
                     continue; // wholly clipped away
@@ -183,30 +192,45 @@ fn walk(node: &Node, parent: Option<Transform>, parent_alpha: f64, clip: Rect, o
     }
 }
 
+/// Most copies of a tiling part one way; more are drawn stretched instead.
+const MOST_TILES: f64 = 64.0;
+
 /// What a picture is drawn as: itself in its rect, or, stretchable and
 /// filling it (mode 0), its nine parts (rows from the top), each with its
 /// rect and its own size. Caps longer than the rect shrink to share it.
-fn parts(shown: &Shown) -> Vec<(String, Rect, (f64, f64))> {
+/// A tiling picture's parts between the caps are copies at their own size,
+/// each with the area it may draw in (the last ones are cut off there).
+fn parts(shown: &Shown) -> Vec<(String, Rect, (f64, f64), Option<Rect>)> {
     let caps = shown.caps.filter(|caps| shown.mode == 0 && caps.iter().any(|&cap| cap > 0.0));
-    let Some([top, left, bottom, right]) = caps else { return vec![(shown.path.clone(), shown.rect, shown.size)] };
-    /// Start, length and source length of the three parts of one side.
-    fn side(start: f64, length: f64, source: f64, first: f64, last: f64) -> [(f64, f64, f64); 3] {
+    let Some([top, left, bottom, right]) = caps else { return vec![(shown.path.clone(), shown.rect, shown.size, None)] };
+    /// Start, length and source length of the pieces of one side's three
+    /// parts, with the part each belongs to and the stretch it fills.
+    fn side(start: f64, length: f64, source: f64, first: f64, last: f64, tile: bool) -> Vec<(usize, f64, f64, f64, (f64, f64))> {
         let shrink = if first + last > length { length / (first + last) } else { 1.0 };
         let (shown_first, shown_last) = (first * shrink, last * shrink);
-        [
-            (start, shown_first, first),
-            (start + shown_first, length - shown_first - shown_last, (source - first - last).max(0.0)),
-            (start + length - shown_last, shown_last, last),
-        ]
+        let (middle_start, middle_length, middle_source) = (start + shown_first, length - shown_first - shown_last, (source - first - last).max(0.0));
+        let mut pieces = vec![(0, start, shown_first, first, (start, shown_first))];
+        let copies = if middle_source > 0.0 { (middle_length / middle_source).ceil() } else { 0.0 };
+        if tile && copies >= 1.0 && copies <= MOST_TILES {
+            let area = (middle_start, middle_length);
+            pieces.extend((0..copies as usize).map(|k| (1, middle_start + k as f64 * middle_source, middle_source, middle_source, area)));
+        } else {
+            pieces.push((1, middle_start, middle_length, middle_source, (middle_start, middle_length)));
+        }
+        pieces.push((2, start + length - shown_last, shown_last, last, (start + length - shown_last, shown_last)));
+        pieces
     }
     let rect = shown.rect;
-    let columns = side(rect.origin.x, rect.size.width, shown.size.0, left, right);
-    let rows = side(rect.origin.y, rect.size.height, shown.size.1, top, bottom);
+    let columns = side(rect.origin.x, rect.size.width, shown.size.0, left, right, shown.tile);
+    let rows = side(rect.origin.y, rect.size.height, shown.size.1, top, bottom, shown.tile);
     let mut out = Vec::new();
-    for (row, &(y, height, source_height)) in rows.iter().enumerate() {
-        for (column, &(x, width, source_width)) in columns.iter().enumerate() {
+    for &(row, y, height, source_height, (area_y, area_height)) in &rows {
+        for &(column, x, width, source_width, (area_x, area_width)) in &columns {
             if width > 0.0 && height > 0.0 && source_width > 0.0 && source_height > 0.0 {
-                out.push((format!("{}{PART_MARK}{}", shown.path, row * 3 + column), Rect::new(x, y, width, height), (source_width, source_height)));
+                let piece = Rect::new(x, y, width, height);
+                let area = Rect::new(area_x, area_y, area_width, area_height);
+                let cut = (piece != area && (x + width > area_x + area_width || y + height > area_y + area_height)).then_some(area);
+                out.push((format!("{}{PART_MARK}{}", shown.path, row * 3 + column), piece, (source_width, source_height), cut));
             }
         }
     }
@@ -248,7 +272,7 @@ fn image_shown(image: Id, mode: i64, rect: Rect) -> Option<Shown> {
     let info = crate::fw::uikit::image_info(image)?;
     let size = crate::fw::uikit::image_points(image);
     // The file is found (or made) only for pictures that end up shown; see `resolve`.
-    Some(Shown { path: format!("{IMAGE_PREFIX}{image:x}"), mode, size: (size.width, size.height), rect, caps: info.caps, text: None, alpha: 1.0 })
+    Some(Shown { path: format!("{IMAGE_PREFIX}{image:x}"), mode, size: (size.width, size.height), rect, caps: info.caps, tile: false, text: None, alpha: 1.0 })
 }
 
 /// How see-through a disabled button's pictures are drawn.
@@ -276,7 +300,7 @@ fn shaded(image: Id, shade: crate::fw::controls::Shade, rect: Rect) -> Option<Sh
 /// Text drawn over `rect` (None for no text).
 fn text_shown(look: Option<TextLook>, rect: Rect) -> Option<Shown> {
     let look = look?;
-    Some(Shown { path: String::new(), mode: 0, size: look.size, rect, caps: None, text: Some(look), alpha: 1.0 })
+    Some(Shown { path: String::new(), mode: 0, size: look.size, rect, caps: None, tile: false, text: Some(look), alpha: 1.0 })
 }
 
 /// The view tree under `view` as `flatten` reads it (main thread).
@@ -360,11 +384,14 @@ fn pixels_per_point() -> f64 {
 /// memory or a turned photo, or one of a stretchable picture's parts; text
 /// is drawn into a PNG. Pictures that can't be made into a file are left out.
 fn resolve(pictures: Vec<Picture>) -> Vec<Picture> {
+    // All the screen's text at once, so none of its files is let go.
+    let looks: Vec<&crate::fw::graphics::TextLook> = pictures.iter().filter_map(|p| p.text.as_ref()).collect();
+    let mut text_files = crate::fw::graphics::text_pictures(&looks, pixels_per_point()).into_iter();
     pictures
         .into_iter()
         .filter_map(|mut p| {
-            if let Some(look) = &p.text {
-                p.path = crate::fw::graphics::text_picture(look, pixels_per_point())?;
+            if p.text.is_some() {
+                p.path = text_files.next()??;
                 return Some(p);
             }
             if let Some(color) = p.path.strip_prefix(COLOR_PREFIX) {
@@ -482,7 +509,7 @@ mod tests {
 
     fn view(frame: Rect, picture: Option<&str>, children: Vec<Node>) -> Node {
         let rect = rect(0.0, 0.0, frame.size.width, frame.size.height);
-        let pictures = picture.map(|p| Shown { path: p.to_string(), mode: 0, size: (10.0, 10.0), rect, caps: None, text: None, alpha: 1.0 }).into_iter().collect();
+        let pictures = picture.map(|p| Shown { path: p.to_string(), mode: 0, size: (10.0, 10.0), rect, caps: None, tile: false, text: None, alpha: 1.0 }).into_iter().collect();
         Node { frame, alpha: 1.0, pictures, children, ..Default::default() }
     }
 
@@ -546,7 +573,7 @@ mod tests {
     fn stretchable_pictures_keep_their_caps() {
         let mut button = view(rect(10.0, 10.0, 100.0, 40.0), None, vec![]);
         let caps = Some([3.0, 4.0, 3.0, 4.0]);
-        button.pictures.push(Shown { path: "b.png".into(), mode: 0, size: (20.0, 10.0), rect: rect(0.0, 0.0, 100.0, 40.0), caps, text: None, alpha: 1.0 });
+        button.pictures.push(Shown { path: "b.png".into(), mode: 0, size: (20.0, 10.0), rect: rect(0.0, 0.0, 100.0, 40.0), caps, tile: false, text: None, alpha: 1.0 });
         let pictures = flatten(&window(vec![button]));
         let parts: Vec<(String, (f64, f64), (f64, f64), (f64, f64))> =
             pictures.iter().map(|p| (p.path.clone(), at(p, 0.0, 0.0), p.area, p.size)).collect();
@@ -567,15 +594,36 @@ mod tests {
         );
         // 6 points wide: the 4-point caps shrink to 3 and there is no middle column.
         let mut narrow = view(rect(0.0, 0.0, 6.0, 40.0), None, vec![]);
-        narrow.pictures.push(Shown { path: "b.png".into(), mode: 0, size: (20.0, 10.0), rect: rect(0.0, 0.0, 6.0, 40.0), caps, text: None, alpha: 1.0 });
+        narrow.pictures.push(Shown { path: "b.png".into(), mode: 0, size: (20.0, 10.0), rect: rect(0.0, 0.0, 6.0, 40.0), caps, tile: false, text: None, alpha: 1.0 });
         let widths: Vec<(String, f64)> = flatten(&window(vec![narrow])).into_iter().map(|p| (p.path, p.area.0)).collect();
         assert_eq!(widths.iter().filter(|(path, _)| path.ends_with(&format!("{PART_MARK}1"))).count(), 0, "{widths:?}");
         assert!(widths.iter().all(|&(_, w)| w == 3.0), "{widths:?}");
         // Shown at its own size (centred): whole.
         let mut centred = view(rect(0.0, 0.0, 100.0, 40.0), None, vec![]);
-        centred.pictures.push(Shown { path: "b.png".into(), mode: 4, size: (20.0, 10.0), rect: rect(0.0, 0.0, 100.0, 40.0), caps, text: None, alpha: 1.0 });
+        centred.pictures.push(Shown { path: "b.png".into(), mode: 4, size: (20.0, 10.0), rect: rect(0.0, 0.0, 100.0, 40.0), caps, tile: false, text: None, alpha: 1.0 });
         let paths: Vec<String> = flatten(&window(vec![centred])).into_iter().map(|p| p.path).collect();
         assert_eq!(paths, ["b.png"]);
+    }
+
+    /// A tiling picture repeats its edges and middle at their own size
+    /// between the caps, the last copy cut off at the cap.
+    #[test]
+    fn tiling_pictures_repeat_their_middle() {
+        let mut button = view(rect(10.0, 10.0, 100.0, 40.0), None, vec![]);
+        let caps = Some([3.0, 4.0, 3.0, 4.0]);
+        button.pictures.push(Shown { path: "b.png".into(), mode: 0, size: (20.0, 10.0), rect: rect(0.0, 0.0, 100.0, 40.0), caps, tile: true, text: None, alpha: 1.0 });
+        let pictures = flatten(&window(vec![button]));
+        let part = |n: usize| -> Vec<&Picture> { pictures.iter().filter(|p| p.path == format!("b.png{PART_MARK}{n}")).collect() };
+        // The top edge (12 points of picture) across the 92 between the caps: 8 copies.
+        let top = part(1);
+        let starts: Vec<(f64, f64)> = top.iter().map(|p| at(p, 0.0, 0.0)).collect();
+        assert_eq!(starts, (0..8).map(|k| (14.0 + 12.0 * k as f64, 10.0)).collect::<Vec<_>>());
+        assert!(top.iter().all(|p| p.area == (12.0, 3.0) && p.size == (12.0, 3.0)), "{top:?}");
+        let last = top.last().unwrap();
+        assert_eq!(last.clip.origin.x + last.clip.size.width, 106.0, "cut at the right cap");
+        // The middle: 8 across, 9 down (4 points of picture in 34).
+        assert_eq!(part(4).len(), 72);
+        assert_eq!((part(0).len(), part(8).len()), (1, 1), "corners once");
     }
 
     fn setup() {
@@ -691,6 +739,41 @@ mod tests {
         // No title and no pictures: nothing.
         let plain = new_view("UIButton", rect(0.0, 0.0, 100.0, 40.0));
         assert!(snapshot(plain, &Classes::find(), 0).pictures.is_empty());
+    }
+
+    /// A title given only as an attributed string is drawn with its text,
+    /// font and colour.
+    #[test]
+    fn buttons_draw_their_attributed_titles() {
+        setup();
+        let red = runtime::send(runtime::class_named("UIColor"), "redColor", &[]);
+        let font = crate::fw::controls::font("Helvetica-Bold", 20.0);
+        let attributes = crate::fw::collections::dictionary_from(&[(crate::fw::string::make("NSFont"), font), (crate::fw::string::make("NSColor"), red)]);
+        let class = runtime::class_named("NSAttributedString");
+        assert_ne!(class, 0, "no NSAttributedString");
+        let title = runtime::send(runtime::send(class, "alloc", &[]), "initWithString:attributes:", &[crate::fw::string::make("Go"), attributes]);
+        let button = new_view("UIButton", rect(0.0, 0.0, 100.0, 40.0));
+        runtime::send(button, "setAttributedTitle:forState:", &[title, 0]);
+        let found = snapshot(button, &Classes::find(), 0).pictures;
+        let look = found.iter().find_map(|p| p.text.clone()).expect("the title drawn");
+        assert_eq!((look.text.as_str(), look.font, look.color), ("Go", ("Helvetica-Bold".into(), 20.0), [1.0, 0.0, 0.0, 1.0]));
+    }
+
+    /// Content alignment Fill (3) stretches the picture over the content
+    /// area (less its insets) that way; the other way it keeps its size.
+    #[test]
+    fn filled_button_content_stretches_the_picture() {
+        use crate::fw::uikit::{make_image, ImageInfo};
+        setup();
+        let icon = make_image(ImageInfo { path: "/nowhere/20x10.png".into(), pixels: (20, 10), scale: 1.0, ..Default::default() });
+        let button = new_view("UIButton", rect(0.0, 0.0, 100.0, 40.0));
+        runtime::send(button, "setImage:forState:", &[icon, 0]);
+        runtime::send(button, "setContentVerticalAlignment:", &[3]);
+        let image_rect = || snapshot(button, &Classes::find(), 0).pictures[0].rect;
+        assert_eq!(image_rect(), rect(40.0, 0.0, 20.0, 40.0));
+        runtime::send(button, "setContentHorizontalAlignment:", &[3]);
+        send_struct(button, "setImageEdgeInsets:", crate::fw::controls::Insets { top: 2.0, left: 4.0, bottom: 6.0, right: 8.0 });
+        assert_eq!(image_rect(), rect(4.0, 2.0, 88.0, 32.0));
     }
 
     /// A white picture made in memory (one reference, the caller's).

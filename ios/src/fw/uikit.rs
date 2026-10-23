@@ -1235,6 +1235,8 @@ pub struct ImageInfo {
     pub orientation: i64,
     /// A stretchable image's cap insets in points (top, left, bottom, right).
     pub caps: Option<[f64; 4]>,
+    /// The stretchable middle is tiled, not stretched (UIImageResizingModeTile).
+    pub tile: bool,
     /// Its CGImage (see fw/graphics.rs; read from the file when first asked for).
     pub cg: OnceLock<Id>,
     /// An upright PNG made to show it on the phone screen (see graphics::picture_file).
@@ -1344,7 +1346,7 @@ extern "C" fn image_init_with_contents_of_file(_this: Id, _: Sel, path: Id) -> I
 /// A new autoreleased UIImage of the same picture with cap insets (top,
 /// left, bottom, right in points): drawn larger, the caps keep their size
 /// and the middle stretches (fw/pictures.rs).
-fn image_with_caps(image: Id, caps: [f64; 4]) -> Id {
+fn image_with_caps(image: Id, caps: [f64; 4], tile: bool) -> Id {
     let Some(info) = image_info(image) else { return 0 };
     // Pictures made in memory have no file: the copy holds the same CGImage.
     let cg = OnceLock::new();
@@ -1353,18 +1355,18 @@ fn image_with_caps(image: Id, caps: [f64; 4]) -> Id {
         crate::fw::counted::retain(picture);
         let _ = cg.set(picture);
     }
-    let copy = ImageInfo { path: info.path.clone(), pixels: info.pixels, scale: info.scale, orientation: info.orientation, caps: Some(caps), cg, ..Default::default() };
+    let copy = ImageInfo { path: info.path.clone(), pixels: info.pixels, scale: info.scale, orientation: info.orientation, caps: Some(caps), tile, cg, ..Default::default() };
     crate::fw::counted::autorelease(make_image(copy))
 }
 
 /// -resizableImageWithCapInsets: (UIEdgeInsets: top, left, bottom, right).
 extern "C" fn image_resizable(this: Id, _: Sel, top: f64, left: f64, bottom: f64, right: f64) -> Id {
-    image_with_caps(this, [top, left, bottom, right])
+    image_with_caps(this, [top, left, bottom, right], false)
 }
 
-/// -resizableImageWithCapInsets:resizingMode: (tiling is drawn stretched).
-extern "C" fn image_resizable_mode(this: Id, _: Sel, top: f64, left: f64, bottom: f64, right: f64, _mode: isize) -> Id {
-    image_with_caps(this, [top, left, bottom, right])
+/// -resizableImageWithCapInsets:resizingMode: (UIImageResizingModeTile 0, Stretch 1).
+extern "C" fn image_resizable_mode(this: Id, _: Sel, top: f64, left: f64, bottom: f64, right: f64, mode: isize) -> Id {
+    image_with_caps(this, [top, left, bottom, right], mode == 0)
 }
 
 /// -stretchableImageWithLeftCapWidth:topCapHeight: (older): the right and
@@ -1374,7 +1376,7 @@ extern "C" fn image_stretchable(this: Id, _: Sel, left: isize, top: isize) -> Id
     let (left, top) = (left.max(0) as f64, top.max(0) as f64);
     let right = if left > 0.0 { (size.width - left - 1.0).max(0.0) } else { 0.0 };
     let bottom = if top > 0.0 { (size.height - top - 1.0).max(0.0) } else { 0.0 };
-    image_with_caps(this, [top, left, bottom, right])
+    image_with_caps(this, [top, left, bottom, right], false)
 }
 
 extern "C" fn image_left_cap_width(this: Id, _: Sel) -> isize {
@@ -1959,6 +1961,9 @@ mod tests {
         let imp = runtime::imp_for(image, sel).expect("-[UIImage resizableImageWithCapInsets:resizingMode:] is missing");
         let with_mode: extern "C" fn(Id, Sel, f64, f64, f64, f64, isize) -> Id = unsafe { std::mem::transmute(imp) };
         assert_eq!(image_info(with_mode(image, sel, 1.0, 1.0, 1.0, 1.0, 1)).unwrap().caps, Some([1.0; 4]));
+        // UIImageResizingModeTile 0, Stretch 1.
+        let tiles = |mode| image_info(with_mode(image, sel, 1.0, 1.0, 1.0, 1.0, mode)).unwrap().tile;
+        assert_eq!((tiles(0), tiles(1)), (true, false));
         let sel = runtime::sel("stretchableImageWithLeftCapWidth:topCapHeight:");
         let imp = runtime::imp_for(image, sel).expect("-[UIImage stretchableImageWithLeftCapWidth:topCapHeight:] is missing");
         let stretchable: extern "C" fn(Id, Sel, isize, isize) -> Id = unsafe { std::mem::transmute(imp) };

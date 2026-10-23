@@ -1,6 +1,7 @@
 //! Stand-ins for Apple's Foundation and UIKit classes.
 
 pub mod app;
+pub mod attributed;
 pub mod cfbridge;
 pub mod audiofile;
 pub mod extaudiofile;
@@ -63,6 +64,7 @@ use crate::symbols::Registry;
 pub fn register(r: &mut Registry) {
     object::define(r);
     string::register(r);
+    attributed::register(r);
     collections::register(r);
     data::register(r);
     plist::register(r);

@@ -926,8 +926,9 @@ fn inset(rect: Rect, by: Insets) -> Rect {
 /// in it, placed by the content alignments (UIControlContentHorizontal/
 /// VerticalAlignment: centre 0, left/top 1, right/bottom 2, fill 3), each
 /// in the content area less its own insets. The picture keeps its size
-/// (no bigger than the content); the title is one line of the title
-/// label's font, cut to the room left.
+/// (no bigger than the content) except that Fill stretches it over its
+/// area; the title is one line of the title label's font (or the
+/// attributed title's own font and colour), cut to the room left.
 pub fn button_parts(button: Id) -> ButtonParts {
     let state = control_state(button);
     let bounds = Rect { origin: Point::default(), size: frame_of(button).size };
@@ -943,10 +944,22 @@ pub fn button_parts(button: Id) -> ButtonParts {
     };
     // The title label's settings (a button's: 15-point system font, cut in the middle, no shadow offset).
     let label = get_id(button, "titleLabel");
-    let font = font_name_and_size(if label != 0 { text_font(label, 0) } else { font(SYSTEM_FONT, 15.0) });
+    let mut font = font_name_and_size(if label != 0 { text_font(label, 0) } else { font(SYSTEM_FONT, 15.0) });
     let line_break = if label != 0 { property_get(label, "lineBreakMode").map_or(5, |v| v as isize) } else { 5 };
     let offset = if label != 0 { (get_f(label, "shadowOffset.w", 0.0), get_f(label, "shadowOffset.h", 0.0)) } else { (0.0, 0.0) };
-    let title = text_of(state_get(button, "title", state));
+    let mut title = text_of(state_get(button, "title", state));
+    // No plain title: the attributed one, with its own font and colour.
+    let mut title_color = state_get(button, "titleColor", state);
+    let attributed = state_get(button, "attributedTitle", state);
+    if title.is_empty() && attributed != 0 {
+        title = crate::fw::attributed::text(attributed);
+        if let font_object @ 1.. = crate::fw::attributed::attribute(attributed, "NSFont") {
+            font = font_name_and_size(font_object);
+        }
+        if let color @ 1.. = crate::fw::attributed::attribute(attributed, "NSColor") {
+            title_color = color;
+        }
+    }
     let title_size = match title.is_empty() {
         true => Size::default(),
         false => {
@@ -956,6 +969,16 @@ pub fn button_parts(button: Id) -> ButtonParts {
     };
     let horizontal = property_get(button, "contentHorizontalAlignment").unwrap_or(0);
     let vertical = property_get(button, "contentVerticalAlignment").unwrap_or(0);
+    let image_area = inset(content, insets_of(button, "imageEdgeInsets"));
+    let title_area = inset(content, insets_of(button, "titleEdgeInsets"));
+    // Fill: the picture takes the room its area leaves (across: beside the title).
+    let mut image_size = image_size;
+    if image != 0 && horizontal == 3 {
+        image_size.width = room(image_area.size.width - title_size.width);
+    }
+    if image != 0 && vertical == 3 {
+        image_size.height = room(image_area.size.height);
+    }
     let together = image_size.width + title_size.width;
     // Where an item starts across, `before` it in the row; and down, for its height.
     let across = |area: Rect, before: f64| match horizontal {
@@ -968,9 +991,7 @@ pub fn button_parts(button: Id) -> ButtonParts {
         2 => area.origin.y + area.size.height - height,
         _ => area.origin.y + (area.size.height - height) / 2.0,
     };
-    let image_area = inset(content, insets_of(button, "imageEdgeInsets"));
-    let title_area = inset(content, insets_of(button, "titleEdgeInsets"));
-    let image_part = (image != 0).then(|| (image, Rect { origin: Point { x: across(image_area, 0.0), y: down(image_area, image_size.height) }, size: image_size }));
+    let image_part =(image != 0).then(|| (image, Rect { origin: Point { x: across(image_area, 0.0), y: down(image_area, image_size.height) }, size: image_size }));
     let title_part = (!title.is_empty()).then(|| {
         let rect = Rect { origin: Point { x: across(title_area, image_size.width), y: down(title_area, title_size.height) }, size: title_size };
         // Custom buttons' titles are white unless told; the others' the system blue.
@@ -978,7 +999,7 @@ pub fn button_parts(button: Id) -> ButtonParts {
         let look = TextLook {
             text: title,
             font,
-            color: color_parts(state_get(button, "titleColor", state)).unwrap_or(plain),
+            color: color_parts(title_color).unwrap_or(plain),
             shadow: color_parts(state_get(button, "titleShadowColor", state)).map(|shadow| (shadow, offset)),
             alignment: 1,
             line_break,

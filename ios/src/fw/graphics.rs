@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 mod shapes;
 mod text;
 
-pub use text::{text_box, text_picture, TextLook};
+pub use text::{text_box, text_pictures, TextLook};
 
 // ----- pixel formats -----
 

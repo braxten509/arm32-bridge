@@ -549,29 +549,56 @@ fn draw_look(look: &TextLook, scale: f64) -> Option<(usize, usize, Vec<u8>)> {
     Some((width as usize, height as usize, rgba))
 }
 
-/// A PNG file showing `look` at `scale` pixels per point (fw/pictures.rs),
-/// made once per look; the last 256 looks' files are kept. None when there
-/// is nothing to draw it with.
-pub fn text_picture(look: &TextLook, scale: f64) -> Option<String> {
-    static MADE: Mutex<Vec<(TextLook, u64, Option<String>)>> = Mutex::new(Vec::new());
-    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(at) = made.iter().position(|(seen, seen_scale, _)| seen == look && *seen_scale == scale.to_bits()) {
-        // Most recently used last.
-        let entry = made.remove(at);
-        let file = entry.2.clone();
-        made.push(entry);
-        return file;
-    }
-    let file = draw_look(look, scale)
-        .and_then(|(width, height, rgba)| encode_png(width, height, &rgba, true))
-        .and_then(|bytes| write_png_file(&format!("text \"{}\"", look.text), &bytes));
-    made.push((look.clone(), scale.to_bits(), file.clone()));
-    if made.len() > 256 {
-        if let (_, _, Some(old)) = made.remove(0) {
-            let _ = std::fs::remove_file(old);
+/// The text picture files made so far, least recently used first.
+#[derive(Default)]
+struct TextFiles {
+    made: Vec<(TextLook, u64, Option<String>)>,
+}
+
+impl TextFiles {
+    /// The files for one screen's looks (made by `make` the first time);
+    /// beyond `keep` files the least recently used ones not on this screen
+    /// are deleted.
+    fn files(&mut self, looks: &[&TextLook], scale: f64, keep: usize, make: impl Fn(&TextLook, f64) -> Option<String>) -> Vec<Option<String>> {
+        let files = looks
+            .iter()
+            .map(|&look| {
+                let entry = match self.made.iter().position(|(seen, seen_scale, _)| seen == look && *seen_scale == scale.to_bits()) {
+                    Some(at) => self.made.remove(at),
+                    None => (look.clone(), scale.to_bits(), make(look, scale)),
+                };
+                let file = entry.2.clone();
+                self.made.push(entry);
+                file
+            })
+            .collect();
+        // The screen's own entries were all moved to the end.
+        let unused = self
+            .made
+            .iter()
+            .take_while(|(seen, seen_scale, _)| !(*seen_scale == scale.to_bits() && looks.contains(&seen)))
+            .count();
+        let extra = self.made.len().saturating_sub(keep).min(unused);
+        for (_, _, file) in self.made.drain(..extra) {
+            if let Some(old) = file {
+                let _ = std::fs::remove_file(old);
+            }
         }
+        files
     }
-    file
+}
+
+/// PNG files showing one screen's `looks` at `scale` pixels per point
+/// (fw/pictures.rs), each made once; None for a look there is nothing to
+/// draw with.
+pub fn text_pictures(looks: &[&TextLook], scale: f64) -> Vec<Option<String>> {
+    static MADE: Mutex<TextFiles> = Mutex::new(TextFiles { made: Vec::new() });
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    made.files(looks, scale, 256, |look, scale| {
+        draw_look(look, scale)
+            .and_then(|(width, height, rgba)| encode_png(width, height, &rgba, true))
+            .and_then(|bytes| write_png_file(&format!("text \"{}\"", look.text), &bytes))
+    })
 }
 
 /// The NSString methods this file adds (32-bit games reach them through
@@ -757,6 +784,33 @@ mod tests {
         let cut = rows(&shrinking);
         shrinking.minimum_font_size = Some(4.0);
         assert!(rows(&shrinking) * 2 < cut, "shrunk to fit: {} rows, cut {cut}", rows(&shrinking));
+    }
+
+    /// Every look on screen keeps its file, however many there are, and is
+    /// drawn only once; files no longer shown go when there are too many.
+    #[test]
+    fn shown_text_keeps_its_picture_files() {
+        let folder = std::env::temp_dir().join(format!("text-files-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let drawn = std::cell::Cell::new(0);
+        let make = |look: &TextLook, _: f64| {
+            drawn.set(drawn.get() + 1);
+            let file = folder.join(&look.text).to_string_lossy().into_owned();
+            std::fs::write(&file, b"png").ok().map(|()| file)
+        };
+        let looks: Vec<TextLook> = (0..5).map(|n| look(&format!("label {n}"), (10.0, 10.0))).collect();
+        let shown: Vec<&TextLook> = looks.iter().collect();
+        let mut files = TextFiles::default();
+        let first = files.files(&shown, 2.0, 4, make);
+        assert!(first.iter().all(|f| f.as_ref().is_some_and(|f| std::path::Path::new(f).exists())), "a shown label's file was deleted: {first:?}");
+        assert_eq!(files.files(&shown, 2.0, 4, make), first, "the same screen again uses the same files");
+        assert_eq!(drawn.get(), 5, "each label drawn once");
+        // A new screen with one label: the old ones beyond 4 files go, oldest first.
+        let other = look("other", (10.0, 10.0));
+        files.files(&[&other], 2.0, 4, make);
+        let kept: Vec<bool> = first.iter().map(|f| std::path::Path::new(f.as_ref().unwrap()).exists()).collect();
+        assert_eq!(kept, [false, false, true, true, true]);
+        let _ = std::fs::remove_dir_all(&folder);
     }
 
     /// 32-bit games reach these methods only through a framework_selectors.tsv row.

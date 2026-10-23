@@ -43,6 +43,8 @@ acceleration	{CMAcceleration=ddd}@:	ambiguous:CMAccelerometerData
 accountsWithAccountType:	@@:@
 accountTypeWithAccountTypeIdentifier:	@@:@
 addArcWithCenter:radius:startAngle:endAngle:clockwise:	v@:{CGPoint=ff}fffc
+addAttribute:value:range:	v@:@@{_NSRange=II}
+addAttributes:range:	v@:@{_NSRange=II}
 addButtonWithTitle:	i@:@
 addCharactersInString:	v@:@
 addChildViewController:	v@:@
@@ -65,6 +67,7 @@ allHeaderFields	@@:
 allKeys	@@:
 allKeysForObject:	@@:@
 anyObject	@@:
+appendAttributedString:	v@:@
 appendBytes:length:	v@:r^vI
 appendData:	v@:@
 appendFormat:	v@:@	format
@@ -77,6 +80,10 @@ arrayWithContentsOfFile:	@@:@
 arrayWithObject:	@@:@
 arrayWithObjects:	@@:@	nil-list
 arrayWithObjects:count:	@@:^@I	in-array
+attribute:atIndex:effectiveRange:	@@:@I^{_NSRange=II}
+attributedText	@@:
+attributedTitleForState:	@@:I
+attributesAtIndex:effectiveRange:	@@:I^{_NSRange=II}
 authenticateWithCompletionHandler:	v@:@?
 autorelease	@@:
 awakeFromNib	v@:
@@ -146,6 +153,7 @@ countByEnumeratingWithState:objects:count:	I@:^{NSFastEnumerationState=I^@^I[5I]
 createDirectoryAtPath:withIntermediateDirectories:attributes:error:	c@:@c@^@
 createFileAtPath:contents:attributes:	c@:@@@
 cStringUsingEncoding:	r*@:I
+currentAttributedTitle	@@:
 currentContext	@@:
 currentDevice	@@:
 currentHandler	@@:
@@ -254,6 +262,7 @@ infoDictionary	@@:
 initWithActivityIndicatorStyle:	@@:i
 initWithAPI:	@@:I
 initWithAPI:sharegroup:	@@:I@
+initWithAttributedString:	@@:@
 initWithBytes:length:	@@:r^vI
 initWithBytes:length:encoding:	@@:r^vII
 initWithBytesNoCopy:length:encoding:freeWhenDone:	@@:^vIIc
@@ -280,6 +289,7 @@ initWithRed:green:blue:alpha:	@@:ffff
 initWithRequest:delegate:	@@:@@
 initWithRequest:delegate:startImmediately:	@@:@@c
 initWithString:	@@:@
+initWithString:attributes:	@@:@@
 initWithTitle:message:delegate:cancelButtonTitle:otherButtonTitles:	@@:@@@@@	nil-list
 initWithURL:cachePolicy:timeoutInterval:	@@:@Id
 initWithURL:parameters:requestMethod:	@@:@@i
@@ -299,6 +309,7 @@ isAuthenticated	c@:
 isEditing	c@:
 isEnabled	c@:
 isEqual:	c@:@
+isEqualToAttributedString:	c@:@
 isEqualToString:	c@:@
 isFileURL	c@:
 isFirstResponder	c@:
@@ -347,6 +358,7 @@ methodSignatureForSelector:	@@::
 modalTransitionStyle	i@:
 moveItemAtPath:toPath:error:	c@:@@^@
 mutableCopy	@@:
+mutableString	@@:
 name	@@:
 new	@@:
 newlineCharacterSet	@@:
@@ -423,6 +435,7 @@ reason	@@:
 redColor	@@:
 release	v@:
 reloadData	v@:
+removeAttribute:range:	v@:@{_NSRange=II}
 removeFromSuperview	v@:
 removeItemAtPath:error:	c@:@^@
 removeLastObject	v@:
@@ -434,6 +447,7 @@ removeObserver:	v@:@
 removeObserver:forKeyPath:	v@:@@
 removeObserver:name:object:	v@:@@@
 renderbufferStorage:fromDrawable:	c@:I@
+replaceCharactersInRange:withString:	v@:{_NSRange=II}@
 reportAchievementWithCompletionHandler:	v@:@?
 reportScoreWithCompletionHandler:	v@:@?
 requestAccessToAccountsWithType:withCompletionHandler:	v@:@@?
@@ -482,6 +496,9 @@ setAnimationDelegate:	v@:@
 setAnimationDidStopSelector:	v@::
 setAnimationDuration:	v@:d
 setArgument:atIndex:	v@:^vi
+setAttributedText:	v@:@
+setAttributedTitle:forState:	v@:@I
+setAttributes:range:	v@:@{_NSRange=II}
 setAutocapitalizationType:	v@:i
 setAutocorrectionType:	v@:i
 setAutoresizesSubviews:	v@:c
