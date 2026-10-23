@@ -201,6 +201,16 @@ impl GuestClasses {
         self.classes.get(&class).map(|c| c.methods.keys().map(String::as_str).collect()).unwrap_or_default()
     }
 
+    /// class_addMethod on a framework class: kept like a category method.
+    pub fn add_framework_method(&mut self, class: &str, meta: bool, sel: &str, imp: u32, types: &str) -> bool {
+        let methods = self.framework_categories.entry((class.to_string(), meta)).or_default();
+        if methods.contains_key(sel) {
+            return false;
+        }
+        methods.insert(sel.to_string(), GuestMethod { imp, types: types.to_string() });
+        true
+    }
+
     /// class_addMethod: adds unless the class itself already has the selector.
     pub fn add_method(&mut self, class: u32, sel: &str, imp: u32, types: &str) -> bool {
         let Some(c) = self.classes.get_mut(&class) else { return false };

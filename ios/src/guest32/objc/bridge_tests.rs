@@ -4,72 +4,10 @@
 use super::bridge::*;
 use super::convert::{HostFrame, HostRet};
 use super::mirror;
+use super::testing::Fake;
 use crate::objc::runtime::{self, Class, Id, Sel};
 use guest32_image::{ClassRo32, ClassTarget, Method32, ObjcClass32, ObjcMetadata32};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-
-const BASE: u32 = 0x10_0000;
-const SIZE: usize = 0x10_0000;
-
-type Code = Arc<dyn Fn(&[u32]) -> u64 + Send + Sync>;
-
-struct Fake {
-    memory: *mut u8,
-    next: Mutex<u32>,
-    code: Mutex<HashMap<u32, Code>>,
-}
-
-unsafe impl Sync for Fake {}
-unsafe impl Send for Fake {}
-
-impl Fake {
-    fn new() -> &'static Fake {
-        let memory = Box::leak(vec![0u8; SIZE].into_boxed_slice()).as_mut_ptr();
-        Box::leak(Box::new(Fake { memory, next: Mutex::new(BASE + 0x1000), code: Mutex::new(HashMap::new()) }))
-    }
-    fn code(&self, imp: u32, f: impl Fn(&[u32]) -> u64 + Send + Sync + 'static) {
-        self.code.lock().unwrap().insert(imp, Arc::new(f));
-    }
-    fn u32_at(&self, addr: u32) -> u32 {
-        u32::from_le_bytes(self.read(addr, 4).try_into().unwrap())
-    }
-    fn text(&self, s: &str) -> u32 {
-        let at = self.alloc_permanent(s.len() as u32 + 1);
-        self.write(at, s.as_bytes());
-        at
-    }
-}
-
-impl GuestSide for Fake {
-    fn read(&self, addr: u32, len: u32) -> Vec<u8> {
-        unsafe { std::slice::from_raw_parts(self.memory.add((addr - BASE) as usize), len as usize).to_vec() }
-    }
-    fn write(&self, addr: u32, data: &[u8]) {
-        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.memory.add((addr - BASE) as usize), data.len()) }
-    }
-    fn alloc(&self, size: u32) -> u32 {
-        self.alloc_permanent(size)
-    }
-    fn free(&self, _addr: u32) {}
-    fn alloc_permanent(&self, size: u32) -> u32 {
-        let mut next = self.next.lock().unwrap();
-        let at = *next;
-        *next += size.div_ceil(8) * 8;
-        at
-    }
-    fn host_address(&self, addr: u32) -> usize {
-        self.memory as usize + (addr - BASE) as usize
-    }
-    fn guest_address(&self, host: usize) -> Option<u32> {
-        let start = self.memory as usize;
-        (host >= start && host < start + SIZE).then(|| BASE + (host - start) as u32)
-    }
-    fn call(&self, imp: u32, words: &[u32]) -> Result<u64, String> {
-        let code = self.code.lock().unwrap().get(&imp).cloned().ok_or(format!("no fake code at {imp:#x}"))?;
-        Ok(code(words))
-    }
-}
+use std::sync::Mutex;
 
 // ----- host classes for the test -----
 

@@ -71,6 +71,33 @@ pub enum SendKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Special {
     ConstantString,
+    StackBlock,
+    MallocBlock,
+    GlobalBlock,
+}
+
+impl Special {
+    pub fn is_block(self) -> bool {
+        matches!(self, Special::StackBlock | Special::MallocBlock | Special::GlobalBlock)
+    }
+}
+
+// Block flags (libclosure).
+pub const BLOCK_REFCOUNT_MASK: u32 = 0xfffe;
+pub const BLOCK_NEEDS_FREE: u32 = 1 << 24;
+pub const BLOCK_HAS_COPY_DISPOSE: u32 = 1 << 25;
+pub const BLOCK_IS_GLOBAL: u32 = 1 << 28;
+pub const BLOCK_HAS_SIGNATURE: u32 = 1 << 30;
+
+/// The host form of a guest block: a global (never copied, never freed)
+/// 64-bit block whose invoke is the mirror trampoline.
+#[repr(C)]
+struct HostBlock {
+    isa: usize,
+    flags: i32,
+    reserved: i32,
+    invoke: usize,
+    descriptor: usize,
 }
 
 pub struct Bridge {
@@ -86,6 +113,10 @@ pub struct Bridge {
     sel_names: HashMap<u32, String>,
     sel_guest: HashMap<String, u32>,
     specials: HashMap<u32, Special>,
+    /// Host block wrappers -> the guest (heap) blocks they run.
+    host_blocks: HashMap<usize, u32>,
+    /// Guest address of the objc_msgSend stand-in (imp of framework Methods).
+    pub msg_send_stub: u32,
 }
 
 /// Where a message goes.
@@ -107,12 +138,51 @@ impl Bridge {
             sel_names: HashMap::new(),
             sel_guest: HashMap::new(),
             specials: HashMap::new(),
+            host_blocks: HashMap::new(),
+            msg_send_stub: 0,
         })
     }
 
     /// Marks guest objects whose isa is `isa` (e.g. `__CFConstantStringClassReference`).
     pub fn set_special(&mut self, isa: u32, kind: Special) {
         self.specials.insert(isa, kind);
+    }
+
+    pub fn special(&self, isa: u32) -> Option<Special> {
+        self.specials.get(&isa).copied()
+    }
+
+    /// The isa registered for a special kind.
+    pub fn special_isa(&self, kind: Special) -> Option<u32> {
+        self.specials.iter().find(|(_, k)| **k == kind).map(|(isa, _)| *isa)
+    }
+
+    /// The host mirror class of a game class.
+    pub fn mirror_of(&self, guest_class: u32) -> Option<usize> {
+        self.mirrors.get(&guest_class).copied()
+    }
+
+    /// Text of a guest string object.
+    pub fn object_text(&mut self, g: &dyn GuestSide, guest: u32) -> Option<String> {
+        let host = self.host_object_for(g, guest).ok()?;
+        (host != 0).then(|| crate::fw::string::get(host))
+    }
+
+    /// A host block that runs guest block `block` (which must already be a
+    /// heap or global block; see functions::block_copy).
+    fn host_block(&mut self, block: u32) -> usize {
+        static DESCRIPTOR: [usize; 2] = [0, std::mem::size_of::<HostBlock>()];
+        let isa = crate::symbols::lookup("__NSConcreteGlobalBlock").map(|s| s.0).unwrap_or(0);
+        let host = crate::symbols::leak(HostBlock {
+            isa,
+            flags: BLOCK_IS_GLOBAL as i32,
+            reserved: 0,
+            invoke: mirror::trampoline_address(),
+            descriptor: DESCRIPTOR.as_ptr() as usize,
+        });
+        self.host_blocks.insert(host, block);
+        self.pair(block, host);
+        host
     }
 
     pub fn selector_name(&mut self, g: &dyn GuestSide, sel: u32) -> String {
@@ -204,6 +274,9 @@ impl Bridge {
     pub fn guest_object(&mut self, g: &dyn GuestSide, host: usize) -> Result<u32, String> {
         if host == 0 {
             return Ok(0);
+        }
+        if let Some(&block) = self.host_blocks.get(&host) {
+            return Ok(block);
         }
         let (class, is_class, name, meta, partner) = {
             let rt = runtime::lock();
@@ -307,6 +380,9 @@ impl Bridge {
                 self.pair(guest, host);
                 Ok(host)
             }
+            // Stack blocks are copied before they reach here (send_from_guest,
+            // functions::block_to_host); a stray one is wrapped as it is.
+            Some(Special::StackBlock | Special::MallocBlock | Special::GlobalBlock) => Ok(self.host_block(guest)),
             None => Err(format!("guest object {guest:#x} (isa {isa:#x}) is not known to the bridge")),
         }
     }
@@ -460,6 +536,20 @@ pub fn send_from_guest(
                 return Ok(GuestRet { r0: if stret { words(0) } else { 0 }, r1: 0 });
             }
             let isa = u32_at(g, receiver);
+            if b.special(isa).is_some_and(Special::is_block) {
+                drop(b);
+                let ctx = super::functions::Ctx { bridge, g };
+                let r0 = match name.as_str() {
+                    "copy" | "retain" => super::functions::block_copy(&ctx, receiver)?,
+                    "release" => {
+                        super::functions::block_release(&ctx, receiver)?;
+                        0
+                    }
+                    "autorelease" | "self" => receiver,
+                    other => return Err(format!("message {other} to a block")),
+                };
+                return Ok(GuestRet { r0, r1: 0 });
+            }
             (receiver, b.resolve(isa, &name)?)
         }
         SendKind::Super2 | SendKind::Super2Stret => {
@@ -487,6 +577,28 @@ pub fn send_from_guest(
         }
         Target::Host { class, meta, via_super } => {
             let (sig, real_float, varargs) = host_signature(&b, &class, meta, &name)?;
+            // The host may keep a block argument: stack blocks move to the heap first.
+            let mut replaced: Vec<(u32, u32)> = Vec::new();
+            let block_words: Vec<u32> = sig
+                .args
+                .iter()
+                .zip(sig.guest_arg_words())
+                .filter(|(ty, _)| **ty == super::encoding::Ty::Block)
+                .map(|(_, at)| at)
+                .collect();
+            if !block_words.is_empty() {
+                let stack_isa = b.special_isa(Special::StackBlock);
+                drop(b);
+                let ctx = super::functions::Ctx { bridge, g };
+                for at in block_words {
+                    let block = get(at);
+                    if block != 0 && stack_isa.is_some_and(|isa| u32_at(g, block) == isa) {
+                        replaced.push((at, super::functions::block_copy(&ctx, block)?));
+                    }
+                }
+                b = lock(bridge);
+            }
+            let get = |i: u32| replaced.iter().find(|r| r.0 == i).map(|r| r.1).unwrap_or_else(|| get(i));
             let call = convert::prepare_host_call(&sig, real_float, varargs, &get, &mut Session { bridge: &mut b, g })?;
             let host_receiver = call.args.x[0] as usize;
             let host_sel = runtime::sel(&name);
@@ -520,6 +632,22 @@ impl Bridge {
 pub fn dispatch_from_host(bridge: &Mutex<Bridge>, g: &dyn GuestSide, frame: &mut HostFrame) -> Result<(), String> {
     let mut b = lock(bridge);
     let host_self = frame.x[0] as usize;
+    if let Some(&block) = b.host_blocks.get(&host_self) {
+        // A host call of a guest block: the block's own signature says how.
+        let flags = u32_at(g, block + 4);
+        let descriptor = u32_at(g, block + 16);
+        if flags & BLOCK_HAS_SIGNATURE == 0 {
+            return Err(format!("the host called guest block {block:#x}, which has no type signature"));
+        }
+        let at = descriptor + 8 + if flags & BLOCK_HAS_COPY_DISPOSE != 0 { 8 } else { 0 };
+        let sig = Signature::parse(&guest_cstr(g, u32_at(g, at)))?;
+        let invoke = u32_at(g, block + 12);
+        let call = convert::prepare_guest_call(&sig, frame, &mut Session { bridge: &mut b, g })?;
+        drop(b);
+        let r = g.call(invoke, &call.words)?;
+        let mut b = lock(bridge);
+        return convert::finish_guest_call(call, r as u32, (r >> 32) as u32, frame, &mut Session { bridge: &mut b, g });
+    }
     let name = unsafe { runtime::cstr(frame.x[1] as usize) };
     let guest_self = b.guest_object(g, host_self)?;
     let isa = u32_at(g, guest_self);

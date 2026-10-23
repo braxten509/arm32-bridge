@@ -15,5 +15,10 @@ pub mod convert;
 #[cfg(test)]
 mod convert_tests;
 pub mod encoding;
+pub mod functions;
+#[cfg(test)]
+mod functions_tests;
 pub mod mirror;
 pub mod selectors;
+#[cfg(test)]
+mod testing;
