@@ -1,6 +1,6 @@
 //! The Objective-C runtime C functions and blocks, on the made-up guest.
 
-use super::bridge::{install, Bridge, GuestSide, Special};
+use super::bridge::{install, set_block_owner, Bridge, GuestSide, Special};
 use super::convert::HostArgs;
 use super::functions::{call_function, Ctx};
 use super::mirror;
@@ -214,4 +214,75 @@ fn autorelease_pools_belong_to_their_thread() {
     pool("objc_autoreleasePoolPop", a).unwrap();
     popped.0.send(()).unwrap();
     assert!(b.join().unwrap().is_ok(), "thread B's pool survived thread A's pop");
+}
+
+static KEPT: Mutex<usize> = Mutex::new(0);
+
+extern "C" fn host_sort(this: Id, _: Sel, block: usize) -> Id {
+    // Runs the comparator now and keeps nothing.
+    let invoke = unsafe { *((block + 16) as *const usize) };
+    let mut args = HostArgs::default();
+    args.x[..3].copy_from_slice(&[block as u64, 5, 6]);
+    mirror::call_host(invoke, &args);
+    this
+}
+
+extern "C" fn host_keep(_: Id, _: Sel, block: usize) {
+    *KEPT.lock().unwrap() = crate::libsystem::mach::block_copy(block as *mut _) as usize;
+}
+
+#[test]
+fn exported_blocks_live_as_long_as_their_host_owners() {
+    let host_class = {
+        let mut rt = runtime::lock();
+        let class = rt.define_class("G32HostKeeper", 0, 16);
+        let (sort, keep) = (rt.sel("sortedArrayUsingComparator:"), rt.sel("setCompletionHandler:"));
+        rt.add_method(class, sort, host_sort as usize);
+        rt.add_method(class, keep, host_keep as usize);
+        class
+    };
+    let g = Fake::new();
+    let bridge: &'static Mutex<Bridge> = Box::leak(Box::new(Mutex::new(Bridge::new(&ObjcMetadata32::default()).unwrap())));
+    let (stack_isa, malloc_isa) = (g.words(&[0; 5]), g.words(&[0; 5]));
+    {
+        let mut b = bridge.lock().unwrap();
+        b.set_special(stack_isa, Special::StackBlock);
+        b.set_special(malloc_isa, Special::MallocBlock);
+    }
+    let ctx = Ctx { bridge, g };
+    let call = |name: &str, words: &[u32]| {
+        let w = |i: u32| words.get(i as usize).copied().unwrap_or(0);
+        call_function(&ctx, name, &w).unwrap() as u32
+    };
+    let _hook = mirror::DISPATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    mirror::set_dispatch(Box::new(move |frame| super::bridge::dispatch_from_host(bridge, g, frame).unwrap()));
+    set_block_owner(g);
+    let runs: &'static Mutex<u32> = Box::leak(Box::new(Mutex::new(0)));
+    g.code(0x4101, move |w| {
+        *runs.lock().unwrap() += 1;
+        u64::from(w[1] + w[2])
+    });
+    let descriptor = g.words(&[0, 20, g.text("i12@?0i4i8")]);
+    let heap = call("_Block_copy", &[g.words(&[stack_isa, 1 << 30, 0, 0x4101, descriptor])]);
+    let count = || g.u32_at(heap + 4) & 0xffff;
+    assert_eq!(count(), 2);
+    let keeper = bridge.lock().unwrap().guest_object(g, runtime::alloc_instance(host_class)).unwrap();
+    let sel = |name: &str| bridge.lock().unwrap().guest_selector(g, name);
+    // Used during the call only: nothing is held afterwards.
+    call("objc_msgSend", &[keeper, sel("sortedArrayUsingComparator:"), heap]);
+    assert_eq!((*runs.lock().unwrap(), count()), (1, 2), "the call's wrapper let go of the block");
+    // Kept by the host (it copied the block): that copy holds a reference.
+    call("objc_msgSend", &[keeper, sel("setCompletionHandler:"), heap]);
+    assert_eq!(count(), 4);
+    call("_Block_release", &[heap]);
+    assert!(!g.freed.lock().unwrap().contains(&heap));
+    let kept = *KEPT.lock().unwrap();
+    let invoke = unsafe { *((kept + 16) as *const usize) };
+    let mut args = HostArgs::default();
+    args.x[..3].copy_from_slice(&[kept as u64, 1, 2]);
+    assert_eq!(mirror::call_host(invoke, &args).x[0] as u32, 3);
+    // When the host's copy is disposed, the guest block goes too.
+    let dispose: extern "C" fn(usize) = unsafe { std::mem::transmute(*((*((kept + 24) as *const usize) + 24) as *const usize)) };
+    dispose(kept);
+    assert!(g.freed.lock().unwrap().contains(&heap));
 }

@@ -247,6 +247,7 @@ fn with_bridge<R>(f: impl FnOnce(&mut Bridge) -> R) -> R {
 pub fn install_program() -> Result<(), String> {
     let (bridge, md) = (bridge().ok_or("no Objective-C bridge")?, METADATA.get().ok_or("no metadata")?);
     install(bridge, &Translator, md)?;
+    super::bridge::set_block_owner(&Translator);
     mirror::set_dispatch(Box::new(|frame| {
         let Some(bridge) = BRIDGE.get() else { return };
         if let Err(error) = dispatch_from_host(bridge, &Translator, frame) {

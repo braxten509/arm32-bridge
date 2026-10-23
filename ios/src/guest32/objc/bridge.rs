@@ -94,15 +94,99 @@ pub const BLOCK_HAS_COPY_DISPOSE: u32 = 1 << 25;
 pub const BLOCK_IS_GLOBAL: u32 = 1 << 28;
 pub const BLOCK_HAS_SIGNATURE: u32 = 1 << 30;
 
-/// The host form of a guest block: a global (never copied, never freed)
-/// 64-bit block whose invoke is the mirror trampoline.
+/// The host form of a guest block: a 64-bit block whose invoke is the
+/// mirror trampoline and which carries its guest block. The bridge's own
+/// wrapper lives for the bridge call that exported it (a stack block to the
+/// host); a host that keeps the block copies it (_Block_copy), and the copy
+/// helper takes a guest reference that the dispose helper gives back.
 #[repr(C)]
 struct HostBlock {
     isa: usize,
     flags: i32,
     reserved: i32,
     invoke: usize,
-    descriptor: usize,
+    descriptor: *const WrapperDescriptor,
+    guest: usize,
+}
+
+#[repr(C)]
+struct WrapperDescriptor {
+    reserved: usize,
+    size: usize,
+    copy: extern "C" fn(*mut HostBlock, *const HostBlock),
+    dispose: extern "C" fn(*mut HostBlock),
+}
+
+static WRAPPER_DESCRIPTOR: WrapperDescriptor =
+    WrapperDescriptor { reserved: 0, size: std::mem::size_of::<HostBlock>(), copy: wrapper_copy, dispose: wrapper_dispose };
+
+/// Host blocks (the bridge's wrappers and the host's copies of them) that
+/// run guest blocks.
+static LIVE_WRAPPERS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+
+/// Guest memory for the copy/dispose helpers (they run from host code).
+static BLOCK_OWNER: std::sync::RwLock<Option<&'static dyn GuestSide>> = std::sync::RwLock::new(None);
+
+thread_local! {
+    /// This thread's wrappers made by the bridge, dropped when the bridge
+    /// call that made them ends (see end_wrapper_scope).
+    static SCOPED_WRAPPERS: std::cell::RefCell<Vec<Box<HostBlock>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn live_wrappers<R>(f: impl FnOnce(&mut HashSet<usize>) -> R) -> R {
+    f(LIVE_WRAPPERS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashSet::new))
+}
+
+/// The guest block a host block runs, if it is one of the bridge's.
+fn wrapper_guest(host: usize) -> Option<u32> {
+    live_wrappers(|live| live.contains(&host)).then(|| unsafe { (*(host as *const HostBlock)).guest as u32 })
+}
+
+/// Takes a reference to a guest heap block (a no-op for global blocks).
+fn retain_guest_block(g: &dyn GuestSide, block: u32) {
+    let flags = u32_at(g, block + 4);
+    if flags & BLOCK_NEEDS_FREE != 0 {
+        let count = ((flags & BLOCK_REFCOUNT_MASK) + 2).min(BLOCK_REFCOUNT_MASK);
+        g.write(block + 4, &((flags & !BLOCK_REFCOUNT_MASK) | count).to_le_bytes());
+    }
+}
+
+extern "C" fn wrapper_copy(destination: *mut HostBlock, source: *const HostBlock) {
+    let guest = unsafe { (*source).guest as u32 };
+    if let Some(g) = *BLOCK_OWNER.read().unwrap_or_else(|e| e.into_inner()) {
+        retain_guest_block(g, guest);
+    }
+    live_wrappers(|live| live.insert(destination as usize));
+}
+
+extern "C" fn wrapper_dispose(block: *mut HostBlock) {
+    live_wrappers(|live| live.remove(&(block as usize)));
+    let guest = unsafe { (*block).guest as u32 };
+    if let Some(g) = *BLOCK_OWNER.read().unwrap_or_else(|e| e.into_inner()) {
+        if let Err(error) = super::functions::release_guest_block(g, guest) {
+            crate::log!("32-bit Objective-C: releasing block {guest:#x}: {error}");
+        }
+    }
+}
+
+/// Where this thread's wrapper list stands (the start of a bridge call).
+fn wrapper_mark() -> usize {
+    SCOPED_WRAPPERS.with(|w| w.borrow().len())
+}
+
+/// Ends a bridge call: its wrappers go, with their guest references (the
+/// host's copies keep their own). Call without the bridge lock held.
+fn end_wrapper_scope(g: &dyn GuestSide, mark: usize) -> Result<(), String> {
+    let ended: Vec<Box<HostBlock>> = SCOPED_WRAPPERS.with(|w| {
+        let mut w = w.borrow_mut();
+        let at = mark.min(w.len());
+        w.split_off(at)
+    });
+    for wrapper in ended {
+        live_wrappers(|live| live.remove(&(&*wrapper as *const HostBlock as usize)));
+        super::functions::release_guest_block(g, wrapper.guest as u32)?;
+    }
+    Ok(())
 }
 
 pub struct Bridge {
@@ -118,8 +202,6 @@ pub struct Bridge {
     sel_names: HashMap<u32, String>,
     sel_guest: HashMap<String, u32>,
     specials: HashMap<u32, Special>,
-    /// Host block wrappers -> the guest (heap) blocks they run.
-    host_blocks: HashMap<usize, u32>,
     /// Host object -> guest copy of its -bytes (address, capacity).
     buffers: HashMap<usize, (u32, u32)>,
     /// Guest address of the objc_msgSend stand-in (imp of framework Methods).
@@ -153,7 +235,6 @@ impl Bridge {
             sel_names: HashMap::new(),
             sel_guest: HashMap::new(),
             specials: HashMap::new(),
-            host_blocks: HashMap::new(),
             buffers: HashMap::new(),
             msg_send_stub: 0,
             init_state: HashMap::new(),
@@ -202,27 +283,23 @@ impl Bridge {
     }
 
     /// A host block that runs guest block `block` (which must already be a
-    /// heap or global block; see functions::block_copy). The wrapper holds a
-    /// reference to a heap block, so the guest's own release can't free it
-    /// while the host may still call it. The 64-bit layer never frees blocks
-    /// (its _Block_release does nothing), so that reference is kept for good.
+    /// heap or global block; see functions::block_copy). It holds a
+    /// reference to the guest block until the bridge call that made it ends;
+    /// a host that keeps it copies it and holds its own.
     fn host_block(&mut self, g: &dyn GuestSide, block: u32) -> usize {
-        let flags = u32_at(g, block + 4);
-        if flags & BLOCK_NEEDS_FREE != 0 {
-            let count = ((flags & BLOCK_REFCOUNT_MASK) + 2).min(BLOCK_REFCOUNT_MASK);
-            g.write(block + 4, &((flags & !BLOCK_REFCOUNT_MASK) | count).to_le_bytes());
-        }
-        static DESCRIPTOR: [usize; 2] = [0, std::mem::size_of::<HostBlock>()];
-        let isa = crate::symbols::lookup("__NSConcreteGlobalBlock").map(|s| s.0).unwrap_or(0);
-        let host = crate::symbols::leak(HostBlock {
+        retain_guest_block(g, block);
+        let isa = crate::symbols::lookup("__NSConcreteStackBlock").map(|s| s.0).unwrap_or(0);
+        let wrapper = Box::new(HostBlock {
             isa,
-            flags: BLOCK_IS_GLOBAL as i32,
+            flags: BLOCK_HAS_COPY_DISPOSE as i32,
             reserved: 0,
             invoke: mirror::trampoline_address(),
-            descriptor: DESCRIPTOR.as_ptr() as usize,
+            descriptor: &WRAPPER_DESCRIPTOR,
+            guest: block as usize,
         });
-        self.host_blocks.insert(host, block);
-        self.pair(block, host);
+        let host = &*wrapper as *const HostBlock as usize;
+        live_wrappers(|live| live.insert(host));
+        SCOPED_WRAPPERS.with(|w| w.borrow_mut().push(wrapper));
         host
     }
 
@@ -316,7 +393,7 @@ impl Bridge {
         if host == 0 {
             return Ok(0);
         }
-        if let Some(&block) = self.host_blocks.get(&host) {
+        if let Some(block) = wrapper_guest(host) {
             return Ok(block);
         }
         let (class, is_class, name, meta, partner) = {
@@ -752,6 +829,11 @@ fn initialize(bridge: &Mutex<Bridge>, g: &dyn GuestSide, class: u32) -> Result<(
     result
 }
 
+/// The guest memory the host-side block helpers use (see HostBlock).
+pub fn set_block_owner(g: &'static dyn GuestSide) {
+    *BLOCK_OWNER.write().unwrap_or_else(|e| e.into_inner()) = Some(g);
+}
+
 /// Type encoding for a message the host answers: the framework table, else
 /// the game's own method of the same name (an override has the same types).
 fn host_signature(b: &Bridge, class: &str, meta: bool, sel: &str) -> Result<(Signature, HostCallOptions), String> {
@@ -833,6 +915,7 @@ pub fn send_from_guest(
             Ok(GuestRet { r0: r as u32, r1: (r >> 32) as u32 })
         }
         Target::Host { class, meta, via_super } => {
+            let mark = wrapper_mark();
             let (sig, options) = host_signature(&b, &class, meta, &name)?;
             // The host may keep a block argument: stack blocks move to the heap first.
             let mut replaced: Vec<(u32, u32)> = Vec::new();
@@ -890,6 +973,7 @@ pub fn send_from_guest(
             for (_, copy) in replaced {
                 super::functions::block_release(&ctx, copy)?;
             }
+            end_wrapper_scope(g, mark)?;
             Ok(result)
         }
     }
@@ -905,10 +989,13 @@ pub fn call_host_function(
     options: HostCallOptions,
     get: &dyn Fn(u32) -> u32,
 ) -> Result<GuestRet, String> {
+    let mark = wrapper_mark();
     let call = convert::prepare_host_call(sig, options, get, &mut Session { bridge: &mut lock(bridge), g })?;
     // Unlocked: the host may message game objects (NSLog's %@ asks for -description).
     let ret = mirror::call_host(address, &call.args);
-    convert::finish_host_call(call, &ret, &mut Session { bridge: &mut lock(bridge), g })
+    let result = convert::finish_host_call(call, &ret, &mut Session { bridge: &mut lock(bridge), g });
+    end_wrapper_scope(g, mark)?;
+    result
 }
 
 impl Bridge {
@@ -929,7 +1016,7 @@ impl Bridge {
 pub fn dispatch_from_host(bridge: &Mutex<Bridge>, g: &dyn GuestSide, frame: &mut HostFrame) -> Result<(), String> {
     let mut b = lock(bridge);
     let host_self = frame.x[0] as usize;
-    if let Some(&block) = b.host_blocks.get(&host_self) {
+    if let Some(block) = wrapper_guest(host_self) {
         // A host call of a guest block: the block's own signature says how.
         let flags = u32_at(g, block + 4);
         let descriptor = u32_at(g, block + 16);

@@ -598,21 +598,27 @@ pub fn block_copy(c: &Ctx, block: u32) -> Result<u32, String> {
 /// _Block_release: drops a heap block's reference; the last one runs its
 /// dispose helper and frees it.
 pub fn block_release(c: &Ctx, block: u32) -> Result<(), String> {
+    release_guest_block(c.g, block)
+}
+
+/// The same, with guest memory only (the host-side block helpers use it).
+pub fn release_guest_block(g: &dyn GuestSide, block: u32) -> Result<(), String> {
     if block == 0 {
         return Ok(());
     }
-    let flags = c.word(block + 4);
+    let word = |addr: u32| u32::from_le_bytes(g.read(addr, 4).try_into().unwrap());
+    let flags = word(block + 4);
     if flags & BLOCK_NEEDS_FREE == 0 {
         return Ok(());
     }
     let count = (flags & BLOCK_REFCOUNT_MASK).saturating_sub(2);
-    c.set_word(block + 4, (flags & !BLOCK_REFCOUNT_MASK) | count);
+    g.write(block + 4, &((flags & !BLOCK_REFCOUNT_MASK) | count).to_le_bytes());
     if count == 0 {
         if flags & BLOCK_HAS_COPY_DISPOSE != 0 {
-            let descriptor = c.word(block + 16);
-            c.g.call(c.word(descriptor + 12), &[block])?;
+            let descriptor = word(block + 16);
+            g.call(word(descriptor + 12), &[block])?;
         }
-        c.g.free(block);
+        g.free(block);
     }
     Ok(())
 }
