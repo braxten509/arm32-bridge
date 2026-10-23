@@ -238,6 +238,30 @@ fn super_calls_pass_through_intermediate_game_classes() {
     assert!(HOST_ALPHA.lock().unwrap().contains(&(host, 0.25)));
 }
 
+#[test]
+fn bytes_asks_a_game_override_of_length_without_holding_the_bridge() {
+    host_class("G32HostBlobBase");
+    let fake = Fake::new();
+    // G32Blob : G32HostBlobBase overrides -length in guest code (2 bytes).
+    let blob = class32(fake, "G32Blob", ClassTarget::External("G32HostBlobBase".into()), "G32HostBlobBase", vec![method("length", "I8@0:4", 0x2201)]);
+    let class = blob.address;
+    let md = ObjcMetadata32 { classes: vec![blob], ..Default::default() };
+    let bridge: &'static Mutex<Bridge> = Box::leak(Box::new(Mutex::new(Bridge::new(&md).unwrap())));
+    install(bridge, fake, &md).unwrap();
+    fake.code(0x2201, |_| 2);
+    let _hook = mirror::DISPATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    mirror::set_dispatch(Box::new(move |frame: &mut HostFrame| {
+        dispatch_from_host(bridge, fake, frame).unwrap();
+    }));
+    let sel = |name: &str| bridge.lock().unwrap().guest_selector(fake, name);
+    let object = send(bridge, fake, &[class, sel("alloc")]).unwrap() as u32;
+    let bytes = sel("bytes");
+    let (done, result) = std::sync::mpsc::channel();
+    std::thread::spawn(move || done.send(send(bridge, fake, &[object, bytes])).unwrap());
+    let copy = result.recv_timeout(std::time::Duration::from_secs(10)).expect("-bytes deadlocked on the bridge lock").unwrap() as u32;
+    assert_eq!(fake.read(copy, 2), &HOST_BYTES[..2]);
+}
+
 static HOST_CG: Mutex<Vec<Id>> = Mutex::new(Vec::new());
 
 extern "C" fn host_cg_image(this: Id, _: Sel) -> Id {

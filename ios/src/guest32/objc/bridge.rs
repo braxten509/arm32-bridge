@@ -661,12 +661,14 @@ pub fn send_from_guest(
             };
             let imp = imp.ok_or_else(|| format!("{}[{class} {name}] is not implemented by the host layer", if meta { "+" } else { "-" }))?;
             let mut ret = mirror::call_host(imp, &call.args);
-            let mut b = lock(bridge);
             // -bytes / -mutableBytes point into host memory: hand the guest a copy
             // (writes through a mutableBytes copy do not reach the host object).
+            // -length first, unlocked: a game subclass may answer it in guest code.
             let pointer = ret.x[0] as usize;
-            if matches!(name.as_str(), "bytes" | "mutableBytes") && pointer != 0 && g.guest_address(pointer).is_none() {
-                let length = runtime::send(host_receiver, "length", &[]);
+            let host_bytes = matches!(name.as_str(), "bytes" | "mutableBytes") && pointer != 0 && g.guest_address(pointer).is_none();
+            let length = if host_bytes { runtime::send(host_receiver, "length", &[]) } else { 0 };
+            let mut b = lock(bridge);
+            if host_bytes {
                 let copy = b.guest_buffer(g, host_receiver, length as u32);
                 g.write(copy, unsafe { std::slice::from_raw_parts(pointer as *const u8, length) });
                 ret.x[0] = g.host_address(copy) as u64;
