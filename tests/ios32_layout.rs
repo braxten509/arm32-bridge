@@ -1,6 +1,6 @@
 //! Memory layouts and Apple system-call decoding (pure: no guest memory is made).
 
-use arm32_bridge::ios32::{self, bind_target, decode_syscall, startup_words, syscall_return, with_carry, AppleCall, BindTarget};
+use arm32_bridge::ios32::{self, bind_target, decode_syscall, startup_words, syscall_return, with_carry, AppleCall, BindTarget, Provided};
 use arm32_bridge::mem::{self, MemoryLayout};
 use guest32_image::{Bind32, BindSource, FixupKind, LibraryRef};
 
@@ -82,10 +82,44 @@ fn weak_imports_nothing_provides_bind_to_zero() {
         lazy_offset: None,
     };
     let library = Some(LibraryRef::Dylib(1));
-    assert_eq!(bind_target(&exports, &bind("_gone", BindSource::Normal, library, true), false), BindTarget::Missing);
-    assert_eq!(bind_target(&exports, &bind("_gone", BindSource::Lazy, library, false), true), BindTarget::Missing);
-    assert_eq!(bind_target(&exports, &bind("_gone", BindSource::Lazy, library, false), false), BindTarget::StandIn);
-    assert_eq!(bind_target(&exports, &bind("_own", BindSource::Weak, None, false), false), BindTarget::Program(0x4001));
+    let nothing = Provided::default();
+    let called = Provided { called_lazily: true, ..Provided::default() };
+    assert_eq!(bind_target(&exports, &bind("_gone", BindSource::Normal, library, true), false, &nothing), BindTarget::Missing);
+    assert_eq!(bind_target(&exports, &bind("_gone", BindSource::Lazy, library, false), true, &called), BindTarget::Missing);
+    assert_eq!(bind_target(&exports, &bind("_gone", BindSource::Lazy, library, false), false, &called), BindTarget::StandIn);
+    assert_eq!(bind_target(&exports, &bind("_own", BindSource::Weak, None, false), false, &nothing), BindTarget::Program(0x4001));
     // A bind that names a library never takes the program's own copy.
-    assert_eq!(bind_target(&exports, &bind("_own", BindSource::Normal, library, false), false), BindTarget::StandIn);
+    assert_eq!(bind_target(&exports, &bind("_own", BindSource::Normal, library, false), false, &called), BindTarget::StandIn);
+    // A weak import something provides is bound to it.
+    let function = Provided { function: true, ..Provided::default() };
+    assert_eq!(bind_target(&exports, &bind("_f", BindSource::Normal, library, true), false, &function), BindTarget::StandIn);
+}
+
+#[test]
+fn data_imports_get_their_own_memory_and_functions_get_stand_ins() {
+    let exports = std::collections::HashMap::new();
+    let pointer = |symbol: &str| Bind32 {
+        source: BindSource::Normal,
+        address: 0x20_0000,
+        segment: 2,
+        kind: FixupKind::Pointer,
+        width: 4,
+        library: Some(LibraryRef::Dylib(1)),
+        symbol: symbol.into(),
+        addend: 0,
+        weak_import: false,
+        lazy_offset: None,
+    };
+    let target = |provided: Provided| bind_target(&exports, &pointer("_x"), false, &provided);
+    // Only reached through a pointer and unknown: data (zero bytes), never an 8-byte stand-in cell.
+    assert_eq!(target(Provided::default()), BindTarget::UnknownData);
+    // Called somewhere (a lazy bind) but unknown: a function that stops the program when called.
+    assert_eq!(target(Provided { called_lazily: true, ..Provided::default() }), BindTarget::StandIn);
+    // Registered data wins over the call guess; a guest library's export wins over both.
+    assert_eq!(target(Provided { data: true, called_lazily: true, ..Provided::default() }), BindTarget::Data);
+    assert_eq!(target(Provided { library: Some(0x0100_0101), data: true, ..Provided::default() }), BindTarget::Library(0x0100_0101));
+    // A registered function reached through a pointer (a callback) is a stand-in.
+    assert_eq!(target(Provided { function: true, ..Provided::default() }), BindTarget::StandIn);
+    assert_eq!(ios32::c_name("__ZdlPv"), "_ZdlPv");
+    assert_eq!(ios32::c_name("_OBJC_CLASS_$_NSObject"), "OBJC_CLASS_$_NSObject");
 }

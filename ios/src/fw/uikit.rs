@@ -110,7 +110,7 @@ pub fn screen_points() -> (f64, f64, f64) {
         let Some(display) = display.filter(|&(w, h)| w >= 1.0 && h >= 1.0) else {
             return (568.0, 320.0, SCALE);
         };
-        let app_dir = crate::loader::loaded().app_dir.clone();
+        let app_dir = crate::loader::app_dir();
         let info = std::fs::read(format!("{app_dir}/Info.plist")).ok().and_then(|bytes| crate::fw::plist::parse(&bytes));
         let files: Vec<String> = std::fs::read_dir(&app_dir)
             .map(|list| list.filter_map(|e| e.ok()?.file_name().into_string().ok()).collect())
@@ -1000,7 +1000,7 @@ pub fn image_info(image: Id) -> Option<&'static ImageInfo> {
 
 extern "C" fn image_named(_: Class, _: Sel, name: Id) -> Id {
     let name = string::get(name);
-    let dir = crate::loader::loaded().app_dir.clone();
+    let dir = crate::loader::app_dir();
     let (stem, ext) = match name.rsplit_once('.') {
         Some((s, e)) if !s.is_empty() => (s.to_string(), e.to_string()),
         _ => (name.clone(), "png".to_string()),

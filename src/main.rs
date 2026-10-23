@@ -290,9 +290,13 @@ fn command_ios32(options: &Options) -> ExitCode {
         start.registers[2],
         start.registers[3]
     );
-    let result = runtime::start_guest(uc, start.pc, &start.registers, start.sp);
+    let result = ios32::run_initializers(uc, &program, &start)
+        .and_then(|count| {
+            println!("Start-up functions run: {count}");
+            runtime::start_guest(uc, start.pc, &start.registers, start.sp)
+        });
     let fallbacks = arm32_bridge::dynarec::fallback_count();
-    match (ios32::first_import(), result) {
+    match (ios32::first_missing_call(), result) {
         (Some((name, registers, lr)), _) => {
             println!(
                 "First import call: {name} (r0-r3 {:#x} {:#x} {:#x} {:#x}, returns to {lr:#010x})",
