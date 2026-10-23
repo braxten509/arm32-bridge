@@ -120,7 +120,8 @@ object Games {
     fun saved(context: Context): List<Game>? = runCatching {
         val saved = JSONObject(savedFile(context).readText())
         val icons = iconFolder(context)
-        val files = saved.getJSONArray("seen")
+        // What an older app read is read again: a newer one may read more (icons, names, kinds).
+        val files = if (saved.optLong("app") == appInstalled(context)) saved.getJSONArray("seen") else JSONArray()
         for (index in 0 until files.length()) {
             val entry = files.getJSONObject(index)
             val path = entry.getString("path")
@@ -132,6 +133,8 @@ object Games {
     }.getOrNull()
 
     private fun savedFile(context: Context) = File(context.filesDir, "games.json")
+    /** When this copy of the app was installed or updated. */
+    private fun appInstalled(context: Context) = context.packageManager.getPackageInfo(context.packageName, 0).lastUpdateTime
     private fun iconFolder(context: Context) = File(context.filesDir, "icons")
 
     /** Keeps `games` and `seen` for [saved]. Each icon is a picture file of its own, written once. */
@@ -144,7 +147,7 @@ object Games {
             seenJson.put(JSONObject().put("path", path).put("length", entry.length).put("modified", entry.modified)
                 .put("game", entry.game?.let(::json) ?: JSONObject.NULL))
         }
-        val saved = JSONObject().put("games", JSONArray(games.mapNotNull(::json))).put("seen", seenJson)
+        val saved = JSONObject().put("games", JSONArray(games.mapNotNull(::json))).put("seen", seenJson).put("app", appInstalled(context))
         val file = savedFile(context)
         val part = File(file.path + ".part")
         part.writeText(saved.toString())
