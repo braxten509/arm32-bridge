@@ -164,6 +164,9 @@ pub fn finish(code: i32) -> ! {
     if RUN_LOOP.load(std::sync::atomic::Ordering::Relaxed) {
         summary += &format!("MILESTONE: start-up finished and the run loop ran ({} timer calls)\n", crate::fw::runloop::timers_fired());
     }
+    if crate::guest32::main_image().is_some() {
+        summary += &format!("translator fallbacks: {}\n", arm32_bridge::dynarec::fallback_count());
+    }
     let frames = crate::fw::eagl::frames_shown();
     if frames > 0 {
         summary += &format!("MILESTONE: the game showed {frames} frames\n");
@@ -259,6 +262,31 @@ fn describe_pointed_memory(registers: &[u64]) {
     }
 }
 
+/// A 32-bit game's registers on the crashing thread (as of its last stand-in
+/// call) and the words on its stack that look like Thumb return addresses.
+fn describe_guest_state() {
+    let Some(r) = arm32_bridge::runtime::guest_registers() else { return };
+    let text: Vec<String> = r.iter().enumerate().map(|(index, value)| format!("r{index}={value:#x}")).collect();
+    line(&format!("  guest: {}", text.join(" ")));
+    // Apple's armv7 code keeps r7 as the frame pointer: [r7] = caller's r7,
+    // [r7 + 4] = return address. Read directly: the guest stack is mapped
+    // while its thread runs.
+    let memory = arm32_bridge::runtime::mem();
+    let (mut frame, mut returns) = (r[7], Vec::new());
+    for _ in 0..24 {
+        if frame % 4 != 0 || frame < r[13] || frame.wrapping_sub(r[13]) > 0x10_0000 {
+            break;
+        }
+        returns.push(format!("{:#x}", memory.read_u32(frame + 4)));
+        let next = memory.read_u32(frame);
+        if next <= frame {
+            break;
+        }
+        frame = next;
+    }
+    line(&format!("  guest call chain (r7): lr={:#x} <- {}", r[14], returns.join(" <- ")));
+}
+
 /// Prints where a crash happened (place, registers, call chain) and stops.
 /// The report takes locks and allocates, which a crash may have left busy:
 /// a second crash ends at once, and a timer ends a report that hangs.
@@ -284,6 +312,7 @@ extern "C" fn on_crash(signal: i32, info: *mut libc::siginfo_t, context: *mut li
         }
         line(&format!("  {text}sp={:#x}", m.sp));
         describe_pointed_memory(&m.regs[..29]);
+        describe_guest_state();
         let mut frame = m.regs[29] as usize;
         for depth in 0..24 {
             if frame == 0 || frame % 8 != 0 {

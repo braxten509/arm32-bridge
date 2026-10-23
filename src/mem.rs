@@ -57,17 +57,27 @@ pub struct MemoryLayout {
     /// Return traps (8 bytes per nesting depth) then stand-ins (8 bytes each).
     pub stub_base: u32,
     pub stub_size: u32,
+    /// Where 32-bit ELF guest libraries are placed: [start, end) (empty: none fit).
+    pub libraries: (u32, u32),
 }
 
 impl MemoryLayout {
     pub fn android() -> MemoryLayout {
-        MemoryLayout { regions: MAPPED_REGIONS.to_vec(), stub_base: STUB_BASE, stub_size: STUB_SIZE }
+        MemoryLayout { regions: MAPPED_REGIONS.to_vec(), stub_base: STUB_BASE, stub_size: STUB_SIZE, libraries: (LIB_BASE, LIB_END) }
     }
 
     /// The regions every layout needs besides its program: heap, runtime
-    /// data and stack, plus a code region for the stub area at `stub_base`.
+    /// data and stack, plus a code region for the stub area at `stub_base`,
+    /// and a code region for guest libraries (libz, libc++) from the first
+    /// MiB above the program (at least LIB_BASE) up to LIB_END.
     pub fn with_program(program: &[(u32, u32, bool)], stub_base: u32, stub_size: u32) -> Result<MemoryLayout, String> {
         let mut regions = program.to_vec();
+        let program_end = program.iter().map(|&(_, end, _)| u64::from(end)).max().unwrap_or(0);
+        let library_start = (program_end.div_ceil(1 << 20) << 20).max(u64::from(LIB_BASE));
+        let libraries = if library_start < u64::from(LIB_END) { (library_start as u32, LIB_END) } else { (0, 0) };
+        if libraries.0 < libraries.1 {
+            regions.push((libraries.0, libraries.1, true));
+        }
         regions.extend([
             (HEAP_BASE, HEAP_END, true),
             (MISC_BASE, MISC_END, false),
@@ -75,7 +85,7 @@ impl MemoryLayout {
             (STACK_BASE, STACK_TOP, false),
         ]);
         regions.sort_unstable();
-        let layout = MemoryLayout { regions, stub_base, stub_size };
+        let layout = MemoryLayout { regions, stub_base, stub_size, libraries };
         layout.validate()?;
         Ok(layout)
     }

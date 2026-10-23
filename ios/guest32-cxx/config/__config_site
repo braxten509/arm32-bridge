@@ -1,0 +1,22 @@
+// libc++ settings for libguest32cxx.so (32-bit iPhone games). See README.md.
+#ifndef _LIBCPP___CONFIG_SITE
+#define _LIBCPP___CONFIG_SITE
+
+#define _LIBCPP_ABI_VERSION 1
+#define _LIBCPP_ABI_NAMESPACE __1
+#define _LIBCPP_HAS_THREAD_API_PTHREAD
+#define _LIBCPP_HAS_NO_VENDOR_AVAILABILITY_ANNOTATIONS
+// type_info equality: same object, or same name (strcmp). Games define their
+// own copies of some type_info objects; names still match.
+#define _LIBCPP_TYPEINFO_COMPARISON_IMPLEMENTATION 2
+#define _LIBCPP_HAS_NO_FILESYSTEM
+#define _LIBCPP_HAS_NO_STD_MODULES
+#define _LIBCPP_HAS_NO_TIME_ZONE_DATABASE
+#define _LIBCPP_PSTL_BACKEND_SERIAL
+#define _LIBCPP_HARDENING_MODE_DEFAULT _LIBCPP_HARDENING_MODE_NONE
+// iPhone OS before 13 has no aligned_alloc; posix_memalign is used.
+#define _LIBCPP_HAS_NO_C11_ALIGNED_ALLOC
+// Not _LIBCPP_ABI_ALTERNATE_STRING_LAYOUT: TownCraft's inlined std::string
+// code reads the usual layout (README.md, "Evidence").
+
+#endif // _LIBCPP___CONFIG_SITE

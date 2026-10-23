@@ -27,6 +27,36 @@ pub fn try_loaded() -> Option<&'static Loaded> {
     LOADED.get()
 }
 
+/// A 32-bit game's program path and .app folder (its code runs on the
+/// translator, so there is no 64-bit `Loaded`).
+static GUEST32_APP: OnceLock<(String, String)> = OnceLock::new();
+
+pub fn set_guest32_app(program_path: &str, app_dir: &str) {
+    let _ = GUEST32_APP.set((program_path.to_string(), app_dir.to_string()));
+}
+
+/// The game's .app folder (64-bit or 32-bit game).
+pub fn app_dir() -> String {
+    try_app_dir().expect("no game loaded")
+}
+
+pub fn try_app_dir() -> Option<String> {
+    match (try_loaded(), GUEST32_APP.get()) {
+        (Some(loaded), _) => Some(loaded.app_dir.clone()),
+        (None, Some((_, app_dir))) => Some(app_dir.clone()),
+        (None, None) => None,
+    }
+}
+
+/// The game's program file (64-bit or 32-bit game).
+pub fn program_path() -> String {
+    match (try_loaded(), GUEST32_APP.get()) {
+        (Some(loaded), _) => loaded.path.clone(),
+        (None, Some((path, _))) => path.clone(),
+        (None, None) => panic!("no game loaded"),
+    }
+}
+
 #[derive(Default)]
 pub struct LoadReport {
     pub functions_found: usize,
@@ -51,7 +81,7 @@ pub fn clear_cache(start: usize, end: usize) {
 /// Names a code address: "SwordGame!function+0x10", or a plain number.
 pub fn describe_address(address: usize) -> String {
     let Some(loaded) = try_loaded() else {
-        return format!("{address:#x}");
+        return describe_host_address(address);
     };
     if address < loaded.start || address >= loaded.end {
         return describe_host_address(address);

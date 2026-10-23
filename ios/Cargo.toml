@@ -14,6 +14,9 @@ name = "ios-run"
 path = "src/main.rs"
 
 [dependencies]
+# 32-bit (armv7) games run on the translator; its loader reads their Mach-O files.
+arm32-bridge = { path = ".." }
+guest32-image = { path = "guest32-image" }
 aes = "0.8"
 blowfish = "0.9"
 cast5 = "0.11"
@@ -25,6 +28,8 @@ libc = "0.2.190"
 miniz_oxide = "0.8"
 libsqlite3-sys = { version = "0.38.2", features = ["bundled"] }
 regex = "1.13.1"
+# Font files: glyph outlines and measures for NSString drawing.
+ttf-parser = { version = "0.25", default-features = false, features = ["std"] }
 symphonia = { version = "0.5", default-features = false, features = ["mp3", "wav", "pcm", "aac", "alac", "isomp4"] }
 
 [build-dependencies]

@@ -177,6 +177,17 @@ pub struct PlatformHooks {
     pub thread_pointer: fn(u32) -> u32,
     /// Whether instructions the translator can't handle may run in Unicorn.
     pub unicorn_allowed: bool,
+    /// 64-bit arguments (long long, double) take the next two words as they
+    /// come: no even-register pair, no 8-byte stack slot, and one may be split
+    /// between r3 and the stack (Apple armv7's APCS rule). False: Android's EABI rule.
+    pub packed_pairs: bool,
+    /// The guest's errno number for a host (Linux) one.
+    pub errno_from_host: fn(i32) -> i32,
+    /// Where a 32-bit ELF library's import goes when neither the library nor
+    /// another loaded library defines it: (name, marked as data, weak,
+    /// library built for the platform's own C library rather than bionic) ->
+    /// address. None: Android's own rules (imports::handler_for / data_import).
+    pub library_import: Option<fn(&str, bool, bool, bool) -> u32>,
 }
 
 /// Android: bionic phone functions, Linux system calls, TPIDRURO = the TLS block.
@@ -186,10 +197,73 @@ pub static ANDROID: PlatformHooks = PlatformHooks {
     syscall: linux_native_syscall,
     thread_pointer: same_block,
     unicorn_allowed: true,
+    packed_pairs: false,
+    errno_from_host: same_errno,
+    library_import: None,
 };
 
 fn same_block(tls_block: u32) -> u32 {
     tls_block
+}
+
+fn same_errno(errno: i32) -> i32 {
+    errno
+}
+
+/// Whether 64-bit arguments are packed (see `PlatformHooks::packed_pairs`).
+#[inline]
+pub fn packed_pairs() -> bool {
+    OTHER_PLATFORM.load(Ordering::Relaxed) && platform().packed_pairs && !ANDROID_RULES.with(Cell::get)
+}
+
+/// The guest's errno number for host errno `errno` (the same on Android).
+pub fn guest_errno(errno: i32) -> i32 {
+    if OTHER_PLATFORM.load(Ordering::Relaxed) && !ANDROID_RULES.with(Cell::get) {
+        (platform().errno_from_host)(errno)
+    } else {
+        errno
+    }
+}
+
+thread_local! {
+    /// On another platform, the call being handled came from a guest library
+    /// built against bionic (an ELF library such as libz): its arguments and
+    /// errno numbers follow Android's rules, not the platform's.
+    static ANDROID_RULES: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Runs a handler for a call from bionic-built guest code under Android's
+/// argument and errno rules. Guest code it calls back runs under the
+/// platform's rules again (see `call_guest_with`).
+pub fn with_android_rules<R>(f: impl FnOnce() -> R) -> R {
+    let outer = ANDROID_RULES.with(|rules| rules.replace(true));
+    let result = f();
+    ANDROID_RULES.with(|rules| rules.set(outer));
+    result
+}
+
+/// While guest code runs, its own stand-ins decide the rules: a callback
+/// from an Android-rules handler doesn't inherit them. (Nothing on Android.)
+struct GuestRules(Option<bool>);
+
+impl GuestRules {
+    fn enter() -> GuestRules {
+        GuestRules(other_platform().then(|| ANDROID_RULES.with(|rules| rules.replace(false))))
+    }
+}
+
+impl Drop for GuestRules {
+    fn drop(&mut self) {
+        if let Some(outer) = self.0 {
+            ANDROID_RULES.with(|rules| rules.set(outer));
+        }
+    }
+}
+
+/// Whether a platform other than Android was chosen.
+#[inline]
+pub fn other_platform() -> bool {
+    OTHER_PLATFORM.load(Ordering::Relaxed)
 }
 
 static PLATFORM: OnceLock<&'static PlatformHooks> = OnceLock::new();
@@ -259,7 +333,9 @@ const LIGHT: &[&str] = &[
 fn light_kind(name: &str, handler: Option<Handler>) -> Light {
     match name {
         _ if handler.is_none() => Light::No,
-        "pthread_mutex_lock" => Light::MutexLock,
+        // Bionic's mutex word; other platforms' mutexes have their own layout.
+        "pthread_mutex_lock" if !other_platform() => Light::MutexLock,
+        "pthread_mutex_lock" => Light::No,
         _ if LIGHT.contains(&name) => Light::Yes,
         _ => Light::No,
     }
@@ -1485,8 +1561,11 @@ fn trap_address(depth: u32) -> u32 {
 
 /// The guest address of the stand-in for `name`, creating it on first use.
 pub fn stub_for(name: &str) -> u32 {
+    make_stub(&mut shared(), name)
+}
+
+fn make_stub(shared: &mut Shared, name: &str) -> u32 {
     let stub_base = mem::layout().stub_base;
-    let mut shared = shared();
     if let Some(&index) = shared.stub_by_name.get(name) {
         return stub_base + index * 8;
     }
@@ -1511,6 +1590,24 @@ pub fn stub_for(name: &str) -> u32 {
     address
 }
 
+/// `slots` stand-ins in a row for an import that may be data or a function
+/// (`slots * 8` bytes): read, it is zeroed memory of its own (on platforms
+/// without Unicorn, where stand-ins hold no code); called at its start, it
+/// runs the stand-in for `name` (later slots are named `name+offset`).
+/// Made once per name.
+pub fn stub_block(name: &str, slots: u32) -> u32 {
+    // One lock for the whole row, so no other stand-in lands inside it.
+    let mut shared = shared();
+    if let Some(&index) = shared.stub_by_name.get(name) {
+        return mem::layout().stub_base + index * 8;
+    }
+    let first = make_stub(&mut shared, name);
+    for slot in 1..slots {
+        make_stub(&mut shared, &format!("{name}+{}", slot * 8));
+    }
+    first
+}
+
 /// Every phone function stand-in made so far, in slot order.
 pub fn stubs() -> Vec<&'static Stub> {
     let count = shared().stub_by_name.len() as u32;
@@ -1524,6 +1621,17 @@ pub fn recent_calls() -> Vec<&'static str> {
         return Vec::new();
     }
     unsafe { &*engine }.get_data().recent.iter().copied().collect()
+}
+
+/// This thread's guest registers r0-r15 as last stored (for crash reports;
+/// inside a phone function: the registers of its call).
+pub fn guest_registers() -> Option<[u32; 16]> {
+    let engine = ENGINE.with(|e| e.get());
+    if engine.is_null() {
+        return None;
+    }
+    let uc = unsafe { &*engine };
+    Some(std::array::from_fn(|register| uc.reg(register)))
 }
 
 /// Hooks get the engine with a borrowed lifetime; ours is always `'static`.
@@ -1792,7 +1900,7 @@ pub fn call_stub(uc: &mut Uc, index: u32) {
     let mut args = Args::from_registers(uc);
     if trace {
         let r = args.registers;
-        crate::log::line(&format!("[call t{}] {name}({:#x}, {:#x}, {:#x}, {:#x})", uc.get_data().id, r[0], r[1], r[2], r[3]));
+        crate::log::line(&format!("[call t{}] {name}({:#x}, {:#x}, {:#x}, {:#x}) from {:#x}", uc.get_data().id, r[0], r[1], r[2], r[3], uc.reg(LR)));
     }
     let started = ticks();
     let resume = uc.reg(LR);
@@ -1890,6 +1998,19 @@ impl Args {
     pub fn from_registers(cpu: &impl GuestCpu) -> Args {
         Args { registers: [cpu.reg(0), cpu.reg(1), cpu.reg(2), cpu.reg(3)], next_register: 0, stack: cpu.reg(SP) }
     }
+
+    /// Arguments in `registers` (r0-r3), the rest from guest address `stack` on.
+    pub fn new(registers: [u32; 4], stack: u32) -> Args {
+        Args { registers, next_register: 0, stack }
+    }
+
+    /// A 64-bit value taken as the next two words: r_n:r_n+1, r3 and the
+    /// first stack word, or two stack words at any 4-byte position.
+    fn packed_u64(&mut self) -> u64 {
+        let low = self.u32();
+        let high = self.u32();
+        u64::from(low) | u64::from(high) << 32
+    }
 }
 
 /// A source of 32-bit-ABI arguments: live registers, or a guest `va_list`.
@@ -1921,6 +2042,9 @@ impl ArgSource for Args {
         value
     }
     fn u64(&mut self) -> u64 {
+        if packed_pairs() {
+            return self.packed_u64();
+        }
         // 64-bit values use an even register pair, or an 8-aligned stack slot.
         if self.next_register < 4 {
             self.next_register = (self.next_register + 1) & !1;
@@ -1951,7 +2075,9 @@ impl ArgSource for VaList {
         value
     }
     fn u64(&mut self) -> u64 {
-        self.pointer = (self.pointer + 7) & !7;
+        if !packed_pairs() {
+            self.pointer = (self.pointer + 7) & !7;
+        }
         let value = mem().read_u64(self.pointer);
         self.pointer += 8;
         value
@@ -1983,12 +2109,15 @@ pub fn call_guest_with(uc: &mut Uc, address: u32, args: &[Arg]) -> Result<u64, S
     if depth >= MAX_DEPTH {
         return Err("guest calls nested too deeply".into());
     }
+    // Arguments as the caller's rules lay them out; the guest code then runs under its own.
+    let packed = packed_pairs();
+    let _rules = GuestRules::enter();
     // The translator runs top-level calls and calls made from its own
     // handlers; calls made while Unicorn is running stay in Unicorn.
     // In parallel mode every call runs there (G4): a Unicorn run could not
     // stop for a stopped world.
     if crate::dynarec::enabled() && (depth == 0 || live_native(uc).is_some() || parallel()) {
-        return call_guest_native(uc, address, args, depth);
+        return call_guest_native(uc, address, args, packed, depth);
     }
     let saved = if depth > 0 {
         let mut context = uc.context_alloc().map_err(|e| format!("{e:?}"))?;
@@ -1998,7 +2127,7 @@ pub fn call_guest_with(uc: &mut Uc, address: u32, args: &[Arg]) -> Result<u64, S
         None
     };
 
-    let (registers, stack_words) = lay_out_arguments(args);
+    let (registers, stack_words) = lay_out_arguments(args, packed);
     let mut sp = if depth > 0 {
         (uc.reg_read(RegisterARM::SP).unwrap() as u32 - 256) & !7
     } else {
@@ -2071,7 +2200,7 @@ pub fn call_guest_with(uc: &mut Uc, address: u32, args: &[Arg]) -> Result<u64, S
 }
 
 /// The same call on the translator: state lives in the thread's `CpuState`.
-fn call_guest_native(uc: &mut Uc, address: u32, args: &[Arg], depth: u32) -> Result<u64, String> {
+fn call_guest_native(uc: &mut Uc, address: u32, args: &[Arg], packed: bool, depth: u32) -> Result<u64, String> {
     if uc.get_data().native.is_none() {
         let tls = (platform().thread_pointer)(uc.get_data().tls_block);
         let flag = attention_flag_address(uc);
@@ -2103,7 +2232,7 @@ fn call_guest_native(uc: &mut Uc, address: u32, args: &[Arg], depth: u32) -> Res
     if unicorn_live {
         crate::dynarec::seed_from_unicorn(uc);
     }
-    let (registers, stack_words) = lay_out_arguments(args);
+    let (registers, stack_words) = lay_out_arguments(args, packed);
     let stack_top = uc.get_data().stack_top;
     let native = uc.get_data_mut().native.as_mut().unwrap();
     let was_active = native.active;
@@ -2204,12 +2333,24 @@ pub fn start_guest(uc: &mut Uc, pc: u32, registers: &[u32; 13], sp: u32) -> Resu
     Ok(r0 | (r1 << 32))
 }
 
-/// Registers r0-r3 and stack words for a softfp call.
-fn lay_out_arguments(args: &[Arg]) -> ([u32; 4], Vec<u32>) {
+/// Registers r0-r3 and stack words for a softfp call. `packed`: Apple
+/// armv7's rule for 64-bit values (see `PlatformHooks::packed_pairs`).
+pub fn lay_out_arguments(args: &[Arg], packed: bool) -> ([u32; 4], Vec<u32>) {
     let mut registers = [0u32; 4];
     let mut next_register = 0usize;
     let mut stack_words: Vec<u32> = Vec::new();
     for arg in args {
+        if let (Arg::Pair(value), true) = (*arg, packed) {
+            for word in [value as u32, (value >> 32) as u32] {
+                if next_register < 4 {
+                    registers[next_register] = word;
+                    next_register += 1;
+                } else {
+                    stack_words.push(word);
+                }
+            }
+            continue;
+        }
         match *arg {
             Arg::Word(value) => {
                 if next_register < 4 {

@@ -28,7 +28,7 @@ struct Entry {
 static LIVE: Mutex<Option<HashMap<Id, Entry>>> = Mutex::new(None);
 
 /// The classes whose objects count (exact classes: only our code makes them).
-static CLASSES: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
+static CLASSES: [AtomicUsize; 8] = [const { AtomicUsize::new(0) }; 8];
 
 fn live() -> std::sync::MutexGuard<'static, Option<HashMap<Id, Entry>>> {
     LIVE.lock().unwrap_or_else(|e| e.into_inner())

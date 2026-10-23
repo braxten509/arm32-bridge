@@ -27,6 +27,9 @@ use image::ImageDecoder;
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 
+mod shapes;
+mod text;
+
 // ----- pixel formats -----
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -405,6 +408,8 @@ struct Classes {
     context: Class,
     space: Class,
     gradient: Class,
+    path: Class,
+    provider: Class,
 }
 
 fn classes() -> &'static Classes {
@@ -595,12 +600,40 @@ extern "C" fn gradient_create_with_color_components(space: Id, components: *cons
 
 // ----- bitmap contexts -----
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct GraphicsState {
     ctm: Transform,
     /// Straight red, green, blue, alpha.
     fill: [f64; 4],
     alpha: f64,
+    stroke: [f64; 4],
+    line_width: f64,
+    /// Colour spaces CGContextSetFillColor / SetStrokeColor read components in.
+    fill_space: Space,
+    stroke_space: Space,
+    /// CGBlendMode (only normal, clear and copy differ here).
+    blend_mode: i32,
+    /// How much of each device pixel (rows from the bottom) drawing may touch.
+    clip: Option<Arc<Vec<f32>>>,
+    /// CGTextDrawingMode: fill, stroke or both (fw/graphics/text.rs).
+    text_mode: i32,
+}
+
+impl GraphicsState {
+    fn new() -> GraphicsState {
+        GraphicsState {
+            ctm: IDENTITY,
+            fill: [0.0, 0.0, 0.0, 1.0],
+            alpha: 1.0,
+            stroke: [0.0, 0.0, 0.0, 1.0],
+            line_width: 1.0,
+            fill_space: Space::Rgb,
+            stroke_space: Space::Rgb,
+            blend_mode: 0,
+            clip: None,
+            text_mode: 0,
+        }
+    }
 }
 
 pub struct Canvas {
@@ -615,6 +648,8 @@ pub struct Canvas {
     owned: Option<Vec<u8>>,
     state: GraphicsState,
     saved: Vec<GraphicsState>,
+    /// The path being built, in device space.
+    path: shapes::Outline,
 }
 
 // The memory is the game's or the canvas's own; it's only touched under the context's lock.
@@ -676,13 +711,18 @@ impl Canvas {
             layout,
             data,
             owned,
-            state: GraphicsState { ctm: IDENTITY, fill: [0.0, 0.0, 0.0, 1.0], alpha: 1.0 },
+            state: GraphicsState::new(),
             saved: Vec::new(),
+            path: shapes::Outline::default(),
         })
     }
 
     fn close(&mut self) {
         self.owned = None;
+        // A clip mask is as big as the pixels: nothing of the context's stays.
+        self.state = GraphicsState::new();
+        self.saved = Vec::new();
+        self.path = shapes::Outline::default();
         self.data = std::ptr::null_mut();
         self.width = 0;
         self.height = 0;
@@ -697,10 +737,16 @@ impl Canvas {
 
     /// Device pixel (x, y from the bottom) composited with `src` (premultiplied).
     fn blend(&mut self, x: usize, y: usize, src: [f32; 4], blend: &Blend) {
+        let src = match &self.state.clip {
+            Some(clip) => scaled(src, clip.get(y * self.width + x).copied().unwrap_or(0.0)),
+            None => src,
+        };
         let (layout, at) = (self.layout, (self.height - 1 - y) * self.bytes_per_row + x * self.layout.bytes);
+        let clear = self.state.blend_mode == shapes::BLEND_CLEAR;
         let pixel = &mut self.memory()[at..at + layout.bytes];
         let dst = layout.read(pixel);
         let out = match blend {
+            Blend::Over if clear => scaled(dst, 1.0 - src[3]),
             Blend::Over => over(src, dst),
             Blend::Clear => scaled(dst, 1.0 - src[3]),
         };
@@ -934,7 +980,7 @@ extern "C" fn context_get_ctm(context: Id) -> Transform {
 }
 extern "C" fn context_save_gstate(context: Id) {
     if let Some(mut c) = canvas("CGContextSaveGState", context) {
-        let state = c.state;
+        let state = c.state.clone();
         c.saved.push(state);
     }
 }
@@ -1335,12 +1381,26 @@ extern "C" fn ui_image_write_to_saved_photos_album(picture: Id, target: Id, sele
     })));
 }
 
+/// CFRetain on a data provider counts here (CF objects count with CFRetain);
+/// false for every other object.
+pub fn cf_retain_provider(object: Id) -> bool {
+    shapes::retain_provider(object)
+}
+
+/// CFRelease on a data provider: its bytes go back at the last reference
+/// (CF objects count with CFRelease); false for every other object.
+pub fn cf_release_provider(object: Id) -> bool {
+    shapes::release_provider(object)
+}
+
 pub fn register(r: &mut Registry) {
     let image_class = define_class("CGImage", "NSObject", 16);
     let context = define_class("CGContext", "NSObject", 16);
     let space = define_class("CGColorSpace", "NSObject", 16);
     let gradient = define_class("CGGradient", "NSObject", 16);
-    let _ = CLASSES.set(Classes { image: image_class, context, space, gradient });
+    let path = define_class("CGPath", "NSObject", 16);
+    let provider = define_class("CGDataProvider", "NSObject", 16);
+    let _ = CLASSES.set(Classes { image: image_class, context, space, gradient, path, provider });
     extern "C" fn retain_method(this: Id, _: Sel) -> Id {
         counted::retain(this)
     }
@@ -1354,6 +1414,7 @@ pub fn register(r: &mut Registry) {
         counted::count(this).unwrap_or(1)
     }
     let ui_image = runtime::class_named("UIImage");
+    counted::count_class(provider);
     for class in [image_class, context, ui_image] {
         counted::count_class(class);
         methods(
@@ -1445,6 +1506,8 @@ pub fn register(r: &mut Registry) {
     r.function("UIImagePNGRepresentation", ui_image_png_representation as usize);
     r.function("UIImageJPEGRepresentation", ui_image_jpeg_representation as usize);
     r.function("UIImageWriteToSavedPhotosAlbum", ui_image_write_to_saved_photos_album as usize);
+    shapes::register(r);
+    text::register();
 }
 
 #[cfg(test)]

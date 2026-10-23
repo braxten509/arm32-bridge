@@ -269,13 +269,20 @@ extern "C" fn boolean_type_id() -> usize {
 }
 
 extern "C" fn cf_retain(object: Id) -> Id {
-    crate::fw::corevideo::retained(object);
-    crate::fw::counted::retain(object)
+    // Data providers keep their own count: CFRetain is a retain like any other.
+    if !crate::fw::graphics::cf_retain_provider(object) {
+        crate::fw::corevideo::retained(object);
+        crate::fw::counted::retain(object);
+    }
+    object
 }
 
 extern "C" fn cf_release(object: Id) {
-    crate::fw::corevideo::released(object);
-    crate::fw::counted::release(object);
+    // A data provider's release callback runs at its last reference.
+    if !crate::fw::graphics::cf_release_provider(object) {
+        crate::fw::corevideo::released(object);
+        crate::fw::counted::release(object);
+    }
 }
 
 pub fn register(r: &mut Registry) {

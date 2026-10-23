@@ -333,7 +333,7 @@ pub fn device_model() -> String {
     std::env::var("IOS_DEVICE").unwrap_or_else(|_| "iPhone6,1".into())
 }
 
-fn sysctl_value(name: &str) -> Option<Vec<u8>> {
+pub fn sysctl_value(name: &str) -> Option<Vec<u8>> {
     let cpus = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) }.clamp(1, 2) as i32;
     Some(match name {
         "hw.machine" => {
@@ -389,9 +389,9 @@ extern "C" fn ios_sysctlbyname(name: *const libc::c_char, old: *mut u8, old_leng
     }
 }
 
-extern "C" fn ios_sysctl(mib: *const i32, count: u32, old: *mut u8, old_length: *mut usize, _new: usize, _new_length: usize) -> i32 {
-    let parts: Vec<i32> = (0..count as usize).map(|i| unsafe { *mib.add(i) }).collect();
-    let name = match parts.as_slice() {
+/// The name of a numeric sysctl entry `sysctl_value` knows.
+pub fn sysctl_name(parts: &[i32]) -> Option<&'static str> {
+    match parts {
         [6, 1, ..] => Some("hw.machine"),
         [6, 2, ..] => Some("hw.model"),
         [6, 3, ..] => Some("hw.ncpu"),
@@ -401,8 +401,12 @@ extern "C" fn ios_sysctl(mib: *const i32, count: u32, old: *mut u8, old_length: 
         [6, 15, ..] => Some("hw.cpufrequency"),
         [1, 65, ..] => Some("kern.osversion"),
         _ => None,
-    };
-    if let Some(name) = name {
+    }
+}
+
+extern "C" fn ios_sysctl(mib: *const i32, count: u32, old: *mut u8, old_length: *mut usize, _new: usize, _new_length: usize) -> i32 {
+    let parts: Vec<i32> = (0..count as usize).map(|i| unsafe { *mib.add(i) }).collect();
+    if let Some(name) = sysctl_name(&parts) {
         return unsafe { answer(&sysctl_value(name).unwrap(), old, old_length) };
     }
     if let [1, 14, ..] = parts.as_slice() {

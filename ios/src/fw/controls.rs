@@ -193,8 +193,9 @@ struct Range {
 
 // ----- fonts and text measuring -----
 
-/// How big a piece of text is in the system font, in points, as
-/// sizeWithFont: gives it: an estimate from Helvetica's average letter width
+/// How big a piece of text is in the system font, in points, for labels
+/// and buttons (NSString's sizeWithFont: measures real fonts in
+/// fw/graphics/text.rs): an estimate from Helvetica's average letter width
 /// (0.55 em) and line height (1.2 em), wrapped at `max_width` and cut at
 /// `max_lines` lines (0: no limit), rounded up like UIKit.
 pub fn text_size(text: &str, point_size: f64, max_width: f64, max_lines: usize) -> Size {
@@ -310,24 +311,11 @@ extern "C" fn font_x_height(this: Id, _: Sel) -> f64 {
     font_size(this) * 0.517
 }
 
-// NSString (UIStringDrawing): measuring; drawing isn't done yet.
-extern "C" fn string_size_with_font(this: Id, _: Sel, font: Id) -> Size {
-    text_size(&string::get(this), font_size(font), f64::INFINITY, 1)
-}
-extern "C" fn string_size_constrained(this: Id, _: Sel, font: Id, size: Size) -> Size {
-    let mut result = text_size(&string::get(this), font_size(font), size.width, 0);
-    if size.height > 0.0 {
-        result.height = result.height.min(size.height);
-    }
-    result
-}
-extern "C" fn string_size_constrained_mode(this: Id, s: Sel, font: Id, size: Size, _mode: isize) -> Size {
-    string_size_constrained(this, s, font, size)
-}
-extern "C" fn string_size_for_width(this: Id, _: Sel, font: Id, width: f64, _mode: isize) -> Size {
-    let mut result = text_size(&string::get(this), font_size(font), f64::INFINITY, 1);
-    result.width = result.width.min(width);
-    result
+/// A UIFont's name and point size (nil: the 17-point system font), for
+/// NSString's measuring and drawing (fw/graphics/text.rs).
+pub fn font_name_and_size(font: Id) -> (String, f64) {
+    let name = if font == 0 { String::new() } else { text_of(get_id(font, "fontName")) };
+    (if name.is_empty() { SYSTEM_FONT.to_string() } else { name }, font_size(font))
 }
 
 // ----- shared text properties (labels, text fields, text views) -----
@@ -2030,16 +2018,6 @@ pub fn register(r: &mut Registry) {
             ("xHeight", font_x_height as usize),
         ],
     );
-    methods(
-        runtime::class_named("NSString"),
-        &[
-            ("sizeWithFont:", string_size_with_font as usize),
-            ("sizeWithFont:constrainedToSize:", string_size_constrained as usize),
-            ("sizeWithFont:constrainedToSize:lineBreakMode:", string_size_constrained_mode as usize),
-            ("sizeWithFont:forWidth:lineBreakMode:", string_size_for_width as usize),
-        ],
-    );
-
     let text_common: &[(&str, usize)] = &[
         ("text", text_get as usize),
         ("setText:", text_set as usize),
