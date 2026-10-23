@@ -304,17 +304,27 @@ fn load_runs_parents_first_then_categories_and_initialize_runs_once_before_first
     assert_eq!(*calls.lock().unwrap(), [(0x2301, base_class), (0x2301, sub_class)]);
 }
 
+extern "C" fn host_label(_: Id, _: Sel) -> usize {
+    7
+}
+
 #[test]
 fn framework_categories_reach_subclasses_from_guest_and_host() {
     let parent = host_class("G32HostObj");
     let sub = runtime::lock().define_class("G32HostStr", parent, 16);
+    // The subclass has its own -label, which beats the parent's category method.
+    {
+        let mut rt = runtime::lock();
+        let label = rt.sel("label");
+        rt.add_method(sub, label, host_label as usize);
+    }
     let fake = Fake::new();
     // A game category on G32HostObj adds -twice:; G32HostStr inherits it.
     let category = ObjcCategory32 {
         address: fake.alloc_permanent(4),
         name: "Twice".into(),
         class: ClassTarget::External("G32HostObj".into()),
-        instance_methods: vec![method("twice:", "i12@0:4i8", 0x2401)],
+        instance_methods: vec![method("twice:", "i12@0:4i8", 0x2401), method("label", "i8@0:4", 0x2402)],
         class_methods: vec![],
         protocols: vec![],
         instance_properties: vec![],
@@ -328,6 +338,11 @@ fn framework_categories_reach_subclasses_from_guest_and_host() {
     // From the guest: found on the parent class.
     let twice = bridge.lock().unwrap().guest_selector(fake, "twice:");
     assert_eq!(send(bridge, fake, &[proxy, twice, 21]).unwrap(), 42);
+    fake.code(0x2402, |_| 99);
+    let label = bridge.lock().unwrap().guest_selector(fake, "label");
+    assert_eq!(send(bridge, fake, &[proxy, label]).unwrap(), 7, "the subclass's own method is nearer");
+    let parent_proxy = bridge.lock().unwrap().guest_object(fake, runtime::alloc_instance(parent)).unwrap();
+    assert_eq!(send(bridge, fake, &[parent_proxy, label]).unwrap(), 99);
     // From the host: the host class answers through the trampoline.
     let _hook = mirror::DISPATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     mirror::set_dispatch(Box::new(move |frame: &mut HostFrame| {

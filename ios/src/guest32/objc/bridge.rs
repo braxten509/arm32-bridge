@@ -441,21 +441,31 @@ impl Bridge {
         Ok(Target::Host { class: class.to_string(), meta, via_super })
     }
 
-    /// The game's category method `sel` on framework class `class` or the
-    /// nearest host superclass that has one: (imp, types).
+    /// The game's category method `sel` on framework class `class` or a host
+    /// superclass, unless a class nearer the receiver has its own (native)
+    /// method: categories and native methods are searched together, the
+    /// nearest wins, like the host's own lookup. (imp, types)
     fn framework_category(&self, class: &str, meta: bool, sel: &str) -> Option<(u32, String)> {
-        let mut name = class.to_string();
+        let host_sel = runtime::sel(sel);
+        let trampoline = mirror::trampoline_address();
+        let mut host = runtime::existing_class(class, meta)?;
         loop {
-            if let Some(m) = self.classes.framework_category_method(&name, meta, sel) {
+            let (name, is_meta, native, superclass) = {
+                let rt = runtime::lock();
+                let rec = rt.classes.get(&host)?;
+                (rec.name.clone(), rec.meta, rec.methods.get(&host_sel).copied(), rec.superclass)
+            };
+            if let Some(m) = self.classes.framework_category_method(&name, is_meta, sel) {
                 return Some((m.imp, m.types.clone()));
             }
-            let host = runtime::existing_class(&name, false)?;
-            let rt = runtime::lock();
-            let superclass = rt.classes.get(&host)?.superclass;
+            // A category's own trampoline is not a native method.
+            if native.is_some_and(|imp| imp != trampoline) {
+                return None;
+            }
             if superclass == 0 {
                 return None;
             }
-            name = rt.class_name(superclass);
+            host = superclass;
         }
     }
 
