@@ -34,7 +34,10 @@ FRONT=(
 )
 CXX=(-x c++ -std=c++23 -nostdinc++ -fexceptions -frtti)
 CC=(-x c -std=c11 -fexceptions)
-LLC=(-mtriple=thumbv7-unknown-unknown -target-abi=apcs-gnu -exception-model=sjlj -relocation-model=pic -O2 -filetype=obj)
+# reserve-r9: Apple's armv7 code doesn't keep r9 across calls (iPhone OS 3+),
+# while this triple's rules would keep values there across calls into game
+# code (virtual functions, callbacks); with r9 reserved this code never uses it.
+LLC=(-mtriple=thumbv7-unknown-unknown -mattr=+reserve-r9 -target-abi=apcs-gnu -exception-model=sjlj -relocation-model=pic -O2 -filetype=obj)
 
 # compile <source> <object> [flags...]
 compile() {

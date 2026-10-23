@@ -36,8 +36,13 @@ Every source is compiled by clang **as Apple armv7 code**
 (`-target armv7-apple-ios5.0`: Thumb-2, `__APPLE__`, Apple's `size_t`/`ptrdiff_t`,
 mangling, SjLj exceptions, Apple's struct layouts) to LLVM bitcode. `llc`
 then makes ELF code from it for `thumbv7-unknown-unknown` with
-`-target-abi=apcs-gnu` (Apple's argument rules and data layout) and
-`-exception-model=sjlj`, and `ld.lld` links one shared library. ELF names are
+`-target-abi=apcs-gnu` (Apple's argument rules and data layout),
+`-mattr=+reserve-r9` and `-exception-model=sjlj`, and `ld.lld` links one
+shared library. r9 is reserved because Apple's armv7 code (iPhone OS 3+)
+doesn't keep r9 across calls, while this triple's rules would keep values
+there across calls into game code: TownCraft's own
+`basic_stringbuf::overflow` changed r9 under libc++'s `xsputn`, which then
+copied from address 1. ELF names are
 the C names: the Mach-O name without one leading underscore
 (`__Znwm` → `_Znwm`, `___cxa_throw` → `__cxa_throw`), which is how the
 runner looks them up (`ios32::c_name`).
@@ -105,9 +110,11 @@ armv7 slice; addresses are the file's).
 
 ## Interface with the 32-bit runner (the core helper's side)
 
-`ios/build.rs` runs `build.sh` when `$GUEST32_CXX_OUT/libguest32cxx.so` is
-missing and embeds the library into the iPhone layer (rebuild by hand after
-changing the sources; the next cargo build embeds the new file). The runner
+`ios/build.rs` runs `build.sh test` when the library or its test libraries
+are missing and embeds the library into the iPhone layer. Its folder is
+`$GUEST32_CXX_OUT` if set, else `~/.cache/gamebridge/guest32-cxx/out-<hash>`,
+the hash of every file in this folder: a change here gets a fresh build,
+and checkouts with different rules never share a library. The runner
 (`ios/src/guest32`), before binding the game (`ios32::load`):
 1. registers its C table, then calls `elf::open_bytes(uc,
    "libguest32cxx.so", <embedded>, true)` (`true`: Apple ABI, so its imports
