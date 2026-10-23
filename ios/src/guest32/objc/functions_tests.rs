@@ -182,6 +182,12 @@ fn blocks_copy_to_the_heap_and_run_when_the_host_calls_them() {
     let mut args = HostArgs::default();
     args.x[..3].copy_from_slice(&[host_block as u64, 5, 6]);
     assert_eq!(mirror::call_host(invoke, &args).x[0] as u32, 111);
+    // The host wrapper holds its own reference: the guest's last release
+    // (a completion handler handed over, then released) keeps the block alive.
+    assert_eq!(g.u32_at(heap + 4) & 0xffff, 4);
+    call("_Block_release", &[heap]);
+    assert!(!g.freed.lock().unwrap().contains(&heap), "the host still holds the block");
+    assert_eq!(mirror::call_host(invoke, &args).x[0] as u32, 111);
     // Messages to a guest block: copy keeps it, release lets it go.
     let copy_sel = bridge.lock().unwrap().guest_selector(g, "copy");
     assert_eq!(call("objc_msgSend", &[heap, copy_sel]), heap);

@@ -677,5 +677,8 @@ fn byref_release(c: &Ctx, byref: u32) -> Result<(), String> {
 /// functions that take blocks (dispatch_async, ...).
 pub fn block_to_host(c: &Ctx, block: u32) -> Result<usize, String> {
     let heap = block_copy(c, block)?;
-    c.lock().host_object_for(c.g, heap)
+    let host = c.lock().host_object_for(c.g, heap);
+    // The host wrapper holds its own reference; this copy's goes.
+    block_release(c, heap)?;
+    host
 }

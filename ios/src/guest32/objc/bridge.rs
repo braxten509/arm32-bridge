@@ -188,8 +188,16 @@ impl Bridge {
     }
 
     /// A host block that runs guest block `block` (which must already be a
-    /// heap or global block; see functions::block_copy).
-    fn host_block(&mut self, block: u32) -> usize {
+    /// heap or global block; see functions::block_copy). The wrapper holds a
+    /// reference to a heap block, so the guest's own release can't free it
+    /// while the host may still call it. The 64-bit layer never frees blocks
+    /// (its _Block_release does nothing), so that reference is kept for good.
+    fn host_block(&mut self, g: &dyn GuestSide, block: u32) -> usize {
+        let flags = u32_at(g, block + 4);
+        if flags & BLOCK_NEEDS_FREE != 0 {
+            let count = ((flags & BLOCK_REFCOUNT_MASK) + 2).min(BLOCK_REFCOUNT_MASK);
+            g.write(block + 4, &((flags & !BLOCK_REFCOUNT_MASK) | count).to_le_bytes());
+        }
         static DESCRIPTOR: [usize; 2] = [0, std::mem::size_of::<HostBlock>()];
         let isa = crate::symbols::lookup("__NSConcreteGlobalBlock").map(|s| s.0).unwrap_or(0);
         let host = crate::symbols::leak(HostBlock {
@@ -401,7 +409,7 @@ impl Bridge {
             }
             // Stack blocks are copied before they reach here (send_from_guest,
             // functions::block_to_host); a stray one is wrapped as it is.
-            Some(Special::StackBlock | Special::MallocBlock | Special::GlobalBlock) => Ok(self.host_block(guest)),
+            Some(Special::StackBlock | Special::MallocBlock | Special::GlobalBlock) => Ok(self.host_block(g, guest)),
             None => Err(format!("guest object {guest:#x} (isa {isa:#x}) is not known to the bridge")),
         }
     }
@@ -666,6 +674,12 @@ pub fn send_from_guest(
             let result = convert::finish_host_call(call, &ret, &mut Session { bridge: &mut b, g })?;
             if via_super && name == "dealloc" {
                 b.forget(g, receiver);
+            }
+            drop(b);
+            // The heap copies made above: a host wrapper holds its own reference.
+            let ctx = super::functions::Ctx { bridge, g };
+            for (_, copy) in replaced {
+                super::functions::block_release(&ctx, copy)?;
             }
             Ok(result)
         }
