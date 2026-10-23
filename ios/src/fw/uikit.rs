@@ -843,6 +843,9 @@ extern "C" fn window_set_root_controller(this: Id, _: Sel, controller: Id) {
     // A new root takes the old one's place: its view leaves the window.
     let shown = WINDOWS.lock().unwrap().contains(&this);
     if old != 0 && old != controller {
+        // What the old root presented goes with it (else dismissing it later
+        // would put the old root's view back over the new one).
+        close_presented(old, false, false);
         let hiding = shown && will_disappear(old, false);
         if let Some(view) = property_get(old, "view").map(|view| view as Id).filter(|&view| view != 0 && view_state(view).superview == this) {
             detach(view);
@@ -852,8 +855,9 @@ extern "C" fn window_set_root_controller(this: Id, _: Sel, controller: Id) {
         }
     }
     if controller != 0 {
-        let showing = shown && will_appear(controller, false);
+        // As UIKit: the view is loaded (viewDidLoad) before viewWillAppear:.
         let view = runtime::send(controller, "view", &[]);
+        let showing = shown && will_appear(controller, false);
         if view != 0 {
             let s = runtime::sel("setFrame:");
             if let Some(imp) = runtime::imp_for(view, s) {
@@ -996,18 +1000,18 @@ fn show_presented(presenter: Id, controller: Id, animated: bool) {
     }
 }
 
-/// Takes a presented controller's view out of its window and puts back the
-/// view it covered; `uncovered` (the controller that view belongs to) hears
-/// that it appears again.
-fn hide_presented(controller: Id, uncovered: Id) {
+/// Takes a presented controller's view out of its window and, with
+/// `restore`, puts back the view it covered; `uncovered` (the controller
+/// that view belongs to) hears that it appears again.
+fn hide_presented(controller: Id, uncovered: Id, animated: bool, restore: bool) {
     let Some(window) = property_get(controller, "presentedInWindow").map(|window| window as Id).filter(|&window| window != 0) else {
         return;
     };
     let view = property_get(controller, "view").unwrap_or(0) as Id;
     let covered = property_get(controller, "coveredView").unwrap_or(0) as Id;
-    let hiding = will_disappear(controller, true);
-    let showing = covered != 0 && will_appear(uncovered, true);
-    if covered != 0 {
+    let hiding = will_disappear(controller, animated);
+    let showing = restore && covered != 0 && will_appear(uncovered, animated);
+    if restore && covered != 0 {
         let index = view_state(window).subviews.iter().position(|&v| v == view);
         attach(window, covered, index);
     }
@@ -1017,10 +1021,10 @@ fn hide_presented(controller: Id, uncovered: Id) {
     property_set(controller, "presentedInWindow", 0);
     property_set(controller, "coveredView", 0);
     if hiding {
-        did_disappear(controller, true);
+        did_disappear(controller, animated);
     }
     if showing {
-        did_appear(uncovered, true);
+        did_appear(uncovered, animated);
     }
 }
 
@@ -1051,14 +1055,21 @@ extern "C" fn controller_present_completion(this: Id, _: Sel, controller: Id, an
 /// what it shows and everything shown on top of that; sent to the shown
 /// controller itself (nothing on top) it is passed to the one that
 /// presented it.
-fn dismiss(this: Id) {
+fn dismiss(this: Id, animated: bool) {
     let owner = match property_get(this, "presented") {
         Some(shown) if shown != 0 => this,
         _ => property_get(this, "presenting").unwrap_or(0) as Id,
     };
-    if owner == 0 {
-        return;
+    if owner != 0 {
+        close_presented(owner, animated, true);
     }
+}
+
+/// Closes everything `owner` presents, top first, and unlinks it. With
+/// `restore` (a dismissal) each view put back the view it covered, so
+/// `owner`'s comes back on screen; without (`owner` is leaving its window)
+/// the presented views just go.
+fn close_presented(owner: Id, animated: bool, restore: bool) {
     let mut shown = property_get(owner, "presented").unwrap_or(0) as Id;
     property_set(owner, "presented", 0);
     // Walk up the stack: A shows B shows C; dismissing from A closes B and C.
@@ -1073,7 +1084,7 @@ fn dismiss(this: Id) {
     // Their views leave the window top first, each putting back the view it
     // covered; only `owner` comes back on screen for good.
     for (index, &controller) in closed.iter().enumerate().rev() {
-        hide_presented(controller, if index == 0 { owner } else { 0 });
+        hide_presented(controller, if index == 0 { owner } else { 0 }, animated, restore);
     }
     for shown in closed {
         property_set(shown, "presenting", 0);
@@ -1082,8 +1093,8 @@ fn dismiss(this: Id) {
     }
 }
 
-extern "C" fn controller_dismiss(this: Id, _: Sel, _animated: u8) {
-    dismiss(this);
+extern "C" fn controller_dismiss(this: Id, _: Sel, animated: u8) {
+    dismiss(this, animated != 0);
 }
 
 extern "C" fn controller_dismiss_completion(this: Id, s: Sel, animated: u8, completion: usize) {
@@ -1845,7 +1856,7 @@ mod tests {
             property_set(from, "presented", to as u64);
             property_set(to, "presenting", from as u64);
         }
-        dismiss(a);
+        dismiss(a, false);
         for (object, key) in [(a, "presented"), (b, "presented"), (b, "presenting"), (c, "presenting")] {
             assert_eq!(property_get(object, key), Some(0), "{object:#x} {key}");
         }
@@ -1854,7 +1865,7 @@ mod tests {
         property_set(b, "presenting", a as u64);
         property_set(b, "presented", c as u64);
         property_set(c, "presenting", b as u64);
-        dismiss(c);
+        dismiss(c, false);
         assert_eq!((property_get(b, "presented"), property_get(a, "presented")), (Some(0), Some(b as u64)));
 
         // Block animations: the changes apply at once; completion(YES) waits

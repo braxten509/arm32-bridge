@@ -68,6 +68,7 @@ arrayWithObjects:	@@:@	nil-list
 arrayWithObjects:count:	@@:^@I	in-array
 authenticateWithCompletionHandler:	v@:@?
 autorelease	@@:
+awakeFromNib	v@:
 beginAnimations:context:	v@:@^v
 beginBackgroundTaskWithExpirationHandler:	I@:@?
 bezierPath	@@:
@@ -207,6 +208,7 @@ handleFailureInMethod:object:file:lineNumber:description:	v@::@@i@	format
 hash	I@:
 hasPrefix:	c@:@
 hasSuffix:	c@:@
+highlightedImage	@@:
 hour	i@:
 hudWasHidden:	v@:@
 identifier	@@:
@@ -227,6 +229,7 @@ initWithCapacity:	@@:I
 initWithCategory:	@@:@
 initWithCGImage:	@@:^{CGImage=}
 initWithCGImage:scale:orientation:	@@:^{CGImage=}fi
+initWithCoder:	@@:@
 initWithContentsOfURL:error:	@@:@^@
 initWithCString:encoding:	@@:r*I
 initWithData:	@@:@
@@ -234,6 +237,7 @@ initWithData:encoding:	@@:@I
 initWithFloat:	@@:f	float
 initWithFormat:	@@:@	format
 initWithIdentifier:	@@:@
+initWithIdentifier:source:destination:	@@:@@@
 initWithImage:	@@:@
 initWithInt:	@@:i
 initWithNibName:bundle:	@@:@@
@@ -248,6 +252,8 @@ initWithURL:parameters:requestMethod:	@@:@@i
 initWithWhite:alpha:	@@:ff
 insertObject:atIndex:	v@:@I
 instanceMethodForSelector:	^?@::
+instantiateInitialViewController	@@:
+instantiateViewControllerWithIdentifier:	@@:@
 integerValue	i@:
 intValue	i@:
 invalidate	v@:
@@ -274,6 +280,7 @@ lengthOfBytesUsingEncoding:	I@:I
 lineBreakMode	i@:
 loadAchievementsWithCompletionHandler:	v@:@?
 loadRequest:	v@:@
+loadView	v@:
 localeIdentifier	@@:
 localizedDescription	@@:
 localizedFailureReason	@@:
@@ -290,12 +297,15 @@ mainScreen	@@:
 makeKeyAndVisible	v@:
 methodForSelector:	^?@::
 methodSignatureForSelector:	@@::
+modalTransitionStyle	i@:
 moveItemAtPath:toPath:error:	c@:@@^@
 mutableCopy	@@:
 name	@@:
 new	@@:
 newlineCharacterSet	@@:
 nextObject	@@:
+nibBundle	@@:
+nibName	@@:
 null	@@:
 numberFromString:	@@:@
 numberWithBool:	@@:c
@@ -324,6 +334,7 @@ pathWithComponents:	@@:@
 payment	@@:
 paymentWithProductIdentifier:	@@:@
 percentComplete	d@:
+perform	v@:
 performBlock:waitUntilDone:	v@:@?c
 performBlock:withObject:waitUntilDone:	v@:@?@c
 performRequestWithHandler:	v@:@?
@@ -338,6 +349,7 @@ postNotification:	v@:@
 postNotificationName:object:	v@:@@
 postNotificationName:object:userInfo:	v@:@@@
 predicateWithFormat:	@@:@	format
+prepareForSegue:sender:	v@:@@
 prepareToPlay	c@:
 presentModalViewController:animated:	v@:@c
 presentRenderbuffer:	c@:I
@@ -389,6 +401,7 @@ scanString:intoString:	c@:@^@
 scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:	@@:d@:@c
 scheduleInRunLoop:forMode:	v@:@@
 scheme	@@:
+segueWithIdentifier:source:destination:performHandler:	@@:@@@@?
 selectRowAtIndexPath:animated:scrollPosition:	v@:@ci
 self	@@:
 sender	@@:
@@ -433,6 +446,7 @@ setFrame:	v@:{CGRect={CGPoint=ff}{CGSize=ff}}
 setFrameInterval:	v@:i
 setGameCenterDelegate:	v@:@
 setHidden:	v@:c
+setHighlightedImage:	v@:@
 setHTTPBody:	v@:@
 setHTTPMethod:	v@:@
 setHTTPShouldHandleCookies:	v@:c
@@ -444,6 +458,7 @@ setLineWidth:	v@:f
 setLocale:	v@:@
 setMailComposeDelegate:	v@:@
 setMessageBody:isHTML:	v@:@c
+setModalTransitionStyle:	v@:i
 setMultipleTouchEnabled:	v@:c
 setNeedsDisplay	v@:
 setNeedsLayout	v@:
@@ -488,6 +503,7 @@ sharedApplication	@@:
 sharedHTTPCookieStorage	@@:
 sharedInstance	@@:
 sharegroup	@@:
+shouldPerformSegueWithIdentifier:sender:	c@:@@
 sizeToFit	v@:
 sizeWithFont:	{CGSize=ff}@:@
 sizeWithFont:constrainedToSize:	{CGSize=ff}@:@{CGSize=ff}
@@ -497,6 +513,7 @@ sleepForTimeInterval:	v@:d
 smallSystemFontSize	f@:
 sortedArrayUsingComparator:	@@:@?
 sortedArrayUsingSelector:	@@::
+sourceViewController	@@:
 standardUserDefaults	@@:
 startAccelerometerUpdatesToQueue:withHandler:	v@:@@?
 startAnimating	v@:
@@ -506,6 +523,8 @@ statusBarOrientation	i@:
 statusBarOrientationAnimationDuration	d@:
 stopAccelerometerUpdates	v@:
 stopAnimating	v@:
+storyboard	@@:
+storyboardWithName:bundle:	@@:@@
 stringByAppendingFormat:	@@:@	format
 stringByAppendingPathComponent:	@@:@
 stringByAppendingPathExtension:	@@:@
@@ -563,6 +582,10 @@ valueForAttribute:	@@:@
 valueForKey:	@@:@
 valueForPasteboardType:	@@:@
 view	@@:
+viewDidAppear:	v@:c
+viewDidDisappear:	v@:c
+viewWillAppear:	v@:c
+viewWillDisappear:	v@:c
 visibleRect	{CGRect={CGPoint=ff}{CGSize=ff}}@:
 whiteColor	@@:
 whitespaceCharacterSet	@@:

@@ -183,17 +183,25 @@ fn events_of(controllers: &[Id]) -> Vec<(Id, String)> {
     mine
 }
 
-extern "C" fn noted_will_appear(this: Id, _: Sel, _animated: bool) {
-    note(this, "viewWillAppear:");
+/// The animated flag as the notes write it.
+fn yes_no(flag: bool) -> &'static str {
+    if flag { "YES" } else { "NO" }
 }
-extern "C" fn noted_did_appear(this: Id, _: Sel, _animated: bool) {
-    note(this, "viewDidAppear:");
+
+extern "C" fn noted_will_appear(this: Id, _: Sel, animated: bool) {
+    note(this, &format!("viewWillAppear: {}", yes_no(animated)));
 }
-extern "C" fn noted_will_disappear(this: Id, _: Sel, _animated: bool) {
-    note(this, "viewWillDisappear:");
+extern "C" fn noted_did_appear(this: Id, _: Sel, animated: bool) {
+    note(this, &format!("viewDidAppear: {}", yes_no(animated)));
 }
-extern "C" fn noted_did_disappear(this: Id, _: Sel, _animated: bool) {
-    note(this, "viewDidDisappear:");
+extern "C" fn noted_will_disappear(this: Id, _: Sel, animated: bool) {
+    note(this, &format!("viewWillDisappear: {}", yes_no(animated)));
+}
+extern "C" fn noted_did_disappear(this: Id, _: Sel, animated: bool) {
+    note(this, &format!("viewDidDisappear: {}", yes_no(animated)));
+}
+extern "C" fn noted_did_load(this: Id, _: Sel) {
+    note(this, "viewDidLoad");
 }
 extern "C" fn noted_prepare(this: Id, _: Sel, segue: Id, sender: Id) {
     note(this, "prepareForSegue:sender:");
@@ -257,6 +265,9 @@ fn setup() {
                 ("shouldPerformSegueWithIdentifier:sender:", noted_should_perform as usize),
             ],
         );
+        // The same, also noting when its view is loaded.
+        let loading = define_class("StoryboardTestLoadingController", "StoryboardTestController", 8);
+        methods(loading, &[("viewDidLoad", noted_did_load as usize)]);
         let delegate = define_class("StoryboardTestDelegate", "NSObject", 8);
         methods(delegate, &[("setWindow:", delegate_set_window as usize), ("window", delegate_window as usize)]);
         // A view class of the game's own (as if loaded from its program).
@@ -727,7 +738,7 @@ fn a_segue_prepares_and_presents_its_destination_in_the_window() {
     runtime::send(window, "makeKeyAndVisible", &[]);
     assert_eq!(view_state(source_view).superview, window);
     let appeared = events_of(&[source]);
-    assert_eq!(appeared, [(source, "viewWillAppear:".to_string()), (source, "viewDidAppear:".to_string())], "the root controller appears with its window");
+    assert_eq!(appeared, [(source, "viewWillAppear: NO".to_string()), (source, "viewDidAppear: NO".to_string())], "the root controller appears with its window");
 
     runtime::send(source, "performSegueWithIdentifier:sender:", &[string::make("ShowMapView"), source]);
     let segue = property_get(source, "testPreparedSegue").unwrap_or(0) as Id;
@@ -746,10 +757,10 @@ fn a_segue_prepares_and_presents_its_destination_in_the_window() {
         events_of(&[source, destination]),
         [
             (source, "prepareForSegue:sender:".to_string()),
-            (destination, "viewWillAppear:".to_string()),
-            (source, "viewWillDisappear:".to_string()),
-            (source, "viewDidDisappear:".to_string()),
-            (destination, "viewDidAppear:".to_string()),
+            (destination, "viewWillAppear: YES".to_string()),
+            (source, "viewWillDisappear: YES".to_string()),
+            (source, "viewDidDisappear: YES".to_string()),
+            (destination, "viewDidAppear: YES".to_string()),
         ],
         "performSegueWithIdentifier: doesn't ask shouldPerformSegueWithIdentifier:sender:"
     );
@@ -761,10 +772,10 @@ fn a_segue_prepares_and_presents_its_destination_in_the_window() {
     assert_eq!(
         events_of(&[source, destination]),
         [
-            (destination, "viewWillDisappear:".to_string()),
-            (source, "viewWillAppear:".to_string()),
-            (destination, "viewDidDisappear:".to_string()),
-            (source, "viewDidAppear:".to_string()),
+            (destination, "viewWillDisappear: NO".to_string()),
+            (source, "viewWillAppear: NO".to_string()),
+            (destination, "viewDidDisappear: NO".to_string()),
+            (source, "viewDidAppear: NO".to_string()),
         ]
     );
 
@@ -853,7 +864,7 @@ fn the_main_storyboard_makes_and_shows_the_window() {
 
     show_main_window(delegate, window);
     assert!(crate::fw::uikit::windows().contains(&window), "shown after didFinishLaunching");
-    assert_eq!(events_of(&[controller]), [(controller, "viewWillAppear:".to_string()), (controller, "viewDidAppear:".to_string())]);
+    assert_eq!(events_of(&[controller]), [(controller, "viewWillAppear: NO".to_string()), (controller, "viewDidAppear: NO".to_string())]);
     show_main_window(delegate, window);
     assert!(events_of(&[controller]).is_empty(), "shown once");
 
@@ -875,4 +886,120 @@ fn the_main_storyboard_makes_and_shows_the_window() {
 
     // No main storyboard: nothing is made.
     assert_eq!(load_main_interface_from(&Value::Dict(vec![]), bundle, delegate), 0);
+}
+
+/// A shown window given a new root controller: the controller's view is
+/// loaded (viewDidLoad) before it hears viewWillAppear:, as in UIKit.
+#[test]
+fn a_new_root_of_a_shown_window_loads_its_view_before_it_appears() {
+    setup();
+    let window = new_window();
+    runtime::send(window, "makeKeyAndVisible", &[]);
+    let fresh = runtime::send(runtime::send(runtime::class_named("StoryboardTestLoadingController"), "alloc", &[]), "init", &[]);
+    runtime::send(window, "setRootViewController:", &[fresh]);
+    assert_eq!(
+        events_of(&[fresh]),
+        [(fresh, "viewDidLoad".to_string()), (fresh, "viewWillAppear: NO".to_string()), (fresh, "viewDidAppear: NO".to_string())]
+    );
+}
+
+/// A presents B, then the window's root becomes C: what A presented is
+/// closed with it (B's view leaves, the links go), so dismissing B later
+/// can't put A's view back over C.
+#[test]
+fn replacing_a_presenting_root_closes_what_it_presented() {
+    setup();
+    let new_controller = || runtime::send(runtime::send(runtime::class_named("StoryboardTestController"), "alloc", &[]), "init", &[]);
+    let (first, presented, replacement) = (new_controller(), new_controller(), new_controller());
+    let window = new_window();
+    runtime::send(window, "setRootViewController:", &[first]);
+    runtime::send(window, "makeKeyAndVisible", &[]);
+    runtime::send(first, "presentViewController:animated:completion:", &[presented, 0, 0]);
+    let (first_view, presented_view) = (runtime::send(first, "view", &[]), runtime::send(presented, "view", &[]));
+    assert_eq!((view_state(first_view).superview, view_state(presented_view).superview), (0, window));
+    let _ = events_of(&[first, presented, replacement]);
+
+    runtime::send(window, "setRootViewController:", &[replacement]);
+    let replacement_view = runtime::send(replacement, "view", &[]);
+    assert_eq!(view_state(presented_view).superview, 0, "the presented view leaves with its presenter");
+    assert_eq!(view_state(first_view).superview, 0);
+    assert_eq!(view_state(replacement_view).superview, window);
+    assert_eq!(runtime::send(first, "presentedViewController", &[]), 0);
+    assert_eq!(runtime::send(presented, "presentingViewController", &[]), 0);
+    assert_eq!(
+        events_of(&[first, presented]),
+        [(presented, "viewWillDisappear: NO".to_string()), (presented, "viewDidDisappear: NO".to_string())]
+    );
+
+    runtime::send(presented, "dismissViewControllerAnimated:completion:", &[0, 0]);
+    assert_eq!(view_state(first_view).superview, 0, "the old root stays gone");
+    assert_eq!(view_state(replacement_view).superview, window);
+}
+
+/// 32-bit games send these messages through the bridge, which needs their
+/// types (framework_selectors.tsv) when the game doesn't implement them.
+#[test]
+fn games_on_the_32_bit_bridge_reach_the_storyboard_messages() {
+    use crate::guest32::objc::bridge::{send_from_guest, Bridge, SendKind};
+    use crate::guest32::objc::testing::Fake;
+    setup();
+    let app = test_app("bridge");
+    write_storyboard(&app, "en.lproj", "BridgeBoard", "Start", &[("Start", "UIViewController-start"), ("Map", "UIViewController-map")]);
+    let bundle = bundle_at(&app);
+    let source = test_controller("bridge-start-view", &[]);
+    let destination = test_controller("bridge-map-view", &[]);
+    scene_nib("en.lproj/BridgeBoard.storyboardc/UIViewController-start", source, vec![]);
+    scene_nib("en.lproj/BridgeBoard.storyboardc/UIViewController-map", destination, vec![]);
+
+    let fake = Fake::new();
+    let bridge = Mutex::new(Bridge::new(&guest32_image::ObjcMetadata32::default()).unwrap());
+    let guest = |host: Id| bridge.lock().unwrap().guest_object(fake, host).unwrap();
+    let host = |guest: u32| bridge.lock().unwrap().host_object(guest).unwrap_or(0);
+    let send = |receiver: u32, name: &str, arguments: &[u32]| -> u32 {
+        let selector = bridge.lock().unwrap().guest_selector(fake, name);
+        let words: Vec<u32> = [receiver, selector].iter().chain(arguments).copied().collect();
+        let word = |index: u32| words.get(index as usize).copied().unwrap_or(0);
+        send_from_guest(&bridge, fake, SendKind::Normal, &word).unwrap_or_else(|error| panic!("{name}: {error}")).r0
+    };
+    let class = |name: &str| guest(runtime::class_named(name));
+    let text_object = |value: &str| guest(string::make(value));
+
+    let storyboard = send(class("UIStoryboard"), "storyboardWithName:bundle:", &[text_object("BridgeBoard"), guest(bundle)]);
+    assert_eq!(string::describe_class_of(host(storyboard)), "UIStoryboard");
+    let first = send(storyboard, "instantiateInitialViewController", &[]);
+    assert_eq!(host(first), source);
+    assert_eq!(host(send(storyboard, "instantiateViewControllerWithIdentifier:", &[text_object("Map")])), destination);
+    assert_eq!(send(first, "storyboard", &[]), storyboard);
+    assert_eq!(string::get(host(send(first, "nibName", &[]))), "bridge-start-view");
+    send(first, "nibBundle", &[]);
+    send(first, "setModalTransitionStyle:", &[2]);
+    assert_eq!(send(first, "modalTransitionStyle", &[]), 2);
+    send(first, "shouldPerformSegueWithIdentifier:sender:", &[text_object("Map"), 0]);
+
+    let segue = send(
+        class("UIStoryboardSegue"),
+        "segueWithIdentifier:source:destination:performHandler:",
+        &[text_object("Custom"), first, guest(destination), 0],
+    );
+    assert_eq!(send(segue, "sourceViewController", &[]), first);
+    assert_eq!(host(send(segue, "destinationViewController", &[])), destination);
+    assert_eq!(string::get(host(send(segue, "identifier", &[]))), "Custom");
+    send(first, "prepareForSegue:sender:", &[segue, 0]);
+    send(segue, "perform", &[]);
+    let made = send(send(class("UIStoryboardSegue"), "alloc", &[]), "initWithIdentifier:source:destination:", &[text_object("Made"), first, 0]);
+    assert_eq!(send(made, "sourceViewController", &[]), first);
+
+    let plain = send(send(class("UIViewController"), "alloc", &[]), "init", &[]);
+    send(plain, "loadView", &[]);
+    for name in ["viewWillAppear:", "viewDidAppear:", "viewWillDisappear:", "viewDidDisappear:"] {
+        send(plain, name, &[0]);
+    }
+    send(send(class("NSObject"), "new", &[]), "awakeFromNib", &[]);
+    let view = send(class("UIView"), "alloc", &[]);
+    let coded = coder(vec![("UIBounds", Held::Rect(Rect::new(0.0, 0.0, 30.0, 20.0)))]);
+    assert_eq!(send(view, "initWithCoder:", &[guest(coded)]), view);
+    assert_eq!(call::<Rect>(host(view), "frame").size, Size { width: 30.0, height: 20.0 });
+    let image_view = send(send(class("UIImageView"), "alloc", &[]), "init", &[]);
+    send(image_view, "setHighlightedImage:", &[0]);
+    assert_eq!(send(image_view, "highlightedImage", &[]), 0);
 }
