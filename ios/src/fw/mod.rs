@@ -45,6 +45,7 @@ pub mod runloop;
 pub mod smallclasses;
 pub mod sqlite;
 pub mod storekit;
+pub mod storyboard;
 pub mod services;
 pub mod sound;
 pub mod string;
@@ -68,6 +69,7 @@ pub fn register(r: &mut Registry) {
     controls::register(r);
     nib::register(r);
     unavailable::register(r);
+    storyboard::register(r);
     graphics::register(r);
     runloop::register(r);
     media::register(r);

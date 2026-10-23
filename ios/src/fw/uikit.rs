@@ -783,6 +783,50 @@ extern "C" fn window_make_key_and_visible(this: Id, _: Sel) {
     set_needs_layout(this);
     property_set(this, "hidden", 0);
     crate::log!("window {this:#x} shown");
+    let root = property_get(this, "rootViewController").unwrap_or(0) as Id;
+    if will_appear(root, false) {
+        did_appear(root, false);
+    }
+}
+
+// ----- appearance: viewWillAppear: / viewDidAppear: as a controller's view
+// comes on screen (its window shown, presented) and viewWillDisappear: /
+// viewDidDisappear: as it leaves; "appeared" keeps the pairs in turn. -----
+
+fn tell_appearance(controller: Id, name: &str, animated: bool) {
+    let s = runtime::sel(name);
+    if let Some(imp) = runtime::imp_for(controller, s) {
+        let f: extern "C" fn(Id, Sel, bool) = unsafe { std::mem::transmute(imp) };
+        f(controller, s, animated);
+    }
+}
+
+/// viewWillAppear: unless the controller is on screen already; whether it was sent.
+fn will_appear(controller: Id, animated: bool) -> bool {
+    if controller == 0 || property_get(controller, "appeared") == Some(1) {
+        return false;
+    }
+    tell_appearance(controller, "viewWillAppear:", animated);
+    true
+}
+
+fn did_appear(controller: Id, animated: bool) {
+    property_set(controller, "appeared", 1);
+    tell_appearance(controller, "viewDidAppear:", animated);
+}
+
+/// viewWillDisappear: if the controller is on screen; whether it was sent.
+fn will_disappear(controller: Id, animated: bool) -> bool {
+    if controller == 0 || property_get(controller, "appeared") != Some(1) {
+        return false;
+    }
+    tell_appearance(controller, "viewWillDisappear:", animated);
+    true
+}
+
+fn did_disappear(controller: Id, animated: bool) {
+    property_set(controller, "appeared", 0);
+    tell_appearance(controller, "viewDidDisappear:", animated);
 }
 
 extern "C" fn window_make_key(this: Id, _: Sel) {
@@ -794,9 +838,26 @@ extern "C" fn window_root_controller(this: Id, _: Sel) -> Id {
 }
 
 extern "C" fn window_set_root_controller(this: Id, _: Sel, controller: Id) {
+    let old = property_get(this, "rootViewController").unwrap_or(0) as Id;
     property_set(this, "rootViewController", controller as u64);
+    // A new root takes the old one's place: its view leaves the window.
+    let shown = WINDOWS.lock().unwrap().contains(&this);
+    if old != 0 && old != controller {
+        // What the old root presented goes with it (else dismissing it later
+        // would put the old root's view back over the new one).
+        close_presented(old, false, false);
+        let hiding = shown && will_disappear(old, false);
+        if let Some(view) = property_get(old, "view").map(|view| view as Id).filter(|&view| view != 0 && view_state(view).superview == this) {
+            detach(view);
+        }
+        if hiding {
+            did_disappear(old, false);
+        }
+    }
     if controller != 0 {
+        // As UIKit: the view is loaded (viewDidLoad) before viewWillAppear:.
         let view = runtime::send(controller, "view", &[]);
+        let showing = shown && will_appear(controller, false);
         if view != 0 {
             let s = runtime::sel("setFrame:");
             if let Some(imp) = runtime::imp_for(view, s) {
@@ -806,6 +867,9 @@ extern "C" fn window_set_root_controller(this: Id, _: Sel, controller: Id) {
             attach(this, view, None);
         }
         put_on_screen(controller);
+        if showing {
+            did_appear(controller, false);
+        }
     }
 }
 
@@ -830,10 +894,6 @@ pub fn key_window() -> Id {
 // ----- view controllers: { isa, ... } with the view kept as a property -----
 
 extern "C" fn controller_init(this: Id, _: Sel) -> Id {
-    this
-}
-
-extern "C" fn controller_init_nib(this: Id, _: Sel, _nib: Id, _bundle: Id) -> Id {
     this
 }
 
@@ -888,16 +948,83 @@ fn complete_later(completion: usize) {
     }
 }
 
-/// Links `controller` as shown by `this` (it isn't drawn yet).
-fn present(this: Id, controller: Id) {
-    crate::log!(
-        "view controller {this:#x} shows {} {controller:#x} on top (not drawn yet)",
-        crate::fw::string::describe_class_of(controller)
-    );
+/// Links `controller` as shown by `this`, and puts its view in the window.
+fn present(this: Id, controller: Id, animated: bool) {
+    crate::log!("view controller {this:#x} shows {} {controller:#x} on top", crate::fw::string::describe_class_of(controller));
     property_set(this, "presented", controller as u64);
     if controller != 0 {
         property_set(controller, "presenting", this as u64);
+        // Screens for services this phone doesn't offer have nothing to show.
+        if !runtime::responds(controller, "gamebridgeAnswerShown") {
+            show_presented(this, controller, animated);
+        }
         put_on_screen(controller);
+    }
+}
+
+/// A full-screen presentation, as on iPhones: the presented controller's
+/// view fills the window, and the presenting controller's view leaves it
+/// (kept as "coveredView" for the way back), with the appearance messages.
+fn show_presented(presenter: Id, controller: Id, animated: bool) {
+    let presenter_view = property_get(presenter, "view").unwrap_or(0) as Id;
+    let window = match if presenter_view != 0 { window_of(presenter_view) } else { 0 } {
+        0 => key_window(),
+        window => window,
+    };
+    if window == 0 {
+        return; // nothing is on screen yet: only linked
+    }
+    let covered = if presenter_view != 0 && view_state(presenter_view).superview == window { presenter_view } else { 0 };
+    let view = runtime::send(controller, "view", &[]);
+    if view == 0 {
+        return;
+    }
+    let showing = will_appear(controller, animated);
+    let hiding = covered != 0 && will_disappear(presenter, animated);
+    let s = runtime::sel("setFrame:");
+    if let Some(imp) = runtime::imp_for(view, s) {
+        let f: extern "C" fn(Id, Sel, Rect) = unsafe { std::mem::transmute(imp) };
+        f(view, s, view_bounds(window, 0));
+    }
+    attach(window, view, None);
+    property_set(controller, "presentedInWindow", window as u64);
+    if covered != 0 {
+        detach(covered);
+        property_set(controller, "coveredView", covered as u64);
+    }
+    if hiding {
+        did_disappear(presenter, animated);
+    }
+    if showing {
+        did_appear(controller, animated);
+    }
+}
+
+/// Takes a presented controller's view out of its window and, with
+/// `restore`, puts back the view it covered; `uncovered` (the controller
+/// that view belongs to) hears that it appears again.
+fn hide_presented(controller: Id, uncovered: Id, animated: bool, restore: bool) {
+    let Some(window) = property_get(controller, "presentedInWindow").map(|window| window as Id).filter(|&window| window != 0) else {
+        return;
+    };
+    let view = property_get(controller, "view").unwrap_or(0) as Id;
+    let covered = property_get(controller, "coveredView").unwrap_or(0) as Id;
+    let hiding = will_disappear(controller, animated);
+    let showing = restore && covered != 0 && will_appear(uncovered, animated);
+    if restore && covered != 0 {
+        let index = view_state(window).subviews.iter().position(|&v| v == view);
+        attach(window, covered, index);
+    }
+    if view != 0 && view_state(view).superview == window {
+        detach(view);
+    }
+    property_set(controller, "presentedInWindow", 0);
+    property_set(controller, "coveredView", 0);
+    if hiding {
+        did_disappear(controller, animated);
+    }
+    if showing {
+        did_appear(uncovered, animated);
     }
 }
 
@@ -911,13 +1038,13 @@ fn answer_shown_later(controller: Id) {
     }
 }
 
-extern "C" fn controller_present(this: Id, _: Sel, controller: Id, _animated: u8) {
-    present(this, controller);
+extern "C" fn controller_present(this: Id, _: Sel, controller: Id, animated: u8) {
+    present(this, controller, animated != 0);
     answer_shown_later(controller);
 }
 
-extern "C" fn controller_present_completion(this: Id, _: Sel, controller: Id, _animated: u8, completion: usize) {
-    present(this, controller);
+extern "C" fn controller_present_completion(this: Id, _: Sel, controller: Id, animated: u8, completion: usize) {
+    present(this, controller, animated != 0);
     // As on iOS: the presentation finishes (completion block) before the
     // user can close the screen. The run loop keeps this order.
     complete_later(completion);
@@ -928,31 +1055,46 @@ extern "C" fn controller_present_completion(this: Id, _: Sel, controller: Id, _a
 /// what it shows and everything shown on top of that; sent to the shown
 /// controller itself (nothing on top) it is passed to the one that
 /// presented it.
-fn dismiss(this: Id) {
+fn dismiss(this: Id, animated: bool) {
     let owner = match property_get(this, "presented") {
         Some(shown) if shown != 0 => this,
         _ => property_get(this, "presenting").unwrap_or(0) as Id,
     };
-    if owner == 0 {
-        return;
+    if owner != 0 {
+        close_presented(owner, animated, true);
     }
+}
+
+/// Closes everything `owner` presents, top first, and unlinks it. With
+/// `restore` (a dismissal) each view put back the view it covered, so
+/// `owner`'s comes back on screen; without (`owner` is leaving its window)
+/// the presented views just go.
+fn close_presented(owner: Id, animated: bool, restore: bool) {
     let mut shown = property_get(owner, "presented").unwrap_or(0) as Id;
     property_set(owner, "presented", 0);
     // Walk up the stack: A shows B shows C; dismissing from A closes B and C.
+    let mut closed = Vec::new();
     for _ in 0..64 {
         if shown == 0 {
             break;
         }
-        let next = property_get(shown, "presented").unwrap_or(0) as Id;
+        closed.push(shown);
+        shown = property_get(shown, "presented").unwrap_or(0) as Id;
+    }
+    // Their views leave the window top first, each putting back the view it
+    // covered; only `owner` comes back on screen for good.
+    for (index, &controller) in closed.iter().enumerate().rev() {
+        hide_presented(controller, if index == 0 { owner } else { 0 }, animated, restore);
+    }
+    for shown in closed {
         property_set(shown, "presenting", 0);
         property_set(shown, "presented", 0);
         property_set(shown, "onScreen", 0); // shown again later: announced again
-        shown = next;
     }
 }
 
-extern "C" fn controller_dismiss(this: Id, _: Sel, _animated: u8) {
-    dismiss(this);
+extern "C" fn controller_dismiss(this: Id, _: Sel, animated: u8) {
+    dismiss(this, animated != 0);
 }
 
 extern "C" fn controller_dismiss_completion(this: Id, s: Sel, animated: u8, completion: usize) {
@@ -1453,11 +1595,11 @@ pub fn register(r: &mut Registry) {
         controller,
         &[
             ("init", controller_init as usize),
-            ("initWithNibName:bundle:", controller_init_nib as usize),
+            ("initWithNibName:bundle:", crate::fw::storyboard::controller_init_with_nib as usize),
             ("view", controller_view as usize),
             ("setView:", controller_set_view as usize),
             ("isViewLoaded", controller_is_view_loaded as usize),
-            ("loadView", nothing as usize),
+            ("loadView", crate::fw::storyboard::controller_load_view as usize),
             ("viewDidLoad", nothing as usize),
             ("viewWillLayoutSubviews", nothing as usize),
             ("viewDidLayoutSubviews", nothing as usize),
@@ -1480,7 +1622,8 @@ pub fn register(r: &mut Registry) {
             ("presentedViewController", controller_presented as usize),
             ("modalViewController", controller_presented as usize),
             ("setModalPresentationStyle:", ignore_int as usize),
-            ("setModalTransitionStyle:", ignore_int as usize),
+            ("modalTransitionStyle", crate::fw::storyboard::controller_modal_transition_style as usize),
+            ("setModalTransitionStyle:", crate::fw::storyboard::controller_set_modal_transition_style as usize),
             ("setEdgesForExtendedLayout:", ignore_int as usize),
             ("setExtendedLayoutIncludesOpaqueBars:", ignore_bool as usize),
             ("setAutomaticallyAdjustsScrollViewInsets:", ignore_bool as usize),
@@ -1713,7 +1856,7 @@ mod tests {
             property_set(from, "presented", to as u64);
             property_set(to, "presenting", from as u64);
         }
-        dismiss(a);
+        dismiss(a, false);
         for (object, key) in [(a, "presented"), (b, "presented"), (b, "presenting"), (c, "presenting")] {
             assert_eq!(property_get(object, key), Some(0), "{object:#x} {key}");
         }
@@ -1722,7 +1865,7 @@ mod tests {
         property_set(b, "presenting", a as u64);
         property_set(b, "presented", c as u64);
         property_set(c, "presenting", b as u64);
-        dismiss(c);
+        dismiss(c, false);
         assert_eq!((property_get(b, "presented"), property_get(a, "presented")), (Some(0), Some(b as u64)));
 
         // Block animations: the changes apply at once; completion(YES) waits
