@@ -182,6 +182,41 @@ fn checked_printf_stops_at_the_object_size() {
     assert!(runtime::engine().get_data_mut().fault.take().is_some(), "max length larger than the object stops");
 }
 
+#[test]
+fn streaming_cryptor_round_trip() {
+    // AES-128 CBC with PKCS7 padding (options 1), in two pieces each way.
+    let (key, iv) = (alloc(16), alloc(16));
+    mem().write_bytes(key, &[7; 16]);
+    mem().write_bytes(iv, &[9; 16]);
+    let plain: Vec<u8> = (0..40u8).collect();
+    let input = alloc(48);
+    mem().write_bytes(input, &plain);
+    let crypt = |decrypt: u32, input: u32, length: u32, out: u32| -> u32 {
+        let reference = alloc(4);
+        assert_eq!(call("CCCryptorCreate", [decrypt, 0, 1, key], &[16, iv, reference]).0, 0);
+        let cryptor = mem().read_u32(reference);
+        let moved = alloc(4);
+        let half = length / 2;
+        assert_eq!(call("CCCryptorUpdate", [cryptor, input, half, out], &[64, moved]).0, 0);
+        let mut total = mem().read_u32(moved);
+        assert_eq!(call("CCCryptorUpdate", [cryptor, input + half, length - half, out + total], &[64, moved]).0, 0);
+        total += mem().read_u32(moved);
+        // Too little room for the last piece: kCCBufferTooSmall.
+        assert_eq!(call("CCCryptorFinal", [cryptor, out + total, 0, moved], &[]).0 as i32, -4301);
+        assert_eq!(call("CCCryptorFinal", [cryptor, out + total, 64, moved], &[]).0, 0);
+        total += mem().read_u32(moved);
+        assert_eq!(call("CCCryptorRelease", [cryptor, 0, 0, 0], &[]).0, 0);
+        total
+    };
+    let encrypted = alloc(64);
+    let length = crypt(0, input, 40, encrypted);
+    let expected = crate::fw::crypto::crypt(false, 0, 1, &[7; 16], Some(&[9; 16]), &plain).unwrap();
+    assert_eq!(mem().bytes(encrypted, length as usize), &expected[..]);
+    let decrypted = alloc(64);
+    let length = crypt(1, encrypted, length, decrypted);
+    assert_eq!(mem().bytes(decrypted, length as usize), &plain[..]);
+}
+
 /// The C++ runtime loaded once, as `run` loads it (call before holding the GIL).
 fn cxx() {
     setup();

@@ -63,6 +63,7 @@
 //! Android's handlers (bionic layouts and errno numbers). Their exports bind
 //! directly to the program's imports of the same name.
 
+mod crypto;
 mod libsystem;
 mod locale;
 #[cfg(test)]
@@ -151,6 +152,7 @@ pub fn call(uc: &mut Uc, address: u32, args: &[u32]) -> Result<u64, String> {
 pub fn register_all() {
     libsystem::register();
     locale::register();
+    crypto::register();
 }
 
 /// libc++, libc++abi and the SjLj unwinder for Apple's armv7 ABI
