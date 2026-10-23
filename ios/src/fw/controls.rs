@@ -227,7 +227,7 @@ const SYSTEM_FONT: &str = ".HelveticaNeueInterface-Regular";
 const BOLD_FONT: &str = ".HelveticaNeueInterface-MediumP4";
 
 /// One UIFont object per name and size (games ask for fonts every frame).
-fn font(name: &str, size: f64) -> Id {
+pub fn font(name: &str, size: f64) -> Id {
     static FONTS: Mutex<Option<HashMap<(String, u64), usize>>> = Mutex::new(None);
     let key = (name.to_string(), size.to_bits());
     if let Some(&font) = FONTS.lock().unwrap().get_or_insert_with(HashMap::new).get(&key) {
@@ -242,6 +242,17 @@ fn font(name: &str, size: f64) -> Id {
 
 fn font_size(font: Id) -> f64 {
     if font == 0 { 17.0 } else { get_f(font, "pointSize", 17.0) }
+}
+
+/// The system font with UIFontDescriptor's symbolic traits (1 italic, 2 bold).
+pub fn system_font(traits: isize, size: f64) -> Id {
+    if traits & 2 != 0 {
+        font(BOLD_FONT, size)
+    } else if traits & 1 != 0 {
+        font(".HelveticaNeueInterface-Italic", size)
+    } else {
+        font(SYSTEM_FONT, size)
+    }
 }
 
 extern "C" fn font_system(_: Class, _: Sel, size: f64) -> Id {
