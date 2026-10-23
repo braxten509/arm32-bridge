@@ -88,6 +88,39 @@ fn graphics_objects_cross_as_guest_words() {
 }
 
 #[test]
+fn every_advertised_gl_extension_function_is_provided() {
+    setup();
+    let missing: Vec<&str> = crate::fw::gl::extension_names().into_iter().filter(|name| ios32::function(name).is_none()).collect();
+    assert!(missing.is_empty(), "no guest handler for {missing:?}");
+}
+
+#[test]
+fn a_data_provider_runs_the_games_release_on_the_last_release_only() {
+    // Guest code for the release callback: *(int*)info = 1; return.
+    let code = alloc(12);
+    for (i, word) in [0xE3A0_1001u32, 0xE580_1000, 0xE12F_FF1E].iter().enumerate() {
+        mem().write_u32(code + i as u32 * 4, *word);
+    }
+    let flag = alloc(4);
+    mem().write_u32(flag, 0);
+    let pixels = alloc(16);
+    let (provider, _) = call("CGDataProviderCreateWithData", [flag, pixels, 16, code], &[]);
+    call("CGDataProviderRetain", [provider, 0, 0, 0], &[]);
+    call("CGDataProviderRelease", [provider, 0, 0, 0], &[]);
+    assert_eq!(mem().read_u32(flag), 0, "still held once");
+    let (space, _) = call("CGColorSpaceCreateDeviceRGB", [0; 4], &[]);
+    let (picture, _) = call("CGImageCreate", [2, 2, 8, 32], &[8, space, 1, provider, 0, 0, 0]);
+    assert_ne!(picture, 0);
+    call("CGDataProviderRelease", [provider, 0, 0, 0], &[]);
+    assert_eq!(mem().read_u32(flag), 1);
+    // CFRelease is a last release too.
+    mem().write_u32(flag, 0);
+    let (provider, _) = call("CGDataProviderCreateWithData", [flag, pixels, 16, code], &[]);
+    call("CFRelease", [provider, 0, 0, 0], &[]);
+    assert_eq!(mem().read_u32(flag), 1, "CFRelease ran the callback");
+}
+
+#[test]
 fn openal_device_and_context_are_guest_handles() {
     let (device, _) = call("alcOpenDevice", [0; 4], &[]);
     assert!(device != 0);

@@ -178,8 +178,33 @@ pub fn register() {
 static OWN_PIXELS: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
 /// Guest copies of colours' components (CGColorGetComponents), per host colour.
 static COMPONENTS: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
-/// Guest release callbacks of data providers: (callback, info, data, size).
+/// Guest release callbacks of data providers by key: (callback, info, data, size).
 static RELEASES: Mutex<Option<HashMap<usize, (u32, u32, u32, u32)>>> = Mutex::new(None);
+static NEXT_KEY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
+thread_local! {
+    /// Keys of providers the host let go of, whose guest callbacks are due.
+    static PENDING: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The host's release callback for providers with a guest one.
+extern "C" fn release_trampoline(key: usize, _data: usize, _size: usize) {
+    PENDING.with(|pending| pending.borrow_mut().push(key));
+}
+
+/// Runs the guest release callbacks that became due on this thread.
+pub(super) fn run_pending_releases(uc: &mut arm32_bridge::runtime::Uc) {
+    let due: Vec<usize> = PENDING.with(|pending| std::mem::take(&mut *pending.borrow_mut()));
+    for key in due {
+        let callback = RELEASES.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|m| m.remove(&key));
+        if let Some((function, info, data, size)) = callback {
+            if let Err(error) = crate::guest32::call(uc, function, &[info, data, size]) {
+                arm32_bridge::runtime::stop_with_fault(uc, format!("CGDataProvider release callback: {error}"));
+                return;
+            }
+        }
+    }
+}
 
 fn special() {
     // CGBitmapContextCreate(data, width, height, bitsPerComponent, bytesPerRow, space, info):
@@ -301,18 +326,22 @@ fn special() {
         }),
     );
     // CGDataProviderCreateWithData(info, data, size, release): the release
-    // callback is guest code, called here when the game releases the
-    // provider (as the host does: CGImageCreate copies the bytes).
+    // callback is guest code. The host counts the provider's references and
+    // calls `release_trampoline` on the last one, with a key standing in for
+    // `info`; the guest callback then runs here, where guest code can.
     function(
         "CGDataProviderCreateWithData",
         handler!(|uc, a| {
             let (info, data, size, release) = (a.u32(), a.u32(), a.u32(), a.u32());
             type Create = unsafe extern "C" fn(usize, *const u8, usize, usize) -> usize;
             let Some(create) = host_fn!("CGDataProviderCreateWithData": Create) else { return super::no_host_function(uc, "CGDataProviderCreateWithData") };
-            let provider = unsafe { create(info as usize, mem().host_or_null(data), size as usize, 0) };
-            if provider != 0 && release != 0 {
-                RELEASES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(provider, (release, info, data, size));
-            }
+            let provider = if release == 0 {
+                unsafe { create(info as usize, mem().host_or_null(data), size as usize, 0) }
+            } else {
+                let key = NEXT_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                RELEASES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(key, (release, info, data, size));
+                unsafe { create(key, mem().host_or_null(data), size as usize, release_trampoline as usize) }
+            };
             Ret::U32(object_to_guest(provider))
         }),
     );
@@ -320,18 +349,12 @@ fn special() {
         "CGDataProviderRelease",
         handler!(|uc, a| {
             let provider = object_to_host(a.u32());
-            if provider == 0 {
-                return Ret::Void;
-            }
-            if let Some(release) = host_fn!("CGDataProviderRelease": unsafe extern "C" fn(usize)) {
-                unsafe { release(provider) };
-            }
-            let callback = RELEASES.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|m| m.remove(&provider));
-            if let Some((function, info, data, size)) = callback {
-                if let Err(error) = crate::guest32::call(uc, function, &[info, data, size]) {
-                    arm32_bridge::runtime::stop_with_fault(uc, format!("CGDataProvider release callback: {error}"));
+            if provider != 0 {
+                if let Some(release) = host_fn!("CGDataProviderRelease": unsafe extern "C" fn(usize)) {
+                    unsafe { release(provider) };
                 }
             }
+            run_pending_releases(uc);
             Ret::Void
         }),
     );
