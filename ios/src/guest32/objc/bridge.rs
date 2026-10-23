@@ -1024,6 +1024,20 @@ pub fn send_from_guest(
             Ok(GuestRet { r0: r as u32, r1: (r >> 32) as u32 })
         }
         Target::Host { class, meta, via_super } => {
+            // +instanceMethodForSelector: / -methodForSelector: of a game class:
+            // the game calls the answer itself, so it is the game's own function
+            // (for a framework method, objc_msgSend's stub, which reaches it alike).
+            if matches!(name.as_str(), "instanceMethodForSelector:" | "methodForSelector:") {
+                let owner = if name == "instanceMethodForSelector:" { receiver } else { u32_at(g, receiver) };
+                if b.classes.class(owner).is_some() {
+                    let asked = b.selector_name(g, get(first + 2));
+                    let imp = match b.classes.lookup(owner, &asked) {
+                        Lookup::Guest(m) => m.imp,
+                        Lookup::Framework { .. } | Lookup::Missing => b.msg_send_stub,
+                    };
+                    return Ok(GuestRet { r0: imp, r1: 0 });
+                }
+            }
             // NSException's -raise and +raise:format: from game code: thrown in
             // the guest, as objc_exception_throw throws (the host's own raise
             // would unwind host code).
