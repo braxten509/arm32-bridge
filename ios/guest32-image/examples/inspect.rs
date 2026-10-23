@@ -4,7 +4,10 @@
 //! llvm-nm -a -p -x and llvm-objdump --macho -h, so tools/compare-llvm.sh can
 //! diff them. Nothing is run.
 //!
-//! usage: inspect <file> [--fixups | --symbols | --sections]
+//! `--objc` summarizes the Objective-C metadata; `--framework-selectors`
+//! lists the selectors the program sends that it does not implement itself.
+//!
+//! usage: inspect <file> [--fixups | --symbols | --sections | --exports | --objc | --framework-selectors]
 
 use guest32_image::*;
 
@@ -25,7 +28,61 @@ fn main() {
         "--symbols" => print_symbols(&image),
         "--sections" => print_sections(&image),
         "--exports" => print_exports(&image, &file),
+        "--objc" => print_objc(&image, &file, false),
+        "--framework-selectors" => print_objc(&image, &file, true),
         _ => print_summary(&image),
+    }
+}
+
+/// `--objc`: counts and every class with its superclass; `--framework-selectors`:
+/// the selectors in `__objc_selrefs` that no class or category of the program
+/// itself implements (so they can only be answered by Apple's classes).
+fn print_objc(image: &Image32, file: &[u8], framework_only: bool) {
+    let memory = ImageMemory::new(image, file).unwrap();
+    let objc = read_objc(&memory, &ObjcSections::from_image(image)).unwrap_or_else(|error| {
+        println!("error: {error}");
+        std::process::exit(2)
+    });
+    let mut own = std::collections::HashSet::new();
+    for class in &objc.classes {
+        own.extend(class.instance.methods.iter().chain(&class.meta.methods).map(|m| m.name.as_str()));
+    }
+    for category in &objc.categories {
+        own.extend(category.instance_methods.iter().chain(&category.class_methods).map(|m| m.name.as_str()));
+    }
+    if framework_only {
+        let mut names: Vec<&str> = objc.selector_names().into_iter().filter(|n| !own.contains(n)).collect();
+        names.sort_unstable();
+        for name in names {
+            println!("{name}");
+        }
+        return;
+    }
+    println!(
+        "classes {} categories {} protocols {} selrefs {} (distinct {}) classrefs {} superrefs {} cfstrings {} imageinfo {:x?}",
+        objc.classes.len(),
+        objc.categories.len(),
+        objc.protocols_by_address.len(),
+        objc.selector_refs.len(),
+        objc.selector_names().len(),
+        objc.class_refs.len(),
+        objc.super_refs.len(),
+        objc.cfstrings.len(),
+        objc.image_info
+    );
+    for class in &objc.classes {
+        println!(
+            "class {} : {:?} size {} methods {}+{} ivars {}",
+            class.name,
+            class.superclass,
+            class.instance.instance_size,
+            class.instance.methods.len(),
+            class.meta.methods.len(),
+            class.instance.ivars.len()
+        );
+    }
+    for category in &objc.categories {
+        println!("category {:?} ({}) methods {}+{}", category.class, category.name, category.instance_methods.len(), category.class_methods.len());
     }
 }
 

@@ -34,7 +34,7 @@ enum class Action {
     Convert,
     /** A bundle that already runs on this phone: install its pieces as they are. */
     Install,
-    /** An unpacked iPhone game (a folder ending in .app with 64-bit code): played in Game Bridge's iPhone game screen. */
+    /** An unpacked iPhone game (a folder ending in .app with 64-bit or ARMv7 code): played in Game Bridge's iPhone game screen. */
     PlayIphone,
 }
 
@@ -529,24 +529,28 @@ object Games {
         return Game(game.file, game.place, label, game.packageName, game.versionCode, game.icon, game.action, game.dataFile, game.looseData)
     }
 
-    /** An unpacked iPhone game: its name, id and icon from its Info.plist; null without 64-bit ARM code. */
+    /** An unpacked iPhone game: its name, id and icon from its Info.plist; null without ARM code it can run. */
     private fun readIphone(context: Context, folder: File, place: String): Game? {
         val info = Plist.read(File(folder, "Info.plist")) as? Map<*, *> ?: return null
         fun text(key: String) = (info[key] as? String)?.takeIf { it.isNotBlank() }
         val program = File(folder, text("CFBundleExecutable") ?: return null)
-        if (!hasArm64(program)) return null
+        if (!hasPlayableCode(program)) return null
         val id = text("CFBundleIdentifier") ?: folder.name
         val label = text("CFBundleDisplayName") ?: text("CFBundleName") ?: folder.nameWithoutExtension
         return Game(folder, place, label, id, 0, iphoneIcon(folder, info), Action.PlayIphone)
     }
 
-    /** CPU_TYPE_ARM64 in an Apple program: a 64-bit one, or one part of a universal file. */
-    private fun hasArm64(program: File): Boolean = runCatching {
+    /**
+     * Code the iPhone layer runs in an Apple program (a thin one, or one part of a universal file):
+     * CPU_TYPE_ARM64, or CPU_TYPE_ARM as ARMv7 / ARMv7s (32-bit, run on the translator).
+     */
+    private fun hasPlayableCode(program: File): Boolean = runCatching {
         val head = program.inputStream().use { it.readNBytes(4096) }
         val buffer = java.nio.ByteBuffer.wrap(head)
+        fun playable(cpu: Int, subtype: Int) = cpu == 0x0100000C || (cpu == 0x0000000C && (subtype and 0x00FFFFFF) in listOf(9, 11))
         when (buffer.getInt(0)) {
-            0xCAFEBABE.toInt() -> (0 until minOf(buffer.getInt(4), (head.size - 8) / 20)).any { buffer.getInt(8 + 20 * it) == 0x0100000C }
-            0xCFFAEDFE.toInt() -> buffer.order(java.nio.ByteOrder.LITTLE_ENDIAN).getInt(4) == 0x0100000C
+            0xCAFEBABE.toInt() -> (0 until minOf(buffer.getInt(4), (head.size - 8) / 20)).any { playable(buffer.getInt(8 + 20 * it), buffer.getInt(12 + 20 * it)) }
+            0xCFFAEDFE.toInt(), 0xCEFAEDFE.toInt() -> buffer.order(java.nio.ByteOrder.LITTLE_ENDIAN).let { playable(it.getInt(4), it.getInt(8)) }
             else -> false
         }
     }.getOrDefault(false)

@@ -283,6 +283,7 @@ const ECB_MODE: u32 = 2;
 const ALGORITHM_NAMES: [&str; 7] = ["AES", "DES", "3DES", "CAST", "RC4", "RC2", "Blowfish"];
 
 /// A block cipher with its key set.
+#[derive(Clone)]
 enum BlockCipher {
     Aes128(aes::Aes128),
     Aes192(aes::Aes192),
@@ -342,27 +343,43 @@ impl BlockCipher {
     }
 }
 
-/// RC4: the key stream XORed over the data (the same both ways).
+/// RC4: a key stream XORed over the data (the same both ways), which
+/// carries on from piece to piece.
+#[derive(Clone)]
+struct Rc4 {
+    state: Vec<u8>,
+    i: u8,
+    j: u8,
+}
+
+impl Rc4 {
+    fn new(key: &[u8]) -> Result<Rc4, i32> {
+        if key.is_empty() || key.len() > 512 {
+            return Err(PARAM_ERROR);
+        }
+        let mut state: Vec<u8> = (0..=255).collect();
+        let mut j = 0u8;
+        for i in 0..256 {
+            j = j.wrapping_add(state[i]).wrapping_add(key[i % key.len()]);
+            state.swap(i, j as usize);
+        }
+        Ok(Rc4 { state, i: 0, j: 0 })
+    }
+
+    fn apply(&mut self, data: &[u8]) -> Vec<u8> {
+        data.iter()
+            .map(|byte| {
+                self.i = self.i.wrapping_add(1);
+                self.j = self.j.wrapping_add(self.state[self.i as usize]);
+                self.state.swap(self.i as usize, self.j as usize);
+                byte ^ self.state[self.state[self.i as usize].wrapping_add(self.state[self.j as usize]) as usize]
+            })
+            .collect()
+    }
+}
+
 fn rc4(key: &[u8], data: &[u8]) -> Result<Vec<u8>, i32> {
-    if key.is_empty() || key.len() > 512 {
-        return Err(PARAM_ERROR);
-    }
-    let mut state: Vec<u8> = (0..=255).collect();
-    let mut j = 0u8;
-    for i in 0..256 {
-        j = j.wrapping_add(state[i]).wrapping_add(key[i % key.len()]);
-        state.swap(i, j as usize);
-    }
-    let (mut i, mut j) = (0u8, 0u8);
-    Ok(data
-        .iter()
-        .map(|byte| {
-            i = i.wrapping_add(1);
-            j = j.wrapping_add(state[i as usize]);
-            state.swap(i as usize, j as usize);
-            byte ^ state[state[i as usize].wrapping_add(state[j as usize]) as usize]
-        })
-        .collect())
+    Ok(Rc4::new(key)?.apply(data))
 }
 
 /// The room CCCrypt asks for before it starts (CCCryptorGetOutputLength
@@ -424,6 +441,131 @@ pub fn crypt(decrypt: bool, algorithm: u32, options: u32, key: &[u8], iv: Option
         data.truncate(data.len() - pad);
     }
     Ok(data)
+}
+
+/// A streaming CCCryptor (CCCryptorCreate / Update / Final): the same
+/// ciphers, modes and padding as `crypt`, fed in pieces.
+#[derive(Clone)]
+pub struct Cryptor {
+    decrypt: bool,
+    padded: bool,
+    /// CBC (else ECB): `previous` is the last cipher block (the IV at first).
+    chained: bool,
+    cipher: Result<BlockCipher, Rc4>,
+    previous: Vec<u8>,
+    /// Input not yet turned into output (less than a block, or the block
+    /// held back while decrypting with padding).
+    pending: Vec<u8>,
+}
+
+impl Cryptor {
+    /// `iv`: the chain's start for CBC (zeros when None).
+    pub fn new(decrypt: bool, algorithm: u32, options: u32, key: &[u8], iv: Option<&[u8]>) -> Result<Cryptor, i32> {
+        let cipher = if algorithm == 4 { Err(Rc4::new(key)?) } else { Ok(BlockCipher::new(algorithm, key)?) };
+        let size = cipher.as_ref().map_or(1, BlockCipher::block_size);
+        let mut previous = vec![0u8; size];
+        if let (Some(iv), true) = (iv, cipher.is_ok()) {
+            previous.copy_from_slice(&iv[..size]);
+        }
+        Ok(Cryptor {
+            decrypt,
+            padded: options & PKCS7_PADDING != 0 && cipher.is_ok(),
+            chained: options & ECB_MODE == 0,
+            cipher,
+            previous,
+            pending: Vec::new(),
+        })
+    }
+
+    fn block_size(&self) -> usize {
+        self.cipher.as_ref().map_or(1, BlockCipher::block_size)
+    }
+
+    /// How many pending bytes `update` turns into output now.
+    fn ready(&self, pending: usize) -> usize {
+        let size = self.block_size();
+        let whole = pending / size * size;
+        // Decrypting with padding: the last whole block may be the padding.
+        if self.decrypt && self.padded && whole == pending && whole > 0 {
+            whole - size
+        } else {
+            whole
+        }
+    }
+
+    /// The bytes `update` (or, when `last`, `update` then `finish`) writes for `length` more bytes in.
+    pub fn output_length(&self, length: usize, last: bool) -> usize {
+        let total = self.pending.len() + length;
+        match (last, self.decrypt, self.padded) {
+            (false, _, _) => self.ready(total),
+            (true, false, true) => total / self.block_size() * self.block_size() + self.block_size(),
+            (true, _, _) => total,
+        }
+    }
+
+    /// Whole blocks out (decrypting with padding holds the last one back for `finish`).
+    pub fn update(&mut self, input: &[u8]) -> Vec<u8> {
+        self.pending.extend_from_slice(input);
+        let ready = self.ready(self.pending.len());
+        let mut data: Vec<u8> = self.pending.drain(..ready).collect();
+        self.transform(&mut data);
+        data
+    }
+
+    /// Runs the cipher over whole blocks (any length for RC4).
+    fn transform(&mut self, data: &mut [u8]) {
+        let cipher = match &mut self.cipher {
+            Err(rc4) => {
+                let out = rc4.apply(data);
+                data.copy_from_slice(&out);
+                return;
+            }
+            Ok(cipher) => cipher,
+        };
+        for block in data.chunks_mut(cipher.block_size()) {
+            if self.decrypt {
+                let encrypted = block.to_vec();
+                cipher.decrypt(block);
+                if self.chained {
+                    block.iter_mut().zip(&self.previous).for_each(|(b, p)| *b ^= p);
+                    self.previous = encrypted;
+                }
+            } else {
+                if self.chained {
+                    block.iter_mut().zip(&self.previous).for_each(|(b, p)| *b ^= p);
+                }
+                cipher.encrypt(block);
+                if self.chained {
+                    self.previous.copy_from_slice(block);
+                }
+            }
+        }
+    }
+
+    /// The rest: padding added (encrypt) or checked and removed (decrypt).
+    pub fn finish(&mut self) -> Result<Vec<u8>, i32> {
+        let size = self.block_size();
+        let mut data = std::mem::take(&mut self.pending);
+        if !self.decrypt && self.padded {
+            let pad = size - data.len() % size;
+            data.resize(data.len() + pad, pad as u8);
+        }
+        if data.len() % size != 0 {
+            return Err(ALIGNMENT_ERROR);
+        }
+        if self.decrypt && self.padded && data.len() != size {
+            return Err(DECODE_ERROR);
+        }
+        self.transform(&mut data);
+        if self.decrypt && self.padded {
+            let pad = *data.last().ok_or(DECODE_ERROR)? as usize;
+            if pad == 0 || pad > size || !data[data.len() - pad..].iter().all(|&b| b as usize == pad) {
+                return Err(DECODE_ERROR);
+            }
+            data.truncate(data.len() - pad);
+        }
+        Ok(data)
+    }
 }
 
 /// The kinds of CCCrypt use seen so far, so each is logged once.
@@ -613,6 +755,52 @@ mod tests {
         let mut back = [0u8; 32];
         let status = cc_crypt(1, 0, PKCS7_PADDING, key.as_ptr(), 32, std::ptr::null(), out.as_ptr(), 32, back.as_mut_ptr(), 32, &mut moved);
         assert_eq!((status, moved, &back[..20]), (SUCCESS, 20, &plain[..]));
+    }
+
+    #[test]
+    fn streaming_matches_one_shot() {
+        let iv = [9u8; 16];
+        let kinds: [(u32, u32, &[u8]); 5] = [
+            (0, PKCS7_PADDING, &[7; 16]),
+            (0, ECB_MODE, &[7; 32]),
+            (0, 0, &[7; 24]),
+            (1, PKCS7_PADDING, &[5; 8]),
+            (4, 0, b"Key"),
+        ];
+        for (algorithm, options, key) in kinds {
+            let size = if algorithm == 0 { 16 } else { 8 };
+            for length in [0usize, 1, 15, 16, 17, 100] {
+                if options & PKCS7_PADDING == 0 && algorithm != 4 && length % size != 0 {
+                    continue;
+                }
+                let plain: Vec<u8> = (0..length).map(|i| i as u8).collect();
+                let iv = (algorithm != 4).then_some(&iv[..size]);
+                let whole = crypt(false, algorithm, options, key, iv, &plain).unwrap();
+                for piece in [1, 7, 16, 33] {
+                    let run = |decrypt: bool, input: &[u8]| {
+                        let mut cryptor = Cryptor::new(decrypt, algorithm, options, key, iv).unwrap();
+                        let mut out = Vec::new();
+                        for chunk in input.chunks(piece) {
+                            let room = cryptor.output_length(chunk.len(), false);
+                            let written = cryptor.update(chunk);
+                            assert!(written.len() <= room, "update wrote {} with room {room}", written.len());
+                            out.extend(written);
+                        }
+                        let room = cryptor.output_length(0, true);
+                        let last = cryptor.finish().unwrap();
+                        assert!(last.len() <= room);
+                        out.extend(last);
+                        out
+                    };
+                    assert_eq!(run(false, &plain), whole, "algorithm {algorithm} options {options} length {length} pieces of {piece}");
+                    assert_eq!(run(true, &whole), plain);
+                }
+            }
+        }
+        // Without padding a partial block left at the end is an error.
+        let mut cryptor = Cryptor::new(false, 0, 0, &[7; 16], None).unwrap();
+        cryptor.update(&[1; 20]);
+        assert_eq!(cryptor.finish(), Err(ALIGNMENT_ERROR));
     }
 
     #[test]

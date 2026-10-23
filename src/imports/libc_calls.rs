@@ -17,10 +17,10 @@ fn last_errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
 
-/// Copies the host errno into the guest's errno slot.
+/// Copies the host errno into the guest's errno slot (in the guest's numbering).
 fn sync_errno(uc: &Uc) {
     let slot = uc.get_data().errno_slot;
-    mem().write_u32(slot, last_errno() as u32);
+    mem().write_u32(slot, crate::runtime::guest_errno(last_errno()) as u32);
 }
 
 fn vsnprintf(buffer: u32, size: u32, format: u32, list: u32) -> Ret {
@@ -36,7 +36,7 @@ fn vsnprintf(buffer: u32, size: u32, format: u32, list: u32) -> Ret {
 
 fn set_errno(uc: &Uc, value: i32) {
     let slot = uc.get_data().errno_slot;
-    mem().write_u32(slot, value as u32);
+    mem().write_u32(slot, crate::runtime::guest_errno(value) as u32);
 }
 
 /// Result of a host call that returns -1 and sets errno on failure.

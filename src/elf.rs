@@ -50,6 +50,9 @@ pub struct Library {
     pub init_functions: Vec<u32>,
     /// Whether `init_functions` have been handed out to run.
     started: bool,
+    /// Built against the platform's own C library (e.g. Apple's), not bionic:
+    /// its imports go to the platform's table (see `PlatformHooks::library_import`).
+    pub platform_abi: bool,
 }
 
 pub struct Symbol {
@@ -98,11 +101,13 @@ pub struct Loader {
     next_base: u32,
     search_dirs: Vec<PathBuf>,
     pub libraries: Vec<Library>,
+    /// The library being loaded now is built for the platform's C library.
+    platform_abi: bool,
 }
 
 impl Loader {
     pub fn new(search_dirs: Vec<PathBuf>) -> Loader {
-        Loader { next_base: mem::LIB_BASE, search_dirs, libraries: Vec::new() }
+        Loader { next_base: mem::layout().libraries.0, search_dirs, libraries: Vec::new(), platform_abi: false }
     }
 
     /// Loads `path` and any 32-bit libraries it needs that sit next to it.
@@ -154,7 +159,7 @@ impl Loader {
             .ok_or("no loadable segments")?;
         let size = (end + mem::PAGE - 1) & !(mem::PAGE - 1);
         let base = self.next_base;
-        if base + size > mem::LIB_END {
+        if base + size > mem::layout().libraries.1 {
             return Err("library area is full".into());
         }
         self.next_base = base + size + mem::PAGE;
@@ -196,7 +201,11 @@ impl Loader {
             let index = if let Some(found) = self.find_guest_library(&needed) {
                 Some(self.load(uc, &found)?)
             } else if let Some((_, bytes)) = BUILT_IN.iter().find(|(name, _)| *name == needed) {
-                Some(self.load_bytes(uc, needed.clone(), bytes)?)
+                // The built-in libraries are bionic's.
+                let outer = std::mem::replace(&mut self.platform_abi, false);
+                let loaded = self.load_bytes(uc, needed.clone(), bytes);
+                self.platform_abi = outer;
+                Some(loaded?)
             } else {
                 None
             };
@@ -216,6 +225,7 @@ impl Loader {
             symbol_count,
             init_functions: Vec::new(),
             started: false,
+            platform_abi: self.platform_abi,
         };
 
         let relocate = |uc: &mut Uc, table: Option<u32>, table_size: Option<u32>| -> Result<(), String> {
@@ -376,6 +386,33 @@ pub fn open(uc: &mut Uc, path: &Path, verbose: bool) -> Result<usize, String> {
     Ok(index)
 }
 
+/// Loads one of the libraries the bridge carries (e.g. "libz.so") into the
+/// shared loader and runs its start-up code; its exports join `guest_exports`.
+pub fn open_built_in(uc: &mut Uc, name: &str) -> Result<usize, String> {
+    let (_, bytes) = BUILT_IN.iter().find(|(built_in, _)| *built_in == name).ok_or_else(|| format!("no built-in library {name}"))?;
+    open_bytes(uc, name, bytes, false)
+}
+
+/// Loads a library from memory into the shared loader (as `open_built_in`).
+/// `platform_abi`: built for the platform's own C library, not bionic.
+pub fn open_bytes(uc: &mut Uc, name: &str, bytes: &[u8], platform_abi: bool) -> Result<usize, String> {
+    let _dl = lock_dl();
+    let (index, pending) = {
+        let mut loader = shared_loader();
+        let loader = loader.get_or_insert_with(|| Loader::new(Vec::new()));
+        loader.platform_abi = platform_abi;
+        let loaded = loader.load_bytes(uc, name.to_string(), bytes);
+        loader.platform_abi = false;
+        (loaded?, loader.take_pending_init())
+    };
+    for (library, functions) in pending {
+        for function in functions {
+            call_guest(uc, function, &[]).map_err(|e| format!("start-up code of {library} ({function:#010x}) failed: {e}"))?;
+        }
+    }
+    Ok(index)
+}
+
 /// For game code opening a library by name or path (dlopen): opens the
 /// game's own 32-bit library of that name, if it has one. None means it is
 /// not a game library (a phone library such as libGLESv2.so, or missing).
@@ -414,6 +451,11 @@ fn resolve(_uc: &mut Uc, library: &Library, symbol: &crate::elf::Symbol) -> u32 
     }
     if let Some(&address) = shared().guest_exports.get(&symbol.name) {
         return address;
+    }
+    if crate::runtime::other_platform() {
+        if let Some(import) = crate::runtime::platform().library_import {
+            return import(&symbol.name, symbol.kind == STT_OBJECT, symbol.weak, library.platform_abi);
+        }
     }
     // Data the bridge knows by name counts as data even when the import isn't marked as an object.
     if symbol.kind == STT_OBJECT || crate::imports::known_data_import(&symbol.name) {

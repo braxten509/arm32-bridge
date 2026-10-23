@@ -354,6 +354,10 @@ fn run_loop_until(run_loop: &'static Loop, until: Option<f64>, once: bool) -> bo
                 None => break,
             }
         }
+        // UIKit lays out marked views once a turn, before anything is drawn.
+        if std::ptr::eq(run_loop, &MAIN_LOOP) {
+            crate::fw::uikit::layout_pass();
+        }
         let (fired, next_timer) = fire_due_timers(run_loop);
         handled |= fired > 0;
         crate::fw::counted::pool_drain(pool);

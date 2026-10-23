@@ -322,12 +322,14 @@ name = "gamebridge-ios"
 version = "0.1.0"
 dependencies = [
  "aes",
+ "arm32-bridge",
  "blowfish",
  "cast5",
  "cc",
  "cipher",
  "des",
  "dlmalloc",
+ "guest32-image",
  "image",
  "jni-sys 0.3.1",
  "libc",
@@ -335,6 +337,7 @@ dependencies = [
  "miniz_oxide 0.8.9",
  "regex",
  "symphonia",
+ "ttf-parser",
 ]
 
 [[package]]
@@ -830,6 +833,12 @@ dependencies = [
  "quote",
  "unicode-ident",
 ]
+
+[[package]]
+name = "ttf-parser"
+version = "0.25.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 
 [[package]]
 name = "typed-path"

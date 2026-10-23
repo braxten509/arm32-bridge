@@ -12,6 +12,8 @@ pub mod report;
 #[cfg(target_arch = "aarch64")]
 pub mod fw;
 #[cfg(target_arch = "aarch64")]
+pub mod guest32;
+#[cfg(target_arch = "aarch64")]
 pub mod libsystem;
 #[cfg(target_arch = "aarch64")]
 pub mod cxx;

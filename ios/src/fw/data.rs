@@ -73,6 +73,14 @@ extern "C" fn data_with_contents_of_file(class: Class, _: Sel, path: Id) -> Id {
     }
 }
 
+/// Only file URLs: the path of the URL.
+extern "C" fn data_with_contents_of_url(class: Class, s: Sel, url: Id) -> Id {
+    if url == 0 || !runtime::responds(url, "path") {
+        return 0;
+    }
+    data_with_contents_of_file(class, s, runtime::send(url, "path", &[]))
+}
+
 extern "C" fn data_init_with_contents_of_file(this: Id, _: Sel, path: Id) -> Id {
     match std::fs::read(crate::fw::string::get(path)) {
         Ok(bytes) => {
@@ -165,6 +173,7 @@ pub fn register(_: &mut Registry) {
             ("dataWithBytesNoCopy:length:", data_with_bytes_no_copy as usize),
             ("dataWithBytesNoCopy:length:freeWhenDone:", data_with_bytes_no_copy_free as usize),
             ("dataWithContentsOfFile:", data_with_contents_of_file as usize),
+            ("dataWithContentsOfURL:", data_with_contents_of_url as usize),
             ("dataWithData:", data_with_data as usize),
         ],
     );

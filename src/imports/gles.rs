@@ -35,13 +35,49 @@ pub fn guest_pointer(guest: u32) -> *mut c_void {
     mem().host_or_null(guest) as *mut c_void
 }
 
+/// Where host GL functions come from when an embedder has its own (the
+/// iPhone layer: Apple's extensions translated, PVRTC decoded); names it
+/// doesn't know fall back to the system's library.
+static HOST_LOOKUP: std::sync::OnceLock<fn(&str) -> usize> = std::sync::OnceLock::new();
+
+/// Sets the embedder's host GL lookup (once, before the first GL call).
+pub fn set_host_lookup(lookup: fn(&str) -> usize) {
+    let _ = HOST_LOOKUP.set(lookup);
+}
+
+/// Where the host context current on this thread comes from when the
+/// embedder runs its own EGL (the iPhone layer's EAGL on Linux, where the
+/// translator's EGL is absent). Unset: the translator's EGL.
+static CURRENT_CONTEXT: std::sync::OnceLock<fn() -> usize> = std::sync::OnceLock::new();
+
+/// Sets the embedder's current-context lookup (once, before the first GL call).
+pub fn set_current_context_source(source: fn() -> usize) {
+    let _ = CURRENT_CONTEXT.set(source);
+}
+
+/// Every GL name `handler` knows.
+pub fn names() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = [include_str!("gles.rs"), include_str!("gles_generated.rs")]
+        .iter()
+        .flat_map(|source| source.lines())
+        .filter_map(|line| line.split_once("=>").map(|(arms, _)| arms))
+        .flat_map(|arms| arms.split('"').skip(1).step_by(2))
+        .filter(|name| name.starts_with("gl") && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+        .filter(|name| handler(name).is_some())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
 /// The host GL function `name`, looked up once and cached in `slot`.
 pub fn host_function(slot: &AtomicUsize, name: &str) -> usize {
     let cached = slot.load(Ordering::Relaxed);
     if cached != 0 {
         return cached;
     }
-    let address = lookup(name);
+    let address = HOST_LOOKUP.get().map_or(0, |embedder| embedder(name));
+    let address = if address != 0 { address } else { lookup(name) };
     if address == 0 {
         panic!("GL function {name} is not available on this phone");
     }
@@ -138,6 +174,11 @@ pub fn context_destroyed(context: usize) {
     }
 }
 
+/// Whether host context `context` has tracking entries (for tests and diagnostics).
+pub fn context_tracked(context: usize) -> bool {
+    CONTEXTS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|contexts| contexts.contains_key(&context))
+}
+
 fn new_context() -> Context {
     Context { bindings: Arc::default(), group: Arc::default() }
 }
@@ -151,7 +192,10 @@ thread_local! {
 /// The state of the context current on this thread (checked against EGL each
 /// time, so a MakeCurrent from Java is seen too).
 fn current() -> Context {
-    let host = crate::imports::egl::current_context();
+    let host = match CURRENT_CONTEXT.get() {
+        Some(source) => source(),
+        None => crate::imports::egl::current_context(),
+    };
     let changes = CONTEXT_CHANGES.load(Ordering::Acquire);
     CURRENT.with(|current| {
         let mut current = current.borrow_mut();
@@ -193,6 +237,12 @@ struct Mapped {
 
 fn bound(target: u32) -> u32 {
     with_bindings(|b| b.buffers.get(&target).copied().unwrap_or(0))
+}
+
+/// The buffer tracked as bound to `target` in the context current on this
+/// thread (for tests and diagnostics).
+pub fn bound_buffer(target: u32) -> u32 {
+    bound(target)
 }
 
 /// The buffer the context has bound to `target` right now (asked from GL, as

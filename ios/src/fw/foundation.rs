@@ -36,7 +36,7 @@ pub fn home() -> String {
 }
 
 fn app_dir() -> String {
-    crate::loader::loaded().app_dir.clone()
+    crate::loader::app_dir()
 }
 
 fn info_dictionary_object() -> Id {
@@ -164,7 +164,7 @@ extern "C" fn bundle_path(this: Id, _: Sel) -> Id {
 }
 
 extern "C" fn executable_path(_this: Id, _: Sel) -> Id {
-    string::make(&crate::loader::loaded().path)
+    string::make(&crate::loader::program_path())
 }
 
 extern "C" fn bundle_identifier_method(_this: Id, _: Sel) -> Id {
@@ -497,7 +497,7 @@ extern "C" fn process_info(_: Class, _: Sel) -> Id {
 }
 
 extern "C" fn process_arguments(_this: Id, _: Sel) -> Id {
-    collections::array_from(&[string::make(&crate::loader::loaded().path)])
+    collections::array_from(&[string::make(&crate::loader::program_path())])
 }
 
 extern "C" fn process_environment(_this: Id, _: Sel) -> Id {
@@ -505,7 +505,7 @@ extern "C" fn process_environment(_this: Id, _: Sel) -> Id {
 }
 
 extern "C" fn process_name(_this: Id, _: Sel) -> Id {
-    let path = &crate::loader::loaded().path;
+    let path = &crate::loader::program_path();
     string::make(path.rsplit('/').next().unwrap_or("game"))
 }
 
@@ -666,10 +666,31 @@ pub fn register(r: &mut Registry) {
         "NSFilePosixPermissions",
         "NSFileSystemFreeSize",
         "NSFileSystemSize",
+        "UIKeyboardWillShowNotification",
+        "UIKeyboardDidShowNotification",
+        "UIKeyboardWillHideNotification",
+        "UIKeyboardDidHideNotification",
+        "UIKeyboardWillChangeFrameNotification",
+        "UIKeyboardDidChangeFrameNotification",
+        "UIKeyboardFrameBeginUserInfoKey",
+        "UIKeyboardFrameEndUserInfoKey",
+        "UIKeyboardAnimationDurationUserInfoKey",
+        "UIKeyboardAnimationCurveUserInfoKey",
+        "NSMetadataQueryDidFinishGatheringNotification",
+        "NSMetadataQueryDidUpdateNotification",
+        "NSMetadataQueryUbiquitousDocumentsScope",
+        "NSMetadataQueryUbiquitousDataScope",
+        "NSURLUbiquitousItemIsDownloadedKey",
     ] {
         named_constant(r, name);
     }
     for (name, value) in [
+        ("NSMetadataItemFSNameKey", "kMDItemFSName"),
+        ("NSMetadataItemFSCreationDateKey", "kMDItemFSCreationDate"),
+        ("NSMetadataItemURLKey", "kMDItemURL"),
+        ("NSMetadataItemPathKey", "kMDItemPath"),
+        ("ACAccountTypeIdentifierTwitter", "com.apple.twitter"),
+        ("ACAccountTypeIdentifierFacebook", "com.apple.facebook"),
         ("NSLocalizedDescriptionKey", "NSLocalizedDescription"),
         ("NSLocalizedFailureReasonErrorKey", "NSLocalizedFailureReason"),
         ("NSUnderlyingErrorKey", "NSUnderlyingError"),

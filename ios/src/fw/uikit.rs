@@ -110,7 +110,7 @@ pub fn screen_points() -> (f64, f64, f64) {
         let Some(display) = display.filter(|&(w, h)| w >= 1.0 && h >= 1.0) else {
             return (568.0, 320.0, SCALE);
         };
-        let app_dir = crate::loader::loaded().app_dir.clone();
+        let app_dir = crate::loader::app_dir();
         let info = std::fs::read(format!("{app_dir}/Info.plist")).ok().and_then(|bytes| crate::fw::plist::parse(&bytes));
         let files: Vec<String> = std::fs::read_dir(&app_dir)
             .map(|list| list.filter_map(|e| e.ok()?.file_name().into_string().ok()).collect())
@@ -315,6 +315,8 @@ pub struct ViewState {
     pub layer: Id,
     pub transform: Transform,
     pub window: Id,
+    /// Marked for -layoutSubviews in the run loop's next layout pass.
+    pub needs_layout: bool,
 }
 
 pub fn view_state(view: Id) -> &'static mut ViewState {
@@ -329,6 +331,7 @@ pub fn view_state(view: Id) -> &'static mut ViewState {
                 layer: 0,
                 transform: IDENTITY,
                 window: 0,
+                needs_layout: false,
             }));
         }
         &mut **slot
@@ -395,7 +398,12 @@ extern "C" fn view_frame(this: Id, _: Sel) -> Rect {
 }
 
 extern "C" fn view_set_frame(this: Id, _: Sel, frame: Rect) {
-    view_state(this).frame = frame;
+    let state = view_state(this);
+    let resized = state.frame.size != frame.size;
+    state.frame = frame;
+    if resized {
+        resized_view(this);
+    }
 }
 
 extern "C" fn view_bounds(this: Id, _: Sel) -> Rect {
@@ -407,9 +415,13 @@ extern "C" fn view_set_bounds(this: Id, _: Sel, bounds: Rect) {
     let state = view_state(this);
     let center_x = state.frame.origin.x + state.frame.size.width / 2.0;
     let center_y = state.frame.origin.y + state.frame.size.height / 2.0;
+    let resized = state.frame.size != bounds.size;
     state.bounds_origin = bounds.origin;
     state.frame.size = bounds.size;
     state.frame.origin = Point { x: center_x - bounds.size.width / 2.0, y: center_y - bounds.size.height / 2.0 };
+    if resized {
+        resized_view(this);
+    }
 }
 
 extern "C" fn view_center(this: Id, _: Sel) -> Point {
@@ -437,6 +449,71 @@ extern "C" fn view_layer(this: Id, _: Sel) -> Id {
     view_state(this).layer
 }
 
+// ----- layout: as in UIKit, views marked as needing layout (added to a
+// superview, resized, setNeedsLayout) get -layoutSubviews once, superview
+// first, in a pass the main run loop makes each turn before drawing (Core
+// Animation's commit); -layoutIfNeeded makes it at once. A view's
+// controller hears viewWillLayoutSubviews / viewDidLayoutSubviews around it.
+
+/// Some view was marked since the last pass.
+static LAYOUT_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn set_needs_layout(view: Id) {
+    if view != 0 {
+        view_state(view).needs_layout = true;
+        LAYOUT_PENDING.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// A new size lays out the view and its superview.
+fn resized_view(view: Id) {
+    set_needs_layout(view);
+    set_needs_layout(view_state(view).superview);
+}
+
+fn lay_out(view: Id) {
+    let controller = property_get(view, "viewController").unwrap_or(0) as Id;
+    if controller != 0 {
+        runtime::send(controller, "viewWillLayoutSubviews", &[]);
+    }
+    runtime::send(view, "layoutSubviews", &[]);
+    if controller != 0 {
+        runtime::send(controller, "viewDidLayoutSubviews", &[]);
+    }
+}
+
+/// Lays out the marked views of a tree, each before its subviews (the
+/// list is read after a view's own layout, which may change it).
+fn lay_out_tree(view: Id, depth: usize) {
+    if view == 0 || depth > 256 {
+        return;
+    }
+    if std::mem::take(&mut view_state(view).needs_layout) {
+        lay_out(view);
+    }
+    for child in view_state(view).subviews.clone() {
+        lay_out_tree(child, depth + 1);
+    }
+}
+
+/// The run loop's layout pass over the shown windows (nothing to do unless
+/// a view was marked; views outside them wait until they join one).
+pub fn layout_pass() {
+    if LAYOUT_PENDING.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        for window in windows() {
+            lay_out_tree(window, 0);
+        }
+    }
+}
+
+extern "C" fn view_set_needs_layout(this: Id, _: Sel) {
+    set_needs_layout(this);
+}
+
+extern "C" fn view_layout_if_needed(this: Id, _: Sel) {
+    lay_out_tree(this, 0);
+}
+
 fn window_of(view: Id) -> Id {
     let mut current = view;
     let window_class = runtime::class_named("UIWindow");
@@ -458,6 +535,7 @@ fn detach(view: Id) {
     if parent != 0 {
         view_state(parent).subviews.retain(|&v| v != view);
         view_state(view).superview = 0;
+        set_needs_layout(parent);
     }
 }
 
@@ -472,6 +550,8 @@ fn attach(parent: Id, view: Id, index: Option<usize>) {
         None => list.push(view),
     }
     view_state(view).superview = parent;
+    set_needs_layout(view);
+    set_needs_layout(parent);
     for name in ["didMoveToSuperview"] {
         if runtime::responds(view, name) {
             runtime::send(view, name, &[]);
@@ -667,6 +747,7 @@ extern "C" fn window_make_key_and_visible(this: Id, _: Sel) {
         windows.push(this);
     }
     drop(windows);
+    set_needs_layout(this);
     property_set(this, "hidden", 0);
     crate::log!("window {this:#x} shown");
 }
@@ -1000,7 +1081,7 @@ pub fn image_info(image: Id) -> Option<&'static ImageInfo> {
 
 extern "C" fn image_named(_: Class, _: Sel, name: Id) -> Id {
     let name = string::get(name);
-    let dir = crate::loader::loaded().app_dir.clone();
+    let dir = crate::loader::app_dir();
     let (stem, ext) = match name.rsplit_once('.') {
         Some((s, e)) if !s.is_empty() => (s.to_string(), e.to_string()),
         _ => (name.clone(), "png".to_string()),
@@ -1299,8 +1380,8 @@ pub fn register(r: &mut Registry) {
             ("contentScaleFactor", view_content_scale as usize),
             ("setContentScaleFactor:", view_set_content_scale as usize),
             ("setNeedsDisplay", nothing as usize),
-            ("setNeedsLayout", nothing as usize),
-            ("layoutIfNeeded", nothing as usize),
+            ("setNeedsLayout", view_set_needs_layout as usize),
+            ("layoutIfNeeded", view_layout_if_needed as usize),
             ("layoutSubviews", nothing as usize),
             ("sizeToFit", nothing as usize),
             ("sizeThatFits:", view_size_that_fits as usize),
@@ -1345,6 +1426,8 @@ pub fn register(r: &mut Registry) {
             ("isViewLoaded", controller_is_view_loaded as usize),
             ("loadView", nothing as usize),
             ("viewDidLoad", nothing as usize),
+            ("viewWillLayoutSubviews", nothing as usize),
+            ("viewDidLayoutSubviews", nothing as usize),
             ("viewWillAppear:", ignore_bool as usize),
             ("viewDidAppear:", ignore_bool as usize),
             ("viewWillDisappear:", ignore_bool as usize),
@@ -1639,6 +1722,69 @@ mod tests {
         assert_eq!((FINISHED.load(std::sync::atomic::Ordering::SeqCst), queued.len()), (0, 1), "completion waits");
         queued.pop().unwrap()();
         assert_eq!(FINISHED.load(std::sync::atomic::Ordering::SeqCst), 2, "completion told finished = YES");
+    }
+
+    /// UIKit's layout pass: a view added to a shown window gets -layoutSubviews
+    /// once before the next frame (superview first, its controller's
+    /// viewWill/DidLayoutSubviews around it), and not again until something
+    /// changes; -layoutIfNeeded lays out at once.
+    #[test]
+    fn views_are_laid_out_once_per_change_before_the_next_frame() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        static EVENTS: Mutex<Vec<(Id, &'static str)>> = Mutex::new(Vec::new());
+        extern "C" fn layout(this: Id, _: Sel) {
+            EVENTS.lock().unwrap().push((this, "layoutSubviews"));
+        }
+        extern "C" fn will_layout(this: Id, _: Sel) {
+            EVENTS.lock().unwrap().push((this, "viewWillLayoutSubviews"));
+        }
+        extern "C" fn did_layout(this: Id, _: Sel) {
+            EVENTS.lock().unwrap().push((this, "viewDidLayoutSubviews"));
+        }
+        let view_class = define_class("G32LayoutTestView", "UIView", 16);
+        methods(view_class, &[("layoutSubviews", layout as usize)]);
+        let controller_class = define_class("G32LayoutTestController", "UIViewController", 8);
+        methods(controller_class, &[("viewWillLayoutSubviews", will_layout as usize), ("viewDidLayoutSubviews", did_layout as usize)]);
+        let new_view = |class: Class, frame: Rect| view_init_with_frame(runtime::send(class, "alloc", &[]), 0, frame);
+        let take = || std::mem::take(&mut *EVENTS.lock().unwrap());
+
+        let root = new_view(view_class, screen_bounds());
+        let controller = runtime::send(runtime::send(controller_class, "alloc", &[]), "init", &[]);
+        runtime::send(controller, "setView:", &[root]);
+        let window = new_view(runtime::class_named("UIWindow"), screen_bounds());
+        window_set_root_controller(window, 0, controller);
+        window_make_key_and_visible(window, 0);
+        let child = new_view(view_class, Rect::new(0.0, 0.0, 10.0, 10.0));
+        runtime::send(root, "addSubview:", &[child]);
+        assert!(take().is_empty(), "nothing is laid out before the run loop's pass");
+        layout_pass();
+        assert_eq!(
+            take(),
+            [(controller, "viewWillLayoutSubviews"), (root, "layoutSubviews"), (controller, "viewDidLayoutSubviews"), (child, "layoutSubviews")]
+        );
+        layout_pass();
+        assert!(take().is_empty(), "nothing changed: no layout");
+        // Moving keeps the size: no layout. A new size lays out the view and its superview.
+        view_set_frame(child, 0, Rect::new(5.0, 5.0, 10.0, 10.0));
+        layout_pass();
+        assert!(take().is_empty());
+        view_set_frame(child, 0, Rect::new(5.0, 5.0, 20.0, 10.0));
+        layout_pass();
+        let events = take();
+        assert_eq!(events.iter().filter(|e| *e == &(child, "layoutSubviews")).count(), 1, "{events:x?}");
+        assert!(events.iter().position(|e| e == &(root, "layoutSubviews")) < events.iter().position(|e| e == &(child, "layoutSubviews")), "{events:x?}");
+        // setNeedsLayout waits for the pass; layoutIfNeeded doesn't.
+        runtime::send(child, "setNeedsLayout", &[]);
+        assert!(take().is_empty());
+        runtime::send(child, "layoutIfNeeded", &[]);
+        assert_eq!(take(), [(child, "layoutSubviews")]);
+        layout_pass();
+        assert!(take().is_empty());
+        // Removing a subview lays out the view it left.
+        runtime::send(child, "removeFromSuperview", &[]);
+        layout_pass();
+        assert_eq!(take(), [(controller, "viewWillLayoutSubviews"), (root, "layoutSubviews"), (controller, "viewDidLayoutSubviews")]);
     }
 
     #[test]

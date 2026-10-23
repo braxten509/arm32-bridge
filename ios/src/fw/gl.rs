@@ -232,6 +232,28 @@ const SAME_AS_STANDARD: &[(&str, &str)] = &[
     ("glGetSyncivAPPLE", "glGetSynciv"),
 ];
 
+/// Extension functions translated in this file (beyond `SAME_AS_STANDARD`).
+const TRANSLATED_EXTENSIONS: &[&str] = &[
+    "glRenderbufferStorageMultisampleAPPLE",
+    "glResolveMultisampleFramebufferAPPLE",
+    "glMapBufferOES",
+    "glLabelObjectEXT",
+    "glGetObjectLabelEXT",
+    "glInsertEventMarkerEXT",
+    "glPushGroupMarkerEXT",
+    "glPopGroupMarkerEXT",
+];
+
+/// Every Apple/EXT/OES function this layer gives games for the extensions it advertises.
+pub fn extension_names() -> Vec<&'static str> {
+    SAME_AS_STANDARD.iter().map(|(apple, _)| *apple).chain(TRANSLATED_EXTENSIONS.iter().copied()).collect()
+}
+
+/// The standard OpenGL ES 3 function an extension function is the same as.
+pub fn standard_name(name: &str) -> Option<&'static str> {
+    SAME_AS_STANDARD.iter().find(|(apple, _)| *apple == name).map(|(_, standard)| *standard)
+}
+
 /// What an iPhone 5s (Apple A7, iOS 8) reports. Games choose texture formats
 /// and drawing paths from this list, so it is copied, limited to what this
 /// layer and the graphics chip can really do.
