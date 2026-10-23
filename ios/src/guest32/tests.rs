@@ -575,9 +575,11 @@ fn guest_exception(name: &str, reason: &str) -> u32 {
 
 #[test]
 fn an_uncaught_objc_exception_runs_the_games_handler_then_stops() {
-    static HANDLED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    // Every exception the handler saw: it is the whole program's, so other
+    // tests throwing meanwhile reach it too.
+    static HANDLED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
     fn handler(_uc: &mut runtime::Uc, a: &mut Args) -> runtime::Ret {
-        HANDLED.store(a.u32(), std::sync::atomic::Ordering::SeqCst);
+        HANDLED.lock().unwrap().push(a.u32());
         runtime::Ret::Void
     }
     cxx();
@@ -594,7 +596,8 @@ fn an_uncaught_objc_exception_runs_the_games_handler_then_stops() {
     uc.get_data_mut().fault = None;
     let error = result.expect_err("an uncaught exception stops the program");
     assert!(error.contains("uncaught Objective-C exception: TestException: thrown on purpose"), "{error}");
-    assert_eq!(HANDLED.load(std::sync::atomic::Ordering::SeqCst), exception, "the game's handler ran first, with the exception");
+    let handled = HANDLED.lock().unwrap().clone();
+    assert!(handled.contains(&exception), "the game's handler ran first, with the exception {exception:#x}: {handled:x?}");
 }
 
 #[test]

@@ -457,6 +457,123 @@ extern "C" fn draw_in_rect_mode_alignment(this: Id, _: Sel, rect: Rect, font: Id
     draw(this, rect, font, mode, align, false)
 }
 
+// ----- labels -----
+
+/// What a UILabel shows (or a UIButton's title): its text drawn in its
+/// bounds as -[UILabel drawTextInRect:] does.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextLook {
+    pub text: String,
+    /// UIFont name and point size.
+    pub font: (String, f64),
+    /// Straight red, green, blue, alpha.
+    pub color: [f64; 4],
+    /// Shadow colour and offset in points (right, down).
+    pub shadow: Option<([f64; 4], (f64, f64))>,
+    /// NSTextAlignment (left, centre, right; others draw left).
+    pub alignment: isize,
+    /// NSLineBreakMode.
+    pub line_break: isize,
+    /// numberOfLines (0: as many as fit).
+    pub lines: isize,
+    /// The bounds' size in points.
+    pub size: (f64, f64),
+    /// Set when the font shrinks to fit a single line's width
+    /// (adjustsFontSizeToFitWidth): the smallest size it may take.
+    pub minimum_font_size: Option<f64>,
+}
+
+impl Font {
+    fn named(name: &str, size: f64) -> Font {
+        Font { face: face_named(name), size }
+    }
+}
+
+/// The font a label draws with (smaller when it shrinks to fit) and the
+/// lines it shows: one cut as its line break mode says, or wrapped, no
+/// more than numberOfLines or than fit its height.
+fn label_lines(look: &TextLook) -> (Font, Vec<Vec<char>>) {
+    let (width, height) = look.size;
+    let single_line = look.lines == 1;
+    let mut font = Font::named(&look.font.0, look.font.1);
+    if let (true, Some(minimum)) = (single_line, look.minimum_font_size) {
+        let first: Vec<char> = look.text.split('\n').next().unwrap_or("").chars().collect();
+        let wide = font.width(&first);
+        if wide > width && width > 0.0 {
+            // Widths grow with the size; a hair under so it surely fits.
+            font.size = (font.size * width / wide * 0.999).max(minimum.max(1.0)).min(font.size);
+        }
+    }
+    let fit = lines_in(&font, height);
+    let max_lines = match (look.lines.max(0) as usize, fit) {
+        (0, fit) => fit,
+        (wanted, 0) => wanted,
+        (wanted, fit) => wanted.min(fit),
+    };
+    let lines = lay_out(&font, &look.text, width, single_line, max_lines, look.line_break);
+    (font, lines)
+}
+
+/// The size `text` takes in a font (name, points) no wider than `width`, on
+/// at most `lines` lines (1: one line cut by `mode`; 0: any number), as
+/// UILabel sizes it to fit.
+pub fn text_box(text: &str, font: &(String, f64), width: f64, lines: isize, mode: isize) -> (f64, f64) {
+    let font = Font::named(&font.0, font.1);
+    let laid = lay_out(&font, text, width, lines == 1, lines.max(0) as usize, mode);
+    let size = size_of(&font, text, &laid, width);
+    (size.width, size.height)
+}
+
+/// A look drawn at `scale` pixels per point: width, height and straight
+/// RGBA rows from the top. The lines sit in the middle of the bounds up and
+/// down, the shadow under the text; nothing is drawn outside the bounds.
+fn draw_look(look: &TextLook, scale: f64) -> Option<(usize, usize, Vec<u8>)> {
+    let (width, height) = ((look.size.0 * scale).ceil(), (look.size.1 * scale).ceil());
+    if !(width >= 1.0 && height >= 1.0 && width * height <= 16e6) {
+        return None;
+    }
+    let (font, lines) = label_lines(look);
+    let face = font.face?;
+    let mut canvas = Canvas::new(std::ptr::null_mut(), width as usize, height as usize, 8, 0, Space::Rgb, PREMULTIPLIED_LAST).ok()?;
+    // UIKit's flip: (0, 0) at the top left, `scale` pixels per point.
+    canvas.state.ctm = Transform { a: scale, b: 0.0, c: 0.0, d: -scale, tx: 0.0, ty: height };
+    let block = lines.len() as f64 * font.line_height();
+    let rect = Rect::new(0.0, (look.size.1 - block) / 2.0, look.size.0, block);
+    if let Some((color, (right, down))) = look.shadow {
+        canvas.state.fill = color;
+        canvas.draw_text(face, &font, &lines, Rect::new(rect.origin.x + right, rect.origin.y + down, rect.size.width, rect.size.height), look.alignment);
+    }
+    canvas.state.fill = look.color;
+    canvas.draw_text(face, &font, &lines, rect, look.alignment);
+    let rgba = canvas.snapshot().straight_rgba()?;
+    Some((width as usize, height as usize, rgba))
+}
+
+/// A PNG file showing `look` at `scale` pixels per point (fw/pictures.rs),
+/// made once per look; the last 256 looks' files are kept. None when there
+/// is nothing to draw it with.
+pub fn text_picture(look: &TextLook, scale: f64) -> Option<String> {
+    static MADE: Mutex<Vec<(TextLook, u64, Option<String>)>> = Mutex::new(Vec::new());
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(at) = made.iter().position(|(seen, seen_scale, _)| seen == look && *seen_scale == scale.to_bits()) {
+        // Most recently used last.
+        let entry = made.remove(at);
+        let file = entry.2.clone();
+        made.push(entry);
+        return file;
+    }
+    let file = draw_look(look, scale)
+        .and_then(|(width, height, rgba)| encode_png(width, height, &rgba, true))
+        .and_then(|bytes| write_png_file(&format!("text \"{}\"", look.text), &bytes));
+    made.push((look.clone(), scale.to_bits(), file.clone()));
+    if made.len() > 256 {
+        if let (_, _, Some(old)) = made.remove(0) {
+            let _ = std::fs::remove_file(old);
+        }
+    }
+    file
+}
+
 /// The NSString methods this file adds (32-bit games reach them through
 /// framework_selectors.tsv, which needs a row for each).
 fn selectors() -> [(&'static str, usize); 9] {
@@ -569,6 +686,77 @@ mod tests {
         let f: extern "C" fn(Id, Sel, Id, Size, isize) -> Size = unsafe { std::mem::transmute(imp) };
         let measured = f(string, s, system_font(20.0), narrow.size, 0);
         assert_eq!((measured.width, measured.height), (two.width, two.height));
+    }
+
+    fn look(text: &str, size: (f64, f64)) -> TextLook {
+        TextLook {
+            text: text.into(),
+            font: ("Helvetica".into(), 20.0),
+            color: [1.0, 1.0, 1.0, 1.0],
+            shadow: None,
+            alignment: 0,
+            line_break: TAIL_TRUNCATION,
+            lines: 1,
+            size,
+            minimum_font_size: None,
+        }
+    }
+
+    /// Straight RGBA pixels of a look drawn at a scale.
+    fn drawn(look: &TextLook, scale: f64) -> (usize, usize, Vec<u8>) {
+        setup();
+        draw_look(look, scale).expect("drawn")
+    }
+
+    /// The painted pixels' bounds (left, top, right, bottom) for pixels `pick` chooses.
+    fn bounds(width: usize, pixels: &[u8], pick: impl Fn(&[u8]) -> bool) -> Option<(usize, usize, usize, usize)> {
+        let found: Vec<(usize, usize)> = pixels.chunks(4).enumerate().filter(|(_, p)| pick(p)).map(|(i, _)| (i % width, i / width)).collect();
+        let xs = found.iter().map(|p| p.0);
+        let ys = found.iter().map(|p| p.1);
+        Some((xs.clone().min()?, ys.clone().min()?, xs.max()?, ys.max()?))
+    }
+
+    /// UILabel's text: in the middle of its bounds up and down, aligned
+    /// across, in its colour, its shadow under it at the offset; at the
+    /// screen's scale.
+    #[test]
+    fn labels_draw_their_text_centred_with_its_colour_and_shadow() {
+        let mut centred = look("T", (64.0, 64.0));
+        centred.alignment = CENTER;
+        let (width, height, pixels) = drawn(&centred, 1.0);
+        assert_eq!((width, height), (64, 64));
+        let (left, top, right, bottom) = bounds(width, &pixels, |p| p[3] > 0).expect("text drawn");
+        assert!(top >= 18 && bottom <= 46, "not in the middle up and down: rows {top}-{bottom}");
+        assert!(((left + right) as f64 / 2.0 - 32.0).abs() <= 3.0, "not centred: columns {left}-{right}");
+        let solid = pixels.chunks(4).find(|p| p[3] == 255).expect("a solid pixel");
+        assert_eq!(&solid[..3], &[255, 255, 255], "white text");
+        // The shadow: red, 3 points right and down.
+        centred.shadow = Some(([1.0, 0.0, 0.0, 1.0], (3.0, 3.0)));
+        let (_, _, pixels) = drawn(&centred, 1.0);
+        let white = bounds(width, &pixels, |p| p[3] == 255 && p[1] > 200).unwrap();
+        let red = bounds(width, &pixels, |p| p[3] == 255 && p[0] > 200 && p[1] < 50).expect("shadow drawn");
+        assert!(red.2.abs_diff(white.2 + 3) <= 1 && red.3.abs_diff(white.3 + 3) <= 1, "shadow {red:?} text {white:?}");
+        // Twice the pixels at scale 2.
+        let (width, height, _) = drawn(&centred, 2.0);
+        assert_eq!((width, height), (128, 128));
+    }
+
+    /// Lines: one line is cut ("…"), any number wraps; a label that adjusts
+    /// its font to fit draws smaller instead of cutting.
+    #[test]
+    fn labels_wrap_cut_or_shrink_their_text() {
+        let rows = |look: &TextLook| {
+            let (width, _, pixels) = drawn(look, 1.0);
+            bounds(width, &pixels, |p| p[3] > 0).map(|(_, top, _, bottom)| bottom - top).unwrap()
+        };
+        let one = look("ab ab ab ab", (40.0, 100.0));
+        let mut many = one.clone();
+        many.lines = 0;
+        assert!(rows(&many) > rows(&one) * 2, "wrapped: {} rows, one line {}", rows(&many), rows(&one));
+        let mut shrinking = look("WWWWWWWW", (40.0, 64.0));
+        let cut = rows(&shrinking);
+        shrinking.minimum_font_size = Some(4.0);
+        assert!(rows(&shrinking) * 2 < cut, "shrunk to fit: {} rows, cut {cut}", rows(&shrinking));
     }
 
     /// 32-bit games reach these methods only through a framework_selectors.tsv row.

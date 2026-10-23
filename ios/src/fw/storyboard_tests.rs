@@ -461,8 +461,9 @@ fn decoding_skips_the_games_init_with_frame_but_keeps_ours() {
     assert!(!GAME_INIT_WITH_FRAME.lock().unwrap().contains(&view), "the game's initWithFrame: was called");
     assert_eq!(call::<Rect>(view, "frame").size, Size { width: 40.0, height: 20.0 });
     let label = decoded("UILabel", vec![("UIBounds", Held::Rect(Rect::new(0.0, 0.0, 40.0, 20.0)))]);
-    assert!(!flag(label, "isUserInteractionEnabled"), "a label takes no touches unless the nib says so");
-    assert_eq!(property_get(label, "notDrawn"), Some(1), "UILabel's own setup ran");
+    assert!(!flag(label, "isUserInteractionEnabled"), "a label takes no touches unless the nib says so (UILabel's own setup ran)");
+    let button = decoded("UIButton", vec![("UIBounds", Held::Rect(Rect::new(0.0, 0.0, 40.0, 20.0)))]);
+    assert_eq!(property_get(button, "notDrawn"), Some(1), "UIControl's own setup ran");
 }
 
 /// A label's text, font, colours and the rest of what a nib stores.
