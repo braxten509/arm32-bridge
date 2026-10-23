@@ -128,22 +128,46 @@ fn main() {
 
 /// The C++ runtime of 32-bit games (guest32-cxx/README.md): a 32-bit ARM
 /// library embedded into this layer. It is a build output, not in the repo:
-/// built here by guest32-cxx/build.sh when missing (rebuild it by hand after
-/// changing its sources; this build then embeds the new one).
+/// built here by `guest32-cxx/build.sh test` when missing, into a folder
+/// named after the contents of guest32-cxx/ (build rules, headers, glue,
+/// tests), so a change there gets a fresh build and never meets a library
+/// another checkout built by other rules.
 fn guest32_cxx() {
     println!("cargo:rerun-if-env-changed=GUEST32_CXX_OUT");
+    let folder = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("guest32-cxx");
+    println!("cargo:rerun-if-changed={}", folder.display());
     let out = std::env::var("GUEST32_CXX_OUT").map(PathBuf::from).unwrap_or_else(|_| {
-        PathBuf::from(std::env::var("HOME").unwrap()).join(".cache/gamebridge/guest32-cxx/out")
+        let mut files = Vec::new();
+        list_files(&folder, &mut files);
+        files.sort();
+        let mut hasher = std::hash::DefaultHasher::new();
+        for file in &files {
+            std::hash::Hash::hash(file.strip_prefix(&folder).unwrap(), &mut hasher);
+            std::hash::Hash::hash(&std::fs::read(file).unwrap(), &mut hasher);
+        }
+        let name = format!(".cache/gamebridge/guest32-cxx/out-{:016x}", std::hash::Hasher::finish(&hasher));
+        PathBuf::from(std::env::var("HOME").unwrap()).join(name)
     });
     let library = out.join("libguest32cxx.so");
-    if !library.exists() {
-        let script = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("guest32-cxx/build.sh");
+    if !library.exists() || !out.join("test/libcxxtest.so").exists() {
         let mut command = Command::new("bash");
-        command.arg(&script).env("GUEST32_CXX_OUT", &out);
-        run(command, "building the 32-bit C++ runtime (guest32-cxx/build.sh)");
+        command.arg(folder.join("build.sh")).arg("test").env("GUEST32_CXX_OUT", &out);
+        run(command, "building the 32-bit C++ runtime (guest32-cxx/build.sh test)");
     }
     println!("cargo:rerun-if-changed={}", library.display());
     println!("cargo:rustc-env=GUEST32_CXX_LIBRARY={}", library.display());
+    println!("cargo:rustc-env=GUEST32_CXX_OUT_DIR={}", out.display());
+}
+
+fn list_files(folder: &Path, files: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(folder).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            list_files(&path, files);
+        } else {
+            files.push(path);
+        }
+    }
 }
 
 fn run(mut command: Command, what: &str) {

@@ -77,7 +77,7 @@ pub fn clear_cache(start: usize, end: usize) {
 /// Names a code address: "SwordGame!function+0x10", or a plain number.
 pub fn describe_address(address: usize) -> String {
     let Some(loaded) = try_loaded() else {
-        return format!("{address:#x}");
+        return describe_host_address(address);
     };
     if address < loaded.start || address >= loaded.end {
         return describe_host_address(address);

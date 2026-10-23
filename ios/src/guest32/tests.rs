@@ -283,10 +283,8 @@ fn cxx_runtime_checks_pass_on_this_c_library() {
     }
     cxx();
     ios32::register_function("testc_mutexes_held", no_locks_counted);
-    let out = std::env::var("GUEST32_CXX_OUT").map(std::path::PathBuf::from).unwrap_or_else(|_| {
-        std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".cache/gamebridge/guest32-cxx/out")
-    });
-    let path = out.join("test/libcxxtest.so");
+    // Built next to the embedded library (build.rs).
+    let path = std::path::Path::new(env!("GUEST32_CXX_OUT_DIR")).join("test/libcxxtest.so");
     let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e} (run guest32-cxx/build.sh test)", path.display()));
     let _gil = runtime::hold_gil();
     let uc = runtime::engine();
@@ -294,6 +292,47 @@ fn cxx_runtime_checks_pass_on_this_c_library() {
     let run_all = arm32_bridge::elf::with_loader(|loader| loader.libraries[index].export(uc, "run_all")).unwrap();
     let failed = runtime::call_guest(uc, run_all, &[]).unwrap() as u32;
     assert_eq!(failed, 0, "run_all: one bit per failed check");
+}
+
+#[test]
+fn cxx_runtime_keeps_nothing_in_r9_across_game_code() {
+    // Apple's armv7 code may change r9 in any call (it is not kept), so the
+    // library must not keep a value there across a call into game code.
+    // TownCraft: libc++'s xsputn kept its source pointer in r9 across the
+    // game's own basic_stringbuf::overflow, which changed r9.
+    static SCRATCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    fn overflow(uc: &mut runtime::Uc, a: &mut Args) -> runtime::Ret {
+        let (this, c) = (a.u32(), a.u32());
+        let out = mem().read_u32(this + 0x20);
+        mem().write_u8(out, c as u8);
+        mem().write_u32(this + 0x18, out + 1); // pptr
+        mem().write_u32(this + 0x1c, out + 32); // epptr
+        uc.set_reg(9, SCRATCH.load(std::sync::atomic::Ordering::SeqCst) - 1);
+        runtime::Ret::U32(c)
+    }
+    cxx();
+    ios32::register_function("test_overflow_changing_r9", overflow);
+    SCRATCH.store(cstring("###########################"), std::sync::atomic::Ordering::SeqCst);
+    // basic_streambuf<char>: vtable, locale, eback/gptr/egptr, pbase/pptr/epptr
+    // (all 0: the first character goes to overflow); +0x20 here: the output.
+    let (vtable, buffer, out) = (alloc(0x40), alloc(0x24), alloc(64));
+    for offset in (0..0x40).step_by(4) {
+        mem().write_u32(vtable + offset, 0);
+    }
+    mem().write_u32(vtable + 0x34, runtime::stub_for("test_overflow_changing_r9"));
+    for offset in (0..0x20).step_by(4) {
+        mem().write_u32(buffer + offset, 0);
+    }
+    mem().write_u32(buffer, vtable);
+    mem().write_u32(buffer + 0x20, out);
+    let text = "hello, world";
+    let source = cstring(text);
+    let xsputn = guest_export("_ZNSt3__115basic_streambufIcNS_11char_traitsIcEEE6xsputnEPKci");
+    let _gil = runtime::hold_gil();
+    let uc = runtime::engine();
+    let written = runtime::call_guest(uc, xsputn, &[buffer, source, text.len() as u32]).unwrap() as u32;
+    assert_eq!(written, text.len() as u32);
+    assert_eq!(mem().bytes(out, text.len()), text.as_bytes());
 }
 
 #[test]
