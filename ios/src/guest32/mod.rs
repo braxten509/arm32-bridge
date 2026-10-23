@@ -235,7 +235,7 @@ pub fn run(app_dir: &str, program_path: &str) -> Result<(), String> {
     }
     let start = ios32::start_state(uc, &program, program_path)?;
     crate::log!("32-bit start: {} at {:#010x} ({})", start.kind, start.pc & !1, if start.pc & 1 == 1 { "Thumb" } else { "ARM" });
-    let result = ios32::run_initializers(uc, &program, &start).and_then(|count| {
+    let result = objc::wire::run_loads().and_then(|_| ios32::run_initializers(uc, &program, &start)).and_then(|count| {
         crate::log!("32-bit start-up functions run: {count}");
         runtime::start_guest(uc, start.pc, &start.registers, start.sp)
     });

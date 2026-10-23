@@ -6,7 +6,7 @@ use super::convert::{HostFrame, HostRet};
 use super::mirror;
 use super::testing::Fake;
 use crate::objc::runtime::{self, Class, Id, Sel};
-use guest32_image::{ClassRo32, ClassTarget, Method32, ObjcClass32, ObjcMetadata32};
+use guest32_image::{ClassRo32, ClassTarget, Method32, ObjcCategory32, ObjcClass32, ObjcMetadata32};
 use std::sync::Mutex;
 
 // ----- host classes for the test -----
@@ -260,6 +260,48 @@ fn bytes_asks_a_game_override_of_length_without_holding_the_bridge() {
     std::thread::spawn(move || done.send(send(bridge, fake, &[object, bytes])).unwrap());
     let copy = result.recv_timeout(std::time::Duration::from_secs(10)).expect("-bytes deadlocked on the bridge lock").unwrap() as u32;
     assert_eq!(fake.read(copy, 2), &HOST_BYTES[..2]);
+}
+
+#[test]
+fn load_runs_parents_first_then_categories_and_initialize_runs_once_before_first_message() {
+    host_class("G32HostRoot");
+    let fake = Fake::new();
+    let mut base = class32(fake, "G32Base", ClassTarget::External("G32HostRoot".into()), "G32HostRoot", vec![]);
+    base.meta.methods = vec![method("load", "v8@0:4", 0x2311), method("initialize", "v8@0:4", 0x2301)];
+    let mut sub = class32(fake, "G32Sub", ClassTarget::Local(base.address), "G32HostRoot", vec![]);
+    sub.meta.methods = vec![method("load", "v8@0:4", 0x2321)];
+    let (base_class, sub_class) = (base.address, sub.address);
+    let category = ObjcCategory32 {
+        address: fake.alloc_permanent(4),
+        name: "Extras".into(),
+        class: ClassTarget::Local(sub_class),
+        instance_methods: vec![],
+        class_methods: vec![method("load", "v8@0:4", 0x2331)],
+        protocols: vec![],
+        instance_properties: vec![],
+    };
+    // The subclass comes first in the image; its superclass still loads first.
+    let md = ObjcMetadata32 { classes: vec![sub, base], categories: vec![category], ..Default::default() };
+    let bridge: &'static Mutex<Bridge> = Box::leak(Box::new(Mutex::new(Bridge::new(&md).unwrap())));
+    install(bridge, fake, &md).unwrap();
+    let calls: &'static Mutex<Vec<(u32, u32)>> = Box::leak(Box::new(Mutex::new(Vec::new())));
+    for imp in [0x2301, 0x2311, 0x2321, 0x2331] {
+        fake.code(imp, move |w| {
+            calls.lock().unwrap().push((imp, w[0]));
+            0
+        });
+    }
+    run_loads(bridge, fake, &md).unwrap();
+    assert_eq!(*calls.lock().unwrap(), [(0x2311, base_class), (0x2321, sub_class), (0x2331, sub_class)]);
+    calls.lock().unwrap().clear();
+    // The first message to G32Sub initializes G32Base, then G32Sub (inheriting
+    // +initialize, as on Apple's runtime); later messages don't.
+    let sel = |name: &str| bridge.lock().unwrap().guest_selector(fake, name);
+    let object = send(bridge, fake, &[sub_class, sel("alloc")]).unwrap() as u32;
+    let _ = object;
+    send(bridge, fake, &[sub_class, sel("alloc")]).unwrap();
+    send(bridge, fake, &[base_class, sel("alloc")]).unwrap();
+    assert_eq!(*calls.lock().unwrap(), [(0x2301, base_class), (0x2301, sub_class)]);
 }
 
 static HOST_CG: Mutex<Vec<Id>> = Mutex::new(Vec::new());

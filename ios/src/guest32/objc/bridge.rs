@@ -26,7 +26,7 @@ use super::mirror;
 use super::selectors::FrameworkSelectors;
 use crate::objc::runtime;
 use guest32_image::ObjcMetadata32;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 /// Guest memory and guest code, as the bridge needs them.
@@ -119,6 +119,8 @@ pub struct Bridge {
     buffers: HashMap<usize, (u32, u32)>,
     /// Guest address of the objc_msgSend stand-in (imp of framework Methods).
     pub msg_send_stub: u32,
+    /// Game classes whose +initialize has started.
+    initialized: HashSet<u32>,
 }
 
 /// Where a message goes.
@@ -143,6 +145,7 @@ impl Bridge {
             host_blocks: HashMap::new(),
             buffers: HashMap::new(),
             msg_send_stub: 0,
+            initialized: HashSet::new(),
         })
     }
 
@@ -533,7 +536,10 @@ pub fn install(bridge: &Mutex<Bridge>, g: &dyn GuestSide, md: &ObjcMetadata32) -
             super::classes::Super::None => 0,
         };
         let instance: Vec<String> = b.classes.selectors_of(address).into_iter().map(str::to_string).collect();
-        let class: Vec<String> = b.classes.selectors_of(meta).into_iter().map(str::to_string).collect();
+        // +load and +initialize are the bridge's to run (run_loads, initialize):
+        // the host runtime's own +initialize must not reach the game's again.
+        let class: Vec<String> =
+            b.classes.selectors_of(meta).into_iter().filter(|s| !matches!(*s, "load" | "initialize")).map(str::to_string).collect();
         let instance: Vec<&str> = instance.iter().map(String::as_str).collect();
         let class: Vec<&str> = class.iter().map(String::as_str).collect();
         let mirror = mirror::define_mirror_class(&name, host_super, address, &instance, &class)?;
@@ -546,6 +552,84 @@ pub fn install(bridge: &Mutex<Bridge>, g: &dyn GuestSide, md: &ObjcMetadata32) -
         if canonical != current {
             g.write(r.slot, &canonical.to_le_bytes());
         }
+    }
+    Ok(())
+}
+
+/// Runs +load of every game class and category that defines one, in
+/// Apple's order: superclasses before subclasses, classes before
+/// categories, otherwise image order. Before the image's C++ initializers.
+pub fn run_loads(bridge: &Mutex<Bridge>, g: &dyn GuestSide, md: &ObjcMetadata32) -> Result<(), String> {
+    fn visit<'a>(
+        class: &'a guest32_image::ObjcClass32,
+        by_address: &HashMap<u32, &'a guest32_image::ObjcClass32>,
+        done: &mut HashSet<u32>,
+        order: &mut Vec<(u32, u32)>,
+    ) {
+        if !done.insert(class.address) {
+            return;
+        }
+        if let guest32_image::ClassTarget::Local(parent) = &class.superclass {
+            if let Some(parent) = by_address.get(parent) {
+                visit(parent, by_address, done, order);
+            }
+        }
+        if let Some(load) = class.meta.methods.iter().find(|m| m.name == "load") {
+            order.push((load.imp, class.address));
+        }
+    }
+    let by_address: HashMap<u32, &guest32_image::ObjcClass32> = md.classes.iter().map(|c| (c.address, c)).collect();
+    let (mut done, mut order) = (HashSet::new(), Vec::new());
+    for class in &md.classes {
+        visit(class, &by_address, &mut done, &mut order);
+    }
+    for category in &md.categories {
+        let Some(load) = category.class_methods.iter().find(|m| m.name == "load") else { continue };
+        let class = match &category.class {
+            guest32_image::ClassTarget::Local(class) => *class,
+            guest32_image::ClassTarget::External(name) => lock(bridge).framework_class(g, name).0,
+            _ => continue,
+        };
+        order.push((load.imp, class));
+    }
+    let sel = lock(bridge).guest_selector(g, "load");
+    for (imp, class) in order {
+        g.call(imp, &[class, sel])?;
+    }
+    Ok(())
+}
+
+/// The game class a message to an object whose isa is `isa` must initialize
+/// first, if its +initialize hasn't run.
+fn class_to_initialize(b: &Bridge, isa: u32) -> Option<u32> {
+    let c = b.classes.class(isa)?;
+    let class = if c.meta { c.partner } else { isa };
+    (!b.initialized.contains(&class)).then_some(class)
+}
+
+/// Sends +initialize to a game class once, its game superclasses first. Like
+/// Apple's runtime it is a message: a class without its own +initialize runs
+/// its superclass's. (Another thread may message the class meanwhile; Apple
+/// makes it wait.)
+fn initialize(bridge: &Mutex<Bridge>, g: &dyn GuestSide, class: u32) -> Result<(), String> {
+    let (superclass, meta, sel) = {
+        let mut b = lock(bridge);
+        if !b.initialized.insert(class) {
+            return Ok(());
+        }
+        let c = b.classes.class(class).ok_or_else(|| format!("+initialize of unknown class {class:#x}"))?;
+        let (superclass, meta) = (c.superclass.clone(), c.partner);
+        (superclass, meta, b.guest_selector(g, "initialize"))
+    };
+    if let super::classes::Super::Game(parent) = superclass {
+        initialize(bridge, g, parent)?;
+    }
+    let imp = match lock(bridge).classes.lookup(meta, "initialize") {
+        Lookup::Guest(m) => Some(m.imp),
+        _ => None,
+    };
+    if let Some(imp) = imp {
+        g.call(imp, &[class, sel])?;
     }
     Ok(())
 }
@@ -599,6 +683,11 @@ pub fn send_from_guest(
                     other => return Err(format!("message {other} to a block")),
                 };
                 return Ok(GuestRet { r0, r1: 0 });
+            }
+            if let Some(class) = class_to_initialize(&b, isa) {
+                drop(b);
+                initialize(bridge, g, class)?;
+                b = lock(bridge);
             }
             (receiver, b.resolve(isa, &name)?)
         }
@@ -741,6 +830,11 @@ pub fn dispatch_from_host(bridge: &Mutex<Bridge>, g: &dyn GuestSide, frame: &mut
     let name = unsafe { runtime::cstr(frame.x[1] as usize) };
     let guest_self = b.guest_object(g, host_self)?;
     let isa = u32_at(g, guest_self);
+    if let Some(class) = class_to_initialize(&b, isa) {
+        drop(b);
+        initialize(bridge, g, class)?;
+        b = lock(bridge);
+    }
     let (imp, types) = match b.classes.lookup(isa, &name) {
         Lookup::Guest(m) => (m.imp, m.types.clone()),
         _ => return Err(format!("host sent {name} to game object {guest_self:#x}, which has no such method")),

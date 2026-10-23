@@ -3,7 +3,7 @@
 //! Objective-C runtime function, the data imports the game's classes and
 //! constants bind to, and setting up the game's classes after loading.
 
-use super::bridge::{dispatch_from_host, install, is_host_object, Bridge, GuestSide, Special};
+use super::bridge::{dispatch_from_host, install, is_host_object, run_loads as run_guest_loads, Bridge, GuestSide, Special};
 use super::functions::{call_function, functions, Ctx, HOST_FUNCTIONS};
 use super::mirror;
 use arm32_bridge::ios32::Program;
@@ -261,4 +261,10 @@ pub fn install_program() -> Result<(), String> {
         md.selector_refs.len()
     );
     Ok(())
+}
+
+/// Runs the game's +load methods (after binding, before its C++ initializers).
+pub fn run_loads() -> Result<(), String> {
+    let (bridge, md) = (bridge().ok_or("no Objective-C bridge")?, METADATA.get().ok_or("no metadata")?);
+    run_guest_loads(bridge, &Translator, md)
 }
