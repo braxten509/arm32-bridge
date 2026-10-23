@@ -241,6 +241,11 @@ pub fn type_text(text: &str) {
     }
 }
 
+/// Text from the phone's keyboard as Java holds it (UTF-16 units).
+pub fn type_java_text(units: &[u16]) {
+    type_text(&String::from_utf16_lossy(units));
+}
+
 /// The return key: textFieldShouldReturn:, then EditingDidEndOnExit,
 /// which ends editing when someone listens for it (UIKit's way).
 fn press_return(field: Id) {
@@ -413,6 +418,14 @@ mod tests {
         assert_eq!(heard(), ["textFieldShouldReturn:"]);
         assert_eq!(text(), "a");
         assert_eq!(shown(), Some(("a".to_string(), [0.0, 0.0, 0.0, 1.0])));
+        // From the phone's keyboard (Java's UTF-16): an emoji is one letter
+        // (two UTF-16 units), typed and deleted whole.
+        type_java_text(&"😀".encode_utf16().collect::<Vec<u16>>());
+        assert_eq!(text(), "a😀");
+        assert_eq!(heard(), ["change 1,0 \"😀\"", "changed"]);
+        type_java_text(&[8]);
+        assert_eq!(text(), "a");
+        assert_eq!(heard(), ["change 1,2 \"\"", "changed"]);
         runtime::send(field, "setSecureTextEntry:", &[1]);
         assert_eq!(shown().unwrap().0, "•", "a password shows dots");
 

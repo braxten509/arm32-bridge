@@ -216,8 +216,16 @@ pub extern "C" fn Java_dev_braxten_gamebridge_IosGameActivity_nativeTouch(
 /// delete and "\n" for return (fw/typing.rs).
 #[no_mangle]
 pub unsafe extern "C" fn Java_dev_braxten_gamebridge_IosGameActivity_nativeType(env: *mut JNIEnv, _this: jobject, typed: jstring) {
-    let typed = text(env, typed);
-    crate::fw::runloop::post(crate::fw::runloop::Work::Native(Box::new(move || crate::fw::typing::type_text(&typed))));
+    // Java's own UTF-16 (GetStringUTFChars' modified UTF-8 splits emoji in two).
+    let functions = &**env;
+    let length = (functions.GetStringLength.unwrap())(env, typed).max(0) as usize;
+    let chars = (functions.GetStringChars.unwrap())(env, typed, std::ptr::null_mut());
+    if chars.is_null() {
+        return;
+    }
+    let units = std::slice::from_raw_parts(chars, length).to_vec();
+    (functions.ReleaseStringChars.unwrap())(env, typed, chars);
+    crate::fw::runloop::post(crate::fw::runloop::Work::Native(Box::new(move || crate::fw::typing::type_java_text(&units))));
 }
 
 /// The game is editing text (true) or stopped (false): the phone's keyboard comes up or goes.
