@@ -402,8 +402,23 @@ pub fn timers_fired() -> usize {
 
 static MAIN_RUN_LOOP: std::sync::OnceLock<Id> = std::sync::OnceLock::new();
 
-thread_local! {
-    static THREAD_RUN_LOOP: std::cell::Cell<Id> = const { std::cell::Cell::new(0) };
+/// Each thread object's run loop object (made when first needed, by the
+/// thread itself or by work sent to it); the main thread's is MAIN_LOOP's.
+static THREAD_RUN_LOOPS: Mutex<Vec<(Id, Id)>> = Mutex::new(Vec::new());
+
+fn run_loop_of_thread(thread: Id) -> Id {
+    if thread == 0 || thread == thread_main(0, 0) {
+        return main_run_loop();
+    }
+    let mut loops = THREAD_RUN_LOOPS.lock().unwrap();
+    if let Some(&(_, object)) = loops.iter().find(|(t, _)| *t == thread) {
+        return object;
+    }
+    // Lives as long as the program: the game may keep the object.
+    let made: &'static Loop = Box::leak(Box::new(Loop::new()));
+    let object = run_loop_object(made);
+    loops.push((thread, object));
+    object
 }
 
 fn run_loop_object(run_loop: &'static Loop) -> Id {
@@ -417,17 +432,7 @@ fn main_run_loop() -> Id {
 }
 
 fn current_run_loop() -> Id {
-    if is_main_thread() {
-        return main_run_loop();
-    }
-    THREAD_RUN_LOOP.with(|cell| {
-        if cell.get() == 0 {
-            // Lives as long as the program: the game may keep the object.
-            let made: &'static Loop = Box::leak(Box::new(Loop::new()));
-            cell.set(run_loop_object(made));
-        }
-        cell.get()
-    })
+    run_loop_of_thread(thread_current(0, 0))
 }
 
 fn loop_of(object: Id) -> &'static Loop {
@@ -535,6 +540,34 @@ extern "C" fn perform_on_main(this: Id, _: Sel, selector: Sel, argument: Id, wai
     }
 }
 
+/// -performSelector:onThread:withObject:waitUntilDone:: on the calling
+/// thread and waiting, done at once; otherwise queued on that thread's run
+/// loop (run when the thread runs it), the caller waiting for it if asked.
+extern "C" fn perform_on_thread(this: Id, _: Sel, selector: Sel, thread: Id, argument: Id, wait: u8) {
+    let here = thread_current(0, 0);
+    let thread = if thread == 0 { thread_main(0, 0) } else { thread };
+    if thread == here && wait != 0 {
+        let name = lock().sel_name(selector);
+        runtime::send(this, &name, &[argument]);
+        return;
+    }
+    // Kept until the message has run (Apple retains it too).
+    crate::fw::counted::keep(argument);
+    let run_loop = loop_of(run_loop_of_thread(thread));
+    let done = (wait != 0).then(|| Arc::new((Mutex::new(false), Condvar::new())));
+    post_to(run_loop, Work::Message { target: this, selector, argument, done: done.clone() });
+    if let Some(done) = done {
+        let mut finished = done.0.lock().unwrap();
+        while !*finished {
+            finished = done.1.wait(finished).unwrap();
+        }
+    }
+}
+
+extern "C" fn perform_on_thread_modes(this: Id, s: Sel, selector: Sel, thread: Id, argument: Id, wait: u8, _modes: Id) {
+    perform_on_thread(this, s, selector, thread, argument, wait);
+}
+
 extern "C" fn perform_on_main_modes(this: Id, s: Sel, selector: Sel, argument: Id, wait: u8, _modes: Id) {
     perform_on_main(this, s, selector, argument, wait);
 }
@@ -635,6 +668,10 @@ thread_local! {
 }
 
 extern "C" fn thread_current(_: Class, _: Sel) -> Id {
+    let started = CURRENT_THREAD.with(|cell| cell.get());
+    if started != 0 {
+        return started;
+    }
     if is_main_thread() {
         return thread_main(0, 0);
     }
@@ -757,6 +794,8 @@ pub fn register(r: &mut Registry) {
         &[
             ("performSelectorOnMainThread:withObject:waitUntilDone:", perform_on_main as usize),
             ("performSelectorOnMainThread:withObject:waitUntilDone:modes:", perform_on_main_modes as usize),
+            ("performSelector:onThread:withObject:waitUntilDone:", perform_on_thread as usize),
+            ("performSelector:onThread:withObject:waitUntilDone:modes:", perform_on_thread_modes as usize),
             ("performSelector:withObject:afterDelay:", perform_after_delay as usize),
             ("performSelector:withObject:afterDelay:inModes:", perform_after_delay_modes as usize),
             ("performSelectorInBackground:withObject:", perform_in_background as usize),
@@ -827,5 +866,66 @@ mod frame_rate_tests {
         let refresh = 1.0 / 120.0;
         assert_eq!(link_interval(refresh, 2, false), refresh);
         assert_eq!(link_interval(refresh, 2, true), 2.0 * refresh, "IOS_FRAME_INTERVAL=1 keeps the game's choice");
+    }
+}
+
+#[cfg(test)]
+mod perform_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    static HEARD: Mutex<Vec<(String, Id)>> = Mutex::new(Vec::new());
+    static STOP: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn note(_this: Id, _: Sel, text: Id) {
+        HEARD.lock().unwrap().push((string::get(text), runtime::send(runtime::class_named("NSThread"), "currentThread", &[])));
+    }
+
+    /// A worker thread's body: runs its own run loop until told to stop.
+    extern "C" fn serve(_this: Id, _: Sel, _: Id) {
+        while !STOP.load(Ordering::Relaxed) {
+            run_loop_until(current_loop(), Some(now() + 0.02), true);
+        }
+    }
+
+    fn heard() -> Vec<String> {
+        std::mem::take(&mut *HEARD.lock().unwrap()).into_iter().map(|(text, _)| text).collect()
+    }
+
+    /// performSelector:onThread:withObject:waitUntilDone: as iOS does it:
+    /// on the calling thread and waiting, at once; not waiting, when that
+    /// thread's run loop next runs; on another thread, by that thread's run
+    /// loop, the caller waiting until it was done.
+    #[test]
+    fn messages_performed_on_a_thread_run_on_its_run_loop() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let class = define_class("PerformTestTarget", "NSObject", 8);
+        methods(class, &[("note:", note as usize), ("serve:", serve as usize)]);
+        let target = runtime::send(runtime::send(class, "alloc", &[]), "init", &[]);
+        let thread_class = runtime::class_named("NSThread");
+        let here = runtime::send(thread_class, "currentThread", &[]);
+        let perform = |thread: Id, text: &str, wait: usize| {
+            let s = runtime::sel("performSelector:onThread:withObject:waitUntilDone:");
+            let imp = runtime::imp_for(target, s).expect("-[NSObject performSelector:onThread:withObject:waitUntilDone:] is missing");
+            let f: extern "C" fn(Id, Sel, Sel, Id, Id, u8) = unsafe { std::mem::transmute(imp) };
+            f(target, s, runtime::sel("note:"), thread, string::make(text), wait as u8);
+        };
+        perform(here, "now", 1);
+        assert_eq!(heard(), ["now"], "this thread, waiting: done at once");
+
+        let worker = runtime::send(runtime::send(thread_class, "alloc", &[]), "initWithTarget:selector:object:", &[target, runtime::sel("serve:"), 0]);
+        runtime::send(worker, "start", &[]);
+        perform(worker, "there", 1);
+        let done = std::mem::take(&mut *HEARD.lock().unwrap());
+        assert_eq!(done.iter().map(|(text, thread)| (text.as_str(), *thread)).collect::<Vec<_>>(), [("there", worker)], "run by the worker's loop before the call returned");
+        // Not waiting: the worker's loop runs it soon after.
+        perform(worker, "soon", 0);
+        let deadline = now() + 5.0;
+        while HEARD.lock().unwrap().is_empty() && now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(heard(), ["soon"]);
+        STOP.store(true, Ordering::Relaxed);
     }
 }

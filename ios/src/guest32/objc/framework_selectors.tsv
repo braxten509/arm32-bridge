@@ -404,6 +404,7 @@ performBlock:withObject:waitUntilDone:	v@:@?@c
 performRequestWithHandler:	v@:@?
 performSegueWithIdentifier:sender:	v@:@@
 performSelector:	@@::
+performSelector:onThread:withObject:waitUntilDone:modes:	v@::@@c@
 performSelectorOnMainThread:withObject:waitUntilDone:	v@::@c
 performSelector:onThread:withObject:waitUntilDone:	v@::@@c
 performSelector:withObject:	@@::@
