@@ -62,6 +62,7 @@
 //! (bionic layouts and errno numbers), everything else goes through this
 //! table. Their exports bind directly to the program's imports of the same name.
 
+pub mod fw;
 mod libsystem;
 #[cfg(test)]
 mod tests;
@@ -148,6 +149,7 @@ pub fn call(uc: &mut Uc, address: u32, args: &[u32]) -> Result<u64, String> {
 /// Every name the 32-bit layer provides, registered before loading.
 pub fn register_all() {
     libsystem::register();
+    fw::register();
 }
 
 /// The loaded program's header address and slide (dyld image functions).
