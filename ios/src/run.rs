@@ -42,6 +42,14 @@ pub fn run(app_dir: &str) -> Result<(), String> {
     crate::libsystem::threads::note_this_thread();
     setup();
     let program = find_program(&app_dir)?;
+    // armv7-only programs run on the translator; the window, run loop and the rest stay ours.
+    let file = std::fs::read(&program).map_err(|e| format!("can't read {program}: {e}"))?;
+    if crate::guest32::is_guest32_program(&file) {
+        drop(file);
+        crate::log!("loading {program} (32-bit: runs on the translator)");
+        return crate::guest32::run(&app_dir, &program);
+    }
+    drop(file);
     crate::log!("loading {program}");
     let loaded = crate::loader::load(&app_dir, &program)?;
     crate::log!(

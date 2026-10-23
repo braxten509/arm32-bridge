@@ -27,6 +27,32 @@ pub fn try_loaded() -> Option<&'static Loaded> {
     LOADED.get()
 }
 
+/// A 32-bit game's program path and .app folder (its code runs on the
+/// translator, so there is no 64-bit `Loaded`).
+static GUEST32_APP: OnceLock<(String, String)> = OnceLock::new();
+
+pub fn set_guest32_app(program_path: &str, app_dir: &str) {
+    let _ = GUEST32_APP.set((program_path.to_string(), app_dir.to_string()));
+}
+
+/// The game's .app folder (64-bit or 32-bit game).
+pub fn app_dir() -> String {
+    match (try_loaded(), GUEST32_APP.get()) {
+        (Some(loaded), _) => loaded.app_dir.clone(),
+        (None, Some((_, app_dir))) => app_dir.clone(),
+        (None, None) => panic!("no game loaded"),
+    }
+}
+
+/// The game's program file (64-bit or 32-bit game).
+pub fn program_path() -> String {
+    match (try_loaded(), GUEST32_APP.get()) {
+        (Some(loaded), _) => loaded.path.clone(),
+        (None, Some((path, _))) => path.clone(),
+        (None, None) => panic!("no game loaded"),
+    }
+}
+
 #[derive(Default)]
 pub struct LoadReport {
     pub functions_found: usize,

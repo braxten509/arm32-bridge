@@ -322,12 +322,14 @@ name = "gamebridge-ios"
 version = "0.1.0"
 dependencies = [
  "aes",
+ "arm32-bridge",
  "blowfish",
  "cast5",
  "cc",
  "cipher",
  "des",
  "dlmalloc",
+ "guest32-image",
  "image",
  "jni-sys 0.3.1",
  "libc",

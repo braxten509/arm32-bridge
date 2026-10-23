@@ -14,6 +14,9 @@ name = "ios-run"
 path = "src/main.rs"
 
 [dependencies]
+# 32-bit (armv7) games run on the translator; its loader reads their Mach-O files.
+arm32-bridge = { path = ".." }
+guest32-image = { path = "guest32-image" }
 aes = "0.8"
 blowfish = "0.9"
 cast5 = "0.11"
