@@ -139,7 +139,7 @@ fn guest_messages_reach_game_code_host_code_and_super() {
     });
     let alpha = bridge_ref.lock().unwrap().guest_selector(fake, "setAlpha:");
     send(bridge_ref, fake, &[object, alpha, 0.5f32.to_bits()]).unwrap();
-    assert_eq!(*HOST_ALPHA.lock().unwrap(), [(host, 0.5)]);
+    assert_eq!(HOST_ALPHA.lock().unwrap().iter().filter(|e| e.0 == host).collect::<Vec<_>>(), [&(host, 0.5)]);
 
     // A framework selector the game does not implement goes to the host with
     // converted types: -frame (CGRect stret) and -objectAtIndex: (id result).
@@ -179,6 +179,63 @@ fn guest_messages_reach_game_code_host_code_and_super() {
     args.x[..3].copy_from_slice(&[host as u64, tick as u64, 5]);
     let ret: HostRet = mirror::call_host(imp, &args);
     assert_eq!(ret.x[0] as u32, 15);
+}
+
+/// A game class in made-up metadata: its class and metaclass structures
+/// (isa words written) at fresh guest addresses.
+fn class32(fake: &Fake, name: &str, superclass: ClassTarget, root: &str, methods: Vec<Method32>) -> ObjcClass32 {
+    let (class, meta) = (fake.alloc_permanent(20), fake.alloc_permanent(20));
+    fake.write(class, &meta.to_le_bytes());
+    let meta_superclass = match &superclass {
+        ClassTarget::Local(parent) => ClassTarget::Local(fake.u32_at(*parent)),
+        other => other.clone(),
+    };
+    ObjcClass32 {
+        address: class,
+        name: name.into(),
+        superclass,
+        meta_address: meta,
+        meta_isa: ClassTarget::External(root.into()),
+        meta_superclass,
+        instance: ClassRo32 { instance_start: 8, instance_size: 16, methods, ..Default::default() },
+        meta: ClassRo32 { flags: 1, ..Default::default() },
+    }
+}
+
+#[test]
+fn super_calls_pass_through_intermediate_game_classes() {
+    host_class("G32HostPanel");
+    let fake = Fake::new();
+    // G32Leaf : G32Middle : G32HostPanel; only G32Leaf has -setAlpha:, which
+    // calls [super setAlpha:]. That must reach the host's method once.
+    let middle = class32(fake, "G32Middle", ClassTarget::External("G32HostPanel".into()), "G32HostPanel", vec![]);
+    let leaf = class32(fake, "G32Leaf", ClassTarget::Local(middle.address), "G32HostPanel", vec![method("setAlpha:", "v12@0:4f8", 0x2101)]);
+    let leaf_class = leaf.address;
+    let md = ObjcMetadata32 { classes: vec![middle, leaf], ..Default::default() };
+    let bridge: &'static Mutex<Bridge> = Box::leak(Box::new(Mutex::new(Bridge::new(&md).unwrap())));
+    install(bridge, fake, &md).unwrap();
+    let _hook = mirror::DISPATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    mirror::set_dispatch(Box::new(move |frame: &mut HostFrame| {
+        dispatch_from_host(bridge, fake, frame).unwrap();
+    }));
+    let entries: &'static Mutex<u32> = Box::leak(Box::new(Mutex::new(0)));
+    let super_struct = fake.alloc_permanent(8);
+    fake.code(0x2101, move |w| {
+        *entries.lock().unwrap() += 1;
+        if *entries.lock().unwrap() > 1 {
+            return 0; // re-entered: the super call came back here
+        }
+        fake.write(super_struct, &[w[0].to_le_bytes(), leaf_class.to_le_bytes()].concat());
+        let words = [super_struct, w[1], w[2]];
+        send_from_guest(bridge, fake, SendKind::Super2, &|i| words[i as usize]).unwrap();
+        0
+    });
+    let sel = |name: &str| bridge.lock().unwrap().guest_selector(fake, name);
+    let object = send(bridge, fake, &[leaf_class, sel("alloc")]).unwrap() as u32;
+    let host = bridge.lock().unwrap().host_object(object).unwrap();
+    send(bridge, fake, &[object, sel("setAlpha:"), 0.25f32.to_bits()]).unwrap();
+    assert_eq!(*entries.lock().unwrap(), 1);
+    assert!(HOST_ALPHA.lock().unwrap().contains(&(host, 0.25)));
 }
 
 static HOST_POINTS: Mutex<Vec<(f64, f64)>> = Mutex::new(Vec::new());

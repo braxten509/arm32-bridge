@@ -578,7 +578,7 @@ pub fn send_from_guest(
             let c = b.classes.class(current).ok_or_else(|| format!("super call {name} from unknown class {current:#x}"))?;
             let meta = c.meta;
             let target = match c.superclass.clone() {
-                super::classes::Super::Game(parent) => b.resolve_from(parent, &name)?,
+                super::classes::Super::Game(parent) => b.resolve_super(parent, &name)?,
                 super::classes::Super::Framework(class) => b.framework_target(&class, meta, &name, true)?,
                 super::classes::Super::None => return Err(format!("super call {name} from a root class")),
             };
@@ -667,8 +667,15 @@ pub fn call_host_function(
 }
 
 impl Bridge {
-    fn resolve_from(&self, class: u32, sel: &str) -> Result<Target, String> {
-        self.resolve(class, sel)
+    /// A super call's target, searched from game class `parent` up: a
+    /// framework class at the end answers with its own host method (the
+    /// receiver's host class would find the game's override again).
+    fn resolve_super(&self, parent: u32, sel: &str) -> Result<Target, String> {
+        match self.classes.lookup(parent, sel) {
+            Lookup::Guest(m) => Ok(Target::Guest { imp: m.imp, types: m.types.clone() }),
+            Lookup::Framework { class, meta } => self.framework_target(&class, meta, sel, true),
+            Lookup::Missing => Err(format!("{}{sel}]: super call finds no method", self.describe(parent))),
+        }
     }
 }
 
