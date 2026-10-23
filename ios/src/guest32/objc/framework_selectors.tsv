@@ -94,11 +94,13 @@ beginBackgroundTaskWithExpirationHandler:	I@:@?
 beginTrackingWithTouch:withEvent:	c@:@@
 bezierPath	@@:
 blackColor	@@:
+blueColor	@@:
 boldSystemFontOfSize:	@@:f
 boolForKey:	c@:@
 boolValue	c@:
 borderStyle	i@:
 bounds	{CGRect={CGPoint=ff}{CGSize=ff}}@:
+brownColor	@@:
 bundleIdentifier	@@:
 bundlePath	@@:
 buttonTitleAtIndex:	@@:i
@@ -162,6 +164,8 @@ currentQueue	@@:
 currentRunLoop	@@:
 currentThread	@@:
 currentTime	d@:
+cyanColor	@@:
+darkGrayColor	@@:
 dataForKey:	@@:@
 dataFromPropertyList:format:errorDescription:	@@:@I^@
 dataUsingEncoding:	@@:I
@@ -333,6 +337,7 @@ layer	@@:
 leftCapWidth	i@:
 length	I@:
 lengthOfBytesUsingEncoding:	I@:I
+lightGrayColor	@@:
 lineBreakMode	i@:
 lineNumber	i@:
 loadAchievementsWithCompletionHandler:	v@:@?
@@ -349,6 +354,7 @@ localTimeZone	@@:
 locationInView:	{CGPoint=ff}@:@
 longLongValue	q@:
 lowercaseString	@@:
+magentaColor	@@:
 mainBundle	@@:
 mainRunLoop	@@:
 mainScreen	@@:
@@ -433,6 +439,7 @@ propertyListFromData:mutabilityOption:format:errorDescription:	@@:@I^I^@
 propertyListWithData:options:format:error:	@@:@I^I^@
 proposedCredential	@@:
 proxyForJson	@@:
+purpleColor	@@:
 raise:format:	v@:@@	format
 rangeOfCharacterFromSet:	{_NSRange=II}@:@
 rangeOfString:	{_NSRange=II}@:@
