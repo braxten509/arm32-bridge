@@ -96,7 +96,7 @@ object Games {
         val (dataFiles, gameFiles) = found.partition { (file, _) -> file.name.endsWith(".obb", ignoreCase = true) || isZip(file) }
         val loose = dataFiles.map { (file, _) -> file }
         // The same game and version found twice shows once: the file already in Game Bridge/Android or
-        // /iPhone, else the first one, else one in Game Bridge/Originals. The others are its copies.
+        // /iPhone, else the first one. The others are its copies (Game Bridge/Originals isn't searched).
         val games = gameFiles
             .mapNotNull { (file, place) -> remembered(file) { read(context, file, place) }?.let { withLooseData(named(context, it), loose) } }
             .sortedBy { game -> game.file?.let { if (inPlace(it)) 0 else if (inside(it, ORIGINALS)) 2 else 1 } ?: 1 }
@@ -158,7 +158,9 @@ object Games {
     /** `game` for the saved file, with its icon's file name (the icon written if it isn't yet). */
     private fun jsonOf(game: Game, icons: File): Pair<JSONObject, String?>? {
         val icon = game.icon?.let { bitmap ->
-            val name = UUID.nameUUIDFromBytes("${game.file?.path ?: game.packageName}:${game.versionCode}".toByteArray()).toString() + ".png"
+            // Named after the picture too: a better reading (a newer app) gets a new file, not the old one.
+            val pixels = java.nio.ByteBuffer.allocate(bitmap.byteCount).also(bitmap::copyPixelsToBuffer).array()
+            val name = UUID.nameUUIDFromBytes("${game.file?.path ?: game.packageName}:${game.versionCode}:".toByteArray() + pixels).toString() + ".png"
             val file = File(icons, name)
             if (!file.exists()) {
                 val part = File(icons, "$name.part")
@@ -339,13 +341,16 @@ object Games {
                 entry.name.startsWith('.') -> emptyList()
                 // An unpacked iPhone game: the folder is the game.
                 entry.isDirectory && entry.name.endsWith(".app", ignoreCase = true) && File(entry, "Info.plist").isFile -> listOf(entry)
-                entry.isDirectory -> if (entry.name in skipped && isRoot(folder)) emptyList() else files(entry)
+                entry.isDirectory -> if (entry.name in skipped && isRoot(folder) || isOriginals(entry)) emptyList() else files(entry)
                 entry.name.endsWith(".apk", ignoreCase = true) || isBundle(entry) -> listOf(entry)
                 entry.name.endsWith(".obb", ignoreCase = true) || isZip(entry) -> listOf(entry)
                 else -> emptyList()
             }
         }
     }
+
+    /** Game Bridge/Originals holds spare copies the owner keeps: never searched, so they show no cards. */
+    private fun isOriginals(folder: File) = folder.name == ORIGINALS && folder.parentFile?.let { it.name == FOLDER && isRoot(it.parentFile ?: it) } == true
 
     private fun isRoot(folder: File) = folder == Environment.getExternalStorageDirectory() ||
         folder.parentFile?.path == "/storage"
