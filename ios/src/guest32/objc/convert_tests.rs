@@ -175,11 +175,14 @@ fn c_strings_and_out_parameters_cross_into_guest_memory() {
     assert_eq!(call.args.x[2] as usize, b.host_address(BASE + 0x100));
     // NSError **: the host writes a 64-bit id into a temporary; the guest's
     // 4-byte slot gets the mapped id after the call.
+    // The slot is often an uninitialized local (`NSError *error;`): it is
+    // never read, the host's temporary starts nil.
     let slot = BASE + 0x200;
-    b.put(slot, &0u32.to_le_bytes());
+    b.put(slot, &0xdead_beefu32.to_le_bytes());
     let sig = Signature::parse("c@:@^@").unwrap();
     let call = prepare_host_call(&sig, plain(), &words(&[1, 2, 3, slot]), &mut b).unwrap();
     let temp = call.args.x[3] as *mut u64;
+    assert_eq!(unsafe { *temp }, 0);
     unsafe { *temp = (HOST_ID + 0x5150) as u64 };
     let r = finish_host_call(call, &HostRet { x: [1, 0], d: [0; 4] }, &mut b).unwrap();
     assert_eq!((r.r0, b.get(slot, 4)), (1, 0x5150u32.to_le_bytes().to_vec()));

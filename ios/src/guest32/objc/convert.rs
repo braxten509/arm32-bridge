@@ -727,6 +727,9 @@ pub fn prepare_host_call(
                 let (count, read, write_back) = match (array_count, **pointee == Ty::Object) {
                     (Some(n), true) if n > MAX_ID_ARRAY => return Err(format!("an id array of {n} elements")),
                     (Some(n), true) => (n.max(1), options.arrays == IdArrays::In, options.arrays == IdArrays::Out),
+                    // `id *` (NSError **error and the like) is output-only: the
+                    // guest's slot is often uninitialized, so the host starts at nil.
+                    (None, true) => (1, false, true),
                     _ => (1, true, true),
                 };
                 let (step, guest_step) = (hty.size() as usize, pointee.guest_size() as usize);
