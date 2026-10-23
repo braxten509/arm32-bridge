@@ -37,10 +37,14 @@ pub fn set_guest32_app(program_path: &str, app_dir: &str) {
 
 /// The game's .app folder (64-bit or 32-bit game).
 pub fn app_dir() -> String {
+    try_app_dir().expect("no game loaded")
+}
+
+pub fn try_app_dir() -> Option<String> {
     match (try_loaded(), GUEST32_APP.get()) {
-        (Some(loaded), _) => loaded.app_dir.clone(),
-        (None, Some((_, app_dir))) => app_dir.clone(),
-        (None, None) => panic!("no game loaded"),
+        (Some(loaded), _) => Some(loaded.app_dir.clone()),
+        (None, Some((_, app_dir))) => Some(app_dir.clone()),
+        (None, None) => None,
     }
 }
 
