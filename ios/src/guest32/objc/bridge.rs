@@ -42,6 +42,11 @@ pub trait GuestSide: Sync {
     fn guest_address(&self, host: usize) -> Option<u32>;
     /// Runs guest code at `imp` (bit 0 = Thumb) with argument words; r0 | r1 << 32.
     fn call(&self, imp: u32, words: &[u32]) -> Result<u64, String>;
+    /// Runs `wait` without this thread holding the guest lock (so other
+    /// threads can run guest code meanwhile).
+    fn without_guest_lock(&self, wait: &mut dyn FnMut()) {
+        wait()
+    }
 }
 
 fn u32_at(g: &dyn GuestSide, addr: u32) -> u32 {
@@ -119,8 +124,8 @@ pub struct Bridge {
     buffers: HashMap<usize, (u32, u32)>,
     /// Guest address of the objc_msgSend stand-in (imp of framework Methods).
     pub msg_send_stub: u32,
-    /// Game classes whose +initialize has started.
-    initialized: HashSet<u32>,
+    /// Classes whose +initialize is running (on which thread) or done.
+    init_state: HashMap<u32, InitState>,
 }
 
 /// Where a message goes.
@@ -145,7 +150,7 @@ impl Bridge {
             host_blocks: HashMap::new(),
             buffers: HashMap::new(),
             msg_send_stub: 0,
-            initialized: HashSet::new(),
+            init_state: HashMap::new(),
         })
     }
 
@@ -634,39 +639,71 @@ pub fn run_loads(bridge: &Mutex<Bridge>, g: &dyn GuestSide, md: &ObjcMetadata32)
     Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InitState {
+    Running(std::thread::ThreadId),
+    Done,
+}
+
+/// Wakes threads waiting for some class's +initialize to finish.
+static INIT_DONE: (Mutex<()>, std::sync::Condvar) = (Mutex::new(()), std::sync::Condvar::new());
+
 /// The game class a message to an object whose isa is `isa` must initialize
-/// first, if its +initialize hasn't run.
+/// first, if its +initialize isn't done.
 fn class_to_initialize(b: &Bridge, isa: u32) -> Option<u32> {
     let c = b.classes.class(isa)?;
     let class = if c.meta { c.partner } else { isa };
-    (!b.initialized.contains(&class)).then_some(class)
+    (b.init_state.get(&class) != Some(&InitState::Done)).then_some(class)
 }
 
 /// Sends +initialize to a game class once, its game superclasses first. Like
 /// Apple's runtime it is a message: a class without its own +initialize runs
-/// its superclass's. (Another thread may message the class meanwhile; Apple
-/// makes it wait.)
+/// its superclass's. The thread running it may message the class again;
+/// other threads wait until it is done (holding neither the bridge lock nor
+/// the guest lock).
 fn initialize(bridge: &Mutex<Bridge>, g: &dyn GuestSide, class: u32) -> Result<(), String> {
-    let (superclass, meta, sel) = {
+    let me = std::thread::current().id();
+    let state = |b: &Bridge| b.init_state.get(&class).copied();
+    let (superclass, meta, sel) = loop {
         let mut b = lock(bridge);
-        if !b.initialized.insert(class) {
-            return Ok(());
+        match state(&b) {
+            Some(InitState::Done) => return Ok(()),
+            Some(InitState::Running(owner)) if owner == me => return Ok(()),
+            Some(InitState::Running(_)) => {
+                drop(b);
+                g.without_guest_lock(&mut || {
+                    let mut waiting = INIT_DONE.0.lock().unwrap_or_else(|e| e.into_inner());
+                    while matches!(state(&lock(bridge)), Some(InitState::Running(_))) {
+                        waiting = INIT_DONE.1.wait(waiting).unwrap_or_else(|e| e.into_inner());
+                    }
+                });
+            }
+            None => {
+                let c = b.classes.class(class).ok_or_else(|| format!("+initialize of unknown class {class:#x}"))?;
+                let (superclass, meta) = (c.superclass.clone(), c.partner);
+                b.init_state.insert(class, InitState::Running(me));
+                break (superclass, meta, b.guest_selector(g, "initialize"));
+            }
         }
-        let c = b.classes.class(class).ok_or_else(|| format!("+initialize of unknown class {class:#x}"))?;
-        let (superclass, meta) = (c.superclass.clone(), c.partner);
-        (superclass, meta, b.guest_selector(g, "initialize"))
     };
-    if let super::classes::Super::Game(parent) = superclass {
-        initialize(bridge, g, parent)?;
-    }
-    let imp = match lock(bridge).classes.lookup(meta, "initialize") {
-        Lookup::Guest(m) => Some(m.imp),
-        _ => None,
-    };
-    if let Some(imp) = imp {
-        g.call(imp, &[class, sel])?;
-    }
-    Ok(())
+    let result = (|| {
+        if let super::classes::Super::Game(parent) = superclass {
+            initialize(bridge, g, parent)?;
+        }
+        let imp = match lock(bridge).classes.lookup(meta, "initialize") {
+            Lookup::Guest(m) => Some(m.imp),
+            _ => None,
+        };
+        if let Some(imp) = imp {
+            g.call(imp, &[class, sel])?;
+        }
+        Ok(())
+    })();
+    // Done even after a failure: waiting threads must not hang.
+    lock(bridge).init_state.insert(class, InitState::Done);
+    let _wake = INIT_DONE.0.lock().unwrap_or_else(|e| e.into_inner());
+    INIT_DONE.1.notify_all();
+    result
 }
 
 /// Type encoding for a message the host answers: the framework table, else

@@ -304,6 +304,52 @@ fn load_runs_parents_first_then_categories_and_initialize_runs_once_before_first
     assert_eq!(*calls.lock().unwrap(), [(0x2301, base_class), (0x2301, sub_class)]);
 }
 
+#[test]
+fn other_threads_wait_for_initialize_and_the_owner_may_reenter() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    host_class("G32HostRootI");
+    let fake = Fake::new();
+    let mut base = class32(fake, "G32InitBase", ClassTarget::External("G32HostRootI".into()), "G32HostRootI", vec![]);
+    base.meta.methods = vec![method("initialize", "v8@0:4", 0x2601), method("ping:", "v12@0:4i8", 0x2611)];
+    let class = base.address;
+    let md = ObjcMetadata32 { classes: vec![base], ..Default::default() };
+    let bridge: &'static Mutex<Bridge> = Box::leak(Box::new(Mutex::new(Bridge::new(&md).unwrap())));
+    install(bridge, fake, &md).unwrap();
+    let ping = bridge.lock().unwrap().guest_selector(fake, "ping:");
+    let log: &'static Mutex<Vec<u32>> = Box::leak(Box::new(Mutex::new(Vec::new())));
+    let (started, release): (&'static AtomicBool, &'static AtomicBool) =
+        (Box::leak(Box::new(AtomicBool::new(false))), Box::leak(Box::new(AtomicBool::new(false))));
+    fake.code(0x2611, move |w| {
+        log.lock().unwrap().push(w[2]);
+        0
+    });
+    // +initialize messages its own class (the owner re-enters), then waits.
+    fake.code(0x2601, move |w| {
+        log.lock().unwrap().push(100);
+        send(bridge, fake, &[w[0], ping, 1]).unwrap();
+        started.store(true, Ordering::SeqCst);
+        while !release.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        log.lock().unwrap().push(101);
+        0
+    });
+    let a = std::thread::spawn(move || send(bridge, fake, &[class, ping, 0]).unwrap());
+    while !started.load(Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let b = std::thread::spawn(move || send(bridge, fake, &[class, ping, 2]).unwrap());
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(!log.lock().unwrap().contains(&2), "thread B ran a method before +initialize finished");
+    release.store(true, Ordering::SeqCst);
+    a.join().unwrap();
+    b.join().unwrap();
+    let log = log.lock().unwrap().clone();
+    let end = log.iter().position(|&e| e == 101).unwrap();
+    assert_eq!(&log[..end + 1], [100, 1, 101]);
+    assert!(log[end + 1..].contains(&2) && log[end + 1..].contains(&0));
+}
+
 extern "C" fn host_label(_: Id, _: Sel) -> usize {
     7
 }

@@ -53,6 +53,9 @@ impl GuestSide for Translator {
         let uc = if current.is_null() { runtime::engine() } else { unsafe { &mut *current } };
         runtime::call_guest(uc, imp, words)
     }
+    fn without_guest_lock(&self, wait: &mut dyn FnMut()) {
+        runtime::without_gil(wait)
+    }
 }
 
 fn bridge() -> Option<&'static Mutex<Bridge>> {
