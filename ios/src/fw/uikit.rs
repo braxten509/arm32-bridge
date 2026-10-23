@@ -103,11 +103,7 @@ pub fn screen_points() -> (f64, f64, f64) {
             let (w, h) = size.split_once('x').unwrap_or(("568", "320"));
             return (w.parse().unwrap_or(568.0), h.parse().unwrap_or(320.0), scale.parse().unwrap_or(2.0));
         }
-        let display = std::env::var("IOS_DISPLAY").ok().and_then(|text| {
-            let (w, h) = text.split_once('x')?;
-            Some((w.trim().parse::<f64>().ok()?, h.trim().parse::<f64>().ok()?))
-        });
-        let Some(display) = display.filter(|&(w, h)| w >= 1.0 && h >= 1.0) else {
+        let Some(display) = display() else {
             return (568.0, 320.0, SCALE);
         };
         let app_dir = crate::loader::app_dir();
@@ -120,6 +116,13 @@ pub fn screen_points() -> (f64, f64, f64) {
         crate::log!("screen: display {}x{}, told {w}x{h} points at {scale}x", display.0, display.1);
         (w, h, scale)
     })
+}
+
+/// The real display's size in pixels (IOS_DISPLAY, set by the phone app).
+pub fn display() -> Option<(f64, f64)> {
+    let text = std::env::var("IOS_DISPLAY").ok()?;
+    let (w, h) = text.split_once('x')?;
+    Some((w.trim().parse::<f64>().ok()?, h.trim().parse::<f64>().ok()?)).filter(|&(w, h)| w >= 1.0 && h >= 1.0)
 }
 
 /// The screen an app is told it has on this display (points, scale).
@@ -432,10 +435,20 @@ extern "C" fn view_frame(this: Id, _: Sel) -> Rect {
 
 extern "C" fn view_set_frame(this: Id, _: Sel, frame: Rect) {
     let state = view_state(this);
-    let resized = state.frame.size != frame.size;
+    let old = state.frame.size;
     state.frame = frame;
-    if resized {
-        resized_view(this);
+    if old != frame.size {
+        resized_view(this, old);
+    }
+}
+
+/// Sends a method taking a CGRect (setFrame:, setBounds:), so the game's
+/// own versions run.
+fn send_rect(view: Id, name: &str, rect: Rect) {
+    let s = runtime::sel(name);
+    if let Some(imp) = runtime::imp_for(view, s) {
+        let f: extern "C" fn(Id, Sel, Rect) = unsafe { std::mem::transmute(imp) };
+        f(view, s, rect);
     }
 }
 
@@ -448,12 +461,12 @@ extern "C" fn view_set_bounds(this: Id, _: Sel, bounds: Rect) {
     let state = view_state(this);
     let center_x = state.frame.origin.x + state.frame.size.width / 2.0;
     let center_y = state.frame.origin.y + state.frame.size.height / 2.0;
-    let resized = state.frame.size != bounds.size;
+    let old = state.frame.size;
     state.bounds_origin = bounds.origin;
     state.frame.size = bounds.size;
     state.frame.origin = Point { x: center_x - bounds.size.width / 2.0, y: center_y - bounds.size.height / 2.0 };
-    if resized {
-        resized_view(this);
+    if old != bounds.size {
+        resized_view(this, old);
     }
 }
 
@@ -498,10 +511,46 @@ fn set_needs_layout(view: Id) {
     }
 }
 
-/// A new size lays out the view and its superview.
-fn resized_view(view: Id) {
+/// A new size lays out the view and its superview, and (as UIKit does at
+/// once) moves and sizes its subviews by their autoresizing masks.
+fn resized_view(view: Id, old: Size) {
     set_needs_layout(view);
     set_needs_layout(view_state(view).superview);
+    if property_get(view, "autoresizes").is_none_or(|v| v != 0) {
+        let new = view_state(view).frame.size;
+        for child in view_state(view).subviews.clone() {
+            let mask = property_get(child, "autoresizing").unwrap_or(0);
+            if mask != 0 {
+                let frame = autoresized(view_state(child).frame, mask, old, new);
+                send_rect(child, "setFrame:", frame);
+            }
+        }
+    }
+}
+
+/// A subview's frame after its superview went from `old` to `new`
+/// (UIViewAutoresizing: flexible left margin 1, width 2, right margin 4,
+/// top margin 8, height 16, bottom margin 32). On each axis the flexible
+/// parts share the change by their sizes (evenly when all are 0).
+fn autoresized(frame: Rect, mask: u64, old: Size, new: Size) -> Rect {
+    fn axis(start: f64, length: f64, old: f64, new: f64, flexible: [bool; 3]) -> (f64, f64) {
+        let parts = [start, length, old - start - length];
+        let flexible_total: f64 = (0..3).filter(|&i| flexible[i]).map(|i| parts[i]).sum();
+        let count = flexible.iter().filter(|&&f| f).count() as f64;
+        if count == 0.0 {
+            return (start, length);
+        }
+        let change = new - old;
+        let share = |i: usize| match (flexible[i], flexible_total != 0.0) {
+            (false, _) => 0.0,
+            (true, true) => change * parts[i] / flexible_total,
+            (true, false) => change / count,
+        };
+        (start + share(0), length + share(1))
+    }
+    let (x, width) = axis(frame.origin.x, frame.size.width, old.width, new.width, [mask & 1 != 0, mask & 2 != 0, mask & 4 != 0]);
+    let (y, height) = axis(frame.origin.y, frame.size.height, old.height, new.height, [mask & 8 != 0, mask & 16 != 0, mask & 32 != 0]);
+    Rect::new(x, y, width, height)
 }
 
 fn lay_out(view: Id) {
@@ -859,11 +908,7 @@ extern "C" fn window_set_root_controller(this: Id, _: Sel, controller: Id) {
         let view = runtime::send(controller, "view", &[]);
         let showing = shown && will_appear(controller, false);
         if view != 0 {
-            let s = runtime::sel("setFrame:");
-            if let Some(imp) = runtime::imp_for(view, s) {
-                let f: extern "C" fn(Id, Sel, Rect) = unsafe { std::mem::transmute(imp) };
-                f(view, s, screen_bounds());
-            }
+            send_rect(view, "setFrame:", screen_bounds());
             attach(this, view, None);
         }
         put_on_screen(controller);
@@ -1180,6 +1225,7 @@ extern "C" fn color_cg(this: Id, _: Sel) -> Id {
 
 // ----- images: { isa, *mut ImageInfo } -----
 
+#[derive(Default)]
 pub struct ImageInfo {
     /// The picture's file ("" for pictures made in memory).
     pub path: String,
@@ -1187,12 +1233,18 @@ pub struct ImageInfo {
     pub scale: f64,
     /// UIImageOrientation (0 = up).
     pub orientation: i64,
+    /// A stretchable image's cap insets in points (top, left, bottom, right).
+    pub caps: Option<[f64; 4]>,
     /// Its CGImage (see fw/graphics.rs; read from the file when first asked for).
     pub cg: OnceLock<Id>,
     /// An upright PNG made to show it on the phone screen (see graphics::picture_file).
     pub picture_file: OnceLock<Option<String>>,
     /// Whether making that file has started.
     pub picture_started: std::sync::atomic::AtomicBool,
+    /// A stretchable image's nine parts as PNGs (see graphics::picture_part_file).
+    pub part_files: OnceLock<Vec<Option<String>>>,
+    /// Whether making those has started.
+    pub parts_started: std::sync::atomic::AtomicBool,
 }
 
 fn png_size(path: &str) -> Option<(u32, u32)> {
@@ -1221,7 +1273,7 @@ fn image_from_path(path: &str) -> Id {
     };
     // A photo's EXIF tag turns it, as UIImage reads it (the size is then swapped).
     let orientation = crate::fw::graphics::file_orientation(path);
-    make_image(ImageInfo { path: path.into(), pixels, scale, orientation, cg: OnceLock::new(), picture_file: OnceLock::new(), picture_started: Default::default() })
+    make_image(ImageInfo { path: path.into(), pixels, scale, orientation, ..Default::default() })
 }
 
 /// A new UIImage with one reference (the caller's); it counts references (fw/counted.rs).
@@ -1289,11 +1341,54 @@ extern "C" fn image_init_with_contents_of_file(_this: Id, _: Sel, path: Id) -> I
     image_from_path(&string::get(path))
 }
 
-/// -resizableImageWithCapInsets: (UIEdgeInsets: top, left, bottom, right):
-/// the same picture (images don't change); stretching only the middle
-/// between the caps is not drawn yet, so it scales whole.
-extern "C" fn image_resizable(this: Id, _: Sel, _top: f64, _left: f64, _bottom: f64, _right: f64) -> Id {
-    this
+/// A new autoreleased UIImage of the same picture with cap insets (top,
+/// left, bottom, right in points): drawn larger, the caps keep their size
+/// and the middle stretches (fw/pictures.rs).
+fn image_with_caps(image: Id, caps: [f64; 4]) -> Id {
+    let Some(info) = image_info(image) else { return 0 };
+    // Pictures made in memory have no file: the copy holds the same CGImage.
+    let cg = OnceLock::new();
+    if info.path.is_empty() {
+        let picture = crate::fw::graphics::image_cg(image);
+        crate::fw::counted::retain(picture);
+        let _ = cg.set(picture);
+    }
+    let copy = ImageInfo { path: info.path.clone(), pixels: info.pixels, scale: info.scale, orientation: info.orientation, caps: Some(caps), cg, ..Default::default() };
+    crate::fw::counted::autorelease(make_image(copy))
+}
+
+/// -resizableImageWithCapInsets: (UIEdgeInsets: top, left, bottom, right).
+extern "C" fn image_resizable(this: Id, _: Sel, top: f64, left: f64, bottom: f64, right: f64) -> Id {
+    image_with_caps(this, [top, left, bottom, right])
+}
+
+/// -resizableImageWithCapInsets:resizingMode: (tiling is drawn stretched).
+extern "C" fn image_resizable_mode(this: Id, _: Sel, top: f64, left: f64, bottom: f64, right: f64, _mode: isize) -> Id {
+    image_with_caps(this, [top, left, bottom, right])
+}
+
+/// -stretchableImageWithLeftCapWidth:topCapHeight: (older): the right and
+/// bottom caps leave a one-point middle; a 0 cap stretches that way whole.
+extern "C" fn image_stretchable(this: Id, _: Sel, left: isize, top: isize) -> Id {
+    let size = image_points(this);
+    let (left, top) = (left.max(0) as f64, top.max(0) as f64);
+    let right = if left > 0.0 { (size.width - left - 1.0).max(0.0) } else { 0.0 };
+    let bottom = if top > 0.0 { (size.height - top - 1.0).max(0.0) } else { 0.0 };
+    image_with_caps(this, [top, left, bottom, right])
+}
+
+extern "C" fn image_left_cap_width(this: Id, _: Sel) -> isize {
+    image_info(this).and_then(|info| info.caps).map_or(0, |caps| caps[1] as isize)
+}
+
+extern "C" fn image_top_cap_height(this: Id, _: Sel) -> isize {
+    image_info(this).and_then(|info| info.caps).map_or(0, |caps| caps[0] as isize)
+}
+
+/// -capInsets (UIEdgeInsets: top, left, bottom, right; zero when not stretchable).
+extern "C" fn image_cap_insets(this: Id, _: Sel) -> crate::fw::controls::Insets {
+    let [top, left, bottom, right] = image_info(this).and_then(|info| info.caps).unwrap_or([0.0; 4]);
+    crate::fw::controls::Insets { top, left, bottom, right }
 }
 
 extern "C" fn image_size(this: Id, _: Sel) -> Size {
@@ -1717,6 +1812,11 @@ pub fn register(r: &mut Registry) {
             ("size", image_size as usize),
             ("scale", image_scale as usize),
             ("resizableImageWithCapInsets:", image_resizable as usize),
+            ("resizableImageWithCapInsets:resizingMode:", image_resizable_mode as usize),
+            ("stretchableImageWithLeftCapWidth:topCapHeight:", image_stretchable as usize),
+            ("leftCapWidth", image_left_cap_width as usize),
+            ("topCapHeight", image_top_cap_height as usize),
+            ("capInsets", image_cap_insets as usize),
         ],
     );
     let spinner = define_class("UIActivityIndicatorView", "UIView", 16);
@@ -1830,25 +1930,57 @@ mod tests {
         assert_eq!(runtime::send(controller, "interfaceOrientation", &[]), runtime::send(device, "orientation", &[]));
     }
 
-    /// A stretchable copy of a picture (button backgrounds) is a picture of
-    /// the same file and size.
+    /// A stretchable copy of a picture (button backgrounds) is a new picture
+    /// of the same file and size that keeps its caps (the original has
+    /// none); stretchableImageWithLeftCapWidth:topCapHeight: leaves a
+    /// one-point middle. Its nine parts are cut into files at the caps.
     #[test]
-    fn resizable_images_keep_the_picture() {
+    fn resizable_images_keep_the_picture_and_their_caps() {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(crate::run::setup);
         let folder = std::env::temp_dir().join(format!("gamebridge-resizable-{}", std::process::id()));
         std::fs::create_dir_all(&folder).unwrap();
         let path = folder.join("button.png");
-        std::fs::write(&path, crate::fw::png::encode(6, 4, &[200; 6 * 4 * 4], false)).unwrap();
+        // 6x4, each column its own red (0, 40, ... 200).
+        let pixels: Vec<u8> = (0..6 * 4).flat_map(|i| [(i % 6) as u8 * 40, 0, 0, 255]).collect();
+        std::fs::write(&path, crate::fw::png::encode(6, 4, &pixels, false)).unwrap();
         let image = image_from_path(&path.to_string_lossy());
         assert_ne!(image, 0);
         let sel = runtime::sel("resizableImageWithCapInsets:");
         let imp = runtime::imp_for(image, sel).expect("-[UIImage resizableImageWithCapInsets:] is missing");
         let resizable: extern "C" fn(Id, Sel, f64, f64, f64, f64) -> Id = unsafe { std::mem::transmute(imp) };
         let stretched = resizable(image, sel, 1.0, 2.0, 1.0, 2.0);
-        assert_ne!(stretched, 0);
+        assert!(stretched != 0 && stretched != image);
         assert_eq!(image_points(stretched), Size { width: 6.0, height: 4.0 });
         assert_eq!(image_info(stretched).map(|info| info.path.clone()), Some(path.to_string_lossy().into_owned()));
+        assert_eq!(image_info(stretched).unwrap().caps, Some([1.0, 2.0, 1.0, 2.0]));
+        assert_eq!(image_info(image).unwrap().caps, None);
+        let sel = runtime::sel("resizableImageWithCapInsets:resizingMode:");
+        let imp = runtime::imp_for(image, sel).expect("-[UIImage resizableImageWithCapInsets:resizingMode:] is missing");
+        let with_mode: extern "C" fn(Id, Sel, f64, f64, f64, f64, isize) -> Id = unsafe { std::mem::transmute(imp) };
+        assert_eq!(image_info(with_mode(image, sel, 1.0, 1.0, 1.0, 1.0, 1)).unwrap().caps, Some([1.0; 4]));
+        let sel = runtime::sel("stretchableImageWithLeftCapWidth:topCapHeight:");
+        let imp = runtime::imp_for(image, sel).expect("-[UIImage stretchableImageWithLeftCapWidth:topCapHeight:] is missing");
+        let stretchable: extern "C" fn(Id, Sel, isize, isize) -> Id = unsafe { std::mem::transmute(imp) };
+        let old_style = stretchable(image, sel, 2, 1);
+        assert_eq!(image_info(old_style).unwrap().caps, Some([1.0, 2.0, 2.0, 3.0]));
+        assert_eq!((runtime::send(old_style, "leftCapWidth", &[]), runtime::send(old_style, "topCapHeight", &[])), (2, 1));
+        // No left cap: stretched whole across.
+        assert_eq!(image_info(stretchable(image, sel, 0, 1)).unwrap().caps, Some([1.0, 0.0, 2.0, 0.0]));
+        // The parts: corners 2x1, the middle 2x2 holding columns 2 and 3.
+        let mut parts = Vec::new();
+        for _ in 0..500 {
+            parts = (0..9).map(|n| crate::fw::graphics::picture_part_file(stretched, n)).collect();
+            if parts.iter().all(|p| p.is_some()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let read = |n: usize| image::open(parts[n].as_ref().expect("part file made")).unwrap().to_rgba8();
+        let sizes: Vec<(u32, u32)> = (0..9).map(|n| read(n).dimensions()).collect();
+        assert_eq!(sizes, [(2, 1), (2, 1), (2, 1), (2, 2), (2, 2), (2, 2), (2, 1), (2, 1), (2, 1)]);
+        let middle = read(4);
+        assert_eq!((middle.get_pixel(0, 0)[0], middle.get_pixel(1, 1)[0]), (80, 120));
         std::fs::remove_dir_all(&folder).unwrap();
     }
 
@@ -1991,6 +2123,47 @@ mod tests {
         runtime::send(child, "removeFromSuperview", &[]);
         layout_pass();
         assert_eq!(take(), [(controller, "viewWillLayoutSubviews"), (root, "layoutSubviews"), (controller, "viewDidLayoutSubviews")]);
+    }
+
+    /// UIKit's autoresizing: a view's new size moves and sizes its subviews
+    /// by their masks at once (the flexible parts share the change by their
+    /// sizes), down the tree, unless it doesn't autoresize subviews. A nib
+    /// laid out 480 wide fills a 568-wide window this way.
+    #[test]
+    fn subviews_follow_their_autoresizing_masks() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let new_view = |frame: Rect, mask: u64| {
+            let view = view_init_with_frame(runtime::send(runtime::class_named("UIView"), "alloc", &[]), 0, frame);
+            property_set(view, "autoresizing", mask);
+            view
+        };
+        let root = new_view(Rect::new(0.0, 0.0, 480.0, 320.0), 0);
+        let background = new_view(Rect::new(0.0, 0.0, 480.0, 320.0), 2 | 16); // flexible width and height
+        let inside = new_view(Rect::new(10.0, 10.0, 460.0, 20.0), 2); // flexible width, in the background
+        let centred = new_view(Rect::new(100.0, 200.0, 72.0, 20.0), 1 | 4 | 32); // flexible margins but the top
+        let fixed = new_view(Rect::new(10.0, 10.0, 20.0, 20.0), 0);
+        let right = new_view(Rect::new(400.0, 10.0, 50.0, 20.0), 1); // flexible left margin
+        runtime::send(background, "addSubview:", &[inside]);
+        for child in [background, centred, fixed, right] {
+            runtime::send(root, "addSubview:", &[child]);
+        }
+        send_rect(root, "setFrame:", Rect::new(0.0, 0.0, 568.0, 320.0));
+        let frame = |view: Id| view_state(view).frame;
+        assert_eq!(frame(background), Rect::new(0.0, 0.0, 568.0, 320.0));
+        assert_eq!(frame(inside), Rect::new(10.0, 10.0, 548.0, 20.0), "grandchildren follow");
+        // 88 more points: left margin 100 of the 408 flexible takes its share.
+        let moved = frame(centred);
+        assert!((moved.origin.x - (100.0 + 88.0 * 100.0 / 408.0)).abs() < 1e-9 && moved.size.width == 72.0, "{moved:?}");
+        assert_eq!(moved.origin.y, 200.0, "same height: nothing moves down");
+        assert_eq!(frame(fixed), Rect::new(10.0, 10.0, 20.0, 20.0));
+        assert_eq!(frame(right), Rect::new(488.0, 10.0, 50.0, 20.0));
+        // Through setBounds: too; and not when the view doesn't autoresize subviews.
+        send_rect(root, "setBounds:", Rect::new(0.0, 0.0, 480.0, 320.0));
+        assert_eq!(frame(background).size.width, 480.0);
+        property_set(root, "autoresizes", 0);
+        send_rect(root, "setFrame:", Rect::new(0.0, 0.0, 568.0, 320.0));
+        assert_eq!(frame(background).size.width, 480.0);
     }
 
     #[test]

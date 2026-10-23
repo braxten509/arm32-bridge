@@ -30,6 +30,8 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 mod shapes;
 mod text;
 
+pub use text::{text_box, text_picture, TextLook};
+
 // ----- pixel formats -----
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -548,7 +550,8 @@ extern "C" fn color_create(space: Id, components: *const f64) -> Id {
     object
 }
 
-fn color_rgba(color: Id) -> Option<[f64; 4]> {
+/// A UIColor's (or CGColor's) red, green, blue and alpha.
+pub fn color_rgba(color: Id) -> Option<[f64; 4]> {
     if color == 0 {
         return None;
     }
@@ -1134,8 +1137,7 @@ fn uikit_image_from_cg(picture: Id, scale: f64, orientation: i64) -> Id {
         scale: if scale > 0.0 { scale } else { 1.0 },
         orientation,
         cg: OnceLock::from(picture),
-        picture_file: OnceLock::new(),
-        picture_started: Default::default(),
+        ..Default::default()
     };
     uikit::make_image(info)
 }
@@ -1148,6 +1150,9 @@ pub fn ui_image_clean_up(picture: Id) {
     // reads (the UIImage is then empty), so nothing is left behind.
     counted::release(*info.cg.get_or_init(|| 0));
     if let Some(file) = info.picture_file.get_or_init(|| None) {
+        let _ = std::fs::remove_file(file);
+    }
+    for file in info.part_files.get_or_init(Vec::new).iter().flatten() {
         let _ = std::fs::remove_file(file);
     }
 }
@@ -1194,11 +1199,72 @@ pub fn picture_file(picture: Id) -> Option<String> {
     None
 }
 
+/// A file for one of a stretchable UIImage's nine parts (0-8, rows from
+/// the top: corners, edges and the middle, cut at its caps), made with the
+/// others on their own thread as `picture_file` does; None until they are
+/// ready, for an empty part, or if it can't be made.
+pub fn picture_part_file(picture: Id, part: usize) -> Option<String> {
+    let info = uikit::image_info(picture)?;
+    if let Some(parts) = info.part_files.get() {
+        return parts.get(part).cloned().flatten();
+    }
+    if !info.parts_started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        // Held while the files are made, so the image can't go meanwhile.
+        counted::retain(picture);
+        std::thread::spawn(move || {
+            let made = write_part_files(picture);
+            if let Some(info) = uikit::image_info(picture) {
+                if let Err(files) = info.part_files.set(made) {
+                    for file in files.into_iter().flatten() {
+                        let _ = std::fs::remove_file(file);
+                    }
+                }
+            }
+            counted::release(picture);
+        });
+    }
+    None
+}
+
+/// Where the three parts of a side `length` pixels long start and how long
+/// they are, with caps `first` and `last` (too long caps get what's there).
+fn cuts(length: usize, first: usize, last: usize) -> [(usize, usize); 3] {
+    let first = first.min(length);
+    let last = last.min(length - first);
+    [(0, first), (first, length - first - last), (length - last, last)]
+}
+
+fn write_part_files(picture: Id) -> Vec<Option<String>> {
+    let Some(info) = uikit::image_info(picture) else { return Vec::new() };
+    let Some((width, height, rgba, alpha)) = upright_rgba(picture) else { return Vec::new() };
+    let [top, left, bottom, right] = info.caps.unwrap_or_default().map(|cap| (cap * info.scale).round().max(0.0) as usize);
+    let (columns, rows) = (cuts(width, left, right), cuts(height, top, bottom));
+    let mut files = Vec::new();
+    for &(y, h) in &rows {
+        for &(x, w) in &columns {
+            if w == 0 || h == 0 {
+                files.push(None);
+                continue;
+            }
+            let mut part = Vec::with_capacity(w * h * 4);
+            for row in y..y + h {
+                part.extend_from_slice(&rgba[(row * width + x) * 4..(row * width + x + w) * 4]);
+            }
+            files.push(encode_png(w, h, &part, alpha).and_then(|bytes| write_png_file(&format!("UIImage {picture:#x}"), &bytes)));
+        }
+    }
+    files
+}
+
 /// The folder for picture files, emptied the first time it's used in a run.
 fn picture_folder() -> &'static str {
     static FOLDER: OnceLock<String> = OnceLock::new();
     FOLDER.get_or_init(|| {
-        let folder = format!("{}/tmp/.gamebridge-pictures", crate::fw::foundation::home());
+        // The game's tmp folder; with no game (unit tests) the system's.
+        let folder = match crate::loader::try_app_dir() {
+            Some(_) => format!("{}/tmp/.gamebridge-pictures", crate::fw::foundation::home()),
+            None => format!("{}/gamebridge-pictures-{}", std::env::temp_dir().display(), std::process::id()),
+        };
         let _ = std::fs::remove_dir_all(&folder);
         let _ = std::fs::create_dir_all(&folder);
         folder
@@ -1206,15 +1272,19 @@ fn picture_folder() -> &'static str {
 }
 
 fn write_picture_file(picture: Id) -> Option<String> {
-    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let (width, height, rgba, alpha) = upright_rgba(picture)?;
-    let bytes = encode_png(width, height, &rgba, alpha)?;
+    write_png_file(&format!("UIImage {picture:#x}"), &encode_png(width, height, &rgba, alpha)?)
+}
+
+/// A new file in the picture folder holding `bytes` (a PNG made to show `what`).
+fn write_png_file(what: &str, bytes: &[u8]) -> Option<String> {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let file = format!("{}/{}-{n}.png", picture_folder(), std::process::id());
     match std::fs::write(&file, bytes) {
         Ok(()) => Some(file),
         Err(e) => {
-            crate::log!("UIImage {picture:#x}: can't write a picture file to show it: {e}");
+            crate::log!("{what}: can't write a picture file to show it: {e}");
             None
         }
     }

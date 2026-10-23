@@ -1,22 +1,30 @@
 //! The game's UIKit pictures on the phone screen.
 //!
-//! Games draw their world with OpenGL, but some put plain UIKit picture
-//! views (UIImageView and kinds of it) over it: start buttons, splash and
-//! loading pictures. Our layer has no UIKit drawing of its own, so the
-//! phone app draws them: up to 20 times a second the main thread walks the
-//! game's windows, lists every picture view that shows (where, how big, how
-//! see-through), and sends the list when it changed. Pictures under a
-//! video's view are left out, since it covers them as on iOS.
+//! Games draw their world with OpenGL, but some put UIKit views over it
+//! (start buttons, splash and loading pictures) or make whole menus of
+//! them. Our layer has no UIKit drawing of its own, so the phone app draws
+//! them: up to 20 times a second the main thread walks the game's windows,
+//! lists every picture that shows (where, how big, how see-through), and
+//! sends the list when it changed. Pictures under a video's view are left
+//! out, since it covers them as on iOS.
+//!
+//! What is shown: picture views (UIImageView and kinds of it), labels'
+//! text, and buttons' state pictures and titles (laid out in
+//! controls::button_parts). Text is drawn into a PNG at the phone's pixels
+//! (graphics::text_picture). A stretchable picture (cap insets) filling
+//! its area is sent as nine parts, so its caps keep their size.
 //!
 //! Places follow UIKit: each view sits at its centre in its parent, turned
 //! and scaled by its transform, its bounds shifting what is inside it; so
-//! sideways launch pictures in older games come out right. Clipping is not
-//! drawn; picture files are PNGs as UIImage reads them here. Pictures made
-//! in memory (or turned photos) are shown through an upright PNG made once.
+//! sideways launch pictures in older games come out right. Clipping and
+//! background colours are not drawn; picture files are PNGs as UIImage
+//! reads them here. Pictures made in memory (or turned photos) are shown
+//! through an upright PNG made once.
 
 use crate::fw::geometry::{Point, Rect, Transform, IDENTITY};
+use crate::fw::graphics::TextLook;
 use crate::fw::uikit::{property_get, view_state};
-use crate::objc::runtime::{self, Id};
+use crate::objc::runtime::{self, Class, Id};
 use std::sync::{Mutex, OnceLock};
 
 /// One picture to draw.
@@ -33,6 +41,25 @@ pub struct Picture {
     pub mode: i64,
     /// The picture's own size in points.
     pub size: (f64, f64),
+    /// Text drawn into a file when shown (labels, button titles; see `resolve`).
+    pub text: Option<TextLook>,
+}
+
+/// A picture a view shows.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Shown {
+    pub path: String,
+    /// UIViewContentMode, as in `Picture`.
+    pub mode: i64,
+    /// The picture's own size in points.
+    pub size: (f64, f64),
+    /// Where in the view, in points from its visible top-left corner.
+    pub rect: Rect,
+    /// A stretchable picture's caps in points (top, left, bottom, right):
+    /// filling its rect, they keep their size and the middle stretches.
+    pub caps: Option<[f64; 4]>,
+    /// Text to show instead of a picture file (`path` is then empty).
+    pub text: Option<TextLook>,
 }
 
 /// A view as far as drawing pictures goes.
@@ -43,8 +70,8 @@ pub struct Node {
     pub transform: Option<Transform>,
     pub hidden: bool,
     pub alpha: f64,
-    /// Its picture: file, mode and size in points.
-    pub picture: Option<(String, i64, (f64, f64))>,
+    /// Its pictures, back to front.
+    pub pictures: Vec<Shown>,
     /// It shows a video: what is under it is covered (on iOS also before and
     /// after the video plays, while the view is there).
     pub video: bool,
@@ -94,10 +121,13 @@ fn walk(node: &Node, parent: Option<Transform>, parent_alpha: f64, out: &mut Vec
     if node.video {
         out.clear();
     }
-    if let Some((path, mode, picture_size)) = &node.picture {
-        if size.width > 0.0 && size.height > 0.0 {
-            let place = then(moved(node.bounds_origin.x, node.bounds_origin.y), own);
-            out.push(Picture { path: path.clone(), place, area: (size.width, size.height), alpha, mode: *mode, size: *picture_size });
+    for shown in &node.pictures {
+        for (path, rect, picture_size) in parts(shown) {
+            if rect.size.width > 0.0 && rect.size.height > 0.0 {
+                let place = then(moved(node.bounds_origin.x + rect.origin.x, node.bounds_origin.y + rect.origin.y), own);
+                let text = shown.text.clone();
+                out.push(Picture { path, place, area: (rect.size.width, rect.size.height), alpha, mode: shown.mode, size: picture_size, text });
+            }
         }
     }
     for child in &node.children {
@@ -105,48 +135,134 @@ fn walk(node: &Node, parent: Option<Transform>, parent_alpha: f64, out: &mut Vec
     }
 }
 
-/// The view tree under `view` as `flatten` reads it (main thread).
-fn snapshot(view: Id, image_view_class: usize, depth: usize) -> Node {
-    let state = view_state(view);
-    let is_image_view = image_view_class != 0 && {
+/// What a picture is drawn as: itself in its rect, or, stretchable and
+/// filling it (mode 0), its nine parts (rows from the top), each with its
+/// rect and its own size. Caps longer than the rect shrink to share it.
+fn parts(shown: &Shown) -> Vec<(String, Rect, (f64, f64))> {
+    let caps = shown.caps.filter(|caps| shown.mode == 0 && caps.iter().any(|&cap| cap > 0.0));
+    let Some([top, left, bottom, right]) = caps else { return vec![(shown.path.clone(), shown.rect, shown.size)] };
+    /// Start, length and source length of the three parts of one side.
+    fn side(start: f64, length: f64, source: f64, first: f64, last: f64) -> [(f64, f64, f64); 3] {
+        let shrink = if first + last > length { length / (first + last) } else { 1.0 };
+        let (shown_first, shown_last) = (first * shrink, last * shrink);
+        [
+            (start, shown_first, first),
+            (start + shown_first, length - shown_first - shown_last, (source - first - last).max(0.0)),
+            (start + length - shown_last, shown_last, last),
+        ]
+    }
+    let rect = shown.rect;
+    let columns = side(rect.origin.x, rect.size.width, shown.size.0, left, right);
+    let rows = side(rect.origin.y, rect.size.height, shown.size.1, top, bottom);
+    let mut out = Vec::new();
+    for (row, &(y, height, source_height)) in rows.iter().enumerate() {
+        for (column, &(x, width, source_width)) in columns.iter().enumerate() {
+            if width > 0.0 && height > 0.0 && source_width > 0.0 && source_height > 0.0 {
+                out.push((format!("{}{PART_MARK}{}", shown.path, row * 3 + column), Rect::new(x, y, width, height), (source_width, source_height)));
+            }
+        }
+    }
+    out
+}
+
+/// The UIKit classes that show something.
+struct Classes {
+    image_view: Class,
+    label: Class,
+    button: Class,
+}
+
+impl Classes {
+    fn find() -> Classes {
+        Classes { image_view: runtime::class_named("UIImageView"), label: runtime::class_named("UILabel"), button: runtime::class_named("UIButton") }
+    }
+
+    fn is(view: Id, class: Class) -> bool {
         let rt = runtime::lock();
-        rt.is_subclass(rt.class_of(view), image_view_class)
-    };
-    let picture = if is_image_view {
-        let image = property_get(view, "image").unwrap_or(0) as Id;
-        crate::fw::uikit::image_info(image).map(|_| {
-            let mode = property_get(view, "contentMode").unwrap_or(0) as i64;
-            let size = crate::fw::uikit::image_points(image);
-            // The file is found (or made) only for pictures that end up shown; see `resolve`.
-            (format!("{IMAGE_PREFIX}{image:x}"), mode, (size.width, size.height))
-        })
-    } else {
-        None
-    };
+        class != 0 && rt.is_subclass(rt.class_of(view), class)
+    }
+}
+
+/// A UIImage shown in `rect` with a content mode (None for no image).
+fn image_shown(image: Id, mode: i64, rect: Rect) -> Option<Shown> {
+    let info = crate::fw::uikit::image_info(image)?;
+    let size = crate::fw::uikit::image_points(image);
+    // The file is found (or made) only for pictures that end up shown; see `resolve`.
+    Some(Shown { path: format!("{IMAGE_PREFIX}{image:x}"), mode, size: (size.width, size.height), rect, caps: info.caps, text: None })
+}
+
+/// Text drawn over `rect` (None for no text).
+fn text_shown(look: Option<TextLook>, rect: Rect) -> Option<Shown> {
+    let look = look?;
+    Some(Shown { path: String::new(), mode: 0, size: look.size, rect, caps: None, text: Some(look) })
+}
+
+/// The view tree under `view` as `flatten` reads it (main thread).
+fn snapshot(view: Id, classes: &Classes, depth: usize) -> Node {
+    let state = view_state(view);
+    let bounds = Rect { origin: Point::default(), size: state.frame.size };
+    let mut pictures = Vec::new();
+    if Classes::is(view, classes.image_view) {
+        let mode = property_get(view, "contentMode").unwrap_or(0) as i64;
+        pictures.extend(image_shown(property_get(view, "image").unwrap_or(0) as Id, mode, bounds));
+    }
+    if Classes::is(view, classes.label) {
+        pictures.extend(text_shown(crate::fw::controls::label_look(view), bounds));
+    }
+    if Classes::is(view, classes.button) {
+        let parts = crate::fw::controls::button_parts(view);
+        pictures.extend(image_shown(parts.background, 0, bounds));
+        if let Some((image, rect)) = parts.image {
+            pictures.extend(image_shown(image, 0, rect));
+        }
+        if let Some((look, rect)) = parts.title {
+            pictures.extend(text_shown(Some(look), rect));
+        }
+    }
     Node {
         frame: state.frame,
         bounds_origin: state.bounds_origin,
         transform: Some(state.transform),
         hidden: property_get(view, "hidden").unwrap_or(0) != 0,
         alpha: property_get(view, "alpha").map(f64::from_bits).unwrap_or(1.0),
-        picture,
+        pictures,
         video: crate::fw::media::shows_video(view),
-        children: if depth < 64 { state.subviews.iter().map(|&child| snapshot(child, image_view_class, depth + 1)).collect() } else { Vec::new() },
+        children: if depth < 64 { state.subviews.iter().map(|&child| snapshot(child, classes, depth + 1)).collect() } else { Vec::new() },
     }
 }
 
 /// Stands for a UIImage in a snapshot's picture path until `resolve`.
 const IMAGE_PREFIX: &str = "\u{1}uiimage:";
 
-/// Turns the shown pictures' UIImages into files the phone app can draw:
-/// the image's own file, or an upright PNG of a picture made in memory or a
-/// turned photo. Pictures that can't be made into a file are left out.
+/// After a picture's path: one of a stretchable picture's nine parts
+/// (0-8, rows from the top), each its own file (see graphics::picture_part_file).
+const PART_MARK: &str = "\u{1}part:";
+
+/// Pixels per point on the phone's screen (the screen's scale, or more
+/// when the display is denser), so text is drawn sharp.
+fn pixels_per_point() -> f64 {
+    let (_, high, scale) = crate::fw::uikit::screen_points();
+    let display = crate::fw::uikit::display().map_or(0.0, |(w, h)| w.min(h) / high);
+    scale.max(display).min(4.0)
+}
+
+/// Turns the shown pictures' UIImages and text into files the phone app
+/// can draw: the image's own file, or an upright PNG of a picture made in
+/// memory or a turned photo, or one of a stretchable picture's parts; text
+/// is drawn into a PNG. Pictures that can't be made into a file are left out.
 fn resolve(pictures: Vec<Picture>) -> Vec<Picture> {
     pictures
         .into_iter()
         .filter_map(|mut p| {
+            if let Some(look) = &p.text {
+                p.path = crate::fw::graphics::text_picture(look, pixels_per_point())?;
+                return Some(p);
+            }
             let Some(id) = p.path.strip_prefix(IMAGE_PREFIX) else { return Some(p) };
-            p.path = crate::fw::graphics::picture_file(usize::from_str_radix(id, 16).ok()?)?;
+            p.path = match id.split_once(PART_MARK) {
+                Some((id, part)) => crate::fw::graphics::picture_part_file(usize::from_str_radix(id, 16).ok()?, part.parse().ok()?)?,
+                None => crate::fw::graphics::picture_file(usize::from_str_radix(id, 16).ok()?)?,
+            };
             Some(p)
         })
         .collect()
@@ -217,10 +333,10 @@ pub fn tick() {
     if last.as_ref().is_some_and(|(at, _)| at.elapsed().as_millis() < 50) {
         return;
     }
-    let image_view_class = runtime::class_named("UIImageView");
+    let classes = Classes::find();
     let mut pictures = Vec::new();
     for window in crate::fw::uikit::windows() {
-        pictures.extend(resolve(flatten(&snapshot(window, image_view_class, 0))));
+        pictures.extend(resolve(flatten(&snapshot(window, &classes, 0))));
     }
     let (wide, high, _) = crate::fw::uikit::screen_points();
     let text = encode((wide, high), &pictures);
@@ -242,13 +358,16 @@ pub fn tick() {
 mod tests {
     use super::*;
     use crate::fw::geometry::Size;
+    use crate::objc::runtime::Sel;
 
     fn rect(x: f64, y: f64, w: f64, h: f64) -> Rect {
         Rect { origin: Point { x, y }, size: Size { width: w, height: h } }
     }
 
     fn view(frame: Rect, picture: Option<&str>, children: Vec<Node>) -> Node {
-        Node { frame, alpha: 1.0, picture: picture.map(|p| (p.to_string(), 0, (10.0, 10.0))), children, ..Default::default() }
+        let rect = rect(0.0, 0.0, frame.size.width, frame.size.height);
+        let pictures = picture.map(|p| Shown { path: p.to_string(), mode: 0, size: (10.0, 10.0), rect, caps: None, text: None }).into_iter().collect();
+        Node { frame, alpha: 1.0, pictures, children, ..Default::default() }
     }
 
     fn window(children: Vec<Node>) -> Node {
@@ -302,6 +421,160 @@ mod tests {
         let window = window(vec![view(rect(0.0, 0.0, 960.0, 540.0), Some("splash.png"), vec![]), video, view(rect(700.0, 350.0, 200.0, 80.0), Some("start.png"), vec![])]);
         let names: Vec<String> = flatten(&window).into_iter().map(|p| p.path).collect();
         assert_eq!(names, ["start.png"]);
+    }
+
+    /// A stretchable picture filling its view comes in nine parts: the
+    /// corners keep their size, the edges stretch one way, the middle both.
+    /// Too small for its caps, they shrink to fit; other modes show it whole.
+    #[test]
+    fn stretchable_pictures_keep_their_caps() {
+        let mut button = view(rect(10.0, 10.0, 100.0, 40.0), None, vec![]);
+        let caps = Some([3.0, 4.0, 3.0, 4.0]);
+        button.pictures.push(Shown { path: "b.png".into(), mode: 0, size: (20.0, 10.0), rect: rect(0.0, 0.0, 100.0, 40.0), caps, text: None });
+        let pictures = flatten(&window(vec![button]));
+        let parts: Vec<(String, (f64, f64), (f64, f64), (f64, f64))> =
+            pictures.iter().map(|p| (p.path.clone(), at(p, 0.0, 0.0), p.area, p.size)).collect();
+        let part = |n: usize| format!("b.png{PART_MARK}{n}");
+        assert_eq!(
+            parts,
+            [
+                (part(0), (10.0, 10.0), (4.0, 3.0), (4.0, 3.0)),
+                (part(1), (14.0, 10.0), (92.0, 3.0), (12.0, 3.0)),
+                (part(2), (106.0, 10.0), (4.0, 3.0), (4.0, 3.0)),
+                (part(3), (10.0, 13.0), (4.0, 34.0), (4.0, 4.0)),
+                (part(4), (14.0, 13.0), (92.0, 34.0), (12.0, 4.0)),
+                (part(5), (106.0, 13.0), (4.0, 34.0), (4.0, 4.0)),
+                (part(6), (10.0, 47.0), (4.0, 3.0), (4.0, 3.0)),
+                (part(7), (14.0, 47.0), (92.0, 3.0), (12.0, 3.0)),
+                (part(8), (106.0, 47.0), (4.0, 3.0), (4.0, 3.0)),
+            ]
+        );
+        // 6 points wide: the 4-point caps shrink to 3 and there is no middle column.
+        let mut narrow = view(rect(0.0, 0.0, 6.0, 40.0), None, vec![]);
+        narrow.pictures.push(Shown { path: "b.png".into(), mode: 0, size: (20.0, 10.0), rect: rect(0.0, 0.0, 6.0, 40.0), caps, text: None });
+        let widths: Vec<(String, f64)> = flatten(&window(vec![narrow])).into_iter().map(|p| (p.path, p.area.0)).collect();
+        assert_eq!(widths.iter().filter(|(path, _)| path.ends_with(&format!("{PART_MARK}1"))).count(), 0, "{widths:?}");
+        assert!(widths.iter().all(|&(_, w)| w == 3.0), "{widths:?}");
+        // Shown at its own size (centred): whole.
+        let mut centred = view(rect(0.0, 0.0, 100.0, 40.0), None, vec![]);
+        centred.pictures.push(Shown { path: "b.png".into(), mode: 4, size: (20.0, 10.0), rect: rect(0.0, 0.0, 100.0, 40.0), caps, text: None });
+        let paths: Vec<String> = flatten(&window(vec![centred])).into_iter().map(|p| p.path).collect();
+        assert_eq!(paths, ["b.png"]);
+    }
+
+    fn setup() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+    }
+
+    /// A new view of a UIKit class with a frame.
+    fn new_view(class: &str, frame: Rect) -> Id {
+        let object = runtime::send(runtime::class_named(class), "alloc", &[]);
+        let s = runtime::sel("initWithFrame:");
+        let init: extern "C" fn(Id, Sel, Rect) -> Id = unsafe { std::mem::transmute(runtime::imp_for(object, s).unwrap()) };
+        init(object, s, frame)
+    }
+
+    /// A UILabel shows its text: a picture over its bounds drawn from its
+    /// text, font, colours, alignment and lines, made into a file at the
+    /// screen's pixels when shown. A label with no text shows nothing.
+    #[test]
+    fn labels_show_their_text() {
+        setup();
+        let label = new_view("UILabel", rect(10.0, 20.0, 100.0, 30.0));
+        runtime::send(label, "setText:", &[crate::fw::string::make("Score")]);
+        runtime::send(label, "setTextColor:", &[runtime::send(runtime::class_named("UIColor"), "redColor", &[])]);
+        runtime::send(label, "setShadowColor:", &[runtime::send(runtime::class_named("UIColor"), "blackColor", &[])]);
+        runtime::send(label, "setTextAlignment:", &[1]);
+        runtime::send(label, "setFont:", &[crate::fw::controls::font("Helvetica-Bold", 12.0)]);
+        let pictures = flatten(&window(vec![snapshot(label, &Classes::find(), 0)]));
+        assert_eq!(pictures.len(), 1, "{pictures:?}");
+        assert_eq!((at(&pictures[0], 0.0, 0.0), pictures[0].area), ((10.0, 20.0), (100.0, 30.0)));
+        let look = pictures[0].text.clone().expect("the label's text");
+        assert_eq!(
+            look,
+            TextLook {
+                text: "Score".into(),
+                font: ("Helvetica-Bold".into(), 12.0),
+                color: [1.0, 0.0, 0.0, 1.0],
+                shadow: Some(([0.0, 0.0, 0.0, 1.0], (0.0, -1.0))),
+                alignment: 1,
+                line_break: 4,
+                lines: 1,
+                size: (100.0, 30.0),
+                minimum_font_size: None,
+            }
+        );
+        let shown = resolve(pictures);
+        let scale = pixels_per_point();
+        let made = image::image_dimensions(&shown[0].path).expect("a picture file");
+        assert_eq!(made, ((100.0 * scale).ceil() as u32, (30.0 * scale).ceil() as u32));
+        runtime::send(label, "setText:", &[0]);
+        assert!(snapshot(label, &Classes::find(), 0).pictures.is_empty());
+    }
+
+    fn send_struct<T>(object: Id, name: &str, value: T) {
+        let s = runtime::sel(name);
+        let f: extern "C" fn(Id, Sel, T) = unsafe { std::mem::transmute(runtime::imp_for(object, s).unwrap()) };
+        f(object, s, value);
+    }
+
+    /// A UIButton shows its state's background picture over its bounds
+    /// (stretchable ones keep their caps), then its picture and its title
+    /// side by side in the middle of its content (its bounds less the
+    /// content insets), each moved by its own insets; the title in the
+    /// state's colour and shadow, the title label's font, on one line.
+    #[test]
+    fn buttons_show_their_state_pictures_and_title() {
+        use crate::fw::controls::Insets;
+        use crate::fw::uikit::{make_image, ImageInfo};
+        setup();
+        let picture = |w: u32, h: u32, caps| make_image(ImageInfo { path: format!("/nowhere/{w}x{h}.png"), pixels: (w, h), scale: 1.0, caps, ..Default::default() });
+        let (background, pressed, icon) = (picture(20, 20, Some([5.0; 4])), picture(20, 21, None), picture(20, 10, None));
+        let color = |name: &str| runtime::send(runtime::class_named("UIColor"), name, &[]);
+        let button = new_view("UIButton", rect(0.0, 0.0, 100.0, 40.0));
+        runtime::send(button, "setBackgroundImage:forState:", &[background, 0]);
+        runtime::send(button, "setBackgroundImage:forState:", &[pressed, 1]);
+        runtime::send(button, "setImage:forState:", &[icon, 0]);
+        runtime::send(button, "setTitle:forState:", &[crate::fw::string::make("Go"), 0]);
+        runtime::send(button, "setTitleColor:forState:", &[color("redColor"), 0]);
+        runtime::send(button, "setTitleColor:forState:", &[color("whiteColor"), 1]);
+        runtime::send(button, "setTitleShadowColor:forState:", &[color("blackColor"), 0]);
+        send_struct(runtime::send(button, "titleLabel", &[]), "setShadowOffset:", Size { width: 1.0, height: 1.0 });
+        let shown = || snapshot(button, &Classes::find(), 0).pictures;
+        let found = shown();
+        assert_eq!(found.len(), 3, "{found:?}");
+        assert_eq!((&found[0].path, found[0].rect, found[0].caps), (&format!("{IMAGE_PREFIX}{background:x}"), rect(0.0, 0.0, 100.0, 40.0), Some([5.0; 4])));
+        let (image, title) = (&found[1], &found[2]);
+        assert_eq!((&image.path, image.rect.size, image.rect.origin.y), (&format!("{IMAGE_PREFIX}{icon:x}"), Size { width: 20.0, height: 10.0 }, 15.0));
+        let look = title.text.clone().expect("the title");
+        assert_eq!((look.text.as_str(), look.color, look.shadow, look.lines), ("Go", [1.0, 0.0, 0.0, 1.0], Some(([0.0, 0.0, 0.0, 1.0], (1.0, 1.0))), 1));
+        assert_eq!(look.size, (title.rect.size.width, title.rect.size.height));
+        assert!(title.rect.size.width > 10.0 && title.rect.size.height > 15.0, "{:?}", title.rect);
+        // Side by side, together in the middle both ways.
+        let middle = |found: &[Shown]| (found[1].rect.origin.x + found[2].rect.origin.x + found[2].rect.size.width) / 2.0;
+        assert_eq!(image.rect.origin.x + 20.0, title.rect.origin.x);
+        assert!((middle(&found) - 50.0).abs() < 1e-9, "{found:?}");
+        assert!((title.rect.origin.y + title.rect.size.height / 2.0 - 20.0).abs() < 1e-9, "{:?}", title.rect);
+        // Pressed: its own background (not stretchable) and title colour.
+        runtime::send(button, "setHighlighted:", &[1]);
+        let found = shown();
+        assert_eq!((&found[0].path, found[0].caps), (&format!("{IMAGE_PREFIX}{pressed:x}"), None));
+        assert_eq!(found[2].text.as_ref().unwrap().color, [1.0, 1.0, 1.0, 1.0]);
+        runtime::send(button, "setHighlighted:", &[0]);
+        // Content insets move the content's middle; the title's own move only it (half, centred).
+        send_struct(button, "setContentEdgeInsets:", Insets { top: 0.0, left: 20.0, bottom: 0.0, right: 0.0 });
+        let found = shown();
+        assert!((middle(&found) - 60.0).abs() < 1e-9, "{found:?}");
+        send_struct(button, "setTitleEdgeInsets:", Insets { top: 0.0, left: 10.0, bottom: 0.0, right: 0.0 });
+        let moved = shown();
+        assert_eq!((moved[1].rect, moved[2].rect.origin.x), (found[1].rect, found[2].rect.origin.x + 5.0));
+        // Left aligned content starts at the content's left.
+        runtime::send(button, "setContentHorizontalAlignment:", &[1]);
+        assert_eq!(shown()[1].rect.origin.x, 20.0);
+        // No title and no pictures: nothing.
+        let plain = new_view("UIButton", rect(0.0, 0.0, 100.0, 40.0));
+        assert!(snapshot(plain, &Classes::find(), 0).pictures.is_empty());
     }
 
     #[test]

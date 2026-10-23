@@ -1,12 +1,15 @@
 //! UIKit controls and screens: fonts, labels, buttons, text fields, web
 //! views, bars, navigation, tables, collections, alerts, action sheets,
 //! popovers and the photo picker. They keep their state and answer like
-//! UIKit, but nothing here is drawn yet: such views are marked "notDrawn"
-//! (so they don't catch taps meant for the game) and what they would show
-//! is logged. Screens for things this phone doesn't offer (photo library,
-//! camera) answer the way iOS does when the user closes them.
+//! UIKit. Labels and buttons are drawn (fw/pictures.rs, from `label_look`
+//! and `button_parts`); the rest is not drawn yet, and what it would show
+//! is logged. Controls (buttons too) are marked "notDrawn" so they don't
+//! catch taps meant for the game: they don't follow touches yet. Screens
+//! for things this phone doesn't offer (photo library, camera) answer the
+//! way iOS does when the user closes them.
 
 use crate::fw::geometry::{Point, Rect, Size};
+use crate::fw::graphics::TextLook;
 use crate::fw::object::{class_methods, define_class, methods};
 use crate::fw::runloop::{post, Work};
 use crate::fw::uikit::{property, property_get, property_set, screen_points, view_state};
@@ -175,13 +178,14 @@ extern "C" fn empty_string_with_id(_this: Id, _: Sel, _value: Id) -> Id {
     string::make("")
 }
 
+/// UIEdgeInsets.
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct Insets {
-    top: f64,
-    left: f64,
-    bottom: f64,
-    right: f64,
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+pub struct Insets {
+    pub top: f64,
+    pub left: f64,
+    pub bottom: f64,
+    pub right: f64,
 }
 
 #[repr(C)]
@@ -342,7 +346,7 @@ extern "C" fn text_or_empty(this: Id, _: Sel) -> Id {
 }
 extern "C" fn text_set(this: Id, _: Sel, text: Id) {
     property_set(this, "text", copied(text) as u64);
-    if text != 0 {
+    if text != 0 && !class_is(this, "UILabel") {
         not_drawn(&format!("{} text \"{}\"", string::describe_class_of(this), text_of(text)));
     }
 }
@@ -423,8 +427,48 @@ extern "C" fn text_scroll_range(_this: Id, _: Sel, _range: Range) {}
 extern "C" fn label_init_with_frame(this: Id, _: Sel, frame: Rect) -> Id {
     super_init_frame(this, "UIView", frame);
     property_set(this, "userInteraction", 0);
-    mark_not_drawn(this);
     this
+}
+
+/// A colour's red, green, blue and alpha (None for no UIColor).
+fn color_parts(color: Id) -> Option<[f64; 4]> {
+    if class_is(color, "UIColor") { crate::fw::graphics::color_rgba(color) } else { None }
+}
+
+/// The text a label (or a text property) holds, plain or attributed.
+fn shown_text(this: Id) -> String {
+    let text = text_of(get_id(this, "text"));
+    let attributed = get_id(this, "attributedText");
+    if text.is_empty() && attributed != 0 { text_of(runtime::send(attributed, "string", &[])) } else { text }
+}
+
+/// What a UILabel shows (fw/pictures.rs draws it): None with no text.
+pub fn label_look(label: Id) -> Option<TextLook> {
+    let text = shown_text(label);
+    if text.is_empty() {
+        return None;
+    }
+    let size = frame_of(label).size;
+    let highlighted = get_flag(label, "highlighted", false);
+    let color = match get_id(label, "highlightedTextColor") {
+        color if highlighted && color != 0 => color,
+        _ => get_id(label, "textColor"),
+    };
+    let offset = (get_f(label, "shadowOffset.w", 0.0), get_f(label, "shadowOffset.h", -1.0));
+    let lines = property_get(label, "numberOfLines").map_or(1, |v| v as isize);
+    let minimum = get_f(label, "minimumFontSize", 0.0);
+    Some(TextLook {
+        text,
+        font: font_name_and_size(text_font(label, 0)),
+        // UILabel's text is black unless told.
+        color: color_parts(color).unwrap_or([0.0, 0.0, 0.0, 1.0]),
+        shadow: color_parts(get_id(label, "shadowColor")).map(|shadow| (shadow, offset)),
+        alignment: property_get(label, "textAlignment").map_or(0, |v| v as isize),
+        line_break: property_get(label, "lineBreakMode").map_or(4, |v| v as isize),
+        lines,
+        size: (size.width, size.height),
+        minimum_font_size: get_flag(label, "adjustsFontSizeToFitWidth", false).then_some(minimum),
+    })
 }
 
 fn label_fitting_size(this: Id, bounds: Size) -> Size {
@@ -605,7 +649,7 @@ extern "C" fn control_send_action(this: Id, _: Sel, action: Sel, target: Id, eve
 }
 
 property!(control_selected, control_set_selected, "selected", bool, false);
-property!(control_horizontal, control_set_horizontal, "contentHorizontalAlignment", isize, 1);
+property!(control_horizontal, control_set_horizontal, "contentHorizontalAlignment", isize, 0);
 property!(control_vertical, control_set_vertical, "contentVerticalAlignment", isize, 0);
 
 extern "C" fn control_init_with_frame(this: Id, _: Sel, frame: Rect) -> Id {
@@ -634,6 +678,9 @@ fn button_label(this: Id) -> Id {
     }
     let label = new_view_named("UILabel", Rect::default());
     property_set(label, "font", font(SYSTEM_FONT, 15.0) as u64);
+    // A button's title is cut in the middle and has no shadow offset.
+    property_set(label, "lineBreakMode", 5);
+    set_f(label, "shadowOffset.h", 0.0);
     property_set(this, "titleLabel", label as u64);
     label
 }
@@ -656,9 +703,6 @@ extern "C" fn button_set_title(this: Id, _: Sel, title: Id, state: usize) {
     state_set(this, "title", state, title);
     if state == control_state(this) || state == 0 {
         property_set(button_label(this), "text", state_get(this, "title", control_state(this)) as u64);
-    }
-    if title != 0 {
-        not_drawn(&format!("button title \"{}\"", text_of(title)));
     }
 }
 
@@ -688,6 +732,94 @@ per_state!(button_image, button_set_image, button_current_image, "image");
 per_state!(button_background_image, button_set_background_image, button_current_background_image, "backgroundImage");
 per_state!(button_title_shadow, button_set_title_shadow, button_current_title_shadow, "titleShadowColor");
 per_state!(button_attributed_title, button_set_attributed_title, button_current_attributed_title, "attributedTitle");
+
+/// What a UIButton shows in its current state (fw/pictures.rs draws it).
+pub struct ButtonParts {
+    /// The background picture, filling the bounds (0: none).
+    pub background: Id,
+    /// The picture and where it goes in the bounds.
+    pub image: Option<(Id, Rect)>,
+    /// The title and where it goes.
+    pub title: Option<(TextLook, Rect)>,
+}
+
+fn insets_of(this: Id, key: &'static str) -> Insets {
+    property_get(this, key).map(|p| unsafe { *(p as *const Insets) }).unwrap_or_default()
+}
+
+fn inset(rect: Rect, by: Insets) -> Rect {
+    Rect::new(rect.origin.x + by.left, rect.origin.y + by.top, rect.size.width - by.left - by.right, rect.size.height - by.top - by.bottom)
+}
+
+/// Lays a button out as UIButton does: the content area is the bounds
+/// less the content insets; the picture then the title sit side by side
+/// in it, placed by the content alignments (UIControlContentHorizontal/
+/// VerticalAlignment: centre 0, left/top 1, right/bottom 2, fill 3), each
+/// in the content area less its own insets. The picture keeps its size
+/// (no bigger than the content); the title is one line of the title
+/// label's font, cut to the room left.
+pub fn button_parts(button: Id) -> ButtonParts {
+    let state = control_state(button);
+    let bounds = Rect { origin: Point::default(), size: frame_of(button).size };
+    let content = inset(bounds, insets_of(button, "contentEdgeInsets"));
+    let room = |length: f64| length.max(0.0);
+    let image = state_get(button, "image", state);
+    let image_size = match image {
+        0 => Size::default(),
+        image => {
+            let size = crate::fw::uikit::image_points(image);
+            Size { width: size.width.min(room(content.size.width)), height: size.height.min(room(content.size.height)) }
+        }
+    };
+    // The title label's settings (a button's: 15-point system font, cut in the middle, no shadow offset).
+    let label = get_id(button, "titleLabel");
+    let font = font_name_and_size(if label != 0 { text_font(label, 0) } else { font(SYSTEM_FONT, 15.0) });
+    let line_break = if label != 0 { property_get(label, "lineBreakMode").map_or(5, |v| v as isize) } else { 5 };
+    let offset = if label != 0 { (get_f(label, "shadowOffset.w", 0.0), get_f(label, "shadowOffset.h", 0.0)) } else { (0.0, 0.0) };
+    let title = text_of(state_get(button, "title", state));
+    let title_size = match title.is_empty() {
+        true => Size::default(),
+        false => {
+            let (width, height) = crate::fw::graphics::text_box(&title, &font, room(content.size.width - image_size.width), 1, line_break);
+            Size { width, height }
+        }
+    };
+    let horizontal = property_get(button, "contentHorizontalAlignment").unwrap_or(0);
+    let vertical = property_get(button, "contentVerticalAlignment").unwrap_or(0);
+    let together = image_size.width + title_size.width;
+    // Where an item starts across, `before` it in the row; and down, for its height.
+    let across = |area: Rect, before: f64| match horizontal {
+        1 | 3 => area.origin.x + before,
+        2 => area.origin.x + area.size.width - together + before,
+        _ => area.origin.x + (area.size.width - together) / 2.0 + before,
+    };
+    let down = |area: Rect, height: f64| match vertical {
+        1 | 3 => area.origin.y,
+        2 => area.origin.y + area.size.height - height,
+        _ => area.origin.y + (area.size.height - height) / 2.0,
+    };
+    let image_area = inset(content, insets_of(button, "imageEdgeInsets"));
+    let title_area = inset(content, insets_of(button, "titleEdgeInsets"));
+    let image_part = (image != 0).then(|| (image, Rect { origin: Point { x: across(image_area, 0.0), y: down(image_area, image_size.height) }, size: image_size }));
+    let title_part = (!title.is_empty()).then(|| {
+        let rect = Rect { origin: Point { x: across(title_area, image_size.width), y: down(title_area, title_size.height) }, size: title_size };
+        // Custom buttons' titles are white unless told; the others' the system blue.
+        let plain = if get_id(button, "buttonType") == 0 { [1.0; 4] } else { [0.0, 122.0 / 255.0, 1.0, 1.0] };
+        let look = TextLook {
+            text: title,
+            font,
+            color: color_parts(state_get(button, "titleColor", state)).unwrap_or(plain),
+            shadow: color_parts(state_get(button, "titleShadowColor", state)).map(|shadow| (shadow, offset)),
+            alignment: 1,
+            line_break,
+            lines: 1,
+            size: (title_size.width, title_size.height),
+            minimum_font_size: None,
+        };
+        (look, rect)
+    });
+    ButtonParts { background: state_get(button, "backgroundImage", state), image: image_part, title: title_part }
+}
 
 extern "C" fn button_size_that_fits(this: Id, _: Sel, _size: Size) -> Size {
     let title = text_of(state_get(this, "title", control_state(this)));

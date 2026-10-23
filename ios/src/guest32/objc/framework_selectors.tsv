@@ -93,6 +93,7 @@ cancelPreviousPerformRequestsWithTarget:selector:object:	v@:@:@
 canMakePayments	c@:
 canSendMail	c@:
 canSendTweet	c@:
+capInsets	{UIEdgeInsets=ffff}@:
 capitalizedString	@@:
 caseInsensitiveCompare:	i@:@
 ccTouchCancelled:withEvent:	v@:@@
@@ -291,6 +292,7 @@ keyWindow	@@:
 lastObject	@@:
 lastPathComponent	@@:
 layer	@@:
+leftCapWidth	i@:
 length	I@:
 lengthOfBytesUsingEncoding:	I@:I
 lineBreakMode	i@:
@@ -404,6 +406,7 @@ requestAccessToAccountsWithType:withCompletionHandler:	v@:@@?
 requestWithURL:	@@:@
 requestWithURL:cachePolicy:timeoutInterval:	@@:@Id
 resizableImageWithCapInsets:	@@:{UIEdgeInsets=ffff}
+resizableImageWithCapInsets:resizingMode:	@@:{UIEdgeInsets=ffff}i
 resourceSpecifier	@@:
 respondsToSelector:	c@::
 restoreCompletedTransactions	v@:
@@ -553,6 +556,7 @@ stopAccelerometerUpdates	v@:
 stopAnimating	v@:
 storyboard	@@:
 storyboardWithName:bundle:	@@:@@
+stretchableImageWithLeftCapWidth:topCapHeight:	@@:ii
 stringByAppendingFormat:	@@:@	format
 stringByAppendingPathComponent:	@@:@
 stringByAppendingPathExtension:	@@:@
@@ -589,6 +593,7 @@ timeIntervalSince1970	d@:
 timeIntervalSinceDate:	d@:@
 timeIntervalSinceNow	d@:
 timestamp	d@:
+topCapHeight	i@:
 topViewController	@@:
 transactionState	i@:
 tryLock	c@:
