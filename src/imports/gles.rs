@@ -174,6 +174,11 @@ pub fn context_destroyed(context: usize) {
     }
 }
 
+/// Whether host context `context` has tracking entries (for tests and diagnostics).
+pub fn context_tracked(context: usize) -> bool {
+    CONTEXTS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|contexts| contexts.contains_key(&context))
+}
+
 fn new_context() -> Context {
     Context { bindings: Arc::default(), group: Arc::default() }
 }

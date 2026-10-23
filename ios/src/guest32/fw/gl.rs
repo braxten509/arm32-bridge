@@ -23,6 +23,7 @@ pub fn register() {
     // are tracked per context and per sharegroup as on the phone.
     gles::set_current_context_source(crate::fw::eagl::current_egl_context);
     crate::fw::eagl::set_context_created_observer(gles::context_created);
+    crate::fw::eagl::set_context_destroyed_observer(gles::context_destroyed);
     for name in gles::names() {
         if let Some(handler) = gles::handler(name) {
             super::super::function(name, handler);
