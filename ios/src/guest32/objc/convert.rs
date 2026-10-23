@@ -453,6 +453,7 @@ impl ArgReader<'_> {
 
 /// What a host function returns in registers.
 #[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
 pub struct HostRet {
     pub x: [u64; 2],
     pub d: [u64; 4],

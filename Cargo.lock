@@ -328,6 +328,7 @@ dependencies = [
  "cipher",
  "des",
  "dlmalloc",
+ "guest32-image",
  "image",
  "jni-sys 0.3.1",
  "libc",
