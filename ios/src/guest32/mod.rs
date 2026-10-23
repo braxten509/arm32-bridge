@@ -149,6 +149,7 @@ pub fn call(uc: &mut Uc, address: u32, args: &[u32]) -> Result<u64, String> {
 /// Every name the 32-bit layer provides, registered before loading.
 pub fn register_all() {
     libsystem::register();
+    objc::wire::register();
 }
 
 /// The loaded program's header address and slide (dyld image functions).
@@ -181,12 +182,14 @@ pub fn run(app_dir: &str, program_path: &str) -> Result<(), String> {
     mem::set_layout(program.layout.clone())?;
     runtime::set_platform(&ios32::APPLE32)?;
     register_all();
+    objc::wire::register_program(&program)?;
     ios32::set_keep_going(env_on("IOS_KEEP_GOING") || crate::trap::KEEP_GOING.load(std::sync::atomic::Ordering::Relaxed));
     runtime::init(false);
     let _gil = runtime::hold_gil();
     let uc = runtime::engine();
     arm32_bridge::elf::open_built_in(uc, "libz.so")?;
     let loaded = ios32::load(&program)?;
+    objc::wire::install_program()?;
     let header = program.image.header_address().unwrap_or(0).wrapping_add(program.plan.slide);
     let _ = IMAGE.set((header, program.plan.slide, program_path.to_string()));
     crate::log!(

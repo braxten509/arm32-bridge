@@ -20,5 +20,6 @@ pub mod functions;
 mod functions_tests;
 pub mod mirror;
 pub mod selectors;
+pub mod wire;
 #[cfg(test)]
 mod testing;
