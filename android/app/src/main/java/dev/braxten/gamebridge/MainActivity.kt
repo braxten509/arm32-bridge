@@ -2,6 +2,7 @@ package dev.braxten.gamebridge
 
 import android.app.ActivityManager
 import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
@@ -32,6 +33,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -150,6 +152,9 @@ class MainActivity : ComponentActivity() {
          * on later needs a restart.
          */
         private var installsAtStart: Boolean? = null
+
+        /** The switch under the title is on "Originals": kept while the app runs (turning the phone rebuilds the screen), starts on "Games". */
+        private var showOriginals by mutableStateOf(false)
     }
 
     /** Starts the app again in a new process (Android's settings changes take effect then). */
@@ -203,6 +208,10 @@ class MainActivity : ComponentActivity() {
     private fun Screen() {
         val scope = rememberCoroutineScope()
         var games by remember { mutableStateOf<List<Game>?>(null) }
+        // The spare copies in Game Bridge/Originals, shown on the switch's other side.
+        var originals by remember { mutableStateOf<List<Game>?>(null) }
+        // Back to the games when the last spare copy goes (not before the list is known, which would undo a kept choice).
+        LaunchedEffect(originals?.isEmpty()) { if (originals?.isEmpty() == true) showOriginals = false }
         // Shown instead of the games until both permissions are given.
         var setup by remember { mutableStateOf<Setup?>(null) }
         // True while the phone is being searched (the refresh button waits).
@@ -223,13 +232,16 @@ class MainActivity : ComponentActivity() {
                 val result = withContext(Dispatchers.IO) {
                     val needed = Setup(Environment.isExternalStorageManager(), packageManager.canRequestPackageInstalls())
                     if (!needed.files || !needed.installs) return@withContext null to needed
-                    Games.scan(this@MainActivity).also(::updateStates) to null
+                    Games.scan(this@MainActivity).also { updateStates(it.games) } to null
                 }
-                result.first?.let { games = it }
+                result.first?.let {
+                    games = it.games
+                    originals = it.originals
+                }
                 setup = result.second
                 searching = false
                 // Each iPhone game gets its own app (made or updated in the background; Android may ask).
-                result.first?.let { found -> updateIphoneApps(found) }
+                result.first?.let { found -> updateIphoneApps(found.games) }
                 if (searchAgain) refresh()
                 // Android/obb opens up only in a process started with the switch on.
                 if (setup == null && installsAtStart == false) restart()
@@ -238,8 +250,11 @@ class MainActivity : ComponentActivity() {
 
         // The list the last search found shows at once; the search below then adds and removes cards.
         LaunchedEffect(Unit) {
-            val saved = withContext(Dispatchers.IO) { Games.saved(this@MainActivity)?.also(::updateStates) }
-            if (games == null && saved != null) games = saved
+            val saved = withContext(Dispatchers.IO) { Games.saved(this@MainActivity)?.also { updateStates(it.games) } }
+            if (games == null && saved != null) {
+                games = saved.games
+                originals = saved.originals
+            }
             refresh()
         }
 
@@ -269,10 +284,11 @@ class MainActivity : ComponentActivity() {
         }
 
         /**
-         * Moves the games' files into the Game Bridge folder, then searches again. Not while a backup
-         * reads them, nor an iPhone game's folder while an iPhone game runs.
+         * Moves the games' files into the Game Bridge folder (or as `how` moves them: to Originals
+         * and back), then searches again. Not while a backup reads them, nor an iPhone game's folder
+         * while an iPhone game runs.
          */
-        fun move(moving: List<Game>) {
+        fun move(moving: List<Game>, how: (Context, Game) -> String? = Games::move) {
             val problem = when {
                 Backups.status != null -> "Wait for the backup to finish, then move."
                 moving.any { it.action == Action.PlayIphone } && iphoneGameRunning() -> "Close the iPhone game first, then move."
@@ -282,14 +298,17 @@ class MainActivity : ComponentActivity() {
                 Toast.makeText(this@MainActivity, problem, Toast.LENGTH_LONG).show()
                 return
             }
-            Conversions.move(this@MainActivity, moving) { moveProblem ->
+            Conversions.move(this@MainActivity, moving, how) { moveProblem ->
                 moveProblem?.let { Toast.makeText(this@MainActivity, it, Toast.LENGTH_LONG).show() }
                 refresh()
             }
         }
 
-        /** Uninstalls the game and/or deletes its file, then searches again so the card updates or goes. */
-        fun remove(game: Game, uninstall: Boolean, deleteFile: Boolean) {
+        /**
+         * Uninstalls the game and/or deletes its file, then searches again so the card updates or goes.
+         * A `spare` copy's card is in Originals, and the game's own card keeps its state.
+         */
+        fun remove(game: Game, uninstall: Boolean, deleteFile: Boolean, spare: Boolean = false) {
             scope.launch {
                 val problems = withContext(Dispatchers.IO) {
                     listOfNotNull(
@@ -298,11 +317,15 @@ class MainActivity : ComponentActivity() {
                     )
                 }
                 problems.firstOrNull()?.let { Toast.makeText(this@MainActivity, it, Toast.LENGTH_LONG).show() }
-                states.remove(game.packageName)
                 // Gone from the phone: the card goes now, not when the search below ends.
                 val fileGone = game.file?.exists() != true
-                if (fileGone && !Games.isInstalled(this@MainActivity, game.packageName)) {
-                    games = games?.filterNot { it.packageName == game.packageName && it.file == game.file }
+                if (spare) {
+                    if (fileGone) originals = originals?.filterNot { it.file == game.file }
+                } else {
+                    states.remove(game.packageName)
+                    if (fileGone && !Games.isInstalled(this@MainActivity, game.packageName)) {
+                        games = games?.filterNot { it.packageName == game.packageName && it.file == game.file }
+                    }
                 }
                 refresh()
             }
@@ -312,6 +335,15 @@ class MainActivity : ComponentActivity() {
             RemoveDialog(game, installed = Games.isInstalled(this, game.packageName), onDismiss = { removing = null }) { uninstall, deleteFile ->
                 removing = null
                 remove(game, uninstall, deleteFile)
+            }
+        }
+
+        // The spare copy whose Delete dialog is showing: only its file goes, even when the game is installed.
+        var deletingSpare by remember { mutableStateOf<Game?>(null) }
+        deletingSpare?.let { game ->
+            RemoveDialog(game, installed = false, onDismiss = { deletingSpare = null }) { _, _ ->
+                deletingSpare = null
+                remove(game, uninstall = false, deleteFile = true, spare = true)
             }
         }
 
@@ -355,14 +387,30 @@ class MainActivity : ComponentActivity() {
                 Spacer(Modifier.width(8.dp))
                 RefreshButton(enabled = !searching && setup == null, spinning = searching && setup == null, onClick = ::refresh)
             }
+            // Only once Originals holds a spare copy.
+            val spares = if (setup == null) originals.orEmpty() else emptyList()
+            val onOriginals = showOriginals && spares.isNotEmpty()
             Text(
-                "Game APKs, XAPKs and data files on this phone.",
+                if (onOriginals) "Spare copies kept in ${Games.FOLDER}/Originals." else "Game APKs, XAPKs and data files on this phone.",
                 color = Muted,
                 fontSize = 13.sp,
                 modifier = Modifier.padding(start = 18.dp, bottom = 14.dp),
             )
+            if (spares.isNotEmpty()) {
+                TabSwitch(spares.size, onOriginals) { showOriginals = it }
+            }
             when {
                 setup != null -> SetupSteps(setup!!)
+                onOriginals -> LazyVerticalGrid(
+                    columns = GridCells.Fixed(2),
+                    contentPadding = PaddingValues(start = 12.dp, end = 12.dp, bottom = 24.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    items(spares, key = { it.file?.path ?: it.packageName }) { game ->
+                        SpareCard(game, busy, onMoveBack = { move(listOf(game), Games::moveBack) }, onDelete = { deletingSpare = game })
+                    }
+                }
                 games == null -> Message("Looking for games…")
                 games!!.isEmpty() -> Message("No games or game bundles on this phone. Download a game's APK, XAPK, APKM or APKS file, then tap ↻.")
                 else -> LazyVerticalGrid(
@@ -372,7 +420,7 @@ class MainActivity : ComponentActivity() {
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
                     items(games!!, key = { it.file?.path ?: it.packageName }) { game ->
-                        GameCard(game, states[game.packageName] ?: CardState.Ready, busy, onConvert = { if (game.action == Action.PlayIphone) IphoneGames.play(this@MainActivity, game) else convert(game) }, onReplace = { replacing = game }, onRemove = { removing = game }, onRename = { renaming = game }, onMove = { move(listOf(game)) }, onOpen = {
+                        GameCard(game, states[game.packageName] ?: CardState.Ready, busy, onConvert = { if (game.action == Action.PlayIphone) IphoneGames.play(this@MainActivity, game) else convert(game) }, onReplace = { replacing = game }, onRemove = { removing = game }, onRename = { renaming = game }, onMove = { move(listOf(game)) }, onToOriginals = { move(listOf(game), Games::moveToOriginals) }, onOpen = {
                             packageManager.getLaunchIntentForPackage(game.packageName)?.let(::startActivity)
                         })
                     }
@@ -501,7 +549,7 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun GameCard(game: Game, state: CardState, busy: Boolean, onConvert: () -> Unit, onReplace: () -> Unit, onRemove: () -> Unit, onRename: () -> Unit, onMove: () -> Unit, onOpen: () -> Unit) {
+    private fun GameCard(game: Game, state: CardState, busy: Boolean, onConvert: () -> Unit, onReplace: () -> Unit, onRemove: () -> Unit, onRename: () -> Unit, onMove: () -> Unit, onToOriginals: () -> Unit, onOpen: () -> Unit) {
         // Outside the Game Bridge folder: Move comes before anything else (an installed game keeps Open).
         val outside = remember(game, Conversions.moved) { Games.needsMove(game) }
         // Press and hold a card for its menu; a running conversion can't be removed under itself.
@@ -555,6 +603,8 @@ class MainActivity : ComponentActivity() {
                     CardState.OtherCopy -> MenuItem("Replace") { close(); onReplace() }
                     is CardState.Working -> {}
                 }
+                // Only the card's file goes; it then shows under Originals.
+                if (game.file != null && !busy) MenuItem("Move to Originals") { close(); onToOriginals() }
                 val installed = Games.isInstalled(this@MainActivity, game.packageName)
                 if (game.action != Action.PlayIphone && (installed || game.file != null)) MenuItem(if (installed) "Remove" else "Delete file", ErrorText) { close(); onRemove() }
             }
@@ -566,21 +616,77 @@ class MainActivity : ComponentActivity() {
         DropdownMenuItem(text = { Text(text, color = color, fontSize = 14.sp) }, onClick = onClick)
     }
 
+    /** A card's icon and name. */
+    @Composable
+    private fun CardTop(game: Game) {
+        Box(Modifier.size(72.dp).clip(RoundedCornerShape(18.dp)).background(Track)) {
+            game.icon?.let { Image(it.asImageBitmap(), contentDescription = null, modifier = Modifier.fillMaxSize()) }
+        }
+        Spacer(Modifier.height(10.dp))
+        Text(
+            game.label,
+            color = Color(0xFFE8E8EE),
+            fontSize = 14.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            textAlign = TextAlign.Center,
+        )
+    }
+
+    /**
+     * "Games" | "Originals (N)" under the title, as wide as the grid: a pill with the chosen side
+     * filled in the accent blue.
+     */
+    @Composable
+    private fun TabSwitch(originals: Int, onOriginals: Boolean, onChoose: (Boolean) -> Unit) {
+        Row(Modifier.padding(start = 12.dp, end = 12.dp, bottom = 12.dp).fillMaxWidth().height(40.dp).clip(CircleShape).background(CardColor).padding(3.dp)) {
+            listOf(false to "Games", true to "Originals ($originals)").forEach { (side, text) ->
+                val chosen = side == onOriginals
+                Box(
+                    Modifier.weight(1f).fillMaxHeight().clip(CircleShape).background(if (chosen) Accent else Color.Transparent)
+                        .clickable { onChoose(side) },
+                    contentAlignment = Alignment.Center,
+                ) { Text(text, color = if (chosen) Color.White else Muted, fontSize = 13.sp, fontWeight = FontWeight.Medium, maxLines = 1) }
+            }
+        }
+    }
+
+    /**
+     * A spare copy in Game Bridge/Originals: its icon and name, nothing to press. Press and hold
+     * it to move it back among the games, or to delete it.
+     */
+    @Composable
+    private fun SpareCard(game: Game, busy: Boolean, onMoveBack: () -> Unit, onDelete: () -> Unit) {
+        var menu by remember { mutableStateOf(false) }
+        // Like a game's card: an iPhone game's file isn't deleted from here.
+        val canDelete = game.action != Action.PlayIphone
+        Box {
+            Column(
+                Modifier.clip(RoundedCornerShape(16.dp)).background(CardColor)
+                    .combinedClickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        onClick = {},
+                        onLongClick = { if (!busy || canDelete) menu = true },
+                    )
+                    .padding(14.dp).fillMaxWidth(),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                CardTop(game)
+                Text("Spare copy", color = Muted, fontSize = 11.sp, maxLines = 1, modifier = Modifier.padding(top = 3.dp))
+            }
+            DropdownMenu(expanded = menu, onDismissRequest = { menu = false }, containerColor = Track) {
+                val close = { menu = false }
+                if (!busy) MenuItem("Move back") { close(); onMoveBack() }
+                if (canDelete) MenuItem("Delete file", ErrorText) { close(); onDelete() }
+            }
+        }
+    }
+
     @Composable
     private fun CardContent(game: Game, state: CardState, busy: Boolean, outside: Boolean, onConvert: () -> Unit, onReplace: () -> Unit, onMove: () -> Unit, onOpen: () -> Unit) {
         Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-            Box(Modifier.size(72.dp).clip(RoundedCornerShape(18.dp)).background(Track)) {
-                game.icon?.let { Image(it.asImageBitmap(), contentDescription = null, modifier = Modifier.fillMaxSize()) }
-            }
-            Spacer(Modifier.height(10.dp))
-            Text(
-                game.label,
-                color = Color(0xFFE8E8EE),
-                fontSize = 14.sp,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                textAlign = TextAlign.Center,
-            )
+            CardTop(game)
             // Same line in every state, so a failure doesn't make the card taller than its neighbour.
             if (outside && state != CardState.Done && state !is CardState.Working) {
                 Text("${game.place} · move first", color = NoticeText, fontSize = 11.sp, maxLines = 1,

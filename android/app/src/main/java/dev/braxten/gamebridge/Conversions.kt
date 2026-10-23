@@ -53,8 +53,11 @@ object Conversions {
         }
     }
 
-    /** Moves the games' files into the Game Bridge folder, then `onDone` with the first problem, or null. */
-    fun move(context: Context, games: List<Game>, onDone: (String?) -> Unit) {
+    /**
+     * Moves the games' files into the Game Bridge folder (or as `how` moves them: to Originals and
+     * back), then `onDone` with the first problem, or null.
+     */
+    fun move(context: Context, games: List<Game>, how: (Context, Game) -> String? = Games::move, onDone: (String?) -> Unit) {
         if (busy || Backups.status != null) return
         busy = true
         moved = 0 to games.size
@@ -62,7 +65,7 @@ object Conversions {
         scope.launch {
             val problem = withContext(Dispatchers.IO) {
                 games.mapIndexedNotNull { index, game ->
-                    Games.move(appContext, game).also { scope.launch { moved = index + 1 to games.size } }
+                    how(appContext, game).also { scope.launch { moved = index + 1 to games.size } }
                 }.firstOrNull()
             }
             moved = null
