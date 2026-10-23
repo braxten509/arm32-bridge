@@ -538,6 +538,62 @@ fn a_float_host_property_reaches_the_host_as_a_float() {
     assert_eq!(HOST_VOLUME.lock().unwrap().clone(), vec![(host, 1.0f32)]);
 }
 
+extern "C" fn host_play(_this: Id, _: Sel) -> bool {
+    true
+}
+
+extern "C" fn host_is_playing(_this: Id, _: Sel) -> bool {
+    true
+}
+
+#[test]
+fn a_host_player_answers_play_even_when_the_game_has_a_void_play() {
+    // Dungeon Plunder's music manager plays AVAudioPlayer itself and checks
+    // -play's BOOL ("Couldn't play Intro.mp3" when NO). The same game holds
+    // CocosDenshion's CDLongAudioSource, whose own -play returns nothing
+    // (v8@0:4); taken from there, the player's YES never reached the game.
+    let player = {
+        let mut rt = runtime::lock();
+        let class = rt.define_class("G32MusicPlayer", 0, 16);
+        let meta = rt.classes[&class].partner;
+        let (alloc, play, playing) = (rt.sel("alloc"), rt.sel("play"), rt.sel("isPlaying"));
+        rt.add_method(meta, alloc, host_alloc as usize);
+        rt.add_method(class, play, host_play as usize);
+        rt.add_method(class, playing, host_is_playing as usize);
+        class
+    };
+    let fake = Fake::new();
+    let (class, meta) = (fake.alloc_permanent(20), fake.alloc_permanent(20));
+    fake.write(class, &meta.to_le_bytes());
+    let md = ObjcMetadata32 {
+        classes: vec![ObjcClass32 {
+            address: class,
+            name: "G32LongAudioSource".into(),
+            superclass: ClassTarget::External("NSObject".into()),
+            meta_address: meta,
+            meta_isa: ClassTarget::External("NSObject".into()),
+            meta_superclass: ClassTarget::External("NSObject".into()),
+            instance: ClassRo32 {
+                instance_start: 8,
+                instance_size: 16,
+                methods: vec![method("play", "v8@0:4", 0x3001), method("isPlaying", "v8@0:4", 0x3003)],
+                ..Default::default()
+            },
+            meta: ClassRo32 { flags: 1, ..Default::default() },
+        }],
+        ..Default::default()
+    };
+    let bridge = Mutex::new(Bridge::new(&md).unwrap());
+    install(&bridge, fake, &md).unwrap();
+    let host = runtime::alloc_instance(player);
+    let proxy = bridge.lock().unwrap().guest_object(fake, host).unwrap();
+    for name in ["play", "isPlaying"] {
+        let selector = bridge.lock().unwrap().guest_selector(fake, name);
+        let answer = send(&bridge, fake, &[proxy, selector]).unwrap();
+        assert_eq!(answer & 0xff, 1, "-[AVAudioPlayer {name}] answers YES");
+    }
+}
+
 /// CMTime, the same on both sides (24 bytes).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]

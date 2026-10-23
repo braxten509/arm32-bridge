@@ -284,6 +284,7 @@ isHidden	c@:
 isKindOfClass:	c@:#
 isMainThread	c@:
 isMultitaskingSupported	c@:
+isPlaying	c@:
 isViewLoaded	c@:
 keyEnumerator	@@:
 keyWindow	@@:
@@ -363,6 +364,7 @@ performSelector:onThread:withObject:waitUntilDone:	v@::@@c
 performSelector:withObject:	@@::@
 performSelector:withObject:afterDelay:	v@::@d
 performSelector:withObject:withObject:	@@::@@
+play	c@:	ambiguous:AVAudioPlayer
 postNotification:	v@:@
 postNotificationName:object:	v@:@@
 postNotificationName:object:userInfo:	v@:@@@
