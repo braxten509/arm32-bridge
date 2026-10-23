@@ -37,6 +37,7 @@
 #
 # A selector missing here stops the game with its name when a framework
 # object receives it (never guessed).
+abortParsing	v@:
 absoluteString	@@:
 acceleration	{CMAcceleration=ddd}@:	ambiguous:CMAccelerometerData
 accountsWithAccountType:	@@:@
@@ -56,7 +57,10 @@ addSubview:	v@:@
 addTarget:action:forControlEvents:	v@:@:I
 addToRunLoop:forMode:	v@:@@
 addTransactionObserver:	v@:@
+adjustsImageWhenDisabled	c@:
+adjustsImageWhenHighlighted	c@:
 advertisingIdentifier	@@:
+alertViewStyle	i@:
 allHeaderFields	@@:
 allKeys	@@:
 allKeysForObject:	@@:@
@@ -76,20 +80,28 @@ arrayWithObjects:count:	@@:^@I	in-array
 authenticateWithCompletionHandler:	v@:@?
 autorelease	@@:
 awakeFromNib	v@:
+backgroundColor	@@:
+becomeFirstResponder	c@:
 beginAnimations:context:	v@:@^v
 beginBackgroundTaskWithExpirationHandler:	I@:@?
+beginTrackingWithTouch:withEvent:	c@:@@
 bezierPath	@@:
 blackColor	@@:
 boldSystemFontOfSize:	@@:f
 boolForKey:	c@:@
 boolValue	c@:
+borderStyle	i@:
 bounds	{CGRect={CGPoint=ff}{CGSize=ff}}@:
 bundleIdentifier	@@:
 bundlePath	@@:
+buttonTitleAtIndex:	@@:i
 buttonWithType:	@@:i
 bytes	r^v@:
+canBecomeFirstResponder	c@:
+cancelButtonIndex	i@:
 cancelPreviousPerformRequestsWithTarget:	v@:@
 cancelPreviousPerformRequestsWithTarget:selector:object:	v@:@:@
+cancelTrackingWithEvent:	v@:@
 canMakePayments	c@:
 canSendMail	c@:
 canSendTweet	c@:
@@ -111,6 +123,7 @@ characterIsMember:	c@:S
 characterSetWithRange:	@@:{_NSRange=II}
 class	#@:
 clearColor	@@:
+clipsToBounds	c@:
 code	i@:
 colorWithRed:green:blue:alpha:	@@:ffff
 commitAnimations	v@:
@@ -122,6 +135,7 @@ componentsSeparatedByCharactersInSet:	@@:@
 componentsSeparatedByString:	@@:@
 containsValueForKey:	c@:@
 contentScaleFactor	f@:
+continueTrackingWithTouch:withEvent:	c@:@@
 convertPoint:toView:	{CGPoint=ff}@:{CGPoint=ff}@
 convertRect:fromView:	{CGRect={CGPoint=ff}{CGSize=ff}}@:{CGRect={CGPoint=ff}{CGSize=ff}}@
 convertRect:toView:	{CGRect={CGPoint=ff}{CGSize=ff}}@:{CGRect={CGPoint=ff}{CGSize=ff}}@
@@ -141,6 +155,7 @@ currentRunLoop	@@:
 currentThread	@@:
 currentTime	d@:
 dataForKey:	@@:@
+dataFromPropertyList:format:errorDescription:	@@:@I^@
 dataUsingEncoding:	@@:I
 dataWithBytes:length:	@@:r^vI
 dataWithContentsOfFile:	@@:@
@@ -186,6 +201,7 @@ didChangeValueForKey:	v@:@
 didMoveToParentViewController:	v@:@
 dismissModalViewControllerAnimated:	v@:c
 dismissViewControllerAnimated:completion:	v@:c@?
+dismissWithClickedButtonIndex:animated:	v@:ic
 displayLinkWithTarget:selector:	@@:@:
 distantFuture	@@:
 distantPast	@@:
@@ -204,12 +220,14 @@ encodeInt64:forKey:	v@:q@
 encodeInt:forKey:	v@:i@
 encodeObject:forKey:	v@:@@
 endBackgroundTask:	v@:I
+endTrackingWithTouch:withEvent:	v@:@@
 errorWithDomain:code:userInfo:	@@:@i@
 exceptionWithName:reason:userInfo:	@@:@@@
 fileExistsAtPath:	c@:@
 fileSystemRepresentation	r*@:
 fileURLWithPath:	@@:@
 finishTransaction:	v@:@
+firstOtherButtonIndex	i@:
 floatValue	f@:
 font	@@:
 fontWithName:size:	@@:@f
@@ -245,6 +263,7 @@ initWithCategory:	@@:@
 initWithCGImage:	@@:^{CGImage=}
 initWithCGImage:scale:orientation:	@@:^{CGImage=}fi
 initWithCoder:	@@:@
+initWithContentsOfURL:	@@:@
 initWithContentsOfURL:error:	@@:@^@
 initWithCString:encoding:	@@:r*I
 initWithData:	@@:@
@@ -277,16 +296,23 @@ invocationWithMethodSignature:	@@:@
 invoke	v@:
 isAbsolutePath	c@:
 isAuthenticated	c@:
+isEditing	c@:
+isEnabled	c@:
 isEqual:	c@:@
 isEqualToString:	c@:@
 isFileURL	c@:
 isFirstResponder	c@:
 isHidden	c@:
+isHighlighted	c@:
 isKindOfClass:	c@:#
 isMainThread	c@:
 isMultitaskingSupported	c@:
 isPlaying	c@:
+isSecureTextEntry	c@:
+isTouchInside	c@:
+isTracking	c@:
 isViewLoaded	c@:
+isVisible	c@:
 keyEnumerator	@@:
 keyWindow	@@:
 lastObject	@@:
@@ -296,6 +322,7 @@ leftCapWidth	i@:
 length	I@:
 lengthOfBytesUsingEncoding:	I@:I
 lineBreakMode	i@:
+lineNumber	i@:
 loadAchievementsWithCompletionHandler:	v@:@?
 loadNibNamed:owner:options:	@@:@@@
 loadRequest:	v@:@
@@ -314,6 +341,7 @@ mainBundle	@@:
 mainRunLoop	@@:
 mainScreen	@@:
 makeKeyAndVisible	v@:
+message	@@:
 methodForSelector:	^?@::
 methodSignatureForSelector:	@@::
 modalTransitionStyle	i@:
@@ -329,6 +357,7 @@ nibWithData:bundle:	@@:@@
 nibWithNibName:bundle:	@@:@@
 null	@@:
 numberFromString:	@@:@
+numberOfButtons	i@:
 numberWithBool:	@@:c
 numberWithDouble:	@@:d
 numberWithFloat:	@@:f	float
@@ -345,6 +374,7 @@ openURL:	c@:@
 orangeColor	@@:
 originalTransaction	@@:
 parse	c@:
+parserError	@@:
 pasteboardWithName:create:	@@:@c
 path	@@:
 pathComponents	@@:
@@ -366,6 +396,7 @@ performSelector:onThread:withObject:waitUntilDone:	v@::@@c
 performSelector:withObject:	@@::@
 performSelector:withObject:afterDelay:	v@::@d
 performSelector:withObject:withObject:	@@::@@
+placeholder	@@:
 play	c@:	ambiguous:AVAudioPlayer
 postNotification:	v@:@
 postNotificationName:object:	v@:@@
@@ -379,6 +410,9 @@ presentViewController:animated:completion:	v@:@c@?
 price	@@:
 priceLocale	@@:
 productIdentifier	@@:
+propertyList:isValidForFormat:	c@:@I
+propertyListFromData:mutabilityOption:format:errorDescription:	@@:@I^I^@
+propertyListWithData:options:format:error:	@@:@I^I^@
 proposedCredential	@@:
 proxyForJson	@@:
 raise:format:	v@:@@	format
@@ -405,6 +439,7 @@ reportScoreWithCompletionHandler:	v@:@?
 requestAccessToAccountsWithType:withCompletionHandler:	v@:@@?
 requestWithURL:	@@:@
 requestWithURL:cachePolicy:timeoutInterval:	@@:@Id
+resignFirstResponder	c@:
 resizableImageWithCapInsets:	@@:{UIEdgeInsets=ffff}
 resizableImageWithCapInsets:resizingMode:	@@:{UIEdgeInsets=ffff}i
 resourceSpecifier	@@:
@@ -427,6 +462,8 @@ scheme	@@:
 segueWithIdentifier:source:destination:performHandler:	@@:@@@@?
 selectRowAtIndexPath:animated:scrollPosition:	v@:@ci
 self	@@:
+sendAction:to:forEvent:	v@::@@
+sendActionsForControlEvents:	v@:I
 sender	@@:
 sendSubviewToBack:	v@:@
 set	@@:
@@ -435,6 +472,8 @@ setAccount:	v@:@
 setActive:error:	c@:c^@
 setActivityIndicatorViewStyle:	v@:i
 setAdjustsFontSizeToFitWidth:	v@:c
+setAdjustsImageWhenDisabled:	v@:c
+setAdjustsImageWhenHighlighted:	v@:c
 setAlertViewStyle:	v@:i
 setAllHTTPHeaderFields:	v@:@
 setAlpha:	v@:f
@@ -443,14 +482,20 @@ setAnimationDelegate:	v@:@
 setAnimationDidStopSelector:	v@::
 setAnimationDuration:	v@:d
 setArgument:atIndex:	v@:^vi
+setAutocapitalizationType:	v@:i
+setAutocorrectionType:	v@:i
 setAutoresizesSubviews:	v@:c
 setAutoresizingMask:	v@:I
+setBackgroundColor:	v@:@
 setBackgroundImage:forState:	v@:@I
 setBool:forKey:	v@:c@
+setBorderStyle:	v@:i
 setBounds:	v@:{CGRect={CGPoint=ff}{CGSize=ff}}
 setCachePolicy:	v@:I
+setCancelButtonIndex:	v@:i
 setCategory:error:	c@:@^@
 setCenter:	v@:{CGPoint=ff}
+setClearsOnBeginEditing:	v@:c
 setClipsToBounds:	v@:c
 setCompletionHandler:	v@:@?
 setContentMode:	v@:i
@@ -462,6 +507,7 @@ setData:forPasteboardType:	v@:@@
 setDateFormat:	v@:@
 setDictionary:	v@:@
 setDrawableProperties:	v@:@
+setEnabled:	v@:c
 setFill	v@:
 setFloat:forKey:	v@:f@	float
 setFont:	v@:@
@@ -470,6 +516,7 @@ setFrame:	v@:{CGRect={CGPoint=ff}{CGSize=ff}}
 setFrameInterval:	v@:i
 setGameCenterDelegate:	v@:@
 setHidden:	v@:c
+setHighlighted:	v@:c
 setHighlightedImage:	v@:@
 setHTTPBody:	v@:@
 setHTTPMethod:	v@:@
@@ -477,10 +524,12 @@ setHTTPShouldHandleCookies:	v@:c
 setImage:	v@:@
 setImage:forState:	v@:@I
 setInitialText:	c@:@
+setKeyboardType:	v@:i
 setLineCapStyle:	v@:i
 setLineWidth:	v@:f
 setLocale:	v@:@
 setMailComposeDelegate:	v@:@
+setMessage:	v@:@
 setMessageBody:isHTML:	v@:@c
 setModalTransitionStyle:	v@:i
 setMultipleTouchEnabled:	v@:c
@@ -496,12 +545,15 @@ setOpaque:	v@:c
 setPan:	v@:f	float
 setPercentComplete:	v@:d
 setPersistent:	v@:c
+setPlaceholder:	v@:@
 setPredicate:	v@:@
 setProgressImage:	v@:@
 setRate:	v@:f	float
 setRemoteParticipantVolume:	v@:f	float
+setReturnKeyType:	v@:i
 setRootViewController:	v@:@
 setSearchScopes:	v@:@
+setSecureTextEntry:	v@:c
 setSelector:	v@::
 setShadowOpacity:	v@:f	float
 setShouldProcessNamespaces:	v@:c
@@ -512,8 +564,11 @@ setShowsTouchWhenHighlighted:	v@:c
 setStatusBarHidden:	v@:c
 setStroke	v@:
 setSubject:	v@:@
+setTag:	v@:i
 setTarget:	v@:@
 setText:	v@:@
+setTextAlignment:	v@:i
+setTextColor:	v@:@
 setTitle:	v@:@
 setTitleColor:forState:	v@:@I
 setTitle:forState:	v@:@I
@@ -587,14 +642,20 @@ superview	@@:
 synchronize	c@:
 systemFontOfSize:	@@:f
 systemVersion	@@:
+tag	i@:
 text	@@:
 textFieldAtIndex:	@@:i
 timeIntervalSince1970	d@:
 timeIntervalSinceDate:	d@:@
 timeIntervalSinceNow	d@:
 timestamp	d@:
+titleForState:	@@:I
 topCapHeight	i@:
 topViewController	@@:
+touchesBegan:withEvent:	v@:@@
+touchesCancelled:withEvent:	v@:@@
+touchesEnded:withEvent:	v@:@@
+touchesMoved:withEvent:	v@:@@
 transactionState	i@:
 tryLock	c@:
 unarchiveObjectWithFile:	@@:@

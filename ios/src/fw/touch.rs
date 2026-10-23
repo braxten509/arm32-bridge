@@ -50,7 +50,7 @@ fn point_of(object: Id, x: &'static str, y: &'static str) -> Point {
 }
 
 /// The view's top-left corner in window points.
-fn origin_in_window(view: Id) -> Point {
+pub(crate) fn origin_in_window(view: Id) -> Point {
     let mut point = Point::default();
     let mut current = view;
     for _ in 0..64 {
@@ -158,6 +158,11 @@ fn hit_test(window: Id, point: Point) -> Id {
     hit_search(window, point, &hit_view).unwrap_or(window)
 }
 
+/// Where a UITouch is in a view's own points (-locationInView:).
+pub fn location_in(touch: Id, view: Id) -> Point {
+    touch_location_in_view(touch, 0, view)
+}
+
 extern "C" fn touch_location_in_view(this: Id, _: Sel, view: Id) -> Point {
     let at = point_of(this, "x", "y");
     if view == 0 {
@@ -219,7 +224,11 @@ extern "C" fn event_type(_this: Id, _: Sel) -> isize {
 
 /// Handles one finger change, on the main thread. `point` is in window points.
 fn deliver_now(finger: i32, phase: Phase, point: Point) {
-    let window = key_window();
+    deliver_in(key_window(), finger, phase, point);
+}
+
+/// The same for a given window.
+pub(crate) fn deliver_in(window: Id, finger: i32, phase: Phase, point: Point) {
     if window == 0 {
         return;
     }
@@ -405,6 +414,130 @@ mod tests {
         assert_eq!(at(20.0, 20.0), Some(4), "drawn view inside the undrawn scroll view");
         assert_eq!(at(100.0, 100.0), Some(2), "undrawn scroll view lets the tap through");
         assert_eq!(at(300.0, 100.0), Some(2));
+    }
+
+    /// What the touch test's views and targets were told, in order.
+    static HEARD: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    fn heard() -> Vec<String> {
+        std::mem::take(&mut *HEARD.lock().unwrap())
+    }
+
+    /// Controls follow a finger as UIKit's do: pressed (highlighted) while
+    /// it is on them, their targets told TouchDown, then TouchUpInside or
+    /// (let go far away) TouchUpOutside, or TouchCancel; the game's control
+    /// classes hear begin/continue/endTracking. Disabled, hidden, untouchable
+    /// controls and places beside them leave the touch to the game's view.
+    #[test]
+    fn controls_track_the_finger_and_send_their_actions() {
+        use crate::fw::geometry::Rect;
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        extern "C" fn note(this: Id, s: Sel, _: Id, event: Id) {
+            let name = lock().sel_name(s);
+            let class = crate::fw::string::describe_class_of(this);
+            assert!(event != 0 || name.starts_with("touches"), "{name}: no event");
+            HEARD.lock().unwrap().push(format!("{class} {name}"));
+        }
+        extern "C" fn tracking(this: Id, s: Sel, _: Id, _: Id) -> bool {
+            HEARD.lock().unwrap().push(format!("{} {}", crate::fw::string::describe_class_of(this), lock().sel_name(s)));
+            true
+        }
+        let game_view = define_class("TouchTestGameView", "UIView", 8);
+        let touches = ["touchesBegan:withEvent:", "touchesMoved:withEvent:", "touchesEnded:withEvent:", "touchesCancelled:withEvent:"];
+        methods(game_view, &touches.map(|name| (name, note as usize)));
+        let target = define_class("TouchTestTarget", "NSObject", 8);
+        methods(target, &[("down:event:", note as usize), ("upInside:event:", note as usize), ("upOutside:event:", note as usize), ("cancelled:event:", note as usize)]);
+        let game_control = define_class("TouchTestControl", "UIControl", 8);
+        methods(
+            game_control,
+            &[
+                ("beginTrackingWithTouch:withEvent:", tracking as usize),
+                ("continueTrackingWithTouch:withEvent:", tracking as usize),
+                ("endTrackingWithTouch:withEvent:", note as usize),
+            ],
+        );
+        let new_view = |class: &str, frame: Rect| {
+            let object = runtime::send(runtime::class_named(class), "alloc", &[]);
+            let s = runtime::sel("initWithFrame:");
+            let init: extern "C" fn(Id, Sel, Rect) -> Id = unsafe { std::mem::transmute(runtime::imp_for(object, s).unwrap()) };
+            init(object, s, frame)
+        };
+        let window = new_view("UIWindow", Rect::new(0.0, 0.0, 568.0, 320.0));
+        let game = new_view("TouchTestGameView", Rect::new(0.0, 0.0, 568.0, 320.0));
+        runtime::send(window, "addSubview:", &[game]);
+        let button = runtime::send(runtime::class_named("UIButton"), "buttonWithType:", &[0]);
+        runtime::send(game, "addSubview:", &[button]);
+        let s = runtime::sel("setFrame:");
+        let set_frame: extern "C" fn(Id, Sel, Rect) = unsafe { std::mem::transmute(runtime::imp_for(button, s).unwrap()) };
+        set_frame(button, s, Rect::new(100.0, 100.0, 80.0, 40.0));
+        let listener = runtime::send(runtime::send(target, "alloc", &[]), "init", &[]);
+        for (name, events) in [("down:event:", 1usize), ("upInside:event:", 1 << 6), ("upOutside:event:", 1 << 7), ("cancelled:event:", 1 << 8)] {
+            runtime::send(button, "addTarget:action:forControlEvents:", &[listener, runtime::sel(name), events]);
+        }
+        let finger = 700; // not a finger other tests use
+        let touch = |phase: Phase, x: f64, y: f64| deliver_in(window, finger, phase, Point { x, y });
+        let highlighted = || runtime::send(button, "isHighlighted", &[]) & 0xFF != 0;
+        let tap = |x: f64, y: f64| {
+            touch(Phase::Began, x, y);
+            touch(Phase::Ended, x, y);
+        };
+        let up_inside = vec!["TouchTestTarget down:event:".to_string(), "TouchTestTarget upInside:event:".to_string()];
+
+        // A tap: pressed while held, then down and up inside.
+        touch(Phase::Began, 120.0, 110.0);
+        assert!(highlighted(), "pressed while the finger is on it");
+        touch(Phase::Ended, 120.0, 110.0);
+        assert!(!highlighted());
+        assert_eq!(heard(), up_inside);
+        // A little way off (inside UIKit's 70-point margin) still counts as inside.
+        touch(Phase::Began, 120.0, 110.0);
+        touch(Phase::Moved, 200.0, 120.0);
+        assert!(highlighted());
+        touch(Phase::Ended, 200.0, 120.0);
+        assert_eq!(heard(), up_inside);
+        // Far away: no longer pressed, and let go outside.
+        touch(Phase::Began, 120.0, 110.0);
+        touch(Phase::Moved, 450.0, 300.0);
+        assert!(!highlighted(), "not pressed once the finger left");
+        touch(Phase::Ended, 450.0, 300.0);
+        assert_eq!(heard(), ["TouchTestTarget down:event:", "TouchTestTarget upOutside:event:"]);
+        touch(Phase::Began, 120.0, 110.0);
+        touch(Phase::Cancelled, 120.0, 110.0);
+        assert_eq!(heard(), ["TouchTestTarget down:event:", "TouchTestTarget cancelled:event:"]);
+        assert!(!highlighted());
+        // Beside it: the game's view has the touch.
+        tap(20.0, 20.0);
+        assert_eq!(heard(), ["TouchTestGameView touchesBegan:withEvent:", "TouchTestGameView touchesEnded:withEvent:"]);
+        // Disabled: no actions, the touch goes on to the view it is in.
+        runtime::send(button, "setEnabled:", &[0]);
+        tap(120.0, 110.0);
+        assert!(!highlighted());
+        assert_eq!(heard(), ["TouchTestGameView touchesBegan:withEvent:", "TouchTestGameView touchesEnded:withEvent:"]);
+        runtime::send(button, "setEnabled:", &[1]);
+        // Hidden or untouchable: as if it weren't there.
+        for (setter, value) in [("setHidden:", 1), ("setUserInteractionEnabled:", 0)] {
+            runtime::send(button, setter, &[value]);
+            tap(120.0, 110.0);
+            assert_eq!(heard(), ["TouchTestGameView touchesBegan:withEvent:", "TouchTestGameView touchesEnded:withEvent:"], "{setter}");
+            runtime::send(button, setter, &[1 - value]);
+        }
+        tap(120.0, 110.0);
+        assert_eq!(heard(), up_inside, "back to normal");
+        // A game's own control hears the tracking calls.
+        let own = new_view("TouchTestControl", Rect::new(300.0, 100.0, 50.0, 50.0));
+        runtime::send(game, "addSubview:", &[own]);
+        touch(Phase::Began, 310.0, 110.0);
+        touch(Phase::Moved, 312.0, 112.0);
+        touch(Phase::Ended, 312.0, 112.0);
+        assert_eq!(
+            heard(),
+            [
+                "TouchTestControl beginTrackingWithTouch:withEvent:",
+                "TouchTestControl continueTrackingWithTouch:withEvent:",
+                "TouchTestControl endTrackingWithTouch:withEvent:"
+            ]
+        );
     }
 
     #[test]

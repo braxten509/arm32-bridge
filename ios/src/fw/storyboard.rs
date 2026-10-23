@@ -325,6 +325,67 @@ extern "C" fn image_view_set_highlighted_image(this: Id, _: Sel, image: Id) {
     property_set_object(this, "highlightedImage", image);
 }
 
+/// -[UITableView initWithCoder:]: its look, and its prototype cells
+/// (UITableViewCellPrototypeNibs: identifier -> the cell's nib, with the
+/// external objects that nib is made with).
+extern "C" fn table_init_with_coder(this: Id, _: Sel, coder: Id) -> Id {
+    let this = super_init_with_coder(this, "UITableView", coder);
+    if this == 0 {
+        return 0;
+    }
+    if let Some(height) = double_for(coder, "UIRowHeight") {
+        property_set(this, "rowHeight", height.to_bits());
+    }
+    if let Some(style) = integer_for(coder, "UISeparatorStyle") {
+        property_set(this, "separatorStyle", style as u64);
+    }
+    if let Some(disabled) = bool_for(coder, "UIScrollDisabled") {
+        property_set(this, "scrollEnabled", !disabled as u64);
+    }
+    let externals = object_for(coder, "UITableViewCellPrototypeNibExternalObjects").unwrap_or(0);
+    if let Some(prototypes) = object_for(coder, "UITableViewCellPrototypeNibs") {
+        for (identifier, nib) in collections::dictionary_pairs(prototypes) {
+            let theirs = if externals == 0 { 0 } else { collections::dictionary_get(externals, identifier) };
+            crate::fw::tables::register_nib(this, &string::get(identifier), nib, theirs);
+        }
+    }
+    this
+}
+
+/// -[UITableViewCell initWithCoder:]: reuse identifier, style, content
+/// view and labels (in the content view, as UIKit puts them).
+extern "C" fn cell_init_with_coder(this: Id, _: Sel, coder: Id) -> Id {
+    let this = super_init_with_coder(this, "UITableViewCell", coder);
+    if this == 0 {
+        return 0;
+    }
+    if let Some(identifier) = object_for(coder, "UIReuseIdentifier") {
+        property_set_object(this, "reuseIdentifier", identifier);
+    }
+    for (key, stored) in [("UITableViewCellStyle", "cellStyle"), ("UISelectionStyle", "selectionStyle"), ("UIAccessoryType", "accessoryType")] {
+        if let Some(value) = integer_for(coder, key) {
+            property_set(this, stored, value as u64);
+        }
+    }
+    if let Some(content) = object_for(coder, "UIContentView").filter(|&view| view != 0) {
+        property_set(this, "contentView", content as u64);
+        if view_state(content).superview != this {
+            own_send(this, "addSubview:", &[content]);
+        }
+    }
+    let content = runtime::send(this, "contentView", &[]);
+    for (key, stored) in [("UITextLabel", "textLabel"), ("UIDetailTextLabel", "detailTextLabel"), ("UIImageView", "imageView")] {
+        // A view the nib couldn't make (nil) is left out.
+        if let Some(view) = object_for(coder, key).filter(|&view| view != 0) {
+            property_set(this, stored, view as u64);
+            if view_state(view).superview == 0 {
+                own_send(content, "addSubview:", &[view]);
+            }
+        }
+    }
+    this
+}
+
 /// -[UIControl initWithCoder:]
 extern "C" fn control_init_with_coder(this: Id, _: Sel, coder: Id) -> Id {
     let this = super_init_with_coder(this, "UIControl", coder);
@@ -976,6 +1037,8 @@ pub fn register(_r: &mut Registry) {
     methods(runtime::class_named("NSObject"), &[("awakeFromNib", awake_from_nib as usize)]);
     methods(runtime::class_named("UIView"), &[("initWithCoder:", view_init_with_coder as usize)]);
     methods(runtime::class_named("UILabel"), &[("initWithCoder:", label_init_with_coder as usize)]);
+    methods(runtime::class_named("UITableView"), &[("initWithCoder:", table_init_with_coder as usize)]);
+    methods(runtime::class_named("UITableViewCell"), &[("initWithCoder:", cell_init_with_coder as usize)]);
     methods(
         runtime::class_named("UIImageView"),
         &[

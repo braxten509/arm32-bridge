@@ -43,6 +43,9 @@ pub struct Picture {
     pub size: (f64, f64),
     /// Text drawn into a file when shown (labels, button titles; see `resolve`).
     pub text: Option<TextLook>,
+    /// The screen area it may draw in, in screen points: the bounds of the
+    /// views around it that clip to their bounds, else the whole screen.
+    pub clip: Rect,
 }
 
 /// A picture a view shows.
@@ -60,6 +63,8 @@ pub struct Shown {
     pub caps: Option<[f64; 4]>,
     /// Text to show instead of a picture file (`path` is then empty).
     pub text: Option<TextLook>,
+    /// How see-through it is drawn, on top of the view's own alpha (dimmed pictures).
+    pub alpha: f64,
 }
 
 /// A view as far as drawing pictures goes.
@@ -75,6 +80,13 @@ pub struct Node {
     /// It shows a video: what is under it is covered (on iOS also before and
     /// after the video plays, while the view is there).
     pub video: bool,
+    /// It shows the GL picture, which is drawn under every UIKit picture:
+    /// what is behind it is covered.
+    pub gl: bool,
+    /// Its background colour (straight red, green, blue, alpha).
+    pub background: Option<[f64; 4]>,
+    /// It clips what it holds to its bounds (clipsToBounds).
+    pub clips: bool,
     pub children: Vec<Node>,
 }
 
@@ -97,12 +109,31 @@ fn moved(x: f64, y: f64) -> Transform {
 /// The pictures under `node` (a window, at the screen's top-left), back to front.
 pub fn flatten(node: &Node) -> Vec<Picture> {
     let mut out = Vec::new();
-    walk(node, None, 1.0, &mut out);
+    walk(node, None, 1.0, Rect { origin: Point::default(), size: node.frame.size }, &mut out);
     out
 }
 
-/// `parent`: the parent's own points to screen points (None for the window).
-fn walk(node: &Node, parent: Option<Transform>, parent_alpha: f64, out: &mut Vec<Picture>) {
+/// The screen area (axis-aligned) a rect in some view's own points covers.
+fn screen_box(place: Transform, rect: Rect) -> Rect {
+    let corners = [(0.0, 0.0), (rect.size.width, 0.0), (0.0, rect.size.height), (rect.size.width, rect.size.height)]
+        .map(|(x, y)| (rect.origin.x + x, rect.origin.y + y))
+        .map(|(x, y)| (place.a * x + place.c * y + place.tx, place.b * x + place.d * y + place.ty));
+    let (left, right) = (corners.iter().map(|c| c.0).fold(f64::INFINITY, f64::min), corners.iter().map(|c| c.0).fold(f64::NEG_INFINITY, f64::max));
+    let (top, bottom) = (corners.iter().map(|c| c.1).fold(f64::INFINITY, f64::min), corners.iter().map(|c| c.1).fold(f64::NEG_INFINITY, f64::max));
+    Rect::new(left, top, right - left, bottom - top)
+}
+
+/// Where two areas meet (no size when they don't).
+fn meet(a: Rect, b: Rect) -> Rect {
+    let (left, top) = (a.origin.x.max(b.origin.x), a.origin.y.max(b.origin.y));
+    let right = (a.origin.x + a.size.width).min(b.origin.x + b.size.width);
+    let bottom = (a.origin.y + a.size.height).min(b.origin.y + b.size.height);
+    Rect::new(left, top, (right - left).max(0.0), (bottom - top).max(0.0))
+}
+
+/// `parent`: the parent's own points to screen points (None for the window);
+/// `clip`: the screen area the node may draw in.
+fn walk(node: &Node, parent: Option<Transform>, parent_alpha: f64, clip: Rect, out: &mut Vec<Picture>) {
     let alpha = parent_alpha * node.alpha;
     if node.hidden || alpha <= 0.01 {
         return;
@@ -118,20 +149,37 @@ fn walk(node: &Node, parent: Option<Transform>, parent_alpha: f64, out: &mut Vec
             then(then(then(to_middle, turn), moved(centre.0, centre.1)), parent)
         }
     };
-    if node.video {
+    if node.video || node.gl {
         out.clear();
     }
-    for shown in &node.pictures {
+    let visible = Rect { origin: node.bounds_origin, size };
+    let clip = if node.clips { meet(clip, screen_box(own, visible)) } else { clip };
+    // The background colour first, under what the view shows (the GL picture covers a GL view's).
+    let background = node.background.filter(|color| color[3] > 0.0 && !node.gl).map(|color| Shown {
+        path: color_path(color),
+        mode: 0,
+        size: (1.0, 1.0),
+        rect: Rect { origin: Point::default(), size },
+        caps: None,
+        text: None,
+        alpha: 1.0,
+    });
+    for shown in background.iter().chain(&node.pictures) {
         for (path, rect, picture_size) in parts(shown) {
             if rect.size.width > 0.0 && rect.size.height > 0.0 {
                 let place = then(moved(node.bounds_origin.x + rect.origin.x, node.bounds_origin.y + rect.origin.y), own);
+                let seen = meet(screen_box(place, Rect { origin: Point::default(), size: rect.size }), clip);
+                if seen.size.width <= 0.0 || seen.size.height <= 0.0 {
+                    continue; // wholly clipped away
+                }
                 let text = shown.text.clone();
-                out.push(Picture { path, place, area: (rect.size.width, rect.size.height), alpha, mode: shown.mode, size: picture_size, text });
+                let alpha = alpha * shown.alpha;
+                out.push(Picture { path, place, area: (rect.size.width, rect.size.height), alpha, mode: shown.mode, size: picture_size, text, clip });
             }
         }
     }
     for child in &node.children {
-        walk(child, Some(own), alpha, out);
+        walk(child, Some(own), alpha, clip, out);
     }
 }
 
@@ -170,11 +218,23 @@ struct Classes {
     image_view: Class,
     label: Class,
     button: Class,
+    text_field: Class,
+    table: Class,
+    cell: Class,
+    gl_layer: Class,
 }
 
 impl Classes {
     fn find() -> Classes {
-        Classes { image_view: runtime::class_named("UIImageView"), label: runtime::class_named("UILabel"), button: runtime::class_named("UIButton") }
+        Classes {
+            image_view: runtime::class_named("UIImageView"),
+            label: runtime::class_named("UILabel"),
+            button: runtime::class_named("UIButton"),
+            text_field: runtime::class_named("UITextField"),
+            table: runtime::class_named("UITableView"),
+            cell: runtime::class_named("UITableViewCell"),
+            gl_layer: runtime::class_named("CAEAGLLayer"),
+        }
     }
 
     fn is(view: Id, class: Class) -> bool {
@@ -188,17 +248,42 @@ fn image_shown(image: Id, mode: i64, rect: Rect) -> Option<Shown> {
     let info = crate::fw::uikit::image_info(image)?;
     let size = crate::fw::uikit::image_points(image);
     // The file is found (or made) only for pictures that end up shown; see `resolve`.
-    Some(Shown { path: format!("{IMAGE_PREFIX}{image:x}"), mode, size: (size.width, size.height), rect, caps: info.caps, text: None })
+    Some(Shown { path: format!("{IMAGE_PREFIX}{image:x}"), mode, size: (size.width, size.height), rect, caps: info.caps, text: None, alpha: 1.0 })
+}
+
+/// How see-through a disabled button's pictures are drawn.
+const DIMMED: f64 = 0.5;
+
+/// A button's picture as its state draws it: a darker copy when pressed,
+/// dimmed when disabled.
+fn shaded(image: Id, shade: crate::fw::controls::Shade, rect: Rect) -> Option<Shown> {
+    if !shade.darker && shade.darker_when_pressed && image != 0 {
+        // A press may last one frame: the darker copy and its files are made now.
+        let darker = crate::fw::graphics::darker_image(image);
+        match crate::fw::uikit::image_info(darker).and_then(|info| info.caps) {
+            Some(_) => drop(crate::fw::graphics::picture_part_file(darker, 0)),
+            None => drop(crate::fw::graphics::picture_file(darker)),
+        }
+    }
+    let darker = if shade.darker { crate::fw::graphics::darker_image(image) } else { 0 };
+    let mut shown = image_shown(if darker != 0 { darker } else { image }, 0, rect)?;
+    if shade.dimmed {
+        shown.alpha = DIMMED;
+    }
+    Some(shown)
 }
 
 /// Text drawn over `rect` (None for no text).
 fn text_shown(look: Option<TextLook>, rect: Rect) -> Option<Shown> {
     let look = look?;
-    Some(Shown { path: String::new(), mode: 0, size: look.size, rect, caps: None, text: Some(look) })
+    Some(Shown { path: String::new(), mode: 0, size: look.size, rect, caps: None, text: Some(look), alpha: 1.0 })
 }
 
 /// The view tree under `view` as `flatten` reads it (main thread).
 fn snapshot(view: Id, classes: &Classes, depth: usize) -> Node {
+    if Classes::is(view, classes.table) {
+        crate::fw::tables::ensure_rows(view);
+    }
     let state = view_state(view);
     let bounds = Rect { origin: Point::default(), size: state.frame.size };
     let mut pictures = Vec::new();
@@ -211,13 +296,26 @@ fn snapshot(view: Id, classes: &Classes, depth: usize) -> Node {
     }
     if Classes::is(view, classes.button) {
         let parts = crate::fw::controls::button_parts(view);
-        pictures.extend(image_shown(parts.background, 0, bounds));
+        pictures.extend(shaded(parts.background, parts.background_shade, bounds));
         if let Some((image, rect)) = parts.image {
-            pictures.extend(image_shown(image, 0, rect));
+            pictures.extend(shaded(image, parts.image_shade, rect));
         }
         if let Some((look, rect)) = parts.title {
             pictures.extend(text_shown(Some(look), rect));
         }
+    }
+    let mut background = crate::fw::graphics::color_rgba(property_get(view, "background").unwrap_or(0) as Id);
+    if Classes::is(view, classes.text_field) {
+        if let Some((look, rect)) = crate::fw::typing::text_field_look(view) {
+            pictures.extend(text_shown(Some(look), rect));
+        }
+        // A field with a bezel or rounded border is white inside.
+        if background.is_none() && matches!(property_get(view, "borderStyle"), Some(2 | 3)) {
+            background = Some([1.0, 1.0, 1.0, 1.0]);
+        }
+    }
+    if Classes::is(view, classes.cell) {
+        background = crate::fw::tables::cell_fill(view).or(background);
     }
     Node {
         frame: state.frame,
@@ -227,8 +325,19 @@ fn snapshot(view: Id, classes: &Classes, depth: usize) -> Node {
         alpha: property_get(view, "alpha").map(f64::from_bits).unwrap_or(1.0),
         pictures,
         video: crate::fw::media::shows_video(view),
+        gl: state.layer != 0 && Classes::is(state.layer, classes.gl_layer),
+        background,
+        clips: property_get(view, "clips").unwrap_or(0) != 0,
         children: if depth < 64 { state.subviews.iter().map(|&child| snapshot(child, classes, depth + 1)).collect() } else { Vec::new() },
     }
+}
+
+/// Stands for a plain colour in a picture path until `resolve`.
+const COLOR_PREFIX: &str = "\u{1}color:";
+
+/// The path standing for a colour (straight red, green, blue, alpha).
+fn color_path(rgba: [f64; 4]) -> String {
+    format!("{COLOR_PREFIX}{},{},{},{}", rgba[0], rgba[1], rgba[2], rgba[3])
 }
 
 /// Stands for a UIImage in a snapshot's picture path until `resolve`.
@@ -256,6 +365,11 @@ fn resolve(pictures: Vec<Picture>) -> Vec<Picture> {
         .filter_map(|mut p| {
             if let Some(look) = &p.text {
                 p.path = crate::fw::graphics::text_picture(look, pixels_per_point())?;
+                return Some(p);
+            }
+            if let Some(color) = p.path.strip_prefix(COLOR_PREFIX) {
+                let parts: Vec<f64> = color.split(',').filter_map(|part| part.parse().ok()).collect();
+                p.path = crate::fw::graphics::color_picture(parts.try_into().ok()?)?;
                 return Some(p);
             }
             let Some(id) = p.path.strip_prefix(IMAGE_PREFIX) else { return Some(p) };
@@ -312,14 +426,16 @@ fn save_list_in(folder: &str, text: &str) {
 /// The list as the phone app reads it: the screen's size in points, then one
 /// line per picture, back to front, fields split by tabs: its place (a, b,
 /// c, d, tx, ty), area width and height, alpha, mode, picture width and
-/// height, file.
+/// height, the area it may draw in (screen points: x, y, width, height),
+/// file.
 pub fn encode(screen: (f64, f64), pictures: &[Picture]) -> String {
     let mut text = format!("{}\t{}\n", screen.0, screen.1);
     for p in pictures {
-        let t = p.place;
+        let (t, c) = (p.place, p.clip);
         text += &format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-            t.a, t.b, t.c, t.d, t.tx, t.ty, p.area.0, p.area.1, p.alpha, p.mode, p.size.0, p.size.1, p.path
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            t.a, t.b, t.c, t.d, t.tx, t.ty, p.area.0, p.area.1, p.alpha, p.mode, p.size.0, p.size.1,
+            c.origin.x, c.origin.y, c.size.width, c.size.height, p.path
         );
     }
     text
@@ -366,7 +482,7 @@ mod tests {
 
     fn view(frame: Rect, picture: Option<&str>, children: Vec<Node>) -> Node {
         let rect = rect(0.0, 0.0, frame.size.width, frame.size.height);
-        let pictures = picture.map(|p| Shown { path: p.to_string(), mode: 0, size: (10.0, 10.0), rect, caps: None, text: None }).into_iter().collect();
+        let pictures = picture.map(|p| Shown { path: p.to_string(), mode: 0, size: (10.0, 10.0), rect, caps: None, text: None, alpha: 1.0 }).into_iter().collect();
         Node { frame, alpha: 1.0, pictures, children, ..Default::default() }
     }
 
@@ -430,7 +546,7 @@ mod tests {
     fn stretchable_pictures_keep_their_caps() {
         let mut button = view(rect(10.0, 10.0, 100.0, 40.0), None, vec![]);
         let caps = Some([3.0, 4.0, 3.0, 4.0]);
-        button.pictures.push(Shown { path: "b.png".into(), mode: 0, size: (20.0, 10.0), rect: rect(0.0, 0.0, 100.0, 40.0), caps, text: None });
+        button.pictures.push(Shown { path: "b.png".into(), mode: 0, size: (20.0, 10.0), rect: rect(0.0, 0.0, 100.0, 40.0), caps, text: None, alpha: 1.0 });
         let pictures = flatten(&window(vec![button]));
         let parts: Vec<(String, (f64, f64), (f64, f64), (f64, f64))> =
             pictures.iter().map(|p| (p.path.clone(), at(p, 0.0, 0.0), p.area, p.size)).collect();
@@ -451,13 +567,13 @@ mod tests {
         );
         // 6 points wide: the 4-point caps shrink to 3 and there is no middle column.
         let mut narrow = view(rect(0.0, 0.0, 6.0, 40.0), None, vec![]);
-        narrow.pictures.push(Shown { path: "b.png".into(), mode: 0, size: (20.0, 10.0), rect: rect(0.0, 0.0, 6.0, 40.0), caps, text: None });
+        narrow.pictures.push(Shown { path: "b.png".into(), mode: 0, size: (20.0, 10.0), rect: rect(0.0, 0.0, 6.0, 40.0), caps, text: None, alpha: 1.0 });
         let widths: Vec<(String, f64)> = flatten(&window(vec![narrow])).into_iter().map(|p| (p.path, p.area.0)).collect();
         assert_eq!(widths.iter().filter(|(path, _)| path.ends_with(&format!("{PART_MARK}1"))).count(), 0, "{widths:?}");
         assert!(widths.iter().all(|&(_, w)| w == 3.0), "{widths:?}");
         // Shown at its own size (centred): whole.
         let mut centred = view(rect(0.0, 0.0, 100.0, 40.0), None, vec![]);
-        centred.pictures.push(Shown { path: "b.png".into(), mode: 4, size: (20.0, 10.0), rect: rect(0.0, 0.0, 100.0, 40.0), caps, text: None });
+        centred.pictures.push(Shown { path: "b.png".into(), mode: 4, size: (20.0, 10.0), rect: rect(0.0, 0.0, 100.0, 40.0), caps, text: None, alpha: 1.0 });
         let paths: Vec<String> = flatten(&window(vec![centred])).into_iter().map(|p| p.path).collect();
         assert_eq!(paths, ["b.png"]);
     }
@@ -577,6 +693,87 @@ mod tests {
         assert!(snapshot(plain, &Classes::find(), 0).pictures.is_empty());
     }
 
+    /// A white picture made in memory (one reference, the caller's).
+    fn white_picture(width: usize, height: usize) -> Id {
+        use crate::fw::graphics::{Bitmap, Space, PREMULTIPLIED_LAST};
+        let bitmap = Bitmap { width, height, bits_per_pixel: 32, bytes_per_row: width * 4, info: PREMULTIPLIED_LAST, space: Space::Rgb, data: vec![255; width * height * 4] };
+        let pixels = crate::fw::graphics::make_image(bitmap);
+        let image = runtime::send(runtime::send(runtime::class_named("UIImage"), "alloc", &[]), "initWithCGImage:", &[pixels]);
+        crate::fw::counted::release(pixels);
+        image
+    }
+
+    /// The first pixel of a UIImage's picture (red, green, blue, alpha).
+    fn first_pixel(image: Id) -> [u8; 4] {
+        let mut pixel = [0u8; 4];
+        let bytes = crate::fw::graphics::straight_pixels(crate::fw::graphics::image_cg(image)).expect("pixels");
+        pixel.copy_from_slice(&bytes[..4]);
+        pixel
+    }
+
+    /// Pressed, a button's pictures are drawn darker (adjustsImageWhenHighlighted,
+    /// unless it has a picture of its own for being pressed); disabled, they
+    /// are dimmed (adjustsImageWhenDisabled). The title stays as it is.
+    #[test]
+    fn pressed_buttons_darken_and_disabled_ones_dim() {
+        setup();
+        let (background, icon) = (white_picture(4, 4), white_picture(2, 2));
+        let button = new_view("UIButton", rect(0.0, 0.0, 100.0, 40.0));
+        runtime::send(button, "setBackgroundImage:forState:", &[background, 0]);
+        runtime::send(button, "setImage:forState:", &[icon, 0]);
+        runtime::send(button, "setTitle:forState:", &[crate::fw::string::make("Go"), 0]);
+        let shown = || snapshot(button, &Classes::find(), 0).pictures;
+        let image_of = |shown: &Shown| usize::from_str_radix(shown.path.strip_prefix(IMAGE_PREFIX).expect("an image"), 16).unwrap();
+        let plain = shown();
+        assert_eq!((image_of(&plain[0]), image_of(&plain[1])), (background, icon));
+        assert!(plain.iter().all(|p| p.alpha == 1.0));
+        runtime::send(button, "setHighlighted:", &[1]);
+        let pressed = shown();
+        let (dark_background, dark_icon) = (image_of(&pressed[0]), image_of(&pressed[1]));
+        assert!(dark_background != background && dark_icon != icon, "darker copies");
+        let [r, g, b, a] = first_pixel(dark_background);
+        assert!(r < 160 && r > 60 && r == g && g == b && a == 255, "darker: {r} {g} {b} {a}");
+        assert_eq!(crate::fw::uikit::image_info(dark_background).unwrap().caps, crate::fw::uikit::image_info(background).unwrap().caps);
+        assert_eq!(image_of(&shown()[0]), dark_background, "made once");
+        runtime::send(button, "setAdjustsImageWhenHighlighted:", &[0]);
+        assert_eq!(image_of(&shown()[0]), background);
+        runtime::send(button, "setAdjustsImageWhenHighlighted:", &[1]);
+        // Its own pressed picture is shown as it is.
+        let own = white_picture(4, 4);
+        runtime::send(button, "setBackgroundImage:forState:", &[own, 1]);
+        assert_eq!(image_of(&shown()[0]), own);
+        runtime::send(button, "setHighlighted:", &[0]);
+        // Disabled: pictures dimmed, the title not.
+        runtime::send(button, "setEnabled:", &[0]);
+        let disabled = shown();
+        assert_eq!((image_of(&disabled[0]), image_of(&disabled[1])), (background, icon));
+        assert!(disabled[0].alpha < 0.6 && disabled[1].alpha < 0.6 && disabled[2].alpha == 1.0, "{disabled:?}");
+        runtime::send(button, "setAdjustsImageWhenDisabled:", &[0]);
+        assert!(shown().iter().all(|p| p.alpha == 1.0));
+    }
+
+    /// A press is often one frame long: the darker pictures are made while
+    /// the button shows normally, so the first pressed frame has them all.
+    #[test]
+    fn pressed_pictures_are_ready_on_the_first_pressed_frame() {
+        setup();
+        let background = white_picture(6, 6);
+        let button = new_view("UIButton", rect(0.0, 0.0, 100.0, 40.0));
+        runtime::send(button, "setBackgroundImage:forState:", &[background, 0]);
+        let drawn = || resolve(flatten(&window(vec![snapshot(button, &Classes::find(), 0)]))).len();
+        // Shown normally until its picture file is ready (made on its own thread).
+        for _ in 0..200 {
+            if drawn() == 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(drawn(), 1);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        runtime::send(button, "setHighlighted:", &[1]);
+        assert_eq!(drawn(), 1, "the darker background is ready at once");
+    }
+
     #[test]
     fn turned_and_scaled_views_keep_their_centre() {
         // An upright 320x480 launch picture turned a quarter so it fills a 480x320 screen.
@@ -591,6 +788,62 @@ mod tests {
         assert_eq!(at(&pictures[1], 0.0, 0.0), (95.0, 95.0));
         assert_eq!(at(&pictures[1], 20.0, 10.0), (135.0, 115.0));
         let text = encode((960.0, 540.0), &pictures[1..]);
-        assert_eq!(text, "960\t540\n2\t0\t0\t2\t95\t95\t20\t10\t1\t0\t10\t10\tgrown.png\n");
+        assert_eq!(text, "960\t540\n2\t0\t0\t2\t95\t95\t20\t10\t1\t0\t10\t10\t0\t0\t960\t540\tgrown.png\n");
+    }
+
+    /// Views with a background colour fill their bounds with it, under what
+    /// they show and what they hold; a clear colour shows nothing. A GL view
+    /// covers what is behind it (the GL picture is under every UIKit one,
+    /// so nothing behind may be drawn over it), not what it holds.
+    #[test]
+    fn background_colours_fill_views_and_gl_views_cover_what_is_behind() {
+        let full = rect(0.0, 0.0, 960.0, 540.0);
+        let mut panel = view(rect(10.0, 20.0, 100.0, 50.0), Some("icon.png"), vec![view(rect(0.0, 0.0, 10.0, 10.0), Some("child.png"), vec![])]);
+        panel.background = Some([1.0, 0.0, 0.0, 0.5]);
+        let mut clear = view(rect(0.0, 0.0, 50.0, 50.0), None, vec![]);
+        clear.background = Some([0.0, 0.0, 0.0, 0.0]);
+        let pictures = flatten(&window(vec![panel, clear]));
+        let paths: Vec<String> = pictures.iter().map(|p| p.path.clone()).collect();
+        assert_eq!(paths, [color_path([1.0, 0.0, 0.0, 0.5]), "icon.png".into(), "child.png".into()]);
+        assert_eq!((at(&pictures[0], 0.0, 0.0), pictures[0].area, pictures[0].mode), ((10.0, 20.0), (100.0, 50.0), 0));
+        // The colour becomes a one-pixel picture of it.
+        let made = resolve(vec![pictures[0].clone()]);
+        let pixel = image::open(&made[0].path).expect("a colour picture").to_rgba8();
+        assert_eq!((pixel.dimensions(), pixel.get_pixel(0, 0).0), ((1, 1), [255, 0, 0, 128]));
+        // Behind a GL view: covered.
+        let mut behind = view(full, Some("behind.png"), vec![]);
+        behind.background = Some([0.0, 0.0, 0.0, 1.0]);
+        let mut gl = view(full, None, vec![view(rect(5.0, 5.0, 20.0, 20.0), Some("hud.png"), vec![])]);
+        gl.gl = true;
+        gl.background = Some([0.0, 0.0, 0.0, 1.0]);
+        let front = view(rect(0.0, 0.0, 30.0, 30.0), Some("front.png"), vec![]);
+        let paths: Vec<String> = flatten(&window(vec![behind, gl, front])).into_iter().map(|p| p.path).collect();
+        assert_eq!(paths, ["hud.png", "front.png"]);
+    }
+
+    /// A view that clips to its bounds keeps what it holds inside them: each
+    /// picture carries the screen area it may draw in (nested clips meet),
+    /// and one wholly outside is left out. Others may use the whole screen.
+    #[test]
+    fn clipping_views_keep_what_they_hold_inside() {
+        let inner = view(rect(20.0, 20.0, 100.0, 100.0), Some("inner.png"), vec![]);
+        let mut small = view(rect(30.0, -10.0, 40.0, 40.0), None, vec![view(rect(0.0, 0.0, 100.0, 100.0), Some("deep.png"), vec![])]);
+        small.clips = true;
+        let away = view(rect(200.0, 200.0, 10.0, 10.0), Some("away.png"), vec![]);
+        let mut clipping = view(rect(100.0, 100.0, 50.0, 50.0), Some("box.png"), vec![inner, small, away]);
+        clipping.clips = true;
+        let free = view(rect(0.0, 0.0, 10.0, 10.0), Some("free.png"), vec![]);
+        let pictures = flatten(&window(vec![clipping, free]));
+        let clips: Vec<(&str, Rect)> = pictures.iter().map(|p| (p.path.as_str(), p.clip)).collect();
+        assert_eq!(
+            clips,
+            [
+                ("box.png", rect(100.0, 100.0, 50.0, 50.0)),
+                ("inner.png", rect(100.0, 100.0, 50.0, 50.0)),
+                ("deep.png", rect(130.0, 100.0, 20.0, 30.0)),
+                ("free.png", rect(0.0, 0.0, 960.0, 540.0)),
+            ]
+        );
+        assert!(encode((960.0, 540.0), &pictures[2..3]).ends_with("\t130\t100\t20\t30\tdeep.png\n"));
     }
 }

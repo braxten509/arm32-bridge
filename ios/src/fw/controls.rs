@@ -143,9 +143,6 @@ fn text_of(object: Id) -> String {
 }
 
 extern "C" fn nothing(_this: Id, _: Sel) {}
-extern "C" fn yes(_this: Id, _: Sel) -> bool {
-    true
-}
 extern "C" fn no(_this: Id, _: Sel) -> bool {
     false
 }
@@ -164,6 +161,7 @@ extern "C" fn ignore_int(_this: Id, _: Sel, _value: isize) {}
 extern "C" fn ignore_double(_this: Id, _: Sel, _value: f64) {}
 extern "C" fn ignore_id_bool(_this: Id, _: Sel, _value: Id, _flag: u8) {}
 extern "C" fn ignore_id_int(_this: Id, _: Sel, _value: Id, _number: isize) {}
+extern "C" fn ignore_id_id(_this: Id, _: Sel, _a: Id, _b: Id) {}
 extern "C" fn ignore_id_int_int(_this: Id, _: Sel, _value: Id, _a: isize, _b: isize) {}
 extern "C" fn nil_with_id(_this: Id, _: Sel, _value: Id) -> Id {
     0
@@ -346,7 +344,7 @@ extern "C" fn text_or_empty(this: Id, _: Sel) -> Id {
 }
 extern "C" fn text_set(this: Id, _: Sel, text: Id) {
     property_set(this, "text", copied(text) as u64);
-    if text != 0 && !class_is(this, "UILabel") {
+    if text != 0 && !class_is(this, "UILabel") && !class_is(this, "UITextField") {
         not_drawn(&format!("{} text \"{}\"", string::describe_class_of(this), text_of(text)));
     }
 }
@@ -400,14 +398,6 @@ extern "C" fn label_shadow_offset(this: Id, _: Sel) -> Size {
 extern "C" fn label_set_shadow_offset(this: Id, _: Sel, size: Size) {
     set_f(this, "shadowOffset.w", size.width);
     set_f(this, "shadowOffset.h", size.height);
-}
-
-/// There is no on-screen keyboard here, so nothing can start editing text:
-/// becomeFirstResponder says NO (UIKit's answer when a view can't become
-/// the first responder) and no keyboard notifications are sent.
-extern "C" fn text_become_first_responder(this: Id, _: Sel) -> bool {
-    crate::log!("{} {this:#x} asked for the keyboard; there is none here yet, answering NO", string::describe_class_of(this));
-    false
 }
 
 extern "C" fn text_selected_range(this: Id, _: Sel) -> Range {
@@ -507,6 +497,21 @@ static STATE_VALUES: Mutex<Option<HashMap<(Id, &'static str, usize), Id>>> = Mut
 
 fn state_set(this: Id, key: &'static str, state: usize, value: Id) {
     STATE_VALUES.lock().unwrap().get_or_insert_with(HashMap::new).insert((this, key, state), value);
+}
+
+/// The same for a picture, which the control holds on to (as UIKit
+/// retains it) until it is replaced; nil takes the state's own picture away.
+fn state_set_kept(this: Id, key: &'static str, state: usize, value: Id) {
+    crate::fw::counted::retain(value);
+    let old = {
+        let mut values = STATE_VALUES.lock().unwrap();
+        let values = values.get_or_insert_with(HashMap::new);
+        if value == 0 { values.remove(&(this, key, state)) } else { values.insert((this, key, state), value) }
+    };
+    // Outside the lock: letting go may clean the picture up.
+    if let Some(old) = old {
+        crate::fw::counted::release(old);
+    }
 }
 
 /// The value for a state, or the normal state's, as UIButton falls back.
@@ -631,7 +636,14 @@ extern "C" fn control_all_events(this: Id, _: Sel) -> usize {
     TARGETS.lock().unwrap().as_ref().and_then(|m| m.get(&this)).map(|l| l.iter().fold(0, |a, t| a | t.events)).unwrap_or(0)
 }
 
-extern "C" fn control_send_actions(this: Id, _: Sel, events: usize) {
+/// Whether any target listens for one of `events`.
+pub(crate) fn listens_for(this: Id, events: usize) -> bool {
+    TARGETS.lock().unwrap().as_ref().and_then(|m| m.get(&this)).is_some_and(|list| list.iter().any(|t| t.events & events != 0))
+}
+
+/// Each target/action pair for any of `events`, through -sendAction:to:forEvent:
+/// (so a game's control can step in), with the event that caused it.
+pub(crate) fn send_actions(this: Id, events: usize, event: Id) {
     let calls: Vec<(Id, Sel)> = TARGETS
         .lock()
         .unwrap()
@@ -640,8 +652,12 @@ extern "C" fn control_send_actions(this: Id, _: Sel, events: usize) {
         .map(|list| list.iter().filter(|t| t.events & events != 0).map(|t| (t.target, t.action)).collect())
         .unwrap_or_default();
     for (target, action) in calls {
-        send_action(this, action, target, 0);
+        runtime::send(this, "sendAction:to:forEvent:", &[action, target, event]);
     }
+}
+
+extern "C" fn control_send_actions(this: Id, _: Sel, events: usize) {
+    send_actions(this, events, 0);
 }
 
 extern "C" fn control_send_action(this: Id, _: Sel, action: Sel, target: Id, event: Id) {
@@ -651,11 +667,136 @@ extern "C" fn control_send_action(this: Id, _: Sel, action: Sel, target: Id, eve
 property!(control_selected, control_set_selected, "selected", bool, false);
 property!(control_horizontal, control_set_horizontal, "contentHorizontalAlignment", isize, 0);
 property!(control_vertical, control_set_vertical, "contentVerticalAlignment", isize, 0);
+extern "C" fn control_tracking(this: Id, _: Sel) -> bool {
+    get_flag(this, "tracking", false)
+}
+extern "C" fn control_touch_inside(this: Id, _: Sel) -> bool {
+    get_flag(this, "touchInside", false)
+}
 
 extern "C" fn control_init_with_frame(this: Id, _: Sel, frame: Rect) -> Id {
     super_init_frame(this, "UIView", frame);
-    mark_not_drawn(this);
     this
+}
+
+// ----- following a finger (UIControl's touch tracking) -----
+
+// UIControlEvents
+const TOUCH_DOWN: usize = 1;
+const TOUCH_DRAG_INSIDE: usize = 1 << 2;
+const TOUCH_DRAG_OUTSIDE: usize = 1 << 3;
+const TOUCH_DRAG_ENTER: usize = 1 << 4;
+const TOUCH_DRAG_EXIT: usize = 1 << 5;
+const TOUCH_UP_INSIDE: usize = 1 << 6;
+const TOUCH_UP_OUTSIDE: usize = 1 << 7;
+const TOUCH_CANCEL: usize = 1 << 8;
+
+/// How far outside its bounds a finger still counts as on a control (UIKit's margin).
+const TOUCH_MARGIN: f64 = 70.0;
+
+/// A tracking method that answers YES or NO (the game's own, if it has one).
+fn ask_tracking(this: Id, name: &str, touch: Id, event: Id) -> bool {
+    let s = runtime::sel(name);
+    match runtime::imp_for(this, s) {
+        Some(imp) => {
+            let f: extern "C" fn(Id, Sel, Id, Id) -> bool = unsafe { std::mem::transmute(imp) };
+            f(this, s, touch, event)
+        }
+        None => true,
+    }
+}
+
+fn finger_inside(this: Id, touch: Id) -> bool {
+    let at = crate::fw::touch::location_in(touch, this);
+    let size = frame_of(this).size;
+    at.x >= -TOUCH_MARGIN && at.y >= -TOUCH_MARGIN && at.x < size.width + TOUCH_MARGIN && at.y < size.height + TOUCH_MARGIN
+}
+
+fn set_pressed(this: Id, pressed: bool) {
+    if get_flag(this, "highlighted", false) != pressed {
+        runtime::send(this, "setHighlighted:", &[pressed as usize]);
+    }
+}
+
+/// A disabled control leaves the touch to the next view up that takes touches (UIResponder's way).
+fn pass_on(this: Id, name: &str, touches: Id, event: Id) {
+    let mut next = view_state(this).superview;
+    while next != 0 && !runtime::responds(next, name) {
+        next = view_state(next).superview;
+    }
+    if next != 0 {
+        runtime::send(next, name, &[touches, event]);
+    }
+}
+
+extern "C" fn control_touches_began(this: Id, _: Sel, touches: Id, event: Id) {
+    let enabled = get_flag(this, "enabled", true);
+    property_set(this, "passingTouches", !enabled as u64);
+    if !enabled {
+        pass_on(this, "touchesBegan:withEvent:", touches, event);
+        return;
+    }
+    let touch = runtime::send(touches, "anyObject", &[]);
+    property_set(this, "touchInside", 1);
+    let tracking = ask_tracking(this, "beginTrackingWithTouch:withEvent:", touch, event);
+    property_set(this, "tracking", tracking as u64);
+    set_pressed(this, true);
+    send_actions(this, TOUCH_DOWN, event);
+}
+
+extern "C" fn control_touches_moved(this: Id, _: Sel, touches: Id, event: Id) {
+    if get_flag(this, "passingTouches", false) {
+        pass_on(this, "touchesMoved:withEvent:", touches, event);
+        return;
+    }
+    let touch = runtime::send(touches, "anyObject", &[]);
+    let was_inside = get_flag(this, "touchInside", false);
+    let inside = finger_inside(this, touch);
+    property_set(this, "touchInside", inside as u64);
+    if get_flag(this, "tracking", false) {
+        let going_on = ask_tracking(this, "continueTrackingWithTouch:withEvent:", touch, event);
+        property_set(this, "tracking", going_on as u64);
+    }
+    set_pressed(this, inside);
+    let crossed = match (was_inside, inside) {
+        (true, false) => TOUCH_DRAG_EXIT,
+        (false, true) => TOUCH_DRAG_ENTER,
+        _ => 0,
+    };
+    send_actions(this, crossed | if inside { TOUCH_DRAG_INSIDE } else { TOUCH_DRAG_OUTSIDE }, event);
+}
+
+pub(crate) extern "C" fn control_touches_ended(this: Id, _: Sel, touches: Id, event: Id) {
+    if get_flag(this, "passingTouches", false) {
+        pass_on(this, "touchesEnded:withEvent:", touches, event);
+        return;
+    }
+    let touch = runtime::send(touches, "anyObject", &[]);
+    let inside = finger_inside(this, touch);
+    property_set(this, "touchInside", inside as u64);
+    set_pressed(this, false);
+    if get_flag(this, "tracking", false) {
+        runtime::send(this, "endTrackingWithTouch:withEvent:", &[touch, event]);
+    }
+    property_set(this, "tracking", 0);
+    send_actions(this, if inside { TOUCH_UP_INSIDE } else { TOUCH_UP_OUTSIDE }, event);
+}
+
+extern "C" fn control_touches_cancelled(this: Id, _: Sel, touches: Id, event: Id) {
+    if get_flag(this, "passingTouches", false) {
+        pass_on(this, "touchesCancelled:withEvent:", touches, event);
+        return;
+    }
+    set_pressed(this, false);
+    if get_flag(this, "tracking", false) {
+        runtime::send(this, "cancelTrackingWithEvent:", &[event]);
+    }
+    property_set(this, "tracking", 0);
+    send_actions(this, TOUCH_CANCEL, event);
+}
+
+extern "C" fn control_begin_tracking(_this: Id, _: Sel, _touch: Id, _event: Id) -> bool {
+    true
 }
 
 extern "C" fn control_state_method(this: Id, _: Sel) -> usize {
@@ -671,6 +812,7 @@ extern "C" fn button_with_type(class: Class, _: Sel, kind: isize) -> Id {
 property!(button_type, button_set_type_unused, "buttonType", isize, 0);
 property!(button_adjusts_highlighted, button_set_adjusts_highlighted, "adjustsImageWhenHighlighted", bool, true);
 property!(button_shows_touch, button_set_shows_touch, "showsTouchWhenHighlighted", bool, false);
+property!(button_adjusts_disabled, button_set_adjusts_disabled, "adjustsImageWhenDisabled", bool, true);
 
 fn button_label(this: Id) -> Id {
     if let Some(label) = property_get(this, "titleLabel") {
@@ -716,8 +858,11 @@ extern "C" fn button_current_title(this: Id, _: Sel) -> Id {
 
 macro_rules! per_state {
     ($get:ident, $set:ident, $current:ident, $key:literal) => {
+        per_state!($get, $set, $current, $key, state_set);
+    };
+    ($get:ident, $set:ident, $current:ident, $key:literal, $store:ident) => {
         extern "C" fn $set(this: Id, _: Sel, value: Id, state: usize) {
-            state_set(this, $key, state, value);
+            $store(this, $key, state, value);
         }
         extern "C" fn $get(this: Id, _: Sel, state: usize) -> Id {
             state_get(this, $key, state)
@@ -728,8 +873,8 @@ macro_rules! per_state {
     };
 }
 per_state!(button_title_color, button_set_title_color, button_current_title_color, "titleColor");
-per_state!(button_image, button_set_image, button_current_image, "image");
-per_state!(button_background_image, button_set_background_image, button_current_background_image, "backgroundImage");
+per_state!(button_image, button_set_image, button_current_image, "image", state_set_kept);
+per_state!(button_background_image, button_set_background_image, button_current_background_image, "backgroundImage", state_set_kept);
 per_state!(button_title_shadow, button_set_title_shadow, button_current_title_shadow, "titleShadowColor");
 per_state!(button_attributed_title, button_set_attributed_title, button_current_attributed_title, "attributedTitle");
 
@@ -741,6 +886,31 @@ pub struct ButtonParts {
     pub image: Option<(Id, Rect)>,
     /// The title and where it goes.
     pub title: Option<(TextLook, Rect)>,
+    /// How the background and the picture are drawn.
+    pub background_shade: Shade,
+    pub image_shade: Shade,
+}
+
+/// How a button's picture is drawn for its state.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Shade {
+    /// Pressed, with no picture of its own for that (adjustsImageWhenHighlighted).
+    pub darker: bool,
+    /// Disabled, with no picture of its own for that (adjustsImageWhenDisabled).
+    pub dimmed: bool,
+    /// Pressed, it would be drawn darker (so that copy can be made beforehand).
+    pub darker_when_pressed: bool,
+}
+
+/// How a button draws the picture it keeps under `key` in its current state.
+fn shade_of(button: Id, key: &'static str, state: usize) -> Shade {
+    let own = |state: usize| STATE_VALUES.lock().unwrap().as_ref().is_some_and(|values| values.contains_key(&(button, key, state)));
+    let darkens = get_flag(button, "adjustsImageWhenHighlighted", true);
+    Shade {
+        darker: state & 1 != 0 && !own(state) && darkens,
+        dimmed: state & 2 != 0 && !own(state) && get_flag(button, "adjustsImageWhenDisabled", true),
+        darker_when_pressed: !own(state | 1) && darkens,
+    }
 }
 
 fn insets_of(this: Id, key: &'static str) -> Insets {
@@ -818,7 +988,13 @@ pub fn button_parts(button: Id) -> ButtonParts {
         };
         (look, rect)
     });
-    ButtonParts { background: state_get(button, "backgroundImage", state), image: image_part, title: title_part }
+    ButtonParts {
+        background: state_get(button, "backgroundImage", state),
+        image: image_part,
+        title: title_part,
+        background_shade: shade_of(button, "backgroundImage", state),
+        image_shade: shade_of(button, "image", state),
+    }
 }
 
 extern "C" fn button_size_that_fits(this: Id, _: Sel, _size: Size) -> Size {
@@ -857,6 +1033,12 @@ insets_property!(flow_section_inset, flow_set_section_inset, "sectionInset");
 extern "C" fn text_view_init_with_frame(this: Id, _: Sel, frame: Rect) -> Id {
     super_init_frame(this, "UIView", frame);
     mark_not_drawn(this);
+    this
+}
+
+/// Text fields are drawn (fw/pictures.rs, from typing::text_field_look).
+extern "C" fn text_field_init_with_frame(this: Id, _: Sel, frame: Rect) -> Id {
+    super_init_frame(this, "UIView", frame);
     this
 }
 
@@ -1288,7 +1470,7 @@ fn register_class(view: Id, key: String, class: Class) {
     REGISTERED.lock().unwrap().get_or_insert_with(HashMap::new).insert((view, key), class);
 }
 
-fn registered_class(view: Id, key: &str) -> Option<Class> {
+pub(crate) fn registered_class(view: Id, key: &str) -> Option<Class> {
     REGISTERED.lock().unwrap().as_ref().and_then(|m| m.get(&(view, key.to_string())).copied())
 }
 
@@ -1323,35 +1505,6 @@ extern "C" fn table_register_class(this: Id, _: Sel, class: Class, identifier: I
     register_class(this, format!("cell:{}", text_of(identifier)), class);
 }
 
-extern "C" fn table_register_nib(this: Id, _: Sel, _nib: Id, identifier: Id) {
-    crate::log!("table {this:#x}: cells from a nib (\"{}\") can't be made here", text_of(identifier));
-}
-
-fn table_make_cell(this: Id, identifier: Id) -> Id {
-    let Some(class) = registered_class(this, &format!("cell:{}", text_of(identifier))) else { return 0 };
-    let cell = runtime::send(class, "alloc", &[]);
-    runtime::send(cell, "initWithStyle:reuseIdentifier:", &[0, identifier])
-}
-
-/// Nothing is ever on screen, so no cell is waiting for reuse: a new one of
-/// the registered class, or nil (the game then makes its own) as UIKit does.
-extern "C" fn table_dequeue(this: Id, _: Sel, identifier: Id) -> Id {
-    table_make_cell(this, identifier)
-}
-
-extern "C" fn table_dequeue_for_path(this: Id, _: Sel, identifier: Id, _path: Id) -> Id {
-    let cell = table_make_cell(this, identifier);
-    if cell == 0 {
-        crate::log!("table {this:#x}: no cell class registered for \"{}\"", text_of(identifier));
-    }
-    cell
-}
-
-extern "C" fn table_reload(this: Id, _: Sel) {
-    clear_selection(this);
-    not_drawn(&format!("table {this:#x} contents"));
-}
-
 extern "C" fn table_number_of_sections(this: Id, _: Sel) -> isize {
     let source = get_id(this, "dataSource");
     tell(source, "numberOfSectionsInTableView:", &[this]).map(|n| n as isize).unwrap_or(1)
@@ -1366,13 +1519,13 @@ extern "C" fn table_rows_in_section(this: Id, _: Sel, section: isize) -> isize {
 
 static SELECTED: Mutex<Option<HashMap<Id, Vec<Id>>>> = Mutex::new(None);
 
-fn selected(view: Id) -> Vec<Id> {
+pub(crate) fn selected(view: Id) -> Vec<Id> {
     SELECTED.lock().unwrap().as_ref().and_then(|m| m.get(&view).cloned()).unwrap_or_default()
 }
 
 /// Two index paths are the same when they name the same section and row
 /// (or item), whichever NSIndexPath class made them; else isEqual: decides.
-fn same_path(a: Id, b: Id) -> bool {
+pub(crate) fn same_path(a: Id, b: Id) -> bool {
     if a == b {
         return true;
     }
@@ -1410,31 +1563,23 @@ fn deselect_in(list: &mut Vec<Id>, path: Id, same: &dyn Fn(Id, Id) -> bool) {
     list.retain(|&p| !same(p, path));
 }
 
-fn select_path(view: Id, path: Id) {
+pub(crate) fn select_path(view: Id, path: Id) {
     let mut list = selected(view);
     select_in(&mut list, path, get_flag(view, "allowsMultipleSelection", false), &same_path);
     SELECTED.lock().unwrap().get_or_insert_with(HashMap::new).insert(view, list);
 }
 
-fn deselect_path(view: Id, path: Id) {
+pub(crate) fn deselect_path(view: Id, path: Id) {
     let mut list = selected(view);
     deselect_in(&mut list, path, &same_path);
     SELECTED.lock().unwrap().get_or_insert_with(HashMap::new).insert(view, list);
 }
 
 /// reloadData forgets the selection, as UIKit does.
-fn clear_selection(view: Id) {
+pub(crate) fn clear_selection(view: Id) {
     if let Some(map) = SELECTED.lock().unwrap().as_mut() {
         map.remove(&view);
     }
-}
-
-extern "C" fn table_select(this: Id, _: Sel, path: Id, _animated: u8, _position: isize) {
-    select_path(this, path);
-}
-
-extern "C" fn table_deselect(this: Id, _: Sel, path: Id, _animated: u8) {
-    deselect_path(this, path);
 }
 
 extern "C" fn table_selected_row(this: Id, _: Sel) -> Id {
@@ -1494,12 +1639,6 @@ extern "C" fn cell_init_with_style(this: Id, _: Sel, style: isize, identifier: I
     call_rect(this, "initWithFrame:", Rect::new(0.0, 0.0, w, 44.0))
 }
 
-extern "C" fn cell_init_with_frame(this: Id, _: Sel, frame: Rect) -> Id {
-    super_init_frame(this, "UIView", frame);
-    mark_not_drawn(this);
-    this
-}
-
 fn cell_content_view(this: Id) -> Id {
     if let Some(view) = property_get(this, "contentView") {
         return view as Id;
@@ -1548,13 +1687,6 @@ property!(cell_selection_style, cell_set_selection_style, "selectionStyle", isiz
 property!(cell_background_view, cell_set_background_view, "backgroundView", id, 0);
 property!(cell_selected_background_view, cell_set_selected_background_view, "selectedBackgroundView", id, 0);
 property!(cell_indentation, cell_set_indentation, "indentationLevel", isize, 0);
-
-extern "C" fn cell_set_selected_animated(this: Id, _: Sel, selected: u8, _animated: u8) {
-    property_set(this, "selected", (selected != 0) as u64);
-}
-extern "C" fn cell_set_highlighted_animated(this: Id, _: Sel, highlighted: u8, _animated: u8) {
-    property_set(this, "highlighted", (highlighted != 0) as u64);
-}
 
 // ----- collections -----
 
@@ -1656,6 +1788,10 @@ extern "C" fn collection_batch(_this: Id, _: Sel, updates: usize, completion: us
 
 extern "C" fn collection_select(this: Id, _: Sel, path: Id, _animated: u8, _position: usize) {
     select_path(this, path);
+}
+
+extern "C" fn collection_deselect(this: Id, _: Sel, path: Id, _animated: u8) {
+    deselect_path(this, path);
 }
 
 /// UICollectionView answers an empty list when nothing is selected.
@@ -1773,10 +1909,15 @@ impl Buttons {
     pub fn add(&mut self, title: String) -> isize {
         let index = self.titles.len() as isize;
         self.titles.push(title);
-        if self.first_other < 0 && index != self.cancel && index != self.destructive {
-            self.first_other = index;
-        }
+        self.find_first_other();
         index
+    }
+
+    /// The first button that is neither cancel nor destructive (-1: none),
+    /// found again when those change, as UIKit's firstOtherButtonIndex is.
+    fn find_first_other(&mut self) {
+        let (cancel, destructive) = (self.cancel, self.destructive);
+        self.first_other = (0..self.titles.len() as isize).find(|&i| i != cancel && i != destructive).unwrap_or(-1);
     }
 }
 
@@ -1811,7 +1952,6 @@ fn optional_text(object: Id) -> Option<String> {
 
 extern "C" fn alert_init_with_frame(this: Id, _: Sel, frame: Rect) -> Id {
     super_init_frame(this, "UIView", frame);
-    mark_not_drawn(this);
     with_buttons(this, |_| ());
     this
 }
@@ -1881,7 +2021,10 @@ extern "C" fn alert_cancel_index(this: Id, _: Sel) -> isize {
     with_buttons(this, |b| b.cancel)
 }
 extern "C" fn alert_set_cancel_index(this: Id, _: Sel, index: isize) {
-    with_buttons(this, |b| b.cancel = index);
+    with_buttons(this, |b| {
+        b.cancel = index;
+        b.find_first_other();
+    });
 }
 extern "C" fn alert_first_other_index(this: Id, _: Sel) -> isize {
     with_buttons(this, |b| b.first_other)
@@ -1890,7 +2033,10 @@ extern "C" fn sheet_destructive_index(this: Id, _: Sel) -> isize {
     with_buttons(this, |b| b.destructive)
 }
 extern "C" fn sheet_set_destructive_index(this: Id, _: Sel, index: isize) {
-    with_buttons(this, |b| b.destructive = index);
+    with_buttons(this, |b| {
+        b.destructive = index;
+        b.find_first_other();
+    });
 }
 
 /// Text fields of the input styles (secure 1, plain 2, login and password 3).
@@ -1913,19 +2059,23 @@ extern "C" fn alert_text_field(this: Id, _: Sel, index: isize) -> Id {
     if index < 0 { 0 } else { fields.get(index as usize).copied().unwrap_or(0) }
 }
 
-/// An alert or sheet is "shown" (visible, its delegate hears it was
-/// presented) but not drawn, so it waits; the game's own code may still
-/// close it with dismissWithClickedButtonIndex:animated:.
-fn show_invisible(this: Id, kind: &str, present_will: &'static str, present_did: &'static str) {
+/// An alert or sheet is shown (visible, drawn over the key window, its
+/// delegate hears it was presented); with no window yet it is only
+/// "visible", and the game's own code may still close it with
+/// dismissWithClickedButtonIndex:animated:.
+fn show(this: Id, kind: &str, present_will: &'static str, present_did: &'static str) {
     let buttons = with_buttons(this, |b| b.clone());
     crate::log!(
-        "{kind} shown but not drawn yet: title \"{}\", message \"{}\", buttons {:?} (cancel {})",
+        "{kind} shown: title \"{}\", message \"{}\", buttons {:?} (cancel {})",
         text_of(get_id(this, "title")),
         text_of(get_id(this, "message")),
         buttons.titles,
         buttons.cancel
     );
     property_set(this, "visible", 1);
+    if !alert_draw(this, kind != "alert") {
+        crate::log!("{kind}: no window to show it in, so it is not drawn");
+    }
     later(move || {
         let delegate = get_id(this, "delegate");
         tell(delegate, present_will, &[this]);
@@ -1934,7 +2084,7 @@ fn show_invisible(this: Id, kind: &str, present_will: &'static str, present_did:
 }
 
 extern "C" fn alert_show(this: Id, _: Sel) {
-    show_invisible(this, "alert", "willPresentAlertView:", "didPresentAlertView:");
+    show(this, "alert", "willPresentAlertView:", "didPresentAlertView:");
 }
 
 extern "C" fn alert_dismiss(this: Id, _: Sel, index: isize, _animated: u8) {
@@ -1942,6 +2092,9 @@ extern "C" fn alert_dismiss(this: Id, _: Sel, index: isize, _animated: u8) {
         return;
     }
     property_set(this, "visible", 0);
+    for field in collections::array_items(get_id(this, "textFields")) {
+        runtime::send(field, "resignFirstResponder", &[]);
+    }
     let delegate = get_id(this, "delegate");
     let (will, did) = if class_is(this, "UIActionSheet") {
         ("actionSheet:willDismissWithButtonIndex:", "actionSheet:didDismissWithButtonIndex:")
@@ -1949,13 +2102,185 @@ extern "C" fn alert_dismiss(this: Id, _: Sel, index: isize, _animated: u8) {
         ("alertView:willDismissWithButtonIndex:", "alertView:didDismissWithButtonIndex:")
     };
     tell(delegate, will, &[this, index as usize]);
+    runtime::send(this, "removeFromSuperview", &[]);
     later(move || {
         tell(delegate, did, &[this, index as usize]);
     });
 }
 
 fn sheet_show(this: Id) {
-    show_invisible(this, "action sheet", "willPresentActionSheet:", "didPresentActionSheet:");
+    show(this, "action sheet", "willPresentActionSheet:", "didPresentActionSheet:");
+}
+
+// ----- drawing alerts and action sheets (iOS 7's look) -----
+
+const ALERT_WIDTH: f64 = 270.0;
+const ALERT_MARGIN: f64 = 16.0;
+const ALERT_BUTTON_HEIGHT: f64 = 44.0;
+const ALERT_FIELD_HEIGHT: f64 = 24.0;
+/// iOS 7's blue for buttons.
+const TINT: [f64; 4] = [0.0, 0.478, 1.0, 1.0];
+const DESTRUCTIVE: [f64; 4] = [1.0, 0.231, 0.188, 1.0];
+const DISABLED_TITLE: [f64; 4] = [0.6, 0.6, 0.6, 1.0];
+const LINE: [f64; 4] = [0.8, 0.8, 0.8, 1.0];
+
+fn colored(rgba: [f64; 4]) -> Id {
+    crate::fw::graphics::make_color(rgba)
+}
+
+fn set_frame(view: Id, frame: Rect) {
+    let s = runtime::sel("setFrame:");
+    if let Some(imp) = runtime::imp_for(view, s) {
+        let f: extern "C" fn(Id, Sel, Rect) = unsafe { std::mem::transmute(imp) };
+        f(view, s, frame);
+    }
+}
+
+fn add_view(parent: Id, class: &str, frame: Rect, background: Option<[f64; 4]>) -> Id {
+    let view = new_view_named(class, frame);
+    if let Some(rgba) = background {
+        runtime::send(view, "setBackgroundColor:", &[colored(rgba)]);
+    }
+    runtime::send(parent, "addSubview:", &[view]);
+    view
+}
+
+/// A centred label of `text` at `y`, as tall as its lines; gives its height.
+fn add_alert_label(parent: Id, text: &str, font: Id, color: [f64; 4], y: f64, width: f64) -> f64 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    let height = text_size(text, font_size(font), width, 0).height;
+    let label = add_view(parent, "UILabel", Rect::new(ALERT_MARGIN, y, width, height), None);
+    runtime::send(label, "setText:", &[string::make(text)]);
+    runtime::send(label, "setFont:", &[font]);
+    runtime::send(label, "setTextColor:", &[colored(color)]);
+    runtime::send(label, "setTextAlignment:", &[1]);
+    runtime::send(label, "setNumberOfLines:", &[0]);
+    height
+}
+
+/// Builds what an alert (or action sheet) shows as its own views, over
+/// the whole key window: a dimmed backdrop that keeps taps from the game,
+/// and a box with the title, message, text fields and buttons. Alerts
+/// with two buttons have them side by side, others one above the other;
+/// a sheet's box sits at the bottom. False with no window to show it in.
+fn alert_draw(this: Id, sheet: bool) -> bool {
+    let window = crate::fw::uikit::key_window();
+    if window == 0 {
+        return false;
+    }
+    for child in view_state(this).subviews.clone() {
+        runtime::send(child, "removeFromSuperview", &[]);
+    }
+    let area = frame_of(window).size;
+    set_frame(this, Rect::new(0.0, 0.0, area.width, area.height));
+    runtime::send(this, "setBackgroundColor:", &[colored([0.0, 0.0, 0.0, 0.4])]);
+    let width = if sheet { (area.width - 16.0).min(400.0) } else { ALERT_WIDTH };
+    let inner = width - 2.0 * ALERT_MARGIN;
+    let panel = add_view(this, "UIView", Rect::default(), Some([0.97, 0.97, 0.97, 1.0]));
+
+    let (title, message) = (text_of(get_id(this, "title")), text_of(get_id(this, "message")));
+    let mut y = if title.is_empty() && message.is_empty() { 0.0 } else { 20.0 };
+    let (title_font, title_color) = if sheet { (font(SYSTEM_FONT, 13.0), [0.56, 0.56, 0.58, 1.0]) } else { (font(BOLD_FONT, 17.0), [0.0, 0.0, 0.0, 1.0]) };
+    y += add_alert_label(panel, &title, title_font, title_color, y, inner);
+    if !title.is_empty() && !message.is_empty() {
+        y += 4.0;
+    }
+    y += add_alert_label(panel, &message, font(SYSTEM_FONT, 13.0), [0.0, 0.0, 0.0, 1.0], y, inner);
+    let fields = collections::array_items(get_id(this, "textFields"));
+    for (index, &field) in fields.iter().enumerate() {
+        y += if index == 0 { 14.0 } else { 0.0 };
+        let frame = Rect::new(ALERT_MARGIN, y, inner, ALERT_FIELD_HEIGHT);
+        // A thin grey edge around the field.
+        add_view(panel, "UIView", Rect::new(frame.origin.x - 0.5, y - 0.5, inner + 1.0, ALERT_FIELD_HEIGHT + 1.0), Some(LINE));
+        set_frame(field, frame);
+        runtime::send(field, "setBackgroundColor:", &[colored([1.0, 1.0, 1.0, 1.0])]);
+        runtime::send(field, "setBorderStyle:", &[3]);
+        if get_id(field, "font") == 0 {
+            runtime::send(field, "setFont:", &[font(SYSTEM_FONT, 13.0)]);
+        }
+        runtime::send(panel, "addSubview:", &[field]);
+        let action = |name: &str| runtime::sel(name);
+        runtime::send(field, "addTarget:action:forControlEvents:", &[this, action("gamebridgeAlertTextChanged:"), 1 << 17]);
+        runtime::send(field, "addTarget:action:forControlEvents:", &[this, action("gamebridgeAlertReturn:"), 1 << 19]);
+        y += ALERT_FIELD_HEIGHT;
+    }
+    if y > 0.0 {
+        y += 20.0;
+    }
+
+    let buttons = with_buttons(this, |b| b.clone());
+    let side_by_side = !sheet && buttons.titles.len() == 2;
+    let mut made = Vec::new();
+    for (index, title) in buttons.titles.iter().enumerate() {
+        let frame = if side_by_side {
+            Rect::new(index as f64 * width / 2.0, y, width / 2.0, ALERT_BUTTON_HEIGHT)
+        } else {
+            Rect::new(0.0, y + index as f64 * ALERT_BUTTON_HEIGHT, width, ALERT_BUTTON_HEIGHT)
+        };
+        add_view(panel, "UIView", Rect::new(frame.origin.x, frame.origin.y, frame.size.width, 0.5), Some(LINE));
+        if side_by_side && index == 1 {
+            add_view(panel, "UIView", Rect::new(frame.origin.x, frame.origin.y, 0.5, frame.size.height), Some(LINE));
+        }
+        let button = runtime::send(runtime::class_named("UIButton"), "buttonWithType:", &[0]);
+        set_frame(button, frame);
+        runtime::send(button, "setTitle:forState:", &[string::make(title), 0]);
+        let index = index as isize;
+        let color = if index == buttons.destructive { DESTRUCTIVE } else { TINT };
+        runtime::send(button, "setTitleColor:forState:", &[colored(color), 0]);
+        runtime::send(button, "setTitleColor:forState:", &[colored(DISABLED_TITLE), 2]);
+        let bold = index == buttons.cancel && !sheet;
+        runtime::send(runtime::send(button, "titleLabel", &[]), "setFont:", &[font(if bold { BOLD_FONT } else { SYSTEM_FONT }, 17.0)]);
+        runtime::send(button, "setTag:", &[index as usize]);
+        runtime::send(button, "addTarget:action:forControlEvents:", &[this, runtime::sel("gamebridgeAlertButton:"), TOUCH_UP_INSIDE]);
+        runtime::send(panel, "addSubview:", &[button]);
+        made.push(button);
+    }
+    let rows = if side_by_side { 1 } else { made.len() };
+    let height = y + rows as f64 * ALERT_BUTTON_HEIGHT;
+    let top = if sheet { area.height - height - 8.0 } else { ((area.height - height) / 2.0).max(0.0) };
+    set_frame(panel, Rect::new(((area.width - width) / 2.0).round(), top.round(), width, height));
+    property_set(this, "shownButtons", collections::array_from(&made) as u64);
+    runtime::send(window, "addSubview:", &[this]);
+    if !sheet {
+        alert_update_first_other(this);
+    }
+    if let Some(&first) = fields.first() {
+        runtime::send(first, "becomeFirstResponder", &[]);
+    }
+    true
+}
+
+/// The delegate's alertViewShouldEnableFirstOtherButton: turns that button on or off.
+fn alert_update_first_other(this: Id) {
+    let first = with_buttons(this, |b| b.first_other);
+    let Some(&button) = collections::array_items(get_id(this, "shownButtons")).get(first.max(0) as usize).filter(|_| first >= 0) else { return };
+    let enable = tell(get_id(this, "delegate"), "alertViewShouldEnableFirstOtherButton:", &[this]).map_or(true, |answer| answer & 0xFF != 0);
+    runtime::send(button, "setEnabled:", &[enable as usize]);
+}
+
+/// A shown button was tapped: the delegate hears which, and the alert goes away.
+extern "C" fn alert_button_tapped(this: Id, _: Sel, button: Id) {
+    let index = runtime::send(button, "tag", &[]) as isize;
+    let clicked = if class_is(this, "UIActionSheet") { "actionSheet:clickedButtonAtIndex:" } else { "alertView:clickedButtonAtIndex:" };
+    tell(get_id(this, "delegate"), clicked, &[this, index as usize]);
+    alert_dismiss(this, 0, index, 1);
+}
+
+extern "C" fn alert_text_changed(this: Id, _: Sel, _field: Id) {
+    alert_update_first_other(this);
+}
+
+/// Return in an alert's text field taps the first other button, if it is on.
+extern "C" fn alert_return(this: Id, s: Sel, _field: Id) {
+    let first = with_buttons(this, |b| b.first_other);
+    let shown = collections::array_items(get_id(this, "shownButtons"));
+    if let Some(&button) = shown.get(first.max(0) as usize).filter(|_| first >= 0) {
+        if runtime::send(button, "isEnabled", &[]) & 0xFF != 0 {
+            alert_button_tapped(this, s, button);
+        }
+    }
 }
 
 extern "C" fn sheet_show_in(this: Id, _: Sel, _view: Id) {
@@ -2226,8 +2551,16 @@ pub fn register(r: &mut Registry) {
             ("isHighlighted", text_highlighted as usize),
             ("setHighlighted:", text_set_highlighted as usize),
             ("state", control_state_method as usize),
-            ("isTracking", no as usize),
-            ("isTouchInside", no as usize),
+            ("isTracking", control_tracking as usize),
+            ("isTouchInside", control_touch_inside as usize),
+            ("touchesBegan:withEvent:", control_touches_began as usize),
+            ("touchesMoved:withEvent:", control_touches_moved as usize),
+            ("touchesEnded:withEvent:", control_touches_ended as usize),
+            ("touchesCancelled:withEvent:", control_touches_cancelled as usize),
+            ("beginTrackingWithTouch:withEvent:", control_begin_tracking as usize),
+            ("continueTrackingWithTouch:withEvent:", control_begin_tracking as usize),
+            ("endTrackingWithTouch:withEvent:", ignore_id_id as usize),
+            ("cancelTrackingWithEvent:", ignore_id as usize),
             ("contentHorizontalAlignment", control_horizontal as usize),
             ("setContentHorizontalAlignment:", control_set_horizontal as usize),
             ("contentVerticalAlignment", control_vertical as usize),
@@ -2271,7 +2604,8 @@ pub fn register(r: &mut Registry) {
             ("setAdjustsImageWhenHighlighted:", button_set_adjusts_highlighted as usize),
             ("showsTouchWhenHighlighted", button_shows_touch as usize),
             ("setShowsTouchWhenHighlighted:", button_set_shows_touch as usize),
-            ("setAdjustsImageWhenDisabled:", ignore_bool as usize),
+            ("adjustsImageWhenDisabled", button_adjusts_disabled as usize),
+            ("setAdjustsImageWhenDisabled:", button_set_adjusts_disabled as usize),
             ("setReversesTitleShadowWhenHighlighted:", ignore_bool as usize),
             ("sizeThatFits:", button_size_that_fits as usize),
             ("sizeToFit", button_size_to_fit as usize),
@@ -2302,12 +2636,8 @@ pub fn register(r: &mut Registry) {
         ("setInputAccessoryView:", text_set_accessory as usize),
         ("inputView", text_input_view as usize),
         ("setInputView:", text_set_input_view as usize),
-        ("becomeFirstResponder", text_become_first_responder as usize),
-        ("canBecomeFirstResponder", no as usize),
-        ("isFirstResponder", no as usize),
-        ("resignFirstResponder", yes as usize),
+        // Editing (becomeFirstResponder and the rest) is in fw/typing.rs.
         ("reloadInputViews", nothing as usize),
-        ("isEditing", no as usize),
         ("selectedTextRange", zero as usize),
         ("setSelectedTextRange:", ignore_id as usize),
         ("beginningOfDocument", zero as usize),
@@ -2322,7 +2652,7 @@ pub fn register(r: &mut Registry) {
     methods(
         field,
         &[
-            ("initWithFrame:", text_view_init_with_frame as usize),
+            ("initWithFrame:", text_field_init_with_frame as usize),
             ("text", text_or_empty as usize),
             ("font", text_field_font as usize),
             ("placeholder", text_placeholder as usize),
@@ -2621,7 +2951,6 @@ pub fn register(r: &mut Registry) {
             ("initWithFrame:style:", table_init_with_style as usize),
             ("style", table_style as usize),
             ("dataSource", table_data_source as usize),
-            ("setDataSource:", table_set_data_source as usize),
             ("tableHeaderView", table_header as usize),
             ("setTableHeaderView:", table_set_header as usize),
             ("tableFooterView", table_footer as usize),
@@ -2646,10 +2975,6 @@ pub fn register(r: &mut Registry) {
             ("setEditing:", table_set_editing as usize),
             ("setEditing:animated:", table_set_editing_animated as usize),
             ("registerClass:forCellReuseIdentifier:", table_register_class as usize),
-            ("registerNib:forCellReuseIdentifier:", table_register_nib as usize),
-            ("dequeueReusableCellWithIdentifier:", table_dequeue as usize),
-            ("dequeueReusableCellWithIdentifier:forIndexPath:", table_dequeue_for_path as usize),
-            ("reloadData", table_reload as usize),
             ("reloadRowsAtIndexPaths:withRowAnimation:", ignore_id_int as usize),
             ("reloadSections:withRowAnimation:", ignore_id_int as usize),
             ("insertRowsAtIndexPaths:withRowAnimation:", ignore_id_int as usize),
@@ -2660,18 +2985,13 @@ pub fn register(r: &mut Registry) {
             ("endUpdates", nothing as usize),
             ("numberOfSections", table_number_of_sections as usize),
             ("numberOfRowsInSection:", table_rows_in_section as usize),
-            ("cellForRowAtIndexPath:", nil_with_id as usize),
-            ("indexPathForCell:", nil_with_id as usize),
             ("indexPathForSelectedRow", table_selected_row as usize),
             ("indexPathsForSelectedRows", table_selected_rows as usize),
-            ("indexPathsForVisibleRows", empty_array as usize),
-            ("visibleCells", empty_array as usize),
-            ("selectRowAtIndexPath:animated:scrollPosition:", table_select as usize),
-            ("deselectRowAtIndexPath:animated:", table_deselect as usize),
             ("scrollToRowAtIndexPath:atScrollPosition:animated:", table_scroll_to as usize),
         ],
     );
-    let _ = table_set_style_unused;
+    // Rows, cells, selection and taps are in fw/tables.rs.
+    let _ = (table_set_style_unused, table_set_data_source);
 
     let table_controller = define_class("UITableViewController", "UIViewController", 8);
     methods(
@@ -2693,7 +3013,6 @@ pub fn register(r: &mut Registry) {
     methods(
         cell,
         &[
-            ("initWithFrame:", cell_init_with_frame as usize),
             ("initWithStyle:reuseIdentifier:", cell_init_with_style as usize),
             ("reuseIdentifier", cell_reuse_identifier as usize),
             ("contentView", cell_content as usize),
@@ -2713,11 +3032,7 @@ pub fn register(r: &mut Registry) {
             ("indentationLevel", cell_indentation as usize),
             ("setIndentationLevel:", cell_set_indentation as usize),
             ("isSelected", control_selected as usize),
-            ("setSelected:", control_set_selected as usize),
-            ("setSelected:animated:", cell_set_selected_animated as usize),
             ("isHighlighted", text_highlighted as usize),
-            ("setHighlighted:", text_set_highlighted as usize),
-            ("setHighlighted:animated:", cell_set_highlighted_animated as usize),
             ("prepareForReuse", nothing as usize),
         ],
     );
@@ -2763,7 +3078,7 @@ pub fn register(r: &mut Registry) {
             ("indexPathsForVisibleItems", empty_array as usize),
             ("visibleCells", empty_array as usize),
             ("selectItemAtIndexPath:animated:scrollPosition:", collection_select as usize),
-            ("deselectItemAtIndexPath:animated:", table_deselect as usize),
+            ("deselectItemAtIndexPath:animated:", collection_deselect as usize),
             ("scrollToItemAtIndexPath:atScrollPosition:animated:", collection_scroll_to as usize),
         ],
     );
@@ -2863,6 +3178,9 @@ pub fn register(r: &mut Registry) {
         ("setCancelButtonIndex:", alert_set_cancel_index as usize),
         ("firstOtherButtonIndex", alert_first_other_index as usize),
         ("dismissWithClickedButtonIndex:animated:", alert_dismiss as usize),
+        ("gamebridgeAlertButton:", alert_button_tapped as usize),
+        ("gamebridgeAlertTextChanged:", alert_text_changed as usize),
+        ("gamebridgeAlertReturn:", alert_return as usize),
     ];
     methods(alert, alert_common);
     methods(
@@ -2987,6 +3305,31 @@ extern "C" fn ignore_insets(_this: Id, _: Sel, _insets: Insets) {}
 mod tests {
     use super::*;
 
+    /// A button holds on to the pictures it is given per state (as UIKit
+    /// retains them): the caller may let go of its own reference, and a
+    /// picture replaced (or the state cleared with nil) is let go of.
+    #[test]
+    fn buttons_keep_their_state_pictures() {
+        use crate::fw::counted;
+        use crate::fw::uikit::{make_image, ImageInfo};
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let picture = || make_image(ImageInfo { path: "/nowhere/frame.png".into(), pixels: (4, 4), scale: 1.0, ..Default::default() });
+        let button = runtime::send(runtime::class_named("UIButton"), "buttonWithType:", &[0]);
+        let (first, second, icon) = (picture(), picture(), picture());
+        runtime::send(button, "setBackgroundImage:forState:", &[first, 0]);
+        runtime::send(button, "setImage:forState:", &[icon, 1]);
+        counted::release(first);
+        counted::release(icon);
+        assert_eq!((counted::count(first), counted::count(icon)), (Some(1), Some(1)), "kept by the button");
+        assert_eq!(runtime::send(button, "backgroundImageForState:", &[0]), first);
+        runtime::send(button, "setBackgroundImage:forState:", &[second, 0]);
+        counted::release(second);
+        assert_eq!((counted::count(first), counted::count(second)), (None, Some(1)), "the replaced one is let go of");
+        runtime::send(button, "setImage:forState:", &[0, 1]);
+        assert_eq!(counted::count(icon), None);
+    }
+
     #[test]
     fn control_targets_and_selection_bookkeeping_follow_uikit() {
         const DOWN: usize = 1 << 0;
@@ -3047,5 +3390,191 @@ mod tests {
         let sheet = Buttons::sheet(Some("Delete".into()), Some("Cancel".into()), vec!["Camera".into(), "Album".into()]);
         assert_eq!(sheet.titles, ["Delete", "Camera", "Album", "Cancel"]);
         assert_eq!((sheet.destructive, sheet.first_other, sheet.cancel), (0, 1, 3));
+    }
+
+    /// A table shows the rows its data source gives, one cell under the
+    /// other at the delegate's heights, their labels laid out by the cell's
+    /// style; a tap on a row selects it (willSelect may change which, then
+    /// didSelect), and the selected cell is drawn selected.
+    #[test]
+    fn tables_show_their_rows_and_take_taps() {
+        use crate::fw::geometry::Point;
+        use crate::fw::object::define_class;
+        use crate::fw::touch::{deliver_in, origin_in_window, Phase};
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        static HEARD: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let heard = || std::mem::take(&mut *HEARD.lock().unwrap());
+        extern "C" fn rows(_this: Id, _: Sel, _table: Id, _section: isize) -> isize {
+            3
+        }
+        // A subtitle cell (style 3) for every row.
+        extern "C" fn cell_for(_this: Id, _: Sel, _table: Id, path: Id) -> Id {
+            let cell = runtime::send(runtime::send(runtime::class_named("UITableViewCell"), "alloc", &[]), "initWithStyle:reuseIdentifier:", &[3, 0]);
+            runtime::send(runtime::send(cell, "textLabel", &[]), "setText:", &[string::make(&format!("Row {}", runtime::send(path, "row", &[])))]);
+            runtime::send(runtime::send(cell, "detailTextLabel", &[]), "setText:", &[string::make("more")]);
+            cell
+        }
+        extern "C" fn height(_this: Id, _: Sel, _table: Id, _path: Id) -> f64 {
+            50.0
+        }
+        extern "C" fn will_select(_this: Id, _: Sel, _table: Id, path: Id) -> Id {
+            HEARD.lock().unwrap().push(format!("will {}", runtime::send(path, "row", &[])));
+            path
+        }
+        extern "C" fn did_select(_this: Id, _: Sel, _table: Id, path: Id) {
+            HEARD.lock().unwrap().push(format!("did {}", runtime::send(path, "row", &[])));
+        }
+        let source_class = define_class("TableTestSource", "NSObject", 8);
+        methods(
+            source_class,
+            &[
+                ("tableView:numberOfRowsInSection:", rows as usize),
+                ("tableView:cellForRowAtIndexPath:", cell_for as usize),
+                ("tableView:heightForRowAtIndexPath:", height as usize),
+                ("tableView:willSelectRowAtIndexPath:", will_select as usize),
+                ("tableView:didSelectRowAtIndexPath:", did_select as usize),
+            ],
+        );
+        let source = new_object("TableTestSource");
+        let window = new_view_named("UIWindow", Rect::new(0.0, 0.0, 568.0, 320.0));
+        let table = new_view_named("UITableView", Rect::new(10.0, 20.0, 240.0, 174.0));
+        runtime::send(window, "addSubview:", &[table]);
+        runtime::send(table, "setDataSource:", &[source]);
+        runtime::send(table, "setDelegate:", &[source]);
+        runtime::send(table, "reloadData", &[]);
+
+        let cells = collections::array_items(runtime::send(table, "visibleCells", &[]));
+        assert_eq!(cells.len(), 3, "a cell per row");
+        let frames: Vec<Rect> = cells.iter().map(|&cell| frame_of(cell)).collect();
+        assert_eq!(frames.iter().map(|f| (f.origin.y, f.size.height, f.size.width)).collect::<Vec<_>>(), [(0.0, 50.0, 240.0), (50.0, 50.0, 240.0), (100.0, 50.0, 240.0)]);
+        let path = runtime::send(runtime::class_named("NSIndexPath"), "indexPathForRow:inSection:", &[1, 0]);
+        assert_eq!(runtime::send(table, "cellForRowAtIndexPath:", &[path]), cells[1]);
+        let content_size: Size = {
+            let s = runtime::sel("contentSize");
+            let f: extern "C" fn(Id, Sel) -> Size = unsafe { std::mem::transmute(runtime::imp_for(table, s).unwrap()) };
+            f(table, s)
+        };
+        assert_eq!(content_size.height, 150.0);
+        // Subtitle cells: the title above the detail, both inside the cell and wide enough.
+        let title = runtime::send(cells[1], "textLabel", &[]);
+        let detail = runtime::send(cells[1], "detailTextLabel", &[]);
+        let (title_frame, detail_frame) = (frame_of(title), frame_of(detail));
+        assert!(title_frame.size.width >= 100.0 && detail_frame.size.width >= 100.0, "{title_frame:?} {detail_frame:?}");
+        assert!(title_frame.origin.y + title_frame.size.height <= detail_frame.origin.y + 0.5, "{title_frame:?} {detail_frame:?}");
+        assert!(detail_frame.origin.y + detail_frame.size.height <= 50.0);
+        assert!(label_look(title).is_some(), "the title is drawn");
+
+        // A tap on the second row selects it.
+        let corner = origin_in_window(cells[1]);
+        let at = Point { x: corner.x + 100.0, y: corner.y + 25.0 };
+        deliver_in(window, 704, Phase::Began, at);
+        deliver_in(window, 704, Phase::Ended, at);
+        assert_eq!(heard(), ["will 1", "did 1"]);
+        let chosen = runtime::send(table, "indexPathForSelectedRow", &[]);
+        assert!(chosen != 0 && runtime::send(chosen, "row", &[]) == 1);
+        assert!(runtime::send(cells[1], "isSelected", &[]) & 0xFF != 0, "drawn selected");
+        assert!(runtime::send(cells[0], "isSelected", &[]) & 0xFF == 0);
+        // Selected in code: the cell follows, without the delegate hearing it (as in UIKit).
+        let first = runtime::send(runtime::class_named("NSIndexPath"), "indexPathForRow:inSection:", &[0, 0]);
+        runtime::send(table, "selectRowAtIndexPath:animated:scrollPosition:", &[first, 0, 0]);
+        assert!(runtime::send(cells[0], "isSelected", &[]) & 0xFF != 0);
+        assert!(runtime::send(cells[1], "isSelected", &[]) & 0xFF == 0);
+        assert!(heard().is_empty());
+    }
+
+    /// Alerts are drawn over the whole key window as UIKit draws them: a box
+    /// with the title, the text fields (the first one being edited) and the
+    /// buttons. alertViewShouldEnableFirstOtherButton: turns the first other
+    /// button on and off as text is typed; a tapped button is told to the
+    /// delegate (clicked, then willDismiss) and the alert goes away. Action
+    /// sheets show their buttons one above the other.
+    #[test]
+    fn alerts_are_drawn_and_answer_their_buttons() {
+        use crate::fw::geometry::Point;
+        use crate::fw::object::define_class;
+        use crate::fw::touch::{deliver_in, origin_in_window, Phase};
+        use crate::fw::typing::{first_responder, type_text};
+        let _turn = crate::fw::typing::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        static HEARD: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let heard = || std::mem::take(&mut *HEARD.lock().unwrap());
+        extern "C" fn clicked(_this: Id, s: Sel, _alert: Id, index: isize) {
+            HEARD.lock().unwrap().push(format!("{} {index}", lock().sel_name(s)));
+        }
+        extern "C" fn should_enable(_this: Id, _: Sel, alert: Id) -> bool {
+            let field = runtime::send(alert, "textFieldAtIndex:", &[0]);
+            !text_of(runtime::send(field, "text", &[])).is_empty()
+        }
+        let delegate_class = define_class("AlertTestDelegate", "NSObject", 8);
+        methods(
+            delegate_class,
+            &[
+                ("alertView:clickedButtonAtIndex:", clicked as usize),
+                ("alertView:willDismissWithButtonIndex:", clicked as usize),
+                ("actionSheet:clickedButtonAtIndex:", clicked as usize),
+                ("alertViewShouldEnableFirstOtherButton:", should_enable as usize),
+            ],
+        );
+        let delegate = new_object("AlertTestDelegate");
+        let window = new_view_named("UIWindow", Rect::new(0.0, 0.0, 568.0, 320.0));
+        runtime::send(window, "makeKeyAndVisible", &[]);
+        fn inside(view: Id) -> Vec<Id> {
+            view_state(view).subviews.clone().into_iter().flat_map(|child| std::iter::once(child).chain(inside(child))).collect()
+        }
+        let buttons = |view: Id| inside(view).into_iter().filter(|&v| class_is(v, "UIButton")).collect::<Vec<_>>();
+        let title = |button: Id| text_of(runtime::send(button, "titleForState:", &[0]));
+        let enabled = |button: Id| runtime::send(button, "isEnabled", &[]) & 0xFF != 0;
+        let tap = |host: Id, button: Id, finger: i32| {
+            let corner = origin_in_window(button);
+            let size = frame_of(button).size;
+            let at = Point { x: corner.x + size.width / 2.0, y: corner.y + size.height / 2.0 };
+            deliver_in(host, finger, Phase::Began, at);
+            deliver_in(host, finger, Phase::Ended, at);
+        };
+
+        let alert = new_view_named("UIAlertView", Rect::default());
+        runtime::send(alert, "setTitle:", &[string::make("Enter your character's name")]);
+        runtime::send(alert, "setDelegate:", &[delegate]);
+        runtime::send(alert, "addButtonWithTitle:", &[string::make("Cancel")]);
+        runtime::send(alert, "addButtonWithTitle:", &[string::make("CREATE")]);
+        runtime::send(alert, "setCancelButtonIndex:", &[0]);
+        runtime::send(alert, "setAlertViewStyle:", &[2]);
+        runtime::send(alert, "show", &[]);
+        let host = view_state(alert).superview;
+        assert!(host != 0, "shown in the key window");
+        assert_eq!(frame_of(alert).size, frame_of(host).size, "over the whole window");
+        let labels: Vec<String> = inside(alert).into_iter().filter(|&v| class_is(v, "UILabel")).map(|v| text_of(get_id(v, "text"))).collect();
+        assert!(labels.contains(&"Enter your character's name".to_string()), "{labels:?}");
+        let field = runtime::send(alert, "textFieldAtIndex:", &[0]);
+        assert!(inside(alert).contains(&field), "its text field is shown");
+        assert_eq!(first_responder(), field, "and being edited");
+        let shown = buttons(alert);
+        assert_eq!(shown.iter().map(|&b| title(b)).collect::<Vec<_>>(), ["Cancel", "CREATE"]);
+        assert!(!enabled(shown[1]), "CREATE waits for a name");
+        type_text("Bo");
+        assert!(enabled(shown[1]));
+        tap(host, shown[1], 702);
+        assert_eq!(heard(), ["alertView:clickedButtonAtIndex: 1", "alertView:willDismissWithButtonIndex: 1"]);
+        assert_eq!(view_state(alert).superview, 0, "the alert went away");
+        assert!(runtime::send(alert, "isVisible", &[]) & 0xFF == 0);
+        assert_eq!(first_responder(), 0, "its field is no longer edited");
+        assert_eq!(text_of(runtime::send(field, "text", &[])), "Bo");
+
+        let sheet = new_view_named("UIActionSheet", Rect::default());
+        runtime::send(sheet, "setDelegate:", &[delegate]);
+        runtime::send(sheet, "addButtonWithTitle:", &[string::make("Camera")]);
+        runtime::send(sheet, "addButtonWithTitle:", &[string::make("Cancel")]);
+        runtime::send(sheet, "setCancelButtonIndex:", &[1]);
+        runtime::send(sheet, "showInView:", &[host]);
+        let host = view_state(sheet).superview;
+        assert!(host != 0);
+        let shown = buttons(sheet);
+        assert_eq!(shown.len(), 2);
+        assert!(origin_in_window(shown[1]).y > origin_in_window(shown[0]).y, "one above the other");
+        tap(host, shown[1], 703);
+        assert_eq!(heard(), ["actionSheet:clickedButtonAtIndex: 1"]);
+        assert_eq!(view_state(sheet).superview, 0);
     }
 }

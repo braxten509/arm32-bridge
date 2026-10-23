@@ -50,10 +50,13 @@ pub mod services;
 pub mod sound;
 pub mod string;
 pub mod system;
+pub mod tables;
 pub mod touch;
+pub mod typing;
 pub mod uikit;
 pub mod unavailable;
 pub mod web;
+pub mod xml;
 
 use crate::symbols::Registry;
 
@@ -62,11 +65,14 @@ pub fn register(r: &mut Registry) {
     string::register(r);
     collections::register(r);
     data::register(r);
+    plist::register(r);
     misc::register(r);
     foundation::register(r);
     app::register(r);
     uikit::register(r);
     controls::register(r);
+    typing::register(r);
+    tables::register(r);
     nib::register(r);
     unavailable::register(r);
     storyboard::register(r);
@@ -79,6 +85,7 @@ pub fn register(r: &mut Registry) {
     files::register(r);
     services::register(r);
     web::register(r);
+    xml::register(r);
     sqlite::register(r);
     regex::register(r);
     locks::register(r);

@@ -1984,6 +1984,41 @@ mod tests {
         std::fs::remove_dir_all(&folder).unwrap();
     }
 
+    /// A stretchable copy is an image of its own (+0, autoreleased, as
+    /// UIKit gives it): kept, it lives on after the image it was made from
+    /// is gone, whether that came from a file or was made in memory.
+    #[test]
+    fn stretchable_copies_outlive_their_source() {
+        use crate::fw::counted;
+        use crate::fw::graphics::{Bitmap, Space, PREMULTIPLIED_LAST};
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let sel = runtime::sel("resizableImageWithCapInsets:");
+        let stretch = |image: Id| {
+            let imp = runtime::imp_for(image, sel).unwrap();
+            let resizable: extern "C" fn(Id, Sel, f64, f64, f64, f64) -> Id = unsafe { std::mem::transmute(imp) };
+            counted::retain(resizable(image, sel, 2.0, 2.0, 2.0, 2.0))
+        };
+        // From a file.
+        let source = make_image(ImageInfo { path: "/nowhere/frame.png".into(), pixels: (8, 8), scale: 1.0, ..Default::default() });
+        let stretched = stretch(source);
+        counted::release(source);
+        assert_eq!(counted::count(source), None, "the source is gone");
+        assert!(counted::count(stretched).is_some(), "the copy is still alive");
+        assert_eq!(image_info(stretched).map(|info| (info.path.as_str(), info.caps)), Some(("/nowhere/frame.png", Some([2.0; 4]))));
+        // Made in memory: the copy keeps the pixels.
+        let bitmap = Bitmap { width: 8, height: 6, bits_per_pixel: 32, bytes_per_row: 32, info: PREMULTIPLIED_LAST, space: Space::Rgb, data: vec![255; 8 * 6 * 4] };
+        let pixels = crate::fw::graphics::make_image(bitmap);
+        let source = runtime::send(runtime::send(runtime::class_named("UIImage"), "alloc", &[]), "initWithCGImage:", &[pixels]);
+        counted::release(pixels);
+        let stretched = stretch(source);
+        counted::release(source);
+        assert_eq!(counted::count(source), None, "the source is gone");
+        let kept = crate::fw::graphics::image_cg(stretched);
+        assert!(kept != 0 && counted::count(kept).is_some(), "the copy still holds the pixels");
+        assert_eq!(image_points(stretched), Size { width: 8.0, height: 6.0 });
+    }
+
     /// The screen takes one of its own modes back, and keeps its overscan setting.
     #[test]
     fn screen_takes_its_mode_and_overscan_setting() {

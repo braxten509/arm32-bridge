@@ -462,8 +462,8 @@ fn decoding_skips_the_games_init_with_frame_but_keeps_ours() {
     assert_eq!(call::<Rect>(view, "frame").size, Size { width: 40.0, height: 20.0 });
     let label = decoded("UILabel", vec![("UIBounds", Held::Rect(Rect::new(0.0, 0.0, 40.0, 20.0)))]);
     assert!(!flag(label, "isUserInteractionEnabled"), "a label takes no touches unless the nib says so (UILabel's own setup ran)");
-    let button = decoded("UIButton", vec![("UIBounds", Held::Rect(Rect::new(0.0, 0.0, 40.0, 20.0)))]);
-    assert_eq!(property_get(button, "notDrawn"), Some(1), "UIControl's own setup ran");
+    let text = decoded("UITextView", vec![("UIBounds", Held::Rect(Rect::new(0.0, 0.0, 40.0, 20.0)))]);
+    assert_eq!(property_get(text, "notDrawn"), Some(1), "UITextView's own setup ran");
 }
 
 /// A label's text, font, colours and the rest of what a nib stores.
@@ -1005,4 +1005,79 @@ fn games_on_the_32_bit_bridge_reach_the_storyboard_messages() {
     let image_view = send(send(class("UIImageView"), "alloc", &[]), "init", &[]);
     send(image_view, "setHighlightedImage:", &[0]);
     assert_eq!(send(image_view, "highlightedImage", &[]), 0);
+}
+
+/// A table from a storyboard keeps its prototype cells
+/// (UITableViewCellPrototypeNibs): dequeueReusableCellWithIdentifier: makes
+/// a new cell from that cell's nib, given its external objects; a cell reads
+/// its reuse identifier, style, content view and labels from its coder.
+#[test]
+fn a_table_makes_cells_from_its_prototypes() {
+    setup();
+    fake_nib("TestCharacterCell", |_owner, _external| {
+        let label = |text_shown: &str, y: f64| {
+            decoded(
+                "UILabel",
+                vec![
+                    ("UIBounds", Held::Rect(Rect::new(0.0, 0.0, 40.0, 20.0))),
+                    ("UICenter", Held::Point(Point { x: 30.0, y })),
+                    ("UIText", text(text_shown)),
+                ],
+            )
+        };
+        let content = plain_view(240.0, 44.0);
+        let cell = decoded(
+            "UITableViewCell",
+            vec![
+                ("UIBounds", Held::Rect(Rect::new(0.0, 0.0, 240.0, 44.0))),
+                ("UICenter", Held::Point(Point { x: 120.0, y: 22.0 })),
+                ("UISubviews", array(&[content])),
+                ("UIReuseIdentifier", text("characterCell")),
+                ("UITableViewCellStyle", Held::Integer(3)),
+                ("UIContentView", Held::Object(content)),
+                ("UITextLabel", Held::Object(label("Title", 14.0))),
+                ("UIDetailTextLabel", Held::Object(label("Subtitle", 33.0))),
+            ],
+        );
+        vec![cell]
+    });
+    let nib = runtime::send(runtime::class_named(TEST_NIB_CLASS), "nibWithNibName:bundle:", &[string::make("TestCharacterCell"), 0]);
+    let externals = collections::dictionary_from(&[]);
+    let table = decoded(
+        "UITableView",
+        vec![
+            ("UIBounds", Held::Rect(Rect::new(0.0, 0.0, 240.0, 174.0))),
+            ("UICenter", Held::Point(Point { x: 120.0, y: 87.0 })),
+            ("UITableViewCellPrototypeNibs", Held::Object(collections::dictionary_from(&[(string::make("characterCell"), nib)]))),
+            ("UITableViewCellPrototypeNibExternalObjects", Held::Object(collections::dictionary_from(&[(string::make("characterCell"), externals)]))),
+        ],
+    );
+    let cell = runtime::send(table, "dequeueReusableCellWithIdentifier:", &[string::make("characterCell")]);
+    assert!(cell != 0, "a cell from the prototype");
+    assert_eq!(text_of(runtime::send(cell, "textLabel", &[]), "text"), "Title");
+    assert_eq!(text_of(runtime::send(cell, "detailTextLabel", &[]), "text"), "Subtitle");
+    assert_eq!(text_of(cell, "reuseIdentifier"), "characterCell");
+    let content = runtime::send(cell, "contentView", &[]);
+    assert!(view_state(cell).subviews.contains(&content), "its content view is inside it");
+    assert_eq!(view_state(runtime::send(cell, "textLabel", &[])).superview, content, "its labels are in the content view");
+    let loads = nib_loads("TestCharacterCell");
+    assert_eq!(loads.len(), 1);
+    assert_eq!(loads[0].external, externals, "the prototype's external objects");
+    let other = runtime::send(table, "dequeueReusableCellWithIdentifier:forIndexPath:", &[string::make("characterCell"), 0]);
+    assert!(other != 0 && other != cell, "each dequeue makes a new cell");
+    assert_eq!(runtime::send(table, "dequeueReusableCellWithIdentifier:", &[string::make("nothing")]), 0);
+}
+
+/// A cell nib may name a label the reader couldn't make (nil): it is left
+/// out. UIKit's own label and content view classes in cell nibs exist here.
+#[test]
+fn cell_nibs_name_uikits_own_cell_classes() {
+    setup();
+    let without = decoded("UITableViewCell", vec![("UIBounds", Held::Rect(Rect::new(0.0, 0.0, 240.0, 44.0))), ("UIDetailTextLabel", Held::Object(0))]);
+    assert!(without != 0);
+    for name in ["UITableViewLabel", "UITableViewCellContentView"] {
+        assert!(runtime::existing_class(name, false).is_some(), "{name}");
+    }
+    let label = decoded("UITableViewLabel", vec![("UIText", text("Subtitle"))]);
+    assert_eq!(text_of(label, "text"), "Subtitle");
 }

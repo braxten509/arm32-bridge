@@ -550,6 +550,13 @@ extern "C" fn color_create(space: Id, components: *const f64) -> Id {
     object
 }
 
+/// A UIColor of straight red, green, blue and alpha.
+pub fn make_color(rgba: [f64; 4]) -> Id {
+    let object = runtime::alloc_instance(runtime::class_named("UIColor"));
+    unsafe { *((object + 8) as *mut [f64; 4]) = rgba };
+    object
+}
+
 /// A UIColor's (or CGColor's) red, green, blue and alpha.
 pub fn color_rgba(color: Id) -> Option<[f64; 4]> {
     if color == 0 {
@@ -1155,6 +1162,61 @@ pub fn ui_image_clean_up(picture: Id) {
     for file in info.part_files.get_or_init(Vec::new).iter().flatten() {
         let _ = std::fs::remove_file(file);
     }
+    let darker = DARKER.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|made| made.remove(&picture));
+    if let Some(darker) = darker {
+        counted::release(darker);
+    }
+}
+
+/// A one-pixel PNG of a colour (straight red, green, blue, alpha), for a
+/// view's background colour (fw/pictures.rs): made once per colour.
+pub fn color_picture(rgba: [f64; 4]) -> Option<String> {
+    static MADE: Mutex<Option<std::collections::HashMap<[u8; 4], Option<String>>>> = Mutex::new(None);
+    let pixel = rgba.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8);
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    made.get_or_insert_with(Default::default)
+        .entry(pixel)
+        .or_insert_with(|| encode_png(1, 1, &pixel, true).and_then(|bytes| write_png_file(&format!("colour {pixel:?}"), &bytes)))
+        .clone()
+}
+
+/// Darker copies made of UIImages (pressed buttons), by the image they copy.
+static DARKER: Mutex<Option<std::collections::HashMap<Id, Id>>> = Mutex::new(None);
+
+/// A CGImage's pixels as straight RGBA rows from the top.
+pub fn straight_pixels(picture: Id) -> Option<Vec<u8>> {
+    image(picture)?.straight_rgba()
+}
+
+/// A copy of a UIImage drawn darker, as UIKit draws a pressed button's
+/// pictures (adjustsImageWhenHighlighted): made once, upright, with the
+/// same scale and caps; it goes when the image does. 0 if it has no pixels.
+pub fn darker_image(picture: Id) -> Id {
+    if let Some(&made) = DARKER.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|made| made.get(&picture)) {
+        return made;
+    }
+    let Some(info) = uikit::image_info(picture) else { return 0 };
+    let Some((width, height, rgba, _)) = upright_rgba(picture) else { return 0 };
+    // About half as bright; stored premultiplied, as the bitmap says.
+    let data: Vec<u8> = rgba
+        .chunks(4)
+        .flat_map(|p| {
+            let alpha = u32::from(p[3]);
+            let shade = |c: u8| (u32::from(c) * 11 / 20 * alpha / 255) as u8;
+            [shade(p[0]), shade(p[1]), shade(p[2]), p[3]]
+        })
+        .collect();
+    let bitmap = Bitmap { width, height, bits_per_pixel: 32, bytes_per_row: width * 4, info: PREMULTIPLIED_LAST, space: Space::Rgb, data };
+    let copy = uikit::ImageInfo {
+        pixels: (width as u32, height as u32),
+        scale: info.scale,
+        caps: info.caps,
+        cg: OnceLock::from(make_image(bitmap)),
+        ..Default::default()
+    };
+    let made = uikit::make_image(copy);
+    DARKER.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(picture, made);
+    made
 }
 
 /// The UIImage's CGImage (pictures from files are read the first time it's asked for).
@@ -1263,7 +1325,7 @@ fn picture_folder() -> &'static str {
         // The game's tmp folder; with no game (unit tests) the system's.
         let folder = match crate::loader::try_app_dir() {
             Some(_) => format!("{}/tmp/.gamebridge-pictures", crate::fw::foundation::home()),
-            None => format!("{}/gamebridge-pictures-{}", std::env::temp_dir().display(), std::process::id()),
+            None => format!("{}/gamebridge-picture-files-{}", std::env::temp_dir().display(), std::process::id()),
         };
         let _ = std::fs::remove_dir_all(&folder);
         let _ = std::fs::create_dir_all(&folder);
