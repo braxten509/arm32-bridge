@@ -9,6 +9,7 @@ import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.RectF
 import android.view.View
+import java.io.File
 
 /**
  * The iPhone game's UIKit pictures (start buttons, splash pictures) drawn over
@@ -52,7 +53,8 @@ class IosPicturesView(context: Context) : View(context) {
         val shown = pictures.map { it.path }.toSet()
         bitmaps.keys.retainAll(shown)
         for (path in shown) {
-            if (path !in bitmaps) bitmaps[path] = BitmapFactory.decodeFile(path)
+            // Most of a game's PNGs are Apple's crushed kind, which Android can't read as they are.
+            if (path !in bitmaps) bitmaps[path] = runCatching { ApplePng.readable(File(path)).let { BitmapFactory.decodeByteArray(it, 0, it.size) } }.getOrNull()
         }
         invalidate()
     }
