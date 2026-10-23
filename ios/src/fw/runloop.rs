@@ -65,6 +65,8 @@ pub struct Loop {
     wake: Condvar,
     /// Set once its thread has run it (the main loop always counts).
     ran: std::sync::atomic::AtomicBool,
+    /// Set when its thread ended: it takes no more work.
+    ended: std::sync::atomic::AtomicBool,
 }
 
 impl Loop {
@@ -74,7 +76,20 @@ impl Loop {
             timers: Mutex::new(Vec::new()),
             wake: Condvar::new(),
             ran: std::sync::atomic::AtomicBool::new(false),
+            ended: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Queues work, unless its thread ended (then the work is let go of).
+    fn push(&self, work: Work) {
+        let mut queue = self.queue.lock().unwrap();
+        if self.ended.load(Ordering::Relaxed) {
+            drop(queue);
+            return discard(work);
+        }
+        queue.push_back(work);
+        drop(queue);
+        self.wake.notify_all();
     }
 
     /// Whether work posted here will be run: the main loop, or a loop its
@@ -108,8 +123,7 @@ pub fn is_main_thread_id(thread: u64) -> bool {
 
 /// Queues work for the main thread's run loop.
 pub fn post(work: Work) {
-    MAIN_LOOP.queue.lock().unwrap().push_back(work);
-    MAIN_LOOP.wake.notify_all();
+    MAIN_LOOP.push(work);
 }
 
 /// The calling thread's run loop, for frameworks that answer on the run
@@ -120,8 +134,7 @@ pub fn this_threads_loop() -> &'static Loop {
 
 /// Queues work for a given run loop; it runs when that thread runs its loop.
 pub fn post_to(run_loop: &'static Loop, work: Work) {
-    run_loop.queue.lock().unwrap().push_back(work);
-    run_loop.wake.notify_all();
+    run_loop.push(work);
 }
 
 /// Queues work for a run loop object (CFRunLoopRef) the game handed over.
@@ -130,8 +143,7 @@ pub fn post_to_object(run_loop: Id, work: Work) {
         return post(work);
     }
     let target = unsafe { &**((run_loop + 8) as *const *const Loop) };
-    target.queue.lock().unwrap().push_back(work);
-    target.wake.notify_all();
+    target.push(work);
 }
 
 /// A message for a run loop. As on Apple, its receiver and argument are
@@ -153,18 +165,44 @@ fn run_work(work: Work) {
         Work::Message { target, selector, argument, done, .. } => {
             let name = lock().sel_name(selector);
             runtime::send(target, &name, &[argument]);
-            // Let go of what the message held while it waited (see `message`).
-            for object in [target, argument] {
-                if object != 0 {
-                    runtime::send(object, "release", &[]);
-                }
-            }
-            if let Some(done) = done {
-                *done.0.lock().unwrap() = true;
-                done.1.notify_all();
-            }
+            message_over(target, argument, done);
         }
     }
+}
+
+/// A message ran or never will: let go of what it held while it waited (see
+/// `message`), and wake the caller waiting for it.
+fn message_over(target: Id, argument: Id, done: Option<Arc<(Mutex<bool>, Condvar)>>) {
+    for object in [target, argument] {
+        if object != 0 {
+            runtime::send(object, "release", &[]);
+        }
+    }
+    if let Some(done) = done {
+        *done.0.lock().unwrap() = true;
+        done.1.notify_all();
+    }
+}
+
+/// Work for a thread that ended. Blocks and our own work are dropped.
+fn discard(work: Work) {
+    if let Work::Message { target, argument, done, .. } = work {
+        message_over(target, argument, done);
+    }
+}
+
+/// When a started thread ends: its run loop (if it had one) takes no more
+/// work, and what was still queued is let go of.
+fn end_thread_loop(thread: Id) {
+    let object = THREAD_RUN_LOOPS.lock().unwrap().iter().find(|(t, _)| *t == thread).map(|&(_, object)| object);
+    let Some(object) = object else { return };
+    let run_loop = loop_of(object);
+    let left: Vec<Work> = {
+        let mut queue = run_loop.queue.lock().unwrap();
+        run_loop.ended.store(true, Ordering::Relaxed);
+        queue.drain(..).collect()
+    };
+    left.into_iter().for_each(discard);
 }
 
 // ----- timers (NSTimer and CADisplayLink): { isa, *mut Timer } -----
@@ -729,6 +767,7 @@ fn spawn(thread: Id, target: Id, selector: Sel, argument: Id, why: &str) {
             CURRENT_THREAD.with(|cell| cell.set(thread));
             runtime::send(target, &name, &[argument]);
             crate::fw::counted::release(argument);
+            end_thread_loop(thread);
         })
         .expect("can't start a thread");
 }
@@ -1101,6 +1140,59 @@ mod perform_tests {
         let (target_count, argument_count) = COUNTS_WHEN_RUN.lock().unwrap()[0];
         assert!(target_count > held_by_thread && argument_count > 0, "released before it ran: counts {target_count}, {argument_count}");
         assert!(wait_for(|| count_of(target) == held_by_thread && count_of(argument) == 0), "not released after running: counts {}, {}", count_of(target), count_of(argument));
+    }
+
+    static RAN_FOR_ENDED: AtomicBool = AtomicBool::new(false);
+    static END_NOW: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn never_run(_this: Id, _: Sel, _: Id) {
+        RAN_FOR_ENDED.store(true, Ordering::SeqCst);
+    }
+
+    /// A thread that ends, when told to, without ever running its run loop.
+    extern "C" fn end_later(_this: Id, _: Sel, _: Id) {
+        while !END_NOW.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// A thread that ended runs no more work: what was queued for it, or
+    /// comes later, lets go of its receiver and argument, and a caller
+    /// waiting for it goes on.
+    #[test]
+    fn work_for_an_ended_thread_is_let_go_of() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let class = define_class("PerformEndedTarget", "NSObject", 8);
+        methods(
+            class,
+            &[("retain", counted_retain as usize), ("release", counted_release as usize), ("neverRun:", never_run as usize), ("endLater:", end_later as usize)],
+        );
+        let make = || {
+            let object = runtime::send(runtime::send(class, "alloc", &[]), "init", &[]);
+            change(object, 1);
+            object
+        };
+        let (target, argument) = (make(), make());
+        let thread_class = runtime::class_named("NSThread");
+        let worker = runtime::send(runtime::send(thread_class, "alloc", &[]), "initWithTarget:selector:object:", &[target, runtime::sel("endLater:"), 0]);
+        runtime::send(worker, "start", &[]);
+        let baseline = (count_of(target), count_of(argument));
+        let s = runtime::sel("performSelector:onThread:withObject:waitUntilDone:");
+        let perform: extern "C" fn(Id, Sel, Sel, Id, Id, u8) = unsafe { std::mem::transmute(runtime::imp_for(target, s).unwrap()) };
+        // Queued while the thread lives; it ends without running its loop.
+        perform(target, s, runtime::sel("neverRun:"), worker, argument, 0);
+        END_NOW.store(true, Ordering::SeqCst);
+        assert!(wait_for(|| (count_of(target), count_of(argument)) == baseline), "work queued for an ended thread still holds its objects");
+        // Asked after it ended, waiting: the caller goes on.
+        let (finished, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            perform(target, s, runtime::sel("neverRun:"), worker, argument, 1);
+            let _ = finished.send(());
+        });
+        assert!(done.recv_timeout(std::time::Duration::from_secs(5)).is_ok(), "a caller waiting for an ended thread never went on");
+        assert_eq!((count_of(target), count_of(argument)), baseline);
+        assert!(!RAN_FOR_ENDED.load(Ordering::SeqCst), "an ended thread ran work");
     }
 
     static MODE_HEARD: Mutex<Vec<String>> = Mutex::new(Vec::new());
