@@ -2,7 +2,7 @@
 //! our NSDictionary/NSArray/NSString/NSNumber objects and written as XML.
 
 use crate::fw::{collections, string};
-use crate::objc::runtime::Id;
+use crate::objc::runtime::{Class, Id, Sel};
 
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -378,4 +378,130 @@ pub fn to_xml(value: &Value) -> String {
     write(value, &mut out, 0);
     out.push_str("</plist>\n");
     out
+}
+
+// ----- NSPropertyListSerialization -----
+
+/// NSPropertyListXMLFormat_v1_0 and NSPropertyListBinaryFormat_v1_0.
+const XML_FORMAT: usize = 100;
+const BINARY_FORMAT: usize = 200;
+
+fn put<T>(out: *mut T, value: T) {
+    if !out.is_null() {
+        unsafe { *out = value };
+    }
+}
+
+/// A list as data; it is always written as XML, which every reader of
+/// either format (ours and Apple's) takes.
+fn to_data(list: Id) -> Option<Id> {
+    from_object(list).map(|value| crate::fw::data::make(to_xml(&value).as_bytes()))
+}
+
+fn from_data(data: Id, format: *mut usize) -> Option<Id> {
+    if data == 0 || !crate::fw::data::is_data(data) {
+        return None;
+    }
+    let bytes = crate::fw::data::bytes(data);
+    let value = parse(&bytes)?;
+    put(format, if bytes.starts_with(b"bplist") { BINARY_FORMAT } else { XML_FORMAT });
+    Some(to_object(&value))
+}
+
+extern "C" fn serialize(_: Class, _: Sel, list: Id, _format: usize, _options: usize, error: *mut Id) -> Id {
+    to_data(list).unwrap_or_else(|| {
+        put(error, crate::fw::misc::error("NSCocoaErrorDomain", 3851, "The property list can't be written."));
+        0
+    })
+}
+
+extern "C" fn serialize_old(_: Class, _: Sel, list: Id, _format: usize, description: *mut Id) -> Id {
+    to_data(list).unwrap_or_else(|| {
+        put(description, string::make("Property list invalid for format"));
+        0
+    })
+}
+
+extern "C" fn deserialize(_: Class, _: Sel, data: Id, _options: usize, format: *mut usize, error: *mut Id) -> Id {
+    from_data(data, format).unwrap_or_else(|| {
+        put(error, crate::fw::misc::error("NSCocoaErrorDomain", 3840, "The data couldn't be read because it isn't in the correct format."));
+        0
+    })
+}
+
+extern "C" fn deserialize_old(_: Class, _: Sel, data: Id, _mutability: usize, format: *mut usize, description: *mut Id) -> Id {
+    from_data(data, format).unwrap_or_else(|| {
+        put(description, string::make("Unexpected character at line 1"));
+        0
+    })
+}
+
+/// Whether everything in the list can be written (strings, numbers, data,
+/// arrays and dictionaries).
+extern "C" fn is_valid(_: Class, _: Sel, list: Id, _format: usize) -> bool {
+    fn valid(object: Id) -> bool {
+        if collections::is_dictionary(object) {
+            collections::dictionary_pairs(object).into_iter().all(|(key, value)| string::is_string(key) && valid(value))
+        } else if collections::is_array(object) {
+            collections::array_items(object).into_iter().all(valid)
+        } else {
+            string::is_string(object) || collections::is_number(object) || crate::fw::data::is_data(object)
+        }
+    }
+    list != 0 && valid(list)
+}
+
+pub fn register(_: &mut crate::symbols::Registry) {
+    let class = crate::fw::object::define_class("NSPropertyListSerialization", "NSObject", 8);
+    crate::fw::object::class_methods(
+        class,
+        &[
+            ("dataWithPropertyList:format:options:error:", serialize as usize),
+            ("dataFromPropertyList:format:errorDescription:", serialize_old as usize),
+            ("propertyListWithData:options:format:error:", deserialize as usize),
+            ("propertyListFromData:mutabilityOption:format:errorDescription:", deserialize_old as usize),
+            ("propertyList:isValidForFormat:", is_valid as usize),
+        ],
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::objc::runtime;
+
+    /// Games save their state with NSPropertyListSerialization: a list
+    /// written to data reads back the same (with the format it was in),
+    /// through the old and new methods; data that isn't a list gives nil
+    /// and an error.
+    #[test]
+    fn property_lists_turn_into_data_and_back() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let class = runtime::class_named("NSPropertyListSerialization");
+        let hero = collections::dictionary_from(&[
+            (string::make("name"), string::make("Bob")),
+            (string::make("level"), collections::number_int(3)),
+            (string::make("items"), collections::array_from(&[string::make("sword"), collections::number_float(1.5)])),
+        ]);
+        assert!(runtime::send(class, "propertyList:isValidForFormat:", &[hero, XML_FORMAT]) & 0xFF != 0);
+        let mut error: Id = 0;
+        let data = runtime::send(class, "dataWithPropertyList:format:options:error:", &[hero, BINARY_FORMAT, 0, &mut error as *mut Id as usize]);
+        assert!(data != 0 && error == 0, "written");
+        let mut format = 0usize;
+        let back = runtime::send(class, "propertyListWithData:options:format:error:", &[data, 0, &mut format as *mut usize as usize, &mut error as *mut Id as usize]);
+        assert!(runtime::send(back, "isEqual:", &[hero]) & 0xFF != 0, "read back the same: {}", string::describe(back));
+        assert!(format == XML_FORMAT || format == BINARY_FORMAT);
+
+        let mut description: Id = 0;
+        let old = runtime::send(class, "dataFromPropertyList:format:errorDescription:", &[hero, XML_FORMAT, &mut description as *mut Id as usize]);
+        let back = runtime::send(class, "propertyListFromData:mutabilityOption:format:errorDescription:", &[old, 0, 0, &mut description as *mut Id as usize]);
+        assert!(runtime::send(back, "isEqual:", &[hero]) & 0xFF != 0);
+        assert_eq!(description, 0);
+
+        let junk = crate::fw::data::make(b"not a list");
+        let back = runtime::send(class, "propertyListWithData:options:format:error:", &[junk, 0, 0, &mut error as *mut Id as usize]);
+        assert_eq!(back, 0);
+        assert!(error != 0, "an error for data that isn't a list");
+    }
 }

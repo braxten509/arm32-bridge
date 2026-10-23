@@ -623,6 +623,14 @@ extern "C" fn dict_add_entries(this: Id, s: Sel, other: Id) {
     }
 }
 
+extern "C" fn dict_set_dictionary(this: Id, s: Sel, other: Id) {
+    let entries = if other == 0 { Vec::new() } else { dictionary_pairs(other) };
+    dict_remove_all(this, s);
+    for (key, value) in entries {
+        dict_set(this, s, value, key);
+    }
+}
+
 extern "C" fn dict_copy(this: Id, _: Sel, _zone: usize) -> Id {
     dictionary_from(&dictionary_pairs(this))
 }
@@ -1140,6 +1148,7 @@ pub fn register(_: &mut Registry) {
             ("removeObjectForKey:", dict_remove as usize),
             ("removeAllObjects", dict_remove_all as usize),
             ("addEntriesFromDictionary:", dict_add_entries as usize),
+            ("setDictionary:", dict_set_dictionary as usize),
             ("initWithCapacity:", dict_init_capacity as usize),
         ],
     );
@@ -1189,6 +1198,20 @@ pub fn register(_: &mut Registry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// setDictionary: makes a mutable dictionary hold exactly the other one's entries.
+    #[test]
+    fn set_dictionary_replaces_every_entry() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let key = |name: &str| crate::fw::string::make(name);
+        let mine = runtime::send(dictionary_from(&[(key("old"), number_int(1)), (key("kept"), number_int(2))]), "mutableCopy", &[]);
+        let other = dictionary_from(&[(key("kept"), number_int(3)), (key("new"), number_int(4))]);
+        runtime::send(mine, "setDictionary:", &[other]);
+        assert!(runtime::send(mine, "isEqual:", &[other]) & 0xFF != 0, "{}", crate::fw::string::describe(mine));
+        runtime::send(mine, "setDictionary:", &[0]);
+        assert_eq!(dictionary_pairs(mine).len(), 0, "nil empties it");
+    }
 
     /// Calls `f(x0, x1, x2, ...)` the way Apple arm64 code calls a variadic
     /// function: the variadic arguments in 8-byte stack slots, and x3-x7
