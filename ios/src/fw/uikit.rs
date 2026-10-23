@@ -1204,20 +1204,33 @@ extern "C" fn color_rgba(_: Class, _: Sel, r: f64, g: f64, b: f64, a: f64) -> Id
 extern "C" fn color_white_alpha(_: Class, _: Sel, w: f64, a: f64) -> Id {
     color(w, w, w, a)
 }
-extern "C" fn color_black(_: Class, _: Sel) -> Id {
-    color(0.0, 0.0, 0.0, 1.0)
+// UIKit's named colours (+blackColor and so on), with Apple's values.
+macro_rules! named_colors {
+    ($($function:ident $selector:literal [$r:expr, $g:expr, $b:expr, $a:expr]),* $(,)?) => {
+        $(extern "C" fn $function(_: Class, _: Sel) -> Id {
+            color($r, $g, $b, $a)
+        })*
+        fn named_colors() -> Vec<(&'static str, usize)> {
+            vec![$(($selector, $function as usize)),*]
+        }
+    };
 }
-extern "C" fn color_white(_: Class, _: Sel) -> Id {
-    color(1.0, 1.0, 1.0, 1.0)
-}
-extern "C" fn color_clear(_: Class, _: Sel) -> Id {
-    color(0.0, 0.0, 0.0, 0.0)
-}
-extern "C" fn color_gray(_: Class, _: Sel) -> Id {
-    color(0.5, 0.5, 0.5, 1.0)
-}
-extern "C" fn color_red(_: Class, _: Sel) -> Id {
-    color(1.0, 0.0, 0.0, 1.0)
+named_colors! {
+    color_black "blackColor" [0.0, 0.0, 0.0, 1.0],
+    color_dark_gray "darkGrayColor" [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0, 1.0],
+    color_light_gray "lightGrayColor" [2.0 / 3.0, 2.0 / 3.0, 2.0 / 3.0, 1.0],
+    color_white "whiteColor" [1.0, 1.0, 1.0, 1.0],
+    color_gray "grayColor" [0.5, 0.5, 0.5, 1.0],
+    color_red "redColor" [1.0, 0.0, 0.0, 1.0],
+    color_green "greenColor" [0.0, 1.0, 0.0, 1.0],
+    color_blue "blueColor" [0.0, 0.0, 1.0, 1.0],
+    color_cyan "cyanColor" [0.0, 1.0, 1.0, 1.0],
+    color_yellow "yellowColor" [1.0, 1.0, 0.0, 1.0],
+    color_magenta "magentaColor" [1.0, 0.0, 1.0, 1.0],
+    color_orange "orangeColor" [1.0, 0.5, 0.0, 1.0],
+    color_purple "purpleColor" [0.5, 0.0, 0.5, 1.0],
+    color_brown "brownColor" [0.6, 0.4, 0.2, 1.0],
+    color_clear "clearColor" [0.0, 0.0, 0.0, 0.0],
 }
 extern "C" fn color_cg(this: Id, _: Sel) -> Id {
     this
@@ -1788,18 +1801,9 @@ pub fn register(r: &mut Registry) {
     let color_class = define_class("UIColor", "NSObject", 40);
     class_methods(
         color_class,
-        &[
-            ("colorWithRed:green:blue:alpha:", color_rgba as usize),
-            ("colorWithWhite:alpha:", color_white_alpha as usize),
-            ("blackColor", color_black as usize),
-            ("whiteColor", color_white as usize),
-            ("clearColor", color_clear as usize),
-            ("grayColor", color_gray as usize),
-            ("darkGrayColor", color_gray as usize),
-            ("lightGrayColor", color_gray as usize),
-            ("redColor", color_red as usize),
-        ],
+        &[("colorWithRed:green:blue:alpha:", color_rgba as usize), ("colorWithWhite:alpha:", color_white_alpha as usize)],
     );
+    class_methods(color_class, &named_colors());
     methods(color_class, &[("CGColor", color_cg as usize)]);
 
     let image = define_class("UIImage", "NSObject", 16);
@@ -1930,6 +1934,41 @@ mod tests {
         let controller = runtime::send(runtime::alloc_instance(class), "init", &[]);
         let device = runtime::send(runtime::class_named("UIDevice"), "currentDevice", &[]);
         assert_eq!(runtime::send(controller, "interfaceOrientation", &[]), runtime::send(device, "orientation", &[]));
+    }
+
+    /// UIKit's named colours, with Apple's values. A missing one stops the
+    /// game code that asks for it (Dungeon Plunder's fight screen and
+    /// +orangeColor), and 32-bit games need a selector row for each.
+    #[test]
+    fn every_named_colour_has_apples_value() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let (third, two_thirds) = (1.0 / 3.0, 2.0 / 3.0);
+        let named: [(&str, [f64; 4]); 15] = [
+            ("blackColor", [0.0, 0.0, 0.0, 1.0]),
+            ("darkGrayColor", [third, third, third, 1.0]),
+            ("lightGrayColor", [two_thirds, two_thirds, two_thirds, 1.0]),
+            ("whiteColor", [1.0, 1.0, 1.0, 1.0]),
+            ("grayColor", [0.5, 0.5, 0.5, 1.0]),
+            ("redColor", [1.0, 0.0, 0.0, 1.0]),
+            ("greenColor", [0.0, 1.0, 0.0, 1.0]),
+            ("blueColor", [0.0, 0.0, 1.0, 1.0]),
+            ("cyanColor", [0.0, 1.0, 1.0, 1.0]),
+            ("yellowColor", [1.0, 1.0, 0.0, 1.0]),
+            ("magentaColor", [1.0, 0.0, 1.0, 1.0]),
+            ("orangeColor", [1.0, 0.5, 0.0, 1.0]),
+            ("purpleColor", [0.5, 0.0, 0.5, 1.0]),
+            ("brownColor", [0.6, 0.4, 0.2, 1.0]),
+            ("clearColor", [0.0, 0.0, 0.0, 0.0]),
+        ];
+        let class = runtime::class_named("UIColor");
+        let table = crate::guest32::objc::selectors::FrameworkSelectors::builtin();
+        for (name, rgba) in named {
+            assert!(runtime::responds(class, name), "+[UIColor {name}] is missing");
+            assert!(table.get(name).is_some(), "no framework_selectors.tsv row for {name}");
+            let got = crate::fw::graphics::color_rgba(runtime::send(class, name, &[])).unwrap();
+            assert!(got.iter().zip(rgba).all(|(a, b)| (a - b).abs() < 1e-9), "{name}: {got:?}, Apple's is {rgba:?}");
+        }
     }
 
     /// A stretchable copy of a picture (button backgrounds) is a new picture
