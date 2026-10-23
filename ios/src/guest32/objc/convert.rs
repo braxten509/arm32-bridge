@@ -33,6 +33,12 @@ pub trait Boundary {
     fn sel_to_guest(&mut self, host: usize) -> Result<u32, String>;
     /// The text of a guest string object (for format arguments).
     fn object_text(&mut self, guest: u32) -> Option<String>;
+    /// The guest word standing for a host pointer outside guest memory (an
+    /// opaque framework object such as a CGImage, or a handle).
+    fn opaque_to_guest(&mut self, host: usize) -> Result<u32, String>;
+    /// The host pointer a guest pointer word stands for, when it is such a
+    /// word (otherwise it is a guest address).
+    fn opaque_to_host(&mut self, guest: u32) -> Option<usize>;
 }
 
 // ---------- host types ----------
@@ -197,9 +203,18 @@ fn to_host(ty: &Ty, hty: &HostTy, guest: &[u8], out: &mut [u8], b: &mut dyn Boun
             let g = guest_u32(guest);
             put(out, if g == 0 { 0 } else { b.sel_to_host(g)? as u64 })
         }
-        (Ty::CString | Ty::Pointer(_) | Ty::Unknown, HostTy::Ptr) => {
+        (Ty::CString, HostTy::Ptr) => {
             let g = guest_u32(guest);
             put(out, if g == 0 { 0 } else { b.host_address(g) as u64 })
+        }
+        // A guest address, or the guest word of an opaque host pointer.
+        (Ty::Pointer(_) | Ty::Unknown, HostTy::Ptr) => {
+            let g = guest_u32(guest);
+            let host = match g {
+                0 => 0,
+                _ => b.opaque_to_host(g).unwrap_or_else(|| b.host_address(g)),
+            };
+            put(out, host as u64)
         }
         (Ty::Struct { fields, .. }, HostTy::Struct { fields: host_fields, .. }) => {
             let mut offset = 0;
@@ -259,7 +274,8 @@ fn to_guest(ty: &Ty, hty: &HostTy, host: &[u8], out: &mut [u8], b: &mut dyn Boun
             let g = match (h, b.guest_address(h)) {
                 (0, _) => 0,
                 (_, Some(g)) => g,
-                _ => return Err(format!("host pointer {h:#x} ({ty:?}) is outside guest memory")),
+                // CGImage, CGColor, ...: a word standing for the host pointer.
+                _ => b.opaque_to_guest(h)?,
             };
             out.copy_from_slice(&g.to_le_bytes())
         }
@@ -635,6 +651,12 @@ impl Boundary for TempMap<'_> {
     }
     fn object_text(&mut self, guest: u32) -> Option<String> {
         self.b.object_text(guest)
+    }
+    fn opaque_to_guest(&mut self, host: usize) -> Result<u32, String> {
+        self.b.opaque_to_guest(host)
+    }
+    fn opaque_to_host(&mut self, guest: u32) -> Option<usize> {
+        self.b.opaque_to_host(guest)
     }
 }
 

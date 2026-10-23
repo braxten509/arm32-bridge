@@ -479,7 +479,29 @@ impl Boundary for Session<'_> {
     fn object_text(&mut self, guest: u32) -> Option<String> {
         let host = self.bridge.host_object_for(self.g, guest).ok()?;
         Some(crate::fw::string::get(host))
+    }    /// Host objects (CG objects are objects in this layer) get their proxy,
+    /// so C functions (guest32::fw, through the same pair table) and messages
+    /// agree; other host pointers get a handle from the C layer's table.
+    fn opaque_to_guest(&mut self, host: usize) -> Result<u32, String> {
+        if is_host_object(host) {
+            self.bridge.guest_object(self.g, host)
+        } else {
+            Ok(super::super::fw::handle_to_guest(host))
+        }
     }
+    fn opaque_to_host(&mut self, guest: u32) -> Option<usize> {
+        self.bridge.host_object(guest).or_else(|| Some(super::super::fw::handle_to_host(guest)).filter(|h| *h != 0))
+    }
+}
+
+/// Whether host pointer `value` is an object of the host runtime (checked
+/// as a plausible pointer before its class is read).
+pub fn is_host_object(value: usize) -> bool {
+    if value < 0x10000 || value >= 1 << 48 || value % 8 != 0 {
+        return false;
+    }
+    let rt = runtime::lock();
+    rt.classes.contains_key(&rt.class_of(value))
 }
 
 fn lock(bridge: &Mutex<Bridge>) -> std::sync::MutexGuard<'_, Bridge> {

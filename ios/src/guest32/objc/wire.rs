@@ -3,7 +3,7 @@
 //! Objective-C runtime function, the data imports the game's classes and
 //! constants bind to, and setting up the game's classes after loading.
 
-use super::bridge::{dispatch_from_host, install, Bridge, GuestSide, Special};
+use super::bridge::{dispatch_from_host, install, is_host_object, Bridge, GuestSide, Special};
 use super::functions::{call_function, functions, Ctx, HOST_FUNCTIONS};
 use super::mirror;
 use arm32_bridge::ios32::Program;
@@ -150,6 +150,7 @@ pub fn register_program(program: &Program) -> Result<(), String> {
     if BRIDGE.set(Mutex::new(bridge)).is_err() {
         return Err("the Objective-C bridge was already set up".into());
     }
+    super::super::fw::set_object_bridge(&FwObjects);
     let mut names: Vec<&str> = program.image.binds.iter().map(|b| b.symbol.as_str()).collect();
     names.sort_unstable();
     names.dedup();
@@ -218,11 +219,20 @@ fn host_object_constant(symbol: &str) -> Option<usize> {
         return None;
     }
     let value = unsafe { *(address as *const usize) };
-    if value < 0x10000 || value >= 1 << 48 || value % 8 != 0 {
-        return None;
+    is_host_object(value).then_some(value)
+}
+
+/// The C framework layer's object table is the bridge's pair table, so a
+/// CGImage from a C call and from -[UIImage CGImage] is one guest object.
+struct FwObjects;
+
+impl super::super::fw::ObjectBridge for FwObjects {
+    fn to_host(&self, guest: u32) -> usize {
+        with_bridge(|b| b.host_object_for(&Translator, guest)).unwrap_or(0)
     }
-    let rt = crate::objc::runtime::lock();
-    rt.classes.contains_key(&rt.class_of(value)).then_some(value)
+    fn to_guest(&self, host: usize) -> u32 {
+        with_bridge(|b| b.guest_object(&Translator, host)).unwrap_or(0)
+    }
 }
 
 fn with_bridge<R>(f: impl FnOnce(&mut Bridge) -> R) -> R {

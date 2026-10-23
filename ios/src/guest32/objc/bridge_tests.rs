@@ -238,6 +238,40 @@ fn super_calls_pass_through_intermediate_game_classes() {
     assert!(HOST_ALPHA.lock().unwrap().contains(&(host, 0.25)));
 }
 
+static HOST_CG: Mutex<Vec<Id>> = Mutex::new(Vec::new());
+
+extern "C" fn host_cg_image(this: Id, _: Sel) -> Id {
+    // A CGImage is an object of this layer, kept beside its UIImage.
+    unsafe { *((this + 8) as *const Id) }
+}
+
+extern "C" fn host_init_with_cg_image(this: Id, _: Sel, image: Id) -> Id {
+    HOST_CG.lock().unwrap().push(image);
+    this
+}
+
+#[test]
+fn cg_objects_from_getters_cross_as_their_proxies() {
+    let class = host_class("G32HostImage");
+    {
+        let mut rt = runtime::lock();
+        let (get, init) = (rt.sel("CGImage"), rt.sel("initWithCGImage:"));
+        rt.add_method(class, get, host_cg_image as usize);
+        rt.add_method(class, init, host_init_with_cg_image as usize);
+    }
+    let (image, cg) = (runtime::alloc_instance(class), runtime::alloc_instance(host_class("G32HostCGImage")));
+    unsafe { *((image + 8) as *mut Id) = cg };
+    let fake = Fake::new();
+    let bridge = Mutex::new(Bridge::new(&ObjcMetadata32::default()).unwrap());
+    let proxy = bridge.lock().unwrap().guest_object(fake, image).unwrap();
+    let sel = |name: &str| bridge.lock().unwrap().guest_selector(fake, name);
+    // -CGImage returns ^{CGImage=}: a host pointer outside guest memory.
+    let guest_cg = send(&bridge, fake, &[proxy, sel("CGImage")]).unwrap() as u32;
+    assert_eq!(guest_cg, bridge.lock().unwrap().guest_object(fake, cg).unwrap(), "the CG object's own proxy");
+    send(&bridge, fake, &[proxy, sel("initWithCGImage:"), guest_cg]).unwrap();
+    assert_eq!(*HOST_CG.lock().unwrap(), [cg]);
+}
+
 static HOST_POINTS: Mutex<Vec<(f64, f64)>> = Mutex::new(Vec::new());
 
 extern "C" fn host_pick(object: Id, x: f64, y: f64) -> Id {

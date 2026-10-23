@@ -8,6 +8,8 @@ use std::collections::HashMap;
 const BASE: u32 = 0x1_0000;
 const HOST_ID: usize = 0x7_0000_0000;
 const HOST_SEL: usize = 0x8_0000_0000;
+/// Guest words for opaque host pointers start here.
+const OPAQUE: u32 = 0x9000_0000;
 
 /// Guest memory is a real buffer, so host_address() can be dereferenced.
 /// Guest id g <-> host id HOST_ID + g; guest selector g <-> HOST_SEL + g.
@@ -15,11 +17,13 @@ struct Fake {
     memory: Vec<u8>,
     next: u32,
     texts: HashMap<u32, String>,
+    /// Opaque host pointer <-> guest word (the bridge's shared table).
+    opaque: Vec<usize>,
 }
 
 impl Fake {
     fn new() -> Self {
-        Fake { memory: vec![0; 0x4000], next: BASE + 0x2000, texts: HashMap::new() }
+        Fake { memory: vec![0; 0x4000], next: BASE + 0x2000, texts: HashMap::new(), opaque: Vec::new() }
     }
     fn put(&mut self, addr: u32, data: &[u8]) {
         self.write(addr, data);
@@ -65,6 +69,16 @@ impl Boundary for Fake {
     }
     fn object_text(&mut self, guest: u32) -> Option<String> {
         self.texts.get(&guest).cloned()
+    }
+    fn opaque_to_guest(&mut self, host: usize) -> Result<u32, String> {
+        let index = self.opaque.iter().position(|h| *h == host).unwrap_or_else(|| {
+            self.opaque.push(host);
+            self.opaque.len() - 1
+        });
+        Ok(OPAQUE + index as u32 * 4)
+    }
+    fn opaque_to_host(&mut self, guest: u32) -> Option<usize> {
+        guest.checked_sub(OPAQUE).and_then(|i| self.opaque.get(i as usize / 4)).copied()
     }
 }
 
@@ -175,6 +189,24 @@ fn c_strings_and_out_parameters_cross_into_guest_memory() {
     unsafe { *(call.args.x[2] as *mut i64) = -42 };
     finish_host_call(call, &HostRet { x: [1, 0], d: [0; 4] }, &mut b).unwrap();
     assert_eq!(b.get(slot, 4), (-42i32).to_le_bytes().to_vec());
+}
+
+#[test]
+fn opaque_host_pointers_cross_as_guest_words_both_ways() {
+    let mut b = Fake::new();
+    // -[UIImage CGImage] returns a host pointer outside guest memory; the guest
+    // gets a word for it, and that word goes back as the same host pointer.
+    let image = 0x7_1234_5670usize;
+    let sig = Signature::parse("^{CGImage=}@:").unwrap();
+    let call = prepare_host_call(&sig, plain(), &words(&[1, 2]), &mut b).unwrap();
+    let r = finish_host_call(call, &HostRet { x: [image as u64, 0], d: [0; 4] }, &mut b).unwrap();
+    assert_eq!(b.opaque_to_host(r.r0), Some(image));
+    let sig = Signature::parse("@@:^{CGImage=}").unwrap();
+    let call = prepare_host_call(&sig, plain(), &words(&[1, 2, r.r0]), &mut b).unwrap();
+    assert_eq!(call.args.x[2] as usize, image);
+    // A pointer into guest memory stays a guest address.
+    let call = prepare_host_call(&sig, plain(), &words(&[1, 2, BASE + 0x40]), &mut b).unwrap();
+    assert_eq!(call.args.x[2] as usize, b.host_address(BASE + 0x40));
 }
 
 #[test]
