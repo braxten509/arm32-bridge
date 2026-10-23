@@ -475,6 +475,39 @@ fn an_uncaught_objc_exception_runs_the_games_handler_then_stops() {
 }
 
 #[test]
+fn raise_and_raise_format_from_game_code_throw_through_the_guest_runtime() {
+    use super::objc::wire::{test_bridge, Translator};
+    use crate::fw::string::make;
+    cxx();
+    let exception = guest_exception("RaisedException", "raised on purpose");
+    let (raise, raise_format, class, name, format) = {
+        let mut b = test_bridge().lock().unwrap();
+        (
+            b.guest_selector(&Translator, "raise"),
+            b.guest_selector(&Translator, "raise:format:"),
+            b.framework_class(&Translator, "NSException").0,
+            b.guest_object(&Translator, make("FormatException")).unwrap(),
+            b.guest_object(&Translator, make("value %d of %s")).unwrap(),
+        )
+    };
+    let text = cstring("ten");
+    let _gil = runtime::hold_gil();
+    let uc = runtime::engine();
+    let send = runtime::stub_for("objc_msgSend");
+    // [exception raise]: thrown as objc_exception_throw throws it (nothing
+    // catches it here, so it ends at the terminate handler).
+    let result = runtime::call_guest(uc, send, &[exception, raise]);
+    uc.get_data_mut().fault = None;
+    let error = result.expect_err("an uncaught exception stops the program");
+    assert!(error.contains("uncaught Objective-C exception: RaisedException: raised on purpose"), "{error}");
+    // [NSException raise:@"FormatException" format:@"value %d of %s", 42, "ten"]
+    let result = runtime::call_guest(uc, send, &[class, raise_format, name, format, 42, text]);
+    uc.get_data_mut().fault = None;
+    let error = result.expect_err("an uncaught exception stops the program");
+    assert!(error.contains("uncaught Objective-C exception: FormatException: value 42 of ten"), "{error}");
+}
+
+#[test]
 fn objc_catch_clauses_match_by_class_and_hand_over_the_object() {
     use super::objc::wire::{test_bridge, Translator};
     cxx();

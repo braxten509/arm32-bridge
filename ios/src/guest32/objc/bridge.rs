@@ -134,6 +134,21 @@ thread_local! {
     /// Game objects whose guest form was just made on this thread and whose
     /// C++ ivars still need constructing (see construct_pending).
     static UNCONSTRUCTED: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// An exception game code raised (-raise, +raise:format:) for the
+    /// runtime function handler to throw in the guest (it has the engine).
+    static PENDING_THROW: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// The exception a message just raised on this thread, to be thrown.
+pub fn take_pending_throw() -> Option<u32> {
+    PENDING_THROW.with(|p| p.take())
+}
+
+/// Whether framework class `name` is NSException or a subclass.
+fn is_exception_class(name: &str) -> bool {
+    let Some(class) = runtime::existing_class(name, false) else { return false };
+    let exception = runtime::class_named("NSException");
+    runtime::lock().is_subclass(class, exception)
 }
 
 const CXX_CONSTRUCT: &str = ".cxx_construct";
@@ -977,6 +992,32 @@ pub fn send_from_guest(
             Ok(GuestRet { r0: r as u32, r1: (r >> 32) as u32 })
         }
         Target::Host { class, meta, via_super } => {
+            // NSException's -raise and +raise:format: from game code: thrown in
+            // the guest, as objc_exception_throw throws (the host's own raise
+            // would unwind host code).
+            let raises = (name == "raise" && !meta) || (name == "raise:format:" && meta);
+            if raises && is_exception_class(&class) {
+                drop(b);
+                let exception = if meta {
+                    let (string_class, with_format) = {
+                        let mut b = lock(bridge);
+                        (b.framework_class(g, "NSString").0, b.guest_selector(g, "stringWithFormat:"))
+                    };
+                    // [NSString stringWithFormat:format, ...] with the same arguments.
+                    let format_args = |i: u32| match i {
+                        0 => string_class,
+                        1 => with_format,
+                        i => get(i + 1),
+                    };
+                    let reason = send_from_guest(bridge, g, SendKind::Normal, &format_args)?.r0;
+                    let ctx = super::functions::Ctx { bridge, g };
+                    ctx.send(receiver, "exceptionWithName:reason:userInfo:", &[get(first + 2), reason, 0])?
+                } else {
+                    receiver
+                };
+                PENDING_THROW.with(|p| p.set(Some(exception)));
+                return Ok(GuestRet { r0: 0, r1: 0 });
+            }
             // The framework's -dealloc of a game object: its C++ ivars go first.
             let game_dealloc = name == "dealloc" && b.classes.class(u32_at(g, receiver)).is_some_and(|c| !c.meta);
             if game_dealloc {

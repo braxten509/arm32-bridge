@@ -93,6 +93,9 @@ fn objc_handler(uc: &mut Uc, args: &mut Args) -> Ret {
         state.1[i as usize]
     };
     let result = with_engine(uc, || call_function(&Ctx { bridge, g: &Translator }, name, &words));
+    if let Some(exception) = super::bridge::take_pending_throw() {
+        return with_context(uc, |uc, c| exceptions::throw(uc, c, exception));
+    }
     match result {
         Ok(value) => Ret::U64(value),
         Err(error) => {
