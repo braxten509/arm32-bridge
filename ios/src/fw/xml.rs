@@ -205,11 +205,26 @@ fn document_text(bytes: &[u8]) -> String {
     match declared.as_deref() {
         None | Some("utf-8" | "utf8" | "us-ascii" | "ascii") => String::from_utf8_lossy(bytes).into_owned(),
         // Each byte is the character with its number.
-        Some("iso-8859-1" | "latin1" | "iso_8859-1" | "iso-latin-1" | "windows-1252" | "cp1252") => bytes.iter().map(|&b| b as char).collect(),
+        Some("iso-8859-1" | "latin1" | "iso_8859-1" | "iso-latin-1") => bytes.iter().map(|&b| b as char).collect(),
+        // The same, but 0x80-0x9F are letters and signs (euro, curly quotes, ...).
+        Some("windows-1252" | "cp1252") => bytes.iter().map(|&b| windows_1252(b)).collect(),
         Some(other) => {
             crate::log!("NSXMLParser: encoding {other} not known, read as UTF-8");
             String::from_utf8_lossy(bytes).into_owned()
         }
+    }
+}
+
+/// A Windows-1252 byte's character (0x80-0x9F differ from Latin-1; its
+/// five unused bytes stay their own numbers, as Apple's decoder keeps them).
+fn windows_1252(byte: u8) -> char {
+    const HIGH: [u16; 32] = [
+        0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008D, 0x017D, 0x008F,
+        0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014, 0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178,
+    ];
+    match byte {
+        0x80..=0x9F => char::from_u32(HIGH[(byte - 0x80) as usize] as u32).unwrap_or('\u{FFFD}'),
+        _ => byte as char,
     }
 }
 
@@ -450,5 +465,10 @@ mod tests {
         let (whole, heard, _) = parse_bytes(latin);
         assert!(whole);
         assert_eq!(heard[1], "start map name=café");
+        // Windows-1252 has its own letters where Latin-1 has control codes.
+        let windows = b"<?xml version='1.0' encoding='windows-1252'?><map name='\x80\x91x\x92'/>";
+        let (whole, heard, _) = parse_bytes(windows);
+        assert!(whole);
+        assert_eq!(heard[1], "start map name=€‘x’");
     }
 }
