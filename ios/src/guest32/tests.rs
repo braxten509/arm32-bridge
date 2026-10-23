@@ -41,6 +41,23 @@ fn call(name: &str, registers: [u32; 4], stack: &[u32]) -> (u32, u32) {
     (uc.reg(0), uc.reg(1))
 }
 
+/// Calls the stand-in for `name` as translated code would (with its stand-in name).
+fn call_stub(name: &str, registers: [u32; 4], stack: &[u32]) -> (u32, u32) {
+    setup();
+    let address = runtime::stub_for(name);
+    let stub = runtime::stub((address - arm32_bridge::mem::stub_base()) / 8).unwrap();
+    let sp = alloc(64 + stack.len() as u32 * 4);
+    for (i, word) in stack.iter().enumerate() {
+        mem().write_u32(sp + i as u32 * 4, *word);
+    }
+    let _gil = runtime::hold_gil();
+    let uc = runtime::engine();
+    uc.get_data_mut().current_call = stub.name;
+    let result = stub.handler.unwrap()(uc, &mut Args::new(registers, sp));
+    runtime::write_result(uc, result);
+    (uc.reg(0), uc.reg(1))
+}
+
 fn errno() -> u32 {
     let (slot, _) = call("__error", [0; 4], &[]);
     mem().read_u32(slot)
@@ -116,6 +133,53 @@ fn unknown_data_is_zeroed_memory_that_names_itself_when_called() {
     let slot = (address - arm32_bridge::mem::stub_base()) / 8;
     assert_eq!(runtime::stub(slot).map(|stub| stub.name), Some("glMadeUpEntryPoint"));
     assert_eq!(ios32::unknown_data("glMadeUpEntryPoint"), address, "one block per name");
+}
+
+#[test]
+fn bionic_library_calls_keep_androids_rules() {
+    // The built-in libz is built against bionic: its lseek64(fd, off64_t,
+    // whence) has the offset in r2:r3 (EABI pair), whence on the stack.
+    let base = std::env::temp_dir().join(format!("guest32-bionic-{}", std::process::id()));
+    std::fs::create_dir_all(base.join("full/inside")).unwrap();
+    let file = base.join("data");
+    std::fs::write(&file, [7u8; 2000]).unwrap();
+    let fd = call_stub("bionic:open", [cstring(file.to_str().unwrap()), 0, 0, 0], &[]).0;
+    assert_eq!(call_stub("bionic:lseek64", [fd, 0xDEAD, 1024, 0], &[0]), (1024, 0));
+    call_stub("bionic:close", [fd, 0, 0, 0], &[]);
+    // Its errno numbers are Linux's: ENOTEMPTY is 39 (Darwin's is 66).
+    assert_eq!(call_stub("bionic:rmdir", [cstring(base.join("full").to_str().unwrap()), 0, 0, 0], &[]).0 as i32, -1);
+    assert_eq!(errno(), 39);
+    // Handlers that tell calls apart by name see the plain name: feof is not clearerr.
+    let stream = call_stub("bionic:fopen", [cstring(file.to_str().unwrap()), cstring("r"), 0, 0], &[]).0;
+    call_stub("bionic:fseek", [stream, 0, 2, 0], &[]);
+    assert_eq!(call_stub("bionic:fgetc", [stream, 0, 0, 0], &[]).0 as i32, -1);
+    assert_ne!(call_stub("bionic:feof", [stream, 0, 0, 0], &[]).0, 0, "at the end of the file");
+    call_stub("bionic:fclose", [stream, 0, 0, 0], &[]);
+    std::fs::remove_dir_all(&base).unwrap();
+    // The program's own (Apple) calls still use Apple's rules.
+    let x = 0.25f64.to_bits();
+    let out = alloc(16);
+    call("__sincos_stret", [out, x as u32, (x >> 32) as u32, 0], &[]);
+    assert_eq!(f64::from_bits(mem().read_u64(out)), 0.25f64.sin());
+}
+
+#[test]
+fn checked_printf_stops_at_the_object_size() {
+    // __sprintf_chk(buffer, flags, object size, format, ...): Apple's
+    // __chk_fail stops the program instead of writing past the object.
+    let buffer = alloc(16);
+    mem().write_bytes(buffer, &[0xEE; 16]);
+    call("__sprintf_chk", [buffer, 0, 4, cstring("%s")], &[cstring("abcdef")]);
+    let _gil = runtime::hold_gil();
+    let uc = runtime::engine();
+    let fault = uc.get_data_mut().fault.take();
+    assert!(fault.is_some_and(|f| f.contains("overflow")), "stopped");
+    assert_eq!(mem().bytes(buffer + 4, 12), [0xEE; 12], "nothing written past the object");
+    drop(_gil);
+    // __snprintf_chk(buffer, max length, flags, object size, format, ...) with max length > object size.
+    call("__snprintf_chk", [buffer, 8, 0, 4], &[cstring("%s"), cstring("ab")]);
+    let _gil = runtime::hold_gil();
+    assert!(runtime::engine().get_data_mut().fault.take().is_some(), "max length larger than the object stops");
 }
 
 /// The C++ runtime loaded once, as `run` loads it (call before holding the GIL).

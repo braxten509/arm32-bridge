@@ -313,6 +313,21 @@ fn write_text(buffer: u32, size: Option<u32>, text: &[u8]) -> Ret {
     Ret::U32(text.len() as u32)
 }
 
+/// The _chk printf calls, as Apple's Libc checks them against the object
+/// size the compiler knew (-1: unknown): a max length larger than the
+/// object, or text that doesn't fit it, ends the program (__chk_fail).
+fn write_checked_text(uc: &mut Uc, buffer: u32, size: Option<u32>, object_size: u32, text: &[u8]) -> Ret {
+    let overflows = match size {
+        Some(size) => size > object_size,
+        None => text.len() as u64 + 1 > u64::from(object_size),
+    };
+    if object_size != u32::MAX && overflows {
+        stop_with_fault(uc, format!("buffer overflow detected ({}: object of {object_size} bytes)", uc.get_data().current_call));
+        return Ret::Void;
+    }
+    write_text(buffer, size, text)
+}
+
 /// Darwin's text for a Darwin errno number.
 fn darwin_strerror(darwin: i32) -> String {
     let linux = (1..134).find(|&linux| darwin_errno(linux) == darwin).unwrap_or(darwin);
@@ -325,8 +340,9 @@ fn text() {
     function(
         "__sprintf_chk",
         handler!(|uc, a| {
-            let (buffer, _flags, _size, format) = (a.u32(), a.u32(), a.u32(), a.u32());
-            write_text(buffer, None, &arm32_bridge::imports::printf::format(mem(), format, a))
+            let (buffer, _flags, object_size, format) = (a.u32(), a.u32(), a.u32(), a.u32());
+            let text = arm32_bridge::imports::printf::format(mem(), format, a);
+            write_checked_text(uc, buffer, None, object_size, &text)
         })
         .unwrap(),
     );
@@ -334,24 +350,27 @@ fn text() {
     function(
         "__snprintf_chk",
         handler!(|uc, a| {
-            let (buffer, size, _flags, _object_size, format) = (a.u32(), a.u32(), a.u32(), a.u32(), a.u32());
-            write_text(buffer, Some(size), &arm32_bridge::imports::printf::format(mem(), format, a))
+            let (buffer, size, _flags, object_size, format) = (a.u32(), a.u32(), a.u32(), a.u32(), a.u32());
+            let text = arm32_bridge::imports::printf::format(mem(), format, a);
+            write_checked_text(uc, buffer, Some(size), object_size, &text)
         })
         .unwrap(),
     );
     function(
         "__vsprintf_chk",
         handler!(|uc, a| {
-            let (buffer, _flags, _size, format, list) = (a.u32(), a.u32(), a.u32(), a.u32(), a.u32());
-            write_text(buffer, None, &arm32_bridge::imports::printf::format(mem(), format, &mut VaList { pointer: list }))
+            let (buffer, _flags, object_size, format, list) = (a.u32(), a.u32(), a.u32(), a.u32(), a.u32());
+            let text = arm32_bridge::imports::printf::format(mem(), format, &mut VaList { pointer: list });
+            write_checked_text(uc, buffer, None, object_size, &text)
         })
         .unwrap(),
     );
     function(
         "__vsnprintf_chk",
         handler!(|uc, a| {
-            let (buffer, size, _flags, _object_size, format, list) = (a.u32(), a.u32(), a.u32(), a.u32(), a.u32(), a.u32());
-            write_text(buffer, Some(size), &arm32_bridge::imports::printf::format(mem(), format, &mut VaList { pointer: list }))
+            let (buffer, size, _flags, object_size, format, list) = (a.u32(), a.u32(), a.u32(), a.u32(), a.u32(), a.u32());
+            let text = arm32_bridge::imports::printf::format(mem(), format, &mut VaList { pointer: list });
+            write_checked_text(uc, buffer, Some(size), object_size, &text)
         })
         .unwrap(),
     );

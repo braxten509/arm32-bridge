@@ -67,6 +67,15 @@ fn apple_system_calls_use_r12_and_the_carry_flag() {
 }
 
 #[test]
+fn start_up_functions_run_below_the_start_block() {
+    let (block, top) = ios32::start_block(0xBFF0_0000, 6);
+    assert!(block + 6 * 4 <= 0xBFF0_0000);
+    // call_guest starts a thread's first frame just under its stack top and
+    // grows down: nothing a start-up function pushes reaches argc/argv/envp.
+    assert!(top <= block, "guest calls start at {top:#x}, above the start block at {block:#x}");
+}
+
+#[test]
 fn weak_imports_nothing_provides_bind_to_zero() {
     let exports = std::collections::HashMap::from([("_own".to_string(), 0x4001)]);
     let bind = |symbol: &str, source, library, weak_import| Bind32 {
