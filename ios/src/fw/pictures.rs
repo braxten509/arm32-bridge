@@ -493,6 +493,12 @@ pub fn encode(screen: (f64, f64), pictures: &[Picture]) -> String {
     text
 }
 
+/// Every window's pictures, back to front, with files to draw them from
+/// (made for all windows at once, so no window's text files are let go).
+fn screen_pictures(windows: &[Id], classes: &Classes) -> Vec<Picture> {
+    resolve(windows.iter().flat_map(|&window| flatten(&snapshot(window, classes, 0))).collect())
+}
+
 /// From the main loop: sends the pictures when they changed (at most 20 times a second).
 pub fn tick() {
     let Some(screen) = screen() else { return };
@@ -503,9 +509,7 @@ pub fn tick() {
     }
     let classes = Classes::find();
     let mut pictures = Vec::new();
-    for window in crate::fw::uikit::windows() {
-        pictures.extend(resolve(flatten(&snapshot(window, &classes, 0))));
-    }
+    pictures.extend(screen_pictures(&crate::fw::uikit::windows(), &classes));
     let (wide, high, _) = crate::fw::uikit::screen_points();
     let text = encode((wide, high), &pictures);
     let changed = last.as_ref().is_none_or(|(_, sent)| *sent != text);
@@ -665,6 +669,35 @@ mod tests {
         assert_eq!(tiles, [((0.0, 0.0), (10.0, 10.0)), ((10.0, 0.0), (10.0, 10.0)), ((20.0, 0.0), (10.0, 10.0)), ((0.0, 10.0), (10.0, 10.0)), ((10.0, 10.0), (10.0, 10.0)), ((20.0, 10.0), (10.0, 10.0))]);
     }
 
+    /// Held by tests that make text files: they share one cache, and a test
+    /// checking that files stay must not see another test's screen evict them.
+    static TEXT_FILES: Mutex<()> = Mutex::new(());
+
+    /// Text on two windows at once keeps every file while both show it,
+    /// however many labels there are between them.
+    #[test]
+    fn text_on_every_window_keeps_its_files() {
+        setup();
+        let _files = TEXT_FILES.lock().unwrap_or_else(|e| e.into_inner());
+        let windows: Vec<Id> = [200, 57]
+            .iter()
+            .enumerate()
+            .map(|(w, &count)| {
+                let window = new_view("UIWindow", rect(0.0, 0.0, 568.0, 320.0));
+                for n in 0..count {
+                    let label = new_view("UILabel", rect((n % 50) as f64 * 10.0, (n / 50) as f64 * 10.0, 8.0, 8.0));
+                    runtime::send(label, "setText:", &[crate::fw::string::make(&format!("{w}.{n}"))]);
+                    runtime::send(window, "addSubview:", &[label]);
+                }
+                window
+            })
+            .collect();
+        let shown = screen_pictures(&windows, &Classes::find());
+        assert_eq!(shown.len(), 257);
+        let gone: Vec<&str> = shown.iter().map(|p| p.path.as_str()).filter(|path| !std::path::Path::new(path).exists()).collect();
+        assert!(gone.is_empty(), "{} shown labels lost their files", gone.len());
+    }
+
     fn setup() {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(crate::run::setup);
@@ -708,6 +741,7 @@ mod tests {
                 minimum_font_size: None,
             }
         );
+        let _files = TEXT_FILES.lock().unwrap_or_else(|e| e.into_inner());
         let shown = resolve(pictures);
         let scale = pixels_per_point();
         let made = image::image_dimensions(&shown[0].path).expect("a picture file");
@@ -901,6 +935,7 @@ mod tests {
         let background = white_picture(6, 6);
         let button = new_view("UIButton", rect(0.0, 0.0, 100.0, 40.0));
         runtime::send(button, "setBackgroundImage:forState:", &[background, 0]);
+        let _files = TEXT_FILES.lock().unwrap_or_else(|e| e.into_inner());
         let drawn = || resolve(flatten(&window(vec![snapshot(button, &Classes::find(), 0)]))).len();
         // Shown normally until its picture file is ready (made on its own thread).
         for _ in 0..200 {
@@ -948,6 +983,7 @@ mod tests {
         assert_eq!(paths, [color_path([1.0, 0.0, 0.0, 0.5]), "icon.png".into(), "child.png".into()]);
         assert_eq!((at(&pictures[0], 0.0, 0.0), pictures[0].area, pictures[0].mode), ((10.0, 20.0), (100.0, 50.0), 0));
         // The colour becomes a one-pixel picture of it.
+        let _files = TEXT_FILES.lock().unwrap_or_else(|e| e.into_inner());
         let made = resolve(vec![pictures[0].clone()]);
         let pixel = image::open(&made[0].path).expect("a colour picture").to_rgba8();
         assert_eq!((pixel.dimensions(), pixel.get_pixel(0, 0).0), ((1, 1), [255, 0, 0, 128]));
