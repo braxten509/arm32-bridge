@@ -195,6 +195,53 @@ fn blocks_copy_to_the_heap_and_run_when_the_host_calls_them() {
 }
 
 #[test]
+fn block_counts_change_atomically_and_saturated_counts_stay() {
+    use super::bridge::BLOCK_NEEDS_FREE;
+    let g = Fake::new();
+    let bridge: &'static Mutex<Bridge> = Box::leak(Box::new(Mutex::new(Bridge::new(&ObjcMetadata32::default()).unwrap())));
+    let malloc_isa = g.words(&[0; 5]);
+    bridge.lock().unwrap().set_special(malloc_isa, Special::MallocBlock);
+    let call = move |name: &str, words: &[u32]| {
+        let w = |i: u32| words.get(i as usize).copied().unwrap_or(0);
+        call_function(&Ctx { bridge, g }, name, &w).unwrap() as u32
+    };
+    let descriptor = g.words(&[0, 20]);
+    let count = |at: u32| g.u32_at(at) & 0xfffe;
+    // A heap block held once. Copies and releases from many threads at once
+    // (the host's block helpers run without the guest lock) leave it as it was.
+    let heap = g.words(&[malloc_isa, BLOCK_NEEDS_FREE | 2, 0, 0x4301, descriptor]);
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            std::thread::spawn(move || {
+                for _ in 0..20_000 {
+                    call("_Block_copy", &[heap]);
+                    call("_Block_release", &[heap]);
+                }
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    assert_eq!(count(heap + 4), 2, "no reference was lost or added");
+    assert!(!g.freed.lock().unwrap().contains(&heap), "a live block was never freed");
+    // A saturated count stays: neither a release nor a copy changes it, and the block is never freed.
+    let pinned = g.words(&[malloc_isa, BLOCK_NEEDS_FREE | 0xfffe, 0, 0x4301, descriptor]);
+    call("_Block_release", &[pinned]);
+    call("_Block_copy", &[pinned]);
+    assert_eq!(count(pinned + 4), 0xfffe);
+    assert!(!g.freed.lock().unwrap().contains(&pinned));
+    // The same for a __block variable on the heap: { isa, forwarding, flags, size }.
+    let byref = g.words(&[0, 0, BLOCK_NEEDS_FREE | 0xfffe, 16]);
+    g.put_words(byref + 4, &[byref]);
+    call("_Block_object_dispose", &[byref, 8]);
+    let slot = g.words(&[0]);
+    call("_Block_object_assign", &[slot, byref, 8]);
+    assert_eq!((count(byref + 8), g.u32_at(slot)), (0xfffe, byref));
+    assert!(!g.freed.lock().unwrap().contains(&byref));
+}
+
+#[test]
 fn autorelease_pools_belong_to_their_thread() {
     // Thread A pushes, thread B pushes, A pops, then B pops: B's pool is still its own.
     fn pool(name: &str, token: u32) -> Result<u64, String> {

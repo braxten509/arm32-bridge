@@ -423,6 +423,23 @@ fn register_all_names_each_function_and_data_once() {
     assert!(twice.is_empty(), "registered more than once: {twice:?}");
 }
 
+#[test]
+fn block_classes_are_replaced_before_anything_binds_them() {
+    use super::objc::bridge::Special;
+    use super::objc::wire::{replace_block_classes, test_bridge};
+    setup();
+    let _ = test_bridge();
+    // run(): register_all, then register_program replaces libSystem's block
+    // classes, then the libraries' constructors run and the program binds.
+    replace_block_classes().expect("nothing has bound the block classes yet");
+    let isa = ios32::data_address("_NSConcreteStackBlock").unwrap();
+    assert_eq!(test_bridge().lock().unwrap().special(isa), Some(Special::StackBlock));
+    // Once bound (data addresses are kept), a late replacement would be
+    // ignored: the check says so instead.
+    let error = replace_block_classes().expect_err("a replacement after binding is refused");
+    assert!(error.contains("_NSConcreteStackBlock"), "{error}");
+}
+
 // ----- Objective-C exceptions and dispatch queues -----
 
 /// A host NSException's guest object, through the runner's bridge.

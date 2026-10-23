@@ -182,10 +182,8 @@ fn wrapper_guest(host: usize) -> Option<u32> {
 
 /// Takes a reference to a guest heap block (a no-op for global blocks).
 fn retain_guest_block(g: &dyn GuestSide, block: u32) {
-    let flags = u32_at(g, block + 4);
-    if flags & BLOCK_NEEDS_FREE != 0 {
-        let count = ((flags & BLOCK_REFCOUNT_MASK) + 2).min(BLOCK_REFCOUNT_MASK);
-        g.write(block + 4, &((flags & !BLOCK_REFCOUNT_MASK) | count).to_le_bytes());
+    if u32_at(g, block + 4) & BLOCK_NEEDS_FREE != 0 {
+        super::functions::count_retain(g, block + 4);
     }
 }
 

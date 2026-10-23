@@ -219,17 +219,7 @@ pub fn register_program(program: &Program) -> Result<(), String> {
             class
         })
     });
-    for (symbol, kind) in [
-        ("_NSConcreteStackBlock", Special::StackBlock),
-        ("_NSConcreteMallocBlock", Special::MallocBlock),
-        ("_NSConcreteGlobalBlock", Special::GlobalBlock),
-    ] {
-        super::super::data(symbol, move || {
-            let isa = super::super::alloc_permanent(64, 8);
-            with_bridge(|b| b.set_special(isa, kind));
-            isa
-        });
-    }
+    replace_block_classes()?;
     // Object constants (NSString *const UIApplicationDidBecomeActiveNotification,
     // NSLocalizedDescriptionKey, ...): when the host has the variable and it
     // holds a host object, the guest variable holds that object's proxy.
@@ -252,6 +242,28 @@ pub fn register_program(program: &Program) -> Result<(), String> {
     // The empty method cache: read, never written.
     for symbol in ["_objc_empty_cache", "_objc_empty_vtable"] {
         super::super::data_words(symbol, vec![0; 4]);
+    }
+    Ok(())
+}
+
+/// The block classes the bridge knows (by isa), replacing libSystem's
+/// placeholders. Data addresses are kept once made, so this must come
+/// before any library constructor or bind reaches them: refused after.
+pub fn replace_block_classes() -> Result<(), String> {
+    const CLASSES: [(&str, Special); 3] = [
+        ("_NSConcreteStackBlock", Special::StackBlock),
+        ("_NSConcreteMallocBlock", Special::MallocBlock),
+        ("_NSConcreteGlobalBlock", Special::GlobalBlock),
+    ];
+    if let Some((symbol, _)) = CLASSES.iter().find(|(symbol, _)| arm32_bridge::ios32::data_made(symbol)) {
+        return Err(format!("{symbol} was bound before the Objective-C bridge replaced libSystem's block class"));
+    }
+    for (symbol, kind) in CLASSES {
+        super::super::data(symbol, move || {
+            let isa = super::super::alloc_permanent(64, 8);
+            with_bridge(|b| b.set_special(isa, kind));
+            isa
+        });
     }
     Ok(())
 }

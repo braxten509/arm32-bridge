@@ -323,6 +323,12 @@ pub fn data_address(name: &str) -> Option<u32> {
     Some(registry(|r| *r.made.entry(name.to_string()).or_insert(address)))
 }
 
+/// Whether registered data `name` has been made (bound or asked for): from
+/// then on registering it again no longer changes what the program sees.
+pub fn data_made(name: &str) -> bool {
+    registry(|r| r.made.contains_key(name))
+}
+
 /// An import only reached through pointers that nothing provides: 64 zero
 /// bytes of its own, made of stand-in slots, so if it is really a function
 /// whose address was taken, calling it stops the program and names it. Listed.

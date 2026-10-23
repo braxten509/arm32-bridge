@@ -586,6 +586,33 @@ fn make_string(c: &Ctx, text: &str) -> Result<u64, String> {
 
 // ---------- blocks ----------
 
+/// The flags word of a heap block or __block variable at guest `at`, as an
+/// atomic: guest block functions and the host's copy/dispose helpers (which
+/// run without the guest lock) change its count from any thread.
+fn flags_word(g: &dyn GuestSide, at: u32) -> &std::sync::atomic::AtomicU32 {
+    unsafe { &*(g.host_address(at) as *const std::sync::atomic::AtomicU32) }
+}
+
+/// One more reference (libclosure's latching increment): a saturated count
+/// stays as it is.
+pub fn count_retain(g: &dyn GuestSide, at: u32) {
+    use std::sync::atomic::Ordering;
+    let _ = flags_word(g, at).fetch_update(Ordering::AcqRel, Ordering::Acquire, |flags| {
+        (flags & BLOCK_REFCOUNT_MASK != BLOCK_REFCOUNT_MASK).then(|| flags + 2)
+    });
+}
+
+/// One reference less; true when it was the last (the caller disposes and
+/// frees). Saturated and zero counts stay as they are.
+pub fn count_release(g: &dyn GuestSide, at: u32) -> bool {
+    use std::sync::atomic::Ordering;
+    let before = flags_word(g, at).fetch_update(Ordering::AcqRel, Ordering::Acquire, |flags| {
+        let count = flags & BLOCK_REFCOUNT_MASK;
+        (count != BLOCK_REFCOUNT_MASK && count != 0).then(|| flags - 2)
+    });
+    before.is_ok_and(|flags| flags & BLOCK_REFCOUNT_MASK == 2)
+}
+
 /// _Block_copy: a heap block (a stack block is copied; heap blocks gain a
 /// reference; global blocks stay as they are).
 pub fn block_copy(c: &Ctx, block: u32) -> Result<u32, String> {
@@ -594,7 +621,7 @@ pub fn block_copy(c: &Ctx, block: u32) -> Result<u32, String> {
     }
     let flags = c.word(block + 4);
     if flags & BLOCK_NEEDS_FREE != 0 {
-        c.set_word(block + 4, (flags & !BLOCK_REFCOUNT_MASK) | ((flags & BLOCK_REFCOUNT_MASK) + 2).min(BLOCK_REFCOUNT_MASK));
+        count_retain(c.g, block + 4);
         return Ok(block);
     }
     let malloc_isa = {
@@ -634,9 +661,7 @@ pub fn release_guest_block(g: &dyn GuestSide, block: u32) -> Result<(), String> 
     if flags & BLOCK_NEEDS_FREE == 0 {
         return Ok(());
     }
-    let count = (flags & BLOCK_REFCOUNT_MASK).saturating_sub(2);
-    g.write(block + 4, &((flags & !BLOCK_REFCOUNT_MASK) | count).to_le_bytes());
-    if count == 0 {
+    if count_release(g, block + 4) {
         if flags & BLOCK_HAS_COPY_DISPOSE != 0 {
             let descriptor = word(block + 16);
             g.call(word(descriptor + 12), &[block])?;
@@ -681,7 +706,7 @@ fn byref_copy(c: &Ctx, byref: u32) -> Result<u32, String> {
     let current = c.word(byref + 4);
     let flags = c.word(current + 8);
     if flags & BLOCK_NEEDS_FREE != 0 {
-        c.set_word(current + 8, flags + 2);
+        count_retain(c.g, current + 8);
         return Ok(current);
     }
     let size = c.word(byref + 12).max(16);
@@ -703,9 +728,7 @@ fn byref_release(c: &Ctx, byref: u32) -> Result<(), String> {
     if flags & BLOCK_NEEDS_FREE == 0 {
         return Ok(());
     }
-    let count = (flags & BLOCK_REFCOUNT_MASK).saturating_sub(2);
-    c.set_word(current + 8, (flags & !BLOCK_REFCOUNT_MASK) | count);
-    if count == 0 {
+    if count_release(c.g, current + 8) {
         if flags & BLOCK_HAS_COPY_DISPOSE != 0 {
             c.g.call(c.word(current + 20), &[current])?;
         }
