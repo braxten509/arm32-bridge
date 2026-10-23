@@ -333,3 +333,69 @@ fn exported_blocks_live_as_long_as_their_host_owners() {
     dispose(kept);
     assert!(g.freed.lock().unwrap().contains(&heap));
 }
+
+extern "C" fn nothing(_: Id, _: Sel) {}
+
+#[test]
+fn a_game_objects_dealloc_releases_its_associated_objects_and_clears_weak_references() {
+    // Host root with counted retain/release and a dealloc; game class G32Dying on it.
+    let host_class = {
+        let mut rt = runtime::lock();
+        let class = rt.define_class("G32DyingRoot", 0, 16);
+        let meta = rt.classes[&class].partner;
+        for (target, name, imp) in [
+            (meta, "alloc", alloc as usize),
+            (class, "retain", retain as usize),
+            (class, "release", release as usize),
+            (class, "dealloc", nothing as usize),
+        ] {
+            let sel = rt.sel(name);
+            rt.add_method(target, sel, imp);
+        }
+        class
+    };
+    let g = Fake::new();
+    let (class, meta) = (g.alloc_permanent(20), g.alloc_permanent(20));
+    g.put_words(class, &[meta]);
+    let md = ObjcMetadata32 {
+        classes: vec![ObjcClass32 {
+            address: class,
+            name: "G32Dying".into(),
+            superclass: ClassTarget::External("G32DyingRoot".into()),
+            meta_address: meta,
+            meta_isa: ClassTarget::External("G32DyingRoot".into()),
+            meta_superclass: ClassTarget::External("G32DyingRoot".into()),
+            instance: ClassRo32 { instance_start: 8, instance_size: 16, ..Default::default() },
+            meta: ClassRo32 { flags: 1, ..Default::default() },
+        }],
+        ..Default::default()
+    };
+    let bridge: &'static Mutex<Bridge> = Box::leak(Box::new(Mutex::new(Bridge::new(&md).unwrap())));
+    install(bridge, g, &md).unwrap();
+    let ctx = Ctx { bridge, g };
+    let call = |name: &str, words: &[u32]| {
+        let w = |i: u32| words.get(i as usize).copied().unwrap_or(0);
+        call_function(&ctx, name, &w).unwrap() as u32
+    };
+    let sel = |name: &str| bridge.lock().unwrap().guest_selector(g, name);
+    let object = call("objc_msgSend", &[class, sel("alloc")]);
+    let survivor = call("objc_msgSend", &[class, sel("alloc")]);
+    // A retained associated value (a host object counting its releases).
+    let value_host = runtime::alloc_instance(host_class);
+    let value = bridge.lock().unwrap().guest_object(g, value_host).unwrap();
+    call("objc_setAssociatedObject", &[object, 0x55, value, 1]);
+    assert_eq!(events(value_host), ["retain"]);
+    // Weak references: initialized, moved, and one to another object.
+    let (weak, moved_from, moved_to, other) = (g.words(&[0]), g.words(&[0]), g.words(&[0]), g.words(&[0]));
+    call("objc_initWeak", &[weak, object]);
+    call("objc_initWeak", &[moved_from, object]);
+    call("objc_moveWeak", &[moved_to, moved_from]);
+    call("objc_storeWeak", &[other, survivor]);
+
+    call("objc_msgSend", &[object, sel("dealloc")]);
+    assert_eq!(events(value_host), ["retain", "release"], "the associated value was released once");
+    assert_eq!(call("objc_getAssociatedObject", &[object, 0x55]), 0);
+    assert_eq!(call("objc_loadWeak", &[weak]), 0, "weak references to it read nil");
+    assert_eq!(call("objc_loadWeak", &[moved_to]), 0, "including a moved one");
+    assert_eq!(call("objc_loadWeak", &[other]), survivor, "a weak reference to another object stays");
+}

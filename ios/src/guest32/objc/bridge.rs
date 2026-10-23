@@ -1023,6 +1023,7 @@ pub fn send_from_guest(
             if game_dealloc {
                 drop(b);
                 destruct(bridge, g, receiver)?;
+                super::functions::object_dying(&super::functions::Ctx { bridge, g }, receiver)?;
                 b = lock(bridge);
             }
             let mark = wrapper_mark();

@@ -93,28 +93,20 @@ pub fn functions() -> &'static [(&'static str, ObjcFn)] {
         ("objc_retainAutoreleaseReturnValue", |c, w| ok(c.autorelease(c.retain(w(0))?)?)),
         ("objc_retainBlock", |c, w| ok(block_copy(c, w(0))?)),
         ("objc_storeStrong", store_strong),
-        // Weak references are plain stores here (not zeroed when the object goes).
-        ("objc_storeWeak", |c, w| {
-            c.set_word(w(0), w(1));
-            ok(w(1))
-        }),
-        ("objc_initWeak", |c, w| {
-            c.set_word(w(0), w(1));
-            ok(w(1))
-        }),
+        // Weak references: the slots are listed per object and cleared when a
+        // game object deallocs (object_dying).
+        ("objc_storeWeak", |c, w| ok(store_weak(c, w(0), w(1)))),
+        ("objc_initWeak", |c, w| ok(store_weak(c, w(0), w(1)))),
         ("objc_loadWeak", |c, w| ok(c.word(w(0)))),
         ("objc_loadWeakRetained", |c, w| ok(c.retain(c.word(w(0)))?)),
-        ("objc_destroyWeak", |c, w| {
-            c.set_word(w(0), 0);
-            ok(0)
-        }),
+        ("objc_destroyWeak", |c, w| ok(store_weak(c, w(0), 0))),
         ("objc_copyWeak", |c, w| {
-            c.set_word(w(0), c.word(w(1)));
+            store_weak(c, w(0), c.word(w(1)));
             ok(0)
         }),
         ("objc_moveWeak", |c, w| {
-            c.set_word(w(0), c.word(w(1)));
-            c.set_word(w(1), 0);
+            store_weak(c, w(0), c.word(w(1)));
+            store_weak(c, w(1), 0);
             ok(0)
         }),
         ("objc_getProperty", get_property),
@@ -149,16 +141,7 @@ pub fn functions() -> &'static [(&'static str, ObjcFn)] {
         ("dispatch_retain", |_, _| ok(0)),
         ("objc_getAssociatedObject", |_, w| ok(with_associated(|m| m.get(&(w(0), w(1))).map_or(0, |v| v.0)))),
         ("objc_setAssociatedObject", set_associated),
-        ("objc_removeAssociatedObjects", |c, w| {
-            let removed: Vec<(u32, u32)> = with_associated(|m| {
-                let keys: Vec<_> = m.keys().filter(|k| k.0 == w(0)).copied().collect();
-                keys.iter().filter_map(|k| m.remove(k)).collect()
-            });
-            for old in removed {
-                release_associated(c, old)?;
-            }
-            ok(0)
-        }),
+        ("objc_removeAssociatedObjects", |c, w| remove_associated(c, w(0)).map(|_| 0)),
         ("objc_getClass", |c, w| ok(class_named(c, &c.cstr(w(0))))),
         ("objc_lookUpClass", |c, w| ok(class_named(c, &c.cstr(w(0))))),
         ("objc_getMetaClass", |c, w| {
@@ -356,6 +339,55 @@ pub(super) fn describe_exception(c: &Ctx, exception: u32) -> String {
 fn with_associated<R>(f: impl FnOnce(&mut HashMap<(u32, u32), (u32, u32)>) -> R) -> R {
     static MAP: Mutex<Option<HashMap<(u32, u32), (u32, u32)>>> = Mutex::new(None);
     f(MAP.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new))
+}
+
+/// Removes every value associated with `object`, releasing each by its policy.
+fn remove_associated(c: &Ctx, object: u32) -> Result<(), String> {
+    let removed: Vec<(u32, u32)> = with_associated(|m| {
+        let keys: Vec<_> = m.keys().filter(|k| k.0 == object).copied().collect();
+        keys.iter().filter_map(|k| m.remove(k)).collect()
+    });
+    for old in removed {
+        release_associated(c, old)?;
+    }
+    Ok(())
+}
+
+/// Object -> the guest slots holding weak references to it.
+fn with_weak<R>(f: impl FnOnce(&mut HashMap<u32, Vec<u32>>) -> R) -> R {
+    static MAP: Mutex<Option<HashMap<u32, Vec<u32>>>> = Mutex::new(None);
+    f(MAP.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new))
+}
+
+/// objc_storeWeak(location, object): the slot now refers weakly to `object`.
+fn store_weak(c: &Ctx, location: u32, object: u32) -> u32 {
+    with_weak(|m| {
+        let old = c.word(location);
+        if let Some(slots) = m.get_mut(&old) {
+            slots.retain(|&s| s != location);
+            if slots.is_empty() {
+                m.remove(&old);
+            }
+        }
+        if object != 0 {
+            m.entry(object).or_default().push(location);
+        }
+        c.set_word(location, object);
+    });
+    object
+}
+
+/// What Apple's objc_destructInstance does after the C++ destructors when a
+/// game object deallocs: its associated objects are released and weak
+/// references to it read nil from now on.
+pub(super) fn object_dying(c: &Ctx, object: u32) -> Result<(), String> {
+    remove_associated(c, object)?;
+    for slot in with_weak(|m| m.remove(&object)).unwrap_or_default() {
+        if c.word(slot) == object {
+            c.set_word(slot, 0);
+        }
+    }
+    Ok(())
 }
 
 /// A replaced or removed value is released by the policy it was set with.
