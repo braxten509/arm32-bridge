@@ -209,34 +209,31 @@ fn listening(queue: Id, observer: Id) -> bool {
 }
 
 /// Brings the queue's observers up to date on the main run loop, as
-/// StoreKit does: each hears the unfinished transactions (as they were when
-/// this runs) it hasn't heard yet, then the end of a waiting restore. One
-/// that stops listening meanwhile hears nothing more; a restore that ends
-/// with nobody listening waits for the first observer.
+/// StoreKit does: each hears the transactions still unfinished at its turn
+/// that it hasn't heard yet, then the end of a waiting restore. One that
+/// stops listening meanwhile hears nothing more; a restore's end waits
+/// until some observer has heard it.
 fn tell_later(queue: Id) {
     post(Work::Native(Box::new(move || {
-        let (observers, unfinished, restore_ended) = with_queue(queue, |q| {
-            let restore_ended = q.restore_pending && !q.observers.is_empty();
-            if restore_ended {
-                q.restore_pending = false;
-            }
-            (q.observers.clone(), q.unfinished.clone(), restore_ended)
-        });
+        let observers = with_queue(queue, |q| q.observers.clone());
+        let mut restore_heard = false;
         for observer in observers {
-            let news: Vec<Id> = with_queue(queue, |q| {
+            let (news, restore_pending) = with_queue(queue, |q| {
                 if !q.observers.contains(&observer) {
-                    return Vec::new();
+                    return (Vec::new(), false);
                 }
-                let news: Vec<Id> = unfinished.iter().copied().filter(|&t| !q.told.contains(&(observer, t))).collect();
+                let news: Vec<Id> = q.unfinished.iter().copied().filter(|&t| !q.told.contains(&(observer, t))).collect();
                 q.told.extend(news.iter().map(|&t| (observer, t)));
-                news
+                (news, q.restore_pending)
             });
             let updated = "paymentQueue:updatedTransactions:";
             if !news.is_empty() && runtime::responds(observer, updated) {
                 runtime::send(observer, updated, &[queue, collections::array_from(&news)]);
             }
             let finished = "paymentQueueRestoreCompletedTransactionsFinished:";
-            if restore_ended && listening(queue, observer) && runtime::responds(observer, finished) {
+            if (restore_pending || restore_heard) && listening(queue, observer) && runtime::responds(observer, finished) {
+                with_queue(queue, |q| q.restore_pending = false);
+                restore_heard = true;
                 runtime::send(observer, finished, &[queue]);
             }
         }
@@ -712,25 +709,42 @@ mod tests {
         let (_guard, listener) = start();
         let rude_class = runtime::class_named("StoreTestRude");
         // The first observer finishes what it hears and leaves; one added
-        // (twice) before the news arrives hears it once, and no replay of
-        // what was finished meanwhile.
+        // (twice) before the news arrives hears it once while unfinished,
+        // and nothing once finished (nor is it remembered as told).
         let queue = runtime::alloc_instance(runtime::class_named("SKPaymentQueue"));
         let rude = runtime::alloc_instance(rude_class);
+        runtime::send(queue, "addTransactionObserver:", &[listener]);
         runtime::send(queue, "addTransactionObserver:", &[rude]);
         let payment = runtime::send(runtime::class_named("SKPayment"), "paymentWithProductIdentifier:", &[string::make("com.game.dlc1")]);
         runtime::send(queue, "addPayment:", &[payment]);
         runtime::send(queue, "addTransactionObserver:", &[listener]);
-        runtime::send(queue, "addTransactionObserver:", &[listener]);
         assert_eq!(heard_by(listener).iter().map(|h| h.0).collect::<Vec<_>>(), ["updated"]);
         assert_eq!(heard_by(rude).iter().map(|h| h.0).collect::<Vec<_>>(), ["updated"]);
+        let late = runtime::alloc_instance(runtime::class_named("StoreTestListener"));
+        runtime::send(queue, "addTransactionObserver:", &[late]);
+        let payment = runtime::send(runtime::class_named("SKPayment"), "paymentWithProductIdentifier:", &[string::make("com.game.dlc2")]);
+        runtime::send(queue, "addPayment:", &[payment]);
+        let rude = runtime::alloc_instance(rude_class);
+        runtime::send(queue, "addTransactionObserver:", &[rude]);
+        // Order now: listener, late, rude, after. Rude finishes it once the
+        // two before it heard it; the one after it is too late.
+        let after = runtime::alloc_instance(runtime::class_named("StoreTestListener"));
+        runtime::send(queue, "addTransactionObserver:", &[after]);
+        assert_eq!(heard_by(late).len(), 1);
+        assert!(heard_by(after).is_empty(), "finished before its turn");
         assert!(collections::array_items(runtime::send(queue, "transactions", &[])).is_empty());
+        assert!(with_queue(queue, |q| q.told.is_empty()), "nothing told is kept once finished");
 
-        // One that leaves while hearing a restore doesn't hear it finish.
+        // One that leaves while hearing a restore doesn't hear it finish;
+        // the observer that comes next does.
         let queue = runtime::alloc_instance(runtime::class_named("SKPaymentQueue"));
         let rude = runtime::alloc_instance(rude_class);
         runtime::send(queue, "addTransactionObserver:", &[rude]);
         runtime::send(queue, "restoreCompletedTransactions", &[]);
         assert_eq!(heard_by(rude).iter().map(|h| h.0).collect::<Vec<_>>(), ["updated"]);
+        let next = runtime::alloc_instance(runtime::class_named("StoreTestListener"));
+        runtime::send(queue, "addTransactionObserver:", &[next]);
+        assert_eq!(heard_by(next).iter().map(|h| h.0).collect::<Vec<_>>(), ["restore finished"]);
 
         // A restore nobody heard goes to the first observer that comes.
         let queue = runtime::alloc_instance(runtime::class_named("SKPaymentQueue"));
