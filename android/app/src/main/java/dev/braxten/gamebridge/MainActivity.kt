@@ -110,6 +110,9 @@ private val Muted = Color(0xFF9AA0AD)
 private val Track = Color(0xFF2B2F3F)
 private val ErrorText = Color(0xFFFF8A80)
 private val NoticeText = Color(0xFFFFCC80)
+/** A card's button for a step before the game can be played (Move, Convert, Install…): amber, with dark text. */
+private val StepColor = Color(0xFFE0A040)
+private val StepText = Color(0xFF1B1406)
 
 /** The space around a checkbox's box inside its 48 dp touch area: a checkbox row moves left by it, so the box lines up with the text above. */
 private val CheckboxInset = 14.dp
@@ -709,27 +712,13 @@ class MainActivity : ComponentActivity() {
             // Every state uses the same 36dp slot, so cards keep their height while converting.
             Box(Modifier.fillMaxWidth().height(36.dp), contentAlignment = Alignment.Center) {
                 when {
-                    outside && state != CardState.Done && state !is CardState.Working -> Button(
-                        onClick = onMove,
-                        enabled = !busy,
-                        colors = ButtonDefaults.buttonColors(containerColor = Accent),
-                        contentPadding = PaddingValues(0.dp),
-                        modifier = Modifier.fillMaxSize(),
-                    ) { Text("Move", fontSize = 13.sp) }
+                    outside && state != CardState.Done && state !is CardState.Working -> CardButton("Move", play = false, enabled = !busy, onClick = onMove)
                     else -> when (state) {
-                    CardState.Ready -> Button(
-                        onClick = onConvert,
+                    CardState.Ready -> when (game.action) {
                         // Playing an iPhone game doesn't wait for a conversion.
-                        enabled = !busy || game.action == Action.PlayIphone,
-                        colors = ButtonDefaults.buttonColors(containerColor = Accent),
-                        contentPadding = PaddingValues(0.dp),
-                        modifier = Modifier.fillMaxSize(),
-                    ) {
-                        Text(when (game.action) {
-                            Action.Install -> "Install"
-                            Action.PlayIphone -> "Play"
-                            Action.Convert -> "Convert"
-                        }, fontSize = 13.sp)
+                        Action.PlayIphone -> CardButton("Play", play = true, enabled = true, onClick = onConvert)
+                        Action.Install -> CardButton("Install", play = false, enabled = !busy, onClick = onConvert)
+                        Action.Convert -> CardButton("Convert", play = false, enabled = !busy, onClick = onConvert)
                     }
                     is CardState.Working -> Column(Modifier.fillMaxWidth()) {
                         Text("${state.progress.percent}% · ${state.progress.text}", color = Muted, fontSize = 12.sp, maxLines = 1,
@@ -742,28 +731,29 @@ class MainActivity : ComponentActivity() {
                             modifier = Modifier.fillMaxWidth().height(4.dp),
                         )
                     }
-                    CardState.Done -> OutlinedButton(
-                        onClick = onOpen,
-                        contentPadding = PaddingValues(0.dp),
-                        modifier = Modifier.fillMaxSize(),
-                    ) { Text("Open", color = AccentText, fontSize = 13.sp) }
-                    CardState.OtherCopy -> Button(
-                        onClick = onReplace,
-                        enabled = !busy,
-                        colors = ButtonDefaults.buttonColors(containerColor = Accent),
-                        contentPadding = PaddingValues(0.dp),
-                        modifier = Modifier.fillMaxSize(),
-                    ) { Text("Replace", fontSize = 13.sp) }
-                    is CardState.Failed -> OutlinedButton(
-                        onClick = onConvert,
-                        enabled = !busy,
-                        contentPadding = PaddingValues(0.dp),
-                        modifier = Modifier.fillMaxSize(),
-                    ) { Text("Try again", color = AccentText, fontSize = 13.sp) }
+                    CardState.Done -> CardButton("Play", play = true, enabled = true, onClick = onOpen)
+                    CardState.OtherCopy -> CardButton("Replace", play = false, enabled = !busy, onClick = onReplace)
+                    is CardState.Failed -> CardButton("Try again", play = false, enabled = !busy, onClick = onConvert)
                     }
                 }
             }
         }
+    }
+
+    /**
+     * A card's button, filling its slot: Play in the accent blue, every step before a game can be
+     * played (Move, Convert, Install, Replace, Try again) in amber.
+     */
+    @Composable
+    private fun CardButton(text: String, play: Boolean, enabled: Boolean, onClick: () -> Unit) {
+        Button(
+            onClick = onClick,
+            enabled = enabled,
+            colors = if (play) ButtonDefaults.buttonColors(containerColor = Accent, contentColor = Color.White)
+                else ButtonDefaults.buttonColors(containerColor = StepColor, contentColor = StepText),
+            contentPadding = PaddingValues(0.dp),
+            modifier = Modifier.fillMaxSize(),
+        ) { Text(text, fontSize = 13.sp) }
     }
 
     /**
