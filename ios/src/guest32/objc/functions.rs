@@ -625,6 +625,12 @@ fn flags_word(g: &dyn GuestSide, at: u32) -> &std::sync::atomic::AtomicU32 {
     unsafe { &*(g.host_address(at) as *const std::sync::atomic::AtomicU32) }
 }
 
+/// The flags word of a heap block or __block variable, read atomically
+/// (its count may be changing on another thread).
+pub fn load_flags(g: &dyn GuestSide, at: u32) -> u32 {
+    flags_word(g, at).load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// One more reference (libclosure's latching increment): a saturated count
 /// stays as it is.
 pub fn count_retain(g: &dyn GuestSide, at: u32) {
@@ -651,7 +657,7 @@ pub fn block_copy(c: &Ctx, block: u32) -> Result<u32, String> {
     if block == 0 {
         return Ok(0);
     }
-    let flags = c.word(block + 4);
+    let flags = load_flags(c.g, block + 4);
     if flags & BLOCK_NEEDS_FREE != 0 {
         count_retain(c.g, block + 4);
         return Ok(block);
@@ -689,7 +695,7 @@ pub fn release_guest_block(g: &dyn GuestSide, block: u32) -> Result<(), String> 
         return Ok(());
     }
     let word = |addr: u32| u32::from_le_bytes(g.read(addr, 4).try_into().unwrap());
-    let flags = word(block + 4);
+    let flags = load_flags(g, block + 4);
     if flags & BLOCK_NEEDS_FREE == 0 {
         return Ok(());
     }
@@ -736,7 +742,7 @@ fn block_object_dispose(c: &Ctx, w: Words) -> Result<u64, String> {
 
 fn byref_copy(c: &Ctx, byref: u32) -> Result<u32, String> {
     let current = c.word(byref + 4);
-    let flags = c.word(current + 8);
+    let flags = load_flags(c.g, current + 8);
     if flags & BLOCK_NEEDS_FREE != 0 {
         count_retain(c.g, current + 8);
         return Ok(current);
@@ -756,7 +762,7 @@ fn byref_copy(c: &Ctx, byref: u32) -> Result<u32, String> {
 
 fn byref_release(c: &Ctx, byref: u32) -> Result<(), String> {
     let current = c.word(byref + 4);
-    let flags = c.word(current + 8);
+    let flags = load_flags(c.g, current + 8);
     if flags & BLOCK_NEEDS_FREE == 0 {
         return Ok(());
     }

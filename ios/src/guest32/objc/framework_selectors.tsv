@@ -176,6 +176,10 @@ distantPast	@@:
 domain	@@:
 doubleValue	d@:
 drain	v@:
+drawAtPoint:forWidth:withFont:lineBreakMode:	{CGSize=ff}@:{CGPoint=ff}f@i
+drawAtPoint:withFont:	{CGSize=ff}@:{CGPoint=ff}@
+drawInRect:withFont:	{CGSize=ff}@:{CGRect={CGPoint=ff}{CGSize=ff}}@
+drawInRect:withFont:lineBreakMode:	{CGSize=ff}@:{CGRect={CGPoint=ff}{CGSize=ff}}@i
 drawInRect:withFont:lineBreakMode:alignment:	{CGSize=ff}@:{CGRect={CGPoint=ff}{CGSize=ff}}@ii
 encodeBool:forKey:	v@:c@
 encodeDouble:forKey:	v@:d@
@@ -488,6 +492,7 @@ sizeToFit	v@:
 sizeWithFont:	{CGSize=ff}@:@
 sizeWithFont:constrainedToSize:	{CGSize=ff}@:@{CGSize=ff}
 sizeWithFont:constrainedToSize:lineBreakMode:	{CGSize=ff}@:@{CGSize=ff}i
+sizeWithFont:forWidth:lineBreakMode:	{CGSize=ff}@:@fi
 sleepForTimeInterval:	v@:d
 smallSystemFontSize	f@:
 sortedArrayUsingComparator:	@@:@?

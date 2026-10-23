@@ -131,7 +131,7 @@ impl Outline {
         self.arc(center, radius, start, end, cross < 0.0, map);
     }
 
-    fn rect(&mut self, r: Rect, map: &dyn Fn((f64, f64)) -> (f64, f64)) {
+    pub(super) fn rect(&mut self, r: Rect, map: &dyn Fn((f64, f64)) -> (f64, f64)) {
         let (x0, y0, x1, y1) = (r.origin.x, r.origin.y, r.origin.x + r.size.width, r.origin.y + r.size.height);
         self.figures.push(Figure { points: [(x0, y0), (x1, y0), (x1, y1), (x0, y1)].map(map).to_vec(), closed: true });
     }
@@ -282,7 +282,7 @@ impl Canvas {
         self.paint_mask(&mask, self.state.stroke);
     }
 
-    fn clip_to(&mut self, outline: &Outline, even_odd: bool) {
+    pub(super) fn clip_to(&mut self, outline: &Outline, even_odd: bool) {
         let mut mask = coverage(&outline.edges(), even_odd, self.width, self.height);
         for value in mask.iter_mut() {
             *value = value.min(1.0);

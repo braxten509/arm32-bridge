@@ -197,7 +197,7 @@ fn wrapper_guest(host: usize) -> Option<u32> {
 
 /// Takes a reference to a guest heap block (a no-op for global blocks).
 fn retain_guest_block(g: &dyn GuestSide, block: u32) {
-    if u32_at(g, block + 4) & BLOCK_NEEDS_FREE != 0 {
+    if super::functions::load_flags(g, block + 4) & BLOCK_NEEDS_FREE != 0 {
         super::functions::count_retain(g, block + 4);
     }
 }
@@ -1131,7 +1131,7 @@ pub fn dispatch_from_host(bridge: &Mutex<Bridge>, g: &dyn GuestSide, frame: &mut
     let host_self = frame.x[0] as usize;
     if let Some(block) = wrapper_guest(host_self) {
         // A host call of a guest block: the block's own signature says how.
-        let flags = u32_at(g, block + 4);
+        let flags = super::functions::load_flags(g, block + 4);
         let descriptor = u32_at(g, block + 16);
         if flags & BLOCK_HAS_SIGNATURE == 0 {
             return Err(format!("the host called guest block {block:#x}, which has no type signature"));

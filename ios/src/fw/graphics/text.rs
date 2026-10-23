@@ -6,8 +6,9 @@
 //! name), else the system's sans-serif font (its bold for bold names).
 //! Glyph outlines go through the CTM into the context's path filler
 //! (shapes.rs), so text is anti-aliased, clipped and transformed like any
-//! other shape, upright in UIKit's flipped coordinates; the context's text
-//! drawing mode picks fill, stroke or both. Lines wrap at words (or
+//! other shape, upright in UIKit's flipped coordinates, and cut at the
+//! rect's edges; the context's text drawing mode picks fill, stroke or
+//! both, and its clip modes add the glyphs to the clip. Lines wrap at words (or
 //! letters) and stop at the last line that fits; the truncating modes end
 //! with "…". With no font file at all, sizes use the same estimate as
 //! controls::text_size and nothing is drawn.
@@ -237,12 +238,13 @@ fn truncate(font: &Font, text: &[char], width: f64, mode: isize) -> Vec<char> {
     }
 }
 
-/// The lines UIKit shows of `text` in `width` (infinite: no wrapping), at
-/// most `max_lines` of them (0: any number; 1: the first paragraph alone).
-fn lay_out(font: &Font, text: &str, width: f64, max_lines: usize, mode: isize) -> Vec<Vec<char>> {
+/// The lines UIKit shows of `text` in `width` (infinite: no wrapping): the
+/// first paragraph alone for the single-line methods, else the wrapped
+/// lines, at most `max_lines` of them (0: any number).
+fn lay_out(font: &Font, text: &str, width: f64, single_line: bool, max_lines: usize, mode: isize) -> Vec<Vec<char>> {
     let paragraphs: Vec<Vec<char>> = text.split('\n').map(|p| p.chars().filter(|&c| c != '\r').collect()).collect();
     let truncating = matches!(mode, HEAD_TRUNCATION | TAIL_TRUNCATION | MIDDLE_TRUNCATION);
-    if max_lines == 1 {
+    if single_line {
         let first = &paragraphs[0];
         return vec![if truncating { truncate(font, first, width, mode) } else { first.clone() }];
     }
@@ -347,17 +349,20 @@ impl ttf_parser::OutlineBuilder for Pen<'_> {
 
 impl Canvas {
     /// Lines of text in `rect` (UIKit's coordinates: its top is the first
-    /// line's top), aligned in its width, filled and/or stroked as the
-    /// context's text drawing mode says.
+    /// line's top), aligned in its width and cut at its edges, filled
+    /// and/or stroked as the context's text drawing mode says; the clip
+    /// modes then add the glyphs' shapes to the context's clip.
     fn draw_text(&mut self, face: &Face, font: &Font, lines: &[Vec<char>], rect: Rect, align: isize) {
-        // CGTextDrawingMode: fill, stroke, fill+stroke, invisible; the clip variants draw the same.
-        let (fill, stroke) = match self.state.text_mode & 3 {
+        // CGTextDrawingMode: fill, stroke, fill+stroke, invisible, then the same four adding to the clip.
+        let mode = self.state.text_mode;
+        let (fill, stroke) = match mode & 3 {
             0 => (true, false),
             1 => (false, true),
             2 => (true, true),
             _ => (false, false),
         };
-        if !fill && !stroke {
+        let clip = (4..=7).contains(&mode);
+        if !fill && !stroke && !clip {
             return;
         }
         let mut outline = shapes::Outline::default();
@@ -377,11 +382,27 @@ impl Canvas {
                 pen.x += font.advance(c);
             }
         }
-        if fill {
-            self.fill_outline(&outline, false);
+        if fill || stroke {
+            // Painted only inside the rect (an unbounded side stays open;
+            // the one line always shown may be taller than the rect).
+            let saved = self.state.clip.clone();
+            let open = |start: f64, length: f64| if length.is_finite() { (start, length) } else { (start - 1e6, 2e6) };
+            let (x, width) = open(rect.origin.x, rect.size.width);
+            let (y, height) = open(rect.origin.y, rect.size.height.max(lines.len() as f64 * font.line_height()));
+            let mut bounds = shapes::Outline::default();
+            let ctm = self.state.ctm;
+            bounds.rect(Rect::new(x, y, width, height), &|(x, y)| geometry::apply(ctm, x, y));
+            self.clip_to(&bounds, false);
+            if fill {
+                self.fill_outline(&outline, false);
+            }
+            if stroke {
+                self.stroke_outline(&outline);
+            }
+            self.state.clip = saved;
         }
-        if stroke {
-            self.stroke_outline(&outline);
+        if clip {
+            self.clip_to(&outline, false);
         }
     }
 }
@@ -390,8 +411,7 @@ impl Canvas {
 fn draw(text: Id, rect: Rect, font: Id, mode: isize, align: isize, single_line: bool) -> Size {
     let font = Font::of(font);
     let text = string::get(text);
-    let max_lines = if single_line { 1 } else { lines_in(&font, rect.size.height) };
-    let lines = lay_out(&font, &text, rect.size.width, max_lines, mode);
+    let lines = lay_out(&font, &text, rect.size.width, single_line, lines_in(&font, rect.size.height), mode);
     if let Some(face) = font.face {
         if let Some(mut c) = canvas("-[NSString drawInRect:withFont:]", current_context()) {
             c.draw_text(face, &font, &lines, rect, align);
@@ -403,8 +423,7 @@ fn draw(text: Id, rect: Rect, font: Id, mode: isize, align: isize, single_line: 
 fn measure(text: Id, font: Id, size: Size, mode: isize, single_line: bool) -> Size {
     let font = Font::of(font);
     let text = string::get(text);
-    let max_lines = if single_line { 1 } else { lines_in(&font, size.height) };
-    let lines = lay_out(&font, &text, size.width, max_lines, mode);
+    let lines = lay_out(&font, &text, size.width, single_line, lines_in(&font, size.height), mode);
     size_of(&font, &text, &lines, size.width)
 }
 
@@ -438,21 +457,24 @@ extern "C" fn draw_in_rect_mode_alignment(this: Id, _: Sel, rect: Rect, font: Id
     draw(this, rect, font, mode, align, false)
 }
 
+/// The NSString methods this file adds (32-bit games reach them through
+/// framework_selectors.tsv, which needs a row for each).
+fn selectors() -> [(&'static str, usize); 9] {
+    [
+        ("sizeWithFont:", size_with_font as usize),
+        ("sizeWithFont:constrainedToSize:", size_constrained as usize),
+        ("sizeWithFont:constrainedToSize:lineBreakMode:", size_constrained_mode as usize),
+        ("sizeWithFont:forWidth:lineBreakMode:", size_for_width as usize),
+        ("drawAtPoint:withFont:", draw_at_point as usize),
+        ("drawAtPoint:forWidth:withFont:lineBreakMode:", draw_at_point_for_width as usize),
+        ("drawInRect:withFont:", draw_in_rect as usize),
+        ("drawInRect:withFont:lineBreakMode:", draw_in_rect_mode as usize),
+        ("drawInRect:withFont:lineBreakMode:alignment:", draw_in_rect_mode_alignment as usize),
+    ]
+}
+
 pub fn register() {
-    methods(
-        runtime::class_named("NSString"),
-        &[
-            ("sizeWithFont:", size_with_font as usize),
-            ("sizeWithFont:constrainedToSize:", size_constrained as usize),
-            ("sizeWithFont:constrainedToSize:lineBreakMode:", size_constrained_mode as usize),
-            ("sizeWithFont:forWidth:lineBreakMode:", size_for_width as usize),
-            ("drawAtPoint:withFont:", draw_at_point as usize),
-            ("drawAtPoint:forWidth:withFont:lineBreakMode:", draw_at_point_for_width as usize),
-            ("drawInRect:withFont:", draw_in_rect as usize),
-            ("drawInRect:withFont:lineBreakMode:", draw_in_rect_mode as usize),
-            ("drawInRect:withFont:lineBreakMode:alignment:", draw_in_rect_mode_alignment as usize),
-        ],
-    );
+    methods(runtime::class_named("NSString"), &selectors());
 }
 
 #[cfg(test)]
@@ -480,11 +502,18 @@ mod tests {
     /// 64x64 bitmap flipped the way cocos2d flips it before UIGraphicsPushContext.
     /// Gives the size it answered and which pixels it painted (rows from the top in memory).
     fn draw(text: &str, rect: Rect, mode: isize, align: isize) -> (Size, Vec<Vec<bool>>) {
+        render(text, rect, mode, align, 0, |_| {})
+    }
+
+    /// The same with a CGTextDrawingMode, and `after` run on the context
+    /// before its pixels are read.
+    fn render(text: &str, rect: Rect, mode: isize, align: isize, text_mode: i32, after: impl FnOnce(&mut Canvas)) -> (Size, Vec<Vec<bool>>) {
         setup();
         let context = bitmap_context_create(std::ptr::null_mut(), W, H, 8, 0, space_object(Space::Rgb), PREMULTIPLIED_LAST);
         context_translate_ctm(context, 0.0, H as f64);
         context_scale_ctm(context, 1.0, -1.0);
         context_set_rgb_fill_color(context, 1.0, 0.0, 0.0, 1.0);
+        locked(context).unwrap().state.text_mode = text_mode;
         graphics_push_context(context);
         let s = runtime::sel("drawInRect:withFont:lineBreakMode:alignment:");
         let string = string::make(text);
@@ -493,6 +522,7 @@ mod tests {
         let size = f(string, s, rect, system_font(20.0), mode, align);
         graphics_pop_context();
         let mut c = locked(context).unwrap();
+        after(&mut c);
         let (bytes_per_row, memory) = (c.bytes_per_row, c.memory().to_vec());
         let painted = (0..H).map(|row| (0..W).map(|x| memory[row * bytes_per_row + x * 4 + 3] > 0).collect()).collect();
         (size, painted)
@@ -539,5 +569,50 @@ mod tests {
         let f: extern "C" fn(Id, Sel, Id, Size, isize) -> Size = unsafe { std::mem::transmute(imp) };
         let measured = f(string, s, system_font(20.0), narrow.size, 0);
         assert_eq!((measured.width, measured.height), (two.width, two.height));
+    }
+
+    /// 32-bit games reach these methods only through a framework_selectors.tsv row.
+    #[test]
+    fn every_string_drawing_selector_has_a_32_bit_type_encoding() {
+        let table = crate::guest32::objc::selectors::FrameworkSelectors::builtin();
+        let missing: Vec<&str> = selectors().iter().map(|&(name, _)| name).filter(|name| table.get(name).is_none()).collect();
+        assert!(missing.is_empty(), "no framework_selectors.tsv row for {missing:?}");
+    }
+
+    /// A rect one line high wraps first and keeps the first wrapped line
+    /// (not the whole paragraph); text never paints outside the rect's width.
+    #[test]
+    fn rect_text_wraps_before_the_line_limit_and_stays_in_its_width() {
+        let (one, _) = draw("one", Rect::new(0.0, 0.0, W as f64, H as f64), 0, 0);
+        let short = Rect::new(0.0, 0.0, one.width + 2.0, one.height);
+        let (both, _) = draw("one two", short, 0, 0);
+        assert_eq!((both.width, both.height), (one.width, one.height), "only \"one\" fits");
+        // One letter is always drawn, even wider than the rect: cut at its edge.
+        let (_, painted) = draw("W", Rect::new(0.0, 0.0, 6.0, H as f64), 0, 0);
+        let x = columns(&painted);
+        assert!(!x.is_empty() && *x.last().unwrap() < 6, "painted past the rect: columns {x:?}");
+    }
+
+    /// The clip text modes (4-7) add the glyphs to the context's clip;
+    /// mode 7 paints nothing itself.
+    #[test]
+    fn clip_text_modes_clip_to_the_glyphs() {
+        let all = Rect::new(0.0, 0.0, W as f64, H as f64);
+        let fill_all = |c: &mut Canvas| {
+            let mut square = shapes::Outline::default();
+            for p in [(0.0, 0.0), (W as f64, 0.0), (W as f64, H as f64), (0.0, H as f64)] {
+                square.line_to(p);
+            }
+            square.close();
+            c.fill_outline(&square, false);
+        };
+        let (_, text) = render("T", all, 0, 0, 7, |_| {});
+        assert!(rows(&text).is_empty(), "mode 7 painted");
+        let (_, filled) = render("T", all, 0, 0, 7, fill_all);
+        let (_, drawn) = draw("T", all, 0, 0);
+        let count = |p: &[Vec<bool>]| p.iter().flatten().filter(|&&b| b).count();
+        assert!(count(&filled) > 0 && count(&filled) <= count(&drawn) + 8, "fill after mode 7: {} pixels, the T has {}", count(&filled), count(&drawn));
+        let (_, filled) = render("T", all, 0, 0, 4, fill_all);
+        assert!(count(&filled) <= count(&drawn) + 8, "fill after mode 4: {} pixels", count(&filled));
     }
 }

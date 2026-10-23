@@ -535,6 +535,7 @@ fn detach(view: Id) {
     if parent != 0 {
         view_state(parent).subviews.retain(|&v| v != view);
         view_state(view).superview = 0;
+        set_needs_layout(parent);
     }
 }
 
@@ -1780,6 +1781,10 @@ mod tests {
         assert_eq!(take(), [(child, "layoutSubviews")]);
         layout_pass();
         assert!(take().is_empty());
+        // Removing a subview lays out the view it left.
+        runtime::send(child, "removeFromSuperview", &[]);
+        layout_pass();
+        assert_eq!(take(), [(controller, "viewWillLayoutSubviews"), (root, "layoutSubviews"), (controller, "viewDidLayoutSubviews")]);
     }
 
     #[test]
