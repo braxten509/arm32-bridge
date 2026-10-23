@@ -61,7 +61,8 @@
 //! built for Apple's ABI, so all its imports go through this table like the
 //! program's; the built-in libz is bionic's, so its C library imports use
 //! Android's handlers (bionic layouts and errno numbers). Their exports bind
-//! directly to the program's imports of the same name.
+//! directly to the program's imports of the same name, except libz's calls
+//! that take game callbacks (zlib.rs: libz keeps values in r9 across them).
 
 mod crypto;
 pub mod fw;
@@ -70,6 +71,7 @@ mod locale;
 pub mod objc;
 #[cfg(test)]
 pub(crate) mod tests;
+mod zlib;
 
 use arm32_bridge::ios32;
 use arm32_bridge::mem;
@@ -166,6 +168,7 @@ pub fn register_all() {
     fw::register();
     locale::register();
     crypto::register();
+    zlib::register();
     objc::wire::register();
 }
 
@@ -216,7 +219,7 @@ pub fn run(app_dir: &str, program_path: &str) -> Result<(), String> {
     runtime::init(env_on("IOS_TRACE_CALLS"));
     let _gil = runtime::hold_gil();
     let uc = runtime::engine();
-    arm32_bridge::elf::open_built_in(uc, "libz.so")?;
+    zlib::open(uc)?;
     open_cxx_library(uc)?;
     objc::exceptions::setup(uc)?;
     let loaded = ios32::load(&program)?;
