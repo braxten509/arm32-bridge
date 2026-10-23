@@ -361,7 +361,17 @@ mod tests {
         // game's types then say only 'f', read as CGFloat), so each needs a
         // row marked float or the host reads half of a double (1.0 becomes 0).
         let table = super::super::selectors::FrameworkSelectors::builtin();
-        for sel in ["setVolume:", "setPan:", "setRate:", "setFloat:forKey:", "setShadowOpacity:", "setRemoteParticipantVolume:"] {
+        let selectors = [
+            "setVolume:",
+            "setPan:",
+            "setRate:",
+            "setFloat:forKey:",
+            "setShadowOpacity:",
+            "setRemoteParticipantVolume:",
+            "setVolume:atTime:",
+            "setVolumeRampFromStartVolume:toEndVolume:timeRange:",
+        ];
+        for sel in selectors {
             let row = table.get(sel).unwrap_or_else(|| panic!("{sel} has no row"));
             assert!(row.real_float, "{sel} is not marked float");
         }

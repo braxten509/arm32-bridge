@@ -538,6 +538,94 @@ fn a_float_host_property_reaches_the_host_as_a_float() {
     assert_eq!(HOST_VOLUME.lock().unwrap().clone(), vec![(host, 1.0f32)]);
 }
 
+/// CMTime, the same on both sides (24 bytes).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MediaTime {
+    value: i64,
+    timescale: i32,
+    flags: u32,
+    epoch: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MediaTimeRange {
+    start: MediaTime,
+    duration: MediaTime,
+}
+
+/// What the host's volume methods were given: start and end volume, then
+/// the start time's value and timescale.
+static HOST_MIX: Mutex<Vec<(f32, f32, i64, i32)>> = Mutex::new(Vec::new());
+
+extern "C" fn host_set_volume_at(_this: Id, _: Sel, volume: f32, time: MediaTime) {
+    HOST_MIX.lock().unwrap().push((volume, volume, time.value, time.timescale));
+}
+
+extern "C" fn host_set_ramp(_this: Id, _: Sel, start: f32, end: f32, range: MediaTimeRange) {
+    HOST_MIX.lock().unwrap().push((start, end, range.start.value, range.start.timescale));
+}
+
+/// A CMTime as the guest passes it: six words.
+fn time_words(value: i64, timescale: i32) -> [u32; 6] {
+    [value as u32, (value >> 32) as u32, timescale as u32, 1, 0, 0]
+}
+
+#[test]
+fn a_float_volume_beside_a_media_time_reaches_the_host_as_a_float() {
+    // AVMutableAudioMixInputParameters' -setVolume:atTime: and
+    // -setVolumeRampFromStartVolume:toEndVolume:timeRange: take C floats.
+    // A game class answering the same names has only 'f' in its types, read
+    // as CGFloat (a double): the host would read half of it and get 0.
+    let mix = {
+        let mut rt = runtime::lock();
+        let class = rt.define_class("G32MixParameters", 0, 16);
+        let (at, ramp) = (rt.sel("setVolume:atTime:"), rt.sel("setVolumeRampFromStartVolume:toEndVolume:timeRange:"));
+        rt.add_method(class, at, host_set_volume_at as usize);
+        rt.add_method(class, ramp, host_set_ramp as usize);
+        class
+    };
+    let fake = Fake::new();
+    let (class, meta) = (fake.alloc_permanent(20), fake.alloc_permanent(20));
+    fake.write(class, &meta.to_le_bytes());
+    let md = ObjcMetadata32 {
+        classes: vec![ObjcClass32 {
+            address: class,
+            name: "G32MixInput".into(),
+            superclass: ClassTarget::External("NSObject".into()),
+            meta_address: meta,
+            meta_isa: ClassTarget::External("NSObject".into()),
+            meta_superclass: ClassTarget::External("NSObject".into()),
+            instance: ClassRo32 {
+                instance_start: 8,
+                instance_size: 16,
+                methods: vec![
+                    method("setVolume:atTime:", "v36@0:4f8{?=qiIq}12", 0x3001),
+                    method("setVolumeRampFromStartVolume:toEndVolume:timeRange:", "v64@0:4f8f12{?={?=qiIq}{?=qiIq}}16", 0x3003),
+                ],
+                ..Default::default()
+            },
+            meta: ClassRo32 { flags: 1, ..Default::default() },
+        }],
+        ..Default::default()
+    };
+    let bridge = Mutex::new(Bridge::new(&md).unwrap());
+    install(&bridge, fake, &md).unwrap();
+    let host = runtime::alloc_instance(mix);
+    let proxy = bridge.lock().unwrap().guest_object(fake, host).unwrap();
+    let at = bridge.lock().unwrap().guest_selector(fake, "setVolume:atTime:");
+    let ramp = bridge.lock().unwrap().guest_selector(fake, "setVolumeRampFromStartVolume:toEndVolume:timeRange:");
+    let mut words = vec![proxy, at, 0.5f32.to_bits()];
+    words.extend(time_words(30, 10));
+    send(&bridge, fake, &words).unwrap();
+    let mut words = vec![proxy, ramp, 1.0f32.to_bits(), 0.25f32.to_bits()];
+    words.extend(time_words(7, 2));
+    words.extend(time_words(4, 2));
+    send(&bridge, fake, &words).unwrap();
+    assert_eq!(HOST_MIX.lock().unwrap().clone(), vec![(0.5, 0.5, 30, 10), (1.0, 0.25, 7, 2)]);
+}
+
 static HOST_POINTS: Mutex<Vec<(f64, f64)>> = Mutex::new(Vec::new());
 
 extern "C" fn host_pick(object: Id, x: f64, y: f64) -> Id {

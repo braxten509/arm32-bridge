@@ -490,6 +490,8 @@ setValue:forHTTPHeaderField:	v@:@@
 setValue:forKey:	v@:@@
 setView:	v@:@
 setVolume:	v@:f	float
+setVolume:atTime:	v@:f{?=qiIq}	float
+setVolumeRampFromStartVolume:toEndVolume:timeRange:	v@:ff{?={?=qiIq}{?=qiIq}}	float
 setWithCapacity:	@@:I
 setWithObjects:	@@:@	nil-list
 sharedAccelerometer	@@:
