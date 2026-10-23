@@ -394,6 +394,12 @@ pub fn run_main_loop(until: Option<f64>) {
     run_loop_until(&MAIN_LOOP, until, false);
 }
 
+/// For tests: runs the main loop's queued work (one round, at most a moment).
+#[cfg(test)]
+pub fn run_main_loop_briefly() {
+    run_loop_until(&MAIN_LOOP, Some(now() + 0.05), true);
+}
+
 pub fn timers_fired() -> usize {
     TIMERS_FIRED.load(Ordering::Relaxed)
 }

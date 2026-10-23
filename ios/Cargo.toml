@@ -37,3 +37,7 @@ cc = "1"
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni-sys = "0.3"
+
+[dev-dependencies]
+# Tests drive the phone app's way in (java_text.rs) with a stand-in JNI table.
+jni-sys = "0.3"

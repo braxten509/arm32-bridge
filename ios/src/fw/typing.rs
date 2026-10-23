@@ -418,12 +418,13 @@ mod tests {
         assert_eq!(heard(), ["textFieldShouldReturn:"]);
         assert_eq!(text(), "a");
         assert_eq!(shown(), Some(("a".to_string(), [0.0, 0.0, 0.0, 1.0])));
-        // From the phone's keyboard (Java's UTF-16): an emoji is one letter
-        // (two UTF-16 units), typed and deleted whole.
-        type_java_text(&"😀".encode_utf16().collect::<Vec<u16>>());
+        // From the phone's keyboard, through nativeType (Java's UTF-16): an
+        // emoji is one letter (two UTF-16 units), typed and deleted whole,
+        // and the string's characters are given back to Java.
+        assert!(crate::java_text::type_through_jni("😀"), "the string's characters were not released");
         assert_eq!(text(), "a😀");
         assert_eq!(heard(), ["change 1,0 \"😀\"", "changed"]);
-        type_java_text(&[8]);
+        assert!(crate::java_text::type_through_jni("\u{8}"));
         assert_eq!(text(), "a");
         assert_eq!(heard(), ["change 1,2 \"\"", "changed"]);
         runtime::send(field, "setSecureTextEntry:", &[1]);
