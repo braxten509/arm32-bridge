@@ -35,13 +35,39 @@ pub fn guest_pointer(guest: u32) -> *mut c_void {
     mem().host_or_null(guest) as *mut c_void
 }
 
+/// Where host GL functions come from when an embedder has its own (the
+/// iPhone layer: Apple's extensions translated, PVRTC decoded); names it
+/// doesn't know fall back to the system's library.
+static HOST_LOOKUP: std::sync::OnceLock<fn(&str) -> usize> = std::sync::OnceLock::new();
+
+/// Sets the embedder's host GL lookup (once, before the first GL call).
+pub fn set_host_lookup(lookup: fn(&str) -> usize) {
+    let _ = HOST_LOOKUP.set(lookup);
+}
+
+/// Every GL name `handler` knows.
+pub fn names() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = [include_str!("gles.rs"), include_str!("gles_generated.rs")]
+        .iter()
+        .flat_map(|source| source.lines())
+        .filter_map(|line| line.split_once("=>").map(|(arms, _)| arms))
+        .flat_map(|arms| arms.split('"').skip(1).step_by(2))
+        .filter(|name| name.starts_with("gl") && name.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .filter(|name| handler(name).is_some())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
 /// The host GL function `name`, looked up once and cached in `slot`.
 pub fn host_function(slot: &AtomicUsize, name: &str) -> usize {
     let cached = slot.load(Ordering::Relaxed);
     if cached != 0 {
         return cached;
     }
-    let address = lookup(name);
+    let address = HOST_LOOKUP.get().map_or(0, |embedder| embedder(name));
+    let address = if address != 0 { address } else { lookup(name) };
     if address == 0 {
         panic!("GL function {name} is not available on this phone");
     }

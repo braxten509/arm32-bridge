@@ -64,6 +64,7 @@
 //! directly to the program's imports of the same name.
 
 mod crypto;
+pub mod fw;
 mod libsystem;
 mod locale;
 #[cfg(test)]
@@ -151,6 +152,7 @@ pub fn call(uc: &mut Uc, address: u32, args: &[u32]) -> Result<u64, String> {
 /// Every name the 32-bit layer provides, registered before loading.
 pub fn register_all() {
     libsystem::register();
+    fw::register();
     locale::register();
     crypto::register();
 }

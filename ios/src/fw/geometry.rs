@@ -190,7 +190,110 @@ extern "C" fn rect_union(r1: Rect, r2: Rect) -> Rect {
     Rect::new(x0, y0, x1 - x0, y1 - y0)
 }
 
+/// The smallest rectangle holding the transformed rectangle (a null one stays null).
+extern "C" fn rect_apply_affine_transform(r: Rect, t: Transform) -> Rect {
+    if is_null(r) {
+        return r;
+    }
+    let r = r.standard();
+    let corners = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)]
+        .map(|(fx, fy)| apply(t, r.origin.x + fx * r.size.width, r.origin.y + fy * r.size.height));
+    let (x0, x1) = corners.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), c| (lo.min(c.0), hi.max(c.0)));
+    let (y0, y1) = corners.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), c| (lo.min(c.1), hi.max(c.1)));
+    Rect::new(x0, y0, x1 - x0, y1 - y0)
+}
+extern "C" fn point_apply_affine_transform(p: Point, t: Transform) -> Point {
+    let (x, y) = apply(t, p.x, p.y);
+    Point { x, y }
+}
+extern "C" fn size_apply_affine_transform(s: Size, t: Transform) -> Size {
+    Size { width: t.a * s.width + t.c * s.height, height: t.b * s.width + t.d * s.height }
+}
+
+/// Core Animation's 4x4 transform (m11, m12, ... m44).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Transform3D(pub [f64; 16]);
+
+pub const IDENTITY_3D: Transform3D = Transform3D([1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]);
+
+extern "C" fn transform_3d_make_scale(sx: f64, sy: f64, sz: f64) -> Transform3D {
+    let mut m = IDENTITY_3D;
+    (m.0[0], m.0[5], m.0[10]) = (sx, sy, sz);
+    m
+}
+extern "C" fn transform_3d_make_translation(tx: f64, ty: f64, tz: f64) -> Transform3D {
+    let mut m = IDENTITY_3D;
+    (m.0[12], m.0[13], m.0[14]) = (tx, ty, tz);
+    m
+}
+
+// ----- UIKit's text forms: "{x, y}", "{w, h}", "{{x, y}, {w, h}}" -----
+
+/// The numbers in `text` in order (missing ones are 0, as UIKit gives).
+fn numbers<const N: usize>(text: &str) -> [f64; N] {
+    let mut out = [0.0; N];
+    let parsed = text
+        .split(|c: char| !(c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | 'e' | 'E')))
+        .filter(|part| !part.is_empty())
+        .map(|part| part.parse::<f64>().unwrap_or(0.0));
+    for (slot, value) in out.iter_mut().zip(parsed) {
+        *slot = value;
+    }
+    out
+}
+
+/// A number as UIKit writes it (%g: no trailing zeros).
+fn number_text(value: f64) -> String {
+    if value == value.trunc() && value.abs() < 1e15 {
+        format!("{}", value as i64)
+    } else {
+        let text = format!("{value:.6}");
+        text.trim_end_matches('0').trim_end_matches('.').to_string()
+    }
+}
+
+extern "C" fn point_from_string(text: crate::objc::runtime::Id) -> Point {
+    let [x, y] = numbers(&crate::fw::string::get(text));
+    Point { x, y }
+}
+extern "C" fn size_from_string(text: crate::objc::runtime::Id) -> Size {
+    let [width, height] = numbers(&crate::fw::string::get(text));
+    Size { width, height }
+}
+extern "C" fn rect_from_string(text: crate::objc::runtime::Id) -> Rect {
+    let [x, y, width, height] = numbers(&crate::fw::string::get(text));
+    Rect::new(x, y, width, height)
+}
+extern "C" fn string_from_point(p: Point) -> crate::objc::runtime::Id {
+    crate::fw::string::make(&format!("{{{}, {}}}", number_text(p.x), number_text(p.y)))
+}
+extern "C" fn string_from_size(s: Size) -> crate::objc::runtime::Id {
+    crate::fw::string::make(&format!("{{{}, {}}}", number_text(s.width), number_text(s.height)))
+}
+extern "C" fn string_from_rect(r: Rect) -> crate::objc::runtime::Id {
+    crate::fw::string::make(&format!(
+        "{{{{{}, {}}}, {{{}, {}}}}}",
+        number_text(r.origin.x),
+        number_text(r.origin.y),
+        number_text(r.size.width),
+        number_text(r.size.height)
+    ))
+}
+
 pub fn register(r: &mut Registry) {
+    r.function("CGRectApplyAffineTransform", rect_apply_affine_transform as usize);
+    r.function("CGPointApplyAffineTransform", point_apply_affine_transform as usize);
+    r.function("CGSizeApplyAffineTransform", size_apply_affine_transform as usize);
+    r.function("CATransform3DMakeScale", transform_3d_make_scale as usize);
+    r.function("CATransform3DMakeTranslation", transform_3d_make_translation as usize);
+    r.data("CATransform3DIdentity", leak(IDENTITY_3D));
+    r.function("CGPointFromString", point_from_string as usize);
+    r.function("CGSizeFromString", size_from_string as usize);
+    r.function("CGRectFromString", rect_from_string as usize);
+    r.function("NSStringFromCGPoint", string_from_point as usize);
+    r.function("NSStringFromCGSize", string_from_size as usize);
+    r.function("NSStringFromCGRect", string_from_rect as usize);
     r.function("CGRectGetWidth", rect_get_width as usize);
     r.function("CGRectGetHeight", rect_get_height as usize);
     r.function("CGRectGetMinX", rect_get_min_x as usize);
