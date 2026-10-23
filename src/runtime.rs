@@ -184,9 +184,10 @@ pub struct PlatformHooks {
     /// The guest's errno number for a host (Linux) one.
     pub errno_from_host: fn(i32) -> i32,
     /// Where a 32-bit ELF library's import goes when neither the library nor
-    /// another loaded library defines it: (name, marked as data, weak) ->
+    /// another loaded library defines it: (name, marked as data, weak,
+    /// library built for the platform's own C library rather than bionic) ->
     /// address. None: Android's own rules (imports::handler_for / data_import).
-    pub library_import: Option<fn(&str, bool, bool) -> u32>,
+    pub library_import: Option<fn(&str, bool, bool, bool) -> u32>,
 }
 
 /// Android: bionic phone functions, Linux system calls, TPIDRURO = the TLS block.

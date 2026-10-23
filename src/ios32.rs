@@ -393,18 +393,33 @@ fn missing_function(uc: &mut Uc, args: &mut Args) -> Ret {
     Ret::Void
 }
 
-/// For 32-bit ELF guest libraries (libz, libc++) loaded into an iPhone
-/// program. They are built against bionic, so their C library calls keep
-/// bionic's layouts (open flags, off_t, struct stat, errno numbers): names
-/// Android's handlers know go there (own stand-ins, "bionic:name"), data
-/// Android knows comes from Android's table. Other names go to what the
-/// embedder registered (Objective-C runtime, ...); then weak ones are 0.
-fn library_import(name: &str, object: bool, weak: bool) -> u32 {
-    if crate::imports::known_data_import(name) {
-        return crate::imports::data_import(name);
-    }
-    if !object && crate::imports::handler_for(name).is_some() {
-        return runtime::stub_for(&format!("{BIONIC_PREFIX}{name}"));
+/// Imports of Apple-ABI guest libraries that nothing provided at load time.
+static LIBRARY_MISSING: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Imports of Apple-ABI guest libraries (libc++) that nothing provides, in load order.
+pub fn missing_library_imports() -> Vec<String> {
+    LIBRARY_MISSING.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// For 32-bit ELF guest libraries loaded into an iPhone program.
+///
+/// Built for Apple's ABI (`apple`: the C++ runtime, compiled with Darwin
+/// headers): every name goes to what the embedder registered, exactly like
+/// the program's own imports; nothing registered: weak ones are 0, the rest
+/// listed (`missing_library_imports`) and stop the program if called.
+///
+/// Built against bionic (the built-in libz): their C library calls keep
+/// bionic's layouts (open flags, off_t, struct stat, errno numbers), so names
+/// Android's handlers know go there (own stand-ins, "bionic:name") and data
+/// Android knows comes from Android's table; other names as above.
+fn library_import(name: &str, object: bool, weak: bool, apple: bool) -> u32 {
+    if !apple {
+        if crate::imports::known_data_import(name) {
+            return crate::imports::data_import(name);
+        }
+        if !object && crate::imports::handler_for(name).is_some() {
+            return runtime::stub_for(&format!("{BIONIC_PREFIX}{name}"));
+        }
     }
     if let Some(address) = data_address(name) {
         return address;
@@ -414,6 +429,12 @@ fn library_import(name: &str, object: bool, weak: bool) -> u32 {
     }
     if weak {
         return 0;
+    }
+    if apple {
+        let mut missing = LIBRARY_MISSING.lock().unwrap_or_else(|e| e.into_inner());
+        if !missing.iter().any(|known| known == name) {
+            missing.push(name.to_string());
+        }
     }
     if object {
         return unknown_data(name);

@@ -4,7 +4,7 @@
 
 use super::libsystem::{RUNE_ALPHA, RUNE_LOWER, RUNE_LOWER_MAP, RUNE_TYPES, RUNE_XDIGIT};
 use arm32_bridge::ios32;
-use arm32_bridge::runtime::{self, mem, Args, GuestCpu};
+use arm32_bridge::runtime::{self, mem, ArgSource, Args, GuestCpu};
 
 fn setup() {
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -116,6 +116,100 @@ fn unknown_data_is_zeroed_memory_that_names_itself_when_called() {
     let slot = (address - arm32_bridge::mem::stub_base()) / 8;
     assert_eq!(runtime::stub(slot).map(|stub| stub.name), Some("glMadeUpEntryPoint"));
     assert_eq!(ios32::unknown_data("glMadeUpEntryPoint"), address, "one block per name");
+}
+
+/// The C++ runtime loaded once, as `run` loads it (call before holding the GIL).
+fn cxx() {
+    setup();
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _gil = runtime::hold_gil();
+        super::open_cxx_library(runtime::engine()).expect("the C++ runtime loads");
+    });
+}
+
+fn guest_export(name: &str) -> u32 {
+    *runtime::shared().guest_exports.get(name).unwrap_or_else(|| panic!("no guest export {name}"))
+}
+
+#[test]
+fn cxx_runtime_imports_are_all_provided() {
+    cxx();
+    assert_eq!(ios32::missing_library_imports(), Vec::<String>::new());
+}
+
+#[test]
+fn cxx_runtime_checks_pass_on_this_c_library() {
+    // guest32-cxx/test/cxxtest.cpp (exceptions through the SjLj unwinder,
+    // streams, locale, guards, threads' keys), built by `build.sh test`,
+    // here on this layer's C functions instead of its stand-in C library.
+    fn no_locks_counted(_uc: &mut runtime::Uc, _a: &mut Args) -> runtime::Ret {
+        runtime::Ret::U32(0)
+    }
+    cxx();
+    ios32::register_function("testc_mutexes_held", no_locks_counted);
+    let out = std::env::var("GUEST32_CXX_OUT").map(std::path::PathBuf::from).unwrap_or_else(|_| {
+        std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".cache/gamebridge/guest32-cxx/out")
+    });
+    let path = out.join("test/libcxxtest.so");
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e} (run guest32-cxx/build.sh test)", path.display()));
+    let _gil = runtime::hold_gil();
+    let uc = runtime::engine();
+    let index = arm32_bridge::elf::open_bytes(uc, "libcxxtest.so", &bytes, true).unwrap();
+    let run_all = arm32_bridge::elf::with_loader(|loader| loader.libraries[index].export(uc, "run_all")).unwrap();
+    let failed = runtime::call_guest(uc, run_all, &[]).unwrap() as u32;
+    assert_eq!(failed, 0, "run_all: one bit per failed check");
+}
+
+#[test]
+fn exit_runs_static_destructors_first() {
+    static RAN_WITH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    fn destructor(_uc: &mut runtime::Uc, a: &mut Args) -> runtime::Ret {
+        RAN_WITH.store(a.u32(), std::sync::atomic::Ordering::SeqCst);
+        runtime::Ret::Void
+    }
+    cxx();
+    ios32::register_function("test_static_destructor", destructor);
+    {
+        let _gil = runtime::hold_gil();
+        let uc = runtime::engine();
+        let function = runtime::stub_for("test_static_destructor");
+        runtime::call_guest(uc, guest_export("__cxa_atexit"), &[function, 7, 0]).unwrap();
+    }
+    call("exit", [3, 0, 0, 0], &[]);
+    let _gil = runtime::hold_gil();
+    let uc = runtime::engine();
+    assert_eq!(uc.get_data().exit_code, Some(3));
+    uc.get_data_mut().exit_code = None;
+    assert_eq!(RAN_WITH.load(std::sync::atomic::Ordering::SeqCst), 7, "__cxa_finalize(NULL) ran the destructor");
+}
+
+#[test]
+fn clocks_use_apples_ids_and_libstdcxx_is_absent() {
+    let out = alloc(8);
+    // CLOCK_UPTIME_RAW (8; Linux's 8 is CLOCK_REALTIME_ALARM): time since boot.
+    assert_eq!(call("clock_gettime", [8, out, 0, 0], &[]).0, 0);
+    let uptime = mem().read_u32(out);
+    assert_eq!(call("clock_gettime", [0, out, 0, 0], &[]).0, 0);
+    assert!(uptime < mem().read_u32(out) / 2, "uptime, not the date");
+    // CLOCK_THREAD_CPUTIME_ID is 16 (not a Linux clock id).
+    assert_eq!(call("clock_gettime", [16, out, 0, 0], &[]).0, 0);
+    // libc++ asks with RTLD_NOLOAD whether GCC's libstdc++ is loaded: it isn't.
+    assert_eq!(call("dlopen", [cstring("/usr/lib/libstdc++.6.dylib"), 0x10, 0, 0], &[]).0, 0);
+}
+
+#[test]
+fn sjlj_slot_stays_the_unwinders() {
+    // Slot 18 of the thread block holds each thread's SjLj context list,
+    // read and written by guest code: zero at thread start, never a key's.
+    for _ in 0..24 {
+        let out = alloc(4);
+        assert_eq!(call("pthread_key_create", [out, 0, 0, 0], &[]).0, 0);
+        assert_eq!(call("pthread_setspecific", [mem().read_u32(out), 0xBAD, 0, 0], &[]).0, 0);
+    }
+    let _gil = runtime::hold_gil();
+    let block = runtime::engine().get_data().tls_block;
+    assert_eq!(mem().read_u32(block + 18 * 4), 0);
 }
 
 #[test]
