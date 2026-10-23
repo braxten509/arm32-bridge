@@ -5,6 +5,7 @@
 //! layer's pixel size; presenting copies it to the window (on the phone) or,
 //! with no window (PC tests), can save it as a PNG picture.
 
+use crate::fw::counted;
 use crate::fw::geometry::Rect;
 use crate::fw::gl::{self, system, Enum};
 use crate::fw::object::{class_methods, define_class, methods};
@@ -38,6 +39,7 @@ system! {
     eglGetCurrentContext() -> Context;
     eglSwapInterval(display: Display, interval: i32) -> u32;
     eglDestroySurface(display: Display, surface: Surface) -> u32;
+    eglDestroyContext(display: Display, context: Context) -> u32;
 }
 
 const EGL_NONE: i32 = 0x3038;
@@ -78,6 +80,14 @@ static CONTEXT_CREATED: OnceLock<fn(usize, usize)> = OnceLock::new();
 /// The 32-bit layer's observer, told of every context and its share context.
 pub fn set_context_created_observer(observer: fn(usize, usize)) {
     let _ = CONTEXT_CREATED.set(observer);
+}
+
+/// Told when a context's EGL context is destroyed (its EAGLContext's last
+/// reference went).
+static CONTEXT_DESTROYED: OnceLock<fn(usize)> = OnceLock::new();
+
+pub fn set_context_destroyed_observer(observer: fn(usize)) {
+    let _ = CONTEXT_DESTROYED.set(observer);
 }
 
 /// The host EGL context current on this thread (0 = none).
@@ -196,6 +206,9 @@ struct State {
     size: (i32, i32),
     /// The thread the context is current on (0 = none).
     owner: u64,
+    /// The context it shares objects with, kept alive meanwhile (it stands
+    /// for the sharegroup, which Apple keeps while any member lives).
+    share_with: Id,
 }
 
 /// The context that uses the window surface: the first one made current
@@ -256,12 +269,44 @@ extern "C" fn init_with_api_sharegroup(this: Id, _: Sel, api: usize, sharegroup:
         return 0;
     }
     property_set(this, "api", api as u64);
-    state_of(this).lock().unwrap().egl = context;
+    {
+        let mut state = state_of(this).lock().unwrap();
+        state.egl = context;
+        if share != 0 {
+            state.share_with = counted::retain(sharegroup);
+        }
+    }
+    counted::track(this, free_context);
     if let Some(observer) = CONTEXT_CREATED.get() {
         observer(context, share);
     }
     crate::log!("graphics: OpenGL ES {api} context {this:#x} made");
     this
+}
+
+/// The EAGLContext's last reference went: its EGL context is destroyed (it
+/// is current nowhere: being current holds a reference). Objects it shared
+/// stay with the other members of its sharegroup, as in EGL.
+fn free_context(this: Id) {
+    let (context, pbuffer, share_with) = {
+        let mut state = state_of(this).lock().unwrap();
+        (std::mem::take(&mut state.egl), std::mem::take(&mut state.pbuffer), std::mem::take(&mut state.share_with))
+    };
+    let _ = WINDOW_OWNER.compare_exchange(this, 0, Ordering::SeqCst, Ordering::SeqCst);
+    let egl = egl();
+    if context != 0 {
+        if unsafe { eglDestroyContext(egl.display, context) } != 0 {
+            if let Some(observer) = CONTEXT_DESTROYED.get() {
+                observer(context);
+            }
+        } else {
+            crate::log!("graphics: context {this:#x} could not be destroyed (EGL error {:#x})", unsafe { eglGetError() });
+        }
+    }
+    if pbuffer != 0 {
+        unsafe { eglDestroySurface(egl.display, pbuffer) };
+    }
+    counted::release(share_with);
 }
 
 extern "C" fn init_with_api(this: Id, s: Sel, api: usize) -> Id {
@@ -296,11 +341,16 @@ extern "C" fn set_current(_: Class, _: Sel, context: Id) -> bool {
             state_of(previous).lock().unwrap().owner = 0;
         }
         CURRENT.with(|c| c.set(0));
+        counted::release(previous);
         return true;
     }
+    // As on Apple, the current context is retained (and the previous one
+    // released): a context released while current stays until let go.
+    counted::retain(context);
     let holder = state_of(context).lock().unwrap().owner;
     if holder != 0 && holder != me && !take_from_main_thread(context, holder) {
         crate::log!("graphics: context {context:#x} is in use on another thread and can't be taken");
+        counted::release(context);
         return false;
     }
     let ok = unsafe {
@@ -314,12 +364,15 @@ extern "C" fn set_current(_: Class, _: Sel, context: Id) -> bool {
     };
     if ok == 0 {
         crate::log!("graphics: context {context:#x} can't be made current on this thread (EGL error {:#x})", unsafe { eglGetError() });
+        counted::release(context);
         return false;
     }
     if previous != 0 && previous != context {
         state_of(previous).lock().unwrap().owner = 0;
     }
     CURRENT.with(|c| c.set(context));
+    // Already held when it was current here before.
+    counted::release(if previous == context { context } else { previous });
     true
 }
 
@@ -350,6 +403,8 @@ fn take_from_main_thread(context: Id, holder: u64) -> bool {
             if unsafe { eglMakeCurrent(egl().display, 0, 0, 0) } != 0 {
                 CURRENT.with(|c| c.set(0));
                 state_of(context).lock().unwrap().owner = 0;
+                // This thread's reference (the asking thread holds its own).
+                counted::release(context);
             }
         } else {
             // Not really current here any more: the record was out of date.
@@ -610,8 +665,26 @@ fn save_frame_if_asked(frame: usize, width: i32, height: i32) {
     }
 }
 
+extern "C" fn retain(this: Id, _: Sel) -> Id {
+    counted::retain(this)
+}
+
+extern "C" fn release(this: Id, _: Sel) {
+    counted::release(this)
+}
+
+extern "C" fn autorelease(this: Id, _: Sel) -> Id {
+    counted::autorelease(this)
+}
+
+extern "C" fn retain_count(this: Id, _: Sel) -> usize {
+    counted::count(this).unwrap_or(1)
+}
+
 pub fn register(r: &mut Registry) {
     let context = define_class("EAGLContext", "NSObject", 8);
+    // Contexts count references, so a freed one gives back its EGL context.
+    counted::count_class(context);
     class_methods(context, &[("setCurrentContext:", set_current as usize), ("currentContext", current as usize)]);
     methods(
         context,
@@ -622,6 +695,10 @@ pub fn register(r: &mut Registry) {
             ("sharegroup", sharegroup as usize),
             ("renderbufferStorage:fromDrawable:", storage_from_drawable as usize),
             ("presentRenderbuffer:", present as usize),
+            ("retain", retain as usize),
+            ("release", release as usize),
+            ("autorelease", autorelease as usize),
+            ("retainCount", retain_count as usize),
         ],
     );
     r.data("kEAGLDrawablePropertyRetainedBacking", leak(crate::fw::string::make("EAGLDrawablePropertyRetainedBacking")));

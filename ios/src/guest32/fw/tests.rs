@@ -264,6 +264,52 @@ fn unshared_eagl_contexts_keep_their_bindings_and_mappings() {
     assert_eq!(gles::bound_buffer(GL_ARRAY_BUFFER), buffer, "the first context kept its binding");
 }
 
+/// The host EGL context behind an EAGLContext (it is made current to find it).
+fn egl_context_of(context: usize) -> usize {
+    make_current(context);
+    crate::fw::eagl::current_egl_context()
+}
+
+#[test]
+fn freed_eagl_contexts_leave_the_gles_tracking() {
+    setup();
+    let release = |context: usize| crate::objc::runtime::send(context, "release", &[]);
+    // A context current nowhere goes at its last release.
+    let lone = eagl_context(0);
+    let lone_egl = egl_context_of(lone);
+    make_current(0);
+    assert!(gles::context_tracked(lone_egl));
+    release(lone);
+    assert!(!gles::context_tracked(lone_egl), "a freed context's tracking entries go");
+
+    // A sharegroup outlives the context that started it while a partner lives.
+    let a = eagl_context(0);
+    let b = eagl_context(a);
+    let (a_egl, b_egl) = (egl_context_of(a), egl_context_of(b));
+    make_current(a);
+    let (buffer, _) = filled_buffer();
+    assert_ne!(call("glMapBufferRange", [GL_ARRAY_BUFFER, 0, 8, GL_MAP_WRITE_BIT], &[]).0, 0, "the buffer mapped");
+    make_current(0);
+    release(a);
+    make_current(b);
+    call("glBindBuffer", [GL_ARRAY_BUFFER, buffer, 0, 0], &[]);
+    assert_eq!(call("glUnmapBuffer", [GL_ARRAY_BUFFER, 0, 0, 0], &[]).0, 1, "the partner still finds the group's mapping");
+    make_current(0);
+    release(b);
+    assert!(!gles::context_tracked(a_egl) && !gles::context_tracked(b_egl), "the last member takes the group with it");
+
+    // As on Apple, the current context is retained: released while current,
+    // it stays usable and goes once another context (or none) is made current.
+    let current = eagl_context(0);
+    let current_egl = egl_context_of(current);
+    release(current);
+    assert!(gles::context_tracked(current_egl), "a current context stays");
+    let (buffer, _) = filled_buffer();
+    assert_eq!(gles::bound_buffer(GL_ARRAY_BUFFER), buffer, "and keeps working");
+    make_current(0);
+    assert!(!gles::context_tracked(current_egl), "then goes once let go");
+}
+
 #[test]
 fn indexed_gl_queries_reach_the_guest_registry() {
     setup();
