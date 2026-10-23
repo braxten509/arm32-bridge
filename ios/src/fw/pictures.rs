@@ -201,7 +201,7 @@ const MOST_TILES: f64 = 64.0;
 /// A tiling picture's parts between the caps are copies at their own size,
 /// each with the area it may draw in (the last ones are cut off there).
 fn parts(shown: &Shown) -> Vec<(String, Rect, (f64, f64), Option<Rect>)> {
-    let caps = shown.caps.filter(|caps| shown.mode == 0 && caps.iter().any(|&cap| cap > 0.0));
+    let caps = shown.caps.filter(|caps| shown.mode == 0 && (shown.tile || caps.iter().any(|&cap| cap > 0.0)));
     let Some([top, left, bottom, right]) = caps else { return vec![(shown.path.clone(), shown.rect, shown.size, None)] };
     /// Start, length and source length of the pieces of one side's three
     /// parts, with the part each belongs to and the stretch it fills.
@@ -274,7 +274,7 @@ fn image_shown(image: Id, mode: i64, rect: Rect) -> Option<Shown> {
     let info = crate::fw::uikit::image_info(image)?;
     let size = crate::fw::uikit::image_points(image);
     // The file is found (or made) only for pictures that end up shown; see `resolve`.
-    Some(Shown { path: format!("{IMAGE_PREFIX}{image:x}"), mode, size: (size.width, size.height), rect, caps: info.caps, tile: false, text: None, alpha: 1.0 })
+    Some(Shown { path: format!("{IMAGE_PREFIX}{image:x}"), mode, size: (size.width, size.height), rect, caps: info.caps, tile: info.tile, text: None, alpha: 1.0 })
 }
 
 /// How see-through a disabled button's pictures are drawn.
@@ -649,6 +649,20 @@ mod tests {
         // The middle: 8 across, 9 down (4 points of picture in 34).
         assert_eq!(part(4).len(), 72);
         assert_eq!((part(0).len(), part(8).len()), (1, 1), "corners once");
+    }
+
+    /// A real tiling UIImage in an image view: repeated at its size, also
+    /// with no caps at all (the whole picture tiles).
+    #[test]
+    fn tiling_images_repeat_in_their_views() {
+        use crate::fw::uikit::{make_image, ImageInfo};
+        setup();
+        let image = make_image(ImageInfo { path: "/nowhere/10x10.png".into(), pixels: (10, 10), scale: 1.0, caps: Some([0.0; 4]), tile: true, ..Default::default() });
+        let view = new_view("UIImageView", rect(0.0, 0.0, 30.0, 20.0));
+        runtime::send(view, "setImage:", &[image]);
+        let pictures = flatten(&window(vec![snapshot(view, &Classes::find(), 0)]));
+        let tiles: Vec<((f64, f64), (f64, f64))> = pictures.iter().map(|p| (at(p, 0.0, 0.0), p.area)).collect();
+        assert_eq!(tiles, [((0.0, 0.0), (10.0, 10.0)), ((10.0, 0.0), (10.0, 10.0)), ((20.0, 0.0), (10.0, 10.0)), ((0.0, 10.0), (10.0, 10.0)), ((10.0, 10.0), (10.0, 10.0)), ((20.0, 10.0), (10.0, 10.0))]);
     }
 
     fn setup() {
