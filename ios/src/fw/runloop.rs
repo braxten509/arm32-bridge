@@ -110,6 +110,18 @@ pub fn post_to_object(run_loop: Id, work: Work) {
     target.wake.notify_all();
 }
 
+/// A message for a run loop. As on Apple, its receiver and argument are
+/// retained until it has run (through their own retain: a game's objects
+/// count it in the game's runtime).
+fn message(target: Id, selector: Sel, argument: Id, done: Option<Arc<(Mutex<bool>, Condvar)>>) -> Work {
+    for object in [target, argument] {
+        if object != 0 {
+            runtime::send(object, "retain", &[]);
+        }
+    }
+    Work::Message { target, selector, argument, done }
+}
+
 fn run_work(work: Work) {
     match work {
         Work::Block(block) => unsafe { crate::libsystem::mach::call_block(block) },
@@ -117,8 +129,12 @@ fn run_work(work: Work) {
         Work::Message { target, selector, argument, done } => {
             let name = lock().sel_name(selector);
             runtime::send(target, &name, &[argument]);
-            // Let go of the argument kept while the message waited (see perform_on_main).
-            crate::fw::counted::release(argument);
+            // Let go of what the message held while it waited (see `message`).
+            for object in [target, argument] {
+                if object != 0 {
+                    runtime::send(object, "release", &[]);
+                }
+            }
             if let Some(done) = done {
                 *done.0.lock().unwrap() = true;
                 done.1.notify_all();
@@ -551,14 +567,12 @@ extern "C" fn perform_on_main(this: Id, _: Sel, selector: Sel, argument: Id, wai
         runtime::send(this, &name, &[argument]);
         return;
     }
-    // Kept until the message has run (Apple retains it too).
-    crate::fw::counted::keep(argument);
     if wait != 0 {
         let done = Arc::new((Mutex::new(false), Condvar::new()));
-        post(Work::Message { target: this, selector, argument, done: Some(done.clone()) });
+        post(message(this, selector, argument, Some(done.clone())));
         wait_until_done(&done);
     } else {
-        post(Work::Message { target: this, selector, argument, done: None });
+        post(message(this, selector, argument, None));
     }
 }
 
@@ -573,11 +587,9 @@ extern "C" fn perform_on_thread(this: Id, _: Sel, selector: Sel, thread: Id, arg
         runtime::send(this, &name, &[argument]);
         return;
     }
-    // Kept until the message has run (Apple retains it too).
-    crate::fw::counted::keep(argument);
     let run_loop = loop_of(run_loop_of_thread(thread));
     let done = (wait != 0).then(|| Arc::new((Mutex::new(false), Condvar::new())));
-    post_to(run_loop, Work::Message { target: this, selector, argument, done: done.clone() });
+    post_to(run_loop, message(this, selector, argument, done.clone()));
     if let Some(done) = done {
         wait_until_done(&done);
     }
@@ -957,5 +969,89 @@ mod perform_tests {
         }
         assert_eq!(heard(), ["soon"]);
         STOP.store(true, Ordering::Relaxed);
+    }
+
+    /// Reference counts of the objects below (counted through their own
+    /// retain and release, as a game's objects are).
+    static COUNTS: Mutex<Vec<(Id, isize)>> = Mutex::new(Vec::new());
+    static COUNTS_WHEN_RUN: Mutex<Vec<(isize, isize)>> = Mutex::new(Vec::new());
+    static GO: AtomicBool = AtomicBool::new(false);
+
+    fn count_of(object: Id) -> isize {
+        COUNTS.lock().unwrap().iter().find(|(o, _)| *o == object).map_or(0, |e| e.1)
+    }
+
+    fn change(object: Id, by: isize) {
+        let mut counts = COUNTS.lock().unwrap();
+        match counts.iter_mut().find(|(o, _)| *o == object) {
+            Some(entry) => entry.1 += by,
+            None => counts.push((object, by)),
+        }
+    }
+
+    extern "C" fn counted_retain(this: Id, _: Sel) -> Id {
+        change(this, 1);
+        this
+    }
+
+    extern "C" fn counted_release(this: Id, _: Sel) {
+        change(this, -1);
+    }
+
+    extern "C" fn check(this: Id, _: Sel, argument: Id) {
+        COUNTS_WHEN_RUN.lock().unwrap().push((count_of(this), count_of(argument)));
+    }
+
+    /// A worker that starts running its run loop once told to.
+    extern "C" fn serve_later(_this: Id, _: Sel, _: Id) {
+        while !GO.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        loop {
+            run_loop_until(current_loop(), Some(now() + 0.02), true);
+        }
+    }
+
+    fn wait_for(what: impl Fn() -> bool) -> bool {
+        let deadline = now() + 5.0;
+        while !what() && now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        what()
+    }
+
+    /// The receiver and the argument are retained (through their own retain)
+    /// until the message has run on the other thread, then released: the
+    /// caller may let go of both right after asking.
+    #[test]
+    fn a_performed_message_holds_its_receiver_and_argument_until_it_ran() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let class = define_class("PerformCountedTarget", "NSObject", 8);
+        methods(
+            class,
+            &[("retain", counted_retain as usize), ("release", counted_release as usize), ("check:", check as usize), ("serveLater:", serve_later as usize)],
+        );
+        let make = || {
+            let object = runtime::send(runtime::send(class, "alloc", &[]), "init", &[]);
+            change(object, 1);
+            object
+        };
+        let (target, argument) = (make(), make());
+        let thread_class = runtime::class_named("NSThread");
+        let worker = runtime::send(runtime::send(thread_class, "alloc", &[]), "initWithTarget:selector:object:", &[target, runtime::sel("serveLater:"), 0]);
+        runtime::send(worker, "start", &[]);
+        let s = runtime::sel("performSelector:onThread:withObject:waitUntilDone:");
+        let perform: extern "C" fn(Id, Sel, Sel, Id, Id, u8) = unsafe { std::mem::transmute(runtime::imp_for(target, s).unwrap()) };
+        // What holds the target besides the caller (the worker's NSThread may).
+        let held_by_thread = count_of(target) - 1;
+        perform(target, s, runtime::sel("check:"), worker, argument, 0);
+        runtime::send(target, "release", &[]);
+        runtime::send(argument, "release", &[]);
+        GO.store(true, Ordering::Relaxed);
+        assert!(wait_for(|| !COUNTS_WHEN_RUN.lock().unwrap().is_empty()), "the message never ran");
+        let (target_count, argument_count) = COUNTS_WHEN_RUN.lock().unwrap()[0];
+        assert!(target_count > held_by_thread && argument_count > 0, "released before it ran: counts {target_count}, {argument_count}");
+        assert!(wait_for(|| count_of(target) == held_by_thread && count_of(argument) == 0), "not released after running: counts {}, {}", count_of(target), count_of(argument));
     }
 }
