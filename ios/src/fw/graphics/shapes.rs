@@ -11,7 +11,6 @@
 //! layers draw straight into the context.
 
 use super::*;
-use std::sync::atomic::Ordering;
 
 pub const BLEND_CLEAR: i32 = 16;
 
@@ -655,57 +654,67 @@ extern "C" fn path_close_subpath(path: Id) {
 // ----- data providers and CGImageCreate -----
 
 /// Bytes the game owns, given back (`release`: info, data, size) when the
-/// last reference goes. The count lives in the provider (fw/counted.rs
-/// keeps its classes few); CGImageCreate copies the bytes, so pictures
-/// don't hold a reference.
+/// last reference goes. Providers count with the other CG objects
+/// (fw/counted.rs): CFRetain/CFRelease, retain/release messages, ARC calls
+/// and autorelease pools all reach the same count. CGImageCreate copies the
+/// bytes, so pictures don't hold a reference.
 struct Provider {
     info: usize,
     data: usize,
     size: usize,
     release: usize,
-    references: std::sync::atomic::AtomicUsize,
 }
 
 fn provider_state(provider: Id) -> Option<&'static Provider> {
     state::<Provider>(provider, classes().provider)
 }
 
+/// The clean-up counted runs at the last reference.
+fn free_provider(provider: Id) {
+    let Some(p) = provider_state(provider) else { return };
+    if p.release != 0 {
+        let release: extern "C" fn(usize, usize, usize) = unsafe { std::mem::transmute(p.release) };
+        release(p.info, p.data, p.size);
+    }
+}
+
 extern "C" fn data_provider_create_with_data(info: usize, data: *const u8, size: usize, release: usize) -> Id {
-    wrap(classes().provider, Provider { info, data: data as usize, size, release, references: 1.into() })
+    let provider = wrap(classes().provider, Provider { info, data: data as usize, size, release });
+    counted::track(provider, free_provider);
+    provider
 }
 /// +1 on a data provider; false for anything else.
 pub fn retain_provider(provider: Id) -> bool {
-    let Some(p) = provider_state(provider) else { return false };
-    // A provider already given back stays at zero.
-    let _ = p.references.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n > 0).then_some(n + 1));
+    if provider_state(provider).is_none() {
+        return false;
+    }
+    counted::retain(provider);
     true
 }
 /// -1 on a data provider, running the release callback at zero; false for
 /// anything else.
 pub fn release_provider(provider: Id) -> bool {
-    let Some(p) = provider_state(provider) else { return false };
-    let last = p.references.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)) == Ok(1);
-    if last && p.release != 0 {
-        let release: extern "C" fn(usize, usize, usize) = unsafe { std::mem::transmute(p.release) };
-        release(p.info, p.data, p.size);
+    if provider_state(provider).is_none() {
+        return false;
     }
+    counted::release(provider);
     true
 }
 extern "C" fn data_provider_retain(provider: Id) -> Id {
-    retain_provider(provider);
+    counted::retain(provider);
     provider
 }
 extern "C" fn data_provider_release(provider: Id) {
-    release_provider(provider);
+    counted::release(provider);
 }
 extern "C" fn provider_retain_method(this: Id, _: Sel) -> Id {
-    data_provider_retain(this)
+    counted::retain(this)
 }
 extern "C" fn provider_release_method(this: Id, _: Sel) {
-    data_provider_release(this)
+    counted::release(this)
 }
 extern "C" fn provider_retain_count_method(this: Id, _: Sel) -> usize {
-    provider_state(this).map_or(0, |p| p.references.load(Ordering::Acquire))
+    counted::count(this).unwrap_or(0)
 }
 
 /// A picture from a provider's bytes (copied: the picture never changes).
@@ -844,14 +853,26 @@ mod tests {
         }
         let bytes = [255u8; 16];
         let provider = data_provider_create_with_data(0, bytes.as_ptr(), 16, on_release as usize);
+        assert_eq!(counted::count(provider), Some(1));
+        // CFRetain, an ARC retain and a release message share the one count.
         data_provider_retain(provider);
+        counted::retain(provider);
+        assert_eq!(counted::count(provider), Some(3));
         data_provider_release(provider);
-        assert_eq!(RELEASED.load(std::sync::atomic::Ordering::Relaxed), 0, "still held once");
+        runtime::send(provider, "release", &[]);
+        assert_eq!(counted::count(provider), Some(1));
         let picture = image_create(2, 2, 8, 32, 8, space_create_rgb(), PREMULTIPLIED_LAST, provider, std::ptr::null(), false, 0);
         assert_ne!(picture, 0);
         data_provider_release(provider);
         assert_eq!(RELEASED.load(std::sync::atomic::Ordering::Relaxed), 1);
         data_provider_release(provider);
         assert_eq!(RELEASED.load(std::sync::atomic::Ordering::Relaxed), 1, "once only");
+        // An autorelease pool releases it like any other counted object.
+        RELEASED.store(0, std::sync::atomic::Ordering::Relaxed);
+        let pooled = data_provider_create_with_data(0, bytes.as_ptr(), 16, on_release as usize);
+        let mark = counted::pool_mark();
+        counted::autorelease(pooled);
+        counted::pool_drain(mark);
+        assert_eq!(RELEASED.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 }

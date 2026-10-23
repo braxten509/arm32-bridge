@@ -118,6 +118,11 @@ fn a_data_provider_runs_the_games_release_on_the_last_release_only() {
     let (provider, _) = call("CGDataProviderCreateWithData", [flag, pixels, 16, code], &[]);
     call("CFRelease", [provider, 0, 0, 0], &[]);
     assert_eq!(mem().read_u32(flag), 1, "CFRelease ran the callback");
+    // A release message runs it at once too, with no framework call after it.
+    mem().write_u32(flag, 0);
+    let (provider, _) = call("CGDataProviderCreateWithData", [flag, pixels, 16, code], &[]);
+    crate::objc::runtime::send(super::object_to_host(provider), "release", &[]);
+    assert_eq!(mem().read_u32(flag), 1, "release message ran the callback");
 }
 
 #[test]

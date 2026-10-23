@@ -1410,6 +1410,7 @@ pub fn register(r: &mut Registry) {
         counted::count(this).unwrap_or(1)
     }
     let ui_image = runtime::class_named("UIImage");
+    counted::count_class(provider);
     for class in [image_class, context, ui_image] {
         counted::count_class(class);
         methods(

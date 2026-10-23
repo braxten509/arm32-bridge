@@ -182,27 +182,16 @@ static COMPONENTS: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
 static RELEASES: Mutex<Option<HashMap<usize, (u32, u32, u32, u32)>>> = Mutex::new(None);
 static NEXT_KEY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 
-thread_local! {
-    /// Keys of providers the host let go of, whose guest callbacks are due.
-    static PENDING: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// The host's release callback for providers with a guest one.
+/// The host's release callback for providers with a guest one: the count
+/// reached zero during a release, so run the game's callback now (nested
+/// guest calls are supported and this is where Apple runs it).
 extern "C" fn release_trampoline(key: usize, _data: usize, _size: usize) {
-    PENDING.with(|pending| pending.borrow_mut().push(key));
-}
-
-/// Runs the guest release callbacks that became due on this thread.
-pub(super) fn run_pending_releases(uc: &mut arm32_bridge::runtime::Uc) {
-    let due: Vec<usize> = PENDING.with(|pending| std::mem::take(&mut *pending.borrow_mut()));
-    for key in due {
-        let callback = RELEASES.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|m| m.remove(&key));
-        if let Some((function, info, data, size)) = callback {
-            if let Err(error) = crate::guest32::call(uc, function, &[info, data, size]) {
-                arm32_bridge::runtime::stop_with_fault(uc, format!("CGDataProvider release callback: {error}"));
-                return;
-            }
-        }
+    let callback = RELEASES.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|m| m.remove(&key));
+    let Some((function, info, data, size)) = callback else { return };
+    let _gil = arm32_bridge::runtime::hold_gil();
+    let uc = arm32_bridge::runtime::engine();
+    if let Err(error) = crate::guest32::call(uc, function, &[info, data, size]) {
+        arm32_bridge::runtime::stop_with_fault(uc, format!("CGDataProvider release callback: {error}"));
     }
 }
 
@@ -347,14 +336,13 @@ fn special() {
     );
     function(
         "CGDataProviderRelease",
-        handler!(|uc, a| {
+        handler!(|_uc, a| {
             let provider = object_to_host(a.u32());
             if provider != 0 {
                 if let Some(release) = host_fn!("CGDataProviderRelease": unsafe extern "C" fn(usize)) {
                     unsafe { release(provider) };
                 }
             }
-            run_pending_releases(uc);
             Ret::Void
         }),
     );

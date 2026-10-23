@@ -44,18 +44,17 @@ pub fn register() {
         "SCNetworkReachabilityUnscheduleFromRunLoop" => fn(target: Handle, run_loop: Obj, mode: Obj) -> Bool;
         "SCNetworkReachabilitySetDispatchQueue" => fn(target: Handle, queue: Word) -> Bool;
     });
-    // CFRelease(object): a data provider's release callback is guest code,
-    // so it runs here, after the host let go of the last reference.
+    // CFRelease(object): a data provider's release callback is guest code
+    // the host runs from inside the release, before this returns.
     super::super::function(
         "CFRelease",
-        handler!(|uc, a| {
+        handler!(|_uc, a| {
             let object = object_to_host(a.u32());
             if object != 0 {
                 if let Some(release) = host_fn!("CFRelease": unsafe extern "C" fn(usize)) {
                     unsafe { release(object) };
                 }
             }
-            super::graphics::run_pending_releases(uc);
             Ret::Void
         })
         .unwrap(),
