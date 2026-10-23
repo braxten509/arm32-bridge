@@ -76,7 +76,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
@@ -455,16 +455,18 @@ class MainActivity : ComponentActivity() {
             Modifier.size(40.dp).clip(CircleShape).background(CardColor).clickable(enabled = enabled, onClick = onClick),
             contentAlignment = Alignment.Center,
         ) {
-            Box(Modifier.rotate(turn.value)) { RefreshIcon(if (enabled || spinning) AccentText else Muted) }
+            RefreshIcon(if (enabled || spinning) AccentText else Muted, turn.value)
         }
     }
 
     /**
      * A circle arrow drawn by hand: a font's arrow sign sits off-center and is too thin. The
      * whole shape (ring plus arrowhead) is centered, so the arrowhead doesn't pull it up and right.
+     * It turns `degrees` around the ring's own middle, which then sits still; turning the whole
+     * drawing would swing the ring around the button's middle by that centering shift.
      */
     @Composable
-    private fun RefreshIcon(color: Color) {
+    private fun RefreshIcon(color: Color, degrees: Float = 0f) {
         Canvas(Modifier.size(24.dp)) {
             val stroke = 2.8.dp.toPx()
             val head = 5.5.dp.toPx()
@@ -477,7 +479,7 @@ class MainActivity : ComponentActivity() {
             val corners = listOf(tip + forward * head, tip + outward * (head * 0.75f), tip - outward * (head * 0.75f))
             val xs = corners.map { it.x } + listOf(center.x - radius - stroke / 2, center.x + radius + stroke / 2)
             val ys = corners.map { it.y } + listOf(center.y - radius - stroke / 2, center.y + radius + stroke / 2)
-            translate(center.x - (xs.min() + xs.max()) / 2, center.y - (ys.min() + ys.max()) / 2) {
+            translate(center.x - (xs.min() + xs.max()) / 2, center.y - (ys.min() + ys.max()) / 2) { rotate(degrees, pivot = center) {
                 drawArc(
                     color, startAngle = -60f, sweepAngle = 290f, useCenter = false,
                     topLeft = Offset(center.x - radius, center.y - radius), size = Size(radius * 2, radius * 2),
@@ -489,7 +491,7 @@ class MainActivity : ComponentActivity() {
                     lineTo(corners[2].x, corners[2].y)
                     close()
                 }, color)
-            }
+            } }
         }
     }
 
