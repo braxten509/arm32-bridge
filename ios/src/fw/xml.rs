@@ -175,6 +175,44 @@ fn read(text: &str, out: &mut Vec<Event>) -> Result<(), (usize, String)> {
     Ok(())
 }
 
+/// A document's bytes as text: by its byte order mark (UTF-8, UTF-16 either
+/// way), else by how it starts ("<?" in UTF-16) or the encoding its
+/// declaration names (UTF-8 when it names none).
+fn document_text(bytes: &[u8]) -> String {
+    let utf16 = |bytes: &[u8], big: bool| {
+        let units: Vec<u16> = bytes.chunks_exact(2).map(|c| if big { u16::from_be_bytes([c[0], c[1]]) } else { u16::from_le_bytes([c[0], c[1]]) }).collect();
+        String::from_utf16_lossy(&units)
+    };
+    match bytes {
+        [0xEF, 0xBB, 0xBF, rest @ ..] => return String::from_utf8_lossy(rest).into_owned(),
+        [0xFF, 0xFE, rest @ ..] => return utf16(rest, false),
+        [0xFE, 0xFF, rest @ ..] => return utf16(rest, true),
+        [b'<', 0, b'?', 0, ..] => return utf16(bytes, false),
+        [0, b'<', 0, b'?', ..] => return utf16(bytes, true),
+        _ => {}
+    }
+    // The declaration is ASCII: <?xml version="1.0" encoding="..."?>
+    let head = String::from_utf8_lossy(&bytes[..bytes.len().min(200)]).into_owned();
+    let declared = head
+        .strip_prefix("<?xml")
+        .and_then(|rest| rest.split("?>").next())
+        .and_then(|declaration| declaration.split("encoding").nth(1))
+        .and_then(|after| after.trim_start().strip_prefix('=').map(str::trim_start))
+        .and_then(|value| {
+            let quote = value.chars().next().filter(|&q| q == '"' || q == '\'')?;
+            value[1..].split(quote).next().map(str::to_ascii_lowercase)
+        });
+    match declared.as_deref() {
+        None | Some("utf-8" | "utf8" | "us-ascii" | "ascii") => String::from_utf8_lossy(bytes).into_owned(),
+        // Each byte is the character with its number.
+        Some("iso-8859-1" | "latin1" | "iso_8859-1" | "iso-latin-1" | "windows-1252" | "cp1252") => bytes.iter().map(|&b| b as char).collect(),
+        Some(other) => {
+            crate::log!("NSXMLParser: encoding {other} not known, read as UTF-8");
+            String::from_utf8_lossy(bytes).into_owned()
+        }
+    }
+}
+
 // ----- NSXMLParser { isa, ... }: the data and delegate kept as properties -----
 
 fn get_id(object: Id, key: &'static str) -> Id {
@@ -236,9 +274,8 @@ fn tell(delegate: Id, name: &str, args: &[usize]) {
 /// (parser:parseErrorOccurred: after the events before the fault) or the
 /// delegate stopped it.
 extern "C" fn parser_parse(this: Id, _: Sel) -> bool {
-    let bytes = crate::fw::data::bytes(get_id(this, "data"));
-    let text = String::from_utf8_lossy(&bytes);
-    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    let text = document_text(&crate::fw::data::bytes(get_id(this, "data")));
+    let text = text.as_str();
     let delegate = get_id(this, "delegate");
     property_set(this, "aborted", 0);
     let stopped = |parser: Id| property_get(parser, "aborted") == Some(1);
@@ -378,13 +415,14 @@ mod tests {
             ],
         );
         let delegate = runtime::send(runtime::send(class, "alloc", &[]), "init", &[]);
-        let parse = |text: &str| {
-            let data = crate::fw::data::make(text.as_bytes());
+        let parse_bytes = |bytes: &[u8]| {
+            let data = crate::fw::data::make(bytes);
             let parser = runtime::send(runtime::send(runtime::class_named("NSXMLParser"), "alloc", &[]), "initWithData:", &[data]);
             runtime::send(parser, "setDelegate:", &[delegate]);
             let whole = runtime::send(parser, "parse", &[]) & 0xFF != 0;
             (whole, std::mem::take(&mut *HEARD.lock().unwrap()), runtime::send(parser, "parserError", &[]))
         };
+        let parse = |text: &str| parse_bytes(text.as_bytes());
         let (whole, heard, error) = parse("<map w=\"2\"><tile gid=\"1\"/>hi</map>");
         assert!(whole && error == 0);
         assert_eq!(
@@ -397,5 +435,20 @@ mod tests {
         let (whole, heard, _) = parse("<map><stop/><after/></map>");
         assert!(!whole, "stopped by the delegate");
         assert_eq!(heard, ["parserDidStartDocument:", "start map ", "start stop "]);
+        // Other encodings: UTF-16 by its byte order mark (either order), or
+        // what the declaration names.
+        let text = "<?xml version=\"1.0\" encoding=\"UTF-16\"?><map name=\"café 🗺\">hi</map>";
+        let little: Vec<u8> = [0xFF, 0xFE].into_iter().chain(text.encode_utf16().flat_map(u16::to_le_bytes)).collect();
+        let big: Vec<u8> = [0xFE, 0xFF].into_iter().chain(text.encode_utf16().flat_map(u16::to_be_bytes)).collect();
+        let expected = ["parserDidStartDocument:", "start map name=café 🗺", "text \"hi\"", "end map", "parserDidEndDocument:"];
+        for bytes in [little, big] {
+            let (whole, heard, _) = parse_bytes(&bytes);
+            assert!(whole);
+            assert_eq!(heard, expected);
+        }
+        let latin = b"<?xml version='1.0' encoding='ISO-8859-1'?><map name='caf\xe9'/>";
+        let (whole, heard, _) = parse_bytes(latin);
+        assert!(whole);
+        assert_eq!(heard[1], "start map name=café");
     }
 }
