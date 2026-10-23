@@ -177,6 +177,14 @@ fn set_errno(uc: &Uc, linux: i32) {
     mem().write_u32(uc.get_data().errno_slot, arm32_bridge::ios32::darwin_errno(linux) as u32);
 }
 
+/// This thread's errno on the host.
+fn host_errno() -> *mut libc::c_int {
+    #[cfg(target_os = "android")]
+    return unsafe { libc::__errno() };
+    #[cfg(not(target_os = "android"))]
+    return unsafe { libc::__errno_location() };
+}
+
 /// A wide number's text as bytes for the host's strto* (it stops at the first
 /// character outside ASCII, as a number would), then the result and the
 /// guest end address (written to `end_out`).
@@ -184,9 +192,9 @@ fn wide_number<T>(uc: &Uc, text: u32, end_out: u32, parse: impl FnOnce(*const li
     let mut bytes: Vec<u8> = read_wide(text).into_iter().take_while(|&c| c < 128).map(|c| c as u8).collect();
     bytes.push(0);
     let mut end: *mut libc::c_char = std::ptr::null_mut();
-    unsafe { *libc::__errno_location() = 0 };
+    unsafe { *host_errno() = 0 };
     let value = parse(bytes.as_ptr() as *const libc::c_char, &mut end);
-    let errno = unsafe { *libc::__errno_location() };
+    let errno = unsafe { *host_errno() };
     if errno != 0 {
         set_errno(uc, errno);
     }
