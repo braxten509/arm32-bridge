@@ -5,6 +5,9 @@
 //! - [`encoding`]: type encodings and the armv7 / AAPCS64 layouts;
 //! - [`selectors`]: encodings of the framework selectors the games send.
 
+pub mod bridge;
+#[cfg(test)]
+mod bridge_tests;
 pub mod classes;
 #[cfg(test)]
 mod classes_tests;

@@ -562,3 +562,17 @@ willChangeValueForKey:	v@:@
 windows	@@:
 writeToFile:atomically:	c@:@c
 yellowColor	@@:
+# NSObject basics: a game may implement these too (so the derivation above
+# leaves them out), but they still reach Apple's classes through super and
+# through the game's own classes' framework roots.
+alloc	@@:
+allocWithZone:	@@:^{_NSZone=}
+conformsToProtocol:	c@:@
+copyWithZone:	@@:^{_NSZone=}
+dealloc	v@:
+description	@@:
+init	@@:
+isMemberOfClass:	c@:#
+retainCount	I@:
+superclass	#@:
+zone	^{_NSZone=}@:

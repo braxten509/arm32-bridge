@@ -51,6 +51,8 @@ pub struct GuestClasses {
     by_name: HashMap<String, u32>,
     /// Game categories on framework classes: (class name, metaclass) -> methods.
     framework_categories: HashMap<(String, bool), HashMap<String, GuestMethod>>,
+    /// Some game method's type encoding per selector name.
+    selector_types: HashMap<String, String>,
 }
 
 fn method_map(list: &[Method32]) -> HashMap<String, GuestMethod> {
@@ -122,7 +124,21 @@ impl GuestClasses {
                 other => return Err(format!("category {} on {other:?}", category.name)),
             }
         }
+        let all = table.classes.values().map(|c| &c.methods).chain(table.framework_categories.values());
+        let mut types = HashMap::new();
+        for methods in all {
+            for (name, m) in methods {
+                types.entry(name.clone()).or_insert_with(|| m.types.clone());
+            }
+        }
+        table.selector_types = types;
         Ok(table)
+    }
+
+    /// The type encoding of some game method named `sel` (an override has
+    /// the framework method's types).
+    pub fn types_for_selector(&self, sel: &str) -> Option<&str> {
+        self.selector_types.get(sel).map(String::as_str)
     }
 
     pub fn lookup(&self, mut class: u32, sel: &str) -> Lookup<'_> {

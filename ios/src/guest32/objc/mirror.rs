@@ -116,6 +116,9 @@ pub fn trampoline_address() -> usize {
 }
 
 type Dispatch = Box<dyn Fn(&mut HostFrame) + Send + Sync>;
+/// Tests that install a dispatch hook hold this, so they do not swap each other's hook.
+#[cfg(test)]
+pub(crate) static DISPATCH_TEST_LOCK: Mutex<()> = Mutex::new(());
 static DISPATCH: RwLock<Option<Dispatch>> = RwLock::new(None);
 
 /// Installs what the trampoline runs: it gets the saved registers and fills
@@ -219,6 +222,7 @@ mod tests {
         // A second class of the same name is refused, so a host class is never replaced.
         assert!(define_mirror_class("G32MirrorTest", 0, 1, &[], &[]).is_err());
 
+        let _hook = DISPATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set_dispatch(Box::new(|frame: &mut HostFrame| {
             // Ten integer arguments: x0-x7, then two stack slots.
             let stack = unsafe { std::slice::from_raw_parts(frame.stack as *const u64, 2) };

@@ -1,0 +1,254 @@
+//! The bridge with a made-up guest (memory buffer + Rust closures standing in
+//! for guest code) and real host classes in the 64-bit runtime.
+
+use super::bridge::*;
+use super::convert::{HostFrame, HostRet};
+use super::mirror;
+use crate::objc::runtime::{self, Class, Id, Sel};
+use guest32_image::{ClassRo32, ClassTarget, Method32, ObjcClass32, ObjcMetadata32};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+const BASE: u32 = 0x10_0000;
+const SIZE: usize = 0x10_0000;
+
+type Code = Arc<dyn Fn(&[u32]) -> u64 + Send + Sync>;
+
+struct Fake {
+    memory: *mut u8,
+    next: Mutex<u32>,
+    code: Mutex<HashMap<u32, Code>>,
+}
+
+unsafe impl Sync for Fake {}
+unsafe impl Send for Fake {}
+
+impl Fake {
+    fn new() -> &'static Fake {
+        let memory = Box::leak(vec![0u8; SIZE].into_boxed_slice()).as_mut_ptr();
+        Box::leak(Box::new(Fake { memory, next: Mutex::new(BASE + 0x1000), code: Mutex::new(HashMap::new()) }))
+    }
+    fn code(&self, imp: u32, f: impl Fn(&[u32]) -> u64 + Send + Sync + 'static) {
+        self.code.lock().unwrap().insert(imp, Arc::new(f));
+    }
+    fn u32_at(&self, addr: u32) -> u32 {
+        u32::from_le_bytes(self.read(addr, 4).try_into().unwrap())
+    }
+    fn text(&self, s: &str) -> u32 {
+        let at = self.alloc_permanent(s.len() as u32 + 1);
+        self.write(at, s.as_bytes());
+        at
+    }
+}
+
+impl GuestSide for Fake {
+    fn read(&self, addr: u32, len: u32) -> Vec<u8> {
+        unsafe { std::slice::from_raw_parts(self.memory.add((addr - BASE) as usize), len as usize).to_vec() }
+    }
+    fn write(&self, addr: u32, data: &[u8]) {
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.memory.add((addr - BASE) as usize), data.len()) }
+    }
+    fn alloc(&self, size: u32) -> u32 {
+        self.alloc_permanent(size)
+    }
+    fn free(&self, _addr: u32) {}
+    fn alloc_permanent(&self, size: u32) -> u32 {
+        let mut next = self.next.lock().unwrap();
+        let at = *next;
+        *next += size.div_ceil(8) * 8;
+        at
+    }
+    fn host_address(&self, addr: u32) -> usize {
+        self.memory as usize + (addr - BASE) as usize
+    }
+    fn guest_address(&self, host: usize) -> Option<u32> {
+        let start = self.memory as usize;
+        (host >= start && host < start + SIZE).then(|| BASE + (host - start) as u32)
+    }
+    fn call(&self, imp: u32, words: &[u32]) -> Result<u64, String> {
+        let code = self.code.lock().unwrap().get(&imp).cloned().ok_or(format!("no fake code at {imp:#x}"))?;
+        Ok(code(words))
+    }
+}
+
+// ----- host classes for the test -----
+
+extern "C" fn host_alloc(class: Class, _: Sel) -> Id {
+    runtime::alloc_instance(class)
+}
+
+static HOST_ALPHA: Mutex<Vec<(Id, f64)>> = Mutex::new(Vec::new());
+
+extern "C" fn host_set_alpha(this: Id, _: Sel, alpha: f64) {
+    HOST_ALPHA.lock().unwrap().push((this, alpha));
+}
+
+#[repr(C)]
+struct Rect {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+extern "C" fn host_frame(_: Id, _: Sel) -> Rect {
+    Rect { x: 1.0, y: 2.0, w: 30.0, h: 40.0 }
+}
+
+extern "C" fn host_object_at_index(this: Id, _: Sel, index: usize) -> Id {
+    if index == 0 {
+        this
+    } else {
+        0
+    }
+}
+
+fn host_class(name: &str) -> Class {
+    let mut rt = runtime::lock();
+    let class = rt.define_class(name, 0, 16);
+    let meta = rt.classes[&class].partner;
+    let (alloc, alpha, frame, at) =
+        (rt.sel("alloc"), rt.sel("setAlpha:"), rt.sel("frame"), rt.sel("objectAtIndex:"));
+    rt.add_method(meta, alloc, host_alloc as usize);
+    rt.add_method(class, alpha, host_set_alpha as usize);
+    rt.add_method(class, frame, host_frame as usize);
+    rt.add_method(class, at, host_object_at_index as usize);
+    class
+}
+
+fn method(name: &str, types: &str, imp: u32) -> Method32 {
+    Method32 { name: name.into(), types: types.into(), imp }
+}
+
+/// Game class `G32Sprite : G32HostView` with -setAlpha: (calls super) and
+/// -tick:(int) returning an int; metaclass with +sprite.
+fn game(fake: &Fake) -> (Mutex<Bridge>, u32, u32) {
+    let (class, meta) = (fake.alloc_permanent(20), fake.alloc_permanent(20));
+    fake.write(class, &meta.to_le_bytes());
+    let md = ObjcMetadata32 {
+        classes: vec![ObjcClass32 {
+            address: class,
+            name: "G32Sprite".into(),
+            superclass: ClassTarget::External("G32HostView".into()),
+            meta_address: meta,
+            meta_isa: ClassTarget::External("G32HostView".into()),
+            meta_superclass: ClassTarget::External("G32HostView".into()),
+            instance: ClassRo32 {
+                instance_start: 8,
+                instance_size: 16,
+                methods: vec![method("setAlpha:", "v12@0:4f8", 0x2001), method("tick:", "i12@0:4i8", 0x2011)],
+                ..Default::default()
+            },
+            meta: ClassRo32 { flags: 1, methods: vec![method("sprite", "@8@0:4", 0x2021)], ..Default::default() },
+        }],
+        ..Default::default()
+    };
+    let bridge = Bridge::new(&md).unwrap();
+    let bridge = Mutex::new(bridge);
+    install(&bridge, fake, &md).unwrap();
+    (bridge, class, meta)
+}
+
+fn send(bridge: &Mutex<Bridge>, fake: &Fake, words: &[u32]) -> Result<u64, String> {
+    let w = |i: u32| words.get(i as usize).copied().unwrap_or(0);
+    send_from_guest(bridge, fake, SendKind::Normal, &w).map(|r| u64::from(r.r0) | u64::from(r.r1) << 32)
+}
+
+#[test]
+fn guest_messages_reach_game_code_host_code_and_super() {
+    let host_view = host_class("G32HostView");
+    let fake = Fake::new();
+    let (bridge, class, meta) = game(fake);
+    let sel = |name: &str| bridge.lock().unwrap().guest_selector(fake, name);
+
+    // +[G32Sprite alloc] goes to the host's alloc with the mirror class; the
+    // guest gets a guest instance of the game class (isa = the game class).
+    let object = send(&bridge, fake, &[class, sel("alloc")]).unwrap() as u32;
+    assert_eq!(fake.u32_at(object), class);
+    let host = bridge.lock().unwrap().host_object(object).unwrap();
+    let mirror_class = runtime::lock().class_of(host);
+    assert_eq!(runtime::lock().classes[&mirror_class].superclass, host_view);
+    // Identity is stable both ways.
+    assert_eq!(bridge.lock().unwrap().guest_object(fake, host).unwrap(), object);
+
+    // A game method runs as guest code with the guest's words.
+    fake.code(0x2011, |w| u64::from(w[2] * 3));
+    assert_eq!(send(&bridge, fake, &[object, sel("tick:"), 14]).unwrap(), 42);
+
+    // -setAlpha: is the game's; it calls [super setAlpha:] which must reach
+    // the host's implementation (not the mirror's trampoline again).
+    let bridge_ref: &'static Mutex<Bridge> = Box::leak(Box::new(bridge));
+    let super_struct = fake.alloc_permanent(8);
+    fake.code(0x2001, move |w| {
+        fake.write(super_struct, &[w[0].to_le_bytes(), class.to_le_bytes()].concat());
+        let words = [super_struct, w[1], w[2]];
+        let get = |i: u32| words[i as usize];
+        send_from_guest(bridge_ref, fake, SendKind::Super2, &get).unwrap();
+        0
+    });
+    let alpha = bridge_ref.lock().unwrap().guest_selector(fake, "setAlpha:");
+    send(bridge_ref, fake, &[object, alpha, 0.5f32.to_bits()]).unwrap();
+    assert_eq!(*HOST_ALPHA.lock().unwrap(), [(host, 0.5)]);
+
+    // A framework selector the game does not implement goes to the host with
+    // converted types: -frame (CGRect stret) and -objectAtIndex: (id result).
+    let out = fake.alloc_permanent(16);
+    let frame_sel = bridge_ref.lock().unwrap().guest_selector(fake, "frame");
+    let w = [out, object, frame_sel];
+    let get = |i: u32| w[i as usize];
+    send_from_guest(bridge_ref, fake, SendKind::Stret, &get).unwrap();
+    let floats: Vec<f32> = fake.read(out, 16).chunks(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+    assert_eq!(floats, [1.0, 2.0, 30.0, 40.0]);
+    let at = bridge_ref.lock().unwrap().guest_selector(fake, "objectAtIndex:");
+    assert_eq!(send(bridge_ref, fake, &[object, at, 0]).unwrap() as u32, object);
+
+    // A class method of the game runs on the guest class object.
+    fake.code(0x2021, move |w| u64::from(w[0]));
+    let sprite = bridge_ref.lock().unwrap().guest_selector(fake, "sprite");
+    assert_eq!(send(bridge_ref, fake, &[class, sprite]).unwrap() as u32, class);
+    let _ = meta;
+
+    // A selector with no encoding and no game method fails loudly with its name.
+    let unknown = bridge_ref.lock().unwrap().guest_selector(fake, "frobnicate:");
+    let error = send(bridge_ref, fake, &[object, unknown, 1]).unwrap_err();
+    assert!(error.contains("frobnicate:"), "{error}");
+
+    // The host messages the game object: the trampoline converts and runs guest code.
+    let _hook = mirror::DISPATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    mirror::set_dispatch(Box::new(move |frame: &mut HostFrame| {
+        dispatch_from_host(bridge_ref, fake, frame).unwrap();
+    }));
+    let tick = runtime::sel("tick:");
+    let imp = runtime::imp_for(host, tick).unwrap();
+    let mut args = super::convert::HostArgs::default();
+    args.x[..3].copy_from_slice(&[host as u64, tick as u64, 5]);
+    let ret: HostRet = mirror::call_host(imp, &args);
+    assert_eq!(ret.x[0] as u32, 15);
+}
+
+#[test]
+fn framework_classes_are_built_in_guest_memory_with_their_chain() {
+    host_class("G32HostBase");
+    let fake = Fake::new();
+    let bridge = Mutex::new(Bridge::new(&ObjcMetadata32::default()).unwrap());
+    let (class, meta) = bridge.lock().unwrap().framework_class(fake, "G32HostBase");
+    // class_t { isa, superclass, cache, vtable, data } in 32-bit layout.
+    assert_eq!(fake.u32_at(class), meta);
+    assert_eq!(fake.u32_at(class + 4), 0);
+    let ro = fake.u32_at(class + 16);
+    let name = fake.u32_at(ro + 16);
+    assert_eq!(fake.read(name, 12), b"G32HostBase\0");
+    // A root metaclass is its own isa, and its superclass is the root class.
+    assert_eq!((fake.u32_at(meta), fake.u32_at(meta + 4)), (meta, class));
+    assert_eq!(fake.u32_at(fake.u32_at(meta + 16)) & 1, 1);
+    // Same class every time; host class objects map to it.
+    assert_eq!(bridge.lock().unwrap().framework_class(fake, "G32HostBase").0, class);
+    let host = runtime::class_named("G32HostBase");
+    assert_eq!(bridge.lock().unwrap().guest_object(fake, host).unwrap(), class);
+    // A host instance gets a proxy whose isa is the guest class.
+    let object = runtime::alloc_instance(host);
+    let proxy = bridge.lock().unwrap().guest_object(fake, object).unwrap();
+    assert_eq!(fake.u32_at(proxy), class);
+    assert_eq!(bridge.lock().unwrap().host_object(proxy), Some(object));
+    let _ = fake.text("");
+}
