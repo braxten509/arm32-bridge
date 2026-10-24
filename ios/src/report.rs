@@ -35,6 +35,80 @@ fn log_file() -> Option<&'static Mutex<std::fs::File>> {
     .as_ref()
 }
 
+/// The last log lines, so a test can wait for one instead of a fixed time
+/// (see `LineWatch`): IOS_TAPS steps and IOS_STOP_AFTER use them.
+const LINES_KEPT: usize = 512;
+
+struct Recent {
+    lines: std::collections::VecDeque<(u64, String)>,
+    written: u64,
+}
+
+static RECENT: Mutex<Recent> = Mutex::new(Recent { lines: std::collections::VecDeque::new(), written: 0 });
+static RECENT_CHANGED: std::sync::Condvar = std::sync::Condvar::new();
+/// Whether a test is waiting for lines: without one, no line is kept (the
+/// phone keeps its memory).
+static LINES_WANTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Watches the log for a line: a test taps or stops as soon as its line
+/// shows up, not after a guessed number of seconds.
+#[derive(Clone, Copy)]
+pub struct LineWatch {
+    /// The number of the last line this watch has gone past.
+    seen: u64,
+}
+
+impl LineWatch {
+    /// Watches the lines written from now on (one written earlier does not
+    /// count).
+    pub fn now() -> Self {
+        LINES_WANTED.store(true, std::sync::atomic::Ordering::Relaxed);
+        let recent = RECENT.lock().unwrap_or_else(|e| e.into_inner());
+        LineWatch { seen: recent.written }
+    }
+
+    /// Waits until a line holds `text` (a plain part of a line, not a
+    /// pattern) and says whether it came within `limit`. A later wait looks
+    /// at the lines the one before it went past too, so steps stay in order.
+    pub fn wait_for(&mut self, text: &str, limit: std::time::Duration) -> bool {
+        let give_up = std::time::Instant::now() + limit;
+        let mut recent = RECENT.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            let found = recent.lines.iter().find(|(number, line)| *number > self.seen && line.contains(text));
+            if let Some((number, _)) = found {
+                self.seen = *number;
+                return true;
+            }
+            let left = give_up.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                // The lines it waited through are behind this watch now, so
+                // a later wait can't match one of them by mistake.
+                self.seen = recent.written;
+                return false;
+            }
+            recent = RECENT_CHANGED.wait_timeout(recent, left).unwrap_or_else(|e| e.into_inner()).0;
+        }
+    }
+}
+
+/// IOS_STOP_AFTER=<text>: ends the run (code 0) as soon as a line holds
+/// that text, so a test that already got what it wanted doesn't sit out
+/// its seconds.
+pub fn stop_when_line_appears() {
+    let Ok(text) = std::env::var("IOS_STOP_AFTER") else { return };
+    if text.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        // The limit only matters when the line never comes: the run then
+        // ends by itself, as without this switch.
+        if LineWatch::now().wait_for(&text, std::time::Duration::from_secs(3600)) {
+            line(&format!("stopping as asked: a line held \"{text}\" (IOS_STOP_AFTER)"));
+            finish(0);
+        }
+    });
+}
+
 pub fn line(text: &str) {
     let _guard = OUT.lock().unwrap_or_else(|e| e.into_inner());
     let tid = unsafe { libc::gettid() };
@@ -42,6 +116,19 @@ pub fn line(text: &str) {
     if let Some(file) = log_file() {
         if let Ok(mut file) = file.try_lock() {
             let _ = writeln!(file, "[ios {tid}] {text}");
+        }
+    }
+    {
+        if LINES_WANTED.load(std::sync::atomic::Ordering::Relaxed) {
+            let mut recent = RECENT.lock().unwrap_or_else(|e| e.into_inner());
+            recent.written += 1;
+            let number = recent.written;
+            recent.lines.push_back((number, text.to_string()));
+            while recent.lines.len() > LINES_KEPT {
+                recent.lines.pop_front();
+            }
+            drop(recent);
+            RECENT_CHANGED.notify_all();
         }
     }
 }
@@ -438,5 +525,46 @@ pub fn install_crash_handler() {
         for signal in [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGFPE, libc::SIGTRAP, libc::SIGABRT] {
             libc::sigaction(signal, &action, std::ptr::null_mut());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn a_line_wait_catches_a_line_written_after_it_starts() {
+        let mut watch = LineWatch::now();
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(30));
+            line("line wait test: the menu is ready");
+        });
+        assert!(watch.wait_for("the menu is ready", Duration::from_millis(400)));
+    }
+
+    #[test]
+    fn a_line_wait_gives_up_at_its_limit() {
+        let mut watch = LineWatch::now();
+        assert!(!watch.wait_for("a line this test never writes", Duration::from_millis(200)));
+    }
+
+    #[test]
+    fn a_line_wait_ignores_lines_written_before_it_started() {
+        line("line wait test: an old line");
+        let mut watch = LineWatch::now();
+        assert!(!watch.wait_for("an old line", Duration::from_millis(200)));
+    }
+
+    #[test]
+    fn a_line_wait_still_sees_a_line_written_while_the_one_before_waited() {
+        let mut watch = LineWatch::now();
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(20));
+            line("line wait test: the first gate");
+            line("line wait test: the second gate");
+        });
+        assert!(watch.wait_for("the first gate", Duration::from_millis(400)));
+        assert!(watch.wait_for("the second gate", Duration::from_millis(0)), "a later wait looks at the lines the earlier wait went past");
     }
 }

@@ -2,6 +2,7 @@
 # Builds the iPhone layer for ARM64 Linux and runs a game under qemu on the PC.
 # usage: run-pc.sh <App.app> [ios-run options...]
 #   env: IOS_HOME (game's writable folder), IOS_RUN_SECONDS, IOS_LIST_MISSING,
+#        IOS_TAPS (taps, see docs/ios-plan.md), IOS_WAIT_LIMIT, IOS_STOP_AFTER,
 #        LOG (log file, default ~/.cache/ios-run.log), TAIL (lines shown, default 20),
 #        TIMEOUT (seconds, default 300)
 # Exits with the run's own exit code (124 = timed out); stops if the build fails.

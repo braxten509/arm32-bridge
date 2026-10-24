@@ -84,6 +84,7 @@ extern "C" fn ui_application_main(_argc: i32, _argv: usize, principal: Id, deleg
     let seconds: f64 = std::env::var("IOS_RUN_SECONDS").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
     crate::report::reached_run_loop();
     crate::fw::touch::schedule_test_taps();
+    crate::report::stop_when_line_appears();
     crate::fw::typing::schedule_test_typing();
     if seconds > 0.0 {
         crate::log!("run loop running for {seconds} s");

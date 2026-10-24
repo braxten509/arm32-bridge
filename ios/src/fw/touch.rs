@@ -316,33 +316,84 @@ pub fn window_to_points(x: f64, y: f64, width: i32, height: i32) -> Point {
     Point { x: across * points_wide, y: down * points_high }
 }
 
-/// IOS_TAPS="12:284,160;20:100,50": taps at those times (seconds after start) and points.
-/// IOS_TAPS="seconds:x,y;seconds:x,y>x2,y2;..." (points): test taps, or
-/// swipes from x,y to x2,y2 over about 150 ms.
-pub fn schedule_test_taps() {
-    let Ok(text) = std::env::var("IOS_TAPS") else { return };
+/// When a test tap fires: after a number of seconds from the start, or as
+/// soon as a log line holds some text.
+#[derive(Clone, Debug, PartialEq)]
+enum When {
+    Time(f64),
+    Line(String),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct TestTap {
+    when: When,
+    from: Point,
+    to: Point,
+}
+
+/// IOS_TAPS="20:283,211;after=Mainmenu.jpg=>283,211;after=the menu=>389,297>400,300":
+/// taps at those times (seconds after start) or as soon as a log line holds
+/// the text after `after=` (points); a swipe goes from x,y to x2,y2 over
+/// about 150 ms. A step that isn't whole is left out.
+fn parse_test_taps(text: &str) -> Vec<TestTap> {
     let point = |text: &str| -> Option<Point> {
         let (x, y) = text.split_once(',')?;
         Some(Point { x: x.trim().parse().ok()?, y: y.trim().parse().ok()? })
     };
-    let touches: Vec<(f64, Point, Point)> = text
-        .split(';')
-        .filter_map(|part| {
-            let (time, place) = part.split_once(':')?;
-            let (from, to) = match place.split_once('>') {
-                Some((from, to)) => (point(from)?, point(to)?),
-                None => (point(place)?, point(place)?),
+    text.split(';')
+        .filter_map(|step| {
+            let (when, place) = match step.split_once("=>") {
+                Some((wait, place)) => (When::Line(wait.trim().strip_prefix("after=")?.to_string()), place),
+                None => {
+                    let (time, place) = step.split_once(':')?;
+                    (When::Time(time.trim().parse().ok()?), place)
+                }
             };
-            Some((time.trim().parse().ok()?, from, to))
+            let (from, to) = match place.trim().split_once('>') {
+                Some((from, to)) => (point(from)?, point(to)?),
+                None => (point(place.trim())?, point(place.trim())?),
+            };
+            Some(TestTap { when, from, to })
         })
-        .collect();
+        .collect()
+}
+
+/// How long a tap waits for its line before it taps anyway: IOS_WAIT_LIMIT,
+/// 60 s by default. The limit only shows up when a test is broken; a test
+/// that passes taps as soon as its line comes.
+fn test_wait_limit() -> std::time::Duration {
+    let seconds: f64 = std::env::var("IOS_WAIT_LIMIT").ok().and_then(|text| text.parse().ok()).unwrap_or(60.0);
+    std::time::Duration::from_secs_f64(seconds.max(0.0))
+}
+
+/// IOS_TAPS makes the test taps on the PC (the phone hands touches over its
+/// own way, see `deliver`).
+pub fn schedule_test_taps() {
+    let Ok(text) = std::env::var("IOS_TAPS") else { return };
+    let taps = parse_test_taps(&text);
+    let limit = test_wait_limit();
     std::thread::spawn(move || {
         let start = now();
-        for (finger, (time, from, to)) in touches.into_iter().enumerate() {
-            let wait = start + time - now();
-            if wait > 0.0 {
-                std::thread::sleep(std::time::Duration::from_secs_f64(wait));
+        let mut watch = crate::report::LineWatch::now();
+        for (finger, tap) in taps.into_iter().enumerate() {
+            match &tap.when {
+                When::Time(time) => {
+                    let wait = start + time - now();
+                    if wait > 0.0 {
+                        crate::log!("test tap at {time:.1} s: a fixed wait, slower than an after= line (IOS_TAPS)");
+                        std::thread::sleep(std::time::Duration::from_secs_f64(wait));
+                    }
+                }
+                When::Line(text) => {
+                    let began = now();
+                    if watch.wait_for(text, limit) {
+                        crate::log!("test tap kept by the line \"{text}\" after {:.1} s", now() - began);
+                    } else {
+                        crate::log!("test tap waited {:.0} s for a line holding \"{text}\" and did not see one (IOS_WAIT_LIMIT); tapping anyway", limit.as_secs_f64());
+                    }
+                }
             }
+            let (from, to) = (tap.from, tap.to);
             let swipe = from.x != to.x || from.y != to.y;
             crate::log!("test {} at {:.0},{:.0}", if swipe { "swipe" } else { "tap" }, from.x, from.y);
             let finger = finger as i32;
@@ -589,5 +640,25 @@ mod tests {
         assert!((bar.y - high).abs() < 1.0);
         let right = window_to_points(x1 as f64, 1080.0, 2400, 1080);
         assert!((right.x - wide).abs() < 0.01 && (right.y - high).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_taps_fire_on_a_log_line_or_a_time() {
+        let taps = parse_test_taps("after=Mainmenu.jpg=>283,211;20:100,50;after=-[TileMapLayer init]=>389,297>400,300");
+        let at = |x: f64, y: f64| Point { x, y };
+        assert_eq!(taps.len(), 3, "three steps: {taps:?}");
+        assert_eq!(taps[0].when, When::Line("Mainmenu.jpg".to_string()));
+        assert_eq!((taps[0].from, taps[0].to), (at(283.0, 211.0), at(283.0, 211.0)));
+        assert_eq!(taps[1].when, When::Time(20.0));
+        assert_eq!((taps[1].from, taps[1].to), (at(100.0, 50.0), at(100.0, 50.0)));
+        assert_eq!(taps[2].when, When::Line("-[TileMapLayer init]".to_string()));
+        assert_eq!((taps[2].from, taps[2].to), (at(389.0, 297.0), at(400.0, 300.0)), "a swipe still goes from one place to another");
+    }
+
+    #[test]
+    fn test_tap_steps_that_make_no_sense_are_left_out() {
+        let taps = parse_test_taps("after=a line with no place;soon:1,2;30:3,4;after=ready=>");
+        assert_eq!(taps.len(), 1, "only the time step is whole: {taps:?}");
+        assert_eq!(taps[0].when, When::Time(30.0));
     }
 }
