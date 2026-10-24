@@ -41,9 +41,11 @@ qemu-aarch64 -L ~/.cache/aarch64-sysroot \
 `IOS_DEVICE` sets the reported model (default `iPhone6,1`, iPhone 5s).
 `IOS_SCREEN` sets the screen (default `568x320@2`, landscape). A game built
 with an iOS 7 or older SDK (`DTSDKName` in its Info.plist) gets old-iPhone
-screen rules: `UIScreen` reports the screen portrait even in a landscape game,
-while the window, the game's picture and touches follow its interface
-orientation. Newer games are unchanged.
+screen rules: `UIScreen` and a full-screen `UIWindow` report portrait bounds
+even in a landscape game, while the picture and touches follow its interface
+orientation. A linked child controller's zero-origin, untransformed,
+exact portrait-sized view in a landscape-height parent is turned to that
+orientation when attached. Newer games are unchanged.
 `IOS_RUN_SECONDS` ends the run loop after that many seconds.
 
 Or build and run in one go (log in `~/.cache/ios-run.log`):

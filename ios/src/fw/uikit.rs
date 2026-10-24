@@ -12,6 +12,7 @@ use std::sync::{Mutex, OnceLock};
 // ----- simple stored properties -----
 
 static PROPERTIES: Mutex<Option<HashMap<(Id, &'static str), u64>>> = Mutex::new(None);
+static CONTROLLER_CHILDREN: Mutex<Option<HashMap<Id, Vec<Id>>>> = Mutex::new(None);
 
 pub fn property_get(object: Id, key: &'static str) -> Option<u64> {
     PROPERTIES.lock().unwrap().as_ref().and_then(|m| m.get(&(object, key)).copied())
@@ -609,7 +610,17 @@ extern "C" fn view_bounds(this: Id, _: Sel) -> Rect {
 }
 
 extern "C" fn window_bounds(this: Id, selector: Sel) -> Rect {
-    window_frame(current_geometry(), view_bounds(this, selector))
+    window_reported_bounds(current_geometry(), view_bounds(this, selector))
+}
+
+fn window_reported_bounds(geometry: Geometry, bounds: Rect) -> Rect {
+    let (wide, high, _) = geometry.oriented;
+    let (short, long, _) = geometry.reported;
+    if geometry.legacy && bounds.size.width == wide && bounds.size.height == high {
+        Rect { origin: bounds.origin, size: Size { width: short, height: long } }
+    } else {
+        bounds
+    }
 }
 
 extern "C" fn window_set_bounds(this: Id, selector: Sel, bounds: Rect) {
@@ -788,7 +799,23 @@ fn detach(view: Id) {
     }
 }
 
+fn controller_child_frame(geometry: Geometry, parent_size: Size, child_frame: Rect, child_transform: Transform, linked: bool) -> Option<Rect> {
+    let (wide, high, _) = geometry.oriented;
+    let (short, long, _) = geometry.reported;
+    let landscape_parent = parent_size.height == high && parent_size.width > high && parent_size.width <= wide;
+    let full_screen_child = child_frame.origin.x == 0.0 && child_frame.origin.y == 0.0 && child_frame.size.width == short && child_frame.size.height == long;
+    if linked && geometry.legacy && wide > high && landscape_parent && full_screen_child && child_transform == IDENTITY {
+        Some(Rect::new(0.0, 0.0, wide, high))
+    } else {
+        None
+    }
+}
+
 fn attach(parent: Id, view: Id, index: Option<usize>) {
+    attach_with_geometry(parent, view, index, current_geometry());
+}
+
+fn attach_with_geometry(parent: Id, view: Id, index: Option<usize>, geometry: Geometry) {
     if view == 0 || parent == 0 {
         return;
     }
@@ -799,6 +826,15 @@ fn attach(parent: Id, view: Id, index: Option<usize>) {
         None => list.push(view),
     }
     view_state(view).superview = parent;
+    let parent_size = view_state(parent).frame.size;
+    let child_frame = view_state(view).frame;
+    let child_transform = view_state(view).transform;
+    if let Some(frame) = controller_child_frame(geometry, parent_size, child_frame, child_transform, true) {
+        let parent_controller = property_get(parent, "viewController").unwrap_or(0) as Id;
+        if linked_controller_view(parent_controller, parent, view) {
+            send_rect(view, "setFrame:", frame);
+        }
+    }
     set_needs_layout(view);
     set_needs_layout(parent);
     for name in ["didMoveToSuperview"] {
@@ -1129,6 +1165,9 @@ extern "C" fn controller_view(this: Id, _: Sel) -> Id {
 }
 
 extern "C" fn controller_set_view(this: Id, _: Sel, view: Id) {
+    if let Some(old) = property_get(this, "view").map(|old| old as Id).filter(|&old| old != view && property_get(old, "viewController") == Some(this as u64)) {
+        property_set(old, "viewController", 0);
+    }
     property_set(this, "view", view as u64);
     if view != 0 {
         property_set(view, "viewController", this as u64);
@@ -1325,6 +1364,78 @@ extern "C" fn controller_navigation(this: Id, _: Sel) -> Id {
 }
 
 property!(controller_presented, controller_set_presented, "presented", id, 0);
+
+fn controller_children_list(parent: Id) -> Vec<Id> {
+    CONTROLLER_CHILDREN.lock().unwrap().as_ref().and_then(|children| children.get(&parent)).cloned().unwrap_or_default()
+}
+
+fn controller_owns_view(controller: Id, view: Id) -> bool {
+    if controller == 0 || view == 0 {
+        return false;
+    }
+    let owned = property_get(controller, "view").unwrap_or(0) as Id;
+    let owned = if owned == 0 { runtime::send(controller, "view", &[]) } else { owned };
+    owned == view
+}
+
+fn linked_controller_view(parent_controller: Id, parent_view: Id, view: Id) -> bool {
+    if !controller_owns_view(parent_controller, parent_view) {
+        return false;
+    }
+    let mut fallback = Vec::new();
+    for child in controller_children_list(parent_controller) {
+        if property_get(child, "parentController") != Some(parent_controller as u64) {
+            continue;
+        }
+        let owned = property_get(child, "view").unwrap_or(0) as Id;
+        if owned == view || property_get(view, "viewController") == Some(child as u64) {
+            return true;
+        }
+        if owned == 0 {
+            fallback.push(child);
+        }
+    }
+    if fallback.len() == 1 {
+        runtime::send(fallback[0], "view", &[]) == view
+    } else {
+        false
+    }
+}
+
+extern "C" fn controller_parent(this: Id, _: Sel) -> Id {
+    property_get(this, "parentController").unwrap_or(0) as Id
+}
+
+extern "C" fn controller_add_child(this: Id, _: Sel, child: Id) {
+    if child == 0 {
+        return;
+    }
+    let previous = property_get(child, "parentController").unwrap_or(0) as Id;
+    if previous == this {
+        return;
+    }
+    {
+        let mut all = CONTROLLER_CHILDREN.lock().unwrap();
+        let all = all.get_or_insert_with(HashMap::new);
+        if previous != 0 {
+            if let Some(children) = all.get_mut(&previous) {
+                children.retain(|&controller| controller != child);
+            }
+        }
+        all.entry(this).or_default().push(child);
+    }
+    property_set(child, "parentController", this as u64);
+}
+
+extern "C" fn controller_remove_from_parent(this: Id, _: Sel) {
+    let parent = property_get(this, "parentController").unwrap_or(0) as Id;
+    if parent != 0 {
+        if let Some(children) = CONTROLLER_CHILDREN.lock().unwrap().as_mut().and_then(|all| all.get_mut(&parent)) {
+            children.retain(|&controller| controller != this);
+        }
+    }
+    property_set(this, "parentController", 0);
+}
 
 extern "C" fn controller_children(_this: Id, _: Sel) -> Id {
     collections::array_from(&[])
@@ -1921,11 +2032,11 @@ pub fn register(r: &mut Registry) {
             ("setNeedsStatusBarAppearanceUpdate", nothing as usize),
             ("preferredStatusBarStyle", zero as usize),
             ("childViewControllers", controller_children as usize),
-            ("addChildViewController:", ignore_id as usize),
-            ("removeFromParentViewController", nothing as usize),
+            ("addChildViewController:", controller_add_child as usize),
+            ("removeFromParentViewController", controller_remove_from_parent as usize),
             ("didMoveToParentViewController:", ignore_id as usize),
             ("willMoveToParentViewController:", ignore_id as usize),
-            ("parentViewController", zero as usize),
+            ("parentViewController", controller_parent as usize),
             ("presentingViewController", controller_presenting as usize),
             ("navigationController", controller_navigation as usize),
             ("setTitle:", ignore_id as usize),
@@ -2512,6 +2623,126 @@ mod tests {
         assert_eq!(window_frame(geometry, Rect::new(0.0, 0.0, 200.0, 100.0)), Rect::new(0.0, 0.0, 200.0, 100.0));
         let current = geometry_for((568.0, 320.0, 2.0), None);
         assert_eq!(window_frame(current, Rect::new(0.0, 0.0, 320.0, 568.0)), Rect::new(0.0, 0.0, 320.0, 568.0));
+    }
+
+    #[test]
+    fn old_fullscreen_window_bounds_are_reported_portrait() {
+        let old_info = screen_info("iphoneos7.0", &["UIInterfaceOrientationLandscapeRight"]);
+        let new_info = screen_info("iphoneos8.0", &["UIInterfaceOrientationLandscapeRight"]);
+        let old = geometry_for((568.0, 320.0, 2.0), Some(&old_info));
+        let newer = geometry_for((568.0, 320.0, 2.0), Some(&new_info));
+        let landscape = Rect::new(0.0, 0.0, 568.0, 320.0);
+        let portrait = Rect::new(0.0, 0.0, 320.0, 568.0);
+        assert_eq!(window_reported_bounds(old, landscape), portrait);
+        assert_eq!(window_frame(old, portrait), landscape);
+        assert_eq!(window_reported_bounds(old, window_frame(old, portrait)), portrait);
+        assert_eq!(window_reported_bounds(newer, landscape), landscape);
+        let custom = Rect::new(5.0, 6.0, 200.0, 100.0);
+        assert_eq!(window_reported_bounds(old, custom), custom);
+    }
+
+    extern "C" fn overriding_controller_view(this: Id, _: Sel) -> Id {
+        let reads = property_get(this, "viewReads").unwrap_or(0);
+        property_set(this, "viewReads", reads + 1);
+        property_get(this, "overrideView").unwrap_or(0) as Id
+    }
+
+    fn overriding_controller_class() -> Class {
+        static CLASS: OnceLock<Class> = OnceLock::new();
+        *CLASS.get_or_init(|| {
+            let class = define_class("UIKitTestOverridingController", "UIViewController", 8);
+            methods(class, &[("view", overriding_controller_view as usize)]);
+            class
+        })
+    }
+
+    #[test]
+    fn attachment_checks_geometry_before_reading_an_overridden_controller_view() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let info = screen_info("iphoneos7.0", &["UIInterfaceOrientationLandscapeRight"]);
+        let geometry = geometry_for((568.0, 320.0, 2.0), Some(&info));
+        let portrait = Rect::new(0.0, 0.0, 320.0, 568.0);
+        let landscape = Rect::new(0.0, 0.0, 568.0, 320.0);
+        let new_view = |frame| view_init_with_frame(runtime::send(runtime::class_named("UIView"), "alloc", &[]), 0, frame);
+        let new_controller = |class| runtime::send(runtime::send(class, "alloc", &[]), "init", &[]);
+        let parent = new_controller(runtime::class_named("UIViewController"));
+        let child = new_controller(overriding_controller_class());
+        let parent_view = new_view(landscape);
+        let child_view = new_view(portrait);
+        controller_set_view(parent, 0, parent_view);
+        property_set(child, "overrideView", child_view as u64);
+        controller_add_child(parent, 0, child);
+        assert_eq!(property_get(child, "view"), None);
+        assert_eq!(property_get(child_view, "viewController"), None);
+
+        let small = Rect::new(0.0, 0.0, 20.0, 20.0);
+        let unrelated = new_view(small);
+        attach_with_geometry(parent_view, unrelated, None, geometry);
+        assert_eq!(property_get(child, "viewReads"), None);
+        assert_eq!(view_state(unrelated).frame, small);
+
+        attach_with_geometry(parent_view, child_view, None, geometry);
+        assert_eq!(view_state(child_view).frame, landscape);
+        assert!(property_get(child, "viewReads").is_some_and(|reads| reads > 0));
+
+        let other = new_view(portrait);
+        attach_with_geometry(parent_view, other, None, geometry);
+        assert_eq!(view_state(other).frame, portrait);
+    }
+
+    #[test]
+    fn controller_links_identify_a_view_without_a_back_pointer() {
+        let parent = 0x1110;
+        let child = 0x2120;
+        let parent_view = 0x3130;
+        let child_view = 0x4140;
+        property_set(parent, "view", parent_view as u64);
+        property_set(child, "view", child_view as u64);
+        controller_add_child(parent, 0, child);
+        assert!(linked_controller_view(parent, parent_view, child_view));
+        assert!(!linked_controller_view(parent, 0, child_view));
+        assert!(!linked_controller_view(parent, parent_view, 0));
+        assert!(!linked_controller_view(parent, parent_view, parent_view));
+        controller_remove_from_parent(child, 0);
+        assert!(!linked_controller_view(parent, parent_view, child_view));
+    }
+
+    #[test]
+    fn only_a_linked_controller_view_gets_an_old_landscape_frame() {
+        let parent = 0x1010;
+        let child = 0x2020;
+        controller_add_child(parent, 0, child);
+        assert_eq!(property_get(child, "parentController"), Some(parent as u64));
+        let info = screen_info("iphoneos7.0", &["UIInterfaceOrientationLandscapeRight"]);
+        let geometry = geometry_for((568.0, 320.0, 2.0), Some(&info));
+        let parent_size = Size { width: 568.0, height: 320.0 };
+        let portrait = Rect::new(0.0, 0.0, 320.0, 568.0);
+        let landscape = Rect::new(0.0, 0.0, 568.0, 320.0);
+        assert_eq!(controller_child_frame(geometry, parent_size, portrait, IDENTITY, true), Some(landscape));
+        assert_eq!(controller_child_frame(geometry, parent_size, landscape, IDENTITY, true), None);
+        assert_eq!(controller_child_frame(geometry, parent_size, portrait, IDENTITY, false), None);
+        assert_eq!(controller_child_frame(geometry, parent_size, Rect::new(1.0, 0.0, 320.0, 568.0), IDENTITY, true), None);
+        let mut rotated = IDENTITY;
+        rotated.b = 1.0;
+        assert_eq!(controller_child_frame(geometry, parent_size, portrait, rotated, true), None);
+        assert_eq!(controller_child_frame(geometry, Size { width: 480.0, height: 320.0 }, portrait, IDENTITY, true), Some(landscape));
+        assert_eq!(controller_child_frame(geometry, Size { width: 500.0, height: 320.0 }, portrait, IDENTITY, true), Some(landscape));
+        assert_eq!(controller_child_frame(geometry, Size { width: 300.0, height: 320.0 }, portrait, IDENTITY, true), None);
+        assert_eq!(controller_child_frame(geometry, Size { width: 500.0, height: 300.0 }, portrait, IDENTITY, true), None);
+        let portrait_info = screen_info("iphoneos7.0", &["UIInterfaceOrientationPortrait"]);
+        let portrait_geometry = geometry_for((320.0, 568.0, 2.0), Some(&portrait_info));
+        assert_eq!(controller_child_frame(portrait_geometry, Size { width: 320.0, height: 568.0 }, portrait, IDENTITY, true), None);
+        controller_remove_from_parent(child, 0);
+        assert_eq!(property_get(child, "parentController"), Some(0));
+        let old_view = 0x3030;
+        let new_view = 0x4040;
+        property_set(old_view, "viewController", child as u64);
+        property_set(child, "view", old_view as u64);
+        controller_set_view(child, 0, new_view);
+        assert_eq!(property_get(old_view, "viewController"), Some(0));
+        assert_eq!(property_get(child, "view"), Some(new_view as u64));
+        assert_eq!(property_get(new_view, "viewController"), Some(child as u64));
     }
 
     /// A presented controller's view fills the game's landscape screen even

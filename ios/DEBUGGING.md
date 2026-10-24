@@ -337,3 +337,81 @@ huge name and is incomplete (0x8cd7), GL error 0x506.
 - Fix: per-thread table (pthread_t → id), filled by every thread start
   before the game's code runs; pthread_create waits for it. Unit test.
   Result: pending.
+
+---
+
+# Debugging: Dungeon Plunder spawns above the town (PC, 2026-10-24)
+
+## Symptom
+The first map frame puts the hero in the mountains above the town instead of
+on the road at its gate. The same wrong bounds also break the game's direction
+calculation, so spawn and movement must be checked together.
+
+## Evidence
+- The exact current build reproduced the bad spawn from the saved character.
+  Its first map frame was pixel-identical to two earlier bad runs; the paused
+  orientation experiment instead put the hero at the gate.
+- The runtime trace shows `MapViewController` adding the director as a child
+  controller, then adding its `CCGLView`. The GL view is made from
+  `keyWindow.bounds`; the director reads `winSize` after attachment.
+- Earlier game-code analysis found `TileMapLayer init` swapping `winSize` for
+  an old-iPhone portrait window. Dungeon Plunder uses the iOS 6.1 SDK.
+- Apple's quoted `UIScreen` rule says pre-iOS-8 bounds stay portrait. The
+  independent touchHLE implementation follows the same rule.
+
+## Attempts
+1. `91edf64` made both screen and window bounds landscape internally and in
+   reported results. The bad spawn remained.
+2. The earlier portrait-only experiment reported portrait bounds but left the
+   GL surface portrait (640x1136), so bounds alone were insufficient.
+3. The paused experiment also recursively resized every matching descendant.
+   It fixed the spawn, but a read-only review rejected that broad effect and
+   noted that its saved movement frames remained stationary.
+4. Approved narrowing: keep reported window bounds separate from drawing
+   geometry; record controller parent links; at attachment, orient only the
+   linked controller's zero-origin, untransformed, exact portrait-sized view.
+   Two tests were added first and failed before the implementation.
+5. The controller link initially depended on a view back-link that cocos2d's
+   `setView:` override never sets. Tracking children and asking the child
+   controller for its view fixed that in unit tests, but the real game stayed
+   portrait. Temporary attachment logs showed the GL view was 320x568 with an
+   identity transform in a 480x320 landscape parent; the approved exact
+   full-screen parent-size guard therefore blocked it. With the owner's OK,
+   the guard now requires the parent's landscape height (not its exact width),
+   while keeping the legacy, linked-controller, zero-origin, exact child size,
+   and identity-transform checks.
+
+## Sub-agent reviews
+- 2026-10-24: codex/gpt-6.1-sol, read-only. Accepted the bounds theory as
+  plausible, rejected arbitrary recursive resizing, identified the missing
+  controller link, and required a real movement check. The narrowed design
+  addresses the arbitrary-view, layout-callback, origin, transform, and
+  attachment concerns.
+- 2026-10-24: codex/gpt-6.1-sol, read-only final review. Found that an
+  unrelated attachment could ask an unloaded child controller for its view,
+  and that the cocos2d-style overridden `view` path lacked regression
+  coverage. Geometry filtering now runs first, the fallback asks only a unique
+  unloaded child, and an attachment test covers the overridden view plus an
+  unrelated view.
+
+## Current best explanation (2026-10-24)
+Root cause: Dungeon Plunder is an iOS 6.1 cocos2d app, so UIKit reports
+portrait screen/window bounds before the game builds its GL view from those
+bounds. `TileMapLayer` then treats that portrait window as an old-iPhone
+landscape screen and computes the wrong map center. The GL view is attached
+through cocos2d's own `setView:`/`view` overrides, so the host cannot rely on
+a view back-link; and its parent is 480x320 on the 568x320 screen, so the
+correction must target the interface's screen size, not the parent's width.
+
+Fix: old apps still receive portrait `UIScreen`/full-screen `UIWindow` bounds
+while drawing geometry stays landscape. Child-controller links are recorded;
+when an exact, zero-origin, untransformed portrait-sized view is attached in a
+landscape-height parent, it is resized to the oriented screen only if the child
+controller owns it. Replacing a controller's view clears the old view's
+controller link.
+
+Evidence: the final full iPhone suite passed (284 passed, 0 failed), the
+Android screen-rule checks passed, and the clean Dungeon Plunder run made
+1136x640 screen memory. Its first map frame was pixel-identical to the known
+good gate frame; after the x>320 tap, frame 30 differed from frame 1 with the
+hero in the new position, and the run exited 0 with no fault.
