@@ -2,6 +2,7 @@ package dev.braxten.gamebridge
 
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.pm.ActivityInfo
 import android.os.Environment
 import android.os.Looper
 import android.os.MessageQueue
@@ -52,11 +53,23 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var keyboard: KeyboardInput
     /** The pipe the "game stopped" byte comes down, kept so it stays open. */
     private var stopPipe: ParcelFileDescriptor? = null
+    private lateinit var screenRules: IphoneScreen.Rules
 
     override fun onCreate(savedInstanceState: Bundle?) {
         screens++
         super.onCreate(savedInstanceState)
         if (switchingGames(intent)) return
+        val info = appFolder(intent)?.let { runCatching { Plist.read(File(it, "Info.plist")) as? Map<*, *> }.getOrNull() }
+        @Suppress("UNCHECKED_CAST")
+        screenRules = IphoneScreen.rules(info as? Map<String, Any?> ?: emptyMap())
+        requestedOrientation = when (screenRules.request) {
+            IphoneScreen.Request.FIXED_PORTRAIT -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            IphoneScreen.Request.FIXED_PORTRAIT_UPSIDE_DOWN -> ActivityInfo.SCREEN_ORIENTATION_REVERSE_PORTRAIT
+            IphoneScreen.Request.SENSOR_PORTRAIT -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+            IphoneScreen.Request.FIXED_LANDSCAPE -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+            IphoneScreen.Request.FIXED_REVERSE_LANDSCAPE -> ActivityInfo.SCREEN_ORIENTATION_REVERSE_LANDSCAPE
+            IphoneScreen.Request.SENSOR_LANDSCAPE -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        }
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         val view = SurfaceView(this)
         view.holder.addCallback(this)
@@ -105,6 +118,7 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
             }
             return
         }
+        if (!screenRules.surfaceReady(width, height)) return
         val app = appFolder(intent) ?: run { finish(); return }
         val home = File(filesDir, "ios/" + File(app).nameWithoutExtension).path
         val name = gameName(File(app))

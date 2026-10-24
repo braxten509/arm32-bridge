@@ -90,12 +90,28 @@ extern "C" fn return_self(this: Id, _: Sel) -> Id {
 
 // ----- screen and device -----
 
-/// The screen the game is told it has, in points, landscape, and its scale.
-/// IOS_SCREEN=568x320@2 sets it outright. Otherwise, with the real display
-/// known (IOS_DISPLAY=2424x1080, set by the phone app), the game gets the
-/// shape iOS would give it there, drawn at the display's real pixels.
-/// Neither: an iPhone 5s (568x320 points at 2x).
+fn app_info() -> Option<&'static crate::fw::plist::Value> {
+    static INFO: OnceLock<Option<crate::fw::plist::Value>> = OnceLock::new();
+    INFO.get_or_init(|| {
+        let app_dir = crate::loader::try_app_dir()?;
+        std::fs::read(format!("{app_dir}/Info.plist")).ok().and_then(|bytes| crate::fw::plist::parse(&bytes))
+    })
+    .as_ref()
+}
+
+/// The screen the game is told it has, in the interface's orientation, in
+/// points, and its scale. IOS_SCREEN=568x320@2 sets the size outright (an
+/// old portrait app still gets it turned upright by the old-iPhone rule).
+/// Otherwise, with the real display known (IOS_DISPLAY=2424x1080, set by the
+/// phone app), the game gets the shape iOS would give it there, drawn at the
+/// display's real pixels. Neither: an iPhone 5s (568x320 points at 2x).
 pub fn screen_points() -> (f64, f64, f64) {
+    geometry_for(raw_screen_points(), app_info()).oriented
+}
+
+/// The screen the app would get in landscape, before the old-iPhone rule
+/// turns it to the interface's orientation.
+fn raw_screen_points() -> (f64, f64, f64) {
     static SCREEN: OnceLock<(f64, f64, f64)> = OnceLock::new();
     *SCREEN.get_or_init(|| {
         if let Ok(text) = std::env::var("IOS_SCREEN") {
@@ -107,14 +123,15 @@ pub fn screen_points() -> (f64, f64, f64) {
             return (568.0, 320.0, SCALE);
         };
         let app_dir = crate::loader::app_dir();
-        let info = std::fs::read(format!("{app_dir}/Info.plist")).ok().and_then(|bytes| crate::fw::plist::parse(&bytes));
+        let info = app_info();
         let files: Vec<String> = std::fs::read_dir(&app_dir)
             .map(|list| list.filter_map(|e| e.ok()?.file_name().into_string().ok()).collect())
             .unwrap_or_default();
         let unreal = std::path::Path::new(&format!("{app_dir}/CookedIPhone")).is_dir();
-        let (w, h, scale) = told_screen(display, info.as_ref(), &files, unreal);
-        crate::log!("screen: display {}x{}, told {w}x{h} points at {scale}x", display.0, display.1);
-        (w, h, scale)
+        let screen = told_screen(display, info, &files, unreal);
+        let (w, h, scale) = screen;
+        crate::log!("screen: display {}x{}, told {w}x{h} landscape points at {scale}x", display.0, display.1);
+        screen
     })
 }
 
@@ -150,6 +167,132 @@ fn told_screen(display: (f64, f64), info: Option<&crate::fw::plist::Value>, file
 /// The scale screens are reported at when they fill the display (an
 /// iPhone 5s's).
 const SCALE: f64 = 2.0;
+
+fn plist_text<'a>(info: Option<&'a crate::fw::plist::Value>, key: &str) -> Option<&'a str> {
+    match info.and_then(|value| value.get(key)) {
+        Some(crate::fw::plist::Value::String(text)) => Some(text),
+        _ => None,
+    }
+}
+
+fn sdk_major(text: &str) -> Option<u32> {
+    text.strip_prefix("iphoneos").unwrap_or(text).split('.').next()?.parse().ok()
+}
+
+fn legacy_screen(info: Option<&crate::fw::plist::Value>) -> bool {
+    plist_text(info, "DTSDKName")
+        .and_then(sdk_major)
+        .or_else(|| plist_text(info, "DTPlatformVersion").and_then(sdk_major))
+        .is_some_and(|major| major <= 7)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Interface {
+    orientation: isize,
+    mask: usize,
+}
+
+fn interface(info: Option<&crate::fw::plist::Value>, legacy: bool) -> Interface {
+    const LANDSCAPE: Interface = Interface { orientation: 3, mask: (1 << 3) | (1 << 4) };
+    if !legacy {
+        return LANDSCAPE;
+    }
+    let orientation_number = |name: &str| match name {
+        "UIInterfaceOrientationPortrait" => Some(1),
+        "UIInterfaceOrientationPortraitUpsideDown" => Some(2),
+        "UIInterfaceOrientationLandscapeRight" => Some(3),
+        "UIInterfaceOrientationLandscapeLeft" => Some(4),
+        _ => None,
+    };
+    let declared = ["UISupportedInterfaceOrientations~iphone", "UISupportedInterfaceOrientations"].into_iter().find_map(|key| {
+        match info.and_then(|value| value.get(key)) {
+            Some(crate::fw::plist::Value::Array(values)) => Some(values),
+            _ => None,
+        }
+    });
+    let initial = plist_text(info, "UIInterfaceOrientation").and_then(orientation_number);
+    let mut orientations: Vec<isize> = declared
+        .into_iter()
+        .flatten()
+        .filter_map(|value| match value {
+            crate::fw::plist::Value::String(name) => orientation_number(name),
+            _ => None,
+        })
+        .collect();
+    if orientations.is_empty() {
+        orientations.extend(initial);
+    }
+    if orientations.is_empty() {
+        return LANDSCAPE;
+    }
+    let mask = orientations.iter().fold(0, |mask, orientation| mask | (1 << orientation));
+    let orientation = initial.filter(|orientation| orientations.contains(orientation)).unwrap_or(orientations[0]);
+    Interface { orientation, mask }
+}
+
+fn current_interface() -> Interface {
+    current_geometry().interface
+}
+
+fn oriented_screen(screen: (f64, f64, f64), info: Option<&crate::fw::plist::Value>) -> (f64, f64, f64) {
+    if !legacy_screen(info) {
+        return screen;
+    }
+    let (long, short) = (screen.0.max(screen.1), screen.0.min(screen.1));
+    match interface(info, true).orientation {
+        1 | 2 => (short, long, screen.2),
+        _ => (long, short, screen.2),
+    }
+}
+
+fn reported_screen(screen: (f64, f64, f64), info: Option<&crate::fw::plist::Value>) -> (f64, f64, f64) {
+    if legacy_screen(info) { (screen.0.min(screen.1), screen.0.max(screen.1), screen.2) } else { screen }
+}
+
+fn screen_pixel_size(screen: (f64, f64, f64)) -> (f64, f64) {
+    (screen.0.min(screen.1) * screen.2, screen.0.max(screen.1) * screen.2)
+}
+
+/// A game's screen shapes and orientation, decided from its Info.plist and
+/// the display.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Geometry {
+    /// What the game draws and touches: the screen in the interface's orientation.
+    oriented: (f64, f64, f64),
+    /// What UIScreen reports. Old iPhones always gave portrait, even in a
+    /// landscape game.
+    reported: (f64, f64, f64),
+    legacy: bool,
+    interface: Interface,
+}
+
+fn geometry_for(screen: (f64, f64, f64), info: Option<&crate::fw::plist::Value>) -> Geometry {
+    let oriented = oriented_screen(screen, info);
+    Geometry { oriented, reported: reported_screen(oriented, info), legacy: legacy_screen(info), interface: interface(info, legacy_screen(info)) }
+}
+
+fn current_geometry() -> Geometry {
+    static GEOMETRY: OnceLock<Geometry> = OnceLock::new();
+    *GEOMETRY.get_or_init(|| geometry_for(raw_screen_points(), app_info()))
+}
+
+/// A window's bounds in the interface's orientation. A full-screen window
+/// made from UIScreen.bounds (portrait in an old app) becomes landscape for
+/// a landscape interface, so reading the bounds and setting them back is
+/// harmless; any other size stays as the game set it.
+fn window_frame(geometry: Geometry, rect: Rect) -> Rect {
+    if !geometry.legacy {
+        return rect;
+    }
+    let (wide, high, _) = geometry.oriented;
+    let (long, short, _) = geometry.reported;
+    let (width, height) = (rect.size.width, rect.size.height);
+    if (width == wide && height == high) || (width == long && height == short) {
+        Rect { origin: rect.origin, size: Size { width: wide, height: high } }
+    } else {
+        rect
+    }
+}
 
 fn has_storyboard(info: Option<&crate::fw::plist::Value>) -> bool {
     let has = |key: &str| info.and_then(|i| i.get(key)).is_some();
@@ -227,7 +370,12 @@ fn fit_points(display: (f64, f64), aspect: f64) -> (f64, f64) {
 }
 
 fn screen_bounds() -> Rect {
-    let (w, h, _) = screen_points();
+    let (w, h, _) = current_geometry().reported;
+    Rect::new(0.0, 0.0, w, h)
+}
+
+fn oriented_bounds() -> Rect {
+    let (w, h, _) = current_geometry().oriented;
     Rect::new(0.0, 0.0, w, h)
 }
 
@@ -247,8 +395,8 @@ extern "C" fn screen_bounds_method(_this: Id, _: Sel) -> Rect {
 }
 
 extern "C" fn screen_native_bounds(_this: Id, _: Sel) -> Rect {
-    let (w, h, scale) = screen_points();
-    Rect::new(0.0, 0.0, h * scale, w * scale)
+    let (w, h) = screen_pixel_size(screen_points());
+    Rect::new(0.0, 0.0, w, h)
 }
 
 extern "C" fn screen_scale(_this: Id, _: Sel) -> f64 {
@@ -261,8 +409,8 @@ extern "C" fn screen_current_mode(_this: Id, _: Sel) -> Id {
 }
 
 extern "C" fn screen_mode_size(_this: Id, _: Sel) -> Size {
-    let (w, h, scale) = screen_points();
-    Size { width: h * scale, height: w * scale }
+    let (width, height) = screen_pixel_size(screen_points());
+    Size { width, height }
 }
 
 extern "C" fn screen_available_modes(this: Id, s: Sel) -> Id {
@@ -297,8 +445,11 @@ extern "C" fn device_idiom(_this: Id, _: Sel) -> isize {
 }
 
 /// Landscape, home button on the right (matches UIInterfaceOrientationLandscapeRight).
+/// UIKit gives the interface's landscape values the device's numbers (its
+/// header maps UIInterfaceOrientationLandscapeRight to UIDeviceOrientationLandscapeLeft,
+/// both 3), so the same number is right; only the names are the other way round.
 extern "C" fn device_orientation(_this: Id, _: Sel) -> isize {
-    3
+    current_interface().orientation
 }
 
 extern "C" fn device_battery_level(_this: Id, _: Sel) -> f32 {
@@ -455,6 +606,22 @@ fn send_rect(view: Id, name: &str, rect: Rect) {
 extern "C" fn view_bounds(this: Id, _: Sel) -> Rect {
     let state = view_state(this);
     Rect { origin: state.bounds_origin, size: state.frame.size }
+}
+
+extern "C" fn window_bounds(this: Id, selector: Sel) -> Rect {
+    window_frame(current_geometry(), view_bounds(this, selector))
+}
+
+extern "C" fn window_set_bounds(this: Id, selector: Sel, bounds: Rect) {
+    view_set_bounds(this, selector, window_frame(current_geometry(), bounds));
+}
+
+extern "C" fn window_init_with_frame(this: Id, selector: Sel, frame: Rect) -> Id {
+    view_init_with_frame(this, selector, window_frame(current_geometry(), frame))
+}
+
+extern "C" fn window_set_frame(this: Id, selector: Sel, frame: Rect) {
+    view_set_frame(this, selector, window_frame(current_geometry(), frame));
 }
 
 extern "C" fn view_set_bounds(this: Id, _: Sel, bounds: Rect) {
@@ -908,7 +1075,7 @@ extern "C" fn window_set_root_controller(this: Id, _: Sel, controller: Id) {
         let view = runtime::send(controller, "view", &[]);
         let showing = shown && will_appear(controller, false);
         if view != 0 {
-            send_rect(view, "setFrame:", screen_bounds());
+            send_rect(view, "setFrame:", oriented_bounds());
             attach(this, view, None);
         }
         put_on_screen(controller);
@@ -952,7 +1119,7 @@ extern "C" fn controller_view(this: Id, _: Sel) -> Id {
         let s = runtime::sel("initWithFrame:");
         let imp = runtime::imp_for(view, s).unwrap();
         let f: extern "C" fn(Id, Sel, Rect) -> Id = unsafe { std::mem::transmute(imp) };
-        let view = f(view, s, screen_bounds());
+        let view = f(view, s, oriented_bounds());
         property_set(this, "view", view as u64);
         // The view's next responder is its controller, as with setView:.
         property_set(view, "viewController", this as u64);
@@ -973,15 +1140,15 @@ extern "C" fn controller_is_view_loaded(this: Id, _: Sel) -> bool {
 }
 
 extern "C" fn controller_orientation(_this: Id, _: Sel) -> isize {
-    3
+    current_interface().orientation
 }
 
 extern "C" fn controller_supported_orientations(_this: Id, _: Sel) -> usize {
-    (1 << 3) | (1 << 4)
+    current_interface().mask
 }
 
 extern "C" fn controller_should_autorotate_to(_this: Id, _: Sel, orientation: isize) -> bool {
-    orientation == 3 || orientation == 4
+    matches!(orientation, 1..=4) && current_interface().mask & (1 << orientation) != 0
 }
 
 /// Runs a completion block (no arguments) later on the main run loop, the
@@ -1026,10 +1193,13 @@ fn show_presented(presenter: Id, controller: Id, animated: bool) {
     }
     let showing = will_appear(controller, animated);
     let hiding = covered != 0 && will_disappear(presenter, animated);
+    // The game draws in the interface's orientation: a window that still
+    // holds portrait bounds (an old app made it from UIScreen.bounds) must
+    // not squeeze the presented view.
     let s = runtime::sel("setFrame:");
     if let Some(imp) = runtime::imp_for(view, s) {
         let f: extern "C" fn(Id, Sel, Rect) = unsafe { std::mem::transmute(imp) };
-        f(view, s, view_bounds(window, 0));
+        f(view, s, oriented_bounds());
     }
     attach(window, view, None);
     property_set(controller, "presentedInWindow", window as u64);
@@ -1441,7 +1611,7 @@ extern "C" fn app_state(_this: Id, _: Sel) -> isize {
 }
 
 extern "C" fn app_status_bar_orientation(_this: Id, _: Sel) -> isize {
-    3
+    current_interface().orientation
 }
 
 extern "C" fn app_status_bar_frame(_this: Id, _: Sel) -> Rect {
@@ -1702,6 +1872,10 @@ pub fn register(r: &mut Registry) {
             ("windowLevel", window_level as usize),
             ("setWindowLevel:", window_set_level as usize),
             ("isKeyWindow", yes as usize),
+            ("initWithFrame:", window_init_with_frame as usize),
+            ("setFrame:", window_set_frame as usize),
+            ("bounds", window_bounds as usize),
+            ("setBounds:", window_set_bounds as usize),
         ],
     );
 
@@ -2277,5 +2451,86 @@ mod tests {
         let aspect = app_aspect((2048.0, 1536.0), None, &["Default-568h@2x.png".into()]);
         assert_eq!(aspect, 1.5);
         assert_eq!(fit_points((2048.0, 1536.0), aspect), (1024.0, 682.0));
+    }
+
+    fn screen_info(sdk: &str, orientations: &[&str]) -> Value {
+        Value::Dict(vec![
+            ("DTSDKName".into(), Value::String(sdk.into())),
+            (
+                "UISupportedInterfaceOrientations".into(),
+                Value::Array(orientations.iter().map(|name| Value::String((*name).into())).collect()),
+            ),
+        ])
+    }
+
+    #[test]
+    fn old_landscape_apps_report_portrait_but_keep_landscape_game_geometry() {
+        let info = screen_info("iphoneos6.1", &["UIInterfaceOrientationLandscapeRight", "UIInterfaceOrientationLandscapeLeft"]);
+        assert!(legacy_screen(Some(&info)));
+        assert_eq!(interface(Some(&info), true), Interface { orientation: 3, mask: (1 << 3) | (1 << 4) });
+        assert_eq!(oriented_screen((568.0, 320.0, 2.0), Some(&info)), (568.0, 320.0, 2.0));
+        assert_eq!(reported_screen((568.0, 320.0, 2.0), Some(&info)), (320.0, 568.0, 2.0));
+        assert_eq!(screen_pixel_size((568.0, 320.0, 2.0)), (640.0, 1136.0));
+    }
+
+    #[test]
+    fn old_portrait_apps_stay_portrait_and_newer_apps_keep_the_new_rules() {
+        let portrait = screen_info("iphoneos7.1", &["UIInterfaceOrientationPortrait"]);
+        assert_eq!(interface(Some(&portrait), true), Interface { orientation: 1, mask: 1 << 1 });
+        assert_eq!(oriented_screen((568.0, 320.0, 2.0), Some(&portrait)), (320.0, 568.0, 2.0));
+        assert_eq!(reported_screen((320.0, 568.0, 2.0), Some(&portrait)), (320.0, 568.0, 2.0));
+        assert_eq!(screen_pixel_size((320.0, 568.0, 2.0)), (640.0, 1136.0));
+        let initial_only = Value::Dict(vec![
+            ("DTSDKName".into(), Value::String("iphoneos5.0".into())),
+            ("UIInterfaceOrientation".into(), Value::String("UIInterfaceOrientationPortrait".into())),
+        ]);
+        assert_eq!(interface(Some(&initial_only), true), Interface { orientation: 1, mask: 1 << 1 });
+
+        let mut newer_entries = match screen_info("iphoneos8.2", &["UIInterfaceOrientationPortrait"]) {
+            Value::Dict(entries) => entries,
+            _ => unreachable!(),
+        };
+        newer_entries.push(("MinimumOSVersion".into(), Value::String("5.0".into())));
+        let newer = Value::Dict(newer_entries);
+        assert!(!legacy_screen(Some(&newer)));
+        assert_eq!(oriented_screen((568.0, 320.0, 2.0), Some(&newer)), (568.0, 320.0, 2.0));
+        assert_eq!(reported_screen((568.0, 320.0, 2.0), Some(&newer)), (568.0, 320.0, 2.0));
+        assert_eq!(interface(Some(&newer), false), Interface { orientation: 3, mask: (1 << 3) | (1 << 4) });
+        assert!(!legacy_screen(None));
+    }
+
+    /// An old landscape game's window is landscape, whichever full-screen
+    /// size it was made with; anything else keeps its size. Reading the
+    /// bounds and setting them back changes nothing.
+    #[test]
+    fn old_landscape_windows_keep_landscape_bounds() {
+        let info = screen_info("iphoneos6.1", &["UIInterfaceOrientationLandscapeRight", "UIInterfaceOrientationLandscapeLeft"]);
+        let geometry = geometry_for((568.0, 320.0, 2.0), Some(&info));
+        let landscape = Rect::new(0.0, 0.0, 568.0, 320.0);
+        assert_eq!(window_frame(geometry, Rect::new(0.0, 0.0, 320.0, 568.0)), landscape, "a window made from UIScreen.bounds");
+        assert_eq!(window_frame(geometry, landscape), landscape);
+        assert_eq!(window_frame(geometry, Rect::new(0.0, 0.0, 200.0, 100.0)), Rect::new(0.0, 0.0, 200.0, 100.0));
+        let current = geometry_for((568.0, 320.0, 2.0), None);
+        assert_eq!(window_frame(current, Rect::new(0.0, 0.0, 320.0, 568.0)), Rect::new(0.0, 0.0, 320.0, 568.0));
+    }
+
+    /// A presented controller's view fills the game's landscape screen even
+    /// when its window holds portrait bounds (an old game made the window
+    /// from UIScreen.bounds).
+    #[test]
+    fn presented_views_fill_the_landscape_window() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let new_view = |class: Class, frame: Rect| view_init_with_frame(runtime::send(class, "alloc", &[]), 0, frame);
+        let new_controller = || runtime::send(runtime::send(runtime::class_named("UIViewController"), "alloc", &[]), "init", &[]);
+        let presenter = new_controller();
+        runtime::send(presenter, "setView:", &[new_view(runtime::class_named("UIView"), Rect::new(0.0, 0.0, 320.0, 568.0))]);
+        let window = new_view(runtime::class_named("UIWindow"), Rect::new(0.0, 0.0, 320.0, 568.0));
+        runtime::send(window, "setRootViewController:", &[presenter]);
+        let presented = new_controller();
+        let presented_view = new_view(runtime::class_named("UIView"), Rect::default());
+        runtime::send(presented, "setView:", &[presented_view]);
+        show_presented(presenter, presented, false);
+        assert_eq!(view_state(presented_view).frame, Rect::new(0.0, 0.0, 568.0, 320.0));
     }
 }
