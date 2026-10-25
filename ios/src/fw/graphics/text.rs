@@ -528,6 +528,13 @@ pub fn text_box(text: &str, font: &(String, f64), width: f64, lines: isize, mode
 /// RGBA rows from the top. The lines sit in the middle of the bounds up and
 /// down, the shadow under the text; nothing is drawn outside the bounds.
 fn draw_look(look: &TextLook, scale: f64) -> Option<(usize, usize, Vec<u8>)> {
+    let bitmap = look_bitmap(look, scale)?;
+    let rgba = bitmap.straight_rgba()?;
+    Some((bitmap.width, bitmap.height, rgba))
+}
+
+/// The same as a picture (rows from the top) to draw into a context.
+pub(super) fn look_bitmap(look: &TextLook, scale: f64) -> Option<Bitmap> {
     let (width, height) = ((look.size.0 * scale).ceil(), (look.size.1 * scale).ceil());
     if !(width >= 1.0 && height >= 1.0 && width * height <= 16e6) {
         return None;
@@ -545,8 +552,7 @@ fn draw_look(look: &TextLook, scale: f64) -> Option<(usize, usize, Vec<u8>)> {
     }
     canvas.state.fill = look.color;
     canvas.draw_text(face, &font, &lines, rect, look.alignment);
-    let rgba = canvas.snapshot().straight_rgba()?;
-    Some((width as usize, height as usize, rgba))
+    Some(canvas.snapshot())
 }
 
 /// The text picture files made so far, least recently used first.

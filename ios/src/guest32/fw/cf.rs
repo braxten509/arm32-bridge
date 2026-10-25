@@ -102,7 +102,7 @@ pub fn register() {
             super::word_constant(name);
         }
     }
-    for name in OBJECT_CONSTANTS {
+    for name in OBJECT_CONSTANTS.iter().chain(crate::fw::animation::CONSTANT_NAMES) {
         if super::host_data(name).is_some() {
             super::object_constant(name);
         }

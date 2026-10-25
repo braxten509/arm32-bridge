@@ -386,6 +386,8 @@ property!(text_editable, text_set_editable, "editable", bool, true);
 property!(text_selectable, text_set_selectable, "selectable", bool, true);
 property!(text_lines, text_set_lines, "numberOfLines", isize, 1);
 property!(text_line_break, text_set_line_break, "lineBreakMode", isize, 4);
+// UIBaselineAdjustment (0: align baselines, the default).
+property!(label_baseline, label_set_baseline, "baselineAdjustment", isize, 0);
 property!(text_shadow_color, text_set_shadow_color, "shadowColor", id, 0);
 property!(text_highlighted_color, text_set_highlighted_color, "highlightedTextColor", id, 0);
 property!(text_highlighted, text_set_highlighted, "highlighted", bool, false);
@@ -2564,7 +2566,8 @@ pub fn register(r: &mut Registry) {
             ("setMinimumFontSize:", text_set_minimum_font as usize),
             ("minimumScaleFactor", text_minimum_font as usize),
             ("setMinimumScaleFactor:", text_set_minimum_font as usize),
-            ("setBaselineAdjustment:", ignore_int as usize),
+            ("baselineAdjustment", label_baseline as usize),
+            ("setBaselineAdjustment:", label_set_baseline as usize),
             ("setPreferredMaxLayoutWidth:", ignore_double as usize),
             ("sizeThatFits:", label_size_that_fits as usize),
             ("sizeToFit", label_size_to_fit as usize),

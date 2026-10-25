@@ -271,9 +271,10 @@ extern "C" fn credential_identity(_this: Id, _: Sel) -> usize {
 }
 
 // ----- CATransaction -----
-// Nothing animates here, so a transaction only keeps its settings (nested,
-// per thread, as on Apple) and runs its completion block once the outermost
-// transaction commits, on the main run loop.
+// A transaction keeps its settings (nested, per thread, as on Apple) and
+// runs its completion block on the main run loop once the outermost
+// transaction commits and the animations added in it (fw/animation.rs)
+// have ended.
 
 struct Transaction {
     /// Started by a setter outside begin/commit. Apple commits it at the end
@@ -287,20 +288,28 @@ struct Transaction {
     /// Completion blocks of nested transactions, run with this one's.
     pending: Vec<usize>,
     values: Id,
+    /// When the last animation added in it (or a nested one) ends (media time).
+    animations_end: f64,
 }
 
 impl Transaction {
     fn new(implicit: bool) -> Self {
-        Transaction { implicit, disable_actions: None, duration: None, timing: None, completion: 0, pending: Vec::new(), values: 0 }
+        Transaction { implicit, disable_actions: None, duration: None, timing: None, completion: 0, pending: Vec::new(), values: 0, animations_end: 0.0 }
     }
 
-    fn blocks(self) -> Vec<usize> {
+    fn blocks(self) -> (Vec<usize>, f64) {
         let mut blocks = self.pending;
         if self.completion != 0 {
             blocks.push(self.completion);
         }
-        blocks
+        (blocks, self.animations_end)
     }
+}
+
+/// An animation that ends at media time `end` was added: the innermost
+/// transaction's completion waits for it (Core Animation's rule).
+pub fn animation_added(end: f64) {
+    with_top(|t| t.animations_end = t.animations_end.max(end));
 }
 
 thread_local! {
@@ -309,9 +318,16 @@ thread_local! {
 
 const DEFAULT_DURATION: f64 = 0.25;
 
-fn run_completions(blocks: Vec<usize>) {
+/// Runs completion blocks on the main run loop, after `animations_end`.
+fn run_completions((blocks, animations_end): (Vec<usize>, f64)) {
+    let wait = animations_end - runloop::media_time();
     for block in blocks {
-        runloop::post(runloop::Work::Native(Box::new(move || unsafe { call_block(block) })));
+        let work: Box<dyn FnOnce() + Send> = Box::new(move || unsafe { call_block(block) });
+        if wait > 0.0 {
+            runloop::post_after(wait, work);
+        } else {
+            runloop::post(runloop::Work::Native(work));
+        }
     }
 }
 
@@ -348,25 +364,26 @@ extern "C" fn ca_begin(_: Class, _: Sel) {
     TRANSACTIONS.with(|t| t.borrow_mut().push(Transaction::new(false)));
 }
 
-/// Nothing animates, so a transaction is done when committed; a nested one's
-/// completion blocks still wait for the outer transaction, as on Apple.
+/// A nested transaction's completion blocks wait for the outer
+/// transaction, as on Apple.
 extern "C" fn ca_commit(_: Class, _: Sel) {
     let ready = TRANSACTIONS.with(|t| {
         let mut list = t.borrow_mut();
         if list.last().map(|top| top.implicit).unwrap_or(true) {
             return None;
         }
-        let finished = list.pop().unwrap().blocks();
+        let (finished, end) = list.pop().unwrap().blocks();
         match list.last_mut() {
             Some(parent) => {
                 parent.pending.extend(finished);
+                parent.animations_end = parent.animations_end.max(end);
                 if list.len() == 1 && list[0].implicit {
                     // The implicit one waited for this transaction.
                     commit_implicit_later();
                 }
-                Some(Vec::new())
+                Some((Vec::new(), 0.0))
             }
-            None => Some(finished),
+            None => Some((finished, end)),
         }
     });
     match ready {

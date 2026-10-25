@@ -27,8 +27,49 @@ use image::ImageDecoder;
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 
+mod render;
 mod shapes;
 mod text;
+
+pub use render::render_layer;
+pub use shapes::{
+    clip_path_in, fill_path_in, new_path, path_append, path_apply, path_arc, path_bounds, path_close, path_contains, path_copy, path_curve, path_current,
+    path_is_empty, path_line, path_move, path_oval, path_quad, path_rect, path_rounded_rect, stroke_path_in,
+};
+
+/// The current UIKit context (UIGraphicsGetCurrentContext), 0 when none.
+pub fn current_ui_context() -> Id {
+    current_context()
+}
+
+pub fn save_state(context: Id) {
+    context_save_gstate(context);
+}
+
+pub fn restore_state(context: Id) {
+    context_restore_gstate(context);
+}
+
+/// Draws later things in a context `alpha` times as see-through.
+pub fn multiply_alpha(context: Id, alpha: f64) {
+    if let Some(mut c) = canvas("-[UIBezierPath fillWithBlendMode:alpha:]", context) {
+        c.state.alpha = (c.state.alpha * alpha).clamp(0.0, 1.0);
+    }
+}
+
+/// Sets a context's fill colour (-[UIColor setFill]).
+pub fn set_fill_in(context: Id, rgba: [f64; 4]) {
+    if let Some(mut c) = canvas("-[UIColor setFill]", context) {
+        c.state.fill = rgba;
+    }
+}
+
+/// Sets a context's stroke colour (-[UIColor setStroke]).
+pub fn set_stroke_in(context: Id, rgba: [f64; 4]) {
+    if let Some(mut c) = canvas("-[UIColor setStroke]", context) {
+        c.state.stroke = rgba;
+    }
+}
 
 pub use text::{text_box, text_pictures, TextLook};
 
@@ -1432,8 +1473,57 @@ pub fn color_picture(rgba: [f64; 4]) -> Option<String> {
         .clone()
 }
 
+/// A dot picture's width and height in pixels.
+pub const DOT_PIXELS: usize = 28;
+
+/// The pixels of a round dot of a colour filling DOT_PIXELS square, its edge smoothed.
+fn dot_pixels(rgba: [f64; 4]) -> Vec<u8> {
+    let n = DOT_PIXELS;
+    let radius = n as f64 / 2.0;
+    let mut pixels = Vec::with_capacity(n * n * 4);
+    for y in 0..n {
+        for x in 0..n {
+            let distance = (x as f64 + 0.5 - radius).hypot(y as f64 + 0.5 - radius);
+            let cover = (radius - distance + 0.5).clamp(0.0, 1.0);
+            let [r, g, b, a] = rgba.map(|c| c.clamp(0.0, 1.0));
+            pixels.extend([r, g, b, a * cover].map(|c| (c * 255.0).round() as u8));
+        }
+    }
+    pixels
+}
+
+/// A PNG of a round dot of a colour (page control dots, fw/pickers.rs): made once per colour.
+pub fn dot_picture(rgba: [f64; 4]) -> Option<String> {
+    static MADE: Mutex<Option<std::collections::HashMap<[u8; 4], Option<String>>>> = Mutex::new(None);
+    let key = rgba.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8);
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    made.get_or_insert_with(Default::default)
+        .entry(key)
+        .or_insert_with(|| encode_png(DOT_PIXELS, DOT_PIXELS, &dot_pixels(rgba), true).and_then(|bytes| write_png_file(&format!("dot {key:?}"), &bytes)))
+        .clone()
+}
+
 /// Darker copies made of UIImages (pressed buttons), by the image they copy.
 static DARKER: Mutex<Option<std::collections::HashMap<Id, Id>>> = Mutex::new(None);
+
+/// For tests: opens a UIKit image context of `width` x `height` points at
+/// 1x and returns it.
+#[cfg(test)]
+pub fn test_begin_context(width: f64, height: f64) -> Id {
+    graphics_begin_image_context_with_options(Size { width, height }, false, 1.0);
+    current_context()
+}
+
+/// For tests: the current image context's pixels (straight RGBA rows from
+/// the top), closing it.
+#[cfg(test)]
+pub fn test_end_context() -> Vec<u8> {
+    let picture = bitmap_context_create_image(current_context());
+    let pixels = straight_pixels(picture).unwrap_or_default();
+    counted::release(picture);
+    graphics_end_image_context();
+    pixels
+}
 
 /// A CGImage's pixels as straight RGBA rows from the top.
 pub fn straight_pixels(picture: Id) -> Option<Vec<u8>> {

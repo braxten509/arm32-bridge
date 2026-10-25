@@ -1,7 +1,9 @@
 //! Stand-ins for Apple's Foundation and UIKit classes.
 
+pub mod animation;
 pub mod app;
 pub mod attributed;
+pub mod bezier;
 pub mod cfbridge;
 pub mod audiofile;
 pub mod extaudiofile;
@@ -23,11 +25,13 @@ pub mod gamekit;
 pub mod openal;
 pub mod operations;
 pub mod geometry;
+pub mod gestures;
 pub mod gl;
 pub mod graphics;
 pub mod invocation;
 pub mod json;
 pub mod keychain;
+pub mod layers;
 pub mod locks;
 pub mod media;
 pub mod misc;
@@ -36,6 +40,7 @@ pub mod numbers;
 pub mod object;
 pub mod paths;
 pub mod photos;
+pub mod pickers;
 pub mod pictures;
 pub mod plist;
 pub mod progress;
@@ -73,7 +78,10 @@ pub fn register(r: &mut Registry) {
     foundation::register(r);
     app::register(r);
     uikit::register(r);
+    layers::register();
+    animation::register(r);
     controls::register(r);
+    pickers::register();
     progress::register(r);
     typing::register(r);
     tables::register(r);
@@ -81,6 +89,7 @@ pub fn register(r: &mut Registry) {
     unavailable::register(r);
     storyboard::register(r);
     graphics::register(r);
+    bezier::register();
     runloop::register(r);
     media::register(r);
     keychain::register(r);
@@ -97,6 +106,7 @@ pub fn register(r: &mut Registry) {
     json::register(r);
     system::register(r);
     touch::register(r);
+    gestures::register();
     sound::register(r);
     gamekit::register(r);
     openal::register(r);

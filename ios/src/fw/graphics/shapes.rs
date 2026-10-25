@@ -251,7 +251,7 @@ fn stroke_edges(lines: &[((f64, f64), (f64, f64))], corners: &[(f64, f64)], half
 }
 
 impl Canvas {
-    fn to_device(&self) -> impl Fn((f64, f64)) -> (f64, f64) {
+    pub(super) fn to_device(&self) -> impl Fn((f64, f64)) -> (f64, f64) {
         let ctm = self.state.ctm;
         move |(x, y)| geometry::apply(ctm, x, y)
     }
@@ -836,6 +836,200 @@ extern "C" fn image_mask_create(width: usize, height: usize, bits_per_component:
         let bitmap = Bitmap { width, height, bits_per_pixel: 8, bytes_per_row: width, info: ALPHA_NONE, space: Space::Gray, data };
         make_mask(bitmap)
     })
+}
+
+// ----- paths for UIBezierPath and CAShapeLayer (fw/bezier.rs, render.rs) -----
+
+/// A new empty CGPath.
+pub fn new_path() -> Id {
+    path_create_mutable()
+}
+
+fn edit(path: Id, work: impl FnOnce(&mut Outline)) {
+    if let Some(p) = path_state(path) {
+        work(&mut p.lock().unwrap_or_else(|e| e.into_inner()));
+    }
+}
+
+pub fn path_move(path: Id, p: Point) {
+    edit(path, |o| o.move_to((p.x, p.y)));
+}
+
+pub fn path_line(path: Id, p: Point) {
+    edit(path, |o| o.line_to((p.x, p.y)));
+}
+
+/// A cubic curve from the current point, flattened into short lines.
+pub fn path_curve(path: Id, c1: Point, c2: Point, end: Point) {
+    edit(path, |o| {
+        let Some((x0, y0)) = o.current() else {
+            o.move_to((end.x, end.y));
+            return;
+        };
+        let steps = 24;
+        for i in 1..=steps {
+            let t = i as f64 / steps as f64;
+            let u = 1.0 - t;
+            let (a, b, c, d) = (u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t);
+            o.line_to((a * x0 + b * c1.x + c * c2.x + d * end.x, a * y0 + b * c1.y + c * c2.y + d * end.y));
+        }
+    });
+}
+
+pub fn path_quad(path: Id, control: Point, end: Point) {
+    let start = path_current(path).unwrap_or(end);
+    // The same curve as a cubic one.
+    let c1 = Point { x: start.x + 2.0 / 3.0 * (control.x - start.x), y: start.y + 2.0 / 3.0 * (control.y - start.y) };
+    let c2 = Point { x: end.x + 2.0 / 3.0 * (control.x - end.x), y: end.y + 2.0 / 3.0 * (control.y - end.y) };
+    path_curve(path, c1, c2, end);
+}
+
+pub fn path_arc(path: Id, center: Point, radius: f64, start: f64, end: f64, clockwise: bool) {
+    edit(path, |o| o.arc((center.x, center.y), radius, start, end, clockwise, &|p| p));
+}
+
+pub fn path_close(path: Id) {
+    edit(path, |o| o.close());
+}
+
+pub fn path_rect(path: Id, rect: Rect) {
+    edit(path, |o| o.rect(rect, &|p| p));
+}
+
+pub fn path_oval(path: Id, rect: Rect) {
+    edit(path, |o| o.ellipse(rect, &|p| p));
+}
+
+/// A rectangle with round corners (the radius at most half the shorter side).
+pub fn path_rounded_rect(path: Id, rect: Rect, radius: f64) {
+    let rect = standard(rect);
+    let r = radius.max(0.0).min(rect.size.width / 2.0).min(rect.size.height / 2.0);
+    let (x0, y0, x1, y1) = (rect.origin.x, rect.origin.y, rect.origin.x + rect.size.width, rect.origin.y + rect.size.height);
+    let half = std::f64::consts::FRAC_PI_2;
+    edit(path, |o| {
+        o.move_to((x0 + r, y0));
+        o.line_to((x1 - r, y0));
+        o.arc((x1 - r, y0 + r), r, -half, 0.0, false, &|p| p);
+        o.line_to((x1, y1 - r));
+        o.arc((x1 - r, y1 - r), r, 0.0, half, false, &|p| p);
+        o.line_to((x0 + r, y1));
+        o.arc((x0 + r, y1 - r), r, half, 2.0 * half, false, &|p| p);
+        o.line_to((x0, y0 + r));
+        o.arc((x0 + r, y0 + r), r, 2.0 * half, 3.0 * half, false, &|p| p);
+        o.close();
+    });
+}
+
+pub fn path_current(path: Id) -> Option<Point> {
+    let p = path_state(path)?;
+    let current = p.lock().unwrap_or_else(|e| e.into_inner()).current();
+    current.map(|(x, y)| Point { x, y })
+}
+
+pub fn path_is_empty(path: Id) -> bool {
+    path_state(path).is_none_or(|p| p.lock().unwrap_or_else(|e| e.into_inner()).figures.is_empty())
+}
+
+/// The smallest rectangle holding the path's points.
+pub fn path_bounds(path: Id) -> Rect {
+    let Some(p) = path_state(path) else { return Rect::default() };
+    let outline = p.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let points: Vec<(f64, f64)> = outline.figures.iter().flat_map(|f| f.points.iter().copied()).collect();
+    if points.is_empty() {
+        return Rect::default();
+    }
+    let (x0, x1) = points.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| (lo.min(p.0), hi.max(p.0)));
+    let (y0, y1) = points.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| (lo.min(p.1), hi.max(p.1)));
+    Rect::new(x0, y0, x1 - x0, y1 - y0)
+}
+
+pub fn path_copy(path: Id) -> Id {
+    let copy = new_path();
+    if let Some(p) = path_state(path) {
+        let outline = p.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        edit(copy, |o| *o = outline);
+    }
+    copy
+}
+
+/// Moves every point of the path by `t`.
+pub fn path_apply(path: Id, t: Transform) {
+    edit(path, |o| {
+        for figure in &mut o.figures {
+            for point in &mut figure.points {
+                *point = geometry::apply(t, point.0, point.1);
+            }
+        }
+    });
+}
+
+pub fn path_append(path: Id, other: Id) {
+    let Some(source) = path_state(other).map(|p| p.lock().unwrap_or_else(|e| e.into_inner()).clone()) else { return };
+    edit(path, |o| o.append(&source, &|p| p));
+}
+
+/// Whether the point is inside the filled path.
+pub fn path_contains(path: Id, point: Point, even_odd: bool) -> bool {
+    let Some(p) = path_state(path) else { return false };
+    let edges = p.lock().unwrap_or_else(|e| e.into_inner()).edges();
+    let mut winding = 0;
+    for ((x0, y0), (x1, y1)) in edges {
+        if (y0 <= point.y && point.y < y1) || (y1 <= point.y && point.y < y0) {
+            let x = x0 + (point.y - y0) * (x1 - x0) / (y1 - y0);
+            if x > point.x {
+                winding += if y1 > y0 { 1 } else { -1 };
+            }
+        }
+    }
+    if even_odd { winding % 2 != 0 } else { winding != 0 }
+}
+
+/// Fills and strokes a CGPath (in the context's user space): `fill` and
+/// `stroke` colours (straight RGBA) and the line width; None leaves that out.
+pub(super) fn draw_path_on(c: &mut Canvas, path: Id, fill: Option<[f64; 4]>, stroke: Option<([f64; 4], f64)>, even_odd: bool) {
+    let Some(p) = path_state(path) else { return };
+    let source = p.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut outline = Outline::default();
+    outline.append(&source, &c.to_device());
+    if let Some(color) = fill {
+        let saved = c.state.fill;
+        c.state.fill = color;
+        c.fill_outline(&outline, even_odd);
+        c.state.fill = saved;
+    }
+    if let Some((color, width)) = stroke {
+        let saved = (c.state.stroke, c.state.line_width);
+        (c.state.stroke, c.state.line_width) = (color, width);
+        c.stroke_outline(&outline);
+        (c.state.stroke, c.state.line_width) = saved;
+    }
+}
+
+/// Fills a path in a context with its fill colour (-[UIBezierPath fill]).
+pub fn fill_path_in(context: Id, path: Id, even_odd: bool) {
+    if let Some(mut c) = canvas("-[UIBezierPath fill]", context) {
+        let color = c.state.fill;
+        draw_path_on(&mut c, path, Some(color), None, even_odd);
+    }
+}
+
+/// Strokes a path in a context with its stroke colour (-[UIBezierPath stroke]).
+pub fn stroke_path_in(context: Id, path: Id, width: f64) {
+    if let Some(mut c) = canvas("-[UIBezierPath stroke]", context) {
+        let color = c.state.stroke;
+        draw_path_on(&mut c, path, None, Some((color, width.max(0.0))), false);
+    }
+}
+
+/// Clips a context to a path (-[UIBezierPath addClip]).
+pub fn clip_path_in(context: Id, path: Id, even_odd: bool) {
+    let Some(p) = path_state(path) else { return };
+    let source = p.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some(mut c) = canvas("-[UIBezierPath addClip]", context) {
+        let mut outline = Outline::default();
+        outline.append(&source, &c.to_device());
+        c.clip_to(&outline, even_odd);
+    }
 }
 
 pub fn register(r: &mut Registry) {

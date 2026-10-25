@@ -126,6 +126,33 @@ pub fn post(work: Work) {
     MAIN_LOOP.push(work);
 }
 
+/// Our own work for the main thread, each at its time (CLOCK_MONOTONIC
+/// seconds, the clock of CACurrentMediaTime).
+static MAIN_LATER: Mutex<Vec<(f64, Box<dyn FnOnce() + Send>)>> = Mutex::new(Vec::new());
+
+/// Queues work for the main thread's run loop to run `seconds` from now
+/// (Core Animation's timing: animations ending, transaction completions).
+pub fn post_after(seconds: f64, work: Box<dyn FnOnce() + Send>) {
+    MAIN_LATER.lock().unwrap().push((now() + seconds.max(0.0), work));
+    MAIN_LOOP.notify();
+}
+
+/// Runs the main loop's later work that is due; when the next is due.
+fn run_due_later() -> (bool, Option<f64>) {
+    let current = now();
+    let due: Vec<Box<dyn FnOnce() + Send>> = {
+        let mut list = MAIN_LATER.lock().unwrap();
+        list.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let count = list.iter().take_while(|(at, _)| *at <= current).count();
+        list.drain(..count).map(|(_, work)| work).collect()
+    };
+    let ran = !due.is_empty();
+    for work in due {
+        work();
+    }
+    (ran, MAIN_LATER.lock().unwrap().iter().map(|(at, _)| *at).reduce(f64::min))
+}
+
 /// The calling thread's run loop, for frameworks that answer on the run
 /// loop of the thread that made an object (Core Location does).
 pub fn this_threads_loop() -> &'static Loop {
@@ -479,8 +506,16 @@ fn run_loop_until(run_loop: &'static Loop, until: Option<f64>, once: bool, mode:
         if std::ptr::eq(run_loop, &MAIN_LOOP) {
             crate::fw::uikit::layout_pass();
         }
-        let (fired, next_timer) = fire_due_timers(run_loop);
+        let (fired, mut next_timer) = fire_due_timers(run_loop);
         handled |= fired > 0;
+        if std::ptr::eq(run_loop, &MAIN_LOOP) {
+            let (ran, next_later) = run_due_later();
+            handled |= ran;
+            next_timer = match (next_timer, next_later) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+        }
         crate::fw::counted::pool_drain(pool);
         if once && handled {
             return true;
@@ -896,6 +931,11 @@ extern "C" fn current_media_time() -> f64 {
     now()
 }
 
+/// The same clock for our own code (Core Animation's layer times).
+pub fn media_time() -> f64 {
+    now()
+}
+
 extern "C" fn ignore_size(_this: Id, _: Sel, _size: usize) {}
 extern "C" fn no(_this: Id, _: Sel) -> bool {
     false
@@ -1033,6 +1073,22 @@ mod frame_rate_tests {
         let refresh = 1.0 / 120.0;
         assert_eq!(link_interval(refresh, 2, false), refresh);
         assert_eq!(link_interval(refresh, 2, true), 2.0 * refresh, "IOS_FRAME_INTERVAL=1 keeps the game's choice");
+    }
+
+    /// Work posted for later runs on the main loop once its time has come,
+    /// not before, earliest first.
+    #[test]
+    fn work_posted_for_later_waits_for_its_time() {
+        static ORDER: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+        post_after(0.15, Box::new(|| ORDER.lock().unwrap().push(2)));
+        post_after(0.05, Box::new(|| ORDER.lock().unwrap().push(1)));
+        run_main_loop(Some(now() + 0.02));
+        assert!(ORDER.lock().unwrap().is_empty(), "nothing runs before its time");
+        let end = now() + 0.5;
+        while ORDER.lock().unwrap().len() < 2 && now() < end {
+            run_main_loop(Some(now() + 0.05));
+        }
+        assert_eq!(*ORDER.lock().unwrap(), [1, 2]);
     }
 
     /// A timer made with plain alloc/init (a placeholder some games keep
