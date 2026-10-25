@@ -243,7 +243,20 @@ pub fn bytes(object: Id) -> Vec<u8> {
     if object == 0 {
         return Vec::new();
     }
+    if !keeps_our_storage(object) && runtime::send(object, "respondsToSelector:", &[runtime::sel("bytes") as usize]) & 0xFF != 0 {
+        // Not ours (a game's NSData subclass, or a proxy standing in for a
+        // data): read through its primitive methods, as Foundation does.
+        let length = runtime::send(object, "length", &[]);
+        let pointer = runtime::send(object, "bytes", &[]) as *const u8;
+        return unsafe { slice(pointer, length) }.to_vec();
+    }
     store(object).as_slice().to_vec()
+}
+
+/// Whether the data keeps its bytes in our storage (its -length is ours).
+fn keeps_our_storage(object: Id) -> bool {
+    let sel = runtime::sel("length");
+    runtime::imp_for(object, sel) == Some(data_length as runtime::Imp)
 }
 
 // ----- class methods: autoreleased, as on Apple -----
@@ -660,6 +673,31 @@ mod tests {
     use crate::objc::runtime::{class_named, send};
         use crate::libsystem::heap::{malloc, malloc_size};
     use crate::fw::string::Range;
+
+    static FOREIGN_BYTES: &[u8] = b"0,#,1\r#,.,2";
+
+    extern "C" fn foreign_length(_this: Id, _: Sel) -> usize {
+        FOREIGN_BYTES.len()
+    }
+    extern "C" fn foreign_bytes(_this: Id, _: Sel) -> *const u8 {
+        FOREIGN_BYTES.as_ptr()
+    }
+
+    /// Data that isn't ours (a game's NSData subclass with its own -length
+    /// and -bytes, or a game proxy standing in for a data) is read through
+    /// those methods, as Foundation does: SpellCraft's dungeon map text came
+    /// from a proxy and read as empty.
+    #[test]
+    fn other_data_objects_are_read_through_length_and_bytes() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let class = define_class("TestForeignBytes", "NSData", 16);
+        methods(class, &[("length", foreign_length as usize), ("bytes", foreign_bytes as usize)]);
+        let foreign = runtime::alloc_instance(class);
+        let text = send(send(class_named("NSString"), "alloc", &[]), "initWithData:encoding:", &[foreign, 1]);
+        assert_eq!(crate::fw::string::get(text), "0,#,1\r#,.,2");
+        assert_eq!(bytes(send(class_named("NSData"), "dataWithData:", &[foreign])), FOREIGN_BYTES);
+    }
 
     /// Data from a URL: a file URL's file; a web URL is nil, as on an
     /// offline iPhone (never a local file at the URL's path).

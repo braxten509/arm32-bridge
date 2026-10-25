@@ -479,6 +479,11 @@ struct TestTap {
     /// `jump=`: goes as soon as its line comes, dropping the steps still
     /// waiting before it (walks on random maps end at a screen any time).
     jump: bool,
+    /// `every=`: outside the order, goes each time its line comes (a box
+    /// that may open at any point), then waits for its own tap's screen
+    /// to be drawn before it can go again.
+    every: bool,
+    armed: bool,
 }
 
 /// IOS_TAPS="on=screen shown: IntroViewController=>505,29;ready=>284,297;on=frame 1 shown=>420,250>460,250":
@@ -487,7 +492,9 @@ struct TestTap {
 /// something at that place to take it; nothing waits or counts seconds. A
 /// swipe goes from x,y to x2,y2 over about 150 ms. A `jump=` step goes the
 /// moment its line comes even while steps before it still wait (those are
-/// dropped). A step that isn't whole is left out.
+/// dropped). An `every=` step stands outside the order and goes each time
+/// its line comes once its last tap's screen is drawn. A step that isn't
+/// whole is left out.
 fn parse_test_taps(text: &str) -> Vec<TestTap> {
     let point = |text: &str| -> Option<Point> {
         let (x, y) = text.split_once(',')?;
@@ -498,17 +505,18 @@ fn parse_test_taps(text: &str) -> Vec<TestTap> {
             let (when, place) = step.split_once("=>")?;
             let when = when.trim();
             let jump = when.starts_with("jump=");
+            let every = when.starts_with("every=");
             let on = match when {
                 "ready" => Trigger::Ready,
                 _ => Trigger::Line(
-                    when.strip_prefix("on=").or_else(|| when.strip_prefix("after=")).or_else(|| when.strip_prefix("jump=")).filter(|text| !text.is_empty())?.to_string(),
+                    ["on=", "after=", "jump=", "every="].iter().find_map(|prefix| when.strip_prefix(prefix)).filter(|text| !text.is_empty())?.to_string(),
                 ),
             };
             let (from, to) = match place.trim().split_once('>') {
                 Some((from, to)) => (point(from)?, point(to)?),
                 None => (point(place.trim())?, point(place.trim())?),
             };
-            Some(TestTap { on, from, to, jump })
+            Some(TestTap { on, from, to, jump, every, armed: true })
         })
         .collect()
 }
@@ -547,12 +555,30 @@ pub fn line_logged(text: &str) {
     }
 }
 
-/// The step this log line sends: the next one if its line is this, else
-/// the first `jump=` step whose line it is (the steps before it go away).
+/// The line a tap's next drawn screen logs (see send_test_tap).
+fn drawn_after(to: Point) -> String {
+    format!("screen drawn after tap at {:.0},{:.0}", to.x, to.y)
+}
+
+/// The step this log line sends: an armed `every=` step whose line it is,
+/// else the next ordered step if its line is this, else the first `jump=`
+/// step whose line it is (the ordered steps before it go away).
 fn next_test_tap(taps: &mut std::collections::VecDeque<TestTap>, text: &str) -> Option<TestTap> {
-    let at = taps.iter().enumerate().position(|(i, tap)| (i == 0 || tap.jump) && matches!(&tap.on, Trigger::Line(line) if text.contains(line.as_str())))?;
-    taps.drain(..at);
-    taps.pop_front()
+    let holds = |tap: &TestTap| matches!(&tap.on, Trigger::Line(line) if text.contains(line.as_str()));
+    for tap in taps.iter_mut().filter(|tap| tap.every && !tap.armed) {
+        tap.armed = text.contains(&drawn_after(tap.to));
+    }
+    if let Some(tap) = taps.iter_mut().find(|tap| tap.every && tap.armed && holds(tap)) {
+        tap.armed = false;
+        return Some(tap.clone());
+    }
+    let ordered: Vec<usize> = (0..taps.len()).filter(|&i| !taps[i].every).collect();
+    let at = ordered.iter().enumerate().position(|(n, &i)| (n == 0 || taps[i].jump) && holds(&taps[i]))?;
+    let chosen = taps[ordered[at]].clone();
+    for &i in ordered[..=at].iter().rev() {
+        taps.remove(i);
+    }
+    Some(chosen)
 }
 
 /// From the main loop each time the drawn screen has settled (see
@@ -575,8 +601,8 @@ fn screen_settled_with(takes_touches: impl Fn(Point) -> bool) {
     }
     let tap = {
         let mut taps = TEST_TAPS.lock().unwrap_or_else(|e| e.into_inner());
-        match taps.front() {
-            Some(next) if next.on == Trigger::Ready && takes_touches(next.from) => taps.pop_front(),
+        match taps.iter().position(|tap| !tap.every) {
+            Some(next) if taps[next].on == Trigger::Ready && takes_touches(taps[next].from) => taps.remove(next),
             _ => None,
         }
     };
@@ -605,7 +631,7 @@ fn send_test_tap(tap: TestTap) {
         crate::fw::runloop::post(crate::fw::runloop::Work::Native(Box::new(move || {
             deliver_now(finger, Phase::Ended, to);
             // The next tap can go on this line: the screen after this one.
-            crate::fw::pictures::on_next_draw(format!("screen drawn after tap at {:.0},{:.0}", to.x, to.y));
+            crate::fw::pictures::on_next_draw(drawn_after(to));
         })));
     };
     send(Phase::Began, from);
@@ -999,5 +1025,20 @@ mod tests {
         assert_eq!(from(next_test_tap(&mut taps, "frame saved")), None, "the walking steps before it are dropped");
         assert_eq!(from(next_test_tap(&mut taps, "next")), Some(5.0));
         assert!(taps.is_empty());
+    }
+
+    #[test]
+    fn an_every_step_answers_its_line_whenever_it_comes() {
+        // A help box that may open after any round of a fight: closed each
+        // time it opens, while the ordered steps go on around it.
+        let mut taps: std::collections::VecDeque<TestTap> = parse_test_taps("every=help shown=>7,7;on=round=>1,1;on=round=>2,2").into();
+        let from = |tap: Option<TestTap>| tap.map(|t| t.from.x);
+        assert_eq!(from(next_test_tap(&mut taps, "help shown")), Some(7.0));
+        assert_eq!(from(next_test_tap(&mut taps, "help shown")), None, "not again before its own tap's screen is drawn");
+        assert_eq!(from(next_test_tap(&mut taps, "round")), Some(1.0), "the ordered steps go on");
+        assert_eq!(from(next_test_tap(&mut taps, "screen drawn after tap at 7,7")), None);
+        assert_eq!(from(next_test_tap(&mut taps, "help shown")), Some(7.0), "again after that");
+        assert_eq!(from(next_test_tap(&mut taps, "round")), Some(2.0));
+        assert_eq!(taps.len(), 1, "the every step stays");
     }
 }

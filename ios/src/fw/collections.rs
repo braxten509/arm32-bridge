@@ -58,7 +58,25 @@ pub fn array_items(object: Id) -> Vec<Id> {
     if object == 0 {
         return Vec::new();
     }
+    if !keeps_our_storage(object, "count", array_count as usize) && answers(object, "objectAtIndex:") {
+        let count = runtime::send(object, "count", &[]);
+        return (0..count).map(|index| runtime::send(object, "objectAtIndex:", &[index])).collect();
+    }
     items(object).clone()
+}
+
+/// Whether a collection keeps its entries in our storage: its `primitive`
+/// method is our `ours`. A game's class-cluster subclass (its own primitive
+/// methods) or a game proxy standing in for a collection doesn't, and is read
+/// through its primitive methods, as Foundation reads any collection.
+fn keeps_our_storage(object: Id, primitive: &str, ours: usize) -> bool {
+    let sel = runtime::sel(primitive);
+    runtime::imp_for(object, sel) == Some(ours as runtime::Imp)
+}
+
+/// -respondsToSelector:, asked by message (a proxy forwards it).
+fn answers(object: Id, selector: &str) -> bool {
+    runtime::send(object, "respondsToSelector:", &[runtime::sel(selector) as usize]) & 0xFF != 0
 }
 
 /// Makes a mutable array hold exactly `list` (kept, as its other setters do).
@@ -112,6 +130,12 @@ pub fn dictionary_pairs(object: Id) -> Vec<(Id, Id)> {
     if object == 0 {
         return Vec::new();
     }
+    if !keeps_our_storage(object, "count", dict_count as usize) && answers(object, "keyEnumerator") {
+        let keys = runtime::send(object, "keyEnumerator", &[]);
+        return std::iter::from_fn(|| Some(runtime::send(keys, "nextObject", &[])).filter(|&key| key != 0))
+            .map(|key| (key, runtime::send(object, "objectForKey:", &[key])))
+            .collect();
+    }
     pairs(object).clone()
 }
 
@@ -151,11 +175,13 @@ extern "C" fn array_init_with_objects_count(this: Id, _: Sel, list: *const Id, c
 extern "C" fn array_with_array(class: Class, _: Sel, other: Id) -> Id {
     let object = runtime::alloc_instance(class);
     *items(object) = array_items(other);
+    keep_all(items(object));
     object
 }
 
 extern "C" fn array_init_with_array(this: Id, _: Sel, other: Id) -> Id {
     *items(this) = array_items(other);
+    keep_all(items(this));
     this
 }
 
@@ -517,19 +543,25 @@ extern "C" fn dict_init_objects_keys_count(this: Id, _: Sel, values: *const Id, 
 extern "C" fn dict_with_dictionary(class: Class, _: Sel, other: Id) -> Id {
     let object = runtime::alloc_instance(class);
     *pairs(object) = dictionary_pairs(other);
+    pairs(object).iter().for_each(|&(k, v)| keep_all(&[k, v]));
     object
 }
 
 extern "C" fn dict_init_with_dictionary(this: Id, _: Sel, other: Id) -> Id {
     *pairs(this) = dictionary_pairs(other);
+    pairs(this).iter().for_each(|&(k, v)| keep_all(&[k, v]));
     this
 }
 
 extern "C" fn dict_init_with_dictionary_copy(this: Id, _: Sel, other: Id, copy_items: u8) -> Id {
     let mut list = dictionary_pairs(other);
-    if copy_items != 0 {
-        for (_, value) in list.iter_mut() {
+    for (key, value) in list.iter_mut() {
+        // A copied value is already the dictionary's own.
+        if copy_items != 0 {
             *value = runtime::send(*value, "copy", &[]);
+            keep_all(&[*key]);
+        } else {
+            keep_all(&[*key, *value]);
         }
     }
     *pairs(this) = list;
@@ -835,12 +867,16 @@ fn boxed(object: Id) -> Option<&'static Boxed> {
 /// A new NSValue (of `class`) holding a copy of `bytes`, of type `kind`.
 pub fn value_with_bytes(class: Class, kind: &str, bytes: &[u8]) -> Id {
     let object = runtime::alloc_instance(class);
+    hold_struct(object, kind, bytes);
+    object
+}
+
+fn hold_struct(object: Id, kind: &str, bytes: &[u8]) {
     let held = Boxed { kind: std::ffi::CString::new(kind).unwrap_or_default(), bytes: bytes.to_vec() };
     unsafe {
         *((object + 8) as *mut usize) = KIND_STRUCT;
         *((object + 16) as *mut *mut Boxed) = Box::into_raw(Box::new(held));
     }
-    object
 }
 
 /// The struct an NSValue holds, if it holds one of `kind`'s size.
@@ -988,6 +1024,89 @@ extern "C" fn value_description(this: Id, _: Sel) -> Id {
         None => format!("<{:x}>", value_pointer(this, 0)),
     };
     crate::fw::string::make(&text)
+}
+
+/// The keyed archive form Foundation writes: "NS.special" 1-4 with the
+/// text form of a point, size or rect ("{1.5, -2}", full precision) or a
+/// range's two numbers; other structs by their type encoding. A pointer
+/// means nothing in another run, so nothing is written for it (Apple
+/// raises) and it reads back as NULL.
+extern "C" fn value_encode_with_coder(this: Id, _: Sel, coder: Id) {
+    let Some(held) = boxed(this) else { return };
+    let key = crate::fw::string::make;
+    let put_text = |name: &str, text: String| {
+        runtime::send(coder, "encodeObject:forKey:", &[crate::fw::string::make(&text), key(name)]);
+    };
+    let put_number = |name: &str, n: i64| {
+        runtime::send(coder, "encodeInt64:forKey:", &[n as usize, key(name)]);
+    };
+    match held.kind.to_str().unwrap_or("") {
+        POINT_TYPE => {
+            let p: Point = value_struct(this);
+            put_number("NS.special", 1);
+            put_text("NS.pointval", format!("{{{}, {}}}", p.x, p.y));
+        }
+        SIZE_TYPE => {
+            let s: Size = value_struct(this);
+            put_number("NS.special", 2);
+            put_text("NS.sizeval", format!("{{{}, {}}}", s.width, s.height));
+        }
+        RECT_TYPE => {
+            let r: Rect = value_struct(this);
+            put_number("NS.special", 3);
+            put_text("NS.rectval", format!("{{{{{}, {}}}, {{{}, {}}}}}", r.origin.x, r.origin.y, r.size.width, r.size.height));
+        }
+        RANGE_TYPE => {
+            let r = value_range(this, 0);
+            put_number("NS.special", 4);
+            put_number("NS.rangeval.location", r.location as i64);
+            put_number("NS.rangeval.length", r.length as i64);
+        }
+        kind => {
+            put_text("NS.objctype", kind.to_string());
+            runtime::send(coder, "encodeValueOfObjCType:at:", &[held.kind.as_ptr() as usize, held.bytes.as_ptr() as usize]);
+        }
+    }
+}
+
+extern "C" fn value_init_with_coder(this: Id, _: Sel, coder: Id) -> Id {
+    let key = crate::fw::string::make;
+    let text = |name: &str| {
+        let object = runtime::send(coder, "decodeObjectForKey:", &[key(name)]);
+        if crate::fw::string::is_string(object) { crate::fw::string::get(object) } else { String::new() }
+    };
+    let number = |name: &str| runtime::send(coder, "decodeInt64ForKey:", &[key(name)]) as i64;
+    match number("NS.special") {
+        1 => {
+            let [x, y] = crate::fw::geometry::numbers(&text("NS.pointval"));
+            hold_struct(this, POINT_TYPE, bytes_of(&Point { x, y }));
+        }
+        2 => {
+            let [width, height] = crate::fw::geometry::numbers(&text("NS.sizeval"));
+            hold_struct(this, SIZE_TYPE, bytes_of(&Size { width, height }));
+        }
+        3 => {
+            let [x, y, width, height] = crate::fw::geometry::numbers(&text("NS.rectval"));
+            hold_struct(this, RECT_TYPE, bytes_of(&Rect::new(x, y, width, height)));
+        }
+        4 => {
+            let range = crate::fw::string::Range { location: number("NS.rangeval.location") as usize, length: number("NS.rangeval.length") as usize };
+            hold_struct(this, RANGE_TYPE, bytes_of(&range));
+        }
+        _ => match text("NS.objctype") {
+            kind if !kind.is_empty() => {
+                let mut bytes = vec![0u8; crate::fw::system::type_size(&kind, false).0];
+                let code = std::ffi::CString::new(kind.as_str()).unwrap_or_default();
+                runtime::send(coder, "decodeValueOfObjCType:at:", &[code.as_ptr() as usize, bytes.as_mut_ptr() as usize]);
+                hold_struct(this, &kind, &bytes);
+            }
+            _ => unsafe {
+                *((this + 8) as *mut usize) = KIND_POINTER;
+                *((this + 16) as *mut usize) = 0;
+            },
+        },
+    }
+    this
 }
 
 // ----- NSNumber: { isa, kind, value bits } -----
@@ -1593,6 +1712,8 @@ pub fn register(_: &mut Registry) {
             ("hash", value_hash as usize),
             ("description", value_description as usize),
             ("copyWithZone:", return_self as usize),
+            ("encodeWithCoder:", value_encode_with_coder as usize),
+            ("initWithCoder:", value_init_with_coder as usize),
         ],
     );
     let index_set = define_class("NSIndexSet", "NSObject", 16);
@@ -1887,6 +2008,50 @@ mod tests {
         assert!(runtime::send(mine, "isEqual:", &[other]) & 0xFF != 0, "{}", crate::fw::string::describe(mine));
         runtime::send(mine, "setDictionary:", &[0]);
         assert_eq!(dictionary_pairs(mine).len(), 0, "nil empties it");
+    }
+
+    static FOREIGN: std::sync::Mutex<Vec<(Id, Id)>> = std::sync::Mutex::new(Vec::new());
+
+    extern "C" fn foreign_count(_this: Id, _: Sel) -> usize {
+        FOREIGN.lock().unwrap().len()
+    }
+    extern "C" fn foreign_object_for_key(_this: Id, _: Sel, key: Id) -> Id {
+        FOREIGN.lock().unwrap().iter().find(|(k, _)| keys_equal(*k, key)).map_or(0, |(_, v)| *v)
+    }
+    extern "C" fn foreign_key_enumerator(_this: Id, _: Sel) -> Id {
+        let keys: Vec<Id> = FOREIGN.lock().unwrap().iter().map(|(k, _)| *k).collect();
+        runtime::send(array_from(&keys), "objectEnumerator", &[])
+    }
+    extern "C" fn foreign_object_at(_this: Id, _: Sel, index: usize) -> Id {
+        FOREIGN.lock().unwrap()[index].1
+    }
+
+    /// Collections that aren't ours (a game's class-cluster subclass with
+    /// only the primitive methods, or a game proxy standing in for one) are
+    /// read through those methods when copied, as Foundation does; reading
+    /// our own storage from them found nothing (SpellCraft's inherited item
+    /// specs lost every value of their parent spec).
+    #[test]
+    fn copies_read_other_collections_through_their_primitive_methods() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let s = crate::fw::string::make;
+        *FOREIGN.lock().unwrap() = vec![(s("icon"), s("Card_Spell_Hex.jpg")), (s("price"), s("gold"))];
+        let words = define_class("TestForeignWords", "NSDictionary", 16);
+        methods(words, &[("count", foreign_count as usize), ("objectForKey:", foreign_object_for_key as usize), ("keyEnumerator", foreign_key_enumerator as usize)]);
+        let list = define_class("TestForeignList", "NSArray", 16);
+        methods(list, &[("count", foreign_count as usize), ("objectAtIndex:", foreign_object_at as usize)]);
+        let (words, list) = (runtime::alloc_instance(words), runtime::alloc_instance(list));
+        let read = |dictionary: Id, key: &str| crate::fw::string::get(runtime::send(dictionary, "objectForKey:", &[s(key)]));
+
+        let copy = runtime::send(runtime::class_named("NSMutableDictionary"), "dictionaryWithDictionary:", &[words]);
+        assert_eq!((read(copy, "icon").as_str(), read(copy, "price").as_str()), ("Card_Spell_Hex.jpg", "gold"));
+        let merged = runtime::send(runtime::class_named("NSMutableDictionary"), "dictionary", &[]);
+        runtime::send(merged, "addEntriesFromDictionary:", &[words]);
+        assert_eq!(read(merged, "icon"), "Card_Spell_Hex.jpg");
+        let items = runtime::send(runtime::class_named("NSArray"), "arrayWithArray:", &[list]);
+        let texts: Vec<String> = array_items(items).into_iter().map(crate::fw::string::get).collect();
+        assert_eq!(texts, ["Card_Spell_Hex.jpg", "gold"]);
     }
 
     /// Calls `f(x0, x1, x2, ...)` the way Apple arm64 code calls a variadic

@@ -590,6 +590,13 @@ pub(super) fn guest_ret_from_bytes(ty: &Ty, bytes: &[u8]) -> GuestRet {
 
 // ---------- guest -> host ----------
 
+/// What an `id *` out-parameter's host temporary holds before the call: an
+/// address no object has, so the result tells whether the host set it.
+fn untouched_out() -> u64 {
+    static MARK: u64 = 0;
+    &MARK as *const u64 as u64
+}
+
 /// A pointer argument whose pointee has a different host layout: the host
 /// gets a temporary, copied back into guest memory after the call.
 struct OutParam {
@@ -787,7 +794,10 @@ pub fn prepare_host_call(
                         to_host(pointee, &hty, element, &mut host[i * step..(i + 1) * step], b)?;
                     }
                 }
-                let temp = words_of(&host).into_boxed_slice();
+                let mut temp = words_of(&host).into_boxed_slice();
+                if (array_count, **pointee == Ty::Object) == (None, true) {
+                    temp[0] = untouched_out();
+                }
                 args.push(&HostTy::Ptr, &(temp.as_ptr() as u64).to_le_bytes());
                 outs.push(OutParam { guest: address, pointee: (**pointee).clone(), hty, count, write_back, temp });
                 continue;
@@ -879,6 +889,11 @@ impl PreparedHostCall {
 pub fn finish_host_call(call: PreparedHostCall, ret: &HostRet, b: &mut dyn Boundary) -> Result<GuestRet, String> {
     let mut mapped = TempMap { b, outs: &call.outs };
     for out in call.outs.iter().filter(|o| o.write_back) {
+        if out.count == 1 && out.pointee == Ty::Object && out.temp[0] == untouched_out() {
+            // The host didn't set it: the game's variable keeps its value,
+            // as Apple's methods leave an out-parameter they don't set.
+            continue;
+        }
         let host: Vec<u8> = out.temp.iter().flat_map(|w| w.to_le_bytes()).collect();
         let (step, guest_step) = (out.hty.size() as usize, out.pointee.guest_size() as usize);
         let mut guest = vec![0u8; guest_step * out.count as usize];
