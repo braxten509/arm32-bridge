@@ -1020,7 +1020,7 @@ pub const MISSING_METHOD: &str = "missing method ";
 
 /// The framework table's row for a message to an instance of the host class
 /// `class`: that class's own row (`class:Name`), else the general one.
-pub fn framework_row(class: &str, sel: &str) -> Option<&'static super::selectors::FrameworkSelector> {
+pub fn framework_row(class: &str, sel: &str) -> Option<&'static FrameworkSelector> {
     let is_kind = |name: &str| {
         let (receiver, named) = (runtime::class_named(class), runtime::class_named(name));
         let rt = runtime::lock();

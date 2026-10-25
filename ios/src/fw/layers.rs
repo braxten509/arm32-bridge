@@ -9,7 +9,7 @@
 //! with their layer's anchor point, z order and animations (fw/animation.rs);
 //! layers of their own are kept, and drawn by -renderInContext:.
 
-use crate::fw::geometry::{Point, Rect, Size, Transform, Transform3D, IDENTITY_3D};
+use crate::fw::geometry::{apply, concat, invert, Point, Rect, Size, Transform, Transform3D, IDENTITY, IDENTITY_3D};
 use crate::fw::object::{class_methods, define_class, methods};
 use crate::fw::uikit::{property_get, property_set, property_set_object, view_state};
 use crate::fw::{collections, string};
@@ -280,33 +280,57 @@ extern "C" fn layer_visible_rect(this: Id, _: Sel) -> Rect {
     bounds(this)
 }
 
-/// A point in `other`'s own space (nil: the window's) to this layer's: both
-/// through the window, by frames and bounds origins.
-fn origin_in_root(layer: Id) -> Point {
-    let mut point = Point::default();
+/// One layer's space to its superlayer's: bounds origin, transform around
+/// the anchor point, position (a view's layer: its view's geometry).
+pub fn to_parent(layer: Id) -> Transform {
+    if let view @ 1.. = view_of(layer) {
+        return crate::fw::touch::view_step(view);
+    }
+    read(layer, |s| {
+        let (ax, ay) = (s.bounds.size.width * s.anchor.x, s.bounds.size.height * s.anchor.y);
+        let to_anchor = Transform { tx: -(s.bounds.origin.x + ax), ty: -(s.bounds.origin.y + ay), ..IDENTITY };
+        let to_parent = Transform { tx: s.position.x, ty: s.position.y, ..IDENTITY };
+        concat(concat(to_anchor, affine_of(s.transform)), to_parent)
+    })
+}
+
+/// A layer's space to its root layer's (the window's for views' layers).
+pub fn to_root(layer: Id) -> Transform {
+    let mut t = IDENTITY;
     let mut current = layer;
-    for _ in 0..64 {
+    for _ in 0..256 {
         let parent = parent_of(current);
         if current == 0 || parent == 0 {
             break;
         }
-        let (f, b) = (frame(current), bounds(current));
-        point.x += f.origin.x - b.origin.x;
-        point.y += f.origin.y - b.origin.y;
+        t = concat(t, to_parent(current));
         current = parent;
     }
-    point
+    t
+}
+
+/// From `from`'s space to `to`'s, through their root (nil: the root's own space).
+fn conversion(from: Id, to: Id) -> Transform {
+    let root = |layer: Id| if layer == 0 { IDENTITY } else { to_root(layer) };
+    concat(root(from), invert(root(to)).unwrap_or(IDENTITY))
 }
 
 extern "C" fn layer_convert_point_from(this: Id, _: Sel, point: Point, other: Id) -> Point {
-    let (from, to) = (if other == 0 { Point::default() } else { origin_in_root(other) }, origin_in_root(this));
-    Point { x: point.x + from.x - to.x, y: point.y + from.y - to.y }
+    let (x, y) = apply(conversion(other, this), point.x, point.y);
+    Point { x, y }
 }
 
-extern "C" fn layer_convert_point_to(this: Id, s: Sel, point: Point, other: Id) -> Point {
-    let (from, to) = (origin_in_root(this), if other == 0 { Point::default() } else { origin_in_root(other) });
-    let _ = s;
-    Point { x: point.x + from.x - to.x, y: point.y + from.y - to.y }
+extern "C" fn layer_convert_point_to(this: Id, _: Sel, point: Point, other: Id) -> Point {
+    let (x, y) = apply(conversion(this, other), point.x, point.y);
+    Point { x, y }
+}
+
+extern "C" fn layer_convert_rect_from(this: Id, _: Sel, rect: Rect, other: Id) -> Rect {
+    crate::fw::uikit::convert_rect(conversion(other, this), rect)
+}
+
+extern "C" fn layer_convert_rect_to(this: Id, _: Sel, rect: Rect, other: Id) -> Rect {
+    crate::fw::uikit::convert_rect(conversion(this, other), rect)
 }
 
 // ----- hierarchy -----
@@ -953,6 +977,8 @@ pub fn register() {
             ("visibleRect", layer_visible_rect as usize),
             ("convertPoint:fromLayer:", layer_convert_point_from as usize),
             ("convertPoint:toLayer:", layer_convert_point_to as usize),
+            ("convertRect:fromLayer:", layer_convert_rect_from as usize),
+            ("convertRect:toLayer:", layer_convert_rect_to as usize),
             ("superlayer", layer_superlayer as usize),
             ("sublayers", layer_sublayers as usize),
             ("setSublayers:", layer_set_sublayers as usize),
@@ -1106,6 +1132,36 @@ mod tests {
 
     fn call_point(object: Id, name: &str) -> Point {
         unboxed::<Point>(object, name).unwrap()
+    }
+
+    /// Layers convert points and rects through positions, anchors, bounds
+    /// origins and transforms, views' layers by their views' geometry; nil
+    /// is the root layer's space (a window's).
+    #[test]
+    fn layers_convert_points_and_rects() {
+        setup();
+        let window = runtime::send(runtime::class_named("UIWindow"), "alloc", &[]);
+        crate::fw::uikit::send_rect(window, "initWithFrame:", Rect::new(0.0, 0.0, 320.0, 480.0));
+        let view = new_view(Rect::new(10.0, 20.0, 100.0, 100.0));
+        runtime::send(window, "addSubview:", &[view]);
+        let host = runtime::send(view, "layer", &[]);
+        let own = layer_class_layer(runtime::class_named("CALayer"), 0);
+        layer_set_bounds(own, 0, Rect::new(0.0, 0.0, 10.0, 10.0));
+        layer_set_position(own, 0, Point { x: 50.0, y: 50.0 });
+        layer_add_sublayer(host, 0, own);
+        let scaled = layer_class_layer(runtime::class_named("CALayer"), 0);
+        layer_set_bounds(scaled, 0, Rect::new(0.0, 0.0, 10.0, 10.0));
+        layer_set_position(scaled, 0, Point { x: 50.0, y: 50.0 });
+        layer_set_affine_transform(scaled, 0, Transform { a: 2.0, b: 0.0, c: 0.0, d: 2.0, tx: 0.0, ty: 0.0 });
+        layer_add_sublayer(host, 0, scaled);
+        let p = |x: f64, y: f64| Point { x, y };
+        assert_eq!(layer_convert_point_to(own, 0, p(0.0, 0.0), host), p(45.0, 45.0));
+        assert_eq!(layer_convert_point_to(own, 0, p(0.0, 0.0), 0), p(55.0, 65.0), "nil: the window's layer");
+        assert_eq!(layer_convert_point_from(own, 0, p(55.0, 65.0), 0), p(0.0, 0.0));
+        assert_eq!(layer_convert_point_to(scaled, 0, p(0.0, 0.0), host), p(40.0, 40.0), "scaled around its anchor");
+        assert_eq!(layer_convert_point_from(scaled, 0, p(0.0, 0.0), own), p(2.5, 2.5));
+        assert_eq!(layer_convert_rect_to(scaled, 0, Rect::new(0.0, 0.0, 10.0, 10.0), host), Rect::new(40.0, 40.0, 20.0, 20.0));
+        assert_eq!(layer_convert_rect_from(host, 0, Rect::new(0.0, 0.0, 10.0, 10.0), own), Rect::new(45.0, 45.0, 10.0, 10.0));
     }
 
     /// A new anchor point keeps the layer's position and moves its frame;
