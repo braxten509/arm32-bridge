@@ -29,8 +29,8 @@ fn u32_at(g: &dyn GuestSide, addr: u32) -> u32 {
 }
 
 thread_local! {
-    /// (isa, selector) messages being sent again after their class said it
-    /// added the method: a second miss is not resolved again.
+    /// (start class, selector) messages being sent again after their class
+    /// said it added the method: a second miss is not resolved again.
     static RESOLVING: RefCell<Vec<(u32, u32)>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -40,7 +40,8 @@ struct GuestMessage<'a> {
     g: &'a dyn GuestSide,
     receiver: u32,
     isa: u32,
-    is_class: bool,
+    /// The class the lookup started at (a super call's superclass).
+    start: u32,
     sel: u32,
     name: String,
 }
@@ -52,20 +53,40 @@ impl Forwarding for GuestMessage<'_> {
         self.receiver
     }
 
-    fn resolve(&self) -> Result<bool, String> {
-        if RESOLVING.with(|r| r.borrow().contains(&(self.isa, self.sel))) {
-            return Ok(false);
+    fn resolve(&self) -> Result<(), String> {
+        if RESOLVING.with(|r| r.borrow().contains(&(self.start, self.sel))) {
+            return Ok(());
         }
-        // Sent to the class; only the game's own resolver can add a method.
-        let (class, resolver) = match self.is_class {
-            true => (self.receiver, "resolveClassMethod:"),
-            false => (self.isa, "resolveInstanceMethod:"),
-        };
-        if !lock(self.bridge).game_answers(u32_at(self.g, class), resolver) {
-            return Ok(false);
+        if lock(self.bridge).classes.resolution_refused(self.start, &self.name) {
+            return Ok(());
         }
-        let added = Ctx { bridge: self.bridge, g: self.g }.send(class, resolver, &[self.sel])? & 0xff != 0;
-        Ok(added && lock(self.bridge).answers(self.isa, &self.name))
+        let Some((meta, nonmeta)) = lock(self.bridge).class_pair(self.start) else { return Ok(()) };
+        let resolver = Ctx { bridge: self.bridge, g: self.g };
+        if meta {
+            // The class object answers +resolveClassMethod: (found in the
+            // metaclass, where the lookup started).
+            if lock(self.bridge).game_answers(self.start, "resolveClassMethod:") {
+                resolver.send(nonmeta, "resolveClassMethod:", &[self.sel])?;
+            }
+            // objc4 then sends +resolveInstanceMethod: to the metaclass
+            // object; its isa (the root metaclass) answers.
+            if !lock(self.bridge).answers(self.start, &self.name) {
+                let root_meta = u32_at(self.g, self.start);
+                if lock(self.bridge).game_answers(root_meta, "resolveInstanceMethod:") {
+                    resolver.send(self.start, "resolveInstanceMethod:", &[self.sel])?;
+                }
+            }
+        } else if lock(self.bridge).game_answers(u32_at(self.g, self.start), "resolveInstanceMethod:") {
+            resolver.send(self.start, "resolveInstanceMethod:", &[self.sel])?;
+        }
+        if !lock(self.bridge).answers(self.start, &self.name) {
+            lock(self.bridge).classes.refuse_resolution(self.start, &self.name);
+        }
+        Ok(())
+    }
+
+    fn found(&self) -> Result<bool, String> {
+        Ok(lock(self.bridge).answers(self.start, &self.name))
     }
 
     fn takes_part(&self) -> Result<bool, String> {
@@ -95,25 +116,23 @@ pub(super) fn forward_message(
     kind: SendKind,
     words: &dyn Fn(u32) -> u32,
     receiver: u32,
+    start: u32,
     missing: &str,
 ) -> Result<GuestRet, String> {
     let stret = matches!(kind, SendKind::Stret | SendKind::Super2Stret);
     let first = u32::from(stret);
     let sel = words(first + 1);
     let isa = u32_at(g, receiver);
-    let (name, is_class) = {
-        let mut b = lock(bridge);
-        (b.selector_name(g, sel), b.class_display(isa).1)
-    };
-    let message = GuestMessage { bridge, g, receiver, isa, is_class, sel, name };
+    let name = lock(bridge).selector_name(g, sel);
+    let message = GuestMessage { bridge, g, receiver, isa, start, sel, name };
     // The receiver's word: a super call's words hold its pair there.
     let as_sent = |to: u32| move |i: u32| if i == first { to } else { words(i) };
     let plain = if stret { SendKind::Stret } else { SendKind::Normal };
     match steps(&message)? {
         Outcome::Resolved => {
-            RESOLVING.with(|r| r.borrow_mut().push((isa, sel)));
+            RESOLVING.with(|r| r.borrow_mut().push((start, sel)));
             let result = send_from_guest(bridge, g, kind, words);
-            RESOLVING.with(|r| r.borrow_mut().retain(|m| *m != (isa, sel)));
+            RESOLVING.with(|r| r.borrow_mut().retain(|m| *m != (start, sel)));
             result
         }
         Outcome::Target(target) => send_from_guest(bridge, g, plain, &as_sent(target)),

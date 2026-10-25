@@ -5,7 +5,7 @@
 //! method is found or the chain reaches a framework (host) class.
 
 use guest32_image::{ClassTarget, Ivar32, Method32, ObjcMetadata32, Property32};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GuestMethod {
@@ -55,6 +55,9 @@ pub struct GuestClasses {
     framework_categories: HashMap<(String, bool), HashMap<String, GuestMethod>>,
     /// Some game method's type encoding per selector name.
     selector_types: HashMap<String, String>,
+    /// (class, selector) whose resolver was asked and added nothing: it is
+    /// not asked again until the class's method table changes.
+    refused_resolutions: HashSet<(u32, String)>,
 }
 
 fn method_map(list: &[Method32]) -> HashMap<String, GuestMethod> {
@@ -245,6 +248,16 @@ impl GuestClasses {
         self.classes.get(&class).map(|c| c.methods.keys().map(String::as_str).collect()).unwrap_or_default()
     }
 
+    /// Whether this class's resolver already said no for `sel` and added nothing.
+    pub fn resolution_refused(&self, class: u32, sel: &str) -> bool {
+        self.refused_resolutions.contains(&(class, sel.to_string()))
+    }
+
+    /// Remembers that this class's resolver said no for `sel`.
+    pub fn refuse_resolution(&mut self, class: u32, sel: &str) {
+        self.refused_resolutions.insert((class, sel.to_string()));
+    }
+
     /// class_addMethod on a framework class: kept like a category method.
     pub fn add_framework_method(&mut self, class: &str, meta: bool, sel: &str, imp: u32, types: &str) -> bool {
         let methods = self.framework_categories.entry((class.to_string(), meta)).or_default();
@@ -252,6 +265,7 @@ impl GuestClasses {
             return false;
         }
         methods.insert(sel.to_string(), GuestMethod { imp, types: types.to_string() });
+        self.refused_resolutions.clear();
         true
     }
 
@@ -262,6 +276,7 @@ impl GuestClasses {
             return false;
         }
         c.methods.insert(sel.to_string(), GuestMethod { imp, types: types.to_string() });
+        self.refused_resolutions.retain(|(owner, _)| *owner != class);
         true
     }
 }

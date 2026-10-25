@@ -21,8 +21,11 @@ use std::cell::Cell;
 pub trait Forwarding {
     type Value: Copy + PartialEq + Default;
     fn receiver(&self) -> Self::Value;
-    /// Step 1: whether the class added the method (it can be found now).
-    fn resolve(&self) -> Result<bool, String>;
+    /// Step 1: give the lookup class's resolver the selector.
+    fn resolve(&self) -> Result<(), String>;
+    /// Whether the method can be found now, whatever the resolver returned
+    /// (objc4 looks it up again either way).
+    fn found(&self) -> Result<bool, String>;
     /// Whether steps 2-4 apply (see the file's notes).
     fn takes_part(&self) -> Result<bool, String>;
     /// Whether the receiver answers `selector` itself (forwarding methods
@@ -49,7 +52,8 @@ pub enum Outcome<V> {
 
 /// Apple's forwarding steps, in order.
 pub fn steps<F: Forwarding>(f: &F) -> Result<Outcome<F::Value>, String> {
-    if f.resolve()? {
+    f.resolve()?;
+    if f.found()? {
         return Ok(Outcome::Resolved);
     }
     if !f.takes_part()? {
@@ -109,7 +113,6 @@ struct HostMessage {
     receiver: Id,
     isa: Class,
     start: Class,
-    is_class: bool,
     sel: Sel,
 }
 
@@ -120,17 +123,38 @@ impl Forwarding for HostMessage {
         self.receiver
     }
 
-    fn resolve(&self) -> Result<bool, String> {
-        // Sent to the class: +resolveClassMethod: for a class receiver.
-        let (class, name) = match self.is_class {
-            true => (self.receiver, "resolveClassMethod:"),
-            false => (self.isa, "resolveInstanceMethod:"),
+    fn resolve(&self) -> Result<(), String> {
+        let (start, meta, nonmeta) = {
+            let rt = lock();
+            match rt.classes.get(&self.start) {
+                Some(rec) => (self.start, rec.meta, rec.partner),
+                None => return Ok(()),
+            }
         };
-        if !runtime::responds(class, name) {
-            return Ok(false);
+        if lock().resolution_refused(start, self.sel) {
+            return Ok(());
         }
-        let added = runtime::send(class, name, &[self.sel]) & 0xff != 0;
-        Ok(added && lock().lookup(self.start, self.sel).is_some())
+        if meta {
+            // The class object answers +resolveClassMethod:.
+            if runtime::responds(nonmeta, "resolveClassMethod:") {
+                runtime::send(nonmeta, "resolveClassMethod:", &[self.sel]);
+            }
+            // objc4 then sends +resolveInstanceMethod: to the metaclass and
+            // looks again (the metaclass's class methods are the root's).
+            if lock().lookup(start, self.sel).is_none() && runtime::responds(start, "resolveInstanceMethod:") {
+                runtime::send(start, "resolveInstanceMethod:", &[self.sel]);
+            }
+        } else if runtime::responds(start, "resolveInstanceMethod:") {
+            runtime::send(start, "resolveInstanceMethod:", &[self.sel]);
+        }
+        if lock().lookup(start, self.sel).is_none() {
+            lock().refuse_resolution(start, self.sel);
+        }
+        Ok(())
+    }
+
+    fn found(&self) -> Result<bool, String> {
+        Ok(lock().lookup(self.start, self.sel).is_some())
     }
 
     fn takes_part(&self) -> Result<bool, String> {
@@ -156,11 +180,8 @@ thread_local! {
 /// instead, with `*receiver` possibly replaced (a forwarding target).
 /// None: report it as missing.
 pub(crate) fn after_miss(receiver: &mut Id, start: Class, sel: Sel, caller: usize) -> Option<Imp> {
-    let (isa, is_class) = {
-        let rt = lock();
-        (rt.class_of(*receiver), rt.is_class_object(*receiver))
-    };
-    let message = HostMessage { receiver: *receiver, isa, start, is_class, sel };
+    let isa = lock().class_of(*receiver);
+    let message = HostMessage { receiver: *receiver, isa, start, sel };
     let outcome = match steps(&message) {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -271,6 +292,7 @@ extern "C" fn ios_objc_forward_invocation(frame: *mut Frame) {
 
 #[cfg(test)]
 mod tests {
+    use crate::fw::object::class_methods;
     use crate::objc::runtime::{self, Class, Id, Sel};
     use crate::symbols::leak_cstr;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -378,5 +400,122 @@ mod tests {
         let unknown: extern "C" fn(Id, Sel, usize) -> usize = message();
         assert_eq!(unknown(invoking, sel("frobnicate:"), 7), 0);
         assert_eq!(*UNRECOGNIZED.lock().unwrap(), ["frobnicate:"]);
+    }
+
+    extern "C" fn answer_42(_: Id, _: Sel) -> usize {
+        42
+    }
+
+    extern "C" fn no_signature(_: Id, _: Sel, _: Sel) -> Id {
+        0
+    }
+
+    extern "C" fn ignore_selector(_: Id, _: Sel, _: Sel) {}
+
+    /// A class that asks for work but says no: forwarding is enabled so a
+    /// miss ends at -doesNotRecognizeSelector: instead of the missing report.
+    fn forwarding_class(name: &str, parent: &str) -> Class {
+        class(name, parent, &[("methodSignatureForSelector:", no_signature as usize), ("doesNotRecognizeSelector:", ignore_selector as usize)])
+    }
+
+    static RESOLVED_AFTER_NO: AtomicUsize = AtomicUsize::new(0);
+
+    extern "C" fn add_and_say_no(class: Class, _: Sel, sel: Sel) -> bool {
+        RESOLVED_AFTER_NO.fetch_add(1, Ordering::Relaxed);
+        runtime::lock().add_method(class, sel, answer_42 as usize);
+        false
+    }
+
+    /// objc4 looks the method up again whatever the resolver returned.
+    #[test]
+    fn a_resolver_that_says_no_still_resolves_when_it_added_the_method() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let class = forwarding_class("H64FwdResolverNo", "NSObject");
+        class_methods(class, &[("resolveInstanceMethod:", add_and_say_no as usize)]);
+        let object = runtime::alloc_instance(class);
+        assert_eq!(runtime::send(object, "fwdAddedAnyway", &[]), 42);
+    }
+
+    static START_SEEN: AtomicUsize = AtomicUsize::new(0);
+
+    extern "C" fn add_to_start(class: Class, _: Sel, sel: Sel) -> bool {
+        START_SEEN.store(class, Ordering::Relaxed);
+        runtime::lock().add_method(class, sel, answer_42 as usize);
+        true
+    }
+
+    /// A super send's miss is resolved by the class the lookup started at,
+    /// not by the receiver's class.
+    #[test]
+    fn a_super_send_resolves_against_its_start_class() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let parent = forwarding_class("H64FwdStartParent", "NSObject");
+        class_methods(parent, &[("resolveInstanceMethod:", add_to_start as usize)]);
+        let child = crate::fw::object::define_class("H64FwdStartChild", "H64FwdStartParent", 16);
+        let mut receiver = runtime::alloc_instance(child);
+        let imp = super::after_miss(&mut receiver, parent, runtime::sel("fwdSuperOnly"), 0);
+        assert_eq!(START_SEEN.load(Ordering::Relaxed), parent, "resolved against the receiver's class instead of the start class");
+        assert_eq!(imp, Some(answer_42 as usize));
+    }
+
+    static REFUSALS: AtomicUsize = AtomicUsize::new(0);
+
+    extern "C" fn refuse(_: Class, _: Sel, _: Sel) -> bool {
+        REFUSALS.fetch_add(1, Ordering::Relaxed);
+        false
+    }
+
+    /// A resolver that added nothing is not asked again for that class until
+    /// the class's methods change.
+    #[test]
+    fn a_refused_resolution_is_remembered_until_the_class_gains_a_method() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let class = forwarding_class("H64FwdRefusal", "NSObject");
+        class_methods(class, &[("resolveInstanceMethod:", refuse as usize)]);
+        let mut receiver = runtime::alloc_instance(class);
+        let first = runtime::sel("fwdRefusedOne");
+        super::after_miss(&mut receiver, class, first, 0);
+        super::after_miss(&mut receiver, class, first, 0);
+        assert_eq!(REFUSALS.load(Ordering::Relaxed), 1, "the resolver was asked again for the same refusal");
+        let other = runtime::sel("fwdRefusalOther");
+        runtime::lock().add_method(class, other, answer_42 as usize);
+        super::after_miss(&mut receiver, class, runtime::sel("fwdRefusedTwo"), 0);
+        assert_eq!(REFUSALS.load(Ordering::Relaxed), 2, "a method added to the class did not clear its refusals");
+    }
+
+    extern "C" fn class_resolver_no(_: Class, _: Sel, _: Sel) -> bool {
+        false
+    }
+
+    extern "C" fn meta_resolver_yes(class: Class, _: Sel, sel: Sel) -> bool {
+        runtime::lock().add_method(class, sel, answer_42 as usize);
+        true
+    }
+
+    /// A class-method miss falls back to +resolveInstanceMethod: on the
+    /// metaclass, as objc4 does.
+    #[test]
+    fn a_class_message_falls_back_to_the_metaclass_resolve_instance_method() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        // A root class: its metaclass is its own isa, so the fallback message
+        // reaches this class's own +resolveInstanceMethod:.
+        let class = runtime::lock().define_class("H64FwdMetaRoot", 0, 16);
+        class_methods(
+            class,
+            &[
+                ("resolveClassMethod:", class_resolver_no as usize),
+                ("resolveInstanceMethod:", meta_resolver_yes as usize),
+                ("methodSignatureForSelector:", no_signature as usize),
+                ("doesNotRecognizeSelector:", ignore_selector as usize),
+            ],
+        );
+        let meta = runtime::lock().classes[&class].partner;
+        let mut receiver = class;
+        let imp = super::after_miss(&mut receiver, meta, runtime::sel("fwdMetaOnly"), 0);
+        assert_eq!(imp, Some(answer_42 as usize));
     }
 }

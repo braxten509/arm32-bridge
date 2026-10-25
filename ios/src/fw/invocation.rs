@@ -470,7 +470,19 @@ pub fn place_result(ty: &Type, bytes: &[u8], x8: usize, ret_x: &mut [u64; 2], re
     } else if ty.is_struct && ty.size > 16 {
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), x8 as *mut u8, ty.size) };
     } else {
-        ret_x[0] = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+        let mut value = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+        // arm64 leaves a small signed result sign-extended to 32 bits (and an
+        // unsigned one zero-extended): (signed char)-1 is -1, not 255.
+        if let Some((false, signed)) = ty.scalar {
+            if ty.size < 4 {
+                let shift = 64 - 8 * ty.size;
+                if signed {
+                    value = (((value << shift) as i64) >> shift) as u64;
+                }
+                value &= u64::from(u32::MAX);
+            }
+        }
+        ret_x[0] = value;
         ret_x[1] = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
     }
 }
@@ -1101,6 +1113,20 @@ mod tests {
             w: x as f64 + r.x + r.y + r.w + r.h,
             h: (big.a + big.b + big.c) as f64,
         }
+    }
+
+    #[test]
+    fn results_smaller_than_four_bytes_keep_their_sign() {
+        let mut x = [0u64; 2];
+        let mut d = [0u64; 4];
+        place_result(&Type::scalar(1, false, true), &[0xff], 0, &mut x, &mut d);
+        assert_eq!(x[0], u64::from(u32::MAX), "(signed char)-1 comes back -1");
+        place_result(&Type::scalar(2, false, true), &[0xff, 0xff], 0, &mut x, &mut d);
+        assert_eq!(x[0], u64::from(u32::MAX), "(short)-1 comes back -1");
+        place_result(&Type::scalar(1, false, false), &[0xff], 0, &mut x, &mut d);
+        assert_eq!(x[0], 0xff, "(unsigned char)255 stays 255");
+        place_result(&Type::scalar(2, false, false), &[0xff, 0xff], 0, &mut x, &mut d);
+        assert_eq!(x[0], 0xffff, "(unsigned short)65535 stays 65535");
     }
 
     #[test]
