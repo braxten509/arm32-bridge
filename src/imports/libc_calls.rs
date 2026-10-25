@@ -70,7 +70,47 @@ fn write_dirent(buffer: u32, entry: &libc::dirent) {
 const WIDE_CLASSES: [&str; 12] =
     ["alnum", "alpha", "blank", "cntrl", "digit", "graph", "lower", "print", "punct", "space", "upper", "xdigit"];
 
-/// Whether a wide character is in one of WIDE_CLASSES (digits and hex digits are ASCII only, as in bionic).
+#[cfg(target_os = "android")]
+extern "C" {
+    fn iswalnum(c: u32) -> libc::c_int;
+    fn iswalpha(c: u32) -> libc::c_int;
+    fn iswblank(c: u32) -> libc::c_int;
+    fn iswcntrl(c: u32) -> libc::c_int;
+    fn iswdigit(c: u32) -> libc::c_int;
+    fn iswgraph(c: u32) -> libc::c_int;
+    fn iswlower(c: u32) -> libc::c_int;
+    fn iswprint(c: u32) -> libc::c_int;
+    fn iswpunct(c: u32) -> libc::c_int;
+    fn iswspace(c: u32) -> libc::c_int;
+    fn iswupper(c: u32) -> libc::c_int;
+    fn iswxdigit(c: u32) -> libc::c_int;
+}
+
+/// Whether a wide character is in one of WIDE_CLASSES. On the phone the answer is bionic's own
+/// (Unicode data from ICU4X: unassigned code points aren't printable, only Pd/Ps/Pe/Pc/Po are
+/// punctuation); 32-bit and 64-bit wint_t are both 32 bits.
+#[cfg(target_os = "android")]
+fn in_wide_class(character: u32, class: &str) -> bool {
+    let test = match class {
+        "alnum" => iswalnum,
+        "alpha" => iswalpha,
+        "blank" => iswblank,
+        "cntrl" => iswcntrl,
+        "digit" => iswdigit,
+        "graph" => iswgraph,
+        "lower" => iswlower,
+        "print" => iswprint,
+        "punct" => iswpunct,
+        "space" => iswspace,
+        "upper" => iswupper,
+        _ => iswxdigit,
+    };
+    unsafe { test(character) != 0 }
+}
+
+/// Test builds off the phone (PC, qemu) have no bionic: an approximation from Rust's char data
+/// (digits are ASCII only here, bionic takes every decimal digit; no unassigned-code-point data).
+#[cfg(not(target_os = "android"))]
 fn in_wide_class(character: u32, class: &str) -> bool {
     let Some(c) = char::from_u32(character) else { return false };
     match class {
@@ -87,6 +127,20 @@ fn in_wide_class(character: u32, class: &str) -> bool {
         "upper" => c.is_uppercase(),
         _ => c.is_ascii_hexdigit(),
     }
+}
+
+/// bionic's 32-bit ftello: the stream position, or -1 with errno (EOVERFLOW past 2 GB).
+fn position_32(uc: &Uc, stream: usize) -> i32 {
+    let at = unsafe { libc::ftello(stream as *mut libc::FILE) } as i64;
+    if at < 0 {
+        sync_errno(uc);
+        return -1;
+    }
+    if at > i32::MAX as i64 {
+        set_errno(uc, libc::EOVERFLOW);
+        return -1;
+    }
+    at as i32
 }
 
 /// The C locale's character tests: only 0..=255 (and EOF) are valid arguments.
@@ -818,7 +872,6 @@ pub fn handler(name: &str) -> Option<Handler> {
         "isprint" => handler!(|uc, a| narrow_class(a.i32(), libc::isprint)),
         "ispunct" => handler!(|uc, a| narrow_class(a.i32(), libc::ispunct)),
         "islower" => handler!(|uc, a| narrow_class(a.i32(), libc::islower)),
-        "iswlower" => handler!(|uc, a| Ret::U32(char::from_u32(a.u32()).is_some_and(|c| c.is_lowercase()) as u32)),
         // wchar_t is 32 bits for the guest too; the C library is always UTF-8.
         "wcslen" => handler!(|uc, a| {
             let text = a.u32();
@@ -957,7 +1010,8 @@ pub fn handler(name: &str) -> Option<Handler> {
             let Some(&name) = (class as usize).checked_sub(1).and_then(|i| WIDE_CLASSES.get(i)) else { return Ret::U32(0) };
             Ret::U32(in_wide_class(character, name) as u32)
         }),
-        "iswalpha" | "iswcntrl" | "iswdigit" | "iswprint" | "iswpunct" | "iswspace" | "iswupper" | "iswxdigit" => handler!(|uc, a| {
+        "iswalnum" | "iswalpha" | "iswblank" | "iswcntrl" | "iswdigit" | "iswgraph" | "iswlower" | "iswprint" | "iswpunct"
+        | "iswspace" | "iswupper" | "iswxdigit" => handler!(|uc, a| {
             let class = &uc.get_data().current_call[3..];
             Ret::U32(in_wide_class(a.u32(), class) as u32)
         }),
@@ -1321,27 +1375,36 @@ pub fn handler(name: &str) -> Option<Handler> {
                 _ => Ret::U32(u32::MAX),
             }
         }),
-        "ftell" | "ftello" => handler!(|uc, a| {
-            let file = a.u32();
+        "fseeko64" => handler!(|uc, a| {
+            let (file, offset, whence) = (a.u32(), a.i64(), a.i32());
             match host_file(file) {
-                Some(HostFile::Stream(stream)) => checked(uc, unsafe { libc::ftello(stream as *mut libc::FILE) } as i64),
+                Some(HostFile::Stream(stream)) => {
+                    checked(uc, unsafe { libc::fseeko(stream as *mut libc::FILE, offset as libc::off_t, whence) } as i64)
+                }
                 _ => Ret::U32(u32::MAX),
             }
         }),
-        // fpos_t is a 32-bit off_t on 32-bit bionic.
+        "ftello64" => handler!(|uc, a| {
+            let Some(HostFile::Stream(stream)) = host_file(a.u32()) else { return Ret::U64(u64::MAX) };
+            let at = unsafe { libc::ftello(stream as *mut libc::FILE) } as i64;
+            if at < 0 {
+                sync_errno(uc);
+            }
+            Ret::U64(at as u64)
+        }),
+        // off_t is 32 bits: like bionic, a position past 2 GB is -1 with EOVERFLOW.
+        "ftell" | "ftello" => handler!(|uc, a| {
+            let Some(HostFile::Stream(stream)) = host_file(a.u32()) else { return Ret::U32(u32::MAX) };
+            Ret::U32(position_32(uc, stream) as u32)
+        }),
+        // fpos_t is a 32-bit off_t on 32-bit bionic, whose fgetpos is `*pos = ftello(fp)`:
+        // a failure (EOVERFLOW past 2 GB) stores -1 too.
         "fgetpos" => handler!(|uc, a| {
             let (file, position) = (a.u32(), a.u32());
             let Some(HostFile::Stream(stream)) = host_file(file) else { return Ret::U32(u32::MAX) };
-            let at = unsafe { libc::ftello(stream as *mut libc::FILE) };
-            if at < 0 {
-                return checked(uc, -1);
-            }
-            if at > i32::MAX as i64 {
-                set_errno(uc, libc::EOVERFLOW);
-                return Ret::U32(u32::MAX);
-            }
+            let at = position_32(uc, stream);
             mem().write_u32(position, at as u32);
-            Ret::U32(0)
+            Ret::U32(if at == -1 { u32::MAX } else { 0 })
         }),
         "fsetpos" => handler!(|uc, a| {
             let (file, position) = (a.u32(), a.u32());
@@ -1983,6 +2046,7 @@ pub fn handler(name: &str) -> Option<Handler> {
         // The checker runs every block twice (and one thread at a time): long tests shrink.
         "arm32_bridge_is_checking" => handler!(|uc, a| Ret::U32(crate::dynarec::check::enabled() as u32)),
         "arm32_bridge_runs_in_parallel" => handler!(|uc, a| Ret::U32(crate::runtime::parallel() as u32)),
+        "arm32_bridge_wide_classes_from_phone" => handler!(|uc, a| Ret::U32(cfg!(target_os = "android") as u32)),
         "arm32_bridge_forces_fallbacks" => handler!(|uc, a| Ret::U32(crate::dynarec::thumb::force_sync_fallback() as u32)),
         "fork" | "execl" | "system" | "setsid" => handler!(|uc, a| {
             set_errno(uc, libc::ENOSYS);
@@ -1998,6 +2062,7 @@ pub fn handler(name: &str) -> Option<Handler> {
             Ret::Void
         }),
         "__errno" => handler!(|uc, a| Ret::U32(uc.get_data().errno_slot)),
+        "__get_h_errno" => handler!(|uc, a| Ret::U32(uc.get_data().errno_slot + crate::runtime::H_ERRNO_OFFSET)),
         "__stack_chk_fail" => handler!(|uc, a| {
             stop_with_fault(uc, "stack protector tripped (__stack_chk_fail)".into());
             Ret::Void

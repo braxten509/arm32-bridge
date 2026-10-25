@@ -69,7 +69,12 @@ wchar_t *c_wcsncpy(wchar_t *, const wchar_t *, size_t) __asm__("wcsncpy");
 size_t c_strlcat(char *, const char *, size_t) __asm__("strlcat");
 int c_fgetpos(FILE *, fpos_t *) __asm__("fgetpos");
 int c_fsetpos(FILE *, const fpos_t *) __asm__("fsetpos");
+long c_ftell(FILE *) __asm__("ftell");
+int c_fseeko64(FILE *, off64_t, int) __asm__("fseeko64");
+off64_t c_ftello64(FILE *) __asm__("ftello64");
 }
+
+static void *h_errno_address(void *) { return &h_errno; }
 
 #define TAG "selftest"
 static int failures = 0;
@@ -3193,7 +3198,7 @@ extern "C" int run_all() {
         check(c_iscntrl('\n') && !c_iscntrl('a') && c_isprint(' ') && !c_isprint('\t') && c_ispunct('!') && !c_ispunct('a') &&
                   !c_ispunct(' ') && c_islower('q') && !c_islower('Q') && !c_isprint(200),
               "iscntrl / isprint / ispunct / islower");
-        check(c_iswalpha(L'é') && !c_iswalpha(L'3') && c_iswcntrl(L'\n') && c_iswdigit(L'7') && !c_iswdigit(L'٣') &&
+        check(c_iswalpha(L'é') && !c_iswalpha(L'3') && c_iswcntrl(L'\n') && c_iswdigit(L'7') && !c_iswdigit(L'x') &&
                   c_iswprint(L'é') && !c_iswprint(L'\n') && c_iswpunct(L'?') && !c_iswpunct(L'b') && c_iswspace(L'\t') &&
                   !c_iswspace(L'x') && c_iswupper(L'É') && !c_iswupper(L'e') && c_iswxdigit(L'F') && !c_iswxdigit(L'g'),
               "iswalpha / iswcntrl / iswdigit / iswprint / iswpunct / iswspace / iswupper / iswxdigit");
@@ -3218,6 +3223,49 @@ extern "C" int run_all() {
             fclose(scratch);
         }
         check(positions, "fgetpos / fsetpos");
+
+        // Past 2 GB a 32-bit position doesn't fit: bionic's fgetpos stores ftello's -1 and
+        // fails with EOVERFLOW, as does ftell. The 64-bit calls still see the position.
+        FILE *large = tmpfile();
+        bool overflow = false;
+        if (large) {
+            fpos_t mark = 123;
+            const off64_t three_gb = 3LL << 30;
+            bool beyond = c_fseeko64(large, three_gb, SEEK_SET) == 0 && c_ftello64(large) == three_gb;
+            errno = 0;
+            bool get_failed = c_fgetpos(large, &mark) == -1 && errno == EOVERFLOW && mark == (fpos_t)-1;
+            errno = 0;
+            bool tell_failed = c_ftell(large) == -1 && errno == EOVERFLOW;
+            overflow = beyond && get_failed && tell_failed;
+            fclose(large);
+        }
+        check(overflow, "fseeko64 / ftello64; fgetpos and ftell past 2 GB fail with EOVERFLOW like bionic");
+
+        // h_errno: one per thread, set by a failed gethostbyname.
+        pthread_t other;
+        void *other_address = nullptr;
+        bool own = pthread_create(&other, nullptr, h_errno_address, nullptr) == 0 && pthread_join(other, &other_address) == 0 &&
+                   other_address && other_address != (void *)&h_errno;
+        h_errno = 0;
+        bool missing = gethostbyname("no-such-host.invalid") == nullptr;
+        int reason = h_errno;
+        check(own && missing && (reason == HOST_NOT_FOUND || reason == TRY_AGAIN || reason == NO_DATA),
+              "__get_h_errno per thread, set by a failed gethostbyname");
+    }
+
+    {
+        // Wide character classes as the phone's bionic has them (ICU4X): unassigned code points
+        // aren't printable, format characters (Cf) are; only Pd/Ps/Pe/Pc/Po are punctuation;
+        // digits are every decimal digit (Nd: U+0663 yes, superscript two U+00B2 no).
+        if (bridge_flag("arm32_bridge_wide_classes_from_phone")) {
+            check(!c_iswprint(0x0378) && c_iswprint(0x200B) && c_iswprint(0x00E9) && !c_iswprint(0xD800) &&
+                      c_iswpunct(0x2014) && c_iswpunct(0x3001) && c_iswpunct(0x00BF) && !c_iswpunct(0x00AB) &&
+                      !c_iswpunct(0x20AC) && !c_iswpunct(0x200B) && !c_iswpunct(0x0378) && c_iswdigit(0x0663) &&
+                      !c_iswdigit(0x00B2),
+                  "iswprint / iswpunct match bionic for unassigned, format, symbol and quote characters");
+        } else {
+            skip("iswprint / iswpunct bionic cases", "this build doesn't run on Android's C library (wide classes are approximated)");
+        }
     }
 
     __android_log_print(ANDROID_LOG_INFO, TAG, "%d failures", failures);

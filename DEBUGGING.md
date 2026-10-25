@@ -2149,4 +2149,31 @@ program under the same qemu (no bridge) showed both:
   check also requires gethostbyname("127.0.0.1") and skips the "localhost" name only when the system's own
   getaddrinfo can't resolve it.
 - Results: qemu 0 failures (one printed skip: the read-back), emulator 0 failures, PC 0 failures (no skips).
-  Still missing, seen in a probe: __get_h_errno (h_errno).
+  Still missing, seen in a probe: __get_h_errno (h_errno) - added in the review round below.
+
+## Review round on android/rtk (Kimi, 2026-10-25)
+
+- field_view "IsAssignableFrom reversed": checked against the JNI spec (IsAssignableFrom(A, B) = an A can be cast
+  to B), so (field type, SurfaceView) was already right. Added: the value must also be IsInstanceOf SurfaceView,
+  and the log names where the surface came from. Emulator: "asked for 120 Hz on the game surface (field
+  mSurface)" (SDLActivity.mSurface, an SDLSurface), not the Object field `buf`.
+- 120 Hz retry: a request that finds no view, a missing/invalid surface (Surface.isValid) or a throwing
+  setFrameRate stays pending; later native calls try again (at most every 0.5 s, 20 tries; one atomic load per
+  call otherwise). Android without setFrameRate isn't retried. Test switch debug.arm32bridge.refresh_test=late holds
+  the first request back: emulator log showed held back -> one miss from another class -> asked (field mSurface)
+  0.5 s later.
+- Wide character classes: bionic (main, ICU4X) answers from Unicode data: iswprint = UTS #18 print (format
+  characters Cf ARE printable, unassigned and surrogates are not), iswpunct = only Pd/Ps/Pe/Pc/Po (not symbols,
+  not Pi/Pf quotes), iswdigit = every Nd digit (U+0663 yes; the old self-test wrongly said no). On Android the bridge
+  now calls the phone's own isw* functions (all twelve, also via iswctype); PC/qemu builds keep a Rust
+  approximation and the self-test skips the bionic-only cases there with a printed reason (flag
+  arm32_bridge_wide_classes_from_phone). Emulator: failed before, passes after.
+- fgetpos/ftell on 32-bit bionic: ftello returns -1 + EOVERFLOW past 2 GB and fgetpos stores that -1 in *pos
+  (bionic stdio.cpp). The bridge's ftell used to cut the value to 32 bits; both now match. Added fseeko64 and
+  ftello64 (test needs them). PC: failed before, passes after.
+- h_errno: __get_h_errno returns a per-thread int right after the thread's errno (errno slot is now 8 bytes,
+  both cleared on reuse); gethostbyname failures set it from getaddrinfo's answer (EAI_AGAIN -> TRY_AGAIN,
+  EAI_FAIL/MEMORY/SYSTEM -> NO_RECOVERY, EAI_NODATA -> NO_DATA, else HOST_NOT_FOUND). PC: crashed before (no
+  handler), passes after.
+- Self-test: PC 0 failures (1 skip: bionic wide cases), qemu ARM64 0 failures (2 skips: same + timeout read-back,
+  0 fallbacks), emulator 0 failures (no skips).
