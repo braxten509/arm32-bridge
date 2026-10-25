@@ -2109,3 +2109,27 @@ Owner's choices: downloaded files only (no Play Store installs), general steps p
   anything (it also covers provider/permission clashes). After removal, a failed install says the old copy is gone.
   Codex review: 3 findings, all fixed. Emulator test: ~/dev/scratch-bhook/replace-test.sh (original T&Q pieces ->
   Replace -> OK -> Install -> Installed + provider).
+
+## Rule the Kingdom 5.11 (SDL game, emulator only, 2026-10-25)
+
+com.gameinsight.kingdom 5.11 (Game Insight, 2014, targetSdk 19): one ARM library libkingdom.so on an old SDL
+1.3-style Java layer (SDLActivity.nativeInit runs the whole game; GL context and eglSwapBuffers are on the Java
+side: createGLContext / flipBuffers; sound through audioWriteShortBuffer). Files and run script live in
+~/dev/arm32-bridge-games/rulethekingdom (scripts/rtk-run.sh). Tested on the headless emulator (x86_64, Unicorn).
+
+- Converter listed 16 missing functions: iscntrl isprint ispunct islower, iswalpha iswcntrl iswdigit iswprint
+  iswpunct iswspace iswupper iswxdigit, wcsncpy, strlcat, fgetpos fsetpos. Four character tests ran at load and
+  answered 0. Added (commit ef7d735); the isw* tests share iswctype's class table; self-test calls them by symbol
+  name (the NDK headers inline the narrow ones). Before the fix the 4 new checks failed, after: 0 failures.
+- 120 Hz was never asked for: the surface lookup only knew cocos2d-x and GLSurfaceView's own GLThread, and SDL's
+  surface (a GLSurfaceView subclass) draws from SDL's thread. The bridge now also looks for a SurfaceView in the
+  fields of the class/object whose nativeInit / nativeOnSurfaceChanged it forwards (commit 89af1b8). Emulator log:
+  "asked for 120 Hz on the game surface".
+- Result: the game draws its own screens (Chapter 1 intro, hero setup, village map), taps work, the first quest
+  (wolves) plays and is won; it works offline (its servers are only contacted in the background). No crash, no ANR,
+  no translator fallback lines (Unicorn-only on x86_64). Android's own permission review and "built for an older
+  Android" notice come first on the emulator (targetSdk 19).
+- Known gap (not fixed): games that swap in Java (SDL) never reach the bridge's frame hooks (nativeRender /
+  bridged eglSwapBuffers), so they get no "[fps]" line, no performance hint (ADPF) and no frame-limiter lifting.
+  This game's frame thread doesn't sleep between frames (only 0 us yields), so nothing is capped; fps and the
+  real translator's fallback count need the phone.
