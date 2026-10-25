@@ -6,7 +6,7 @@ use super::functions::{call_function, Ctx};
 use super::mirror;
 use super::testing::Fake;
 use crate::objc::runtime::{self, Class, Id, Sel};
-use guest32_image::{ClassRo32, ClassTarget, Ivar32, ObjcClass32, ObjcMetadata32};
+use guest32_image::{ClassRo32, ClassTarget, Ivar32, ObjcCategory32, ObjcClass32, ObjcMetadata32, Property32};
 use std::sync::Mutex;
 
 static COUNTS: Mutex<Vec<(Id, &'static str)>> = Mutex::new(Vec::new());
@@ -458,6 +458,74 @@ fn method_for_selector_gives_the_games_own_function() {
     call_function(&ctx, &g.function_at(stret).unwrap(), &w(vec![result, object, sel("bounds")])).unwrap();
     let floats: Vec<f32> = (0..4).map(|i| f32::from_bits(g.u32_at(result + 4 * i))).collect();
     assert_eq!(floats, [1.0, 2.0, 3.0, 4.0]);
+}
+
+/// class_copyPropertyList lists a game class's own properties (its
+/// categories' first, as Apple's runtime attaches them) in a list the game
+/// frees; property_getName/Attributes read each entry.
+#[test]
+fn property_lists_come_from_the_games_metadata() {
+    runtime::lock().define_class("G32PropertyRoot", 0, 16);
+    let g = Fake::new();
+    let (class, meta) = (g.alloc_permanent(20), g.alloc_permanent(20));
+    let (bare, bare_meta) = (g.alloc_permanent(20), g.alloc_permanent(20));
+    g.put_words(class, &[meta]);
+    g.put_words(bare, &[bare_meta]);
+    let property = |name: &str, attributes: &str| Property32 { name: name.into(), attributes: attributes.into() };
+    let class_record = |address: u32, meta_address: u32, name: &str, properties: Vec<Property32>| ObjcClass32 {
+        address,
+        name: name.into(),
+        superclass: ClassTarget::External("G32PropertyRoot".into()),
+        meta_address,
+        meta_isa: ClassTarget::External("G32PropertyRoot".into()),
+        meta_superclass: ClassTarget::External("G32PropertyRoot".into()),
+        instance: ClassRo32 { instance_start: 8, instance_size: 8, properties, ..Default::default() },
+        meta: ClassRo32 { flags: 1, ..Default::default() },
+    };
+    let md = ObjcMetadata32 {
+        classes: vec![
+            class_record(class, meta, "G32Settings", vec![property("volume", "Tf,N,V_volume"), property("name", "T@\"NSString\",C,N,V_name")]),
+            class_record(bare, bare_meta, "G32Bare", Vec::new()),
+        ],
+        categories: vec![ObjcCategory32 {
+            address: g.alloc_permanent(24),
+            name: "Extra".into(),
+            class: ClassTarget::Local(class),
+            instance_methods: Vec::new(),
+            class_methods: Vec::new(),
+            protocols: Vec::new(),
+            instance_properties: vec![property("level", "Ti,R,N")],
+        }],
+        ..Default::default()
+    };
+    let bridge: &'static Mutex<Bridge> = Box::leak(Box::new(Mutex::new(Bridge::new(&md).unwrap())));
+    install(bridge, g, &md).unwrap();
+    let ctx = Ctx { bridge, g };
+    let call = |name: &str, words: &[u32]| {
+        let w = |i: u32| words.get(i as usize).copied().unwrap_or(0);
+        call_function(&ctx, name, &w).unwrap() as u32
+    };
+    let text = |address: u32| unsafe { runtime::cstr(g.host_address(address)) };
+    let count = g.words(&[99]);
+    let list = call("class_copyPropertyList", &[class, count]);
+    assert_eq!(g.u32_at(count), 3);
+    let entries: Vec<(String, String)> = (0..3)
+        .map(|i| g.u32_at(list + 4 * i))
+        .map(|p| (text(call("property_getName", &[p])), text(call("property_getAttributes", &[p]))))
+        .collect();
+    assert_eq!(
+        entries,
+        [("level", "Ti,R,N"), ("volume", "Tf,N,V_volume"), ("name", "T@\"NSString\",C,N,V_name")].map(|(n, a)| (n.to_string(), a.to_string()))
+    );
+    assert_eq!(g.u32_at(list + 12), 0, "the list ends with NULL");
+    // The same property is the same entry every time; the list itself is new.
+    let again = call("class_copyPropertyList", &[class, 0]);
+    assert_ne!(again, list);
+    assert_eq!(g.u32_at(again), g.u32_at(list));
+    // No properties: NULL and a count of 0; the metaclass has none either.
+    assert_eq!(call("class_copyPropertyList", &[bare, count]), 0);
+    assert_eq!(g.u32_at(count), 0);
+    assert_eq!(call("class_copyPropertyList", &[meta, count]), 0);
 }
 
 extern "C" fn plain_root_bounds(_: Id, _: Sel) -> crate::fw::geometry::Rect {

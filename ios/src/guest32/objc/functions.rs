@@ -200,6 +200,10 @@ pub fn functions() -> &'static [(&'static str, ObjcFn)] {
         ("method_getTypeEncoding", |c, w| ok(c.word(w(0) + 4))),
         ("method_getName", |c, w| ok(c.word(w(0)))),
         ("protocol_getMethodDescription", method_description),
+        ("class_copyPropertyList", copy_property_list),
+        ("class_getProperty", class_property),
+        ("property_getName", |c, w| ok(if w(0) == 0 { 0 } else { c.word(w(0)) })),
+        ("property_getAttributes", |c, w| ok(if w(0) == 0 { 0 } else { c.word(w(0) + 4) })),
         ("_Block_copy", |c, w| ok(block_copy(c, w(0))?)),
         ("_Block_release", |c, w| block_release(c, w(0)).map(|_| 0)),
         ("_Block_object_assign", block_object_assign),
@@ -521,6 +525,57 @@ fn instance_variable(c: &Ctx, w: Words) -> Result<u64, String> {
     c.g.write(entry, &words.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>());
     cache.insert((owner, name), entry);
     ok(entry)
+}
+
+/// The guest property_t { name, attributes } of a class's property: made
+/// once, so the same property is the same entry every time.
+fn property_entry(c: &Ctx, class: u32, property: &guest32_image::Property32) -> u32 {
+    static ENTRIES: Mutex<Option<HashMap<(u32, String), u32>>> = Mutex::new(None);
+    let key = (class, property.name.clone());
+    if let Some(&entry) = ENTRIES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).get(&key) {
+        return entry;
+    }
+    let (name, attributes) = (c.name(&property.name), c.name(&property.attributes));
+    let entry = c.g.alloc_permanent(8);
+    c.g.write(entry, &[name.to_le_bytes(), attributes.to_le_bytes()].concat());
+    *ENTRIES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).entry(key).or_insert(entry)
+}
+
+/// class_copyPropertyList(class, *count): the class's own properties (not
+/// its superclasses') in a NULL-ended list from the game's heap, which the
+/// game frees; NULL when there are none. Framework classes list none: the
+/// host layer keeps no property declarations.
+fn copy_property_list(c: &Ctx, w: Words) -> Result<u64, String> {
+    let (class, count) = (w(0), w(1));
+    let properties = c.lock().classes.class(class).map(|k| k.properties.clone()).unwrap_or_default();
+    if count != 0 {
+        c.set_word(count, properties.len() as u32);
+    }
+    if properties.is_empty() {
+        return ok(0);
+    }
+    let entries: Vec<u32> = properties.iter().map(|p| property_entry(c, class, p)).chain([0]).collect();
+    let list = c.g.alloc(4 * entries.len() as u32);
+    c.g.write(list, &entries.iter().flat_map(|e| e.to_le_bytes()).collect::<Vec<_>>());
+    ok(list)
+}
+
+/// class_getProperty(class, name): searches the superclasses too.
+fn class_property(c: &Ctx, w: Words) -> Result<u64, String> {
+    let (mut class, name) = (w(0), c.cstr(w(1)));
+    for _ in 0..256 {
+        let (found, parent) = {
+            let b = c.lock();
+            let Some(k) = b.classes.class(class) else { return ok(0) };
+            (k.properties.iter().find(|p| p.name == name).cloned(), k.superclass.clone())
+        };
+        match (found, parent) {
+            (Some(property), _) => return ok(property_entry(c, class, &property)),
+            (None, Super::Game(next)) => class = next,
+            _ => break,
+        }
+    }
+    ok(0)
 }
 
 /// class_addMethod(class, sel, imp, types)

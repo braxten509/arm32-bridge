@@ -1249,6 +1249,73 @@ fn mix_music(out: &mut [f32], frames: usize, out_rate: f64) {
     }
 }
 
+// ----- system sounds (AudioServices) -----
+// A sound made from a file plays once per AudioServicesPlaySystemSound, on
+// a player of its own (plays may overlap, as on iPhone). The phone's own
+// sounds (kSystemSoundID_Vibrate and the other built-in IDs) don't exist
+// here: they do nothing.
+
+/// Sounds made from files, by SystemSoundID.
+static SYSTEM_SOUNDS: Mutex<Option<HashMap<u32, Source>>> = Mutex::new(None);
+/// Plays still sounding.
+static SOUNDING: Mutex<Vec<Arc<Player>>> = Mutex::new(Vec::new());
+/// The first ID handed out; Apple's start above the built-in ones too.
+const FIRST_SYSTEM_SOUND: u32 = 4097;
+/// kAudioServicesSystemSoundUnspecifiedError.
+const SYSTEM_SOUND_UNSPECIFIED_ERROR: i32 = -1500;
+
+extern "C" fn create_system_sound(url: Id, out: *mut u32) -> i32 {
+    if url == 0 || out.is_null() {
+        return SYSTEM_SOUND_UNSPECIFIED_ERROR;
+    }
+    let source = Source::File(string::get(runtime::send(url, "path", &[])));
+    if let Err(e) = open(&source) {
+        crate::log!("AudioServicesCreateSystemSoundID: {e}");
+        return SYSTEM_SOUND_UNSPECIFIED_ERROR;
+    }
+    let mut sounds = SYSTEM_SOUNDS.lock().unwrap_or_else(|e| e.into_inner());
+    let sounds = sounds.get_or_insert_with(HashMap::new);
+    let id = (FIRST_SYSTEM_SOUND..).find(|id| !sounds.contains_key(id)).unwrap_or(FIRST_SYSTEM_SOUND);
+    sounds.insert(id, source);
+    unsafe { *out = id };
+    0
+}
+
+extern "C" fn dispose_system_sound(id: u32) -> i32 {
+    let removed = SYSTEM_SOUNDS.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|s| s.remove(&id));
+    if removed.is_some() { 0 } else { SYSTEM_SOUND_UNSPECIFIED_ERROR }
+}
+
+extern "C" fn play_system_sound(id: u32) {
+    let source = SYSTEM_SOUNDS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|s| s.get(&id).cloned());
+    let Some(source) = source else { return };
+    let rate = match open(&source) {
+        Ok((_, rate)) => rate,
+        Err(e) => {
+            crate::log!("AudioServicesPlaySystemSound: {e}");
+            return;
+        }
+    };
+    let player = Player::new(source, rate);
+    start();
+    player.ensure_worker();
+    player.playing.store(true, Ordering::Relaxed);
+    SOUNDING.lock().unwrap_or_else(|e| e.into_inner()).push(player);
+}
+
+fn mix_system_sounds(out: &mut [f32], frames: usize, out_rate: f64) {
+    let Ok(mut sounding) = SOUNDING.try_lock() else { return };
+    sounding.retain(|player| {
+        if !player.mix_into(out, frames, out_rate) {
+            return true;
+        }
+        // Played to its end: its worker stops.
+        player.queue().quit = true;
+        player.wake.notify_all();
+        false
+    });
+}
+
 // ----- the output: one stereo stream -----
 
 static OUT_RATE: AtomicU32 = AtomicU32::new(44100);
@@ -1273,6 +1340,7 @@ pub fn mix(out: &mut [f32], rate: u32) {
     let frames = out.len() / 2;
     mix_graph(out, frames, rate as f64);
     mix_music(out, frames, rate as f64);
+    mix_system_sounds(out, frames, rate as f64);
     {
         let _mixing = QUEUE_MIXING.lock().unwrap_or_else(|e| e.into_inner());
         crate::fw::audioqueue::mix(out, frames, rate as f64);
@@ -1550,6 +1618,11 @@ pub fn register(r: &mut Registry) {
     r.function("AudioOutputUnitStart", unit_start as usize);
     r.function("AudioOutputUnitStop", unit_stop as usize);
     r.function("CAShow", ok_1 as usize);
+    r.function("AudioServicesCreateSystemSoundID", create_system_sound as usize);
+    r.function("AudioServicesDisposeSystemSoundID", dispose_system_sound as usize);
+    r.function("AudioServicesPlaySystemSound", play_system_sound as usize);
+    // An alert sound also vibrates on iPhone; here it only plays.
+    r.function("AudioServicesPlayAlertSound", play_system_sound as usize);
 
     let player = define_class("AVAudioPlayer", "NSObject", 8);
     methods(

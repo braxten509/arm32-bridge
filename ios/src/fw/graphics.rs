@@ -401,6 +401,11 @@ pub fn file_orientation(path: &str) -> i64 {
 /// A CGImage: its pixels never change; they go (None) when the last reference does.
 struct ImageState {
     bitmap: RwLock<Option<Arc<Bitmap>>>,
+    /// An image mask (CGImageMaskCreate): 8-bit gray samples, 1 hides and 0 paints.
+    mask: bool,
+    /// CGImageGetDataProvider's provider of the pixels: made when first asked
+    /// for, released with the image.
+    provider: OnceLock<Id>,
 }
 
 static CLASSES: OnceLock<Classes> = OnceLock::new();
@@ -438,7 +443,16 @@ fn wrap<T>(class: Class, value: T) -> Id {
 
 /// A new CGImage with one reference (the caller's, as CGBitmapContextCreateImage gives).
 pub fn make_image(bitmap: Bitmap) -> Id {
-    let object = wrap(classes().image, ImageState { bitmap: RwLock::new(Some(Arc::new(bitmap))) });
+    make_picture(bitmap, false)
+}
+
+/// A new image mask (8-bit gray samples) with one reference.
+fn make_mask(bitmap: Bitmap) -> Id {
+    make_picture(bitmap, true)
+}
+
+fn make_picture(bitmap: Bitmap, mask: bool) -> Id {
+    let object = wrap(classes().image, ImageState { bitmap: RwLock::new(Some(Arc::new(bitmap))), mask, provider: OnceLock::new() });
     counted::track(object, free_image);
     object
 }
@@ -446,12 +460,95 @@ pub fn make_image(bitmap: Bitmap) -> Id {
 fn free_image(object: Id) {
     if let Some(s) = state::<ImageState>(object, classes().image) {
         *s.bitmap.write().unwrap_or_else(|e| e.into_inner()) = None;
+        if let Some(&provider) = s.provider.get() {
+            counted::release(provider);
+        }
     }
 }
 
 /// The picture's pixels (kept alive while in use, even if released meanwhile).
 fn image(object: Id) -> Option<Arc<Bitmap>> {
     state::<ImageState>(object, classes().image)?.bitmap.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn is_mask(object: Id) -> bool {
+    state::<ImageState>(object, classes().image).is_some_and(|s| s.mask)
+}
+
+/// The image's own provider (not the caller's to release, as on Apple):
+/// its pixels as they are stored.
+extern "C" fn image_get_data_provider(object: Id) -> Id {
+    let Some(s) = state::<ImageState>(object, classes().image) else {
+        complain("CGImageGetDataProvider", "image", object);
+        return 0;
+    };
+    let Some(bitmap) = image(object) else { return 0 };
+    *s.provider.get_or_init(|| shapes::picture_provider(bitmap))
+}
+
+extern "C" fn image_is_mask(object: Id) -> bool {
+    is_mask(object)
+}
+
+/// How much (0..1) a mask lets through at (s, t) (0..1, t down from its
+/// first row): an image mask's samples hide (1 - S), a gray picture's
+/// samples are the alpha (S). Nearest sample: Quartz stretches the mask
+/// over the image.
+fn mask_alpha(mask: &Bitmap, layout: &Layout, image_mask: bool, s: f64, t: f64) -> f32 {
+    let x = ((s * mask.width as f64) as usize).min(mask.width - 1);
+    let y = ((t * mask.height as f64) as usize).min(mask.height - 1);
+    let at = y * mask.bytes_per_row + x * layout.bytes;
+    let c = layout.read_straight(&mask.data[at..at + layout.bytes]);
+    let sample = 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2];
+    if image_mask {
+        1.0 - sample
+    } else {
+        sample
+    }
+}
+
+/// CGImageCreateWithMask: a new picture of `picture` with the mask's alpha
+/// (premultiplied RGBA). The picture can't be a mask itself, and a picture
+/// used as the mask can't have alpha (Apple's rules: nil otherwise).
+extern "C" fn image_create_with_mask(picture: Id, mask: Id) -> Id {
+    let (Some(source), Some(cover)) = (image(picture), image(mask)) else {
+        complain("CGImageCreateWithMask", "image", if image(picture).is_none() { picture } else { mask });
+        return 0;
+    };
+    let image_mask = is_mask(mask);
+    let (Some(from), Some(through)) = (source.layout(), cover.layout()) else { return 0 };
+    if is_mask(picture) || (!image_mask && through.has_alpha()) || cover.width == 0 || cover.height == 0 {
+        crate::log!("CGImageCreateWithMask: this image and mask can't be combined");
+        return 0;
+    }
+    let out = layout(Space::Rgb, 8, 32, PREMULTIPLIED_LAST).expect("RGBA layout");
+    let (width, height) = (source.width, source.height);
+    let mut data = vec![0u8; width * height * 4];
+    for row in 0..height {
+        for x in 0..width {
+            let (s, t) = ((x as f64 + 0.5) / width as f64, (row as f64 + 0.5) / height as f64);
+            let alpha = mask_alpha(&cover, &through, image_mask, s, t);
+            let at = (row * width + x) * 4;
+            out.write(&mut data[at..at + 4], scaled(source.pixel(&from, x, row), alpha));
+        }
+    }
+    make_image(Bitmap { width, height, bits_per_pixel: 32, bytes_per_row: width * 4, info: PREMULTIPLIED_LAST, space: Space::Rgb, data })
+}
+
+/// An image mask painted in `fill` (straight RGBA): a premultiplied RGBA picture.
+fn mask_in_color(mask: &Bitmap, fill: [f64; 4]) -> Option<Bitmap> {
+    let through = mask.layout()?;
+    let color = premultiply(fill);
+    let out = layout(Space::Rgb, 8, 32, PREMULTIPLIED_LAST)?;
+    let mut data = vec![0u8; mask.width * mask.height * 4];
+    for row in 0..mask.height {
+        for x in 0..mask.width {
+            let (s, t) = ((x as f64 + 0.5) / mask.width as f64, (row as f64 + 0.5) / mask.height as f64);
+            let at = (row * mask.width + x) * 4;
+            out.write(&mut data[at..at + 4], scaled(color, mask_alpha(mask, &through, true, s, t)));
+        }
+    }
+    Some(Bitmap { width: mask.width, height: mask.height, bits_per_pixel: 32, bytes_per_row: mask.width * 4, info: PREMULTIPLIED_LAST, space: Space::Rgb, data })
 }
 
 /// Logs the first few uses of a bad object, as Core Graphics does.
@@ -608,6 +705,34 @@ extern "C" fn gradient_create_with_color_components(space: Id, components: *cons
     wrap(classes().gradient, Gradient { stops })
 }
 
+/// CGGradientCreateWithColors(space, CFArray of CGColors, locations or NULL
+/// for evenly spread ones). The colours are RGBA here whatever the space.
+extern "C" fn gradient_create_with_colors(_space: Id, colors: Id, locations: *const f64) -> Id {
+    if !crate::fw::collections::is_array(colors) {
+        complain("CGGradientCreateWithColors", "colour array", colors);
+        return 0;
+    }
+    let colors: Vec<[f64; 4]> = crate::fw::collections::array_items(colors).into_iter().filter_map(color_rgba).collect();
+    if colors.is_empty() {
+        return 0;
+    }
+    let count = colors.len();
+    let mut stops: Vec<(f64, [f64; 4])> = colors
+        .into_iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let location = if locations.is_null() {
+                if count == 1 { 0.0 } else { i as f64 / (count - 1) as f64 }
+            } else {
+                unsafe { *locations.add(i) }
+            };
+            (location, c)
+        })
+        .collect();
+    stops.sort_by(|a, b| a.0.total_cmp(&b.0));
+    wrap(classes().gradient, Gradient { stops })
+}
+
 // ----- bitmap contexts -----
 
 #[derive(Clone)]
@@ -671,6 +796,8 @@ struct ContextState(Mutex<Canvas>);
 enum Blend {
     Over,
     Clear,
+    /// The source replaces what is there (kCGBlendModeCopy), as far as it covers the pixel.
+    Copy,
 }
 
 impl Canvas {
@@ -759,8 +886,21 @@ impl Canvas {
             Blend::Over if clear => scaled(dst, 1.0 - src[3]),
             Blend::Over => over(src, dst),
             Blend::Clear => scaled(dst, 1.0 - src[3]),
+            // Painted through `copy` (it needs the coverage on its own).
+            Blend::Copy => src,
         };
         layout.write(pixel, out);
+    }
+
+    /// Device pixel (x, y from the bottom) becomes `src` (premultiplied) as
+    /// far as `coverage` and the clip reach, keeping the rest of what is there.
+    fn copy(&mut self, x: usize, y: usize, src: [f32; 4], coverage: f32) {
+        let clip = self.state.clip.as_ref().map_or(1.0, |clip| clip.get(y * self.width + x).copied().unwrap_or(0.0));
+        let k = coverage * clip;
+        let (layout, at) = (self.layout, (self.height - 1 - y) * self.bytes_per_row + x * self.layout.bytes);
+        let pixel = &mut self.memory()[at..at + layout.bytes];
+        let dst = layout.read(pixel);
+        layout.write(pixel, [0, 1, 2, 3].map(|i| src[i] * k + dst[i] * (1.0 - k)));
     }
 
     /// Paints the user-space rectangle: `shade` gives the premultiplied
@@ -806,7 +946,10 @@ impl Canvas {
                 }
                 let (ux, uy) = geometry::apply(inverse, fx + 0.5, fy + 0.5);
                 let color = shade(ux.clamp(min_x, max_x), uy.clamp(min_y, max_y));
-                self.blend(x, y, scaled(color, coverage as f32 * alpha), &blend);
+                match blend {
+                    Blend::Copy => self.copy(x, y, scaled(color, alpha), coverage as f32),
+                    _ => self.blend(x, y, scaled(color, coverage as f32 * alpha), &blend),
+                }
             }
         }
     }
@@ -814,6 +957,12 @@ impl Canvas {
     fn fill_rect(&mut self, rect: Rect) {
         let color = premultiply(self.state.fill);
         self.paint(rect, Blend::Over, &|_, _| color);
+    }
+
+    /// The fill colour replacing what is there (UIRectFill).
+    fn copy_rect(&mut self, rect: Rect) {
+        let color = premultiply(self.state.fill);
+        self.paint(rect, Blend::Copy, &|_, _| color);
     }
 
     /// The device pixels (x0, x1, y0, y1; y from the bottom, not cut to the
@@ -1117,8 +1266,14 @@ extern "C" fn context_draw_image(context: Id, rect: Rect, picture: Id) {
         complain("CGContextDrawImage", "image", picture);
         return;
     };
+    let mask = is_mask(picture);
     if let Some(mut c) = canvas("CGContextDrawImage", context) {
-        c.draw_image(rect, &bitmap);
+        if !mask {
+            c.draw_image(rect, &bitmap);
+        } else if let Some(painted) = mask_in_color(&bitmap, c.state.fill) {
+            // An image mask paints the fill colour where it lets through.
+            c.draw_image(rect, &painted);
+        }
     }
 }
 extern "C" fn context_draw_linear_gradient(context: Id, gradient: Id, start: Point, end: Point, options: u32) {
@@ -1172,6 +1327,19 @@ extern "C" fn graphics_begin_image_context(size: Size) {
 
 extern "C" fn graphics_get_current_context() -> Id {
     current_context()
+}
+
+/// UIRectFill: the current UIKit context's fill colour replaces what is
+/// there (UIKit fills with kCGBlendModeCopy).
+extern "C" fn ui_rect_fill(rect: Rect) {
+    let context = current_context();
+    if context == 0 {
+        crate::log!("UIRectFill: no current context");
+        return;
+    }
+    if let Some(mut c) = canvas("UIRectFill", context) {
+        c.copy_rect(rect);
+    }
 }
 
 extern "C" fn graphics_push_context(context: Id) {
@@ -1675,6 +1843,9 @@ pub fn register(r: &mut Registry) {
     r.function("CGImageGetBitmapInfo", image_get_bitmap_info as usize);
     r.function("CGImageGetAlphaInfo", image_get_alpha_info as usize);
     r.function("CGImageGetColorSpace", image_get_color_space as usize);
+    r.function("CGImageGetDataProvider", image_get_data_provider as usize);
+    r.function("CGImageIsMask", image_is_mask as usize);
+    r.function("CGImageCreateWithMask", image_create_with_mask as usize);
     r.function("CGImageRetain", cf_style_retain as usize);
     r.function("CGImageRelease", cf_style_release as usize);
     r.function("CGContextRetain", cf_style_retain as usize);
@@ -1687,6 +1858,7 @@ pub fn register(r: &mut Registry) {
     r.function("CGColorCreate", color_create as usize);
     r.function("CGColorRelease", nothing as usize);
     r.function("CGGradientCreateWithColorComponents", gradient_create_with_color_components as usize);
+    r.function("CGGradientCreateWithColors", gradient_create_with_colors as usize);
     r.function("CGGradientRelease", nothing as usize);
     r.function("CGBitmapContextCreate", bitmap_context_create as usize);
     r.function("CGBitmapContextCreateImage", bitmap_context_create_image as usize);
@@ -1715,6 +1887,7 @@ pub fn register(r: &mut Registry) {
     r.function("UIGraphicsBeginImageContext", graphics_begin_image_context as usize);
     r.function("UIGraphicsBeginImageContextWithOptions", graphics_begin_image_context_with_options as usize);
     r.function("UIGraphicsGetCurrentContext", graphics_get_current_context as usize);
+    r.function("UIRectFill", ui_rect_fill as usize);
     r.function("UIGraphicsPushContext", graphics_push_context as usize);
     r.function("UIGraphicsPopContext", graphics_pop_context as usize);
     r.function("UIGraphicsGetImageFromCurrentImageContext", graphics_get_image_from_current_image_context as usize);

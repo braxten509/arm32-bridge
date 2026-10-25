@@ -53,7 +53,7 @@ pub enum HostTy {
 }
 
 /// Struct names whose float fields are CGFloat (double on the host).
-const CGFLOAT_STRUCTS: &[&str] = &["CGPoint", "CGSize", "CGRect", "CGAffineTransform", "UIEdgeInsets", "CGVector"];
+const CGFLOAT_STRUCTS: &[&str] = &["CGPoint", "CGSize", "CGRect", "CGAffineTransform", "UIEdgeInsets", "CGVector", "CATransform3D"];
 /// Struct names whose int fields are NSInteger/NSUInteger (8 bytes on the host).
 const WIDE_INT_STRUCTS: &[&str] = &["_NSRange", "NSFastEnumerationState"];
 

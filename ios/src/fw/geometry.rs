@@ -228,6 +228,81 @@ extern "C" fn transform_3d_make_translation(tx: f64, ty: f64, tz: f64) -> Transf
     m
 }
 
+/// a then b: the row-vector product a * b (a point is a row on the left).
+pub fn concat_3d(a: Transform3D, b: Transform3D) -> Transform3D {
+    let mut m = [0.0; 16];
+    for row in 0..4 {
+        for column in 0..4 {
+            m[row * 4 + column] = (0..4).map(|k| a.0[row * 4 + k] * b.0[k * 4 + column]).sum();
+        }
+    }
+    Transform3D(m)
+}
+
+/// A turn by `angle` radians about the axis (x, y, z); no axis turns nothing.
+#[rustfmt::skip]
+extern "C" fn transform_3d_make_rotation(angle: f64, x: f64, y: f64, z: f64) -> Transform3D {
+    let length = (x * x + y * y + z * z).sqrt();
+    if length == 0.0 || !length.is_finite() {
+        return IDENTITY_3D;
+    }
+    let (x, y, z) = (x / length, y / length, z / length);
+    let (s, c) = angle.sin_cos();
+    let t = 1.0 - c;
+    Transform3D([
+        t * x * x + c, t * x * y + s * z, t * x * z - s * y, 0.0,
+        t * x * y - s * z, t * y * y + c, t * y * z + s * x, 0.0,
+        t * x * z + s * y, t * y * z - s * x, t * z * z + c, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ])
+}
+// Each step comes before t (in the layer's own space), as Core Animation's.
+extern "C" fn transform_3d_rotate(t: Transform3D, angle: f64, x: f64, y: f64, z: f64) -> Transform3D {
+    concat_3d(transform_3d_make_rotation(angle, x, y, z), t)
+}
+extern "C" fn transform_3d_scale(t: Transform3D, sx: f64, sy: f64, sz: f64) -> Transform3D {
+    concat_3d(transform_3d_make_scale(sx, sy, sz), t)
+}
+extern "C" fn transform_3d_translate(t: Transform3D, tx: f64, ty: f64, tz: f64) -> Transform3D {
+    concat_3d(transform_3d_make_translation(tx, ty, tz), t)
+}
+extern "C" fn transform_3d_concat(a: Transform3D, b: Transform3D) -> Transform3D {
+    concat_3d(a, b)
+}
+extern "C" fn transform_3d_is_identity(t: Transform3D) -> bool {
+    t == IDENTITY_3D
+}
+extern "C" fn transform_3d_make_affine_transform(t: Transform) -> Transform3D {
+    let mut m = IDENTITY_3D;
+    (m.0[0], m.0[1], m.0[4], m.0[5], m.0[12], m.0[13]) = (t.a, t.b, t.c, t.d, t.tx, t.ty);
+    m
+}
+
+/// Whether the rectangles share any area (touching edges don't; a null one never does).
+extern "C" fn rect_intersects_rect(r1: Rect, r2: Rect) -> bool {
+    if is_null(r1) || is_null(r2) {
+        return false;
+    }
+    let (a, b) = (r1.standard(), r2.standard());
+    a.origin.x < b.origin.x + b.size.width
+        && b.origin.x < a.origin.x + a.size.width
+        && a.origin.y < b.origin.y + b.size.height
+        && b.origin.y < a.origin.y + a.size.height
+}
+
+/// CGPointMakeWithDictionaryRepresentation: numbers under "X" and "Y"
+/// (CGPointCreateDictionaryRepresentation's form); false when one is missing.
+extern "C" fn point_make_with_dictionary(dictionary: crate::objc::runtime::Id, point: *mut Point) -> bool {
+    use crate::fw::collections::{dictionary_get, is_dictionary, is_number, number_as_f64};
+    if !is_dictionary(dictionary) || point.is_null() {
+        return false;
+    }
+    let value = |key: &str| Some(dictionary_get(dictionary, crate::fw::string::make(key))).filter(|&v| is_number(v)).map(number_as_f64);
+    let (Some(x), Some(y)) = (value("X"), value("Y")) else { return false };
+    unsafe { *point = Point { x, y } };
+    true
+}
+
 // ----- UIKit's text forms: "{x, y}", "{w, h}", "{{x, y}, {w, h}}" -----
 
 /// The numbers in `text` in order (missing ones are 0, as UIKit gives).
@@ -287,6 +362,15 @@ pub fn register(r: &mut Registry) {
     r.function("CGSizeApplyAffineTransform", size_apply_affine_transform as usize);
     r.function("CATransform3DMakeScale", transform_3d_make_scale as usize);
     r.function("CATransform3DMakeTranslation", transform_3d_make_translation as usize);
+    r.function("CATransform3DMakeRotation", transform_3d_make_rotation as usize);
+    r.function("CATransform3DMakeAffineTransform", transform_3d_make_affine_transform as usize);
+    r.function("CATransform3DRotate", transform_3d_rotate as usize);
+    r.function("CATransform3DScale", transform_3d_scale as usize);
+    r.function("CATransform3DTranslate", transform_3d_translate as usize);
+    r.function("CATransform3DConcat", transform_3d_concat as usize);
+    r.function("CATransform3DIsIdentity", transform_3d_is_identity as usize);
+    r.function("CGRectIntersectsRect", rect_intersects_rect as usize);
+    r.function("CGPointMakeWithDictionaryRepresentation", point_make_with_dictionary as usize);
     r.data("CATransform3DIdentity", leak(IDENTITY_3D));
     r.function("CGPointFromString", point_from_string as usize);
     r.function("CGSizeFromString", size_from_string as usize);

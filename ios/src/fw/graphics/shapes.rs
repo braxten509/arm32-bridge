@@ -658,15 +658,42 @@ extern "C" fn path_close_subpath(path: Id) {
 // ----- data providers and CGImageCreate -----
 
 /// Bytes the game owns, given back (`release`: info, data, size) when the
-/// last reference goes. Providers count with the other CG objects
-/// (fw/counted.rs): CFRetain/CFRelease, retain/release messages, ARC calls
-/// and autorelease pools all reach the same count. CGImageCreate copies the
-/// bytes, so pictures don't hold a reference.
+/// last reference goes, or bytes this layer holds (`held`). Providers count
+/// with the other CG objects (fw/counted.rs): CFRetain/CFRelease,
+/// retain/release messages, ARC calls and autorelease pools all reach the
+/// same count. CGImageCreate copies the bytes, so pictures don't hold a
+/// reference.
 struct Provider {
     info: usize,
     data: usize,
     size: usize,
     release: usize,
+    held: RwLock<Option<Held>>,
+    /// The last reference went: the game's bytes may be gone too.
+    released: std::sync::atomic::AtomicBool,
+}
+
+/// What a provider holds itself.
+enum Held {
+    /// A CFData's bytes (CGDataProviderCreateWithCFData).
+    Bytes(Vec<u8>),
+    /// A picture's pixels (CGImageGetDataProvider).
+    Picture(Arc<Bitmap>),
+}
+
+impl Provider {
+    /// Runs `work` on the provider's bytes (none once its last reference went).
+    fn with_bytes<R>(&self, work: impl FnOnce(&[u8]) -> R) -> R {
+        let held = self.held.read().unwrap_or_else(|e| e.into_inner());
+        match held.as_ref() {
+            Some(Held::Bytes(bytes)) => work(bytes),
+            Some(Held::Picture(bitmap)) => work(&bitmap.data),
+            None if self.data != 0 && !self.released.load(std::sync::atomic::Ordering::Acquire) => {
+                work(unsafe { std::slice::from_raw_parts(self.data as *const u8, self.size) })
+            }
+            None => work(&[]),
+        }
+    }
 }
 
 fn provider_state(provider: Id) -> Option<&'static Provider> {
@@ -676,16 +703,52 @@ fn provider_state(provider: Id) -> Option<&'static Provider> {
 /// The clean-up counted runs at the last reference.
 fn free_provider(provider: Id) {
     let Some(p) = provider_state(provider) else { return };
+    p.released.store(true, std::sync::atomic::Ordering::Release);
+    *p.held.write().unwrap_or_else(|e| e.into_inner()) = None;
     if p.release != 0 {
         let release: extern "C" fn(usize, usize, usize) = unsafe { std::mem::transmute(p.release) };
         release(p.info, p.data, p.size);
     }
 }
 
-extern "C" fn data_provider_create_with_data(info: usize, data: *const u8, size: usize, release: usize) -> Id {
-    let provider = wrap(classes().provider, Provider { info, data: data as usize, size, release });
+fn make_provider(provider: Provider) -> Id {
+    let provider = wrap(classes().provider, provider);
     counted::track(provider, free_provider);
     provider
+}
+
+fn holding(held: Held) -> Provider {
+    Provider { info: 0, data: 0, size: 0, release: 0, held: RwLock::new(Some(held)), released: Default::default() }
+}
+
+extern "C" fn data_provider_create_with_data(info: usize, data: *const u8, size: usize, release: usize) -> Id {
+    make_provider(Provider { info, data: data as usize, size, release, held: RwLock::new(None), released: Default::default() })
+}
+
+/// A copy of the CFData's bytes: Apple's provider keeps the CFData itself,
+/// which only differs if the game changes a mutable one afterwards.
+extern "C" fn data_provider_create_with_cf_data(bytes: Id) -> Id {
+    if !data::is_data(bytes) {
+        complain("CGDataProviderCreateWithCFData", "data", bytes);
+        return 0;
+    }
+    make_provider(holding(Held::Bytes(data::bytes(bytes))))
+}
+
+/// A provider of a picture's pixels, sharing them (CGImageGetDataProvider).
+pub(super) fn picture_provider(bitmap: Arc<Bitmap>) -> Id {
+    make_provider(holding(Held::Picture(bitmap)))
+}
+
+/// A new CFData of the provider's bytes.
+extern "C" fn data_provider_copy_data(provider: Id) -> Id {
+    match provider_state(provider) {
+        Some(p) => p.with_bytes(data::make),
+        None => {
+            complain("CGDataProviderCopyData", "data provider", provider);
+            0
+        }
+    }
 }
 /// +1 on a data provider; false for anything else.
 pub fn retain_provider(provider: Id) -> bool {
@@ -729,13 +792,50 @@ extern "C" fn image_create(width: usize, height: usize, bits_per_component: usiz
         return 0;
     };
     let bitmap = Bitmap { width, height, bits_per_pixel, bytes_per_row, info, space: space_of(space), data: Vec::new() };
-    let needed = bytes_per_row.checked_mul(height).filter(|&n| n <= p.size && n <= MOST_PIXEL_BYTES);
-    let (Some(needed), true, Some(_)) = (needed, bits_per_component == 8, bitmap.layout()) else {
-        crate::log!("CGImageCreate: {width}x{height}, {bits_per_component} bits/component, {bits_per_pixel} bits/pixel, {bytes_per_row} bytes/row, info {info:#x} from {} bytes: not supported", p.size);
+    p.with_bytes(|bytes| {
+        let needed = bytes_per_row.checked_mul(height).filter(|&n| n <= bytes.len() && n <= MOST_PIXEL_BYTES);
+        let (Some(needed), true, Some(_)) = (needed, bits_per_component == 8, bitmap.layout()) else {
+            crate::log!("CGImageCreate: {width}x{height}, {bits_per_component} bits/component, {bits_per_pixel} bits/pixel, {bytes_per_row} bytes/row, info {info:#x} from {} bytes: not supported", bytes.len());
+            return 0;
+        };
+        make_image(Bitmap { data: bytes[..needed].to_vec(), ..bitmap })
+    })
+}
+
+/// CGImageMaskCreate: samples of 1, 2, 4 or 8 bits (rows from the top, the
+/// first pixel in a byte's top bits), through the decode range [Dmin Dmax]
+/// (default [0 1]); kept as 8-bit samples, where 1 hides and 0 paints.
+#[allow(clippy::too_many_arguments)]
+extern "C" fn image_mask_create(width: usize, height: usize, bits_per_component: usize, bits_per_pixel: usize, bytes_per_row: usize, provider: Id, decode: *const f64, _interpolate: bool) -> Id {
+    let Some(p) = provider_state(provider) else {
+        complain("CGImageMaskCreate", "data provider", provider);
         return 0;
     };
-    let data = unsafe { std::slice::from_raw_parts(p.data as *const u8, needed) }.to_vec();
-    make_image(Bitmap { data, ..bitmap })
+    let (low, high) = if decode.is_null() { (0.0, 1.0) } else { unsafe { (*decode, *decode.add(1)) } };
+    let bits = bits_per_component;
+    let usable = matches!(bits, 1 | 2 | 4 | 8) && bits_per_pixel == bits && width > 0 && height > 0;
+    let least = width.saturating_mul(bits).div_ceil(8);
+    let pixels = width.checked_mul(height).filter(|&n| n <= MOST_PIXEL_BYTES);
+    let needed = bytes_per_row.checked_mul(height).filter(|&n| usable && pixels.is_some() && bytes_per_row >= least && n <= MOST_PIXEL_BYTES);
+    p.with_bytes(|bytes| {
+        let Some(_) = needed.filter(|&n| n <= bytes.len()) else {
+            crate::log!("CGImageMaskCreate: {width}x{height}, {bits} bits/component, {bits_per_pixel} bits/pixel, {bytes_per_row} bytes/row from {} bytes: not supported", bytes.len());
+            return 0;
+        };
+        let most = ((1u32 << bits) - 1) as f64;
+        let mut data = Vec::with_capacity(width * height);
+        for row in 0..height {
+            for x in 0..width {
+                let bit = x * bits;
+                let byte = bytes[row * bytes_per_row + bit / 8];
+                let sample = (byte >> (8 - bits - bit % 8)) & ((1u16 << bits) - 1) as u8;
+                let value = low + sample as f64 / most * (high - low);
+                data.push(to_byte(value as f32));
+            }
+        }
+        let bitmap = Bitmap { width, height, bits_per_pixel: 8, bytes_per_row: width, info: ALPHA_NONE, space: Space::Gray, data };
+        make_mask(bitmap)
+    })
 }
 
 pub fn register(r: &mut Registry) {
@@ -801,7 +901,10 @@ pub fn register(r: &mut Registry) {
         ("CGDataProviderCreateWithData", data_provider_create_with_data as usize),
         ("CGDataProviderRetain", data_provider_retain as usize),
         ("CGDataProviderRelease", data_provider_release as usize),
+        ("CGDataProviderCreateWithCFData", data_provider_create_with_cf_data as usize),
+        ("CGDataProviderCopyData", data_provider_copy_data as usize),
         ("CGImageCreate", image_create as usize),
+        ("CGImageMaskCreate", image_mask_create as usize),
     ] {
         r.function(name, function);
     }
