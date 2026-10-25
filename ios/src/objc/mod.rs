@@ -1,5 +1,6 @@
 //! Apple's Objective-C runtime functions the game imports.
 
+pub mod forward;
 pub mod reflect;
 pub mod runtime;
 

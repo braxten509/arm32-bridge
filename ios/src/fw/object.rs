@@ -221,6 +221,9 @@ pub fn define(_: &mut Registry) -> Class {
     m("setValue:forUndefinedKey:", set_value_for_undefined_key as usize);
     m("setNilValueForKey:", set_nil_value_for_key as usize);
     m("doesNotRecognizeSelector:", does_not_recognize as usize);
+    m("isProxy", answer_no as usize);
+    m("forwardingTargetForSelector:", no_forwarding_target as usize);
+    m("forwardInvocation:", forward_invocation as usize);
     let meta = lock().classes[&class].partner;
     let c = |name: &str, imp: usize| {
         let mut rt = lock();
@@ -239,7 +242,103 @@ pub fn define(_: &mut Registry) -> Class {
     c("conformsToProtocol:", class_conforms_to as usize);
     c("description", class_description as usize);
     c("copyWithZone:", return_self_with as usize);
+    c("resolveInstanceMethod:", resolve_nothing as usize);
+    c("resolveClassMethod:", resolve_nothing as usize);
     class
+}
+
+/// NSProxy: the other root class. It has only the NSObject protocol's
+/// bookkeeping; everything else, -respondsToSelector: and -isKindOfClass:
+/// included, is forwarded (-methodSignatureForSelector: and
+/// -forwardInvocation:, which a subclass must override).
+pub fn define_proxy() -> Class {
+    let class = lock().define_class("NSProxy", 0, 8);
+    methods(
+        class,
+        &[
+            ("retain", return_self as usize),
+            ("autorelease", return_self as usize),
+            ("release", nothing as usize),
+            ("dealloc", dealloc as usize),
+            ("finalize", nothing as usize),
+            ("retainCount", retain_count as usize),
+            ("zone", hash_zero as usize),
+            ("self", return_self as usize),
+            ("class", class_of_instance as usize),
+            ("superclass", superclass_of_instance as usize),
+            ("hash", hash as usize),
+            ("isEqual:", is_equal as usize),
+            ("description", description as usize),
+            ("debugDescription", description as usize),
+            ("isProxy", answer_yes as usize),
+            ("performSelector:", perform as usize),
+            ("performSelector:withObject:", perform_with as usize),
+            ("performSelector:withObject:withObject:", perform_with_with as usize),
+            ("doesNotRecognizeSelector:", does_not_recognize as usize),
+            ("methodSignatureForSelector:", proxy_method_signature as usize),
+            ("forwardInvocation:", proxy_forward_invocation as usize),
+        ],
+    );
+    class_methods(
+        class,
+        &[
+            ("alloc", alloc as usize),
+            ("allocWithZone:", alloc_with_zone as usize),
+            ("class", return_self as usize),
+            ("superclass", superclass_of_class as usize),
+            ("initialize", nothing as usize),
+            ("load", nothing as usize),
+            ("respondsToSelector:", responds_to as usize),
+            ("instancesRespondToSelector:", instances_respond_to as usize),
+            ("isSubclassOfClass:", is_subclass_of as usize),
+            ("conformsToProtocol:", class_conforms_to as usize),
+            ("description", class_description as usize),
+            ("resolveInstanceMethod:", resolve_nothing as usize),
+            ("resolveClassMethod:", resolve_nothing as usize),
+        ],
+    );
+    class
+}
+
+extern "C" fn answer_no(_this: Id, _: Sel) -> bool {
+    false
+}
+
+extern "C" fn answer_yes(_this: Id, _: Sel) -> bool {
+    true
+}
+
+extern "C" fn resolve_nothing(_class: Class, _: Sel, _selector: Sel) -> bool {
+    false
+}
+
+extern "C" fn no_forwarding_target(_this: Id, _: Sel, _selector: Sel) -> Id {
+    0
+}
+
+/// NSObject's -forwardInvocation: gives up: -doesNotRecognizeSelector:.
+extern "C" fn forward_invocation(this: Id, _: Sel, invocation: Id) {
+    let selector = runtime::send(invocation, "selector", &[]);
+    runtime::send(this, "doesNotRecognizeSelector:", &[selector]);
+}
+
+/// The NSInvalidArgumentException Apple's NSProxy raises when a subclass
+/// left one of its forwarding methods out.
+pub fn proxy_abstract_exception(selector: &str) -> Id {
+    let reason = format!("-[NSProxy {selector}] called!");
+    runtime::send(
+        runtime::class_named("NSException"),
+        "exceptionWithName:reason:userInfo:",
+        &[crate::fw::string::make("NSInvalidArgumentException"), crate::fw::string::make(&reason), 0],
+    )
+}
+
+extern "C" fn proxy_method_signature(_this: Id, _: Sel, _selector: Sel) -> Id {
+    crate::fw::exception::throw(proxy_abstract_exception("methodSignatureForSelector:"))
+}
+
+extern "C" fn proxy_forward_invocation(_this: Id, _: Sel, _invocation: Id) {
+    crate::fw::exception::throw(proxy_abstract_exception("forwardInvocation:"))
 }
 
 extern "C" fn ignore_one(_this: Id, _: Sel, _value: usize) {}

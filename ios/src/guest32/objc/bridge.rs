@@ -289,6 +289,8 @@ pub struct Bridge {
 enum Target {
     Guest { imp: u32, types: String },
     Host { class: String, meta: bool, via_super: bool },
+    /// No method in the game's class chain (the error if not forwarded).
+    Missing(String),
 }
 
 impl Bridge {
@@ -621,7 +623,7 @@ impl Bridge {
             return match self.classes.lookup(isa, sel) {
                 Lookup::Guest(m) => Ok(Target::Guest { imp: m.imp, types: m.types.clone() }),
                 Lookup::Framework { class, meta } => self.framework_target(&class, meta, sel, false),
-                Lookup::Missing => Err(format!("{MISSING_METHOD}{}{sel}: no method in the game's class chain", self.describe(isa))),
+                Lookup::Missing => Ok(Target::Missing(format!("{MISSING_METHOD}{}{sel}]: no method in the game's class chain", self.describe(isa)))),
             };
         }
         match self.framework_by_guest.get(&isa) {
@@ -667,9 +669,63 @@ impl Bridge {
         }
     }
 
+    /// Whether a receiver whose isa is `isa` answers `sel`: a game method, a
+    /// game category on a framework class, or the host class's own method.
+    pub(super) fn answers(&self, isa: u32, sel: &str) -> bool {
+        let host_sel = runtime::sel(sel);
+        let framework = |class: &str, meta: bool| {
+            self.framework_category(class, meta, sel).is_some()
+                || runtime::existing_class(class, meta).is_some_and(|host| runtime::lock().lookup(host, host_sel).is_some())
+        };
+        if self.classes.class(isa).is_some() {
+            return match self.classes.lookup(isa, sel) {
+                Lookup::Guest(_) => true,
+                Lookup::Framework { class, meta } => framework(&class, meta),
+                Lookup::Missing => false,
+            };
+        }
+        self.framework_by_guest.get(&isa).is_some_and(|(class, meta)| framework(class, *meta))
+    }
+
+    /// Whether the game itself answers `sel` for a receiver whose isa is
+    /// `isa` (its own method or a category method, not the host's).
+    pub(super) fn game_answers(&self, isa: u32, sel: &str) -> bool {
+        if self.classes.class(isa).is_some() {
+            return match self.classes.lookup(isa, sel) {
+                Lookup::Guest(_) => true,
+                Lookup::Framework { class, meta } => self.framework_category(&class, meta, sel).is_some(),
+                Lookup::Missing => false,
+            };
+        }
+        self.framework_by_guest.get(&isa).is_some_and(|(class, meta)| self.framework_category(class, *meta, sel).is_some())
+    }
+
+    /// The armv7 type encoding of the method a receiver whose isa is `isa`
+    /// answers `sel` with (the game's own, else the framework table's for a
+    /// method the host has); None when it has no such method.
+    pub(super) fn armv7_method_types(&self, isa: u32, sel: &str) -> Option<String> {
+        let framework = |class: &str, meta: bool| -> Option<String> {
+            if let Some((_, types)) = self.framework_category(class, meta, sel) {
+                return Some(types);
+            }
+            let (host, host_sel) = (runtime::existing_class(class, meta)?, runtime::sel(sel));
+            runtime::lock().lookup(host, host_sel)?;
+            framework_row(class, sel).map(|row| row.encoding.to_string())
+        };
+        if self.classes.class(isa).is_some() {
+            return match self.classes.lookup(isa, sel) {
+                Lookup::Guest(m) => Some(m.types.clone()),
+                Lookup::Framework { class, meta } => framework(&class, meta),
+                Lookup::Missing => None,
+            };
+        }
+        let (class, meta) = self.framework_by_guest.get(&isa)?;
+        framework(class, *meta)
+    }
+
     /// The name of the class the guest sees for a receiver's isa, and whether
     /// that isa is a metaclass (the receiver is the class itself).
-    fn class_display(&self, isa: u32) -> (String, bool) {
+    pub(super) fn class_display(&self, isa: u32) -> (String, bool) {
         if let Some(c) = self.classes.class(isa) {
             return (c.name.clone(), c.meta);
         }
@@ -962,15 +1018,27 @@ pub fn set_block_owner(g: &'static dyn GuestSide) {
 /// run that keeps going can skip just that message (`functions::skip_missing`).
 pub const MISSING_METHOD: &str = "missing method ";
 
-/// Type encoding for a message the host answers: the framework table, else
-/// the game's own method of the same name (an override has the same types).
-fn host_signature(b: &Bridge, class: &str, meta: bool, sel: &str) -> Result<(Signature, HostCallOptions), String> {
+/// The framework table's row for `sel` sent to framework class `class`.
+fn framework_row(class: &str, sel: &str) -> Option<&'static super::selectors::FrameworkSelector> {
     let is_kind = |name: &str| {
         let (receiver, named) = (runtime::class_named(class), runtime::class_named(name));
         let rt = runtime::lock();
         receiver != 0 && named != 0 && rt.is_subclass(receiver, named)
     };
-    if let Some(entry) = FrameworkSelectors::builtin().get_for(sel, is_kind) {
+    FrameworkSelectors::builtin().get_for(sel, is_kind)
+}
+
+/// Throws `exception` (a host NSException) in the guest, as -raise does.
+pub(super) fn throw_in_guest(b: &mut Bridge, g: &dyn GuestSide, exception: usize) -> Result<GuestRet, String> {
+    let exception = b.guest_object(g, exception)?;
+    PENDING_THROW.with(|p| p.set(Some(exception)));
+    Ok(GuestRet { r0: 0, r1: 0 })
+}
+
+/// Type encoding for a message the host answers: the framework table, else
+/// the game's own method of the same name (an override has the same types).
+fn host_signature(b: &Bridge, class: &str, meta: bool, sel: &str) -> Result<(Signature, HostCallOptions), String> {
+    if let Some(entry) = framework_row(class, sel) {
         let options =
             HostCallOptions { real_float: entry.real_float, varargs: entry.varargs, arrays: entry.arrays, host_bytes: entry.host_bytes };
         return Ok((entry.signature.clone(), options));
@@ -1049,6 +1117,10 @@ pub fn send_from_guest(
     let receiver_word = first;
     let get = |i: u32| if i == receiver_word { receiver } else { words(i) };
     match target {
+        Target::Missing(error) => {
+            drop(b);
+            super::forward::forward_message(bridge, g, kind, words, receiver, &error)
+        }
         Target::Guest { imp, types } => {
             drop(b);
             let sig = Signature::parse_method(&types)?;
@@ -1107,6 +1179,51 @@ pub fn send_from_guest(
                 PENDING_THROW.with(|p| p.set(Some(exception)));
                 return Ok(GuestRet { r0: 0, r1: 0 });
             }
+            // Method signatures for game code have the armv7 layout, and the
+            // root classes' -forwardInvocation: (see forward.rs).
+            match name.as_str() {
+                "signatureWithObjCTypes:" if meta => {
+                    let types = guest_cstr(g, get(first + 2));
+                    let signature = crate::fw::invocation::make_signature_in(&types, crate::fw::invocation::Layout::Armv7);
+                    return Ok(GuestRet { r0: b.guest_object(g, signature)?, r1: 0 });
+                }
+                "methodSignatureForSelector:" | "instanceMethodSignatureForSelector:" => {
+                    let asked = b.selector_name(g, get(first + 2));
+                    let host_receiver = b.host_object_for(g, receiver)?;
+                    if name == "methodSignatureForSelector:" && !meta && crate::objc::forward::is_proxy_object(host_receiver) {
+                        drop(b);
+                        let exception = crate::fw::object::proxy_abstract_exception("methodSignatureForSelector:");
+                        return throw_in_guest(&mut lock(bridge), g, exception);
+                    }
+                    // Of the receiver's own class, also from a super call (as Apple's).
+                    let owner = if name == "instanceMethodSignatureForSelector:" { receiver } else { u32_at(g, receiver) };
+                    let signature = match b.armv7_method_types(owner, &asked) {
+                        Some(types) => crate::fw::invocation::make_signature_in(&types, crate::fw::invocation::Layout::Armv7),
+                        None => 0,
+                    };
+                    return Ok(GuestRet { r0: b.guest_object(g, signature)?, r1: 0 });
+                }
+                "forwardInvocation:" if !meta => {
+                    drop(b);
+                    return super::forward::root_forward_invocation(bridge, g, receiver, get(first + 2));
+                }
+                _ => {}
+            }
+            // No host method: Apple's forwarding (forward.rs).
+            let host_receiver = b.host_object_for(g, receiver)?;
+            let host_sel = runtime::sel(&name);
+            drop(b);
+            let imp = if via_super {
+                let host_class = Bridge::host_class_named(&class, meta);
+                runtime::lock().lookup(host_class, host_sel)
+            } else {
+                runtime::imp_for(host_receiver, host_sel)
+            };
+            let Some(imp) = imp else {
+                let error = format!("{MISSING_METHOD}{}[{class} {name}]: not implemented by the host layer", if meta { "+" } else { "-" });
+                return super::forward::forward_message(bridge, g, kind, words, receiver, &error);
+            };
+            b = lock(bridge);
             // The framework's -dealloc of a game object: its C++ ivars go first.
             let game_dealloc = name == "dealloc" && b.classes.class(u32_at(g, receiver)).is_some_and(|c| !c.meta);
             if game_dealloc {
@@ -1141,15 +1258,7 @@ pub fn send_from_guest(
             let get = |i: u32| replaced.iter().find(|r| r.0 == i).map(|r| r.1).unwrap_or_else(|| get(i));
             let call = convert::prepare_host_call(&sig, options, &get, &mut Session { bridge: &mut b, g })?;
             let host_receiver = call.args.x[0] as usize;
-            let host_sel = runtime::sel(&name);
             drop(b);
-            let imp = if via_super {
-                let host_class = Bridge::host_class_named(&class, meta);
-                runtime::lock().lookup(host_class, host_sel)
-            } else {
-                runtime::imp_for(host_receiver, host_sel)
-            };
-            let imp = imp.ok_or_else(|| format!("{}[{class} {name}] is not implemented by the host layer", if meta { "+" } else { "-" }))?;
             // An exception the host method raises is thrown in the game once it returns.
             let (mut ret, raised) = crate::fw::exception::catching(|| mirror::call_host(imp, &call.args));
             // -bytes / -mutableBytes: data bytes live in guest memory (fw::data)
@@ -1225,9 +1334,26 @@ impl Bridge {
         match self.classes.lookup(parent, sel) {
             Lookup::Guest(m) => Ok(Target::Guest { imp: m.imp, types: m.types.clone() }),
             Lookup::Framework { class, meta } => self.framework_target(&class, meta, sel, true),
-            Lookup::Missing => Err(format!("{MISSING_METHOD}{}{sel}]: super call finds no method", self.describe(parent))),
+            Lookup::Missing => Ok(Target::Missing(format!("{MISSING_METHOD}{}{sel}]: super call finds no method", self.describe(parent)))),
         }
     }
+}
+
+/// A host message the game object `frame.x[0]` has no method for and
+/// forwards by `signature` (an armv7 NSMethodSignature): the registers as
+/// guest words, the invocation's result back in the host's registers.
+pub fn forward_host_message(bridge: &Mutex<Bridge>, g: &dyn GuestSide, frame: &mut HostFrame, signature: usize) -> Result<(), String> {
+    let types = crate::fw::invocation::signature_of(signature).ok_or("forwarding without a method signature")?;
+    let sig = Signature::parse_method(&types.text)?;
+    let mut b = lock(bridge);
+    let receiver = b.guest_object(g, frame.x[0] as usize)?;
+    let call = convert::prepare_guest_call(&sig, frame, &mut Session { bridge: &mut b, g })?;
+    drop(b);
+    let words = call.words.clone();
+    let get = |i: u32| words.get(i as usize).copied().unwrap_or(0);
+    let ret = super::forward::forward_invocation(bridge, g, receiver, signature, sig.ret.guest_returns_in_memory(), &get)?;
+    let mut b = lock(bridge);
+    convert::finish_guest_call(call, ret.r0, ret.r1, frame, &mut Session { bridge: &mut b, g })
 }
 
 /// The mirror trampoline's hook: a host message to a game object runs the

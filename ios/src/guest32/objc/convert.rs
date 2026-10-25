@@ -541,7 +541,7 @@ fn set_host_result(hty: &HostTy, bytes: &[u8], frame: &mut HostFrame) {
 
 // ---------- guest words ----------
 
-fn guest_bytes(words: &dyn Fn(u32) -> u32, first: u32, size: u32) -> Vec<u8> {
+pub(super) fn guest_bytes(words: &dyn Fn(u32) -> u32, first: u32, size: u32) -> Vec<u8> {
     let mut out: Vec<u8> = (0..size.div_ceil(4).max(1)).flat_map(|i| words(first + i).to_le_bytes()).collect();
     out.truncate(size.max(1) as usize);
     out
@@ -558,7 +558,7 @@ pub struct GuestRet {
     pub r1: u32,
 }
 
-fn guest_ret_from_bytes(ty: &Ty, bytes: &[u8]) -> GuestRet {
+pub(super) fn guest_ret_from_bytes(ty: &Ty, bytes: &[u8]) -> GuestRet {
     let mut raw = [0u8; 8];
     let n = bytes.len().min(8);
     raw[..n].copy_from_slice(&bytes[..n]);

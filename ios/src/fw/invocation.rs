@@ -1,14 +1,45 @@
 //! NSMethodSignature and NSInvocation. Arguments are placed in registers and
 //! on the stack by Apple's arm64 rules, and the call goes through our
 //! objc_msgSend, so the message finds its method the way any other does.
+//!
+//! A 32-bit game's signatures have the armv7 layout (4-byte pointers, 8-byte
+//! types 4-byte aligned): its invocations hold every argument as the guest
+//! has it (objects as guest objects), and the game's bridge sends them
+//! (see [`GuestInvocations`]). One class serves both kinds of game.
 
 use crate::fw::object::{class_methods, define_class, methods};
 use crate::objc::runtime::{self, lock, Class, ClassObject, Id, Sel};
 use crate::symbols::{leak_cstr, Registry};
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 // ----- type encodings -----
+
+/// Whose rules a signature's sizes and an invocation's argument bytes follow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Layout {
+    /// 64-bit games and our own code.
+    Arm64,
+    /// 32-bit games (values as guest memory has them).
+    Armv7,
+}
+
+impl Layout {
+    fn pointer_size(self) -> usize {
+        match self {
+            Layout::Arm64 => 8,
+            Layout::Armv7 => 4,
+        }
+    }
+
+    /// The largest alignment a scalar gets: armv7 iOS aligns 8-byte types to 4.
+    fn max_align(self) -> usize {
+        match self {
+            Layout::Arm64 => 16,
+            Layout::Armv7 => 4,
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Type {
@@ -27,8 +58,12 @@ impl Type {
         Type { size, align: size, scalar: Some((float, signed)), floats: float.then_some((1, size)), is_struct: false, is_void: false }
     }
 
-    fn pointer() -> Type {
-        Type::scalar(8, false, false)
+    fn scalar_in(layout: Layout, size: usize, float: bool, signed: bool) -> Type {
+        Type { align: size.min(layout.max_align()), ..Type::scalar(size, float, signed) }
+    }
+
+    fn pointer(layout: Layout) -> Type {
+        Type::scalar(layout.pointer_size(), false, false)
     }
 }
 
@@ -78,6 +113,11 @@ fn aggregate(members: Vec<Type>, union: bool) -> Type {
 
 /// Reads one type from an encoding like "{CGRect={CGPoint=dd}{CGSize=dd}}".
 pub fn parse_type(t: &[u8], i: &mut usize) -> Type {
+    parse_type_in(t, i, Layout::Arm64)
+}
+
+/// [`parse_type`] by `layout`'s sizes.
+pub fn parse_type_in(t: &[u8], i: &mut usize, layout: Layout) -> Type {
     skip_qualifiers(t, i);
     let Some(&c) = t.get(*i) else {
         return Type { size: 0, align: 1, scalar: None, floats: None, is_struct: false, is_void: true };
@@ -90,11 +130,11 @@ pub fn parse_type(t: &[u8], i: &mut usize) -> Type {
         b'S' => Type::scalar(2, false, false),
         b'i' | b'l' => Type::scalar(4, false, true),
         b'I' | b'L' => Type::scalar(4, false, false),
-        b'q' => Type::scalar(8, false, true),
-        b'Q' => Type::scalar(8, false, false),
+        b'q' => Type::scalar_in(layout, 8, false, true),
+        b'Q' => Type::scalar_in(layout, 8, false, false),
         b'f' => Type::scalar(4, true, true),
-        // long double is a double on Apple arm64.
-        b'd' | b'D' => Type::scalar(8, true, true),
+        // long double is a double on Apple's ARM targets.
+        b'd' | b'D' => Type::scalar_in(layout, 8, true, true),
         b'v' => Type { size: 0, align: 1, scalar: None, floats: None, is_struct: false, is_void: true },
         b'@' => {
             // "@?" is a block; '@"NSString"' names the class.
@@ -107,20 +147,20 @@ pub fn parse_type(t: &[u8], i: &mut usize) -> Type {
                 }
                 *i += 1;
             }
-            Type::pointer()
+            Type::pointer(layout)
         }
-        b'#' | b':' | b'*' | b'?' => Type::pointer(),
+        b'#' | b':' | b'*' | b'?' => Type::pointer(layout),
         b'^' => {
-            parse_type(t, i);
-            Type::pointer()
+            parse_type_in(t, i, layout);
+            Type::pointer(layout)
         }
         b'b' => {
             let bits = skip_digits(t, i);
-            Type::scalar(if bits > 32 { 8 } else { 4 }, false, false)
+            Type::scalar_in(layout, if bits > 32 { 8 } else { 4 }, false, false)
         }
         b'[' => {
             let count = skip_digits(t, i);
-            let element = parse_type(t, i);
+            let element = parse_type_in(t, i, layout);
             if t.get(*i) == Some(&b']') {
                 *i += 1;
             }
@@ -144,7 +184,7 @@ pub fn parse_type(t: &[u8], i: &mut usize) -> Type {
                         *i += 1;
                         continue;
                     }
-                    members.push(parse_type(t, i));
+                    members.push(parse_type_in(t, i, layout));
                 }
             }
             *i += 1;
@@ -152,7 +192,7 @@ pub fn parse_type(t: &[u8], i: &mut usize) -> Type {
         }
         _ => {
             crate::log!("type encoding '{}' not known; read as a pointer", c as char);
-            Type::pointer()
+            Type::pointer(layout)
         }
     }
 }
@@ -161,22 +201,27 @@ pub fn parse_type(t: &[u8], i: &mut usize) -> Type {
 pub struct Signature {
     pub text: String,
     pub parts: Vec<(String, Type)>,
+    pub layout: Layout,
     part_names: Vec<usize>,
 }
 
 pub fn parse_signature(text: &str) -> Signature {
+    parse_signature_in(text, Layout::Arm64)
+}
+
+pub fn parse_signature_in(text: &str, layout: Layout) -> Signature {
     let bytes = text.as_bytes();
     let mut i = 0;
     let mut parts = Vec::new();
     while i < bytes.len() {
         let start = i;
-        let ty = parse_type(bytes, &mut i);
+        let ty = parse_type_in(bytes, &mut i, layout);
         let part = text[start..i].to_string();
         skip_digits(bytes, &mut i);
         parts.push((part, ty));
     }
     let part_names = parts.iter().map(|(p, _)| leak_cstr(p)).collect();
-    Signature { text: text.to_string(), parts, part_names }
+    Signature { text: text.to_string(), parts, layout, part_names }
 }
 
 // ----- the call -----
@@ -349,7 +394,93 @@ pub fn call(function: usize, types: &[Type], values: &[Vec<u8>], result_type: &T
     }
 }
 
+/// The other half of [`call`]: each argument's bytes as a caller placed them
+/// by Apple's arm64 rules, from its saved registers (x0-x7, d0-d7) and its
+/// stack arguments at `stack`.
+pub fn capture(types: &[Type], x: &[u64; 8], d: &[u64; 8], stack: usize) -> Vec<Vec<u8>> {
+    let (mut next_x, mut next_d, mut offset) = (0usize, 0usize, 0usize);
+    let mut from_stack = |size: usize, align: usize| -> Vec<u8> {
+        offset = offset.div_ceil(align.max(1)) * align.max(1);
+        let bytes = unsafe { std::slice::from_raw_parts((stack + offset) as *const u8, size) }.to_vec();
+        offset += size;
+        bytes
+    };
+    let mut values = Vec::new();
+    for ty in types {
+        let mut value = Vec::with_capacity(ty.size.max(8));
+        if let Some((count, each)) = ty.floats {
+            if next_d + count <= 8 {
+                for k in 0..count {
+                    value.extend_from_slice(&d[next_d + k].to_le_bytes()[..each]);
+                }
+                next_d += count;
+            } else {
+                next_d = 8;
+                value = from_stack(ty.size, ty.align);
+            }
+        } else if ty.is_struct && ty.size > 16 {
+            // Big structs come by reference to the caller's copy.
+            let pointer = if next_x < 8 {
+                next_x += 1;
+                x[next_x - 1] as usize
+            } else {
+                usize::from_le_bytes(from_stack(8, 8).try_into().unwrap())
+            };
+            value = unsafe { std::slice::from_raw_parts(pointer as *const u8, ty.size) }.to_vec();
+        } else if ty.is_struct {
+            let words = ty.size.div_ceil(8).max(1);
+            if ty.align == 16 && next_x % 2 == 1 {
+                next_x += 1;
+            }
+            if next_x + words <= 8 {
+                for k in 0..words {
+                    value.extend_from_slice(&x[next_x + k].to_le_bytes());
+                }
+                next_x += words;
+            } else {
+                next_x = 8;
+                value = from_stack(words * 8, ty.align.max(8));
+            }
+        } else if next_x < 8 {
+            value.extend_from_slice(&x[next_x].to_le_bytes());
+            next_x += 1;
+        } else {
+            value = from_stack(ty.size.max(1), ty.size.clamp(1, 8));
+        }
+        value.resize(ty.size.max(8), 0);
+        values.push(value);
+    }
+    values
+}
+
+/// Where an arm64 callee leaves a result of `ty`: big structs at the
+/// caller's x8 buffer (`x8`), float aggregates in d0-d3, the rest in x0/x1.
+pub fn place_result(ty: &Type, bytes: &[u8], x8: usize, ret_x: &mut [u64; 2], ret_d: &mut [u64; 4]) {
+    let mut bytes = bytes.to_vec();
+    bytes.resize(ty.size.max(16), 0);
+    if ty.is_void {
+        return;
+    }
+    if let Some((count, each)) = ty.floats {
+        for k in 0..count.min(4) {
+            let mut raw = [0u8; 8];
+            raw[..each].copy_from_slice(&bytes[k * each..(k + 1) * each]);
+            ret_d[k] = u64::from_le_bytes(raw);
+        }
+    } else if ty.is_struct && ty.size > 16 {
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), x8 as *mut u8, ty.size) };
+    } else {
+        ret_x[0] = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+        ret_x[1] = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    }
+}
+
 // ----- NSMethodSignature: { isa, *const Signature } -----
+
+/// The types an NSMethodSignature holds.
+pub fn signature_of(object: Id) -> Option<Arc<Signature>> {
+    signature(object)
+}
 
 fn signature(object: Id) -> Option<Arc<Signature>> {
     if object == 0 {
@@ -366,7 +497,13 @@ fn signature(object: Id) -> Option<Arc<Signature>> {
 }
 
 fn make_signature(text: &str) -> Id {
-    let parsed = parse_signature(text);
+    make_signature_in(text, Layout::Arm64)
+}
+
+/// A new NSMethodSignature for `text` by `layout`'s sizes (nil when it
+/// lacks a return type, self or _cmd).
+pub fn make_signature_in(text: &str, layout: Layout) -> Id {
+    let parsed = parse_signature_in(text, layout);
     if parsed.parts.len() < 3 {
         crate::log!("NSMethodSignature \"{text}\": needs a return type, self and _cmd; nil");
         return 0;
@@ -400,7 +537,12 @@ extern "C" fn ms_return_length(this: Id, _: Sel) -> usize {
 }
 
 extern "C" fn ms_frame_length(this: Id, _: Sel) -> usize {
-    signature(this).map(|s| s.parts[1..].iter().map(|(_, t)| t.size.div_ceil(8).max(1) * 8).sum::<usize>().max(224)).unwrap_or(0)
+    signature(this)
+        .map(|s| match s.layout {
+            Layout::Arm64 => s.parts[1..].iter().map(|(_, t)| t.size.div_ceil(8).max(1) * 8).sum::<usize>().max(224),
+            Layout::Armv7 => s.parts[1..].iter().map(|(_, t)| t.size.div_ceil(4).max(1) * 4).sum::<usize>(),
+        })
+        .unwrap_or(0)
 }
 
 extern "C" fn ms_is_oneway(this: Id, _: Sel) -> bool {
@@ -576,6 +718,40 @@ struct Invocation {
     copies: Vec<std::ffi::CString>,
 }
 
+/// What a 32-bit game's invocations need from its bridge. Their argument
+/// bytes are the guest's (objects and selectors as guest words).
+pub trait GuestInvocations: Send + Sync {
+    /// Sends the message `arguments` hold (self and _cmd first, by `types`)
+    /// from the guest; the result's bytes as the guest has them.
+    fn invoke(&self, types: &str, arguments: &[Vec<u8>]) -> Result<Vec<u8>, String>;
+    fn object_to_host(&self, guest: u32) -> Id;
+    fn object_to_guest(&self, host: Id) -> u32;
+    fn selector_to_host(&self, guest: u32) -> Sel;
+    fn selector_to_guest(&self, host: Sel) -> u32;
+    /// -retainArguments for one argument of type `kind` ("@", "@?", "*"):
+    /// the word the invocation keeps instead (retained, copied).
+    fn keep(&self, kind: &str, word: u32) -> u32;
+    /// A host message the 32-bit game object `frame.x[0]` forwards with an
+    /// armv7 `signature`: converted, sent through -forwardInvocation:, and
+    /// its result left in `frame`.
+    fn forward_from_host(&self, frame: &mut crate::objc::forward::Frame, signature: Id) -> Result<(), String>;
+}
+
+static GUEST: RwLock<Option<Arc<dyn GuestInvocations>>> = RwLock::new(None);
+
+/// Installs the 32-bit game's side (its bridge does, once set up).
+pub fn set_guest_invocations(hooks: Arc<dyn GuestInvocations>) {
+    *GUEST.write().unwrap_or_else(|e| e.into_inner()) = Some(hooks);
+}
+
+pub(crate) fn guest_invocations() -> Option<Arc<dyn GuestInvocations>> {
+    let hooks = GUEST.read().unwrap_or_else(|e| e.into_inner()).clone();
+    if hooks.is_none() {
+        crate::log!("NSInvocation: a 32-bit invocation without the 32-bit bridge");
+    }
+    hooks
+}
+
 fn invocation(this: Id) -> Option<&'static mut Invocation> {
     let slot = unsafe { *((this + 8) as *const *mut Invocation) };
     if slot.is_null() {
@@ -583,6 +759,31 @@ fn invocation(this: Id) -> Option<&'static mut Invocation> {
     } else {
         Some(unsafe { &mut *slot })
     }
+}
+
+/// [NSInvocation invocationWithMethodSignature:signature].
+pub fn new_invocation(signature: Id) -> Id {
+    inv_with_signature(runtime::class_named("NSInvocation"), 0, signature)
+}
+
+/// An invocation's argument bytes, self and _cmd first.
+pub fn invocation_arguments(this: Id) -> Option<Vec<Vec<u8>>> {
+    invocation(this).map(|state| state.arguments.clone())
+}
+
+/// Sets an invocation's arguments (self and _cmd first) from bytes laid
+/// out as its signature says.
+pub fn set_invocation_arguments(this: Id, values: &[Vec<u8>]) {
+    let Some(state) = invocation(this) else { return };
+    for (slot, value) in state.arguments.iter_mut().zip(values) {
+        let n = slot.len().min(value.len());
+        slot[..n].copy_from_slice(&value[..n]);
+    }
+}
+
+/// An invocation's result bytes (as long as its return type, at least 16).
+pub fn invocation_result(this: Id) -> Option<Vec<u8>> {
+    invocation(this).map(|state| state.result.clone())
 }
 
 extern "C" fn inv_with_signature(class: Class, _: Sel, signature_object: Id) -> Id {
@@ -602,36 +803,63 @@ extern "C" fn inv_signature(this: Id, _: Sel) -> Id {
     invocation(this).map(|i| i.signature).unwrap_or(0)
 }
 
-fn argument_word(this: Id, index: usize) -> usize {
-    invocation(this)
-        .and_then(|i| i.arguments.get(index))
-        .map(|bytes| usize::from_le_bytes(bytes[..8].try_into().unwrap()))
-        .unwrap_or(0)
+/// A pointer-sized argument as stored (a guest word for armv7).
+fn stored_word(state: &Invocation, index: usize) -> usize {
+    let Some(bytes) = state.arguments.get(index) else { return 0 };
+    match state.types.layout {
+        Layout::Arm64 => usize::from_le_bytes(bytes[..8].try_into().unwrap()),
+        Layout::Armv7 => u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize,
+    }
 }
 
-fn set_argument_word(this: Id, index: usize, value: usize) {
-    if let Some(bytes) = invocation(this).and_then(|i| i.arguments.get_mut(index)) {
-        bytes[..8].copy_from_slice(&value.to_le_bytes());
+fn store_word(state: &mut Invocation, index: usize, value: usize) {
+    let layout = state.types.layout;
+    let Some(bytes) = state.arguments.get_mut(index) else { return };
+    match layout {
+        Layout::Arm64 => bytes[..8].copy_from_slice(&value.to_le_bytes()),
+        Layout::Armv7 => bytes[..4].copy_from_slice(&(value as u32).to_le_bytes()),
     }
+}
+
+fn is_armv7(state: &Invocation) -> bool {
+    state.types.layout == Layout::Armv7
 }
 
 extern "C" fn inv_target(this: Id, _: Sel) -> Id {
-    argument_word(this, 0)
-}
-
-extern "C" fn inv_set_target(this: Id, _: Sel, target: Id) {
-    set_argument_word(this, 0, target);
-    if let Some(state) = invocation(this) {
-        keep_argument(state, 0);
+    let Some(state) = invocation(this) else { return 0 };
+    let word = stored_word(state, 0);
+    match is_armv7(state) {
+        true => guest_invocations().map_or(0, |g| g.object_to_host(word as u32)),
+        false => word,
     }
 }
 
+extern "C" fn inv_set_target(this: Id, _: Sel, target: Id) {
+    let Some(state) = invocation(this) else { return };
+    let word = match is_armv7(state) {
+        true => guest_invocations().map_or(0, |g| g.object_to_guest(target) as usize),
+        false => target,
+    };
+    store_word(state, 0, word);
+    keep_argument(state, 0);
+}
+
 extern "C" fn inv_selector(this: Id, _: Sel) -> Sel {
-    argument_word(this, 1)
+    let Some(state) = invocation(this) else { return 0 };
+    let word = stored_word(state, 1);
+    match is_armv7(state) {
+        true => guest_invocations().map_or(0, |g| g.selector_to_host(word as u32)),
+        false => word,
+    }
 }
 
 extern "C" fn inv_set_selector(this: Id, _: Sel, sel: Sel) {
-    set_argument_word(this, 1, sel);
+    let Some(state) = invocation(this) else { return };
+    let word = match is_armv7(state) {
+        true => guest_invocations().map_or(0, |g| g.selector_to_guest(sel) as usize),
+        false => sel,
+    };
+    store_word(state, 1, word);
 }
 
 extern "C" fn inv_set_argument(this: Id, _: Sel, pointer: *const u8, index: isize) {
@@ -690,8 +918,16 @@ fn keep_argument(state: &mut Invocation, index: usize) {
     }
     let Some((part, _)) = state.types.parts.get(index + 1) else { return };
     let kind = bare(part);
-    let word = usize::from_le_bytes(state.arguments[index][..8].try_into().unwrap());
+    let word = stored_word(state, index);
     if word == 0 {
+        return;
+    }
+    if is_armv7(state) {
+        let kind = ["@?", "@", "*"].into_iter().find(|k| kind.starts_with(k));
+        if let (Some(kind), Some(guest)) = (kind, guest_invocations()) {
+            let kept = guest.keep(kind, word as u32) as usize;
+            store_word(state, index, kept);
+        }
         return;
     }
     let kept = if kind.starts_with("@?") {
@@ -727,13 +963,31 @@ extern "C" fn inv_arguments_retained(this: Id, _: Sel) -> bool {
 
 extern "C" fn inv_invoke(this: Id, _: Sel) {
     let Some(state) = invocation(this) else { return };
-    let types: Vec<Type> = state.types.parts[1..].iter().map(|(_, t)| t.clone()).collect();
     let result_type = state.types.parts[0].1.clone();
     let mut result = vec![0u8; result_type.size.max(16)];
-    call(runtime::ios_objc_msgSend as usize, &types, &state.arguments, &result_type, &mut result);
+    if is_armv7(state) {
+        let Some(guest) = guest_invocations() else { return };
+        match guest.invoke(&state.types.text, &state.arguments) {
+            Ok(bytes) => {
+                let n = bytes.len().min(result.len());
+                result[..n].copy_from_slice(&bytes[..n]);
+            }
+            Err(error) => crate::log!("NSInvocation -invoke ({}): {error}", state.types.text),
+        }
+    } else {
+        let types: Vec<Type> = state.types.parts[1..].iter().map(|(_, t)| t.clone()).collect();
+        call(runtime::ios_objc_msgSend as usize, &types, &state.arguments, &result_type, &mut result);
+    }
     state.result = result;
     // A retained invocation also keeps its object result.
     if state.retained && bare(&state.types.parts[0].0).starts_with('@') {
+        if is_armv7(state) {
+            let object = u32::from_le_bytes(state.result[..4].try_into().unwrap());
+            if let (true, Some(guest)) = (object != 0, guest_invocations()) {
+                guest.keep("@", object);
+            }
+            return;
+        }
         let object = usize::from_le_bytes(state.result[..8].try_into().unwrap());
         if object != 0 {
             runtime::send(object, "retain", &[]);
