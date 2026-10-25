@@ -778,6 +778,8 @@ pub fn register(r: &mut Registry) {
 
     let null = define_class("NSNull", "NSObject", 8);
     class_methods(null, &[("null", null_object as usize)]);
+    // kCFNull is the one NSNull (toll-free bridged).
+    r.data("kCFNull", leak(null_object(0, 0)));
 
     let date_class = define_class("NSDate", "NSObject", 16);
     class_methods(

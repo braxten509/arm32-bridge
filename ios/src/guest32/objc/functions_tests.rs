@@ -542,3 +542,67 @@ fn property_lists_come_from_the_games_metadata() {
 extern "C" fn plain_root_bounds(_: Id, _: Sel) -> crate::fw::geometry::Rect {
     crate::fw::geometry::Rect::new(1.0, 2.0, 3.0, 4.0)
 }
+
+/// NSAllocateObject makes a zeroed game instance with room for its extra
+/// bytes; NSGetSizeAndAlignment measures armv7 layouts; CFStringAppendFormat
+/// formats the game's variadic arguments, objects included.
+#[test]
+fn foundation_allocation_layout_and_format_functions() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(crate::run::setup);
+    {
+        let mut rt = runtime::lock();
+        let class = rt.define_class("G32AllocRoot", 0, 16);
+        let meta = rt.classes[&class].partner;
+        let sel = rt.sel("alloc");
+        rt.add_method(meta, sel, alloc as usize);
+    }
+    let g = Fake::new();
+    let (class, meta) = (g.alloc_permanent(20), g.alloc_permanent(20));
+    g.put_words(class, &[meta]);
+    let md = ObjcMetadata32 {
+        classes: vec![ObjcClass32 {
+            address: class,
+            name: "G32Allocated".into(),
+            superclass: ClassTarget::External("G32AllocRoot".into()),
+            meta_address: meta,
+            meta_isa: ClassTarget::External("G32AllocRoot".into()),
+            meta_superclass: ClassTarget::External("G32AllocRoot".into()),
+            instance: ClassRo32 { instance_start: 4, instance_size: 12, ..Default::default() },
+            meta: ClassRo32 { flags: 1, ..Default::default() },
+        }],
+        ..Default::default()
+    };
+    let bridge: &'static Mutex<Bridge> = Box::leak(Box::new(Mutex::new(Bridge::new(&md).unwrap())));
+    install(bridge, g, &md).unwrap();
+    let ctx = Ctx { bridge, g };
+    let call = |name: &str, words: &[u32]| {
+        let w = |i: u32| words.get(i as usize).copied().unwrap_or(0);
+        call_function(&ctx, name, &w).unwrap() as u32
+    };
+
+    let zone = call("NSDefaultMallocZone", &[]);
+    assert_ne!(zone, 0);
+    let object = call("NSAllocateObject", &[class, 40, zone]);
+    assert_eq!(g.u32_at(object), class, "an instance of the game class");
+    assert_eq!(g.read(object + 4, 48), [0; 48], "its own and extra bytes, zeroed");
+    let host = bridge.lock().unwrap().host_object(object).expect("a host side");
+    assert_eq!(bridge.lock().unwrap().guest_object(g, host).unwrap(), object);
+    let next = g.alloc(4);
+    assert!(next >= object + 52, "the extra bytes are the object's ({object:#x}, next {next:#x})");
+
+    // NSGetSizeAndAlignment(type, &size, &align) -> the type after it (offsets skipped).
+    let (size, align) = (g.words(&[0]), g.words(&[0]));
+    let types = g.text("{Pair=cd}12@0");
+    let rest = call("NSGetSizeAndAlignment", &[types, size, align]);
+    assert_eq!((g.u32_at(size), g.u32_at(align), rest), (12, 4, types + 11), "a double is 4-byte aligned on armv7");
+    assert_eq!(call("NSGetSizeAndAlignment", &[rest, 0, align]), rest + 2, "NULL outputs are skipped");
+    assert_eq!(g.u32_at(align), 4);
+
+    // CFStringAppendFormat(string, options, format, ...)
+    let mutable = runtime::send(runtime::class_named("NSMutableString"), "stringWithString:", &[crate::fw::string::make("x")]);
+    let guest = |host: usize| bridge.lock().unwrap().guest_object(g, host).unwrap();
+    let (target, format, word) = (guest(mutable), guest(crate::fw::string::make("%d-%@")), guest(crate::fw::string::make("hi")));
+    call("CFStringAppendFormat", &[target, 0, format, 42, word]);
+    assert_eq!(crate::fw::string::get(mutable), "x42-hi");
+}

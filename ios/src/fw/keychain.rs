@@ -53,6 +53,7 @@ fn load() -> Result<Vec<Item>, i32> {
 fn identity_keys(class: &str) -> &'static [&'static str] {
     match class {
         "inet" => &["class", "acct", "sdmn", "srvr", "ptcl", "atyp", "port", "path", "agrp", "sync"],
+        "keys" => &["class", "kcls", "klbl", "atag", "type", "bsiz", "esiz", "agrp", "sync"],
         _ => &["class", "acct", "svce", "agrp", "sync"],
     }
 }
@@ -103,10 +104,22 @@ fn matches(item: &Item, query: &[(String, Id)]) -> bool {
     })
 }
 
+/// A key item's SecKeyRef: made from its stored bytes (public RSA keys);
+/// other items have none here.
+fn key_ref(item: &Item) -> Id {
+    match item.iter().find(|(k, _)| k == "v_Data").map(|(_, v)| v) {
+        Some(plist::Value::Data(bytes)) if item_class(item) == "keys" => crate::fw::seckey::key_object(bytes).unwrap_or(0),
+        _ => 0,
+    }
+}
+
 fn result_for(item: &Item, query: &[(String, Id)]) -> Id {
     let get = |name: &str| query.iter().find(|(k, _)| k == name).map(|(_, v)| *v).unwrap_or(0);
     let want_data = truthy(get("r_Data"));
     let want_attributes = truthy(get("r_Attributes"));
+    if truthy(get("r_Ref")) && !want_data && !want_attributes {
+        return key_ref(item);
+    }
     let stored_data = || match item.iter().find(|(k, _)| k == "v_Data").map(|(_, v)| v) {
         Some(plist::Value::Data(bytes)) => data::make(bytes),
         _ => data::make(&[]),
@@ -170,10 +183,11 @@ extern "C" fn add(attributes: Id, result: *mut Id) -> i32 {
     if items.iter().any(|item| identity(item) == new_identity) {
         return DUPLICATE;
     }
-    items.push(new_item);
     if !result.is_null() {
-        unsafe { *result = 0 };
+        let wants_ref = attributes.iter().any(|(k, v)| k == "r_Ref" && truthy(*v));
+        unsafe { *result = if wants_ref { key_ref(&new_item) } else { 0 } };
     }
+    items.push(new_item);
     if save(&items) { SUCCESS } else { BAD_PARAMETER }
 }
 
@@ -320,6 +334,16 @@ pub fn register(r: &mut Registry) {
         ("kSecMatchLimitOne", "m_LimitOne"),
         ("kSecMatchLimitAll", "m_LimitAll"),
         ("kSecTrustInfoExtendedValidationKey", "ExtendedValidation"),
+        ("kSecClassKey", "keys"),
+        ("kSecAttrKeyClass", "kcls"),
+        ("kSecAttrKeyClassPublic", "0"),
+        ("kSecAttrKeyClassPrivate", "1"),
+        ("kSecAttrApplicationLabel", "klbl"),
+        ("kSecAttrApplicationTag", "atag"),
+        ("kSecAttrKeyType", "type"),
+        ("kSecAttrKeyTypeRSA", "42"),
+        ("kSecAttrKeySizeInBits", "bsiz"),
+        ("kSecReturnRef", "r_Ref"),
     ] {
         r.data(name, leak(string::make(value)));
     }

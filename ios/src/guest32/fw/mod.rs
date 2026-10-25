@@ -340,6 +340,27 @@ impl Return for CStr {
         Ret::U32(guest_text(value))
     }
 }
+/// A pointer into guest memory (data bytes the host keeps there).
+impl Return for Ptr {
+    type Host = usize;
+    fn give(value: usize, _: u32) -> Ret {
+        Ret::U32(guest_pointer(value))
+    }
+}
+
+/// The guest address of host pointer `host`, which must point into guest
+/// memory (0 for NULL, and for host memory the guest can't reach).
+pub fn guest_pointer(host: usize) -> u32 {
+    let base = mem().host(0) as usize;
+    match host.checked_sub(base) {
+        _ if host == 0 => 0,
+        Some(offset) if offset < 1 << 32 => offset as u32,
+        _ => {
+            crate::log!("32-bit: a host pointer {host:#x} outside guest memory was handed to the game as NULL");
+            0
+        }
+    }
+}
 
 /// A permanent guest copy of host C string `host` (0 for null).
 pub fn guest_text(host: usize) -> u32 {
@@ -576,6 +597,32 @@ pub fn struct_constant<T: GuestStruct + 'static>(name: &'static str) {
             None => crate::log!("32-bit: the iPhone layer has no constant {name}"),
         }
         guest
+    });
+}
+
+/// A guest copy of the host's CGFloat constant `name` (a float here).
+pub fn float_constant(name: &'static str) {
+    super::data(name, move || {
+        let guest = super::alloc_permanent(4, 4);
+        let value = host_data(name).map_or(0.0, |address| unsafe { *(address as *const f64) });
+        mem().write_u32(guest, (value as f32).to_bits());
+        guest
+    });
+}
+
+/// Makes the host's data bytes (NSData, CFData) come from the guest heap,
+/// so the pointers to them the game is given are guest addresses. Call
+/// once guest memory is set up.
+pub fn keep_data_bytes_in_guest_memory() {
+    crate::fw::data::keep_bytes_in(crate::fw::data::ByteHeap {
+        alloc: |size| match u32::try_from(size) {
+            Ok(size) => match runtime::heap().malloc(size) {
+                0 => std::ptr::null_mut(),
+                guest => mem().host(guest),
+            },
+            Err(_) => std::ptr::null_mut(),
+        },
+        free: |pointer| runtime::heap().free(mem().guest(pointer)),
     });
 }
 

@@ -15,6 +15,7 @@ pub(crate) fn setup() {
         let _ = runtime::set_platform(&ios32::APPLE32);
         super::register_all();
         runtime::init(false);
+        super::fw::keep_data_bytes_in_guest_memory();
     });
 }
 
@@ -249,6 +250,33 @@ fn cryptor_final_measures_the_unpadded_output() {
     mem().write_u8(out, 0);
     assert_eq!(call("CCCryptorFinal", [cryptor, out, 16, moved], &[]).0, 0);
     assert_eq!((mem().read_u32(moved), mem().read_u8(out)), (1, 0x5A));
+}
+
+#[test]
+fn a_reset_cryptor_starts_again_from_the_new_iv() {
+    // AES-128 CBC, no padding: one block, then a reset to another IV, then the same block.
+    let (key, iv, other_iv) = (alloc(16), alloc(16), alloc(16));
+    mem().write_bytes(key, &[7; 16]);
+    mem().write_bytes(iv, &[9; 16]);
+    mem().write_bytes(other_iv, &[3; 16]);
+    let (input, out, moved, reference) = (alloc(16), alloc(16), alloc(4), alloc(4));
+    mem().write_bytes(input, &[0x42; 16]);
+    assert_eq!(call("CCCryptorCreate", [0, 0, 0, key], &[16, iv, reference]).0, 0);
+    let cryptor = mem().read_u32(reference);
+    assert_eq!(call("CCCryptorUpdate", [cryptor, input, 16, out], &[16, moved]).0, 0);
+    // Reset with a new IV: the chain starts there (pending input is dropped too).
+    assert_eq!(call("CCCryptorUpdate", [cryptor, input, 5, out], &[16, moved]).0, 0);
+    assert_eq!(call("CCCryptorReset", [cryptor, other_iv, 0, 0], &[]).0, 0);
+    assert_eq!(call("CCCryptorUpdate", [cryptor, input, 16, out], &[16, moved]).0, 0);
+    let expected = crate::fw::crypto::crypt(false, 0, 0, &[7; 16], Some(&[3; 16]), &[0x42; 16]).unwrap();
+    assert_eq!((mem().read_u32(moved), mem().bytes(out, 16)), (16, &expected[..]));
+    // A NULL IV is all zeros.
+    assert_eq!(call("CCCryptorReset", [cryptor, 0, 0, 0], &[]).0, 0);
+    assert_eq!(call("CCCryptorUpdate", [cryptor, input, 16, out], &[16, moved]).0, 0);
+    let expected = crate::fw::crypto::crypt(false, 0, 0, &[7; 16], Some(&[0; 16]), &[0x42; 16]).unwrap();
+    assert_eq!(mem().bytes(out, 16), &expected[..]);
+    assert_eq!(call("CCCryptorReset", [alloc(4), 0, 0, 0], &[]).0 as i32, -4300, "not a cryptor: kCCParamError");
+    call("CCCryptorRelease", [cryptor, 0, 0, 0], &[]);
 }
 
 /// The C++ runtime loaded once, as `run` loads it (call before holding the GIL).

@@ -1489,4 +1489,7 @@ fn data() {
         super::data_bytes(name, vec![0; 32], 4);
     }
     super::data_words("mach_task_self_", vec![0x103]);
+    // vm_page_size and NDR_record: guest32/mach.rs.
+    // The offset of NSObject's one ivar, isa.
+    super::data_words("OBJC_IVAR_$_NSObject.isa", vec![0]);
 }

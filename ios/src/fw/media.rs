@@ -641,6 +641,20 @@ fn register_movie_player() {
 
 pub fn register(r: &mut Registry) {
     register_movie_player();
+    // The movie player's notification names and keys are their own text.
+    for name in [
+        "MPMovieDurationAvailableNotification",
+        "MPMoviePlayerContentPreloadDidFinishNotification",
+        "MPMoviePlayerLoadStateDidChangeNotification",
+        "MPMoviePlayerPlaybackDidFinishNotification",
+        "MPMoviePlayerPlaybackDidFinishReasonUserInfoKey",
+        "MPMoviePlayerPlaybackStateDidChangeNotification",
+        "MPMoviePlayerNowPlayingMovieDidChangeNotification",
+        "MPMoviePlayerWillEnterFullscreenNotification",
+        "MPMoviePlayerDidExitFullscreenNotification",
+    ] {
+        r.data(name, leak(string::make(name)));
+    }
     r.function("CMTimeGetSeconds", cm_time_get_seconds as usize);
     r.data("kCMTimeZero", leak(CmTime { value: 0, timescale: 1, flags: 1, epoch: 0 }));
     r.function("AudioSessionInitialize", audio_session_initialize as usize);
