@@ -68,7 +68,12 @@ mod crypto;
 pub mod fw;
 mod libsystem;
 mod locale;
+mod mach;
 pub mod objc;
+mod regex;
+mod signals;
+#[cfg(test)]
+mod system_tests;
 #[cfg(test)]
 pub(crate) mod tests;
 mod zlib;
@@ -165,6 +170,9 @@ pub fn call(uc: &mut Uc, address: u32, args: &[u32]) -> Result<u64, String> {
 /// Every name the 32-bit layer provides, registered before loading.
 pub fn register_all() {
     libsystem::register();
+    signals::register();
+    regex::register();
+    mach::register();
     fw::register();
     locale::register();
     crypto::register();
@@ -188,6 +196,13 @@ static IMAGE: std::sync::OnceLock<(u32, u32, String)> = std::sync::OnceLock::new
 
 pub(crate) fn main_image() -> Option<&'static (u32, u32, String)> {
     IMAGE.get()
+}
+
+/// The guest addresses the loaded program covers (start, end).
+static IMAGE_SPAN: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
+
+pub(crate) fn main_image_span() -> Option<(u32, u32)> {
+    IMAGE_SPAN.get().copied()
 }
 
 /// Whether a program file has no 64-bit ARM part but a 32-bit one this layer can run.
@@ -226,6 +241,7 @@ pub fn run(app_dir: &str, program_path: &str) -> Result<(), String> {
     objc::wire::install_program()?;
     let header = program.image.header_address().unwrap_or(0).wrapping_add(program.plan.slide);
     let _ = IMAGE.set((header, program.plan.slide, program_path.to_string()));
+    let _ = IMAGE_SPAN.set((program.plan.span.start as u32, program.plan.span.end as u32));
     crate::log!(
         "32-bit program: {:?} slice, {} rebases, {} binds to functions ({} stand-ins), {} to data, {} to guest libraries, {} inside, {} weak left 0",
         program.image.slice.subtype,

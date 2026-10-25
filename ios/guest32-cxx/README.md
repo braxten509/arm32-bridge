@@ -18,6 +18,7 @@ into guest memory, so this code runs translated like the game's own.
 | `config/__config_site` | libc++ settings |
 | `darwin-include/` | Game Bridge's own minimal Darwin armv7 C headers (Apple's types, sizes and constants; not Apple's files) |
 | `glue/cxa_atexit.c` | `__cxa_atexit` / `__cxa_finalize` (libSystem's on iOS) |
+| `glue/libstdcxx.cpp` | GCC libstdc++'s out-of-line helpers that games built with GCC's headers import: `std::_Rb_tree_increment`/`_decrement`/`_insert_and_rebalance`/`_rebalance_for_erase` (std::map/set on GCC's node layout) and `std::__throw_length_error`; Game Bridge's own code, GCC's mangled names |
 | `test/` | `cxxtest.cpp` (the checks) and `testc.c` (a tiny Darwin-ABI C library standing in for the runner's C table in the test) |
 
 The built library (1.2 MB) is not committed: it is a build output, rebuilt
@@ -166,12 +167,14 @@ What the library needs from the core side:
 
 `test.sh` (PC: needs the ARM64 cross build of arm32-bridge, `BIN=` to
 point elsewhere): loads `libtestc.so`, `libguest32cxx.so` and
-`libcxxtest.so` with the Android loader and calls `run_all`: 15 checks,
+`libcxxtest.so` with the Android loader and calls `run_all`: 17 checks,
 one bit each (string layout bytes, growth, exceptions thrown inside the
 library and caught across a frame with a cleanup, catch by base class,
 rethrow, `std::logic_error`, static guard, `dynamic_cast`/`typeid`,
 `ostringstream`/`istringstream`, the hand-made APCS call, `__cxa_atexit`,
-destructors run with the registration lock released). Passes when run_all
+destructors run with the registration lock released, GCC's red-black tree
+helpers on a 40-node tree, GCC's `__throw_length_error` caught as
+`std::length_error`). Passes when run_all
 = 0, the runner exits cleanly within the time limit, and there are 0
 translator fallbacks. Without the library it stops at `_Znwm`. This is a
 PC unit test (qemu-aarch64); game tests run on the Pixel only, never on

@@ -182,6 +182,7 @@ pub fn register() {
         exceptions::framework_type("NSException", with_bridge(|b| b.framework_class(&Translator, "NSException").0))
     });
     super::super::data("_dispatch_main_q", super::dispatch::main_queue);
+    super::super::data("_dispatch_source_type_timer", super::dispatch::timer_type);
 }
 
 /// Reads the program's Objective-C metadata and registers the data its

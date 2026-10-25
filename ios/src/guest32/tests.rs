@@ -18,18 +18,18 @@ pub(crate) fn setup() {
     });
 }
 
-fn alloc(size: u32) -> u32 {
+pub(crate) fn alloc(size: u32) -> u32 {
     setup();
     super::alloc(size)
 }
 
-fn cstring(text: &str) -> u32 {
+pub(crate) fn cstring(text: &str) -> u32 {
     setup();
     super::cstring(text)
 }
 
 /// Calls registered function `name` with r0-r3 and stack words; returns (r0, r1).
-fn call(name: &str, registers: [u32; 4], stack: &[u32]) -> (u32, u32) {
+pub(crate) fn call(name: &str, registers: [u32; 4], stack: &[u32]) -> (u32, u32) {
     setup();
     let _gil = runtime::hold_gil();
     let uc = runtime::engine();

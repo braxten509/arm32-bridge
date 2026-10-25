@@ -4,6 +4,9 @@
 //! crosses as the bridge's host block, whose invoke runs it in the guest
 //! (taking the guest lock on whatever thread the queue runs it); queues
 //! cross as handles, and `_dispatch_main_q` is the main queue's handle.
+//! Groups, timer sources (`_dispatch_source_type_timer` is the host timer
+//! type's handle), dispatch_after and suspend/resume are the host's too;
+//! dispatch times are 64-bit values in word pairs.
 //!
 //! dispatch_once runs its block in place on Apple's 32-bit predicate (a
 //! `long`: one word, where the 64-bit layer's is eight bytes). Waits for
@@ -66,6 +69,140 @@ pub fn run_sync(c: &Ctx, w: Words) -> Result<u64, String> {
     in_wrapper_scope(c.g, || {
         let block = block_to_host(c, w(1))?;
         c.g.without_guest_lock(&mut || send(queue, block));
+        Ok(0)
+    })
+}
+
+/// A 64-bit argument from two words, low first (Apple's packed rule).
+fn pair(w: Words, first: u32) -> u64 {
+    u64::from(w(first)) | u64::from(w(first + 1)) << 32
+}
+
+/// A queue argument where 0 means the default (a global queue).
+fn queue_or_default(guest: u32) -> Result<usize, String> {
+    if guest == 0 {
+        Ok(0)
+    } else {
+        queue_to_host(guest)
+    }
+}
+
+/// The host object (queue, source, group) behind a guest handle.
+fn object_to_host(guest: u32, what: &str) -> Result<usize, String> {
+    match handle_to_host(guest) {
+        0 => Err(format!("{guest:#x} is not a dispatch {what}")),
+        object => Ok(object),
+    }
+}
+
+/// `_dispatch_source_type_timer`: the guest handle of the host's timer type
+/// (DISPATCH_SOURCE_TYPE_TIMER is that data symbol's address).
+pub fn timer_type() -> u32 {
+    let host = crate::symbols::lookup("__dispatch_source_type_timer").map(|s| s.0).unwrap_or(0);
+    handle_to_guest(host)
+}
+
+/// dispatch_get_current_queue(): the queue running the current block.
+pub fn current_queue(_: &Ctx, _: Words) -> Result<u64, String> {
+    let get: extern "C" fn() -> usize = unsafe { std::mem::transmute(host_function("dispatch_get_current_queue")?) };
+    Ok(u64::from(handle_to_guest(get())))
+}
+
+/// dispatch_time(when, delta): both 64-bit, the result too.
+pub fn time(_: &Ctx, w: Words) -> Result<u64, String> {
+    let make: extern "C" fn(u64, i64) -> u64 = unsafe { std::mem::transmute(host_function("dispatch_time")?) };
+    Ok(make(pair(w, 0), pair(w, 2) as i64))
+}
+
+/// dispatch_after(when, queue, block)
+pub fn after(c: &Ctx, w: Words) -> Result<u64, String> {
+    let queue = queue_to_host(w(2))?;
+    let send: extern "C" fn(u64, usize, usize) = unsafe { std::mem::transmute(host_function("dispatch_after")?) };
+    in_wrapper_scope(c.g, || {
+        send(pair(w, 0), queue, block_to_host(c, w(3))?);
+        Ok(0)
+    })
+}
+
+/// dispatch_suspend / dispatch_resume on a queue or source.
+pub fn suspend(_: &Ctx, w: Words) -> Result<u64, String> {
+    let call: extern "C" fn(usize) = unsafe { std::mem::transmute(host_function("dispatch_suspend")?) };
+    call(object_to_host(w(0), "object")?);
+    Ok(0)
+}
+
+pub fn resume(_: &Ctx, w: Words) -> Result<u64, String> {
+    let call: extern "C" fn(usize) = unsafe { std::mem::transmute(host_function("dispatch_resume")?) };
+    call(object_to_host(w(0), "object")?);
+    Ok(0)
+}
+
+/// dispatch_source_create(type, handle, mask, queue): the host's timer
+/// sources (other types answer NULL, as the host layer does).
+pub fn source_create(_: &Ctx, w: Words) -> Result<u64, String> {
+    let create: extern "C" fn(usize, usize, usize, usize) -> usize = unsafe { std::mem::transmute(host_function("dispatch_source_create")?) };
+    let source = create(handle_to_host(w(0)), w(1) as usize, w(2) as usize, queue_or_default(w(3))?);
+    Ok(u64::from(handle_to_guest(source)))
+}
+
+pub fn source_set_event_handler(c: &Ctx, w: Words) -> Result<u64, String> {
+    let source = object_to_host(w(0), "source")?;
+    let set: extern "C" fn(usize, usize) = unsafe { std::mem::transmute(host_function("dispatch_source_set_event_handler")?) };
+    in_wrapper_scope(c.g, || {
+        set(source, if w(1) == 0 { 0 } else { block_to_host(c, w(1))? });
+        Ok(0)
+    })
+}
+
+/// dispatch_source_set_timer(source, start, interval, leeway): three 64-bit values.
+pub fn source_set_timer(_: &Ctx, w: Words) -> Result<u64, String> {
+    let source = object_to_host(w(0), "source")?;
+    let set: extern "C" fn(usize, u64, u64, u64) = unsafe { std::mem::transmute(host_function("dispatch_source_set_timer")?) };
+    set(source, pair(w, 1), pair(w, 3), pair(w, 5));
+    Ok(0)
+}
+
+pub fn group_create(_: &Ctx, _: Words) -> Result<u64, String> {
+    let create: extern "C" fn() -> usize = unsafe { std::mem::transmute(host_function("dispatch_group_create")?) };
+    Ok(u64::from(handle_to_guest(create())))
+}
+
+pub fn group_enter(_: &Ctx, w: Words) -> Result<u64, String> {
+    let enter: extern "C" fn(usize) = unsafe { std::mem::transmute(host_function("dispatch_group_enter")?) };
+    enter(object_to_host(w(0), "group")?);
+    Ok(0)
+}
+
+pub fn group_leave(_: &Ctx, w: Words) -> Result<u64, String> {
+    let leave: extern "C" fn(usize) = unsafe { std::mem::transmute(host_function("dispatch_group_leave")?) };
+    leave(object_to_host(w(0), "group")?);
+    Ok(0)
+}
+
+/// dispatch_group_wait(group, timeout): the wait lets go of the guest lock,
+/// which the group's blocks need. A long: 0, or non-zero when timed out.
+pub fn group_wait(c: &Ctx, w: Words) -> Result<u64, String> {
+    let group = object_to_host(w(0), "group")?;
+    let wait: extern "C" fn(usize, u64) -> isize = unsafe { std::mem::transmute(host_function("dispatch_group_wait")?) };
+    let mut result = 0;
+    c.g.without_guest_lock(&mut || result = wait(group, pair(w, 1)));
+    Ok(u64::from(result as i32 as u32))
+}
+
+/// dispatch_group_notify(group, queue, block) and dispatch_group_async(group, queue, block).
+pub fn group_notify(c: &Ctx, w: Words) -> Result<u64, String> {
+    group_send(c, w, "dispatch_group_notify")
+}
+
+pub fn group_async(c: &Ctx, w: Words) -> Result<u64, String> {
+    group_send(c, w, "dispatch_group_async")
+}
+
+fn group_send(c: &Ctx, w: Words, name: &str) -> Result<u64, String> {
+    let (group, queue) = (object_to_host(w(0), "group")?, queue_to_host(w(1))?);
+    let send: extern "C" fn(usize, usize, usize) = unsafe { std::mem::transmute(host_function(name)?) };
+    in_wrapper_scope(c.g, || {
+        send(group, queue, block_to_host(c, w(2))?);
         Ok(0)
     })
 }

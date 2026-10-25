@@ -679,6 +679,8 @@ pub struct Runner {
     pub thread_id: u32,
     pub errno_slot: u32,
     pub tls_block: u32,
+    /// The top of the thread's guest stack (0 for an idle engine).
+    pub stack_top: u32,
 }
 
 /// Every runner, for stopping the world.
@@ -689,13 +691,13 @@ static STOPPER: Mutex<()> = Mutex::new(());
 /// Threads wait here for the world to start again.
 static RELEASED: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
-fn new_runner(thread_id: u32, errno_slot: u32, tls_block: u32) -> Arc<Runner> {
-    let runner = make_runner(thread_id, errno_slot, tls_block);
+fn new_runner(thread_id: u32, errno_slot: u32, tls_block: u32, stack_top: u32) -> Arc<Runner> {
+    let runner = make_runner(thread_id, errno_slot, tls_block, stack_top);
     RUNNERS.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::clone(&runner));
     runner
 }
 
-fn make_runner(thread_id: u32, errno_slot: u32, tls_block: u32) -> Arc<Runner> {
+fn make_runner(thread_id: u32, errno_slot: u32, tls_block: u32, stack_top: u32) -> Arc<Runner> {
     Arc::new(Runner {
         state: AtomicU32::new(OUTSIDE),
         attention: AtomicU32::new(0),
@@ -705,6 +707,7 @@ fn make_runner(thread_id: u32, errno_slot: u32, tls_block: u32) -> Arc<Runner> {
         thread_id,
         errno_slot,
         tls_block,
+        stack_top,
     })
 }
 
@@ -1457,7 +1460,7 @@ fn idle_thread(code_generation: u64, clean: Option<unicorn_engine::Context>) -> 
         current_call: "",
         native: None,
         recent: VecDeque::new(),
-        runner: make_runner(0, 0, 0),
+        runner: make_runner(0, 0, 0, 0),
         code_generation,
         clean,
         resume_at: None,
@@ -1534,7 +1537,7 @@ fn adopt_engine(uc: &mut Uc) {
         current_call: "",
         native: None,
         recent: VecDeque::with_capacity(32),
-        runner: new_runner(id, errno_slot, tls_block),
+        runner: new_runner(id, errno_slot, tls_block, stack_top),
         code_generation,
         clean,
         resume_at: None,
