@@ -178,6 +178,8 @@ pub fn register(_: &mut Registry) {
             ("dataWithBytesNoCopy:length:", data_with_bytes_no_copy as usize),
             ("dataWithBytesNoCopy:length:freeWhenDone:", data_with_bytes_no_copy_free as usize),
             ("dataWithContentsOfFile:", data_with_contents_of_file as usize),
+            // The old name: iOS maps the file, a plain read gives the same bytes.
+            ("dataWithContentsOfMappedFile:", data_with_contents_of_file as usize),
             ("dataWithContentsOfURL:", data_with_contents_of_url as usize),
             ("dataWithData:", data_with_data as usize),
         ],
@@ -188,6 +190,7 @@ pub fn register(_: &mut Registry) {
             ("initWithBytes:length:", data_init_with_bytes as usize),
             ("initWithData:", data_init_with_data as usize),
             ("initWithContentsOfFile:", data_init_with_contents_of_file as usize),
+            ("initWithContentsOfMappedFile:", data_init_with_contents_of_file as usize),
             ("bytes", data_bytes as usize),
             ("length", data_length as usize),
             ("base64EncodedStringWithOptions:", data_base64 as usize),

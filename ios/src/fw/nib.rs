@@ -797,6 +797,43 @@ extern "C" fn bundle_load_nib(this: Id, _: Sel, name: Id, owner: Id, options: Id
     nib_instantiate(nib, 0, owner, options)
 }
 
+// ----- the main nib (UIApplicationMain) -----
+
+/// The nib an app starts from: Info.plist NSMainNibFile, its variant for
+/// this kind of device first.
+pub fn main_nib_name(info: &crate::fw::plist::Value, tablet: bool) -> Option<String> {
+    let variant = if tablet { "NSMainNibFile~ipad" } else { "NSMainNibFile~iphone" };
+    [variant, "NSMainNibFile"].into_iter().find_map(|key| match info.get(key) {
+        Some(crate::fw::plist::Value::String(name)) if !name.is_empty() => Some(name.clone()),
+        _ => None,
+    })
+}
+
+/// What UIApplicationMain does with the main nib before the app's launch
+/// code: loads it with the app object as its owner, so its outlets set the
+/// app's delegate (and the delegate's window). Its top-level objects are
+/// kept for the whole run, as UIKit keeps them; 0 when there is none.
+pub fn load_main_nib_from(info: &crate::fw::plist::Value, bundle: Id, app: Id, tablet: bool) -> Id {
+    let Some(name) = main_nib_name(info, tablet) else { return 0 };
+    let top = runtime::send(bundle, "loadNibNamed:owner:options:", &[string::make(&name), app, 0]);
+    if top == 0 {
+        crate::log!("main nib {name}: can't be opened");
+        return 0;
+    }
+    crate::log!("main nib {name}: {} objects", collections::array_items(top).len());
+    runtime::send(top, "retain", &[])
+}
+
+/// The main nib of the running app (its Info.plist).
+pub fn load_main_nib(app: Id) -> Id {
+    let Some(app_dir) = crate::loader::try_app_dir() else { return 0 };
+    let Some(info) = std::fs::read(format!("{app_dir}/Info.plist")).ok().and_then(|bytes| crate::fw::plist::parse(&bytes)) else {
+        return 0;
+    };
+    let tablet = crate::libsystem::io::device_model().starts_with("iPad");
+    load_main_nib_from(&info, runtime::send(runtime::class_named("NSBundle"), "mainBundle", &[]), app, tablet)
+}
+
 pub fn register(_: &mut Registry) {
     if runtime::class_named("NSCoder") == 0 {
         define_class("NSCoder", "NSObject", 8);
@@ -1462,6 +1499,9 @@ mod tests {
                 ],
             );
             object::define_class("NibTestRecorderChild", "NibTestRecorder", 16);
+            // The app object a main nib is loaded with: its delegate is the partner.
+            let app = object::define_class("NibTestApp", "NSObject", 16);
+            object::methods(app, &[("setDelegate:", recorder_set_partner as usize)]);
             // The scene nib's controller class, made here as a recorder.
             object::define_class("NibTestSceneController", "NibTestRecorder", 16);
             let owner = object::define_class("NibTestOwner", "NSObject", 16);
@@ -1922,6 +1962,56 @@ mod tests {
         assert_eq!(top.len(), 1);
         assert_eq!(record(top[0]).count, 2);
         assert_eq!(runtime::send(bundle, "loadNibNamed:owner:options:", &[string::make("Nothing"), 0, 0]), 0);
+        std::fs::remove_dir_all(&folder).unwrap();
+    }
+
+    /// The main nib (Info.plist NSMainNibFile, the device's variant first) is
+    /// loaded with the app as its owner, as UIApplicationMain does: its
+    /// outlets give the app its delegate and the delegate its window.
+    #[test]
+    fn the_main_nib_gives_the_app_its_delegate() {
+        test_classes();
+        use crate::fw::plist::Value as Plist;
+        let info = Plist::Dict(vec![
+            ("NSMainNibFile".into(), Plist::String("Launch".into())),
+            ("NSMainNibFile~ipad".into(), Plist::String("Launch-Tablet".into())),
+        ]);
+        assert_eq!(main_nib_name(&info, false).as_deref(), Some("Launch"));
+        assert_eq!(main_nib_name(&info, true).as_deref(), Some("Launch-Tablet"));
+        assert_eq!(main_nib_name(&Plist::Dict(vec![]), false), None);
+
+        let mut b = Builder::new();
+        let owner = b.proxy("IBFilesOwner");
+        let responder = b.proxy("IBFirstResponder");
+        let class_name = b.string("NibTestRecorder");
+        let original = b.string("UICustomObject");
+        let delegate = b.object("UIClassSwapper", vec![("UIClassName", Put::Ref(class_name)), ("UIOriginalClassName", Put::Ref(original))]);
+        let window = b.object("UIWindow", vec![]);
+        let outlet = |b: &mut Builder, label: &str, source: usize, destination: usize| {
+            let label = b.string(label);
+            b.object(
+                "UIRuntimeOutletConnection",
+                vec![("UILabel", Put::Ref(label)), ("UISource", Put::Ref(source)), ("UIDestination", Put::Ref(destination))],
+            )
+        };
+        let to_delegate = outlet(&mut b, "delegate", owner, delegate);
+        let to_window = outlet(&mut b, "thing", delegate, window);
+        b.standard_root(&[owner, responder, delegate, window], &[owner, responder, delegate, window], &[to_delegate, to_window]);
+        let folder = std::env::temp_dir().join(format!("gamebridge-main-nib-{}", std::process::id()));
+        let app_dir = folder.join("Game.app");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(app_dir.join("Launch.nib"), b.bytes()).unwrap();
+        let bundle = runtime::send(runtime::class_named("NSBundle"), "bundleWithPath:", &[string::make(&app_dir.to_string_lossy())]);
+
+        let app = runtime::send(runtime::send(runtime::class_named("NibTestApp"), "alloc", &[]), "init", &[]);
+        let top = load_main_nib_from(&info, bundle, app, false);
+        assert_eq!(collections::array_items(top).len(), 2, "the delegate and the window (placeholders left out)");
+        let made = record(app).partner;
+        assert_ne!(made, 0, "the nib set the app's delegate");
+        assert_eq!(string::describe_class_of(made), "NibTestRecorder");
+        assert_eq!(string::describe_class_of(record(made).thing), "UIWindow", "the delegate got its window");
+        let none = Plist::Dict(vec![]);
+        assert_eq!(load_main_nib_from(&none, bundle, app, false), 0, "no main nib named");
         std::fs::remove_dir_all(&folder).unwrap();
     }
 

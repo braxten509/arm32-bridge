@@ -43,14 +43,22 @@ extern "C" fn ui_application_main(_argc: i32, _argv: usize, principal: Id, deleg
     let app_class = class_for_name(principal, "UIApplication");
     let app = runtime::send(runtime::send(app_class, "alloc", &[]), "init", &[]);
     APPLICATION.store(app, Ordering::Relaxed);
-    if delegate_name == 0 {
-        crate::log!("STOP: UIApplicationMain without a delegate class (reading it from a storyboard is not supported)");
+    if delegate_name != 0 {
+        let delegate_class = class_for_name(delegate_name, "");
+        let delegate_object = runtime::send(runtime::send(delegate_class, "alloc", &[]), "init", &[]);
+        DELEGATE.store(delegate_object, Ordering::Relaxed);
+    }
+    // Older apps name their delegate in the main nib (owner: the app), not here.
+    crate::fw::nib::load_main_nib(app);
+    let delegate_object = DELEGATE.load(Ordering::Relaxed);
+    if delegate_object == 0 {
+        crate::log!("STOP: UIApplicationMain without a delegate (no delegate class, and no main nib gave one)");
         crate::report::finish(1);
     }
-    let delegate_class = class_for_name(delegate_name, "");
-    let delegate_object = runtime::send(runtime::send(delegate_class, "alloc", &[]), "init", &[]);
-    DELEGATE.store(delegate_object, Ordering::Relaxed);
-    let class_name = lock().class_name(delegate_class);
+    let class_name = {
+        let rt = lock();
+        rt.class_name(rt.class_of(delegate_object))
+    };
     crate::log!("UIApplicationMain: app {app:#x}, delegate {class_name} {delegate_object:#x}");
 
     // Apple's launch order: the main storyboard (window, root view
@@ -60,7 +68,9 @@ extern "C" fn ui_application_main(_argc: i32, _argv: usize, principal: Id, deleg
     for name in ["application:willFinishLaunchingWithOptions:", "application:didFinishLaunchingWithOptions:"] {
         if let Some(imp) = runtime::imp_for(delegate_object, runtime::sel(name)) {
             let place = crate::loader::describe_address(imp);
-            let in_game = crate::loader::try_loaded().map(|l| imp >= l.start && imp < l.end).unwrap_or(false);
+            // A 32-bit game's methods all start at the mirror trampoline.
+            let in_game = crate::loader::try_loaded().map(|l| imp >= l.start && imp < l.end).unwrap_or(false)
+                || imp == crate::guest32::objc::mirror::trampoline_address();
             crate::log!("calling -[{class_name} {name}] at {place}");
             if name.starts_with("application:didFinish") {
                 crate::report::reached_did_finish(in_game, &place);
