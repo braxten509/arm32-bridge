@@ -16,6 +16,8 @@ libc = "0.2.190"
 unicorn-engine = { version = "2.1.5", default-features = false, features = ["arch_arm"] }
 # 32-bit iPhone programs (Mach-O reader and load planner; pure Rust).
 guest32-image = { path = "ios/guest32-image" }
+# The bridge's memory allocator (src/lib.rs); local-dynamic TLS because Android loads the bridge with dlopen.
+mimalloc = { version = "0.1.52", features = ["local_dynamic_tls"] }
 
 [workspace]
 members = ["converter", "pacer", "ios", "ios/guest32-image"]

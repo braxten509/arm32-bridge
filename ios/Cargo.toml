@@ -41,3 +41,5 @@ jni-sys = "0.3"
 [dev-dependencies]
 # Tests drive the phone app's way in (java_text.rs) with a stand-in JNI table.
 jni-sys = "0.3"
+# Checks that the bridge's memory comes from mimalloc (src/lib.rs).
+libmimalloc-sys = { version = "0.1.49", features = ["extended"] }

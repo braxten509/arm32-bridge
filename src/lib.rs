@@ -2,6 +2,12 @@
 //! process. Built as a command-line tool (src/main.rs) for testing, and as a
 //! drop-in replacement for a game's native library inside its APK (app.rs).
 
+/// Every allocation of the bridge's own code goes through mimalloc: the
+/// phone's malloc (GrapheneOS's hardened one) made each small one slow enough
+/// that SpellCraft stalled ~100 ms during its message bursts.
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub mod dynarec;
 pub mod elf;
 pub mod imports;

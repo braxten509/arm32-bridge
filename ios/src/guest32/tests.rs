@@ -1161,3 +1161,12 @@ fn gil_mode_waiting_threads_let_others_run_game_code() {
         assert_eq!(CALLS.load(Ordering::SeqCst), round);
     }
 }
+
+#[test]
+fn the_bridges_own_memory_comes_from_the_fast_allocator() {
+    // SpellCraft on the Pixel stalled ~100 ms twice a second: about half of
+    // its game thread went to GrapheneOS's hardened malloc, which every small
+    // bridge allocation (each objc_msgSend asks for several) went through.
+    let block = Box::new([7u8; 24]);
+    assert!(unsafe { libmimalloc_sys::mi_is_in_heap_region(block.as_ptr().cast()) }, "Rust memory still comes from the system's malloc");
+}
