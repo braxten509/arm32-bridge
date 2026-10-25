@@ -1006,14 +1006,52 @@ fn remote_io_unit(rate: f64, channels: u32) -> u32 {
     assert_eq!(call("AudioComponentInstanceNew", [component, out, 0, 0], &[]).0, 0);
     let unit = mem().read_u32(out);
     assert_ne!(unit, 0);
+    set_format(unit, 0, rate, channels);
+    unit
+}
+
+/// A 16-bit stream format on input `element` of a unit.
+fn set_format(unit: u32, element: u32, rate: f64, channels: u32) {
     let format = alloc(40);
     mem().write_bytes(format, &rate.to_ne_bytes());
     for (i, word) in [four_cc(b"lpcm"), 0xC, 2 * channels, 1, 2 * channels, channels, 16, 0].iter().enumerate() {
         mem().write_u32(format + 8 + i as u32 * 4, *word);
     }
-    // AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat, input scope, 0, format, 40).
-    assert_eq!(call("AudioUnitSetProperty", [unit, 8, 1, 0], &[format, 40]).0, 0);
-    unit
+    // AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat, input scope, element, format, 40).
+    assert_eq!(call("AudioUnitSetProperty", [unit, 8, 1, element], &[format, 40]).0, 0);
+}
+
+/// Writes Thumb halfwords into guest memory; returns the address with the Thumb bit.
+fn thumb_code(code: &[u16]) -> u32 {
+    let address = alloc(code.len() as u32 * 2);
+    for (i, half) in code.iter().enumerate() {
+        mem().write_bytes(address + i as u32 * 2, &half.to_le_bytes());
+    }
+    address | 1
+}
+
+/// AURenderCallbackStruct { inputProc, inputProcRefCon }: two guest words
+/// for game code callback(refCon, *flags, *stamp, bus, frames, ioData) that
+/// writes the 16-bit ramp 0, 1, 2 ... into ioData->mBuffers[0].mData
+/// (offset 12 in the 32-bit AudioBufferList) and returns noErr.
+fn ramp_callback() -> u32 {
+    let code = thumb_code(&[
+        0x9A01, // ldr r2, [sp, #4]   ioData
+        0x9900, // ldr r1, [sp]       frames
+        0x68D2, // ldr r2, [r2, #12]  mData
+        0x2300, // movs r3, #0
+        0x8013, // strh r3, [r2]
+        0x3202, // adds r2, #2
+        0x3301, // adds r3, #1
+        0x428B, // cmp r3, r1
+        0xDBFA, // blt (the strh)
+        0x2000, // movs r0, #0
+        0x4770, // bx lr
+    ]);
+    let callback = alloc(8);
+    mem().write_u32(callback, code);
+    mem().write_u32(callback + 4, 0x1234);
+    callback
 }
 
 #[test]
@@ -1033,31 +1071,7 @@ fn audio_unit_structs_cross_from_32_bit() {
 /// A mono 16-bit RemoteIO unit whose render callback is game code writing a ramp.
 fn ramp_unit() -> u32 {
     let unit = remote_io_unit(44100.0, 1);
-    // Thumb: callback(refCon, *flags, *stamp, bus, frames, ioData) writes the
-    // 16-bit ramp 0, 1, 2 ... into ioData->mBuffers[0].mData (offset 12 in
-    // the 32-bit AudioBufferList) and returns noErr.
-    let code = alloc(24);
-    let thumb: [u16; 11] = [
-        0x9A01, // ldr r2, [sp, #4]   ioData
-        0x9900, // ldr r1, [sp]       frames
-        0x68D2, // ldr r2, [r2, #12]  mData
-        0x2300, // movs r3, #0
-        0x8013, // strh r3, [r2]
-        0x3202, // adds r2, #2
-        0x3301, // adds r3, #1
-        0x428B, // cmp r3, r1
-        0xDBFA, // blt (the strh)
-        0x2000, // movs r0, #0
-        0x4770, // bx lr
-    ];
-    for (i, half) in thumb.iter().enumerate() {
-        mem().write_bytes(code + i as u32 * 2, &half.to_le_bytes());
-    }
-    // AURenderCallbackStruct { inputProc, inputProcRefCon }: two guest words.
-    let callback = alloc(8);
-    mem().write_u32(callback, code | 1);
-    mem().write_u32(callback + 4, 0x1234);
-    assert_eq!(call("AudioUnitSetProperty", [unit, 23, 0, 0], &[callback, 8]).0, 0);
+    assert_eq!(call("AudioUnitSetProperty", [unit, 23, 0, 0], &[ramp_callback(), 8]).0, 0);
     unit
 }
 
@@ -1099,4 +1113,110 @@ fn a_render_call_is_silent_while_the_guest_lock_is_kept() {
     // Holding it here: the other GIL-mode tests may be using it right now.
     let _gil = runtime::hold_gil();
     assert_eq!(crate::fw::sound::render_input(unit, 0, 64), ramp(64), "game code runs with the lock");
+}
+
+/// A host AudioBufferList with one buffer of `size` bytes and no data
+/// pointer: count, then { channels, size, data (8 bytes) } from offset 8.
+fn host_list(size: u32) -> [u64; 4] {
+    let mut list = [0u64; 4];
+    list[0] = 1;
+    list[1] = 1 | (size as u64) << 32;
+    list
+}
+
+#[test]
+fn a_render_callback_with_its_own_buffer_hands_the_host_a_copy() {
+    setup();
+    let own = alloc(128);
+    for i in 0..64u32 {
+        mem().write_bytes(own + i * 2, &(i as i16).to_le_bytes());
+    }
+    // refCon -> { own buffer, the time stamp pointer the game was given }.
+    let context = alloc(8);
+    mem().write_u32(context, own);
+    let code = thumb_code(&[
+        0x9B01, // ldr r3, [sp, #4]   ioData
+        0x6801, // ldr r1, [r0]       own buffer
+        0x60D9, // str r1, [r3, #12]  mData = own buffer
+        0x6042, // str r2, [r0, #4]   the stamp pointer
+        0x2000, // movs r0, #0
+        0x4770, // bx lr
+    ]);
+    let render = super::audio::guest_render_for(code, context);
+    let mut list = host_list(128);
+    let (mut flags, stamp) = (0u32, [0u8; 64]);
+    let status = super::audio::guest_render(render, &mut flags, stamp.as_ptr(), 0, 64, list.as_mut_ptr() as *mut u8);
+    assert_eq!(status, 0);
+    let (size, data) = ((list[1] >> 32) as usize, list[2] as usize);
+    let base = mem().host(0) as usize;
+    assert!(!(base..base + (1 << 32)).contains(&data), "the host reads a copy, not guest memory another thread may reuse");
+    let samples = |data: usize| unsafe { std::slice::from_raw_parts(data as *const u8, 128) }.to_vec();
+    assert_eq!(size, 128);
+    assert_eq!(samples(data), mem().bytes(own, 128));
+    mem().write_bytes(own, &[0; 128]);
+    assert_ne!(samples(data), vec![0; 128], "the game reusing its buffer leaves the copy alone");
+    assert_eq!(mem().read_u32(context + 4) % 8, 0, "AudioTimeStamp (doubles) is 8-aligned");
+}
+
+/// The AUGraph route: a multichannel mixer's input bus pulls game code.
+#[test]
+fn a_32_bit_graph_pulls_its_mixer_input_from_game_code() {
+    let out = alloc(4);
+    assert_eq!(call("NewAUGraph", [out, 0, 0, 0], &[]).0, 0);
+    let graph = mem().read_u32(out);
+    assert_ne!(graph, 0);
+    let description = alloc(20);
+    for (i, word) in [four_cc(b"aumx"), four_cc(b"mcmx"), four_cc(b"appl"), 0, 0].iter().enumerate() {
+        mem().write_u32(description + i as u32 * 4, *word);
+    }
+    assert_eq!(call("AUGraphAddNode", [graph, description, out, 0], &[]).0, 0);
+    let node = mem().read_u32(out);
+    let found = alloc(20);
+    assert_eq!(call("AUGraphNodeInfo", [graph, node, found, out], &[]).0, 0);
+    assert_eq!(mem().read_u32(found + 4), four_cc(b"mcmx"));
+    let unit = mem().read_u32(out);
+    assert_ne!(unit, 0);
+    for name in ["AUGraphOpen", "AUGraphInitialize", "AUGraphStart"] {
+        assert_eq!(call(name, [graph, 0, 0, 0], &[]).0, 0, "{name}");
+    }
+    set_format(unit, 2, 44100.0, 1);
+    assert_eq!(call("AUGraphSetNodeInputCallback", [graph, node, 2, ramp_callback()], &[]).0, 0);
+    assert_eq!(crate::fw::sound::render_input(super::handle_to_host(unit), 2, 64), ramp(64));
+    for name in ["AUGraphStop", "AUGraphUninitialize", "AUGraphClose", "DisposeAUGraph"] {
+        assert_eq!(call(name, [graph, 0, 0, 0], &[]).0, 0, "{name}");
+    }
+}
+
+/// AudioUnitRender from a 32-bit caller (the microphone, which is silent
+/// here): buffers it leaves empty get guest memory the game can read.
+#[test]
+fn audio_unit_render_gives_32_bit_callers_guest_buffers() {
+    let unit = remote_io_unit(44100.0, 1);
+    let (list, flags, stamp) = (alloc(16), alloc(4), alloc(64));
+    for (i, word) in [1, 1, 0, 0].iter().enumerate() {
+        mem().write_u32(list + i as u32 * 4, *word);
+    }
+    mem().write_u32(flags, 0);
+    assert_eq!(call("AudioUnitRender", [unit, flags, stamp, 1], &[64, list]).0, 0);
+    let (size, data) = (mem().read_u32(list + 8), mem().read_u32(list + 12));
+    assert_ne!(data, 0, "a guest buffer");
+    assert!(size >= 128, "{size} bytes for 64 frames");
+    assert!(mem().bytes(data, size as usize).iter().all(|&b| b == 0), "silence");
+    assert_ne!(mem().read_u32(flags) & 16, 0, "kAudioUnitRenderAction_OutputIsSilence");
+    call("AudioComponentInstanceDispose", [unit, 0, 0, 0], &[]);
+}
+
+/// A sound thread that ends (AAudio opens each stream on a new thread)
+/// gives its guest thread back.
+#[test]
+fn a_sound_thread_that_ends_gives_back_its_guest_thread() {
+    let unit = super::handle_to_host(ramp_unit());
+    let id = std::thread::spawn(move || {
+        assert_eq!(crate::fw::sound::render_input(unit, 0, 64), ramp(64));
+        let _gil = runtime::hold_gil();
+        runtime::engine().get_data().id
+    })
+    .join()
+    .unwrap();
+    assert!(super::audio::retired_render_threads().contains(&id), "guest thread {id} given back");
 }
