@@ -606,7 +606,7 @@ impl Bridge {
             return match self.classes.lookup(isa, sel) {
                 Lookup::Guest(m) => Ok(Target::Guest { imp: m.imp, types: m.types.clone() }),
                 Lookup::Framework { class, meta } => self.framework_target(&class, meta, sel, false),
-                Lookup::Missing => Err(format!("{}{sel}: no method in the game's class chain", self.describe(isa))),
+                Lookup::Missing => Err(format!("{MISSING_METHOD}{}{sel}: no method in the game's class chain", self.describe(isa))),
             };
         }
         match self.framework_by_guest.get(&isa) {
@@ -941,6 +941,10 @@ pub fn set_block_owner(g: &'static dyn GuestSide) {
     *BLOCK_OWNER.write().unwrap_or_else(|e| e.into_inner()) = Some(g);
 }
 
+/// How every "the game asked for a method nobody has" error starts, so a
+/// run that keeps going can skip just that message (`functions::skip_missing`).
+pub const MISSING_METHOD: &str = "missing method ";
+
 /// Type encoding for a message the host answers: the framework table, else
 /// the game's own method of the same name (an override has the same types).
 fn host_signature(b: &Bridge, class: &str, meta: bool, sel: &str) -> Result<(Signature, HostCallOptions), String> {
@@ -953,7 +957,7 @@ fn host_signature(b: &Bridge, class: &str, meta: bool, sel: &str) -> Result<(Sig
         return Ok((Signature::parse_method(types)?, HostCallOptions::default()));
     }
     Err(format!(
-        "{}[{class} {sel}]: no type encoding for this framework selector (add it to framework_selectors.tsv)",
+        "{MISSING_METHOD}{}[{class} {sel}]: no type encoding for this framework selector (add it to framework_selectors.tsv)",
         if meta { "+" } else { "-" }
     ))
 }
@@ -1182,7 +1186,7 @@ impl Bridge {
         match self.classes.lookup(parent, sel) {
             Lookup::Guest(m) => Ok(Target::Guest { imp: m.imp, types: m.types.clone() }),
             Lookup::Framework { class, meta } => self.framework_target(&class, meta, sel, true),
-            Lookup::Missing => Err(format!("{}{sel}]: super call finds no method", self.describe(parent))),
+            Lookup::Missing => Err(format!("{MISSING_METHOD}{}{sel}]: super call finds no method", self.describe(parent))),
         }
     }
 }

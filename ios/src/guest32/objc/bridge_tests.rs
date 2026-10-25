@@ -167,6 +167,15 @@ fn guest_messages_reach_game_code_host_code_and_super() {
     let unknown = bridge_ref.lock().unwrap().guest_selector(fake, "frobnicate:");
     let error = send(bridge_ref, fake, &[object, unknown, 1]).unwrap_err();
     assert!(error.contains("frobnicate:"), "{error}");
+    // Keeping going (always on the phone): that one message is skipped, the
+    // game gets 0 back, and the log and the missing list name it.
+    let mut watch = crate::report::LineWatch::now();
+    let skipped = super::functions::skip_missing(send_from_guest(bridge_ref, fake, SendKind::Normal, &|i| [object, unknown, 1].get(i as usize).copied().unwrap_or(0)), true);
+    assert_eq!(skipped.map(|r| (r.r0, r.r1)), Ok((0, 0)));
+    assert!(watch.wait_for("ERROR: missing method", std::time::Duration::ZERO), "an error line in the log");
+    assert!(runtime::missing_methods().iter().any(|(name, _)| name.contains("frobnicate:")), "in the missing list");
+    // A failure that isn't a missing method still stops the call.
+    assert!(super::functions::skip_missing(Err("guest object 0x10 is not known to the bridge".into()), true).is_err());
 
     // The host messages the game object: the trampoline converts and runs guest code.
     let _hook = mirror::DISPATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());

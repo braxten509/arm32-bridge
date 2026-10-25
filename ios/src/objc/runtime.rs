@@ -497,6 +497,15 @@ fn missing_method(class: Class, receiver_is_class: bool, sel: Sel, caller: usize
     crate::report::finish(1);
 }
 
+/// Counts a call to a method nobody has (named like "-[Class selector");
+/// says whether it is the first.
+pub fn note_missing_method(text: &str) -> bool {
+    let mut rt = lock();
+    let count = rt.missing_methods.entry(text.to_string()).or_default();
+    *count += 1;
+    *count == 1
+}
+
 /// Methods asked for that don't exist. Gives nothing if the runtime is busy
 /// (a crash report must not wait on a lock the crashed code held).
 pub fn missing_methods() -> Vec<(String, u64)> {

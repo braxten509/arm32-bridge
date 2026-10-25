@@ -15,7 +15,7 @@ use super::bridge::{
     BLOCK_REFCOUNT_MASK,
 };
 use super::classes::{Lookup, Super};
-use super::convert::HostCallOptions;
+use super::convert::{GuestRet, HostCallOptions};
 use super::encoding::Signature;
 use super::selectors::{FrameworkSelectors, Varargs};
 use crate::objc::runtime;
@@ -233,8 +233,29 @@ pub fn call_function(ctx: &Ctx, name: &str, words: Words) -> Result<u64, String>
 }
 
 fn send(c: &Ctx, w: Words, kind: SendKind) -> Result<u64, String> {
-    let r = send_from_guest(c.bridge, c.g, kind, w)?;
+    let keep_going = crate::trap::KEEP_GOING.load(std::sync::atomic::Ordering::Relaxed);
+    let r = skip_missing(send_from_guest(c.bridge, c.g, kind, w), keep_going)?;
     Ok(u64::from(r.r0) | u64::from(r.r1) << 32)
+}
+
+/// A message to a method nobody has: when the run keeps going (always on the
+/// phone), only that message is skipped and the game gets 0 back, with an
+/// error in the log (once per method) and the method in the missing list;
+/// otherwise, and for every other failure, the game's call stops as before.
+pub(super) fn skip_missing(result: Result<GuestRet, String>, keep_going: bool) -> Result<GuestRet, String> {
+    match result {
+        Err(error) if keep_going && error.starts_with(super::bridge::MISSING_METHOD) => {
+            // "-[Class selector:]", from "missing method -[Class selector:]: why".
+            let rest = &error[super::bridge::MISSING_METHOD.len()..];
+            let name = rest.split(": ").next().unwrap_or(rest);
+            let name = if name.ends_with(']') { name.to_string() } else { format!("{name}]") };
+            if crate::objc::runtime::note_missing_method(&name) {
+                crate::log!("ERROR: {error}; skipped, the game got 0");
+            }
+            Ok(GuestRet { r0: 0, r1: 0 })
+        }
+        other => other,
+    }
 }
 
 fn store_strong(c: &Ctx, w: Words) -> Result<u64, String> {
