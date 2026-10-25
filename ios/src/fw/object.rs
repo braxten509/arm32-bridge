@@ -1321,6 +1321,7 @@ mod tests {
         runtime::send(object, "setValue:forKey:", &[s("quiet"), s("title")]);
         assert_eq!(take(), [], "removed");
         assert_eq!(string::get(thing_title(object, 0)), "quiet");
+        assert_eq!(string::get(runtime::send(object, "performSelector:", &[runtime::sel("title")])), "quiet", "performSelector: still answers");
     }
 
     /// Fields of a 32-bit game's object: long is 4 bytes, 8-byte values may
