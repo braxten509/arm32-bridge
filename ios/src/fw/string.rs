@@ -707,6 +707,15 @@ extern "C" fn path_components(this: Id, _: Sel) -> Id {
     crate::fw::collections::array_from(&parts)
 }
 
+/// +pathWithComponents: the parts joined by "/"; a leading "/" part makes
+/// the path absolute, empty parts and doubled or trailing slashes go away.
+extern "C" fn path_with_components(_: Class, _: Sel, components: Id) -> Id {
+    let parts: Vec<String> = crate::fw::collections::array_items(components).into_iter().map(get).collect();
+    let absolute = parts.first().is_some_and(|p| p.starts_with('/'));
+    let inner: Vec<&str> = parts.iter().flat_map(|p| p.split('/')).filter(|p| !p.is_empty()).collect();
+    make(&format!("{}{}", if absolute { "/" } else { "" }, inner.join("/")))
+}
+
 extern "C" fn by_appending_path_component(this: Id, _: Sel, other: Id) -> Id {
     let base = get(this);
     let other = get(other);
@@ -871,6 +880,7 @@ pub fn register(r: &mut Registry) {
             ("string", empty_string as usize),
             ("stringWithUTF8String:", string_with_utf8 as usize),
             ("stringWithString:", string_with_string as usize),
+            ("pathWithComponents:", path_with_components as usize),
             ("stringWithCharacters:length:", string_with_characters as usize),
             ("stringWithCString:encoding:", string_with_c_string as usize),
             ("stringWithFormat:", ios_string_with_format as usize),
@@ -913,5 +923,25 @@ mod tests {
         ONCE.call_once(crate::run::setup);
         let absolute = |path: &str| crate::objc::runtime::send(make(path), "isAbsolutePath", &[]) as u8 != 0;
         assert_eq!([absolute("/a/b.tmx"), absolute("~/a"), absolute("a/b.tmx"), absolute("")], [true, true, false, false]);
+    }
+
+    /// +pathWithComponents: undoes -pathComponents (CocosDenshion finds its
+    /// sound files this way; a file with no folder gives no components).
+    #[test]
+    fn path_with_components_joins_what_path_components_splits() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let class = crate::objc::runtime::class_named("NSString");
+        let join = |parts: &[&str]| {
+            let items: Vec<Id> = parts.iter().map(|p| make(p)).collect();
+            get(crate::objc::runtime::send(class, "pathWithComponents:", &[crate::fw::collections::array_from(&items)]))
+        };
+        assert_eq!(join(&["/", "tmp", "scratch.tiff"]), "/tmp/scratch.tiff");
+        assert_eq!(join(&["Sounds", "hit.caf"]), "Sounds/hit.caf");
+        assert_eq!(join(&["a", "", "b/"]), "a/b");
+        assert_eq!(join(&[]), "");
+        assert_eq!(join(&["/"]), "/");
+        let split = crate::objc::runtime::send(make("/x/y.png"), "pathComponents", &[]);
+        assert_eq!(get(crate::objc::runtime::send(class, "pathWithComponents:", &[split])), "/x/y.png");
     }
 }

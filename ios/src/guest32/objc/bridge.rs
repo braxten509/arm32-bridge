@@ -1212,6 +1212,14 @@ pub fn dispatch_from_host(bridge: &Mutex<Bridge>, g: &dyn GuestSide, frame: &mut
     let name = unsafe { runtime::cstr(frame.x[1] as usize) };
     let guest_self = b.guest_object(g, host_self)?;
     let isa = u32_at(g, guest_self);
+    // IOS_TRACE_MESSAGES also names the host's calls into game methods
+    // (control actions, timers, delegate calls).
+    if runtime::message_trace_on() {
+        let (class_name, class_is_meta) = b.class_display(isa);
+        if let Some(text) = runtime::traced_message_text(&class_name, class_is_meta, &name) {
+            crate::log!("32-bit message from the host {text}");
+        }
+    }
     if let Some(class) = class_to_initialize(&b, isa) {
         drop(b);
         initialize(bridge, g, class)?;

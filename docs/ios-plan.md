@@ -71,6 +71,9 @@ IOS_RUN_SECONDS=240 ios/tools/run-pc.sh <App>.app [--keep-going]
 `on=` (or the older `after=`) takes a plain part of a line (not a pattern)
 and ends at `=>`; steps go in order. There are no fixed-time taps: a step
 whose line never comes is never tapped, and the run cap ends the test.
+A `jump=` step goes as soon as its line comes even while earlier steps
+still wait, dropping them (walks on random maps: repeat a walking step on
+a line that keeps coming, then `jump=segue ShowBattleIntroView=>...`).
 
 Check that our fix-up lists match Apple's tool exactly:
 

@@ -229,7 +229,34 @@ pub struct Timer(Mutex<TimerState>);
 static TIMERS_FIRED: AtomicUsize = AtomicUsize::new(0);
 
 fn timer(object: Id) -> std::sync::MutexGuard<'static, TimerState> {
-    unsafe { (**((object + 8) as *const *const Timer)).0.lock().unwrap() }
+    let slot = unsafe { &*((object + 8) as *const std::sync::atomic::AtomicPtr<Timer>) };
+    let mut state = slot.load(Ordering::Acquire);
+    if state.is_null() {
+        // Made with plain alloc/init, not one of the timer makers: a timer
+        // that never fires (Apple's answers to it likewise do nothing).
+        let blank = TimerState {
+            fire_at: f64::INFINITY,
+            interval: 0.0,
+            repeats: false,
+            target: 0,
+            selector: 0,
+            user_info: 0,
+            valid: false,
+            owner: None,
+            paused: false,
+            pass_argument: false,
+            frames: 1,
+        };
+        let made = Box::into_raw(Box::new(Timer(Mutex::new(blank))));
+        state = match slot.compare_exchange(std::ptr::null_mut(), made, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => made,
+            Err(other) => {
+                drop(unsafe { Box::from_raw(made) });
+                other
+            }
+        };
+    }
+    unsafe { (*state).0.lock().unwrap() }
 }
 
 fn make_timer(class: Class, interval: f64, target: Id, selector: Sel, user_info: Id, repeats: bool) -> Id {
@@ -1000,6 +1027,19 @@ mod frame_rate_tests {
         let refresh = 1.0 / 120.0;
         assert_eq!(link_interval(refresh, 2, false), refresh);
         assert_eq!(link_interval(refresh, 2, true), 2.0 * refresh, "IOS_FRAME_INTERVAL=1 keeps the game's choice");
+    }
+
+    /// A timer made with plain alloc/init (a placeholder some games keep
+    /// before their first real one) answers like an invalidated timer.
+    #[test]
+    fn a_plain_alloc_init_timer_can_be_invalidated() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let class = runtime::class_named("NSTimer");
+        let timer = runtime::send(runtime::send(class, "alloc", &[]), "init", &[]);
+        runtime::send(timer, "invalidate", &[]);
+        assert_eq!(runtime::send(timer, "isValid", &[]) as u8, 0);
+        assert_eq!(runtime::send(timer, "userInfo", &[]), 0);
     }
 }
 

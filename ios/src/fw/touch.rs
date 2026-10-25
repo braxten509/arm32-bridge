@@ -332,14 +332,18 @@ struct TestTap {
     on: Trigger,
     from: Point,
     to: Point,
+    /// `jump=`: goes as soon as its line comes, dropping the steps still
+    /// waiting before it (walks on random maps end at a screen any time).
+    jump: bool,
 }
 
 /// IOS_TAPS="on=screen shown: IntroViewController=>505,29;ready=>284,297;on=frame 1 shown=>420,250>460,250":
 /// each tap goes out the moment a log line holds the text after `on=`
 /// (`after=` means the same), or with `ready` once the drawn screen has
 /// something at that place to take it; nothing waits or counts seconds. A
-/// swipe goes from x,y to x2,y2 over about 150 ms. A step that isn't whole
-/// is left out.
+/// swipe goes from x,y to x2,y2 over about 150 ms. A `jump=` step goes the
+/// moment its line comes even while steps before it still wait (those are
+/// dropped). A step that isn't whole is left out.
 fn parse_test_taps(text: &str) -> Vec<TestTap> {
     let point = |text: &str| -> Option<Point> {
         let (x, y) = text.split_once(',')?;
@@ -349,15 +353,18 @@ fn parse_test_taps(text: &str) -> Vec<TestTap> {
         .filter_map(|step| {
             let (when, place) = step.split_once("=>")?;
             let when = when.trim();
+            let jump = when.starts_with("jump=");
             let on = match when {
                 "ready" => Trigger::Ready,
-                _ => Trigger::Line(when.strip_prefix("on=").or_else(|| when.strip_prefix("after=")).filter(|text| !text.is_empty())?.to_string()),
+                _ => Trigger::Line(
+                    when.strip_prefix("on=").or_else(|| when.strip_prefix("after=")).or_else(|| when.strip_prefix("jump=")).filter(|text| !text.is_empty())?.to_string(),
+                ),
             };
             let (from, to) = match place.trim().split_once('>') {
                 Some((from, to)) => (point(from)?, point(to)?),
                 None => (point(place.trim())?, point(place.trim())?),
             };
-            Some(TestTap { on, from, to })
+            Some(TestTap { on, from, to, jump })
         })
         .collect()
 }
@@ -389,17 +396,19 @@ pub fn line_logged(text: &str) {
     if !TAPS_ARMED.load(std::sync::atomic::Ordering::Relaxed) || text.starts_with("test tap") || text.starts_with("test swipe") {
         return;
     }
-    let tap = {
-        let mut taps = TEST_TAPS.lock().unwrap_or_else(|e| e.into_inner());
-        match taps.front().map(|next| &next.on) {
-            Some(Trigger::Line(line)) if text.contains(line.as_str()) => taps.pop_front(),
-            _ => None,
-        }
-    };
+    let tap = next_test_tap(&mut TEST_TAPS.lock().unwrap_or_else(|e| e.into_inner()), text);
     if let Some(tap) = tap {
         let sender = *TEST_TAP_SENDER.lock().unwrap_or_else(|e| e.into_inner());
         sender(tap);
     }
+}
+
+/// The step this log line sends: the next one if its line is this, else
+/// the first `jump=` step whose line it is (the steps before it go away).
+fn next_test_tap(taps: &mut std::collections::VecDeque<TestTap>, text: &str) -> Option<TestTap> {
+    let at = taps.iter().enumerate().position(|(i, tap)| (i == 0 || tap.jump) && matches!(&tap.on, Trigger::Line(line) if text.contains(line.as_str())))?;
+    taps.drain(..at);
+    taps.pop_front()
 }
 
 /// From the main loop each time the drawn screen has settled (see
@@ -721,8 +730,12 @@ mod tests {
         assert_eq!(taps[0].on, Trigger::Line("go".to_string()));
     }
 
+    /// The tests that arm the one shared list of test taps take turns.
+    static ARMED_TAPS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn a_ready_tap_goes_once_the_drawn_screen_has_something_there_to_take_it() {
+        let _turn = ARMED_TAPS.lock().unwrap_or_else(|e| e.into_inner());
         let taps = parse_test_taps("ready=>505,29;on=after=>1,2");
         assert_eq!(taps.len(), 2, "{taps:?}");
         assert_eq!(taps[0].on, Trigger::Ready);
@@ -742,6 +755,7 @@ mod tests {
 
     #[test]
     fn a_test_tap_is_sent_the_moment_its_line_is_logged() {
+        let _turn = ARMED_TAPS.lock().unwrap_or_else(|e| e.into_inner());
         static SENT: std::sync::Mutex<Vec<(f64, f64)>> = std::sync::Mutex::new(Vec::new());
         fn record(tap: TestTap) {
             SENT.lock().unwrap().push((tap.from.x, tap.from.y));
@@ -754,5 +768,19 @@ mod tests {
         assert_eq!(sent(), [(10.0, 20.0)], "the tap went out inside the log call, nothing waited");
         crate::log!("tap test: screen two");
         assert_eq!(sent(), [(10.0, 20.0), (30.0, 40.0)]);
+    }
+
+    #[test]
+    fn a_jump_step_skips_the_steps_still_waiting_before_it() {
+        // Walking on a random map: steps repeat on a line that keeps coming,
+        // and the fight screen may open after any of them.
+        let mut taps: std::collections::VecDeque<TestTap> = parse_test_taps("on=saved=>1,1;on=saved=>2,2;on=saved=>3,3;jump=fight shown=>9,9;on=next=>5,5").into();
+        let from = |tap: Option<TestTap>| tap.map(|t| t.from.x);
+        assert_eq!(from(next_test_tap(&mut taps, "frame saved")), Some(1.0));
+        assert_eq!(from(next_test_tap(&mut taps, "next")), None, "a plain step still waits its turn");
+        assert_eq!(from(next_test_tap(&mut taps, "fight shown")), Some(9.0), "the jump step goes now");
+        assert_eq!(from(next_test_tap(&mut taps, "frame saved")), None, "the walking steps before it are dropped");
+        assert_eq!(from(next_test_tap(&mut taps, "next")), Some(5.0));
+        assert!(taps.is_empty());
     }
 }
