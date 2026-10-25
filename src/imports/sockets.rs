@@ -308,8 +308,16 @@ pub fn handler(name: &str) -> Option<Handler> {
                 let result = host_call(uc, || unsafe {
                     libc::getsockopt(fd, level, option, (&mut timeout as *mut libc::timeval).cast(), &mut size)
                 } as i64);
-                write_timeval(value, &timeout);
-                mem().write_u32(length, 8);
+                // Only a whole timeval becomes the guest's 8-byte one; any other answer (qemu-user
+                // gives none: size 0) is passed on as it is instead of a made-up zero timeout.
+                if matches!(result, Ret::U32(0)) {
+                    if size == std::mem::size_of::<libc::timeval>() as libc::socklen_t {
+                        write_timeval(value, &timeout);
+                        mem().write_u32(length, 8);
+                    } else {
+                        mem().write_u32(length, size.min(8));
+                    }
+                }
                 return result;
             }
             host_call(uc, || unsafe { libc::getsockopt(fd, level, option, pointer(value).cast(), pointer(length).cast()) } as i64)

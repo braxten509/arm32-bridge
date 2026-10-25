@@ -78,6 +78,11 @@ static void check(bool ok, const char *what) {
     if (!ok) failures++;
 }
 
+// A part the system running the test can't do (not the bridge): logged with the reason, not counted.
+static void skip(const char *what, const char *reason) {
+    __android_log_print(ANDROID_LOG_WARN, TAG, "skip %s: %s", what, reason);
+}
+
 // A C++ static constructor: runs from init_array during loading.
 static std::string built_at_load = std::string("made") + " at load";
 static int constructor_ran = 0;
@@ -2897,13 +2902,26 @@ extern "C" int run_all() {
         struct pollfd ready = {pair[1], POLLIN, 0};
         bool moved = made && send(pair[0], "ping", 4, 0) == 4 && poll(&ready, 1, 1000) == 1 &&
                      recv(pair[1], got, sizeof got, 0) == 4 && strcmp(got, "ping") == 0;
+        // The receive timeout must work: recv on an empty socket gives up after it.
+        struct timeval short_wait = {0, 200000};
+        double before = seconds_now();
+        bool timed_out = made && setsockopt(pair[1], SOL_SOCKET, SO_RCVTIMEO, &short_wait, sizeof short_wait) == 0 &&
+                         recv(pair[1], got, sizeof got, 0) == -1 && (errno == EAGAIN || errno == EWOULDBLOCK);
+        double took = seconds_now() - before;
+        timed_out = timed_out && took >= 0.15 && took < 2.0;
+        // And read back as set. qemu-user answers this getsockopt with no value (size 0);
+        // only then is the read-back skipped (a real kernel always returns the value).
         struct timeval wait = {2, 500000}, back = {0, 0};
         socklen_t size = sizeof back;
-        bool timeout = made && setsockopt(pair[1], SOL_SOCKET, SO_RCVTIMEO, &wait, sizeof wait) == 0 &&
-                       getsockopt(pair[1], SOL_SOCKET, SO_RCVTIMEO, &back, &size) == 0 && back.tv_sec == 2 &&
-                       back.tv_usec == 500000 && size == sizeof back;
+        bool set = made && setsockopt(pair[1], SOL_SOCKET, SO_RCVTIMEO, &wait, sizeof wait) == 0;
+        bool read = set && getsockopt(pair[1], SOL_SOCKET, SO_RCVTIMEO, &back, &size) == 0;
+        bool timeout = read && back.tv_sec == 2 && back.tv_usec == 500000 && size == sizeof back;
+        if (read && size == 0) {
+            skip("receive timeout read back", "this system's getsockopt(SO_RCVTIMEO) returns no value (size 0)");
+            timeout = true;
+        }
         if (made) { close(pair[0]); close(pair[1]); }
-        check(moved && timeout, "socketpair, send / poll / recv, receive timeout option");
+        check(moved && timed_out && set && timeout, "socketpair, send / poll / recv, receive timeout option");
 
         unsigned char binary[4] = {0};
         char text[INET_ADDRSTRLEN] = {0};
@@ -2986,10 +3004,24 @@ extern "C" int run_all() {
         check(written, "writev / ioctl FIONREAD");
         struct in_addr loopback;
         loopback.s_addr = htonl(0x7f000001);
-        struct hostent *host = gethostbyname("localhost");
-        check(strcmp(inet_ntoa(loopback), "127.0.0.1") == 0 && host && host->h_addrtype == AF_INET && host->h_length == 4 &&
-                  host->h_addr_list[0] && ((struct in_addr *)host->h_addr_list[0])->s_addr == htonl(0x7f000001),
-              "inet_ntoa / gethostbyname");
+        auto is_loopback = [](struct hostent *host) {
+            return host && host->h_addrtype == AF_INET && host->h_length == 4 && host->h_addr_list[0] &&
+                   ((struct in_addr *)host->h_addr_list[0])->s_addr == htonl(0x7f000001);
+        };
+        bool numeric = is_loopback(gethostbyname("127.0.0.1"));
+        bool named = is_loopback(gethostbyname("localhost"));
+        if (!named) {
+            // Only skipped when the system itself can't resolve the name (no hosts file, no DNS).
+            struct addrinfo hints = {}, *found = nullptr;
+            hints.ai_family = AF_INET;
+            int system = getaddrinfo("localhost", nullptr, &hints, &found);
+            if (found) freeaddrinfo(found);
+            if (system != 0) {
+                skip("gethostbyname(\"localhost\")", "this system can't resolve localhost either (getaddrinfo fails)");
+                named = true;
+            }
+        }
+        check(strcmp(inet_ntoa(loopback), "127.0.0.1") == 0 && numeric && named, "inet_ntoa / gethostbyname");
         // What Broken Age does at start: list the network interfaces, then read each one's flags.
         int udp = socket(AF_INET, SOCK_DGRAM, 0);
         struct ifreq interfaces[10];

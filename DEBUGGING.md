@@ -2133,3 +2133,20 @@ side: createGLContext / flipBuffers; sound through audioWriteShortBuffer). Files
   bridged eglSwapBuffers), so they get no "[fps]" line, no performance hint (ADPF) and no frame-limiter lifting.
   This game's frame thread doesn't sleep between frames (only 0 us yields), so nothing is capped; fps and the
   real translator's fallback count need the phone.
+
+## The 2 self-test network checks that failed under qemu-aarch64 (2026-10-25)
+
+"socketpair ... receive timeout option" and "inet_ntoa / gethostbyname" failed in the ARM64 self-test under
+qemu-aarch64 (PC), on old builds too; they pass on the PC (x86_64) bridge and the emulator. A plain ARM64 Linux
+program under the same qemu (no bridge) showed both:
+- qemu-aarch64 11.1.2 answers getsockopt(SO_RCVTIMEO) with success, size 0 and no value (the PC kernel: 2.5 s,
+  size 16). The bridge then reported a made-up 8-byte zero timeout. Fix: the bridge converts only a whole host
+  timeval and otherwise passes the host's size on (no value written on failure either). The check now also
+  tests that the timeout works (recv on an empty socket gives up after 0.2 s) and skips only the read-back, with
+  a printed reason, when the system returns size 0. Before the bridge fix it still failed under qemu.
+- The qemu sysroot's /etc/hosts (~/.cache/aarch64-sysroot, from a Docker image) was empty and DNS is blocked on
+  this PC, so "localhost" could not be resolved. The sysroot now has a normal hosts file (outside the repo). The
+  check also requires gethostbyname("127.0.0.1") and skips the "localhost" name only when the system's own
+  getaddrinfo can't resolve it.
+- Results: qemu 0 failures (one printed skip: the read-back), emulator 0 failures, PC 0 failures (no skips).
+  Still missing, seen in a probe: __get_h_errno (h_errno).
