@@ -73,14 +73,16 @@ struct _opaque_pthread_t {
     char __opaque[__PTHREAD_SIZE__];
 };
 typedef struct _opaque_pthread_t *__darwin_pthread_t;
-typedef struct { long __sig; char __opaque[__PTHREAD_ATTR_SIZE__]; } __darwin_pthread_attr_t;
-typedef struct { long __sig; char __opaque[__PTHREAD_MUTEX_SIZE__]; } __darwin_pthread_mutex_t;
-typedef struct { long __sig; char __opaque[__PTHREAD_MUTEXATTR_SIZE__]; } __darwin_pthread_mutexattr_t;
-typedef struct { long __sig; char __opaque[__PTHREAD_COND_SIZE__]; } __darwin_pthread_cond_t;
-typedef struct { long __sig; char __opaque[__PTHREAD_CONDATTR_SIZE__]; } __darwin_pthread_condattr_t;
-typedef struct { long __sig; char __opaque[__PTHREAD_ONCE_SIZE__]; } __darwin_pthread_once_t;
-typedef struct { long __sig; char __opaque[__PTHREAD_RWLOCK_SIZE__]; } __darwin_pthread_rwlock_t;
-typedef struct { long __sig; char __opaque[__PTHREAD_RWLOCKATTR_SIZE__]; } __darwin_pthread_rwlockattr_t;
+/* Apple's struct tags: C++ names that take these carry them (GCC's
+ * std::__basic_file<char>(__c_lock*) is ...EP23_opaque_pthread_mutex_t). */
+typedef struct _opaque_pthread_attr_t { long __sig; char __opaque[__PTHREAD_ATTR_SIZE__]; } __darwin_pthread_attr_t;
+typedef struct _opaque_pthread_mutex_t { long __sig; char __opaque[__PTHREAD_MUTEX_SIZE__]; } __darwin_pthread_mutex_t;
+typedef struct _opaque_pthread_mutexattr_t { long __sig; char __opaque[__PTHREAD_MUTEXATTR_SIZE__]; } __darwin_pthread_mutexattr_t;
+typedef struct _opaque_pthread_cond_t { long __sig; char __opaque[__PTHREAD_COND_SIZE__]; } __darwin_pthread_cond_t;
+typedef struct _opaque_pthread_condattr_t { long __sig; char __opaque[__PTHREAD_CONDATTR_SIZE__]; } __darwin_pthread_condattr_t;
+typedef struct _opaque_pthread_once_t { long __sig; char __opaque[__PTHREAD_ONCE_SIZE__]; } __darwin_pthread_once_t;
+typedef struct _opaque_pthread_rwlock_t { long __sig; char __opaque[__PTHREAD_RWLOCK_SIZE__]; } __darwin_pthread_rwlock_t;
+typedef struct _opaque_pthread_rwlockattr_t { long __sig; char __opaque[__PTHREAD_RWLOCKATTR_SIZE__]; } __darwin_pthread_rwlockattr_t;
 typedef unsigned long __darwin_pthread_key_t;
 
 #endif

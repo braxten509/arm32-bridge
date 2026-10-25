@@ -149,7 +149,7 @@ fn guest32_cxx() {
         PathBuf::from(std::env::var("HOME").unwrap()).join(name)
     });
     let library = out.join("libguest32cxx.so");
-    if !library.exists() || !out.join("test/libcxxtest.so").exists() {
+    if !library.exists() || !out.join("test/libcxxtest.so").exists() || !out.join("test/libgnutest.so").exists() {
         let mut command = Command::new("bash");
         command.arg(folder.join("build.sh")).arg("test").env("GUEST32_CXX_OUT", &out);
         run(command, "building the 32-bit C++ runtime (guest32-cxx/build.sh test)");

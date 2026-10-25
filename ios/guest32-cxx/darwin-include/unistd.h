@@ -15,6 +15,7 @@ int usleep(useconds_t);
 unsigned sleep(unsigned);
 ssize_t read(int, void *, size_t);
 ssize_t write(int, const void *, size_t);
+off_t lseek(int, off_t, int);
 int close(int);
 int isatty(int);
 pid_t getpid(void);

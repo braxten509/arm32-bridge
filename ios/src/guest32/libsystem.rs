@@ -36,7 +36,8 @@ const REUSED: &[&str] = &[
     "ferror", "fileno", "clearerr", "fgets", "getc", "fgetc", "ungetc", "fseek", "ftell", "rewind", "fflush",
     "setvbuf", "setbuf",
     // files
-    "read", "write", "close", "unlink", "remove", "rename", "mkdir", "rmdir", "access", "chdir", "getcwd", "isatty",
+    "read", "write", "writev", "close", "unlink", "remove", "rename", "mkdir", "rmdir", "access", "chdir", "getcwd",
+    "isatty",
     // time
     "time", "gettimeofday", "clock", "localtime", "localtime_r", "gmtime", "gmtime_r", "mktime", "difftime",
     "strftime", "nanosleep", "usleep", "sleep", "sched_yield",
@@ -284,6 +285,61 @@ fn files() {
                 Some(HostFile::Stream(stream)) => checked64(uc, unsafe { libc::ftello(stream as *mut libc::FILE) }),
                 _ => Ret::U64(u64::MAX),
             }
+        })
+        .unwrap(),
+    );
+    // ioctl(fd, request, argument): Darwin's request numbers for the
+    // descriptor calls that mean the same here (an int argument on both).
+    function(
+        "ioctl",
+        handler!(|uc, a| {
+            const FIONREAD: u32 = 0x4004_667F;
+            const FIONBIO: u32 = 0x8004_667E;
+            let (fd, request, argument) = (a.i32(), a.u32(), a.u32());
+            let host = match request {
+                FIONREAD => libc::FIONREAD,
+                FIONBIO => libc::FIONBIO,
+                _ => {
+                    mem().write_u32(uc.get_data().errno_slot, darwin_errno(libc::ENOTTY) as u32);
+                    return Ret::U32(u32::MAX);
+                }
+            };
+            checked(uc, unsafe { libc::ioctl(fd, host as _, mem().host(argument)) } as i64)
+        })
+        .unwrap(),
+    );
+    // poll(fds, count, timeout): struct pollfd is the same 8 bytes; Darwin's
+    // POLLWRBAND is 0x100 (Linux 0x200), and Linux's POLLWRNORM (0x100) is
+    // Darwin's POLLOUT.
+    function(
+        "poll",
+        handler!(|uc, a| {
+            let (list, count, timeout) = (a.u32(), a.u32(), a.i32());
+            let mut fds: Vec<libc::pollfd> = (0..count)
+                .map(|i| {
+                    let events = mem().read_u16(list + i * 8 + 4) as i16;
+                    libc::pollfd {
+                        fd: mem().read_u32(list + i * 8) as i32,
+                        events: (events & !0x100) | if events & 0x100 != 0 { libc::POLLWRBAND } else { 0 },
+                        revents: 0,
+                    }
+                })
+                .collect();
+            let (result, errno, fds) = runtime::without_gil(move || {
+                let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
+                (result, host_errno(), fds)
+            });
+            if result < 0 {
+                mem().write_u32(uc.get_data().errno_slot, darwin_errno(errno) as u32);
+            }
+            for (i, fd) in fds.iter().enumerate() {
+                let host = fd.revents;
+                let darwin = (host & !(libc::POLLWRNORM | libc::POLLWRBAND))
+                    | if host & libc::POLLWRNORM != 0 { libc::POLLOUT } else { 0 }
+                    | if host & libc::POLLWRBAND != 0 { 0x100 } else { 0 };
+                mem().write_u16(list + i as u32 * 8 + 6, darwin as u16);
+            }
+            Ret::U32(result as u32)
         })
         .unwrap(),
     );

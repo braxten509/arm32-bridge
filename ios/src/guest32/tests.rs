@@ -103,6 +103,30 @@ fn stat_fills_darwins_layout() {
 }
 
 #[test]
+fn poll_and_ioctl_use_darwins_numbers() {
+    // GNU libstdc++'s filebuf asks ioctl(FIONREAD) and poll how much it can read.
+    let mut fds = [0i32; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    assert_eq!(unsafe { libc::write(fds[1], b"abc".as_ptr().cast(), 3) }, 3);
+    let count = alloc(4);
+    assert_eq!(call("ioctl", [fds[0] as u32, 0x4004_667F, count, 0], &[]).0, 0, "Darwin's FIONREAD");
+    assert_eq!(mem().read_u32(count), 3);
+    assert_eq!(call("ioctl", [fds[0] as u32, 0x4004_7400, count, 0], &[]).0 as i32, -1);
+    assert_eq!(errno(), 25, "ENOTTY for a request it doesn't know");
+    // { fd, events, revents } x2: POLLIN|POLLWRBAND (Darwin 0x100) and POLLOUT.
+    let list = alloc(16);
+    for (i, (fd, events)) in [(fds[0], 0x101u32), (fds[1], 0x4)].into_iter().enumerate() {
+        mem().write_u32(list + i as u32 * 8, fd as u32);
+        mem().write_u32(list + i as u32 * 8 + 4, events);
+    }
+    assert_eq!(call("poll", [list, 2, 0, 0], &[]).0, 2);
+    assert_eq!(mem().read_u16(list + 6), 0x1, "readable");
+    assert_eq!(mem().read_u16(list + 14), 0x4, "writable: Darwin's POLLOUT, not Linux's POLLOUT|POLLWRNORM");
+    unsafe { libc::close(fds[0]) };
+    unsafe { libc::close(fds[1]) };
+}
+
+#[test]
 fn ctype_tables_sit_where_inline_code_reads_them() {
     setup();
     let locale = super::data_address("_DefaultRuneLocale").expect("_DefaultRuneLocale is registered");
@@ -320,6 +344,22 @@ fn cxx_runtime_checks_pass_on_this_c_library() {
     let run_all = arm32_bridge::elf::with_loader(|loader| loader.libraries[index].export(uc, "run_all")).unwrap();
     let failed = runtime::call_guest(uc, run_all, &[]).unwrap() as u32;
     assert_eq!(failed, 0, "run_all: one bit per failed check");
+}
+
+#[test]
+fn cxx_runtime_gnu_checks_pass_on_this_c_library() {
+    // guest32-cxx/test/gnutest.cc: GCC 4.2.1's libstdc++ as GCC-era games
+    // inline it (copy-on-write strings, string and file streams, locale,
+    // exceptions caught by libc++ code, list and map), on this layer's C functions.
+    cxx();
+    let path = std::path::Path::new(env!("GUEST32_CXX_OUT_DIR")).join("test/libgnutest.so");
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e} (run guest32-cxx/build.sh test)", path.display()));
+    let _gil = runtime::hold_gil();
+    let uc = runtime::engine();
+    let index = arm32_bridge::elf::open_bytes(uc, "libgnutest.so", &bytes, true).unwrap();
+    let run_all = arm32_bridge::elf::with_loader(|loader| loader.libraries[index].export(uc, "gnu_run_all")).unwrap();
+    let failed = runtime::call_guest(uc, run_all, &[]).unwrap() as u32;
+    assert_eq!(failed, 0, "gnu_run_all: one bit per failed check");
 }
 
 #[test]
