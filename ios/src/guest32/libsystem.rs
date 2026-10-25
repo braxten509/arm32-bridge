@@ -259,7 +259,7 @@ fn write_dirent(out: u32, entry: &libc::dirent) {
 /// The next host entry (None at the end or on an error, errno telling which).
 fn next_entry(host: *mut libc::DIR) -> Option<libc::dirent> {
     unsafe {
-        *libc::__errno_location() = 0;
+        *crate::libsystem::host_errno() = 0;
         libc::readdir(host).as_ref().copied()
     }
 }
