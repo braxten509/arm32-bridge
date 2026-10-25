@@ -721,7 +721,11 @@ fn settings_of(recognizer: Id) -> Settings {
 fn settle(recognizer: Id) {
     let done = with(recognizer, |r| r.fingers.is_empty() && r.waiting.is_none() && matches!(r.state, ENDED | FAILED | CANCELLED)).unwrap_or(false);
     if done {
-        with(recognizer, |r| (r.state, r.taps) = (POSSIBLE, 0));
+        with(recognizer, |r| {
+            (r.state, r.taps) = (POSSIBLE, 0);
+            // A new pinch starts at scale 1 and a new rotation at 0, as UIKit's do.
+            (r.start_spread, r.spread_base, r.scale, r.rotation) = (None, 1.0, 1.0, 0.0);
+        });
         if runtime::responds(recognizer, "reset") {
             runtime::send(recognizer, "reset", &[]);
         }
@@ -1354,6 +1358,42 @@ mod tests {
         set_spread_value(&mut turn, 0.0);
         step(&mut turn, &settings, 2, Phase::Moved, p(-10.0, 0.0), 0.2);
         assert!((turn.rotation - std::f64::consts::FRAC_PI_2).abs() < 1e-9, "a quarter turn since it was set: {}", turn.rotation);
+    }
+
+    /// UIKit starts every new pinch at scale 1.0: a second pinch on the same
+    /// recognizer counts from 1, not from where the first one left the scale.
+    #[test]
+    fn a_new_pinch_starts_from_scale_one() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        // One piece of main-loop work, as the phone's main thread would.
+        crate::fw::runloop::as_main(new_pinch_starts_from_scale_one);
+    }
+
+    fn new_pinch_starts_from_scale_one() {
+        let view = runtime::send(runtime::class_named("UIView"), "alloc", &[]);
+        crate::fw::uikit::send_rect(view, "initWithFrame:", Rect::new(0.0, 0.0, 300.0, 300.0));
+        let pinch = runtime::send(runtime::alloc_instance(runtime::class_named("UIPinchGestureRecognizer")), "init", &[]);
+        view_add(view, 0, pinch);
+        let touch = |finger: i32, phase: Phase, at: Point| touch_changed(view, 0, finger, phase, at);
+        // First pinch: fingers 100 points apart, spreading to 300.
+        touch(901, Phase::Began, p(100.0, 100.0));
+        touch(902, Phase::Began, p(200.0, 100.0));
+        touch(902, Phase::Moved, p(300.0, 100.0));
+        assert!((scale(pinch, 0) - 2.0).abs() < 1e-9, "100 to 200 points: {}", scale(pinch, 0));
+        touch(902, Phase::Moved, p(400.0, 100.0));
+        assert!((scale(pinch, 0) - 3.0).abs() < 1e-9, "100 to 300 points: {}", scale(pinch, 0));
+        touch(901, Phase::Ended, p(100.0, 100.0));
+        touch(902, Phase::Ended, p(400.0, 100.0));
+        assert_eq!(state(pinch, 0), POSSIBLE, "ready for the next pinch");
+        // Second pinch: again 100 points apart, then 50 more.
+        touch(903, Phase::Began, p(100.0, 100.0));
+        touch(904, Phase::Began, p(200.0, 100.0));
+        touch(904, Phase::Moved, p(250.0, 100.0));
+        assert!((scale(pinch, 0) - 1.5).abs() < 1e-9, "100 to 150 points since this pinch began: {}", scale(pinch, 0));
+        touch(903, Phase::Ended, p(100.0, 100.0));
+        touch(904, Phase::Ended, p(250.0, 100.0));
+        view_remove(view, 0, pinch);
     }
 
     /// 32-bit games reach these methods only through a framework_selectors.tsv row.

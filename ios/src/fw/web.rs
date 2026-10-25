@@ -533,6 +533,21 @@ pub fn register(r: &mut Registry) {
             ("allHeaderFields", http_all_headers as usize),
         ],
     );
+    let cache = define_class("NSURLCache", "NSObject", 8);
+    class_methods(cache, &[("sharedURLCache", shared_url_cache as usize), ("setSharedURLCache:", set_shared_url_cache as usize)]);
+    methods(
+        cache,
+        &[
+            ("initWithMemoryCapacity:diskCapacity:diskPath:", url_cache_init as usize),
+            ("memoryCapacity", url_cache_memory as usize),
+            ("diskCapacity", url_cache_disk as usize),
+            ("setMemoryCapacity:", url_cache_set_memory as usize),
+            ("setDiskCapacity:", url_cache_set_disk as usize),
+            ("currentMemoryUsage", url_cache_usage as usize),
+            ("currentDiskUsage", url_cache_usage as usize),
+            ("removeAllCachedResponses", nothing as usize),
+        ],
+    );
     let challenge = define_class("NSURLAuthenticationChallenge", "NSObject", 8);
     methods(
         challenge,
@@ -549,6 +564,79 @@ pub fn register(r: &mut Registry) {
 }
 
 extern "C" fn nothing(_this: Id, _: Sel) {}
+
+// NSURLCache: capacities only. Nothing is ever loaded from the network
+// (see the offline answers above), so no response is stored and usage is 0.
+static SHARED_URL_CACHE: std::sync::Mutex<Id> = std::sync::Mutex::new(0);
+
+extern "C" fn shared_url_cache(class: Class, _: Sel) -> Id {
+    let mut shared = SHARED_URL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if *shared == 0 {
+        // iOS's own: 512 KB in memory, 10 MB on disk.
+        let cache = runtime::alloc_instance(class);
+        *shared = url_cache_init(cache, 0, 512 * 1024, 10 * 1024 * 1024, 0);
+    }
+    *shared
+}
+
+extern "C" fn set_shared_url_cache(_: Class, _: Sel, cache: Id) {
+    if cache != 0 {
+        runtime::send(cache, "retain", &[]);
+    }
+    let old = std::mem::replace(&mut *SHARED_URL_CACHE.lock().unwrap_or_else(|e| e.into_inner()), cache);
+    if old != 0 {
+        runtime::send(old, "release", &[]);
+    }
+}
+
+extern "C" fn url_cache_init(this: Id, _: Sel, memory: usize, disk: usize, _path: Id) -> Id {
+    property_set(this, "memoryCapacity", memory as u64);
+    property_set(this, "diskCapacity", disk as u64);
+    this
+}
+
+extern "C" fn url_cache_memory(this: Id, _: Sel) -> usize {
+    property_get(this, "memoryCapacity").unwrap_or(0) as usize
+}
+
+extern "C" fn url_cache_disk(this: Id, _: Sel) -> usize {
+    property_get(this, "diskCapacity").unwrap_or(0) as usize
+}
+
+extern "C" fn url_cache_set_memory(this: Id, _: Sel, value: usize) {
+    property_set(this, "memoryCapacity", value as u64);
+}
+
+extern "C" fn url_cache_set_disk(this: Id, _: Sel, value: usize) {
+    property_set(this, "diskCapacity", value as u64);
+}
+
+extern "C" fn url_cache_usage(_this: Id, _: Sel) -> usize {
+    0
+}
 extern "C" fn no_with(_: Class, _: Sel, _value: Id) -> bool {
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn url_caches_keep_their_capacities_and_the_shared_one_can_change() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let class = runtime::class_named("NSURLCache");
+        let shared = runtime::send(class, "sharedURLCache", &[]);
+        assert_ne!(shared, 0);
+        assert_eq!(runtime::send(shared, "memoryCapacity", &[]), 512 * 1024, "iOS's default");
+        let path = string::make("Cache.db");
+        let cache = runtime::send(runtime::send(class, "alloc", &[]), "initWithMemoryCapacity:diskCapacity:diskPath:", &[4096, 1 << 20, path]);
+        assert_eq!((runtime::send(cache, "memoryCapacity", &[]), runtime::send(cache, "diskCapacity", &[])), (4096, 1 << 20));
+        runtime::send(class, "setSharedURLCache:", &[cache]);
+        assert_eq!(runtime::send(class, "sharedURLCache", &[]), cache);
+        runtime::send(cache, "removeAllCachedResponses", &[]);
+        assert_eq!(runtime::send(cache, "currentMemoryUsage", &[]), 0);
+        runtime::send(class, "setSharedURLCache:", &[shared]);
+    }
 }

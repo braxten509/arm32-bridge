@@ -279,8 +279,9 @@ extern "C" fn unit_render(unit: usize, flags: *mut u32, _stamp: *const u8, bus: 
             .filter(|&b| (*(list.add(8 + 16 * b + 8) as *const usize)) == 0)
             .map(|b| {
                 let entry = list.add(8 + 16 * b);
-                let channels = (*(entry as *const u32)).max(1) as usize;
-                (b, (frames as usize * channels * 4).max(*(entry.add(4) as *const u32) as usize))
+                let channels = (*(entry as *const u32)).max(1) as u64;
+                let asked = (u64::from(frames) * channels * 4).min(MAX_RENDER_BYTES);
+                (b, asked.max(u64::from(*(entry.add(4) as *const u32))).min(MAX_RENDER_BYTES) as usize)
             })
             .collect();
         if !wants.is_empty() {
@@ -576,6 +577,9 @@ type RenderCallback = extern "C" fn(usize, *mut u32, *const u8, u32, u32, *mut u
 
 const OUTPUT_IS_SILENCE: u32 = 1 << 4;
 const MAX_CHANNELS: usize = 8;
+/// Most bytes one AudioUnitRender buffer may be given: a game writes the
+/// byte counts, and no sane buffer comes near this.
+pub(crate) const MAX_RENDER_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Asks one input's callback for `frames` frames and appends them to `out`
 /// as stereo floats (left, right, ...). Anything the game doesn't give

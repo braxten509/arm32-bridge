@@ -1021,3 +1021,45 @@ fn values_pointing_at_unmapped_memory_are_not_host_objects() {
     let object = runtime::send(runtime::class_named("NSObject"), "new", &[]);
     assert!(is_host_object(object), "a real object still counts");
 }
+
+/// -sortUsingFunction:context: / -sortedArrayUsingFunction:context: from a
+/// 32-bit game: the comparator is game code, called with the elements' guest
+/// ids and the game's context.
+#[test]
+fn framework_arrays_sort_with_a_game_function() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(crate::run::setup);
+    let fake = Fake::new();
+    let bridge: &'static Mutex<Bridge> = Box::leak(Box::new(Mutex::new(Bridge::new(&ObjcMetadata32::default()).unwrap())));
+    let numbers = |values: &[usize]| {
+        let list = runtime::send(runtime::class_named("NSMutableArray"), "new", &[]);
+        for &n in values {
+            runtime::send(list, "addObject:", &[runtime::send(runtime::class_named("NSNumber"), "numberWithInt:", &[n])]);
+        }
+        list
+    };
+    let values = |list: Id| -> Vec<i64> {
+        let count = runtime::send(list, "count", &[]);
+        (0..count).map(|i| crate::fw::collections::number_as_f64(runtime::send(list, "objectAtIndex:", &[i])) as i64).collect()
+    };
+    let contexts: &'static Mutex<Vec<u32>> = Box::leak(Box::new(Mutex::new(Vec::new())));
+    // Largest first: NSOrderedAscending (-1) when the first is larger.
+    fake.code(0x4201, move |w| {
+        contexts.lock().unwrap().push(w[2]);
+        let value = |guest: u32| crate::fw::collections::number_as_f64(bridge.lock().unwrap().host_object_for(fake, guest).unwrap());
+        let (a, b) = (value(w[0]), value(w[1]));
+        (if a > b { -1i32 } else if a < b { 1 } else { 0 }) as u32 as u64
+    });
+    let sel = |name: &str| bridge.lock().unwrap().guest_selector(fake, name);
+    let list = numbers(&[3, 1, 4, 1, 5]);
+    let proxy = bridge.lock().unwrap().guest_object(fake, list).unwrap();
+    send(bridge, fake, &[proxy, sel("sortUsingFunction:context:"), 0x4201, 77]).unwrap();
+    assert_eq!(values(list), [5, 4, 3, 1, 1]);
+    let other = numbers(&[2, 9, 7]);
+    let proxy = bridge.lock().unwrap().guest_object(fake, other).unwrap();
+    let sorted = send(bridge, fake, &[proxy, sel("sortedArrayUsingFunction:context:"), 0x4201, 77]).unwrap() as u32;
+    assert_eq!(values(bridge.lock().unwrap().host_object_for(fake, sorted).unwrap()), [9, 7, 2]);
+    assert_eq!(values(other), [2, 9, 7], "the receiver stays as it was");
+    let contexts = contexts.lock().unwrap();
+    assert!(!contexts.is_empty() && contexts.iter().all(|&c| c == 77), "{contexts:?}");
+}

@@ -1270,6 +1270,11 @@ pub fn send_from_guest(
                     drop(b);
                     return super::forward::root_forward_invocation(bridge, g, receiver, get(first + 2));
                 }
+                "sortUsingFunction:context:" | "sortedArrayUsingFunction:context:" if !meta => {
+                    drop(b);
+                    let in_place = name == "sortUsingFunction:context:";
+                    return sort_with_game_function(bridge, g, receiver, get(first + 2), get(first + 3), in_place);
+                }
                 _ => {}
             }
             // No host method: Apple's forwarding (forward.rs).
@@ -1367,6 +1372,58 @@ pub fn send_from_guest(
             Ok(result)
         }
     }
+}
+
+/// -sortUsingFunction:context: and -sortedArrayUsingFunction:context: on a
+/// framework array: the comparator is game code, so the sort runs here and
+/// calls it with the elements' guest ids (a stable merge sort, which any
+/// comparator answer leaves whole).
+fn sort_with_game_function(
+    bridge: &Mutex<Bridge>,
+    g: &dyn GuestSide,
+    receiver: u32,
+    function: u32,
+    context: u32,
+    in_place: bool,
+) -> Result<GuestRet, String> {
+    let array = lock(bridge).host_object_for(g, receiver)?;
+    let count = runtime::send(array, "count", &[]);
+    let hosts: Vec<usize> = (0..count).map(|i| runtime::send(array, "objectAtIndex:", &[i])).collect();
+    let guests = {
+        let mut b = lock(bridge);
+        hosts.iter().map(|&host| b.guest_object(g, host)).collect::<Result<Vec<u32>, String>>()?
+    };
+    // NSComparisonResult: NSOrderedDescending (1) puts the first after the second.
+    let after = |x: usize, y: usize| -> Result<bool, String> { Ok(g.call(function, &[guests[x], guests[y], context])? as u32 as i32 > 0) };
+    let mut order: Vec<usize> = (0..hosts.len()).collect();
+    let mut width = 1;
+    while width < order.len() {
+        let mut merged = Vec::with_capacity(order.len());
+        for run in order.chunks(width * 2) {
+            let (left, right) = run.split_at(width.min(run.len()));
+            let (mut i, mut j) = (0, 0);
+            while i < left.len() && j < right.len() {
+                if after(left[i], right[j])? {
+                    merged.push(right[j]);
+                    j += 1;
+                } else {
+                    merged.push(left[i]);
+                    i += 1;
+                }
+            }
+            merged.extend_from_slice(&left[i..]);
+            merged.extend_from_slice(&right[j..]);
+        }
+        order = merged;
+        width *= 2;
+    }
+    let sorted = crate::fw::collections::array_from(&order.iter().map(|&i| hosts[i]).collect::<Vec<_>>());
+    if in_place {
+        runtime::send(array, "setArray:", &[sorted]);
+        runtime::send(sorted, "release", &[]);
+        return Ok(GuestRet { r0: 0, r1: 0 });
+    }
+    Ok(GuestRet { r0: lock(bridge).guest_object(g, sorted)?, r1: 0 })
 }
 
 /// A guest call to a C function the host layer implements (`address`),

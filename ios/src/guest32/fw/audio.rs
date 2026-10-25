@@ -11,6 +11,7 @@ use super::{
     Obj, Ptr, F32, I32, I64, U32,
 };
 use crate::fw::extaudiofile::{BUFFER_LIST_FIRST, BUFFER_SIZE};
+use crate::fw::sound::MAX_RENDER_BYTES;
 use arm32_bridge::handler;
 use arm32_bridge::runtime::{self, mem, ArgSource, Ret};
 use std::cell::{Cell, RefCell};
@@ -224,11 +225,20 @@ pub(crate) extern "C" fn guest_render(data: usize, flags: *mut u32, stamp: *cons
     let returned = m.read_u32(block + LIST_AT) as usize;
     unsafe { *(list as *mut u32) = returned as u32 };
     let guest_entry = |b: usize| block + LIST_AT + 4 + 12 * b as u32;
+    // The sizes here are the game's: clamp each to what the host asked for
+    // (a frame per channel) and to the room it really has, so a bad value
+    // can't grow this thread's copies without bound.
+    let fitted = |b: usize| -> usize {
+        let (channels, room, host_data) = host_buffers[b];
+        let asked = (u64::from(frames) * u64::from(channels.max(1)) * 4).min(MAX_RENDER_BYTES);
+        let room = if host_data.is_null() { guest_room(m.read_u32(guest_entry(b) + 8)) } else { u64::from(room) };
+        u64::from(m.read_u32(guest_entry(b) + 4)).min(asked).min(room) as usize
+    };
     // Room for copies of the game's own buffers, made all at once so growing
     // never moves a copy already handed to the host.
     let own_total: usize = (0..count.min(returned))
         .filter(|&b| host_buffers[b].2.is_null() && m.read_u32(guest_entry(b) + 8) != 0)
-        .map(|b| m.read_u32(guest_entry(b) + 4) as usize)
+        .map(fitted)
         .sum();
     let mut copy_at = OWN_COPIES.with(|c| {
         let mut c = c.borrow_mut();
@@ -237,9 +247,9 @@ pub(crate) extern "C" fn guest_render(data: usize, flags: *mut u32, stamp: *cons
         }
         c.as_mut_ptr()
     });
-    for (b, &(_, room, host_data)) in host_buffers.iter().enumerate().take(returned) {
+    for (b, &(_, _, host_data)) in host_buffers.iter().enumerate().take(returned) {
         let at = guest_entry(b);
-        let (size, pointer) = (m.read_u32(at + 4), m.read_u32(at + 8));
+        let (size, pointer) = (fitted(b), m.read_u32(at + 8));
         unsafe {
             *(entry(b) as *mut u32) = m.read_u32(at);
             if pointer == 0 {
@@ -247,9 +257,9 @@ pub(crate) extern "C" fn guest_render(data: usize, flags: *mut u32, stamp: *cons
                 continue;
             }
             // Another game thread may reuse its buffer once the lock goes: the host reads a copy.
-            let (to, size) = if host_data.is_null() { (copy_at, size) } else { (host_data, size.min(room)) };
+            let to = if host_data.is_null() { copy_at } else { host_data };
             std::ptr::copy_nonoverlapping(m.bytes(pointer, size as usize).as_ptr(), to, size as usize);
-            *(entry(b).add(4) as *mut u32) = size;
+            *(entry(b).add(4) as *mut u32) = size as u32;
             *(entry(b).add(8) as *mut *mut u8) = to;
             if host_data.is_null() {
                 copy_at = copy_at.add(size as usize);
@@ -257,6 +267,15 @@ pub(crate) extern "C" fn guest_render(data: usize, flags: *mut u32, stamp: *cons
         }
     }
     status
+}
+
+/// Bytes from a guest pointer to the end of the 32-bit address space.
+fn guest_room(pointer: u32) -> u64 {
+    if pointer == 0 {
+        0
+    } else {
+        (1u64 << 32) - u64::from(pointer)
+    }
 }
 
 pub fn register() {
@@ -494,9 +513,17 @@ pub fn register() {
             let at = |b: u32| list + 4 + 12 * b;
             let empty: Vec<(u32, u32)> = (0..m.read_u32(list))
                 .filter(|&b| m.read_u32(at(b) + 8) == 0)
-                .map(|b| (b, (frames * m.read_u32(at(b)).max(1) * 4).max(m.read_u32(at(b) + 4))))
+                .map(|b| {
+                    let channels = u64::from(m.read_u32(at(b)).max(1));
+                    let asked = (u64::from(frames) * channels * 4).min(MAX_RENDER_BYTES);
+                    (b, asked.max(u64::from(m.read_u32(at(b) + 4))).min(MAX_RENDER_BYTES) as u32)
+                })
                 .collect();
-            let total: u32 = empty.iter().map(|e| (e.1 + 7) & !7).sum();
+            let total: u64 = empty.iter().map(|e| (u64::from(e.1) + 7) & !7).sum();
+            if total > u64::from(u32::MAX) {
+                return Ret::U32(-108i32 as u32);
+            }
+            let total = total as u32;
             if total > 0 {
                 let mut scratch = reused_block(&INPUT_BLOCK, total);
                 if scratch == 0 {

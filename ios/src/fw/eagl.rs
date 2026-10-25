@@ -652,7 +652,13 @@ extern "C" fn present(this: Id, _: Sel, _target: Enum) -> bool {
     drop(state);
     gl::check_errors(&format!("in frame {frame}"));
     let slow_frames = note_frame_gap(frame);
-    if frame <= 3 || frame % 300 == 0 {
+    // Test switch IOS_FRAME_MARK_EVERY: these lines more often, for test taps
+    // timed by frame without saving pictures (which is slow on the PC).
+    static MARK_EVERY: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let mark_every = *MARK_EVERY.get_or_init(|| {
+        std::env::var("IOS_FRAME_MARK_EVERY").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&n| n > 0).unwrap_or(300)
+    });
+    if frame <= 3 || frame % mark_every == 0 {
         crate::log!("graphics: frame {frame} shown ({width}x{height}) at {:.1} s, {slow_frames} slow so far", crate::report::seconds_since_start());
     }
     if let Some(limit) = std::env::var("IOS_FRAME_LIMIT").ok().and_then(|v| v.parse::<usize>().ok()) {

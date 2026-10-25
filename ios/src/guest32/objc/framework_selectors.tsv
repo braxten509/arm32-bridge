@@ -1293,7 +1293,8 @@ zone	^{_NSZone=}@:
 # Monster Life (2026-10-25, the same derivation), its Apple selectors not
 # listed above (API: EAGLContext's; without it the game took its context
 # for OpenGL ES 1). Left out: its Facebook/Twitter SDK names, and
-# sortUsingFunction:context: (a guest C function the host would call).
+# sortUsingFunction:context: (its comparator is game code: the bridge sorts,
+# see sort_with_game_function).
 albumsQuery	@@:
 API	I@:
 artistsQuery	@@:
@@ -1332,6 +1333,7 @@ HTTPBody	@@:
 initWithBarButtonSystemItem:target:action:	@@:i@:
 initWithFileURL:	@@:@
 initWithFrame:reuseIdentifier:	@@:{CGRect={CGPoint=ff}{CGSize=ff}}@
+initWithMemoryCapacity:diskCapacity:diskPath:	@@:II@
 initWithStyle:	@@:i
 initWithStyle:reuseIdentifier:	@@:i@
 initWithTitle:delegate:cancelButtonTitle:destructiveButtonTitle:otherButtonTitles:	@@:@@@@@	nil-list
