@@ -593,17 +593,40 @@ extern "C" fn substring_with_range(this: Id, _: Sel, range: Range) -> Id {
     object
 }
 
-extern "C" fn range_of_string(this: Id, _: Sel, other: Id) -> Range {
-    let haystack = units(this);
-    let needle = units(other);
-    if !needle.is_empty() && needle.len() <= haystack.len() {
-        for start in 0..=haystack.len() - needle.len() {
-            if haystack[start..start + needle.len()] == needle[..] {
-                return Range { location: start, length: needle.len() };
-            }
-        }
+extern "C" fn range_of_string(this: Id, s: Sel, other: Id) -> Range {
+    range_of_string_options(this, s, other, 0)
+}
+
+extern "C" fn range_of_string_options(this: Id, s: Sel, other: Id, options: usize) -> Range {
+    range_of_string_in(this, s, other, options, Range { location: 0, length: units(this).len() })
+}
+
+/// NSStringCompareOptions: 1 case-insensitive (ASCII letters, as -compare:
+/// here), 4 backwards (the last match), 8 anchored (only at the start, or at
+/// the end when backwards); 2 (literal) changes nothing for plain units.
+extern "C" fn range_of_string_in(this: Id, _: Sel, other: Id, options: usize, range: Range) -> Range {
+    let (case_insensitive, backwards, anchored) = (options & 1 != 0, options & 4 != 0, options & 8 != 0);
+    let fold = |u: u16| if case_insensitive && (b'A' as u16..=b'Z' as u16).contains(&u) { u + 32 } else { u };
+    let haystack: Vec<u16> = units(this).into_iter().map(fold).collect();
+    let needle: Vec<u16> = units(other).into_iter().map(fold).collect();
+    let end = range.location.saturating_add(range.length).min(haystack.len());
+    let begin = range.location.min(end);
+    let not_found = Range { location: isize::MAX as usize, length: 0 };
+    if needle.is_empty() || needle.len() > end - begin {
+        return not_found;
     }
-    Range { location: isize::MAX as usize, length: 0 }
+    let last = end - needle.len();
+    let starts: Vec<usize> = match (backwards, anchored) {
+        (false, false) => (begin..=last).collect(),
+        (true, false) => (begin..=last).rev().collect(),
+        (false, true) => vec![begin],
+        (true, true) => vec![last],
+    };
+    starts
+        .into_iter()
+        .find(|&start| haystack[start..start + needle.len()] == needle[..])
+        .map(|location| Range { location, length: needle.len() })
+        .unwrap_or(not_found)
 }
 
 extern "C" fn int_value(this: Id, _: Sel) -> i32 {
@@ -853,6 +876,8 @@ pub fn register(r: &mut Registry) {
             ("substringToIndex:", substring_to as usize),
             ("substringWithRange:", substring_with_range as usize),
             ("rangeOfString:", range_of_string as usize),
+            ("rangeOfString:options:", range_of_string_options as usize),
+            ("rangeOfString:options:range:", range_of_string_in as usize),
             ("intValue", int_value as usize),
             ("integerValue", integer_value as usize),
             ("longLongValue", integer_value as usize),
@@ -914,6 +939,30 @@ mod tests {
         assert!(crate::objc::runtime::responds(text, "capitalizedString"), "-[NSString capitalizedString] is missing");
         let result = crate::objc::runtime::send(text, "capitalizedString", &[]);
         assert_eq!(get(result), "Hello World\tFoo-bar\nSuccess 1st");
+    }
+
+    /// -rangeOfString:options:(range:) honours case-insensitive, backwards and
+    /// anchored searches and stays inside the range it is given.
+    #[test]
+    fn range_of_string_with_options_and_a_range() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        type Find = extern "C" fn(Id, Sel, Id, usize) -> Range;
+        type FindIn = extern "C" fn(Id, Sel, Id, usize, Range) -> Range;
+        let imp = |name: &str| crate::objc::runtime::imp_for(make("x"), crate::objc::runtime::sel(name)).unwrap_or_else(|| panic!("-[NSString {name}] is missing"));
+        let find: Find = unsafe { std::mem::transmute(imp("rangeOfString:options:")) };
+        let find_in: FindIn = unsafe { std::mem::transmute(imp("rangeOfString:options:range:")) };
+        let at = |r: Range| (r.location as isize, r.length);
+        let (text, sel) = (make("Spell=spell=SPELL"), crate::objc::runtime::sel("rangeOfString:options:"));
+        let not_found = (isize::MAX, 0);
+        assert_eq!(at(find(text, sel, make("spell"), 0)), (6, 5), "plain search is case-sensitive");
+        assert_eq!(at(find(text, sel, make("spell"), 1)), (0, 5), "case-insensitive");
+        assert_eq!(at(find(text, sel, make("spell"), 1 | 4)), (12, 5), "backwards finds the last one");
+        assert_eq!(at(find(text, sel, make("spell"), 8)), not_found, "anchored: only at the start");
+        assert_eq!(at(find(text, sel, make("SPELL"), 4 | 8)), (12, 5), "anchored backwards: only at the end");
+        assert_eq!(at(find(text, sel, make(""), 0)), not_found, "an empty string is never found");
+        assert_eq!(at(find_in(text, sel, make("spell"), 1, Range { location: 1, length: 9 })), not_found, "the match must fit the range");
+        assert_eq!(at(find_in(text, sel, make("spell"), 1, Range { location: 1, length: 10 })), (6, 5));
     }
 
     /// Paths from the root or the home folder (~) are absolute.
