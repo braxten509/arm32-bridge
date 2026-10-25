@@ -1115,7 +1115,6 @@ sharegroup	@@:
 shouldPerformSegueWithIdentifier:sender:	c@:@@
 signal	v@:
 signatureWithObjCTypes:	@@:r*
-size	{CGSize=ff}@:
 sizeThatFits:	{CGSize=ff}@:{CGSize=ff}
 sizeToFit	v@:
 sizeWithFont:	{CGSize=ff}@:@
