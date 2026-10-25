@@ -291,6 +291,61 @@ extern "C" fn zero_float(_this: Id, _: Sel) -> f32 {
     0.0
 }
 
+// ----- turn-based matches -----
+
+object_property!(turn_matchmaker_delegate, turn_matchmaker_set_delegate, "turnBasedMatchmakerDelegate");
+number_property!(show_existing_matches, set_show_existing_matches, "showExistingMatches", 1);
+number_property!(participant_outcome, participant_set_outcome, "matchOutcome", 0);
+
+extern "C" fn turn_based_event_handler(_: Class, _: Sel) -> Id {
+    static SHARED: std::sync::OnceLock<Id> = std::sync::OnceLock::new();
+    *SHARED.get_or_init(|| runtime::alloc_instance(runtime::class_named("GKTurnBasedEventHandler")))
+}
+
+/// Turn changes can't reach Game Center: the handler hears the player isn't
+/// signed in (its only argument is the error).
+extern "C" fn end_match_in_turn(_this: Id, _: Sel, _data: Id, handler: usize) {
+    answer_later(handler, [not_signed_in_error(), 0, 0]);
+}
+extern "C" fn end_turn(_this: Id, _: Sel, _next: Id, _data: Id, handler: usize) {
+    answer_later(handler, [not_signed_in_error(), 0, 0]);
+}
+extern "C" fn end_turn_with_timeout(_this: Id, _: Sel, _next: Id, _timeout: f64, _data: Id, handler: usize) {
+    answer_later(handler, [not_signed_in_error(), 0, 0]);
+}
+extern "C" fn quit_in_turn(_this: Id, _: Sel, _outcome: isize, _next: Id, _data: Id, handler: usize) {
+    answer_later(handler, [not_signed_in_error(), 0, 0]);
+}
+extern "C" fn quit_out_of_turn(_this: Id, _: Sel, _outcome: isize, handler: usize) {
+    answer_later(handler, [not_signed_in_error(), 0, 0]);
+}
+
+/// The turn-based matchmaker screen is cancelled once shown.
+extern "C" fn turn_matchmaker_answer_shown(this: Id, _: Sel) {
+    finish_screen(this, "turnBasedMatchmakerDelegate", "turnBasedMatchmakerViewControllerWasCancelled:");
+}
+
+/// +placeholderCompletedAchievementImage: a plain gray medal (a filled
+/// circle, 64 points) in place of Game Center's own picture.
+extern "C" fn placeholder_achievement_image(_: Class, _: Sel) -> Id {
+    use crate::fw::graphics::{make_image, Bitmap, Space, PREMULTIPLIED_LAST};
+    const SIDE: usize = 64;
+    let mut data = vec![0u8; SIDE * SIDE * 4];
+    let middle = SIDE as f64 / 2.0;
+    for y in 0..SIDE {
+        for x in 0..SIDE {
+            let (dx, dy) = (x as f64 + 0.5 - middle, y as f64 + 0.5 - middle);
+            if dx * dx + dy * dy <= (middle - 1.0) * (middle - 1.0) {
+                data[(y * SIDE + x) * 4..][..4].copy_from_slice(&[0x9a, 0x9a, 0x9a, 0xff]);
+            }
+        }
+    }
+    let picture = make_image(Bitmap { width: SIDE, height: SIDE, bits_per_pixel: 32, bytes_per_row: SIDE * 4, info: PREMULTIPLIED_LAST, space: Space::Rgb, data });
+    let image = runtime::send(runtime::class_named("UIImage"), "imageWithCGImage:", &[picture]);
+    crate::fw::counted::release(picture);
+    image
+}
+
 pub fn register(_r: &mut Registry) {
     define_class("GKPlayer", "NSObject", 8);
     let local = define_class("GKLocalPlayer", "GKPlayer", 8);
@@ -542,8 +597,30 @@ pub fn register(_r: &mut Registry) {
             ("status", zero_state as usize),
             ("loadMatchDataWithCompletionHandler:", nothing_then_error as usize),
             ("removeWithCompletionHandler:", error_only as usize),
+            ("endMatchInTurnWithMatchData:completionHandler:", end_match_in_turn as usize),
+            ("saveCurrentTurnWithMatchData:completionHandler:", end_match_in_turn as usize),
+            ("endTurnWithNextParticipant:matchData:completionHandler:", end_turn as usize),
+            ("endTurnWithNextParticipants:turnTimeout:matchData:completionHandler:", end_turn_with_timeout as usize),
+            ("participantQuitInTurnWithOutcome:nextParticipant:matchData:completionHandler:", quit_in_turn as usize),
+            ("participantQuitOutOfTurnWithOutcome:withCompletionHandler:", quit_out_of_turn as usize),
         ],
     );
+    let turn_handler = define_class("GKTurnBasedEventHandler", "NSObject", 8);
+    class_methods(turn_handler, &[("sharedTurnBasedEventHandler", turn_based_event_handler as usize)]);
+    methods(turn_handler, &[("delegate", handler_delegate as usize), ("setDelegate:", handler_set_delegate as usize)]);
+    let turn_screen = define_class("GKTurnBasedMatchmakerViewController", "UINavigationController", 8);
+    methods(
+        turn_screen,
+        &[
+            ("initWithMatchRequest:", matchmaker_init_with_request as usize),
+            ("turnBasedMatchmakerDelegate", turn_matchmaker_delegate as usize),
+            ("setTurnBasedMatchmakerDelegate:", turn_matchmaker_set_delegate as usize),
+            ("showExistingMatches", show_existing_matches as usize),
+            ("setShowExistingMatches:", set_show_existing_matches as usize),
+            ("gamebridgeAnswerShown", turn_matchmaker_answer_shown as usize),
+        ],
+    );
+    class_methods(description, &[("placeholderCompletedAchievementImage", placeholder_achievement_image as usize)]);
     let participant = define_class("GKTurnBasedParticipant", "NSObject", 8);
     methods(
         participant,
@@ -553,7 +630,8 @@ pub fn register(_r: &mut Registry) {
             ("lastTurnDate", nothing as usize),
             ("timeoutDate", nothing as usize),
             ("status", zero_state as usize),
-            ("matchOutcome", zero_state as usize),
+            ("matchOutcome", participant_outcome as usize),
+            ("setMatchOutcome:", participant_set_outcome as usize),
         ],
     );
 

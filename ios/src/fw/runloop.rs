@@ -302,6 +302,50 @@ extern "C" fn timer_unscheduled(class: Class, _: Sel, interval: f64, target: Id,
     make_timer(class, interval, target, selector, info, repeats != 0)
 }
 
+/// A timer made with alloc: first fires at `date` (not scheduled until added to a run loop).
+extern "C" fn timer_init_with_fire_date(this: Id, _: Sel, date: Id, interval: f64, target: Id, selector: Sel, info: Id, repeats: u8) -> Id {
+    crate::fw::counted::keep(info);
+    let wait = if date == 0 { 0.0 } else { runtime_send_f64(date, "timeIntervalSinceNow") };
+    let state = TimerState {
+        fire_at: now() + wait.max(0.0),
+        interval: if interval <= 0.0 { 0.0001 } else { interval },
+        repeats: repeats != 0,
+        target,
+        selector,
+        user_info: info,
+        valid: true,
+        owner: None,
+        paused: false,
+        pass_argument: false,
+        frames: 1,
+    };
+    let made = Box::into_raw(Box::new(Timer(Mutex::new(state))));
+    let slot = unsafe { &*((this + 8) as *const std::sync::atomic::AtomicPtr<Timer>) };
+    let old = slot.swap(made, Ordering::AcqRel);
+    if !old.is_null() {
+        drop(unsafe { Box::from_raw(old) });
+    }
+    this
+}
+
+extern "C" fn timer_fire_date(this: Id, _: Sel) -> Id {
+    let at = timer(this).fire_at;
+    crate::fw::misc::date(crate::fw::misc::now_since_2001() + (at - now()))
+}
+
+/// Moves the next firing (a scheduled timer is woken to notice).
+extern "C" fn timer_set_fire_date(this: Id, _: Sel, date: Id) {
+    let wait = if date == 0 { 0.0 } else { runtime_send_f64(date, "timeIntervalSinceNow") };
+    let owner = {
+        let mut state = timer(this);
+        state.fire_at = now() + wait.max(0.0);
+        state.owner
+    };
+    if let Some(run_loop) = owner {
+        run_loop.notify();
+    }
+}
+
 extern "C" fn timer_invalidate(this: Id, _: Sel) {
     timer(this).valid = false;
 }
@@ -918,6 +962,9 @@ pub fn register(r: &mut Registry) {
             ("userInfo", timer_user_info as usize),
             ("timeInterval", timer_interval as usize),
             ("fire", timer_fire as usize),
+            ("initWithFireDate:interval:target:selector:userInfo:repeats:", timer_init_with_fire_date as usize),
+            ("fireDate", timer_fire_date as usize),
+            ("setFireDate:", timer_set_fire_date as usize),
         ],
     );
     let link = define_class("CADisplayLink", "NSObject", 16);

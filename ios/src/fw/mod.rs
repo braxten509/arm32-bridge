@@ -38,6 +38,7 @@ pub mod paths;
 pub mod photos;
 pub mod pictures;
 pub mod plist;
+pub mod predicate;
 pub mod progress;
 pub mod png;
 pub mod pvrtc;
@@ -70,6 +71,8 @@ pub fn register(r: &mut Registry) {
     data::register(r);
     plist::register(r);
     misc::register(r);
+    object::register_collection_coding();
+    predicate::register(r);
     foundation::register(r);
     app::register(r);
     uikit::register(r);

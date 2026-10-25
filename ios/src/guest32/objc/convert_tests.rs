@@ -265,6 +265,12 @@ fn variadic_arguments_go_to_stack_slots() {
     assert_eq!(f64::from_bits(call.args.stack[2]), 1.25);
     assert_eq!(call.args.stack[3], 9);
     assert_eq!(call.args.stack[4] as usize, b.host_address(BASE + 0x10));
+    // A predicate format's %K is a key path object, like %@ (not an int).
+    b.texts.insert(0x310, "%K == %@ AND %K > %d".into());
+    let w = [1, 2, 0x310, 0x500, 0x510, 0x520, (-1i32) as u32];
+    let call = prepare_host_call(&sig, HostCallOptions { varargs: Varargs::Format, ..plain() }, &words(&w), &mut b).unwrap();
+    assert_eq!(call.args.stack[..3], [(HOST_ID + 0x500) as u64, (HOST_ID + 0x510) as u64, (HOST_ID + 0x520) as u64]);
+    assert_eq!(call.args.stack[3] as i32, -1);
     // nil-ended object lists end with a 0 slot.
     let call = prepare_host_call(&sig, HostCallOptions { varargs: Varargs::NilList, ..plain() }, &words(&[1, 2, 0x10, 0x20, 0x30, 0]), &mut b).unwrap();
     assert_eq!(call.args.stack, [(HOST_ID + 0x20) as u64, (HOST_ID + 0x30) as u64, 0]);

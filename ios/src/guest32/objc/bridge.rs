@@ -1076,6 +1076,17 @@ pub fn send_from_guest(
                 PENDING_THROW.with(|p| p.set(Some(exception)));
                 return Ok(GuestRet { r0: 0, r1: 0 });
             }
+            // -doesNotRecognizeSelector: from game code: Apple's exception,
+            // thrown in the guest like -raise.
+            if name == "doesNotRecognizeSelector:" && !meta {
+                let asked = b.selector_name(g, get(first + 2));
+                let host = b.host_object_for(g, receiver)?;
+                drop(b);
+                let exception = crate::fw::object::unrecognized_selector_exception(host, &asked);
+                let exception = lock(bridge).guest_object(g, exception)?;
+                PENDING_THROW.with(|p| p.set(Some(exception)));
+                return Ok(GuestRet { r0: 0, r1: 0 });
+            }
             // The framework's -dealloc of a game object: its C++ ivars go first.
             let game_dealloc = name == "dealloc" && b.classes.class(u32_at(g, receiver)).is_some_and(|c| !c.meta);
             if game_dealloc {

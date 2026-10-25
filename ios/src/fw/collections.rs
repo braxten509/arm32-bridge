@@ -2,6 +2,7 @@
 //! Arrays: { isa, *mut Vec<Id> }. Dictionaries: { isa, *mut Vec<(key, value)> }.
 //! What goes in is kept (fw/counted.rs `keep`) and never let go.
 
+use crate::fw::geometry::{Point, Rect, Size, Transform, Transform3D};
 use crate::fw::object::{class_methods, define_class, methods};
 use crate::objc::runtime::{self, lock, Class, Id, Sel};
 use crate::symbols::Registry;
@@ -58,6 +59,12 @@ pub fn array_items(object: Id) -> Vec<Id> {
         return Vec::new();
     }
     items(object).clone()
+}
+
+/// Makes a mutable array hold exactly `list` (kept, as its other setters do).
+pub fn set_array_items(object: Id, list: Vec<Id>) {
+    keep_all(&list);
+    *items(object) = list;
 }
 
 pub fn dictionary_from(list: &[(Id, Id)]) -> Id {
@@ -803,9 +810,107 @@ extern "C" fn dict_object_enumerator(this: Id, _: Sel) -> Id {
     enumerator(dictionary_pairs(this).into_iter().map(|(_, v)| v).collect())
 }
 
-// ----- NSValue holding a pointer: { isa, kind, pointer } -----
+// ----- NSValue: { isa, kind, pointer } or { isa, KIND_STRUCT, *mut Boxed } -----
 
 const KIND_POINTER: usize = 3;
+const KIND_STRUCT: usize = 4;
+
+/// A struct held by value: its type encoding (as the host lays it out) and bytes.
+struct Boxed {
+    kind: std::ffi::CString,
+    bytes: Vec<u8>,
+}
+
+fn value_kind(object: Id) -> usize {
+    unsafe { *((object + 8) as *const usize) }
+}
+
+fn boxed(object: Id) -> Option<&'static Boxed> {
+    if object == 0 || value_kind(object) != KIND_STRUCT {
+        return None;
+    }
+    unsafe { (*((object + 16) as *const *const Boxed)).as_ref() }
+}
+
+/// A new NSValue (of `class`) holding a copy of `bytes`, of type `kind`.
+pub fn value_with_bytes(class: Class, kind: &str, bytes: &[u8]) -> Id {
+    let object = runtime::alloc_instance(class);
+    let held = Boxed { kind: std::ffi::CString::new(kind).unwrap_or_default(), bytes: bytes.to_vec() };
+    unsafe {
+        *((object + 8) as *mut usize) = KIND_STRUCT;
+        *((object + 16) as *mut *mut Boxed) = Box::into_raw(Box::new(held));
+    }
+    object
+}
+
+/// The struct an NSValue holds, if it holds one of `kind`'s size.
+pub fn value_struct<T: Copy + Default>(object: Id) -> T {
+    match boxed(object) {
+        Some(held) if held.bytes.len() == std::mem::size_of::<T>() => unsafe { (held.bytes.as_ptr() as *const T).read_unaligned() },
+        _ => T::default(),
+    }
+}
+
+fn bytes_of<T>(value: &T) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(value as *const T as *const u8, std::mem::size_of::<T>()) }
+}
+
+pub const POINT_TYPE: &str = "{CGPoint=dd}";
+pub const SIZE_TYPE: &str = "{CGSize=dd}";
+pub const RECT_TYPE: &str = "{CGRect={CGPoint=dd}{CGSize=dd}}";
+pub const TRANSFORM_TYPE: &str = "{CGAffineTransform=dddddd}";
+pub const TRANSFORM_3D_TYPE: &str = "{CATransform3D=dddddddddddddddd}";
+pub const RANGE_TYPE: &str = "{_NSRange=QQ}";
+
+pub fn value_with<T>(kind: &str, value: &T) -> Id {
+    value_with_bytes(runtime::class_named("NSValue"), kind, bytes_of(value))
+}
+
+extern "C" fn value_with_point(class: Class, _: Sel, value: Point) -> Id {
+    value_with_bytes(class, POINT_TYPE, bytes_of(&value))
+}
+extern "C" fn value_with_size(class: Class, _: Sel, value: Size) -> Id {
+    value_with_bytes(class, SIZE_TYPE, bytes_of(&value))
+}
+extern "C" fn value_with_rect(class: Class, _: Sel, value: Rect) -> Id {
+    value_with_bytes(class, RECT_TYPE, bytes_of(&value))
+}
+extern "C" fn value_with_transform(class: Class, _: Sel, value: Transform) -> Id {
+    value_with_bytes(class, TRANSFORM_TYPE, bytes_of(&value))
+}
+extern "C" fn value_with_transform_3d(class: Class, _: Sel, value: Transform3D) -> Id {
+    value_with_bytes(class, TRANSFORM_3D_TYPE, bytes_of(&value))
+}
+extern "C" fn value_with_range(class: Class, _: Sel, value: crate::fw::string::Range) -> Id {
+    value_with_bytes(class, RANGE_TYPE, bytes_of(&value))
+}
+extern "C" fn value_point(this: Id, _: Sel) -> Point {
+    value_struct(this)
+}
+extern "C" fn value_size(this: Id, _: Sel) -> Size {
+    value_struct(this)
+}
+extern "C" fn value_rect(this: Id, _: Sel) -> Rect {
+    value_struct(this)
+}
+extern "C" fn value_transform(this: Id, _: Sel) -> Transform {
+    match boxed(this) {
+        Some(held) if held.bytes.len() == std::mem::size_of::<Transform>() => unsafe { (held.bytes.as_ptr() as *const Transform).read_unaligned() },
+        _ => crate::fw::geometry::IDENTITY,
+    }
+}
+extern "C" fn value_transform_3d(this: Id, _: Sel) -> Transform3D {
+    match boxed(this) {
+        Some(held) if held.bytes.len() == std::mem::size_of::<Transform3D>() => unsafe { (held.bytes.as_ptr() as *const Transform3D).read_unaligned() },
+        _ => crate::fw::geometry::IDENTITY_3D,
+    }
+}
+extern "C" fn value_range(this: Id, _: Sel) -> crate::fw::string::Range {
+    match boxed(this) {
+        Some(held) if held.bytes.len() == 16 => unsafe { (held.bytes.as_ptr() as *const crate::fw::string::Range).read_unaligned() },
+        _ => crate::fw::string::Range { location: 0, length: 0 },
+    }
+}
 
 extern "C" fn value_with_pointer(class: Class, _: Sel, pointer: usize) -> Id {
     let object = runtime::alloc_instance(class);
@@ -817,12 +922,27 @@ extern "C" fn value_with_pointer(class: Class, _: Sel, pointer: usize) -> Id {
 }
 
 extern "C" fn value_pointer(this: Id, _: Sel) -> usize {
+    if boxed(this).is_some() {
+        return 0;
+    }
     unsafe { *((this + 16) as *const usize) }
 }
 
+/// Copies the value out: a struct's bytes, else the pointer.
 extern "C" fn value_get(this: Id, s: Sel, out: *mut usize) {
-    if !out.is_null() {
-        unsafe { out.write_unaligned(value_pointer(this, s)) };
+    if out.is_null() {
+        return;
+    }
+    match boxed(this) {
+        Some(held) => unsafe { std::ptr::copy_nonoverlapping(held.bytes.as_ptr(), out as *mut u8, held.bytes.len()) },
+        None => unsafe { out.write_unaligned(value_pointer(this, s)) },
+    }
+}
+
+extern "C" fn value_objc_type(this: Id, _: Sel) -> *const std::ffi::c_char {
+    match boxed(this) {
+        Some(held) => held.kind.as_ptr(),
+        None => c"^v".as_ptr(),
     }
 }
 
@@ -831,11 +951,43 @@ extern "C" fn value_is_equal(this: Id, s: Sel, other: Id) -> bool {
         let rt = lock();
         other != 0 && rt.class_of(other) == rt.class_of(this)
     };
-    same_class && value_pointer(this, s) == value_pointer(other, s)
+    if !same_class {
+        return false;
+    }
+    match (boxed(this), boxed(other)) {
+        (Some(a), Some(b)) => a.kind == b.kind && a.bytes == b.bytes,
+        (None, None) => value_pointer(this, s) == value_pointer(other, s),
+        _ => false,
+    }
 }
 
 extern "C" fn value_hash(this: Id, s: Sel) -> usize {
-    value_pointer(this, s)
+    match boxed(this) {
+        Some(held) => held.bytes.iter().fold(0xcbf29ce484222325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100000001b3)) as usize,
+        None => value_pointer(this, s),
+    }
+}
+
+extern "C" fn value_description(this: Id, _: Sel) -> Id {
+    let text = match boxed(this) {
+        Some(held) => match held.kind.to_str().unwrap_or("") {
+            POINT_TYPE => {
+                let p: Point = value_struct(this);
+                format!("NSPoint: {{{}, {}}}", p.x, p.y)
+            }
+            SIZE_TYPE => {
+                let s: Size = value_struct(this);
+                format!("NSSize: {{{}, {}}}", s.width, s.height)
+            }
+            RECT_TYPE => {
+                let r: Rect = value_struct(this);
+                format!("NSRect: {{{{{}, {}}}, {{{}, {}}}}}", r.origin.x, r.origin.y, r.size.width, r.size.height)
+            }
+            _ => format!("<{}>", held.bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+        },
+        None => format!("<{:x}>", value_pointer(this, 0)),
+    };
+    crate::fw::string::make(&text)
 }
 
 // ----- NSNumber: { isa, kind, value bits } -----
@@ -981,6 +1133,336 @@ extern "C" fn number_string_value(this: Id, _: Sel) -> Id {
 extern "C" fn return_self(this: Id, _: Sel, _zone: usize) -> Id {
     this
 }
+extern "C" fn number_with_unsigned_long(_: Class, _: Sel, value: u64) -> Id {
+    number_int(value as i64)
+}
+extern "C" fn number_init_unsigned_long_long(this: Id, _: Sel, value: u64) -> Id {
+    unsafe {
+        *((this + 8) as *mut usize) = KIND_INT;
+        *((this + 16) as *mut u64) = value;
+    }
+    this
+}
+extern "C" fn number_unsigned_short_value(this: Id, _: Sel) -> u16 {
+    number_as_i64(this) as u16
+}
+/// The C type the number was made from, as Apple reports it for each kind.
+extern "C" fn number_objc_type(this: Id, _: Sel) -> *const std::ffi::c_char {
+    match number_parts(this).0 {
+        KIND_FLOAT => c"d".as_ptr(),
+        KIND_BOOL => c"c".as_ptr(),
+        _ => c"q".as_ptr(),
+    }
+}
+
+// ----- NSDecimalNumber: kept as a whole number, or a double when it has a fraction -----
+
+fn decimal_from(value: f64) -> Id {
+    if value.fract() == 0.0 && value.abs() < 9.0e15 {
+        return decimal_number(value as i64);
+    }
+    let object = runtime::alloc_instance(runtime::class_named("NSDecimalNumber"));
+    unsafe {
+        *((object + 8) as *mut usize) = KIND_FLOAT;
+        *((object + 16) as *mut u64) = value.to_bits();
+    }
+    object
+}
+
+extern "C" fn decimal_with_mantissa(_: Class, _: Sel, mantissa: u64, exponent: i16, negative: u8) -> Id {
+    if exponent >= 0 {
+        if let Some(whole) = 10i64.checked_pow(exponent as u32).and_then(|p| i64::try_from(mantissa).ok()?.checked_mul(p)) {
+            return decimal_number(if negative != 0 { -whole } else { whole });
+        }
+    }
+    let value = mantissa as f64 * 10f64.powi(exponent as i32);
+    decimal_from(if negative != 0 { -value } else { value })
+}
+
+extern "C" fn decimal_not_a_number(_: Class, _: Sel) -> Id {
+    decimal_from(f64::NAN)
+}
+
+/// The number the text starts with (after spaces); NaN when it starts with none.
+extern "C" fn decimal_with_string(class: Class, s: Sel, text: Id) -> Id {
+    let text = crate::fw::string::get(text);
+    let text = text.trim_start();
+    let digits = text.trim_start_matches(['-', '+']);
+    if !digits.starts_with(|c: char| c.is_ascii_digit() || c == '.') || !digits.trim_start_matches('.').starts_with(|c: char| c.is_ascii_digit()) {
+        return decimal_not_a_number(class, s);
+    }
+    let number = crate::fw::string::make(text);
+    let double: extern "C" fn(Id, Sel) -> f64 =
+        unsafe { std::mem::transmute(runtime::imp_for(number, runtime::sel("doubleValue")).expect("NSString doubleValue")) };
+    decimal_from(double(number, 0))
+}
+
+// ----- NSIndexSet / NSMutableIndexSet: { isa, *mut BTreeSet<usize> } -----
+
+const NOT_FOUND: usize = isize::MAX as usize;
+
+fn indexes(object: Id) -> &'static mut std::collections::BTreeSet<usize> {
+    unsafe {
+        let slot = (object + 8) as *mut *mut std::collections::BTreeSet<usize>;
+        if (*slot).is_null() {
+            *slot = Box::into_raw(Box::default());
+        }
+        &mut **slot
+    }
+}
+
+/// The indexes in an index set, in order.
+pub fn index_set_items(object: Id) -> Vec<usize> {
+    if object == 0 {
+        return Vec::new();
+    }
+    indexes(object).iter().copied().collect()
+}
+
+fn range_indexes(range: crate::fw::string::Range) -> std::ops::Range<usize> {
+    range.location..range.location.saturating_add(range.length)
+}
+
+extern "C" fn index_set_empty(class: Class, _: Sel) -> Id {
+    let object = runtime::alloc_instance(class);
+    indexes(object);
+    object
+}
+extern "C" fn index_set_with_index(class: Class, s: Sel, index: usize) -> Id {
+    let object = index_set_empty(class, s);
+    indexes(object).insert(index);
+    object
+}
+extern "C" fn index_set_with_range(class: Class, s: Sel, range: crate::fw::string::Range) -> Id {
+    let object = index_set_empty(class, s);
+    indexes(object).extend(range_indexes(range));
+    object
+}
+extern "C" fn index_set_init(this: Id, _: Sel) -> Id {
+    indexes(this);
+    this
+}
+extern "C" fn index_set_init_with_index(this: Id, _: Sel, index: usize) -> Id {
+    indexes(this).insert(index);
+    this
+}
+extern "C" fn index_set_init_with_range(this: Id, _: Sel, range: crate::fw::string::Range) -> Id {
+    indexes(this).extend(range_indexes(range));
+    this
+}
+extern "C" fn index_set_init_with_set(this: Id, _: Sel, other: Id) -> Id {
+    *indexes(this) = index_set_items(other).into_iter().collect();
+    this
+}
+extern "C" fn index_set_count(this: Id, _: Sel) -> usize {
+    indexes(this).len()
+}
+extern "C" fn index_set_first(this: Id, _: Sel) -> usize {
+    indexes(this).first().copied().unwrap_or(NOT_FOUND)
+}
+extern "C" fn index_set_last(this: Id, _: Sel) -> usize {
+    indexes(this).last().copied().unwrap_or(NOT_FOUND)
+}
+extern "C" fn index_set_greater(this: Id, _: Sel, index: usize) -> usize {
+    indexes(this).range(index.saturating_add(1)..).next().copied().unwrap_or(NOT_FOUND)
+}
+extern "C" fn index_set_less(this: Id, _: Sel, index: usize) -> usize {
+    indexes(this).range(..index).next_back().copied().unwrap_or(NOT_FOUND)
+}
+extern "C" fn index_set_contains(this: Id, _: Sel, index: usize) -> bool {
+    indexes(this).contains(&index)
+}
+extern "C" fn index_set_contains_set(this: Id, _: Sel, other: Id) -> bool {
+    index_set_items(other).iter().all(|i| indexes(this).contains(i))
+}
+extern "C" fn index_set_is_equal(this: Id, _: Sel, other: Id) -> bool {
+    other != 0 && index_set_items(this) == index_set_items(other)
+}
+extern "C" fn index_set_copy(this: Id, _: Sel, _zone: usize) -> Id {
+    let object = runtime::alloc_instance(runtime::class_named("NSIndexSet"));
+    *indexes(object) = indexes(this).clone();
+    object
+}
+extern "C" fn index_set_mutable_copy(this: Id, _: Sel, _zone: usize) -> Id {
+    let object = runtime::alloc_instance(runtime::class_named("NSMutableIndexSet"));
+    *indexes(object) = indexes(this).clone();
+    object
+}
+/// block(index, &stop), in order.
+extern "C" fn index_set_enumerate(this: Id, _: Sel, block: usize) {
+    let header = block as *const crate::libsystem::mach::BlockHeader;
+    let invoke: extern "C" fn(usize, usize, *mut u8) = unsafe { std::mem::transmute((*header).invoke) };
+    let mut stop = 0u8;
+    for index in index_set_items(this) {
+        invoke(block, index, &mut stop);
+        if stop != 0 {
+            break;
+        }
+    }
+}
+extern "C" fn index_set_description(this: Id, _: Sel) -> Id {
+    let list: Vec<String> = index_set_items(this).iter().map(|i| i.to_string()).collect();
+    crate::fw::string::make(&format!("<NSIndexSet>[number of indexes: {} (in {} ranges), indexes: ({})]", list.len(), list.len(), list.join(" ")))
+}
+extern "C" fn index_set_add(this: Id, _: Sel, index: usize) {
+    indexes(this).insert(index);
+}
+extern "C" fn index_set_remove(this: Id, _: Sel, index: usize) {
+    indexes(this).remove(&index);
+}
+extern "C" fn index_set_add_range(this: Id, _: Sel, range: crate::fw::string::Range) {
+    indexes(this).extend(range_indexes(range));
+}
+extern "C" fn index_set_remove_range(this: Id, _: Sel, range: crate::fw::string::Range) {
+    let range = range_indexes(range);
+    indexes(this).retain(|i| !range.contains(i));
+}
+extern "C" fn index_set_add_set(this: Id, _: Sel, other: Id) {
+    indexes(this).extend(index_set_items(other));
+}
+extern "C" fn index_set_remove_set(this: Id, _: Sel, other: Id) {
+    for index in index_set_items(other) {
+        indexes(this).remove(&index);
+    }
+}
+extern "C" fn index_set_remove_all(this: Id, _: Sel) {
+    indexes(this).clear();
+}
+
+// ----- more NSArray / NSDictionary -----
+
+/// Calls a test block (item, index, &stop) -> BOOL for each item until it stops.
+fn passing_test(list: &[Id], block: usize, mut found: impl FnMut(usize)) {
+    let header = block as *const crate::libsystem::mach::BlockHeader;
+    let invoke: extern "C" fn(usize, Id, usize, *mut u8) -> u8 = unsafe { std::mem::transmute((*header).invoke) };
+    let mut stop = 0u8;
+    for (index, &item) in list.iter().enumerate() {
+        if invoke(block, item, index, &mut stop) != 0 {
+            found(index);
+        }
+        if stop != 0 {
+            break;
+        }
+    }
+}
+
+extern "C" fn array_index_passing(this: Id, _: Sel, block: usize) -> usize {
+    let mut first = None;
+    let list = array_items(this);
+    let header = block as *const crate::libsystem::mach::BlockHeader;
+    let invoke: extern "C" fn(usize, Id, usize, *mut u8) -> u8 = unsafe { std::mem::transmute((*header).invoke) };
+    let mut stop = 0u8;
+    for (index, &item) in list.iter().enumerate() {
+        if invoke(block, item, index, &mut stop) != 0 {
+            first = Some(index);
+            break;
+        }
+        if stop != 0 {
+            break;
+        }
+    }
+    first.unwrap_or(NOT_FOUND)
+}
+
+extern "C" fn array_indexes_passing(this: Id, _: Sel, block: usize) -> Id {
+    let set = runtime::alloc_instance(runtime::class_named("NSIndexSet"));
+    passing_test(&array_items(this), block, |index| {
+        indexes(set).insert(index);
+    });
+    set
+}
+
+extern "C" fn array_objects_at_indexes(this: Id, _: Sel, set: Id) -> Id {
+    let list = array_items(this);
+    let mut picked = Vec::new();
+    for index in index_set_items(set) {
+        match list.get(index) {
+            Some(&item) => picked.push(item),
+            None => {
+                crate::log!("STOP: objectsAtIndexes: index {index} is past the end ({} items)", list.len());
+                crate::report::finish(1);
+            }
+        }
+    }
+    array_from(&picked)
+}
+
+extern "C" fn array_init_copy_items(this: Id, _: Sel, other: Id, copy_items: u8) -> Id {
+    let mut list = array_items(other);
+    if copy_items != 0 {
+        list = list.into_iter().map(|item| if item == 0 { 0 } else { runtime::send(item, "copyWithZone:", &[0]) }).collect();
+    }
+    set_array_items(this, list);
+    this
+}
+
+extern "C" fn array_remove_at_indexes(this: Id, _: Sel, set: Id) {
+    let remove = index_set_items(set);
+    let mut index = 0;
+    items(this).retain(|_| {
+        let keep = remove.binary_search(&index).is_err();
+        index += 1;
+        keep
+    });
+}
+
+extern "C" fn array_remove_range(this: Id, _: Sel, range: crate::fw::string::Range) {
+    let list = items(this);
+    let start = range.location.min(list.len());
+    let end = range.location.saturating_add(range.length).min(list.len());
+    list.drain(start..end);
+}
+
+extern "C" fn array_set_array(this: Id, _: Sel, other: Id) {
+    set_array_items(this, array_items(other));
+}
+
+extern "C" fn dict_with_objects_for_keys(class: Class, s: Sel, values: Id, keys: Id) -> Id {
+    dict_init_objects_for_keys(runtime::alloc_instance(class), s, values, keys)
+}
+
+extern "C" fn dict_init_objects_for_keys(this: Id, s: Sel, values: Id, keys: Id) -> Id {
+    let (values, keys) = (array_items(values), array_items(keys));
+    if values.len() != keys.len() {
+        crate::log!("STOP: dictionaryWithObjects:forKeys: has {} objects but {} keys", values.len(), keys.len());
+        crate::report::finish(1);
+    }
+    dict_init_objects_keys_count(this, s, values.as_ptr(), keys.as_ptr(), keys.len())
+}
+
+fn keys_sorted_by_value(this: Id, mut order: impl FnMut(Id, Id) -> std::cmp::Ordering) -> Id {
+    let mut entries = dictionary_pairs(this);
+    entries.sort_by(|a, b| order(a.1, b.1));
+    array_from(&entries.into_iter().map(|(k, _)| k).collect::<Vec<_>>())
+}
+
+extern "C" fn dict_keys_sorted_by_selector(this: Id, _: Sel, selector: Sel) -> Id {
+    keys_sorted_by_value(this, |a, b| compare_with_selector(a, b, selector))
+}
+
+extern "C" fn dict_keys_sorted_by_comparator(this: Id, _: Sel, block: usize) -> Id {
+    keys_sorted_by_value(this, |a, b| compare_with_block(a, b, block))
+}
+
+/// "key" = "value"; lines, as a .strings file holds them.
+extern "C" fn dict_strings_file_format(this: Id, _: Sel) -> Id {
+    let quote = |object: Id| {
+        let text = crate::fw::string::describe(object);
+        let escaped: String = text
+            .chars()
+            .flat_map(|c| match c {
+                '"' => vec!['\\', '"'],
+                '\\' => vec!['\\', '\\'],
+                '\n' => vec!['\\', 'n'],
+                '\t' => vec!['\\', 't'],
+                other => vec![other],
+            })
+            .collect();
+        format!("\"{escaped}\"")
+    };
+    let lines: String = dictionary_pairs(this).into_iter().map(|(k, v)| format!("{} = {};\n", quote(k), quote(v))).collect();
+    crate::fw::string::make(&lines)
+}
 
 pub fn register(_: &mut Registry) {
     let array = define_class("NSArray", "NSObject", 16);
@@ -990,10 +1472,28 @@ pub fn register(_: &mut Registry) {
     let value = define_class("NSValue", "NSObject", 24);
     let number = define_class("NSNumber", "NSValue", 24);
     let decimal = define_class("NSDecimalNumber", "NSNumber", 24);
-    class_methods(decimal, &[("zero", decimal_zero as usize), ("one", decimal_one as usize)]);
+    class_methods(
+        decimal,
+        &[
+            ("zero", decimal_zero as usize),
+            ("one", decimal_one as usize),
+            ("notANumber", decimal_not_a_number as usize),
+            ("decimalNumberWithMantissa:exponent:isNegative:", decimal_with_mantissa as usize),
+            ("decimalNumberWithString:", decimal_with_string as usize),
+        ],
+    );
     class_methods(
         value,
-        &[("valueWithPointer:", value_with_pointer as usize), ("valueWithNonretainedObject:", value_with_pointer as usize)],
+        &[
+            ("valueWithPointer:", value_with_pointer as usize),
+            ("valueWithNonretainedObject:", value_with_pointer as usize),
+            ("valueWithCGPoint:", value_with_point as usize),
+            ("valueWithCGSize:", value_with_size as usize),
+            ("valueWithCGRect:", value_with_rect as usize),
+            ("valueWithCGAffineTransform:", value_with_transform as usize),
+            ("valueWithCATransform3D:", value_with_transform_3d as usize),
+            ("valueWithRange:", value_with_range as usize),
+        ],
     );
     methods(
         value,
@@ -1001,10 +1501,62 @@ pub fn register(_: &mut Registry) {
             ("pointerValue", value_pointer as usize),
             ("nonretainedObjectValue", value_pointer as usize),
             ("getValue:", value_get as usize),
+            ("objCType", value_objc_type as usize),
+            ("CGPointValue", value_point as usize),
+            ("CGSizeValue", value_size as usize),
+            ("CGRectValue", value_rect as usize),
+            ("CGAffineTransformValue", value_transform as usize),
+            ("CATransform3DValue", value_transform_3d as usize),
+            ("rangeValue", value_range as usize),
             ("isEqual:", value_is_equal as usize),
             ("isEqualToValue:", value_is_equal as usize),
             ("hash", value_hash as usize),
+            ("description", value_description as usize),
             ("copyWithZone:", return_self as usize),
+        ],
+    );
+    let index_set = define_class("NSIndexSet", "NSObject", 16);
+    let mutable_index_set = define_class("NSMutableIndexSet", "NSIndexSet", 16);
+    class_methods(
+        index_set,
+        &[
+            ("indexSet", index_set_empty as usize),
+            ("indexSetWithIndex:", index_set_with_index as usize),
+            ("indexSetWithIndexesInRange:", index_set_with_range as usize),
+        ],
+    );
+    methods(
+        index_set,
+        &[
+            ("init", index_set_init as usize),
+            ("initWithIndex:", index_set_init_with_index as usize),
+            ("initWithIndexesInRange:", index_set_init_with_range as usize),
+            ("initWithIndexSet:", index_set_init_with_set as usize),
+            ("count", index_set_count as usize),
+            ("firstIndex", index_set_first as usize),
+            ("lastIndex", index_set_last as usize),
+            ("indexGreaterThanIndex:", index_set_greater as usize),
+            ("indexLessThanIndex:", index_set_less as usize),
+            ("containsIndex:", index_set_contains as usize),
+            ("containsIndexes:", index_set_contains_set as usize),
+            ("isEqualToIndexSet:", index_set_is_equal as usize),
+            ("isEqual:", index_set_is_equal as usize),
+            ("enumerateIndexesUsingBlock:", index_set_enumerate as usize),
+            ("copyWithZone:", index_set_copy as usize),
+            ("mutableCopyWithZone:", index_set_mutable_copy as usize),
+            ("description", index_set_description as usize),
+        ],
+    );
+    methods(
+        mutable_index_set,
+        &[
+            ("addIndex:", index_set_add as usize),
+            ("removeIndex:", index_set_remove as usize),
+            ("addIndexesInRange:", index_set_add_range as usize),
+            ("removeIndexesInRange:", index_set_remove_range as usize),
+            ("addIndexes:", index_set_add_set as usize),
+            ("removeIndexes:", index_set_remove_set as usize),
+            ("removeAllIndexes", index_set_remove_all as usize),
         ],
     );
     CLASSES.set(Classes { array, mutable_array, dictionary, mutable_dictionary, number }).ok();
@@ -1037,12 +1589,19 @@ pub fn register(_: &mut Registry) {
             ("enumerateObjectsUsingBlock:", array_enumerate_block as usize),
             ("initWithContentsOfFile:", init_with_contents_of_file as usize),
             ("writeToFile:atomically:", write_to_file as usize),
+            ("indexOfObjectPassingTest:", array_index_passing as usize),
+            ("indexesOfObjectsPassingTest:", array_indexes_passing as usize),
+            ("objectsAtIndexes:", array_objects_at_indexes as usize),
+            ("initWithArray:copyItems:", array_init_copy_items as usize),
         ],
     );
     class_methods(array, &[("arrayWithContentsOfFile:", array_with_contents_of_file as usize)]);
     methods(
         mutable_array,
         &[
+            ("removeObjectsAtIndexes:", array_remove_at_indexes as usize),
+            ("removeObjectsInRange:", array_remove_range as usize),
+            ("setArray:", array_set_array as usize),
             ("sortUsingSelector:", array_sort_selector as usize),
             ("sortUsingComparator:", array_sort_comparator as usize),
             ("sortUsingFunction:context:", array_sort_function as usize),
@@ -1061,11 +1620,16 @@ pub fn register(_: &mut Registry) {
             ("allKeysForObject:", dict_keys_for_object as usize),
             ("initWithContentsOfFile:", init_with_contents_of_file as usize),
             ("writeToFile:atomically:", write_to_file as usize),
+            ("initWithObjects:forKeys:", dict_init_objects_for_keys as usize),
+            ("keysSortedByValueUsingSelector:", dict_keys_sorted_by_selector as usize),
+            ("keysSortedByValueUsingComparator:", dict_keys_sorted_by_comparator as usize),
+            ("descriptionInStringsFileFormat", dict_strings_file_format as usize),
         ],
     );
     class_methods(
         dictionary,
         &[
+            ("dictionaryWithObjects:forKeys:", dict_with_objects_for_keys as usize),
             ("dictionaryWithContentsOfFile:", dict_with_contents_of_file as usize),
             ("dictionaryWithContentsOfURL:", dict_with_contents_of_url as usize),
         ],
@@ -1190,6 +1754,7 @@ pub fn register(_: &mut Registry) {
             ("numberWithLongLong:", number_with_long as usize),
             ("numberWithUnsignedLongLong:", number_with_long as usize),
             ("numberWithUnsignedInteger:", number_with_long as usize),
+            ("numberWithUnsignedLong:", number_with_unsigned_long as usize),
             ("numberWithBool:", number_with_bool as usize),
             ("numberWithFloat:", number_with_float as usize),
             ("numberWithDouble:", number_with_double as usize),
@@ -1208,6 +1773,10 @@ pub fn register(_: &mut Registry) {
             ("unsignedIntValue", number_int_value as usize),
             ("unsignedIntegerValue", number_int_value as usize),
             ("unsignedLongLongValue", number_int_value as usize),
+            ("unsignedLongValue", number_int_value as usize),
+            ("unsignedShortValue", number_unsigned_short_value as usize),
+            ("initWithUnsignedLongLong:", number_init_unsigned_long_long as usize),
+            ("objCType", number_objc_type as usize),
             ("boolValue", number_bool_value as usize),
             ("floatValue", number_float_value as usize),
             ("doubleValue", number_double_value as usize),
@@ -1310,5 +1879,130 @@ mod tests {
         let mut out = 0usize;
         runtime::send(boxed, "getValue:", &[&mut out as *mut usize as usize]);
         assert_eq!(out, 0x1234_5670);
+    }
+
+    /// NSValue boxes geometry structs by value (CGFloat doubles here; a
+    /// CATransform3D goes by address, too big for registers) and gives
+    /// each back with its type encoding; equal boxes compare equal.
+    #[test]
+    fn values_box_geometry_structs() {
+        use crate::fw::geometry::{Point, Rect, Size, Transform, Transform3D};
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let class = runtime::class_named("NSValue");
+        let imp = |receiver: Id, name: &str| runtime::imp_for(receiver, runtime::sel(name)).unwrap_or_else(|| panic!("{name} is missing"));
+        let meta = |name: &str| imp(class, name);
+        let rect = Rect::new(1.5, -2.0, 320.0, 480.25);
+        let make_rect: extern "C" fn(Class, Sel, Rect) -> Id = unsafe { std::mem::transmute(meta("valueWithCGRect:")) };
+        let boxed = make_rect(class, runtime::sel("valueWithCGRect:"), rect);
+        let get_rect: extern "C" fn(Id, Sel, ) -> Rect = unsafe { std::mem::transmute(imp(boxed, "CGRectValue")) };
+        assert_eq!(get_rect(boxed, 0), rect);
+        let kind = runtime::send(boxed, "objCType", &[]);
+        assert_eq!(unsafe { runtime::cstr(kind) }, "{CGRect={CGPoint=dd}{CGSize=dd}}");
+        let again = make_rect(class, 0, rect);
+        assert_eq!(runtime::send(boxed, "isEqualToValue:", &[again]) & 0xFF, 1);
+        assert_eq!(runtime::send(boxed, "isEqual:", &[make_rect(class, 0, Rect::default())]) & 0xFF, 0);
+
+        let make_point: extern "C" fn(Class, Sel, Point) -> Id = unsafe { std::mem::transmute(meta("valueWithCGPoint:")) };
+        let point = make_point(class, 0, Point { x: 3.0, y: 4.0 });
+        let get_point: extern "C" fn(Id, Sel) -> Point = unsafe { std::mem::transmute(imp(point, "CGPointValue")) };
+        assert_eq!(get_point(point, 0), Point { x: 3.0, y: 4.0 });
+        let make_size: extern "C" fn(Class, Sel, Size) -> Id = unsafe { std::mem::transmute(meta("valueWithCGSize:")) };
+        let size = make_size(class, 0, Size { width: 5.0, height: 6.0 });
+        let get_size: extern "C" fn(Id, Sel) -> Size = unsafe { std::mem::transmute(imp(size, "CGSizeValue")) };
+        assert_eq!(get_size(size, 0), Size { width: 5.0, height: 6.0 });
+        let turn = Transform { a: 0.0, b: 1.0, c: -1.0, d: 0.0, tx: 7.0, ty: 8.0 };
+        let make_transform: extern "C" fn(Class, Sel, Transform) -> Id = unsafe { std::mem::transmute(meta("valueWithCGAffineTransform:")) };
+        let transform = make_transform(class, 0, turn);
+        let get_transform: extern "C" fn(Id, Sel) -> Transform = unsafe { std::mem::transmute(imp(transform, "CGAffineTransformValue")) };
+        assert_eq!(get_transform(transform, 0), turn);
+        let mut cells = [0.0f64; 16];
+        cells.iter_mut().enumerate().for_each(|(i, c)| *c = i as f64 + 0.5);
+        let make_3d: extern "C" fn(Class, Sel, Transform3D) -> Id = unsafe { std::mem::transmute(meta("valueWithCATransform3D:")) };
+        let three = make_3d(class, 0, Transform3D(cells));
+        let get_3d: extern "C" fn(Id, Sel) -> Transform3D = unsafe { std::mem::transmute(imp(three, "CATransform3DValue")) };
+        assert_eq!(get_3d(three, 0).0, cells);
+        // getValue: copies the struct's bytes.
+        let mut out = Point::default();
+        runtime::send(point, "getValue:", &[&mut out as *mut Point as usize]);
+        assert_eq!(out, Point { x: 3.0, y: 4.0 });
+    }
+
+    /// The NSNumber/NSDecimalNumber pieces games read back as other types.
+    #[test]
+    fn numbers_and_decimals_keep_their_values() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let number = runtime::class_named("NSNumber");
+        let big = runtime::send(number, "numberWithUnsignedLong:", &[u64::MAX as usize]);
+        assert_eq!(runtime::send(big, "unsignedLongValue", &[]), u64::MAX as usize);
+        let short = runtime::send(number, "numberWithInt:", &[70_000]);
+        assert_eq!(runtime::send(short, "unsignedShortValue", &[]) & 0xFFFF, 70_000 & 0xFFFF);
+        let made = runtime::send(runtime::alloc_instance(number), "initWithUnsignedLongLong:", &[1 << 40]);
+        assert_eq!(number_as_i64(made), 1 << 40);
+        assert_eq!(unsafe { runtime::cstr(runtime::send(made, "objCType", &[])) }, "q");
+        let decimal = runtime::class_named("NSDecimalNumber");
+        // 1999 x 10^-2, negative: -19.99
+        let price = runtime::send(decimal, "decimalNumberWithMantissa:exponent:isNegative:", &[1999, (-2i16) as u16 as usize, 1]);
+        assert!((number_as_f64(price) + 19.99).abs() < 1e-9, "{}", number_as_f64(price));
+        let whole = runtime::send(decimal, "decimalNumberWithMantissa:exponent:isNegative:", &[25, 3, 0]);
+        assert_eq!(number_as_i64(whole), 25_000);
+        let parsed = runtime::send(decimal, "decimalNumberWithString:", &[crate::fw::string::make("4.75")]);
+        assert_eq!(number_as_f64(parsed), 4.75);
+        let nan = runtime::send(decimal, "notANumber", &[]);
+        assert!(number_as_f64(nan).is_nan());
+        let bad = runtime::send(decimal, "decimalNumberWithString:", &[crate::fw::string::make("price")]);
+        assert!(number_as_f64(bad).is_nan(), "text that isn't a number gives NaN");
+    }
+
+    /// Index sets, and the array and dictionary methods that take ranges,
+    /// index sets, blocks and selectors.
+    #[test]
+    fn index_sets_and_collection_edits() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let s = crate::fw::string::make;
+        let n = number_int;
+        let indexes = runtime::send(runtime::class_named("NSMutableIndexSet"), "indexSet", &[]);
+        for i in [5, 1, 3, 1] {
+            runtime::send(indexes, "addIndex:", &[i]);
+        }
+        runtime::send(indexes, "removeIndex:", &[3]);
+        assert_eq!(runtime::send(indexes, "count", &[]), 2);
+        extern "C" fn note(block: usize, index: usize, _stop: *mut u8) {
+            unsafe { (*((block + 32) as *const std::sync::Mutex<Vec<usize>>)).lock().unwrap().push(index) };
+        }
+        #[repr(C)]
+        struct Block {
+            header: crate::libsystem::mach::BlockHeader,
+            seen: std::sync::Mutex<Vec<usize>>,
+        }
+        let descriptor: [usize; 4] = [0, std::mem::size_of::<Block>(), 0, 0];
+        let block = Block {
+            header: crate::libsystem::mach::BlockHeader { isa: 0, flags: 1 << 28, reserved: 0, invoke: note as usize, descriptor: &descriptor },
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
+        runtime::send(indexes, "enumerateIndexesUsingBlock:", &[&block as *const Block as usize]);
+        assert_eq!(*block.seen.lock().unwrap(), [1, 5]);
+
+        let list = runtime::send(array_from(&[s("a"), s("b"), s("c"), s("d"), s("e"), s("f")]), "mutableCopy", &[]);
+        runtime::send(list, "removeObjectsAtIndexes:", &[indexes]);
+        let remove_range: extern "C" fn(Id, Sel, crate::fw::string::Range) = unsafe { std::mem::transmute(runtime::imp_for(list, runtime::sel("removeObjectsInRange:")).unwrap()) };
+        remove_range(list, 0, crate::fw::string::Range { location: 1, length: 2 });
+        let left: Vec<String> = array_items(list).into_iter().map(crate::fw::string::get).collect();
+        assert_eq!(left, ["a", "e"]);
+        runtime::send(list, "setArray:", &[array_from(&[s("x")])]);
+        assert_eq!(array_items(list).len(), 1);
+        let copied = runtime::send(runtime::alloc_instance(runtime::class_named("NSArray")), "initWithArray:copyItems:", &[list, 1]);
+        assert_eq!(crate::fw::string::get(array_items(copied)[0]), "x");
+
+        let keys = array_from(&[s("low"), s("high"), s("mid")]);
+        let dictionary = runtime::send(runtime::class_named("NSDictionary"), "dictionaryWithObjects:forKeys:", &[array_from(&[n(1), n(9), n(5)]), keys]);
+        assert_eq!(number_as_i64(dictionary_get(dictionary, s("mid"))), 5);
+        let sorted = runtime::send(dictionary, "keysSortedByValueUsingSelector:", &[runtime::sel("compare:")]);
+        let order: Vec<String> = array_items(sorted).into_iter().map(crate::fw::string::get).collect();
+        assert_eq!(order, ["low", "mid", "high"]);
+        let text = crate::fw::string::get(runtime::send(dictionary_from(&[(s("k"), s("v \"q\""))]), "descriptionInStringsFileFormat", &[]));
+        assert_eq!(text, "\"k\" = \"v \\\"q\\\"\";\n");
     }
 }
