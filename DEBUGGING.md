@@ -2109,3 +2109,71 @@ Owner's choices: downloaded files only (no Play Store installs), general steps p
   anything (it also covers provider/permission clashes). After removal, a failed install says the old copy is gone.
   Codex review: 3 findings, all fixed. Emulator test: ~/dev/scratch-bhook/replace-test.sh (original T&Q pieces ->
   Replace -> OK -> Install -> Installed + provider).
+
+## Rule the Kingdom 5.11 (SDL game, emulator only, 2026-10-25)
+
+com.gameinsight.kingdom 5.11 (Game Insight, 2014, targetSdk 19): one ARM library libkingdom.so on an old SDL
+1.3-style Java layer (SDLActivity.nativeInit runs the whole game; GL context and eglSwapBuffers are on the Java
+side: createGLContext / flipBuffers; sound through audioWriteShortBuffer). Files and run script live in
+~/dev/arm32-bridge-games/rulethekingdom (scripts/rtk-run.sh). Tested on the headless emulator (x86_64, Unicorn).
+
+- Converter listed 16 missing functions: iscntrl isprint ispunct islower, iswalpha iswcntrl iswdigit iswprint
+  iswpunct iswspace iswupper iswxdigit, wcsncpy, strlcat, fgetpos fsetpos. Four character tests ran at load and
+  answered 0. Added (commit ef7d735); the isw* tests share iswctype's class table; self-test calls them by symbol
+  name (the NDK headers inline the narrow ones). Before the fix the 4 new checks failed, after: 0 failures.
+- 120 Hz was never asked for: the surface lookup only knew cocos2d-x and GLSurfaceView's own GLThread, and SDL's
+  surface (a GLSurfaceView subclass) draws from SDL's thread. The bridge now also looks for a SurfaceView in the
+  fields of the class/object whose nativeInit / nativeOnSurfaceChanged it forwards (commit 89af1b8). Emulator log:
+  "asked for 120 Hz on the game surface".
+- Result: the game draws its own screens (Chapter 1 intro, hero setup, village map), taps work, the first quest
+  (wolves) plays and is won; it works offline (its servers are only contacted in the background). No crash, no ANR,
+  no translator fallback lines (Unicorn-only on x86_64). Android's own permission review and "built for an older
+  Android" notice come first on the emulator (targetSdk 19).
+- Known gap (not fixed): games that swap in Java (SDL) never reach the bridge's frame hooks (nativeRender /
+  bridged eglSwapBuffers), so they get no "[fps]" line, no performance hint (ADPF) and no frame-limiter lifting.
+  This game's frame thread doesn't sleep between frames (only 0 us yields), so nothing is capped; fps and the
+  real translator's fallback count need the phone.
+
+## The 2 self-test network checks that failed under qemu-aarch64 (2026-10-25)
+
+"socketpair ... receive timeout option" and "inet_ntoa / gethostbyname" failed in the ARM64 self-test under
+qemu-aarch64 (PC), on old builds too; they pass on the PC (x86_64) bridge and the emulator. A plain ARM64 Linux
+program under the same qemu (no bridge) showed both:
+- qemu-aarch64 11.1.2 answers getsockopt(SO_RCVTIMEO) with success, size 0 and no value (the PC kernel: 2.5 s,
+  size 16). The bridge then reported a made-up 8-byte zero timeout. Fix: the bridge converts only a whole host
+  timeval and otherwise passes the host's size on (no value written on failure either). The check now also
+  tests that the timeout works (recv on an empty socket gives up after 0.2 s) and skips only the read-back, with
+  a printed reason, when the system returns size 0. Before the bridge fix it still failed under qemu.
+- The qemu sysroot's /etc/hosts (~/.cache/aarch64-sysroot, from a Docker image) was empty and DNS is blocked on
+  this PC, so "localhost" could not be resolved. The sysroot now has a normal hosts file (outside the repo). The
+  check also requires gethostbyname("127.0.0.1") and skips the "localhost" name only when the system's own
+  getaddrinfo can't resolve it.
+- Results: qemu 0 failures (one printed skip: the read-back), emulator 0 failures, PC 0 failures (no skips).
+  Still missing, seen in a probe: __get_h_errno (h_errno) - added in the review round below.
+
+## Review round on android/rtk (Kimi, 2026-10-25)
+
+- field_view "IsAssignableFrom reversed": checked against the JNI spec (IsAssignableFrom(A, B) = an A can be cast
+  to B), so (field type, SurfaceView) was already right. Added: the value must also be IsInstanceOf SurfaceView,
+  and the log names where the surface came from. Emulator: "asked for 120 Hz on the game surface (field
+  mSurface)" (SDLActivity.mSurface, an SDLSurface), not the Object field `buf`.
+- 120 Hz retry: a request that finds no view, a missing/invalid surface (Surface.isValid) or a throwing
+  setFrameRate stays pending; later native calls try again (at most every 0.5 s, 20 tries; one atomic load per
+  call otherwise). Android without setFrameRate isn't retried. Test switch debug.arm32bridge.refresh_test=late holds
+  the first request back: emulator log showed held back -> one miss from another class -> asked (field mSurface)
+  0.5 s later.
+- Wide character classes: bionic (main, ICU4X) answers from Unicode data: iswprint = UTS #18 print (format
+  characters Cf ARE printable, unassigned and surrogates are not), iswpunct = only Pd/Ps/Pe/Pc/Po (not symbols,
+  not Pi/Pf quotes), iswdigit = every Nd digit (U+0663 yes; the old self-test wrongly said no). On Android the bridge
+  now calls the phone's own isw* functions (all twelve, also via iswctype); PC/qemu builds keep a Rust
+  approximation and the self-test skips the bionic-only cases there with a printed reason (flag
+  arm32_bridge_wide_classes_from_phone). Emulator: failed before, passes after.
+- fgetpos/ftell on 32-bit bionic: ftello returns -1 + EOVERFLOW past 2 GB and fgetpos stores that -1 in *pos
+  (bionic stdio.cpp). The bridge's ftell used to cut the value to 32 bits; both now match. Added fseeko64 and
+  ftello64 (test needs them). PC: failed before, passes after.
+- h_errno: __get_h_errno returns a per-thread int right after the thread's errno (errno slot is now 8 bytes,
+  both cleared on reuse); gethostbyname failures set it from getaddrinfo's answer (EAI_AGAIN -> TRY_AGAIN,
+  EAI_FAIL/MEMORY/SYSTEM -> NO_RECOVERY, EAI_NODATA -> NO_DATA, else HOST_NOT_FOUND). PC: crashed before (no
+  handler), passes after.
+- Self-test: PC 0 failures (1 skip: bionic wide cases), qemu ARM64 0 failures (2 skips: same + timeout read-back,
+  0 fallbacks), emulator 0 failures (no skips).

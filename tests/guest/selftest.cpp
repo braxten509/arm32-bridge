@@ -50,11 +50,42 @@
 // Broken Age's libpollen exports function pointers named after the GL functions it fetches.
 extern "C" __attribute__((visibility("default"))) void *glGenVertexArraysOES = nullptr;
 
+// C library functions called by their symbol names, so the bridge's handler runs
+// (the NDK headers inline the character tests and may build in the string ones).
+extern "C" {
+int c_iscntrl(int) __asm__("iscntrl");
+int c_isprint(int) __asm__("isprint");
+int c_ispunct(int) __asm__("ispunct");
+int c_islower(int) __asm__("islower");
+int c_iswalpha(wint_t) __asm__("iswalpha");
+int c_iswcntrl(wint_t) __asm__("iswcntrl");
+int c_iswdigit(wint_t) __asm__("iswdigit");
+int c_iswprint(wint_t) __asm__("iswprint");
+int c_iswpunct(wint_t) __asm__("iswpunct");
+int c_iswspace(wint_t) __asm__("iswspace");
+int c_iswupper(wint_t) __asm__("iswupper");
+int c_iswxdigit(wint_t) __asm__("iswxdigit");
+wchar_t *c_wcsncpy(wchar_t *, const wchar_t *, size_t) __asm__("wcsncpy");
+size_t c_strlcat(char *, const char *, size_t) __asm__("strlcat");
+int c_fgetpos(FILE *, fpos_t *) __asm__("fgetpos");
+int c_fsetpos(FILE *, const fpos_t *) __asm__("fsetpos");
+long c_ftell(FILE *) __asm__("ftell");
+int c_fseeko64(FILE *, off64_t, int) __asm__("fseeko64");
+off64_t c_ftello64(FILE *) __asm__("ftello64");
+}
+
+static void *h_errno_address(void *) { return &h_errno; }
+
 #define TAG "selftest"
 static int failures = 0;
 static void check(bool ok, const char *what) {
     __android_log_print(ok ? ANDROID_LOG_INFO : ANDROID_LOG_ERROR, TAG, "%s %s", ok ? "ok  " : "FAIL", what);
     if (!ok) failures++;
+}
+
+// A part the system running the test can't do (not the bridge): logged with the reason, not counted.
+static void skip(const char *what, const char *reason) {
+    __android_log_print(ANDROID_LOG_WARN, TAG, "skip %s: %s", what, reason);
 }
 
 // A C++ static constructor: runs from init_array during loading.
@@ -2876,13 +2907,26 @@ extern "C" int run_all() {
         struct pollfd ready = {pair[1], POLLIN, 0};
         bool moved = made && send(pair[0], "ping", 4, 0) == 4 && poll(&ready, 1, 1000) == 1 &&
                      recv(pair[1], got, sizeof got, 0) == 4 && strcmp(got, "ping") == 0;
+        // The receive timeout must work: recv on an empty socket gives up after it.
+        struct timeval short_wait = {0, 200000};
+        double before = seconds_now();
+        bool timed_out = made && setsockopt(pair[1], SOL_SOCKET, SO_RCVTIMEO, &short_wait, sizeof short_wait) == 0 &&
+                         recv(pair[1], got, sizeof got, 0) == -1 && (errno == EAGAIN || errno == EWOULDBLOCK);
+        double took = seconds_now() - before;
+        timed_out = timed_out && took >= 0.15 && took < 2.0;
+        // And read back as set. qemu-user answers this getsockopt with no value (size 0);
+        // only then is the read-back skipped (a real kernel always returns the value).
         struct timeval wait = {2, 500000}, back = {0, 0};
         socklen_t size = sizeof back;
-        bool timeout = made && setsockopt(pair[1], SOL_SOCKET, SO_RCVTIMEO, &wait, sizeof wait) == 0 &&
-                       getsockopt(pair[1], SOL_SOCKET, SO_RCVTIMEO, &back, &size) == 0 && back.tv_sec == 2 &&
-                       back.tv_usec == 500000 && size == sizeof back;
+        bool set = made && setsockopt(pair[1], SOL_SOCKET, SO_RCVTIMEO, &wait, sizeof wait) == 0;
+        bool read = set && getsockopt(pair[1], SOL_SOCKET, SO_RCVTIMEO, &back, &size) == 0;
+        bool timeout = read && back.tv_sec == 2 && back.tv_usec == 500000 && size == sizeof back;
+        if (read && size == 0) {
+            skip("receive timeout read back", "this system's getsockopt(SO_RCVTIMEO) returns no value (size 0)");
+            timeout = true;
+        }
         if (made) { close(pair[0]); close(pair[1]); }
-        check(moved && timeout, "socketpair, send / poll / recv, receive timeout option");
+        check(moved && timed_out && set && timeout, "socketpair, send / poll / recv, receive timeout option");
 
         unsigned char binary[4] = {0};
         char text[INET_ADDRSTRLEN] = {0};
@@ -2965,10 +3009,24 @@ extern "C" int run_all() {
         check(written, "writev / ioctl FIONREAD");
         struct in_addr loopback;
         loopback.s_addr = htonl(0x7f000001);
-        struct hostent *host = gethostbyname("localhost");
-        check(strcmp(inet_ntoa(loopback), "127.0.0.1") == 0 && host && host->h_addrtype == AF_INET && host->h_length == 4 &&
-                  host->h_addr_list[0] && ((struct in_addr *)host->h_addr_list[0])->s_addr == htonl(0x7f000001),
-              "inet_ntoa / gethostbyname");
+        auto is_loopback = [](struct hostent *host) {
+            return host && host->h_addrtype == AF_INET && host->h_length == 4 && host->h_addr_list[0] &&
+                   ((struct in_addr *)host->h_addr_list[0])->s_addr == htonl(0x7f000001);
+        };
+        bool numeric = is_loopback(gethostbyname("127.0.0.1"));
+        bool named = is_loopback(gethostbyname("localhost"));
+        if (!named) {
+            // Only skipped when the system itself can't resolve the name (no hosts file, no DNS).
+            struct addrinfo hints = {}, *found = nullptr;
+            hints.ai_family = AF_INET;
+            int system = getaddrinfo("localhost", nullptr, &hints, &found);
+            if (found) freeaddrinfo(found);
+            if (system != 0) {
+                skip("gethostbyname(\"localhost\")", "this system can't resolve localhost either (getaddrinfo fails)");
+                named = true;
+            }
+        }
+        check(strcmp(inet_ntoa(loopback), "127.0.0.1") == 0 && numeric && named, "inet_ntoa / gethostbyname");
         // What Broken Age does at start: list the network interfaces, then read each one's flags.
         int udp = socket(AF_INET, SOCK_DGRAM, 0);
         struct ifreq interfaces[10];
@@ -3132,6 +3190,82 @@ extern "C" int run_all() {
         while (!spin_flag && spins < 2000000000u) spins++;
         check(spin_flag == 1, "spinning thread lets others run");
         pthread_join(setter, nullptr);
+    }
+
+    {
+        // Functions Rule the Kingdom needs (2026-10-25). Called by symbol name:
+        // the NDK headers would inline the character tests.
+        check(c_iscntrl('\n') && !c_iscntrl('a') && c_isprint(' ') && !c_isprint('\t') && c_ispunct('!') && !c_ispunct('a') &&
+                  !c_ispunct(' ') && c_islower('q') && !c_islower('Q') && !c_isprint(200),
+              "iscntrl / isprint / ispunct / islower");
+        check(c_iswalpha(L'é') && !c_iswalpha(L'3') && c_iswcntrl(L'\n') && c_iswdigit(L'7') && !c_iswdigit(L'x') &&
+                  c_iswprint(L'é') && !c_iswprint(L'\n') && c_iswpunct(L'?') && !c_iswpunct(L'b') && c_iswspace(L'\t') &&
+                  !c_iswspace(L'x') && c_iswupper(L'É') && !c_iswupper(L'e') && c_iswxdigit(L'F') && !c_iswxdigit(L'g'),
+              "iswalpha / iswcntrl / iswdigit / iswprint / iswpunct / iswspace / iswupper / iswxdigit");
+        wchar_t padded[6];
+        wmemset(padded, L'#', 6);
+        wchar_t cut[3];
+        bool wide_copy = c_wcsncpy(padded, L"ab", 5) == padded && wcscmp(padded, L"ab") == 0 && padded[4] == 0 && padded[5] == L'#' &&
+                         c_wcsncpy(cut, L"xyz", 3) == cut && cut[2] == L'z';
+        char joined[8] = "abc";
+        size_t full = c_strlcat(joined, "defgh", sizeof joined);
+        char small[4] = "ab";
+        size_t over = c_strlcat(small, "xyz", 2);
+        check(wide_copy && full == 8 && strcmp(joined, "abcdefg") == 0 && over == 5 && strcmp(small, "ab") == 0, "wcsncpy / strlcat");
+        FILE *scratch = tmpfile();
+        bool positions = false;
+        if (scratch) {
+            fputs("hello world", scratch);
+            fseek(scratch, 6, SEEK_SET);
+            fpos_t mark;
+            positions = c_fgetpos(scratch, &mark) == 0 && fgetc(scratch) == 'w' && fseek(scratch, 0, SEEK_SET) == 0 &&
+                        c_fsetpos(scratch, &mark) == 0 && fgetc(scratch) == 'w' && ftell(scratch) == 7;
+            fclose(scratch);
+        }
+        check(positions, "fgetpos / fsetpos");
+
+        // Past 2 GB a 32-bit position doesn't fit: bionic's fgetpos stores ftello's -1 and
+        // fails with EOVERFLOW, as does ftell. The 64-bit calls still see the position.
+        FILE *large = tmpfile();
+        bool overflow = false;
+        if (large) {
+            fpos_t mark = 123;
+            const off64_t three_gb = 3LL << 30;
+            bool beyond = c_fseeko64(large, three_gb, SEEK_SET) == 0 && c_ftello64(large) == three_gb;
+            errno = 0;
+            bool get_failed = c_fgetpos(large, &mark) == -1 && errno == EOVERFLOW && mark == (fpos_t)-1;
+            errno = 0;
+            bool tell_failed = c_ftell(large) == -1 && errno == EOVERFLOW;
+            overflow = beyond && get_failed && tell_failed;
+            fclose(large);
+        }
+        check(overflow, "fseeko64 / ftello64; fgetpos and ftell past 2 GB fail with EOVERFLOW like bionic");
+
+        // h_errno: one per thread, set by a failed gethostbyname.
+        pthread_t other;
+        void *other_address = nullptr;
+        bool own = pthread_create(&other, nullptr, h_errno_address, nullptr) == 0 && pthread_join(other, &other_address) == 0 &&
+                   other_address && other_address != (void *)&h_errno;
+        h_errno = 0;
+        bool missing = gethostbyname("no-such-host.invalid") == nullptr;
+        int reason = h_errno;
+        check(own && missing && (reason == HOST_NOT_FOUND || reason == TRY_AGAIN || reason == NO_DATA),
+              "__get_h_errno per thread, set by a failed gethostbyname");
+    }
+
+    {
+        // Wide character classes as the phone's bionic has them (ICU4X): unassigned code points
+        // aren't printable, format characters (Cf) are; only Pd/Ps/Pe/Pc/Po are punctuation;
+        // digits are every decimal digit (Nd: U+0663 yes, superscript two U+00B2 no).
+        if (bridge_flag("arm32_bridge_wide_classes_from_phone")) {
+            check(!c_iswprint(0x0378) && c_iswprint(0x200B) && c_iswprint(0x00E9) && !c_iswprint(0xD800) &&
+                      c_iswpunct(0x2014) && c_iswpunct(0x3001) && c_iswpunct(0x00BF) && !c_iswpunct(0x00AB) &&
+                      !c_iswpunct(0x20AC) && !c_iswpunct(0x200B) && !c_iswpunct(0x0378) && c_iswdigit(0x0663) &&
+                      !c_iswdigit(0x00B2),
+                  "iswprint / iswpunct match bionic for unassigned, format, symbol and quote characters");
+        } else {
+            skip("iswprint / iswpunct bionic cases", "this build doesn't run on Android's C library (wide classes are approximated)");
+        }
     }
 
     __android_log_print(ANDROID_LOG_INFO, TAG, "%d failures", failures);

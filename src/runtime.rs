@@ -388,6 +388,9 @@ pub const THREAD_STACK_SIZE: u32 = 1 << 20;
 /// Phone-function calls at least this slow (in ms) are logged as "[slow]".
 const SLOW_CALL_MS: u64 = 5;
 
+/// A thread's h_errno sits right after its errno (`Thread::errno_slot`).
+pub const H_ERRNO_OFFSET: u32 = 4;
+
 /// A cheap timestamp: the CPU's own counter on ARM64 (a clock call costs far
 /// more, and every phone-function call is timed).
 #[cfg(target_arch = "aarch64")]
@@ -469,6 +472,7 @@ pub struct Thread {
     pub depth: u32,
     pub fault: Option<String>,
     pub exit_code: Option<i32>,
+    /// This thread's errno; its h_errno follows at H_ERRNO_OFFSET.
     pub errno_slot: u32,
     pub tls_block: u32,
     pub stack_top: u32,
@@ -1558,14 +1562,15 @@ fn adopt_engine(uc: &mut Uc) {
         let mut shared = shared();
         if let Some((id, stack_top, errno_slot, tls_block)) = shared.free_threads.pop() {
             unsafe { std::ptr::write_bytes(mem().host(tls_block), 0, 0x100) };
-            mem().write_u32(errno_slot, 0);
+            mem().write_u64(errno_slot, 0); // errno and h_errno
             (id, stack_top, errno_slot, tls_block)
         } else {
             let id = shared.next_thread_id;
             shared.next_thread_id += 1;
             let stack_size = if id == 1 { MAIN_STACK_SIZE } else { THREAD_STACK_SIZE };
             let stack_top = shared.alloc_stack(stack_size);
-            let errno_slot = shared.misc_alloc(4, 4);
+            // errno, then h_errno (H_ERRNO_OFFSET).
+            let errno_slot = shared.misc_alloc(8, 4);
             let tls_block = shared.misc_alloc(0x100, 8);
             (id, stack_top, errno_slot, tls_block)
         }
