@@ -2,6 +2,7 @@
 
 pub mod animation;
 pub mod app;
+pub mod addressbook;
 pub mod attributed;
 pub mod bezier;
 pub mod cfbridge;
@@ -72,6 +73,7 @@ use crate::symbols::Registry;
 pub fn register(r: &mut Registry) {
     object::define(r);
     string::register(r);
+    addressbook::register(r);
     attributed::register(r);
     collections::register(r);
     data::register(r);

@@ -251,6 +251,8 @@ pub fn functions() -> &'static [(&'static str, ObjcFn)] {
 /// framework_selectors.tsv, without self/_cmd), variadic arguments.
 pub const HOST_FUNCTIONS: &[(&str, &str, Varargs)] = &[
     ("NSLog", "v@", Varargs::Format),
+    // class_respondsToSelector(Class, SEL): BOOL
+    ("class_respondsToSelector", "c#::", Varargs::None),
     // CFStringAppendFormat(string, format options, format, ...)
     ("CFStringAppendFormat", "v@@@", Varargs::Format),
     // The keychain: CFTypeRef results come back through `id *`.

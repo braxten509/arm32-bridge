@@ -283,6 +283,14 @@ extern "C" fn cf_array_get_values(array: Id, range: CFRange, values: *mut Id) {
     }
 }
 
+/// CFArrayGetValueAtIndex: the item itself (no retain); NULL past the end.
+extern "C" fn cf_array_get_value_at_index(array: Id, index: isize) -> Id {
+    if array == 0 || index < 0 || index >= count(array) {
+        return 0;
+    }
+    crate::objc::runtime::send(array, "objectAtIndex:", &[index as usize])
+}
+
 /// Keys and values in the same order; either list may be NULL.
 extern "C" fn cf_dictionary_get_keys_and_values(dictionary: Id, keys: *mut Id, values: *mut Id) {
     if dictionary == 0 || !collections::is_dictionary(dictionary) {
@@ -656,6 +664,22 @@ extern "C" fn cf_url_copy_path_extension(url: Id) -> Id {
     string::make(&string::get(extension))
 }
 
+/// CFURLCopyFileSystemPath(url, style): the path of a file URL in POSIX (0),
+/// HFS (1, colon-separated) or Windows (2, backslashes) form; NULL for a URL
+/// that isn't a file URL, or an unknown style.
+extern "C" fn cf_url_copy_file_system_path(url: Id, style: i32) -> Id {
+    if url == 0 || crate::objc::runtime::send(url, "isFileURL", &[]) as u8 == 0 {
+        return 0;
+    }
+    let path = string::get(crate::objc::runtime::send(url, "path", &[]));
+    match style {
+        0 => string::make(&path),
+        1 => string::make(&path.trim_start_matches('/').replace('/', ":")),
+        2 => string::make(&path.replace('/', "\\")),
+        _ => 0,
+    }
+}
+
 extern "C" fn cf_string_append_characters(text: Id, characters: *const u16, count: isize) {
     if characters.is_null() || count <= 0 {
         return;
@@ -742,6 +766,7 @@ pub fn register(r: &mut Registry) {
     }
     r.function("CFStringCompare", cf_string_compare as usize);
     r.function("CFURLCopyPathExtension", cf_url_copy_path_extension as usize);
+    r.function("CFURLCopyFileSystemPath", cf_url_copy_file_system_path as usize);
     r.function("CFStringAppendCharacters", cf_string_append_characters as usize);
     r.function("CFPropertyListCreateFromXMLData", cf_property_list_create_from_xml_data as usize);
     r.function("CFBitVectorCreate", cf_bit_vector_create as usize);
@@ -762,6 +787,7 @@ pub fn register(r: &mut Registry) {
     r.function("CFNumberCreate", cf_number_create as usize);
     r.function("CFArrayGetCount", count as usize);
     r.function("CFArrayGetValues", cf_array_get_values as usize);
+    r.function("CFArrayGetValueAtIndex", cf_array_get_value_at_index as usize);
     r.function("CFDictionaryGetCount", count as usize);
     r.function("CFDictionaryGetKeysAndValues", cf_dictionary_get_keys_and_values as usize);
     r.function("CFDataCreate", cf_data_create as usize);

@@ -313,7 +313,9 @@ extern "C" fn file_system_representation_with_path(_this: Id, _: Sel, path: Id) 
     runtime::send(path, "fileSystemRepresentation", &[])
 }
 
-pub fn register(_: &mut Registry) {
+pub fn register(r: &mut Registry) {
+    // The attribute key for a file's modification date.
+    r.data("NSFileModificationDate", crate::symbols::leak(string::make("NSFileModificationDate")));
     let manager = define_class("NSFileManager", "NSObject", 8);
     class_methods(manager, &[("defaultManager", default_manager as usize)]);
     methods(

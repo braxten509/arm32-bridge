@@ -19,6 +19,7 @@
 //! aren't objects (OpenAL devices, AudioFileIDs) cross as handles.
 
 pub mod audio;
+mod addressbook;
 mod cf;
 mod gl;
 mod graphics;
@@ -655,6 +656,7 @@ pub fn register() {
     openal::register();
     graphics::register();
     cf::register();
+    addressbook::register();
     audio::register();
     xml::register();
     sqlite::register();
