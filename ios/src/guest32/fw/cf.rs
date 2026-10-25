@@ -209,7 +209,7 @@ pub fn register() {
             super::word_constant(name);
         }
     }
-    for name in OBJECT_CONSTANTS {
+    for name in OBJECT_CONSTANTS.iter().chain(crate::fw::animation::CONSTANT_NAMES) {
         if super::host_data(name).is_some() {
             super::object_constant(name);
         }
@@ -241,12 +241,8 @@ const OBJECT_CONSTANTS: &[&str] = &[
     "SKErrorDomain", "MPMovieDurationAvailableNotification", "MPMoviePlayerContentPreloadDidFinishNotification",
     "MPMoviePlayerLoadStateDidChangeNotification", "MPMoviePlayerPlaybackDidFinishNotification",
     "MPMoviePlayerPlaybackDidFinishReasonUserInfoKey", "MPMoviePlayerPlaybackStateDidChangeNotification",
-    "MPMoviePlayerNowPlayingMovieDidChangeNotification", "kCAFillModeForwards", "kCAFillModeBackwards",
-    "kCAFillModeBoth", "kCAFillModeRemoved", "kCAMediaTimingFunctionLinear", "kCAMediaTimingFunctionEaseIn",
-    "kCAMediaTimingFunctionEaseOut", "kCAMediaTimingFunctionEaseInEaseOut", "kCAMediaTimingFunctionDefault",
-    "kCATransitionFade", "kCATransitionMoveIn", "kCATransitionPush", "kCATransitionReveal", "kCATransitionFromRight",
-    "kCATransitionFromLeft", "kCATransitionFromTop", "kCATransitionFromBottom", "kCAAnimationLinear",
-    "kCAAnimationDiscrete", "kCAAnimationPaced", "kCAAnimationCubic", "kCAAnimationCubicPaced",
+    "MPMoviePlayerNowPlayingMovieDidChangeNotification",
+    // (Core Animation's are fw::animation::CONSTANT_NAMES, below.)
     // Foundation
     "NSDefaultRunLoopMode", "NSRunLoopCommonModes", "NSInternalInconsistencyException", "NSInvalidArgumentException",
     "NSLocalizedDescriptionKey", "NSLocalizedFailureReasonErrorKey", "NSUnderlyingErrorKey", "NSPOSIXErrorDomain",

@@ -965,7 +965,12 @@ pub const MISSING_METHOD: &str = "missing method ";
 /// Type encoding for a message the host answers: the framework table, else
 /// the game's own method of the same name (an override has the same types).
 fn host_signature(b: &Bridge, class: &str, meta: bool, sel: &str) -> Result<(Signature, HostCallOptions), String> {
-    if let Some(entry) = FrameworkSelectors::builtin().get(sel) {
+    let is_kind = |name: &str| {
+        let (receiver, named) = (runtime::class_named(class), runtime::class_named(name));
+        let rt = runtime::lock();
+        receiver != 0 && named != 0 && rt.is_subclass(receiver, named)
+    };
+    if let Some(entry) = FrameworkSelectors::builtin().get_for(sel, is_kind) {
         let options =
             HostCallOptions { real_float: entry.real_float, varargs: entry.varargs, arrays: entry.arrays, host_bytes: entry.host_bytes };
         return Ok((entry.signature.clone(), options));

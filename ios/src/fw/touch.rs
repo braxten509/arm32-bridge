@@ -23,6 +23,8 @@ pub enum Phase {
 struct Touch {
     object: Id,
     view: Id,
+    /// A gesture recognizer took this touch: the view heard touchesCancelled and hears no more.
+    taken: bool,
 }
 
 static TOUCHES: Mutex<Option<HashMap<i32, Touch>>> = Mutex::new(None);
@@ -242,13 +244,13 @@ pub(crate) fn deliver_in(window: Id, finger: i32, phase: Phase, point: Point) {
             property_set(object, "view", view as u64);
             property_set(object, "tapCount", 1);
             set_point(object, "previousX", point);
-            touches.insert(finger, Touch { object, view });
+            touches.insert(finger, Touch { object, view, taken: false });
             touches.get(&finger).unwrap()
         }
         (_, Some(existing)) => existing,
         (_, None) => return,
     };
-    let (object, view) = (touch.object, touch.view);
+    let (object, view, taken) = (touch.object, touch.view, touch.taken);
     if phase != Phase::Began {
         let previous = point_of(object, "x", "y");
         set_point(object, "previousX", previous);
@@ -270,6 +272,20 @@ pub(crate) fn deliver_in(window: Id, finger: i32, phase: Phase, point: Point) {
     property_set(event, "touches", misc::set_from(&active) as u64);
     property_set(event, "timestamp", stamp.to_bits());
     let changed = misc::set_from(&[object]);
+    // Gesture recognizers on the view and the views it is in see the touch first.
+    let took = crate::fw::gestures::touch_changed(view, object, finger, phase, point);
+    if taken {
+        return;
+    }
+    let phase = if took {
+        if let Some(touch) = TOUCHES.lock().unwrap().as_mut().and_then(|t| t.get_mut(&finger)) {
+            touch.taken = true;
+        }
+        property_set(object, "phase", Phase::Cancelled as u64);
+        Phase::Cancelled
+    } else {
+        phase
+    };
     let selector = match phase {
         Phase::Began => "touchesBegan:withEvent:",
         Phase::Moved => "touchesMoved:withEvent:",

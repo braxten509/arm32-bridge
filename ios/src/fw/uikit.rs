@@ -596,7 +596,7 @@ extern "C" fn view_set_frame(this: Id, _: Sel, frame: Rect) {
 
 /// Sends a method taking a CGRect (setFrame:, setBounds:), so the game's
 /// own versions run.
-fn send_rect(view: Id, name: &str, rect: Rect) {
+pub(crate) fn send_rect(view: Id, name: &str, rect: Rect) {
     let s = runtime::sel(name);
     if let Some(imp) = runtime::imp_for(view, s) {
         let f: extern "C" fn(Id, Sel, Rect) = unsafe { std::mem::transmute(imp) };
@@ -635,27 +635,33 @@ extern "C" fn window_set_frame(this: Id, selector: Sel, frame: Rect) {
     view_set_frame(this, selector, window_frame(current_geometry(), frame));
 }
 
+/// New bounds keep the view's center (its layer's position, at the layer's
+/// anchor point) where it is.
 extern "C" fn view_set_bounds(this: Id, _: Sel, bounds: Rect) {
+    let center = view_center(this, 0);
+    let anchor = crate::fw::layers::view_anchor(this);
     let state = view_state(this);
-    let center_x = state.frame.origin.x + state.frame.size.width / 2.0;
-    let center_y = state.frame.origin.y + state.frame.size.height / 2.0;
     let old = state.frame.size;
     state.bounds_origin = bounds.origin;
     state.frame.size = bounds.size;
-    state.frame.origin = Point { x: center_x - bounds.size.width / 2.0, y: center_y - bounds.size.height / 2.0 };
+    state.frame.origin = Point { x: center.x - bounds.size.width * anchor.x, y: center.y - bounds.size.height * anchor.y };
     if old != bounds.size {
         resized_view(this, old);
     }
 }
 
+/// UIKit's center is the layer's position: the anchor point (the middle
+/// unless the game moved it) in the superview.
 extern "C" fn view_center(this: Id, _: Sel) -> Point {
+    let anchor = crate::fw::layers::view_anchor(this);
     let f = view_state(this).frame;
-    Point { x: f.origin.x + f.size.width / 2.0, y: f.origin.y + f.size.height / 2.0 }
+    Point { x: f.origin.x + f.size.width * anchor.x, y: f.origin.y + f.size.height * anchor.y }
 }
 
 extern "C" fn view_set_center(this: Id, _: Sel, center: Point) {
+    let anchor = crate::fw::layers::view_anchor(this);
     let state = view_state(this);
-    state.frame.origin = Point { x: center.x - state.frame.size.width / 2.0, y: center.y - state.frame.size.height / 2.0 };
+    state.frame.origin = Point { x: center.x - state.frame.size.width * anchor.x, y: center.y - state.frame.size.height * anchor.y };
 }
 
 extern "C" fn view_transform(this: Id, _: Sel) -> Transform {
@@ -819,6 +825,11 @@ fn attach_with_geometry(parent: Id, view: Id, index: Option<usize>, geometry: Ge
     if view == 0 || parent == 0 {
         return;
     }
+    // Controllers whose views come on screen or leave it with this one hear
+    // it before (will) and after (did), as in UIKit.
+    let (was_shown, will_show) = (on_screen(view), on_screen(parent));
+    let leaving = if was_shown && !will_show { disappearing(view) } else { Vec::new() };
+    let arriving = if !was_shown && will_show { appearing(view) } else { Vec::new() };
     detach(view);
     let list = &mut view_state(parent).subviews;
     match index {
@@ -845,6 +856,8 @@ fn attach_with_geometry(parent: Id, view: Id, index: Option<usize>, geometry: Ge
     if window_of(parent) != 0 && runtime::responds(view, "didMoveToWindow") {
         runtime::send(view, "didMoveToWindow", &[]);
     }
+    disappeared(leaving);
+    appeared(arriving);
 }
 
 extern "C" fn view_add_subview(this: Id, _: Sel, view: Id) {
@@ -866,7 +879,7 @@ extern "C" fn view_insert_below(this: Id, _: Sel, view: Id, sibling: Id) {
 }
 
 extern "C" fn view_remove_from_superview(this: Id, _: Sel) {
-    detach(this);
+    take_out(this);
     crate::fw::media::view_removed(this);
 }
 
@@ -898,6 +911,21 @@ extern "C" fn view_window(this: Id, _: Sel) -> Id {
     window_of(this)
 }
 
+/// Whether the view is `other` or somewhere inside it.
+extern "C" fn view_is_descendant(this: Id, _: Sel, other: Id) -> bool {
+    let mut current = this;
+    for _ in 0..256 {
+        if current == 0 || other == 0 {
+            return false;
+        }
+        if current == other {
+            return true;
+        }
+        current = view_state(current).superview;
+    }
+    false
+}
+
 extern "C" fn view_with_tag(this: Id, _: Sel, tag: isize) -> Id {
     fn search(view: Id, tag: isize) -> Id {
         if property_get(view, "tag").map(|v| v as isize).unwrap_or(0) == tag {
@@ -924,10 +952,6 @@ extern "C" fn view_convert_point(_this: Id, _: Sel, point: Point, _other: Id) ->
 
 extern "C" fn view_convert_rect(_this: Id, _: Sel, rect: Rect, _other: Id) -> Rect {
     rect
-}
-
-extern "C" fn view_gesture_recognizers(_this: Id, _: Sel) -> Id {
-    collections::array_from(&[])
 }
 
 // ----- block animations: nothing moves on screen here, so the changes the
@@ -1105,6 +1129,7 @@ pub fn windows() -> Vec<Id> {
 
 extern "C" fn window_make_key_and_visible(this: Id, _: Sel) {
     *KEY_WINDOW.lock().unwrap() = this;
+    let was_shown = on_screen(this);
     let mut windows = WINDOWS.lock().unwrap();
     if !windows.contains(&this) {
         windows.push(this);
@@ -1114,7 +1139,11 @@ extern "C" fn window_make_key_and_visible(this: Id, _: Sel) {
     property_set(this, "hidden", 0);
     crate::log!("window {this:#x} shown");
     let root = property_get(this, "rootViewController").unwrap_or(0) as Id;
-    if will_appear(root, false) {
+    let showing_root = will_appear(root, false);
+    // The other controllers whose views are in the window come on screen with it.
+    let arriving = if was_shown { Vec::new() } else { appearing(this) };
+    appeared(arriving);
+    if showing_root {
         did_appear(root, false);
     }
 }
@@ -1131,34 +1160,133 @@ fn tell_appearance(controller: Id, name: &str, animated: bool) {
     }
 }
 
-/// viewWillAppear: unless the controller is on screen already; whether it was sent.
+/// viewWillAppear: unless the controller is on screen already or on its
+/// way ("appearing": whoever sent viewWillAppear: sends viewDidAppear:);
+/// whether it was sent.
 fn will_appear(controller: Id, animated: bool) -> bool {
-    if controller == 0 || property_get(controller, "appeared") == Some(1) {
+    if controller == 0 || property_get(controller, "appeared") == Some(1) || property_get(controller, "appearing") == Some(1) {
         return false;
     }
+    property_set(controller, "appearing", 1);
     tell_appearance(controller, "viewWillAppear:", animated);
     true
 }
 
 fn did_appear(controller: Id, animated: bool) {
+    property_set(controller, "appearing", 0);
+    if property_get(controller, "appeared") == Some(1) {
+        return;
+    }
     property_set(controller, "appeared", 1);
     tell_appearance(controller, "viewDidAppear:", animated);
     // Tests tap on this line (IOS_TAPS "on=screen shown: <class>"), once it is drawn.
     crate::fw::pictures::on_next_draw(format!("screen shown: {}", crate::fw::string::describe_class_of(controller)));
 }
 
-/// viewWillDisappear: if the controller is on screen; whether it was sent.
+/// viewWillDisappear: if the controller is on screen and not already on its
+/// way out; whether it was sent.
 fn will_disappear(controller: Id, animated: bool) -> bool {
-    if controller == 0 || property_get(controller, "appeared") != Some(1) {
+    if controller == 0 || property_get(controller, "appeared") != Some(1) || property_get(controller, "disappearing") == Some(1) {
         return false;
     }
+    property_set(controller, "disappearing", 1);
     tell_appearance(controller, "viewWillDisappear:", animated);
     true
 }
 
 fn did_disappear(controller: Id, animated: bool) {
+    property_set(controller, "disappearing", 0);
+    if property_get(controller, "appeared") != Some(1) {
+        return;
+    }
     property_set(controller, "appeared", 0);
     tell_appearance(controller, "viewDidDisappear:", animated);
+}
+
+/// Whether a view is in a window that is shown.
+fn on_screen(view: Id) -> bool {
+    let window = window_of(view);
+    window != 0 && property_get(window, "hidden").unwrap_or(0) == 0 && WINDOWS.lock().unwrap().contains(&window)
+}
+
+/// Whether a container passes appearance on to its children (iOS 5's
+/// automaticallyForwardAppearanceAndRotationMethodsToChildViewControllers,
+/// iOS 6's shouldAutomaticallyForwardAppearanceMethods; yes unless it says NO).
+fn forwards_to_children(controller: Id) -> bool {
+    ["automaticallyForwardAppearanceAndRotationMethodsToChildViewControllers", "shouldAutomaticallyForwardAppearanceMethods"]
+        .iter()
+        .all(|name| !runtime::responds(controller, name) || runtime::send(controller, name, &[]) & 0xFF != 0)
+}
+
+/// The controllers whose own views are in `view`'s tree, outer ones first,
+/// that UIKit tells about appearance: not those inside a container that
+/// passes nothing on.
+fn controllers_in(view: Id) -> Vec<Id> {
+    fn walk(view: Id, forward: bool, out: &mut Vec<Id>, depth: usize) {
+        if view == 0 || depth > 256 {
+            return;
+        }
+        let mut forward_inside = forward;
+        let controller = property_get(view, "viewController").unwrap_or(0) as Id;
+        if controller != 0 && property_get(controller, "view") == Some(view as u64) {
+            if forward {
+                out.push(controller);
+            }
+            forward_inside = forward && forwards_to_children(controller);
+        }
+        for child in view_state(view).subviews.clone() {
+            walk(child, forward_inside, out, depth + 1);
+        }
+    }
+    let mut out = Vec::new();
+    walk(view, true, &mut out, 0);
+    out
+}
+
+/// `view` is about to come on screen: viewWillAppear: to the controllers
+/// in it (not those already told by whoever is showing them); the ones told,
+/// for `appeared` once it is there.
+fn appearing(view: Id) -> Vec<Id> {
+    controllers_in(view).into_iter().filter(|&controller| will_appear(controller, false)).collect()
+}
+
+fn appeared(controllers: Vec<Id>) {
+    for controller in controllers {
+        did_appear(controller, false);
+    }
+}
+
+/// `view` is about to leave the screen: viewWillDisappear: to the controllers in it.
+fn disappearing(view: Id) -> Vec<Id> {
+    controllers_in(view).into_iter().filter(|&controller| will_disappear(controller, false)).collect()
+}
+
+fn disappeared(controllers: Vec<Id>) {
+    for controller in controllers {
+        did_disappear(controller, false);
+    }
+}
+
+/// Takes a view out of its superview, with the appearance calls for the
+/// controllers that leave the screen with it.
+fn take_out(view: Id) {
+    let leaving = if on_screen(view) { disappearing(view) } else { Vec::new() };
+    detach(view);
+    disappeared(leaving);
+}
+
+/// A shown window hidden or unhidden: what is in it leaves or comes back.
+extern "C" fn window_set_hidden(this: Id, s: Sel, hidden: u8) {
+    let listed = WINDOWS.lock().unwrap().contains(&this);
+    let was_shown = listed && property_get(this, "hidden").unwrap_or(0) == 0;
+    let (leaving, arriving) = match (listed, was_shown, hidden != 0) {
+        (true, true, true) => (disappearing(this), Vec::new()),
+        (true, false, false) => (Vec::new(), appearing(this)),
+        _ => (Vec::new(), Vec::new()),
+    };
+    view_set_hidden(this, s, hidden);
+    disappeared(leaving);
+    appeared(arriving);
 }
 
 extern "C" fn window_make_key(this: Id, _: Sel) {
@@ -1180,7 +1308,7 @@ extern "C" fn window_set_root_controller(this: Id, _: Sel, controller: Id) {
         close_presented(old, false, false);
         let hiding = shown && will_disappear(old, false);
         if let Some(view) = property_get(old, "view").map(|view| view as Id).filter(|&view| view != 0 && view_state(view).superview == this) {
-            detach(view);
+            take_out(view);
         }
         if hiding {
             did_disappear(old, false);
@@ -1266,6 +1394,18 @@ extern "C" fn controller_supported_orientations(_this: Id, _: Sel) -> usize {
     current_interface().mask
 }
 
+/// -[UIApplication supportedInterfaceOrientationsForWindow:]: what the app
+/// delegate says (application:supportedInterfaceOrientationsForWindow:),
+/// else the orientations its Info.plist lists.
+extern "C" fn app_supported_orientations(this: Id, _: Sel, window: Id) -> usize {
+    let delegate = runtime::send(this, "delegate", &[]);
+    let ask = "application:supportedInterfaceOrientationsForWindow:";
+    if delegate != 0 && runtime::responds(delegate, ask) {
+        return runtime::send(delegate, ask, &[this, window]);
+    }
+    current_interface().mask
+}
+
 extern "C" fn controller_should_autorotate_to(_this: Id, _: Sel, orientation: isize) -> bool {
     matches!(orientation, 1..=4) && current_interface().mask & (1 << orientation) != 0
 }
@@ -1323,7 +1463,7 @@ fn show_presented(presenter: Id, controller: Id, animated: bool) {
     attach(window, view, None);
     property_set(controller, "presentedInWindow", window as u64);
     if covered != 0 {
-        detach(covered);
+        take_out(covered);
         property_set(controller, "coveredView", covered as u64);
     }
     if hiding {
@@ -1350,7 +1490,7 @@ fn hide_presented(controller: Id, uncovered: Id, animated: bool, restore: bool) 
         attach(window, covered, index);
     }
     if view != 0 && view_state(view).superview == window {
-        detach(view);
+        take_out(view);
     }
     property_set(controller, "presentedInWindow", 0);
     property_set(controller, "coveredView", 0);
@@ -1517,8 +1657,55 @@ extern "C" fn controller_remove_from_parent(this: Id, _: Sel) {
     property_set(this, "parentController", 0);
 }
 
-extern "C" fn controller_children(_this: Id, _: Sel) -> Id {
-    collections::array_from(&[])
+extern "C" fn controller_children(this: Id, _: Sel) -> Id {
+    collections::array_from(&controller_children_list(this))
+}
+
+/// transitionFromViewController:toViewController:duration:options:animations:completion:
+/// between two children of the receiver: the new child's view takes the old
+/// one's place in its superview (with ShowHideTransitionViews, the old view
+/// is hidden instead), the animations block runs, and after `duration` the
+/// old view leaves, the appearance calls finish and completion(YES) runs.
+#[allow(clippy::too_many_arguments)]
+extern "C" fn controller_transition(_this: Id, _: Sel, from: Id, to: Id, duration: f64, options: usize, animations: usize, completion: usize) {
+    let from_view = if from == 0 { 0 } else { runtime::send(from, "view", &[]) };
+    let to_view = if to == 0 { 0 } else { runtime::send(to, "view", &[]) };
+    let on_screen = from != 0 && property_get(from, "appeared") == Some(1);
+    let hiding = on_screen && will_disappear(from, true);
+    let showing = on_screen && will_appear(to, true);
+    let show_hide = options & SHOW_HIDE_TRANSITION_VIEWS != 0;
+    if show_hide {
+        property_set(to_view, "hidden", 0);
+    } else if from_view != 0 && to_view != 0 {
+        let parent = view_state(from_view).superview;
+        if parent != 0 {
+            let index = view_state(parent).subviews.iter().position(|&v| v == from_view);
+            attach(parent, to_view, index.map(|i| i + 1));
+        }
+    }
+    let completion = if completion == 0 { 0 } else { crate::libsystem::mach::block_copy(completion as *mut _) as usize };
+    animate_with(animations, 0, |_| {});
+    crate::fw::runloop::post_after(
+        duration.max(0.0),
+        Box::new(move || {
+            if show_hide {
+                property_set(from_view, "hidden", 1);
+            } else if from_view != 0 && from_view != to_view {
+                runtime::send(from_view, "removeFromSuperview", &[]);
+            }
+            if hiding {
+                did_disappear(from, true);
+            }
+            if showing {
+                did_appear(to, true);
+            }
+            if completion != 0 {
+                let header = completion as *const crate::libsystem::mach::BlockHeader;
+                let invoke: extern "C" fn(usize, u8) = unsafe { std::mem::transmute((*header).invoke) };
+                invoke(completion, 1);
+            }
+        }),
+    );
 }
 
 // ----- layers -----
@@ -1531,25 +1718,6 @@ property!(layer_opaque, layer_set_opaque, "opaque", bool, false);
 property!(layer_drawable_properties, layer_set_drawable_properties, "drawableProperties", id, 0);
 property!(layer_contents_scale, layer_set_contents_scale, "contentsScale", f64, 1.0);
 property!(layer_delegate, layer_set_delegate, "delegate", id, 0);
-
-extern "C" fn layer_bounds(this: Id, _: Sel) -> Rect {
-    let view = property_get(this, "delegate").unwrap_or(0) as Id;
-    if view != 0 {
-        return view_bounds(view, 0);
-    }
-    Rect::default()
-}
-
-extern "C" fn layer_frame(this: Id, _: Sel) -> Rect {
-    let view = property_get(this, "delegate").unwrap_or(0) as Id;
-    if view != 0 {
-        return view_state(view).frame;
-    }
-    Rect::default()
-}
-
-extern "C" fn layer_ignore_rect(_this: Id, _: Sel, _rect: Rect) {}
-extern "C" fn layer_ignore_point(_this: Id, _: Sel, _point: Point) {}
 
 // ----- colours: { isa, r, g, b, a } -----
 
@@ -2018,6 +2186,7 @@ pub fn register(r: &mut Registry) {
             ("subviews", view_subviews as usize),
             ("superview", view_superview as usize),
             ("window", view_window as usize),
+            ("isDescendantOfView:", view_is_descendant as usize),
             ("viewWithTag:", view_with_tag as usize),
             ("isHidden", view_hidden as usize),
             ("setHidden:", view_set_hidden as usize),
@@ -2055,9 +2224,6 @@ pub fn register(r: &mut Registry) {
             ("convertPoint:toView:", view_convert_point as usize),
             ("convertRect:fromView:", view_convert_rect as usize),
             ("convertRect:toView:", view_convert_rect as usize),
-            ("addGestureRecognizer:", ignore_id as usize),
-            ("removeGestureRecognizer:", ignore_id as usize),
-            ("gestureRecognizers", view_gesture_recognizers as usize),
             ("endEditing:", no_with as usize),
             ("setClearsContextBeforeDrawing:", ignore_bool as usize),
         ],
@@ -2068,6 +2234,7 @@ pub fn register(r: &mut Registry) {
         window,
         &[
             ("makeKeyAndVisible", window_make_key_and_visible as usize),
+            ("setHidden:", window_set_hidden as usize),
             ("makeKeyWindow", window_make_key as usize),
             ("rootViewController", window_root_controller as usize),
             ("setRootViewController:", window_set_root_controller as usize),
@@ -2125,6 +2292,7 @@ pub fn register(r: &mut Registry) {
             ("setNeedsStatusBarAppearanceUpdate", nothing as usize),
             ("preferredStatusBarStyle", zero as usize),
             ("childViewControllers", controller_children as usize),
+            ("transitionFromViewController:toViewController:duration:options:animations:completion:", controller_transition as usize),
             ("addChildViewController:", controller_add_child as usize),
             ("removeFromParentViewController", controller_remove_from_parent as usize),
             ("didMoveToParentViewController:", ignore_id as usize),
@@ -2150,21 +2318,8 @@ pub fn register(r: &mut Registry) {
             ("setContentsScale:", layer_set_contents_scale as usize),
             ("delegate", layer_delegate as usize),
             ("setDelegate:", layer_set_delegate as usize),
-            ("bounds", layer_bounds as usize),
-            ("frame", layer_frame as usize),
-            ("setBounds:", layer_ignore_rect as usize),
-            ("setFrame:", layer_ignore_rect as usize),
-            ("setPosition:", layer_ignore_point as usize),
             ("setNeedsDisplay", nothing as usize),
-            ("setMasksToBounds:", ignore_bool as usize),
-            ("setCornerRadius:", ignore_double as usize),
-            ("setBorderWidth:", ignore_double as usize),
-            ("setBorderColor:", ignore_id as usize),
-            ("setShadowOpacity:", ignore_float as usize),
-            ("addSublayer:", ignore_id as usize),
-            ("removeFromSuperlayer", nothing as usize),
-            ("removeAllAnimations", nothing as usize),
-            ("addAnimation:forKey:", ignore_id_id as usize),
+            // Geometry, looks, sublayers and animations: fw/layers.rs.
         ],
     );
     let eagl_layer = define_class("CAEAGLLayer", "CALayer", 8);
@@ -2249,6 +2404,7 @@ pub fn register(r: &mut Registry) {
             ("windows", app_windows as usize),
             ("applicationState", app_state as usize),
             ("statusBarOrientation", app_status_bar_orientation as usize),
+            ("supportedInterfaceOrientationsForWindow:", app_supported_orientations as usize),
             ("statusBarFrame", app_status_bar_frame as usize),
             ("setStatusBarOrientation:", ignore_int as usize),
             ("setStatusBarOrientation:animated:", ignore_int_bool as usize),
@@ -2286,40 +2442,11 @@ pub fn register(r: &mut Registry) {
     r.data("UIWindowLevelNormal", leak(0.0f64));
     r.data("UIWindowLevelStatusBar", leak(1000.0f64));
     r.data("UIWindowLevelAlert", leak(2000.0f64));
-    // Core Animation's names (fill modes, timing functions, transitions, key frame modes).
-    for (name, value) in [
-        ("kCAFillModeForwards", "forwards"),
-        ("kCAFillModeBackwards", "backwards"),
-        ("kCAFillModeBoth", "both"),
-        ("kCAFillModeRemoved", "removed"),
-        ("kCAMediaTimingFunctionLinear", "linear"),
-        ("kCAMediaTimingFunctionEaseIn", "easeIn"),
-        ("kCAMediaTimingFunctionEaseOut", "easeOut"),
-        ("kCAMediaTimingFunctionEaseInEaseOut", "easeInEaseOut"),
-        ("kCAMediaTimingFunctionDefault", "default"),
-        ("kCATransitionFade", "fade"),
-        ("kCATransitionMoveIn", "moveIn"),
-        ("kCATransitionPush", "push"),
-        ("kCATransitionReveal", "reveal"),
-        ("kCATransitionFromRight", "fromRight"),
-        ("kCATransitionFromLeft", "fromLeft"),
-        ("kCATransitionFromTop", "fromTop"),
-        ("kCATransitionFromBottom", "fromBottom"),
-        ("kCAAnimationLinear", "linear"),
-        ("kCAAnimationDiscrete", "discrete"),
-        ("kCAAnimationPaced", "paced"),
-        ("kCAAnimationCubic", "cubic"),
-        ("kCAAnimationCubicPaced", "cubicPaced"),
-    ] {
-        r.data(name, leak(string::make(value)));
-    }
+    // Core Animation's names (fill modes, timing functions, ...) are in fw/animation.rs.
     r.data("UIBackgroundTaskInvalid", leak(0usize));
     let _ = ignore_id_bool;
 }
 
-extern "C" fn ignore_double(_this: Id, _: Sel, _value: f64) {}
-extern "C" fn ignore_float(_this: Id, _: Sel, _value: f32) {}
-extern "C" fn ignore_id_id(_this: Id, _: Sel, _a: Id, _b: Id) {}
 extern "C" fn ignore_bool_int(_this: Id, _: Sel, _a: u8, _b: isize) {}
 extern "C" fn screen_scale_one(_this: Id, _: Sel) -> f64 {
     1.0
