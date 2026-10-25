@@ -891,6 +891,11 @@ extern "C" fn thread_is_finished(this: Id, _: Sel) -> bool {
     crate::fw::uikit::property_get(this, "finished").is_some()
 }
 
+/// CACurrentMediaTime: seconds on the clock display link timestamps use.
+extern "C" fn current_media_time() -> f64 {
+    now()
+}
+
 extern "C" fn ignore_size(_this: Id, _: Sel, _size: usize) {}
 extern "C" fn no(_this: Id, _: Sel) -> bool {
     false
@@ -948,6 +953,7 @@ pub fn register(r: &mut Registry) {
     r.function("CFRunLoopGetCurrent", cf_run_loop_get_current as usize);
     r.function("CFRunLoopGetMain", cf_run_loop_get_main as usize);
     r.function("CFRunLoopRunInMode", cf_run_loop_run_in_mode as usize);
+    r.function("CACurrentMediaTime", current_media_time as usize);
 
     let object = runtime::class_named("NSObject");
     methods(

@@ -4,7 +4,7 @@
 //! game adds at run time. Lookup walks the game's superclass chain until a
 //! method is found or the chain reaches a framework (host) class.
 
-use guest32_image::{ClassTarget, Ivar32, Method32, ObjcMetadata32};
+use guest32_image::{ClassTarget, Ivar32, Method32, ObjcMetadata32, Property32};
 use std::collections::HashMap;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,6 +43,8 @@ pub struct GuestClass {
     pub instance_size: u32,
     pub ivars: Vec<Ivar32>,
     pub methods: HashMap<String, GuestMethod>,
+    /// Declared properties, its categories' first (as Apple's runtime attaches them).
+    pub properties: Vec<Property32>,
 }
 
 #[derive(Default)]
@@ -85,6 +87,7 @@ impl GuestClasses {
                     instance_size: c.instance.instance_size,
                     ivars: c.instance.ivars.clone(),
                     methods: method_map(&c.instance.methods),
+                    properties: c.instance.properties.clone(),
                 },
             );
             table.classes.insert(
@@ -100,6 +103,7 @@ impl GuestClasses {
                     instance_size: c.meta.instance_size,
                     ivars: Vec::new(),
                     methods: method_map(&c.meta.methods),
+                    properties: c.meta.properties.clone(),
                 },
             );
             table.by_name.insert(c.name.clone(), c.address);
@@ -115,6 +119,8 @@ impl GuestClasses {
                     for (target, list) in [(*address, &category.instance_methods), (meta, &category.class_methods)] {
                         table.classes.get_mut(&target).unwrap().methods.extend(method_map(list));
                     }
+                    let class = table.classes.get_mut(address).unwrap();
+                    class.properties.splice(0..0, category.instance_properties.iter().cloned());
                 }
                 ClassTarget::External(name) => {
                     for (meta, list) in [(false, &category.instance_methods), (true, &category.class_methods)] {

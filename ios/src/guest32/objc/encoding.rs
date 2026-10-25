@@ -44,7 +44,7 @@ pub enum Ty {
 }
 
 /// Struct names whose `f` fields are CGFloat (double on the host).
-const CGFLOAT_STRUCTS: &[&str] = &["CGPoint", "CGSize", "CGRect", "CGAffineTransform", "UIEdgeInsets", "CGVector"];
+const CGFLOAT_STRUCTS: &[&str] = &["CGPoint", "CGSize", "CGRect", "CGAffineTransform", "UIEdgeInsets", "CGVector", "CATransform3D"];
 
 impl Ty {
     /// Size on armv7.

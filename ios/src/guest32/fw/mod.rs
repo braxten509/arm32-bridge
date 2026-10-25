@@ -165,6 +165,9 @@ pub struct Obj;
 pub struct Handle;
 /// A C string result: a permanent guest copy (one per text).
 pub struct CStr;
+/// A selector: the guest's is its name (a C string), the host's own SEL is
+/// made from it (0 stays 0).
+pub struct Sel;
 
 impl Param for U32 {
     type Host = u32;
@@ -230,6 +233,15 @@ impl Param for Handle {
     type Host = usize;
     fn read(a: &mut Args) -> usize {
         handle_to_host(a.u32())
+    }
+}
+impl Param for Sel {
+    type Host = usize;
+    fn read(a: &mut Args) -> usize {
+        match a.u32() {
+            0 => 0,
+            name => crate::objc::runtime::sel(&mem().string(name)),
+        }
     }
 }
 

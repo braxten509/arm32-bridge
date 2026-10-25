@@ -173,6 +173,191 @@ fn xml_text_writer_writes_the_file() {
     assert_eq!(text, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<save a=\"1 &lt; 2 &amp; &quot;x&quot;\" b=\"7-x\"><item/></save>");
 }
 
+// ----- Core Animation transforms -----
+
+const IDENTITY_3D: [f32; 16] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+
+/// Calls a CATransform3D function `name(&result, t, extra...)`: the result
+/// pointer in r0, the 16 floats in r1-r3 and on the stack, then `extra`.
+fn transform_3d(name: &str, t: [f32; 16], extra: &[f32]) -> Vec<f32> {
+    let out = alloc(64);
+    let words: Vec<u32> = t.iter().chain(extra).map(|v| v.to_bits()).collect();
+    call(name, [out, words[0], words[1], words[2]], &words[3..]);
+    floats(out, 16)
+}
+
+fn assert_matrix(got: &[f32], want: [f32; 16], what: &str) {
+    assert!(got.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-5), "{what}: {got:?}, expected {want:?}");
+}
+
+#[test]
+fn transform_3d_functions_give_apples_matrices() {
+    // Rows m11..m14, ..., m41..m44; a point is a row vector on the left.
+    let quarter = std::f32::consts::FRAC_PI_2;
+    let turned = transform_3d("CATransform3DRotate", IDENTITY_3D, &[quarter, 0.0, 0.0, 1.0]);
+    assert_matrix(&turned, [0.0, 1.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0], "90 degrees about z");
+    // A zero axis turns nothing.
+    assert_matrix(&transform_3d("CATransform3DRotate", IDENTITY_3D, &[quarter, 0.0, 0.0, 0.0]), IDENTITY_3D, "no axis");
+    // The new step comes first (in the layer's own space): translating a
+    // turned layer moves it along its turned x axis.
+    let mut turned_16 = [0.0f32; 16];
+    turned_16.copy_from_slice(&turned);
+    let moved = transform_3d("CATransform3DTranslate", turned_16, &[5.0, 0.0, 0.0]);
+    let mut want = [0.0, 1.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 5.0, 0.0, 1.0];
+    assert_matrix(&moved, want, "translate after rotate");
+    // ...and turning a moved layer keeps where it was moved to.
+    let mut moved_x = IDENTITY_3D;
+    moved_x[12] = 10.0;
+    (want[12], want[13]) = (10.0, 0.0);
+    assert_matrix(&transform_3d("CATransform3DRotate", moved_x, &[quarter, 0.0, 0.0, 1.0]), want, "rotate after translate");
+    let mut shifted = IDENTITY_3D;
+    (shifted[12], shifted[13], shifted[14]) = (1.0, 2.0, 3.0);
+    let scaled = transform_3d("CATransform3DScale", shifted, &[2.0, 3.0, 4.0]);
+    assert_matrix(&scaled, [2.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 0.0, 4.0, 0.0, 1.0, 2.0, 3.0, 1.0], "scale keeps the translation");
+    let mut big = IDENTITY_3D;
+    (big[0], big[5], big[10]) = (2.0, 3.0, 4.0);
+    let translated = transform_3d("CATransform3DTranslate", big, &[1.0, 1.0, 1.0]);
+    assert_matrix(&translated, [2.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 0.0, 4.0, 0.0, 2.0, 3.0, 4.0, 1.0], "translate is scaled");
+    // CATransform3DMakeAffineTransform(&result, CGAffineTransform): six floats in r1-r3 and the stack.
+    let out = alloc(64);
+    call("CATransform3DMakeAffineTransform", [out, f(1.0), f(2.0), f(3.0)], &[f(4.0), f(5.0), f(6.0)]);
+    assert_matrix(&floats(out, 16), [1.0, 2.0, 0.0, 0.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 5.0, 6.0, 0.0, 1.0], "affine to 3D");
+    // CGRectIntersectsRect: rectangles that only touch don't intersect.
+    let rect = |x: f32, w: f32| [f(x), f(0.0), f(w), f(10.0)];
+    let (a, b, c) = (rect(0.0, 10.0), rect(5.0, 10.0), rect(10.0, 10.0));
+    assert_eq!(call("CGRectIntersectsRect", [a[0], a[1], a[2], a[3]], &b).0, 1);
+    assert_eq!(call("CGRectIntersectsRect", [a[0], a[1], a[2], a[3]], &c).0, 0);
+}
+
+// ----- Core Graphics pictures -----
+
+/// A guest provider over a copy of `bytes` (no release callback).
+fn provider_with(bytes: &[u8]) -> u32 {
+    let data = alloc(bytes.len() as u32);
+    mem().write_bytes(data, bytes);
+    call("CGDataProviderCreateWithData", [0, data, bytes.len() as u32, 0], &[]).0
+}
+
+/// A width x 1 RGBA (premultiplied last) picture of `bytes`.
+fn picture(bytes: &[u8]) -> u32 {
+    let (space, _) = call("CGColorSpaceCreateDeviceRGB", [0; 4], &[]);
+    let width = bytes.len() as u32 / 4;
+    call("CGImageCreate", [width, 1, 8, 32], &[width * 4, space, 1, provider_with(bytes), 0, 0, 0]).0
+}
+
+/// A width x 1 RGBA context over zeroed guest pixels: (context, pixels).
+fn row_context(width: u32) -> (u32, u32) {
+    let (space, _) = call("CGColorSpaceCreateDeviceRGB", [0; 4], &[]);
+    let pixels = alloc(width * 4);
+    unsafe { std::ptr::write_bytes(mem().host(pixels), 0, width as usize * 4) };
+    (call("CGBitmapContextCreate", [pixels, width, 1, 8], &[width * 4, space, 1]).0, pixels)
+}
+
+fn draw(context: u32, width: u32, image: u32) {
+    call("CGContextDrawImage", [context, f(0.0), f(0.0), f(width as f32)], &[f(1.0), image]);
+}
+
+#[test]
+fn image_providers_give_back_the_pictures_bytes() {
+    let bytes = [255, 0, 0, 255, 0, 0, 255, 255];
+    let image = picture(&bytes);
+    let (provider, _) = call("CGImageGetDataProvider", [image, 0, 0, 0], &[]);
+    assert_ne!(provider, 0);
+    let (copied, _) = call("CGDataProviderCopyData", [provider, 0, 0, 0], &[]);
+    let copied_host = super::object_to_host(copied);
+    assert_eq!(crate::fw::data::bytes(copied_host), bytes);
+    // A provider over a CFData makes the same picture again.
+    let (again, _) = call("CGDataProviderCreateWithCFData", [copied, 0, 0, 0], &[]);
+    let (space, _) = call("CGColorSpaceCreateDeviceRGB", [0; 4], &[]);
+    let (image2, _) = call("CGImageCreate", [2, 1, 8, 32], &[8, space, 1, again, 0, 0, 0]);
+    let (context, pixels) = row_context(2);
+    draw(context, 2, image2);
+    assert_eq!(mem().bytes(pixels, 8), bytes);
+}
+
+#[test]
+fn image_masks_hide_where_their_samples_are_one() {
+    let image = picture(&[255, 0, 0, 255, 0, 0, 255, 255]);
+    // An 8-bit image mask: 0 paints, 255 hides.
+    let (mask, _) = call("CGImageMaskCreate", [2, 1, 8, 8], &[2, provider_with(&[0, 255]), 0, 0]);
+    assert_ne!(mask, 0);
+    let (masked, _) = call("CGImageCreateWithMask", [image, mask, 0, 0], &[]);
+    assert_ne!(masked, 0);
+    let (context, pixels) = row_context(2);
+    draw(context, 2, masked);
+    assert_eq!(mem().bytes(pixels, 8), [255, 0, 0, 255, 0, 0, 0, 0]);
+    // A gray picture as the mask: its samples are the alpha (the other way round).
+    let (gray, _) = call("CGColorSpaceCreateDeviceGray", [0; 4], &[]);
+    let (gray_image, _) = call("CGImageCreate", [2, 1, 8, 8], &[2, gray, 0, provider_with(&[0, 255]), 0, 0, 0]);
+    let (masked, _) = call("CGImageCreateWithMask", [image, gray_image, 0, 0], &[]);
+    let (context, pixels) = row_context(2);
+    draw(context, 2, masked);
+    assert_eq!(mem().bytes(pixels, 8), [0, 0, 0, 0, 0, 0, 255, 255]);
+    // Drawing an image mask paints the fill colour where it lets through.
+    let (context, pixels) = row_context(2);
+    call("CGContextSetRGBFillColor", [context, f(0.0), f(1.0), f(0.0)], &[f(1.0)]);
+    draw(context, 2, mask);
+    assert_eq!(mem().bytes(pixels, 8), [0, 255, 0, 255, 0, 0, 0, 0]);
+    // A 1-bit mask (first pixel in the top bit) with a decode array [1 0]:
+    // the samples flip, so the first pixel hides and the second paints.
+    let decode = alloc(8);
+    mem().write_u32(decode, f(1.0));
+    mem().write_u32(decode + 4, f(0.0));
+    let (bits, _) = call("CGImageMaskCreate", [2, 1, 1, 1], &[1, provider_with(&[0b0100_0000]), decode, 0]);
+    let (context, pixels) = row_context(2);
+    call("CGContextSetRGBFillColor", [context, f(0.0), f(0.0), f(1.0)], &[f(1.0)]);
+    draw(context, 2, bits);
+    assert_eq!(mem().bytes(pixels, 8), [0, 0, 0, 0, 0, 0, 255, 255]);
+}
+
+#[test]
+fn gradients_from_colour_arrays_and_points_from_dictionaries() {
+    setup();
+    let color = |value: f64| crate::fw::graphics::make_color([value, value, value, 1.0]);
+    let colors = super::object_to_guest(crate::fw::collections::array_from(&[color(0.0), color(1.0)]));
+    let (space, _) = call("CGColorSpaceCreateDeviceRGB", [0; 4], &[]);
+    let locations = alloc(8);
+    mem().write_u32(locations, f(0.0));
+    mem().write_u32(locations + 4, f(1.0));
+    let (gradient, _) = call("CGGradientCreateWithColors", [space, colors, locations, 0], &[]);
+    assert_ne!(gradient, 0);
+    let (context, pixels) = {
+        let pixels = alloc(16);
+        unsafe { std::ptr::write_bytes(mem().host(pixels), 0, 16) };
+        (call("CGBitmapContextCreate", [pixels, 4, 1, 8], &[16, space, 5]).0, pixels)
+    };
+    call("CGContextDrawLinearGradient", [context, gradient, f(0.0), f(0.0)], &[f(4.0), f(0.0), 0]);
+    let reds: Vec<u8> = (0..4).map(|i| mem().read_u8(pixels + i * 4)).collect();
+    assert_eq!(reds, [32, 96, 159, 223]);
+    // CGPointMakeWithDictionaryRepresentation reads "X" and "Y".
+    let key = crate::fw::string::make;
+    let number = crate::fw::collections::number_float;
+    let dictionary = crate::fw::collections::dictionary_from(&[(key("X"), number(3.5)), (key("Y"), number(-2.0))]);
+    let point = alloc(8);
+    assert_eq!(call("CGPointMakeWithDictionaryRepresentation", [super::object_to_guest(dictionary), point, 0, 0], &[]).0 & 0xff, 1);
+    assert_eq!(floats(point, 2), [3.5, -2.0]);
+    let half = crate::fw::collections::dictionary_from(&[(key("X"), number(1.0))]);
+    assert_eq!(call("CGPointMakeWithDictionaryRepresentation", [super::object_to_guest(half), point, 0, 0], &[]).0 & 0xff, 0);
+}
+
+#[test]
+fn ui_rect_fill_replaces_the_pixels_with_the_fill_colour() {
+    // A 2x1 point image context, then half-transparent red over opaque blue.
+    call("UIGraphicsBeginImageContextWithOptions", [f(2.0), f(1.0), 0, f(1.0)], &[]);
+    let (context, _) = call("UIGraphicsGetCurrentContext", [0; 4], &[]);
+    call("CGContextSetRGBFillColor", [context, f(0.0), f(0.0), f(1.0)], &[f(1.0)]);
+    call("UIRectFill", [f(0.0), f(0.0), f(2.0), f(1.0)], &[]);
+    call("CGContextSetRGBFillColor", [context, f(1.0), f(0.0), f(0.0)], &[f(0.5)]);
+    call("UIRectFill", [f(0.0), f(0.0), f(1.0), f(1.0)], &[]);
+    let host = super::object_to_host(context);
+    type Get = unsafe extern "C" fn(usize) -> *mut u8;
+    let get = super::host_fn!("CGBitmapContextGetData": Get).unwrap();
+    // BGRA (premultiplied first, little-endian): copied, not blended over the blue.
+    let pixels = unsafe { std::slice::from_raw_parts(get(host), 8) }.to_vec();
+    call("UIGraphicsEndImageContext", [0; 4], &[]);
+    assert_eq!(pixels, [0, 0, 128, 128, 255, 0, 0, 255]);
+}
+
 // ----- GL contexts -----
 
 const GL_ARRAY_BUFFER: u32 = 0x8892;

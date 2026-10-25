@@ -1,12 +1,12 @@
-//! AudioToolbox for 32-bit games: AudioFile, ExtAudioFile and the C
-//! AudioSession calls, on this layer's (fw/audiofile.rs, fw/extaudiofile.rs,
-//! fw/media.rs). File ids are host pointers (handles here); an
+//! AudioToolbox for 32-bit games: AudioFile, ExtAudioFile, system sounds
+//! and the C AudioSession calls, on this layer's (fw/audiofile.rs,
+//! fw/extaudiofile.rs, fw/sound.rs, fw/media.rs). File ids are host pointers (handles here); an
 //! AudioBufferList holds pointers, so it is rebuilt in the host's layout
 //! for the call and the byte counts copied back.
 
 use super::{
     forget_handle, handle_to_guest, handle_to_host, host_fn, host_functions, object_to_guest, object_to_host, register_all, Byte, Handle,
-    Ptr, I32, I64, U32,
+    Obj, Ptr, I32, I64, U32,
 };
 use crate::fw::extaudiofile::{BUFFER_LIST_FIRST, BUFFER_SIZE};
 use arm32_bridge::handler;
@@ -63,6 +63,10 @@ pub fn register() {
         "ExtAudioFileTell" => fn(file: Handle, out: Ptr) -> I32;
         "AudioSessionSetProperty" => fn(property: U32, size: U32, data: Ptr) -> I32;
         "AudioSessionSetActive" => fn(active: Byte) -> I32;
+        "AudioServicesCreateSystemSoundID" => fn(url: Obj, out: Ptr) -> I32;
+        "AudioServicesDisposeSystemSoundID" => fn(id: U32) -> I32;
+        "AudioServicesPlaySystemSound" => fn(id: U32);
+        "AudioServicesPlayAlertSound" => fn(id: U32);
     });
     let function = |name: &str, handler: Option<arm32_bridge::runtime::Handler>| super::super::function(name, handler.expect(name));
     // AudioFileOpenURL(url, permissions, typeHint, *file).
