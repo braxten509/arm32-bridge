@@ -435,6 +435,11 @@ pub(crate) extern "C" fn ios_setsockopt(fd: i32, level: i32, name: i32, value: *
         set_errno(libc::ENOPROTOOPT);
         return -1;
     };
+    // SO_NOSIGPIPE is answered without a system call, but Darwin still looks
+    // the descriptor up first (EBADF for a closed one).
+    if kind == Value::NoSigpipe && unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        return -1;
+    }
     unsafe {
         match kind {
             Value::NoSigpipe | Value::Waiting => 0,
@@ -466,6 +471,11 @@ pub(crate) extern "C" fn ios_getsockopt(fd: i32, level: i32, name: i32, value: *
         set_errno(libc::ENOPROTOOPT);
         return -1;
     };
+    // SO_NOSIGPIPE is answered without a system call, but Darwin still looks
+    // the descriptor up first (EBADF for a closed one).
+    if kind == Value::NoSigpipe && unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        return -1;
+    }
     unsafe {
         let write_int = |number: i32| {
             if value.is_null() || length.is_null() || *length < 4 {
@@ -561,6 +571,13 @@ unsafe fn host_time(apple: *const u8) -> Option<libc::timeval> {
 
 /// Apple's descriptor sets have the same bit layout as the system's.
 pub(crate) extern "C" fn ios_select(count: i32, read: *mut libc::fd_set, write: *mut libc::fd_set, error: *mut libc::fd_set, timeout: *const u8) -> i32 {
+    // Darwin's fd_set holds 1024 descriptors: a count outside that is EINVAL
+    // before the sets are read (or written), as Apple checks it.
+    const FD_SETSIZE: i32 = 1024;
+    if count < 0 || count > FD_SETSIZE {
+        set_errno(libc::EINVAL);
+        return -1;
+    }
     let mut time = unsafe { host_time(timeout) };
     let time_pointer = time.as_mut().map_or(std::ptr::null_mut(), |t| t as *mut _);
     let result = blocking(|| unsafe { libc::select(count, read, write, error, time_pointer) });

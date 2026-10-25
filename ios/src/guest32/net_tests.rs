@@ -195,6 +195,43 @@ fn inet_pton_and_ntop_use_darwin_families() {
 }
 
 #[test]
+fn select_refuses_more_descriptors_than_its_fd_sets_hold() {
+    // Darwin's FD_SETSIZE is 1024 (128-byte fd_set): nfds outside 0..=1024
+    // is EINVAL before the sets are read.
+    let set = alloc(128);
+    let timeout = alloc(8);
+    mem().write_u32(timeout, 0);
+    mem().write_u32(timeout + 4, 0);
+    for (name, count) in [("select", 1025u32), ("select$DARWIN_EXTSN", 1025), ("select", u32::MAX)] {
+        mem().write_bytes(set, &[0xAA; 128]);
+        assert_eq!(call(name, [count, set, 0, 0], &[timeout]).0, u32::MAX, "{name} nfds {count}");
+        assert_eq!(errno(), 22, "Darwin's EINVAL for nfds {count}");
+        assert_eq!(mem().bytes(set, 128), [0xAA; 128], "the fd_set was touched");
+    }
+    // 1024 is allowed; nothing is ready and the timeout is zero.
+    mem().write_bytes(set, &[0; 128]);
+    assert_eq!(call("select", [1024, set, 0, 0], &[timeout]).0, 0, "nfds 1024");
+}
+
+#[test]
+fn so_nosigpipe_needs_a_real_descriptor() {
+    // Answered without a system call, but Darwin still looks the fd up.
+    let one = word(1);
+    assert_eq!(call("setsockopt", [u32::MAX, 0xffff, 0x1022, one], &[4]).0, u32::MAX, "setsockopt -1");
+    assert_eq!(errno(), 9, "Darwin's EBADF");
+    let length = word(4);
+    assert_eq!(call("getsockopt", [u32::MAX, 0xffff, 0x1022, one], &[length]).0, u32::MAX, "getsockopt -1");
+    assert_eq!(errno(), 9, "Darwin's EBADF");
+    // An open socket still answers yes.
+    let fd = call("socket", [2, 1, 0, 0], &[]).0 as i32;
+    assert!(fd >= 0);
+    assert_eq!(call("setsockopt", [fd as u32, 0xffff, 0x1022, one], &[4]).0, 0);
+    assert_eq!(call("getsockopt", [fd as u32, 0xffff, 0x1022, one], &[length]).0, 0);
+    assert_eq!(mem().read_u32(one), 1);
+    close(fd);
+}
+
+#[test]
 fn poll_and_select_read_armv7_fd_sets_and_timevals() {
     let mut fds = [0i32; 2];
     assert_eq!(unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) }, 0);

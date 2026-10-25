@@ -298,23 +298,23 @@ fn control() {
 /// canonname, addr, next (canonname comes before addr on Darwin).
 const ADDRINFO_SIZE: u32 = 32;
 
-/// The 32-bit list for `entries`, from the guest heap (freeaddrinfo's to free).
-fn guest_chain(entries: &[AddressEntry]) -> u32 {
+/// The 32-bit list for `entries`, from the guest heap (freeaddrinfo's to free);
+/// None when a node can't be allocated (the partial list is freed).
+fn guest_chain(entries: &[AddressEntry]) -> Option<u32> {
     let mut head = 0;
     let mut tail = 0u32;
     for entry in entries {
         let name = entry.canonname.as_deref().unwrap_or(&[]);
         let node = super::alloc(ADDRINFO_SIZE + entry.address.len() as u32 + name.len() as u32);
         if node == 0 {
-            // Out of memory: give back what was made, as Apple's list would
-            // be freed by the caller on an error.
+            // Out of memory: give back what was made.
             let mut rest = head;
             while rest != 0 {
                 let next = mem().read_u32(rest + 28);
                 super::free(rest);
                 rest = next;
             }
-            return 0;
+            return None;
         }
         let address_at = node + ADDRINFO_SIZE;
         let name_at = address_at + entry.address.len() as u32;
@@ -338,7 +338,7 @@ fn guest_chain(entries: &[AddressEntry]) -> u32 {
         }
         tail = node;
     }
-    head
+    Some(head)
 }
 
 fn guest_hints(guest: u32) -> Option<Hints> {
@@ -414,12 +414,16 @@ fn names() {
             let (node, service, hints, out) = (a.u32(), a.u32(), a.u32(), a.u32());
             let result = net::find_addresses(host_ptr(node).cast(), host_ptr(service).cast(), guest_hints(hints));
             match result {
-                Ok(entries) => {
-                    if out != 0 {
-                        mem().write_u32(out, guest_chain(&entries));
+                Ok(entries) => match guest_chain(&entries) {
+                    Some(list) => {
+                        if out != 0 {
+                            mem().write_u32(out, list);
+                        }
+                        Ret::U32(0)
                     }
-                    Ret::U32(0)
-                }
+                    // EAI_MEMORY: the partial list is already freed.
+                    None => Ret::U32(6),
+                },
                 Err(error) => Ret::U32(net::apple_lookup_error(error) as u32),
             }
         })
