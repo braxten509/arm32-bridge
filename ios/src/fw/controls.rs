@@ -12,7 +12,7 @@ use crate::fw::geometry::{Point, Rect, Size};
 use crate::fw::graphics::TextLook;
 use crate::fw::object::{class_methods, define_class, methods};
 use crate::fw::runloop::{post, Work};
-use crate::fw::uikit::{property, property_get, property_set, screen_points, view_state};
+use crate::fw::uikit::{next_responder, property, property_get, property_set, screen_points, view_state};
 use crate::fw::{collections, string};
 use crate::objc::runtime::{self, lock, Class, Id, Sel};
 use crate::symbols::{leak, Registry};
@@ -569,33 +569,6 @@ extern "C" fn control_remove_target(this: Id, _: Sel, target: Id, action: Sel, e
     }
 }
 
-/// The next responder, as UIKit links them: a controller's view → the
-/// controller → the view's superview; a window → the application → the
-/// application delegate.
-fn next_responder(object: Id) -> Id {
-    let app = runtime::send(runtime::class_named("UIApplication"), "sharedApplication", &[]);
-    if object == app {
-        return runtime::send(app, "delegate", &[]);
-    }
-    if class_is(object, "UIView") {
-        if let Some(controller) = property_get(object, "viewController").filter(|&c| c != 0) {
-            return controller as Id;
-        }
-        let parent = view_state(object).superview;
-        return if parent != 0 { parent } else { app };
-    }
-    if class_is(object, "UIViewController") {
-        let view = get_id(object, "view");
-        let parent = if view != 0 { view_state(view).superview } else { 0 };
-        if parent != 0 {
-            return parent;
-        }
-        let presenting = get_id(object, "presenting");
-        return if presenting != 0 { presenting } else { app };
-    }
-    0
-}
-
 /// Sends an action. With no target UIKit asks the first responder and
 /// then the responder chain; there's no first responder here (no
 /// keyboard), so the search starts at the control itself, as UIKit does
@@ -720,7 +693,8 @@ fn set_pressed(this: Id, pressed: bool) {
     }
 }
 
-/// A disabled control leaves the touch to the next view up that takes touches (UIResponder's way).
+/// A disabled control leaves the touch to the view it is in, which passes it
+/// up the responder chain (UIResponder's way).
 fn pass_on(this: Id, name: &str, touches: Id, event: Id) {
     let mut next = view_state(this).superview;
     while next != 0 && !runtime::responds(next, name) {
