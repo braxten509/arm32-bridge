@@ -303,11 +303,30 @@ fn image_masks_hide_where_their_samples_are_one() {
     let decode = alloc(8);
     mem().write_u32(decode, f(1.0));
     mem().write_u32(decode + 4, f(0.0));
-    let (bits, _) = call("CGImageMaskCreate", [2, 1, 1, 1], &[1, provider_with(&[0b0100_0000]), decode, 0]);
+    let bits_provider = provider_with(&[0b0100_0000]);
+    let (bits, _) = call("CGImageMaskCreate", [2, 1, 1, 1], &[1, bits_provider, decode, 0]);
     let (context, pixels) = row_context(2);
     call("CGContextSetRGBFillColor", [context, f(0.0), f(0.0), f(1.0)], &[f(1.0)]);
     draw(context, 2, bits);
     assert_eq!(mem().bytes(pixels, 8), [0, 0, 0, 0, 0, 0, 255, 255]);
+    // The mask keeps what it was made from: its provider and packed bytes,
+    // its format, its decode array, and no colour space.
+    let (provider, _) = call("CGImageGetDataProvider", [bits, 0, 0, 0], &[]);
+    assert_eq!(provider, bits_provider);
+    let (bytes, _) = call("CGDataProviderCopyData", [provider, 0, 0, 0], &[]);
+    assert_eq!(crate::fw::data::bytes(super::object_to_host(bytes)), [0b0100_0000]);
+    let format: Vec<u32> = ["CGImageGetBitsPerComponent", "CGImageGetBitsPerPixel", "CGImageGetBytesPerRow", "CGImageGetColorSpace", "CGImageIsMask"]
+        .iter()
+        .map(|name| call(name, [bits, 0, 0, 0], &[]).0)
+        .collect();
+    assert_eq!(format, [1, 1, 1, 0, 1]);
+    let (kept, _) = call("CGImageGetDecode", [bits, 0, 0, 0], &[]);
+    assert_eq!(floats(kept, 2), [1.0, 0.0]);
+    // A picture used as the mask must be DeviceGray: an RGB one gives NULL.
+    let (rgb, _) = call("CGColorSpaceCreateDeviceRGB", [0; 4], &[]);
+    let (rgb_image, _) = call("CGImageCreate", [2, 1, 8, 32], &[8, rgb, 5, provider_with(&[0; 8]), 0, 0, 0]);
+    assert_ne!(rgb_image, 0);
+    assert_eq!(call("CGImageCreateWithMask", [image, rgb_image, 0, 0], &[]).0, 0);
 }
 
 #[test]
@@ -489,6 +508,203 @@ fn freed_eagl_contexts_leave_the_gles_tracking() {
     assert!(!gles::context_tracked(current_egl), "then goes once let go");
 }
 
+// ----- OpenGL ES 1 -----
+
+const GL_FRAMEBUFFER_OES: u32 = 0x8D40;
+const GL_RENDERBUFFER_OES: u32 = 0x8D41;
+const GL_TEXTURE_2D: u32 = 0x0DE1;
+const GL_FLOAT: u32 = 0x1406;
+const GL_UNSIGNED_BYTE: u32 = 0x1401;
+const GL_RGBA: u32 = 0x1908;
+const GL_MODELVIEW: u32 = 0x1700;
+const GL_PROJECTION: u32 = 0x1701;
+const GL_VERTEX_ARRAY: u32 = 0x8074;
+const GL_COLOR_ARRAY: u32 = 0x8076;
+const GL_TEXTURE_COORD_ARRAY: u32 = 0x8078;
+const GL_TEXTURE_ENV: u32 = 0x2300;
+const GL_TEXTURE_ENV_MODE: u32 = 0x2200;
+
+/// [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES1], made current.
+fn es1_context() -> usize {
+    let class = crate::objc::runtime::class_named("EAGLContext");
+    let context = crate::objc::runtime::send(crate::objc::runtime::send(class, "alloc", &[]), "initWithAPI:", &[1]);
+    assert_ne!(context, 0, "an OpenGL ES 1 context was made");
+    assert_eq!(crate::objc::runtime::send(context, "API", &[]), 1);
+    make_current(context);
+    context
+}
+
+/// A framebuffer with a `width` x `height` colour renderbuffer, made the
+/// OES way an ES 1 game makes it; left bound. Returns (framebuffer, renderbuffer).
+fn es1_framebuffer(width: u32, height: u32) -> (u32, u32) {
+    let names = alloc(8);
+    call("glGenFramebuffersOES", [1, names, 0, 0], &[]);
+    call("glGenRenderbuffersOES", [1, names + 4, 0, 0], &[]);
+    let (framebuffer, renderbuffer) = (mem().read_u32(names), mem().read_u32(names + 4));
+    call("glBindFramebufferOES", [GL_FRAMEBUFFER_OES, framebuffer, 0, 0], &[]);
+    call("glBindRenderbufferOES", [GL_RENDERBUFFER_OES, renderbuffer, 0, 0], &[]);
+    call("glRenderbufferStorageOES", [GL_RENDERBUFFER_OES, 0x8058, width, height], &[]);
+    call("glFramebufferRenderbufferOES", [GL_FRAMEBUFFER_OES, 0x8CE0, GL_RENDERBUFFER_OES, renderbuffer], &[]);
+    assert_eq!(call("glCheckFramebufferStatusOES", [GL_FRAMEBUFFER_OES, 0, 0, 0], &[]).0, 0x8CD5, "the framebuffer is complete");
+    (framebuffer, renderbuffer)
+}
+
+/// Guest words with these values.
+fn words(values: &[u32]) -> u32 {
+    let address = alloc(values.len() as u32 * 4);
+    for (i, value) in values.iter().enumerate() {
+        mem().write_u32(address + i as u32 * 4, *value);
+    }
+    address
+}
+
+fn gl_ints(name: u32, count: u32) -> Vec<u32> {
+    let out = alloc(count * 4);
+    call("glGetIntegerv", [name, out, 0, 0], &[]);
+    (0..count).map(|i| mem().read_u32(out + i * 4)).collect()
+}
+
+fn gl_floats(name: u32, count: u32) -> Vec<f32> {
+    let out = alloc(count * 4);
+    call("glGetFloatv", [name, out, 0, 0], &[]);
+    floats(out, count)
+}
+
+/// glReadPixels of the bound framebuffer, RGBA rows from the bottom.
+fn read_pixels(width: u32, height: u32) -> Vec<u8> {
+    let out = alloc(width * height * 4);
+    call("glReadPixels", [0, 0, width, height], &[GL_RGBA, GL_UNSIGNED_BYTE, out]);
+    mem().bytes(out, (width * height * 4) as usize).to_vec()
+}
+
+fn pixel(pixels: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
+    let at = ((y * width + x) * 4) as usize;
+    pixels[at..at + 4].try_into().unwrap()
+}
+
+#[test]
+fn es1_contexts_draw_textured_coloured_client_arrays() {
+    setup();
+    es1_context();
+    es1_framebuffer(8, 8);
+    call("glViewport", [0, 0, 8, 8], &[]);
+    call("glClearColor", [f(0.0), f(0.0), f(0.0), f(1.0)], &[]);
+    call("glClear", [0x4000, 0, 0, 0], &[]);
+    // A 2x1 texture: white, then red.
+    let name = alloc(4);
+    call("glGenTextures", [1, name, 0, 0], &[]);
+    call("glBindTexture", [GL_TEXTURE_2D, mem().read_u32(name), 0, 0], &[]);
+    call("glTexParameteri", [GL_TEXTURE_2D, 0x2801, 0x2600, 0], &[]);
+    call("glTexParameteri", [GL_TEXTURE_2D, 0x2800, 0x2600, 0], &[]);
+    let texels = words(&[0xFFFF_FFFF, 0xFF00_00FF]);
+    call("glTexImage2D", [GL_TEXTURE_2D, 0, GL_RGBA, 2], &[1, 0, GL_RGBA, GL_UNSIGNED_BYTE, texels]);
+    call("glEnable", [GL_TEXTURE_2D, 0, 0, 0], &[]);
+    call("glTexEnvi", [GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, 0x2100, 0], &[]);
+    // Fixed-function matrices: glOrthof's six floats run from r0-r3 onto the stack.
+    call("glMatrixMode", [GL_PROJECTION, 0, 0, 0], &[]);
+    call("glLoadIdentity", [0; 4], &[]);
+    call("glOrthof", [f(0.0), f(8.0), f(0.0), f(8.0)], &[f(-1.0), f(1.0)]);
+    call("glMatrixMode", [GL_MODELVIEW, 0, 0, 0], &[]);
+    call("glLoadIdentity", [0; 4], &[]);
+    call("glScalef", [f(2.0), f(2.0), f(1.0), 0], &[]);
+    // Client-side arrays (no buffer bound): read by the driver at draw time.
+    let vertices = words(&[0.0, 0.0, 4.0, 0.0, 0.0, 4.0, 4.0, 4.0].map(f32::to_bits));
+    let coords = words(&[0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0].map(f32::to_bits));
+    let colours = words(&[0xFF00_FFFF; 4]); // yellow
+    let indices = words(&[0x0001_0000, 0x0001_0002, 0x0003_0002]);
+    call("glEnableClientState", [GL_VERTEX_ARRAY, 0, 0, 0], &[]);
+    call("glEnableClientState", [GL_TEXTURE_COORD_ARRAY, 0, 0, 0], &[]);
+    call("glEnableClientState", [GL_COLOR_ARRAY, 0, 0, 0], &[]);
+    call("glVertexPointer", [2, GL_FLOAT, 0, vertices], &[]);
+    call("glTexCoordPointer", [2, GL_FLOAT, 0, coords], &[]);
+    call("glColorPointer", [4, GL_UNSIGNED_BYTE, 0, colours], &[]);
+    call("glDrawElements", [4, 6, 0x1403, indices], &[]);
+    // The game can ask where its arrays are: its own guest pointer back.
+    let out = alloc(4);
+    call("glGetPointerv", [0x808E, out, 0, 0], &[]);
+    assert_eq!(mem().read_u32(out), vertices, "GL_VERTEX_ARRAY_POINTER is the game's pointer");
+    let pixels = read_pixels(8, 8);
+    assert_eq!(call("glGetError", [0; 4], &[]).0, 0, "no GL error");
+    assert_eq!(pixel(&pixels, 8, 1, 4), [255, 255, 0, 255], "white texel times yellow");
+    assert_eq!(pixel(&pixels, 8, 6, 4), [255, 0, 0, 255], "red texel times yellow");
+    make_current(0);
+}
+
+#[test]
+fn es1_frames_reach_the_window_and_the_game_state_stays() {
+    setup();
+    let context = es1_context();
+    let (framebuffer, _) = es1_framebuffer(16, 24);
+    crate::fw::eagl::set_drawable_size(context, 16, 24);
+    // The game drew red, then left all kinds of state set.
+    call("glClearColor", [f(1.0), f(0.0), f(0.0), f(1.0)], &[]);
+    call("glClear", [0x4000, 0, 0, 0], &[]);
+    call("glClearColor", [f(0.25), f(0.5), f(0.75), f(1.0)], &[]);
+    call("glColorMask", [1, 0, 1, 1], &[]);
+    call("glViewport", [1, 2, 3, 4], &[]);
+    call("glEnable", [0x0C11, 0, 0, 0], &[]); // scissor
+    call("glScissor", [0, 0, 1, 1], &[]);
+    call("glEnable", [0x0BE2, 0, 0, 0], &[]); // blend
+    call("glMatrixMode", [GL_MODELVIEW, 0, 0, 0], &[]);
+    call("glLoadIdentity", [0; 4], &[]);
+    call("glTranslatef", [f(5.0), f(0.0), f(0.0), 0], &[]);
+    call("glMatrixMode", [GL_PROJECTION, 0, 0, 0], &[]);
+    call("glLoadIdentity", [0; 4], &[]);
+    call("glOrthof", [f(0.0), f(16.0), f(0.0), f(16.0)], &[f(-1.0), f(1.0)]);
+    let name = alloc(4);
+    call("glGenTextures", [1, name, 0, 0], &[]);
+    let texture = mem().read_u32(name);
+    call("glBindTexture", [GL_TEXTURE_2D, texture, 0, 0], &[]);
+    call("glTexEnvi", [GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, 0x0104, 0], &[]); // GL_ADD
+    let vertices = words(&[0; 8]);
+    call("glEnableClientState", [GL_VERTEX_ARRAY, 0, 0, 0], &[]);
+    call("glVertexPointer", [3, GL_FLOAT, 12, vertices], &[]);
+    let before = (gl_floats(0x0BA6, 16), gl_floats(0x0BA7, 16)); // modelview, projection
+
+    let (window_width, window_height) = (64u32, 48u32);
+    crate::fw::eagl::use_test_window(window_width as i32, window_height as i32);
+    assert_ne!(crate::objc::runtime::send(context, "presentRenderbuffer:", &[GL_RENDERBUFFER_OES as usize]), 0, "the frame was shown");
+    assert_eq!(call("glGetError", [0; 4], &[]).0, 0, "no GL error");
+
+    // Everything the game set is as it was.
+    assert_eq!(gl_ints(0x8CA6, 1), [framebuffer], "framebuffer binding");
+    assert_eq!(gl_ints(0x0BA2, 4), [1, 2, 3, 4], "viewport");
+    assert_eq!(gl_floats(0x0C22, 4), [0.25, 0.5, 0.75, 1.0], "clear colour");
+    assert_eq!(gl_ints(0x0C23, 4), [1, 0, 1, 1], "colour mask");
+    assert_eq!(call("glIsEnabled", [0x0C11, 0, 0, 0], &[]).0 & 0xff, 1, "scissor test");
+    assert_eq!(gl_ints(0x0C10, 4), [0, 0, 1, 1], "scissor box");
+    assert_eq!(call("glIsEnabled", [0x0BE2, 0, 0, 0], &[]).0 & 0xff, 1, "blending");
+    assert_eq!(call("glIsEnabled", [GL_TEXTURE_2D, 0, 0, 0], &[]).0 & 0xff, 0, "2D textures stay off");
+    assert_eq!(gl_ints(0x0BA0, 1), [GL_PROJECTION], "matrix mode");
+    assert_eq!((gl_floats(0x0BA6, 16), gl_floats(0x0BA7, 16)), before, "matrices");
+    assert_eq!(gl_ints(0x8069, 1), [texture], "texture binding");
+    assert_eq!(gl_ints(0x84E0, 1), [0x84C0], "active texture");
+    let mode = alloc(4);
+    call("glGetTexEnviv", [GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, mode, 0], &[]);
+    assert_eq!(mem().read_u32(mode), 0x0104, "texture environment");
+    assert_eq!(call("glIsEnabled", [GL_VERTEX_ARRAY, 0, 0, 0], &[]).0 & 0xff, 1, "vertex array on");
+    assert_eq!(call("glIsEnabled", [GL_TEXTURE_COORD_ARRAY, 0, 0, 0], &[]).0 & 0xff, 0, "texture coordinates off");
+    assert_eq!([gl_ints(0x807A, 1)[0], gl_ints(0x807B, 1)[0], gl_ints(0x807C, 1)[0]], [3, GL_FLOAT, 12], "vertex array size, type, stride");
+    let out = alloc(4);
+    call("glGetPointerv", [0x808E, out, 0, 0], &[]);
+    assert_eq!(mem().read_u32(out), vertices, "vertex array pointer");
+
+    // The window shows the game's red picture in its area, black around it.
+    call("glBindFramebufferOES", [GL_FRAMEBUFFER_OES, 0, 0, 0], &[]);
+    call("glColorMask", [1, 1, 1, 1], &[]);
+    let pixels = read_pixels(window_width, window_height);
+    call("glBindFramebufferOES", [GL_FRAMEBUFFER_OES, framebuffer, 0, 0], &[]);
+    let (x0, y0, x1, y1) = crate::fw::eagl::picture_area(window_width as i32, window_height as i32);
+    let (cx, cy) = (((x0 + x1) / 2) as u32, ((y0 + y1) / 2) as u32);
+    assert_eq!(pixel(&pixels, window_width, cx, cy), [255, 0, 0, 255], "the picture reached the window");
+    assert_eq!(pixel(&pixels, window_width, x0 as u32 + 1, y0 as u32 + 1), [255, 0, 0, 255], "all of it");
+    if x0 > 0 || y0 > 0 {
+        assert_eq!(pixel(&pixels, window_width, 0, 0), [0, 0, 0, 255], "black around the picture");
+    }
+    crate::fw::eagl::use_test_window(0, 0);
+    make_current(0);
+}
+
 #[test]
 fn game_retains_autoreleases_and_releases_reach_the_eagl_context_count() {
     use crate::guest32::objc::bridge::Bridge;
@@ -549,6 +765,154 @@ fn game_retains_autoreleases_and_releases_reach_the_eagl_context_count() {
     call("objc_msgSend", &[class, sel("setCurrentContext:"), 0]);
     assert_eq!(count(), None, "then goes once it is no longer current");
     assert!(!gles::context_tracked(egl), "its EGL context went with it");
+}
+
+// ----- Core Foundation, CommonCrypto -----
+
+const CF_UTF8: u32 = 0x0800_0100;
+const CF_ASCII: u32 = 0x0600;
+const CF_UNICODE: u32 = 0x0100;
+
+fn host_of(guest: u32) -> usize {
+    super::object_to_host(guest)
+}
+
+fn guest_of(host: usize) -> u32 {
+    super::object_to_guest(host)
+}
+
+#[test]
+fn cf_data_bytes_live_in_guest_memory_and_follow_the_length() {
+    let source = alloc(5);
+    mem().write_bytes(source, b"hello");
+    let one = |name: &str, data: u32| call(name, [data, 0, 0, 0], &[]).0;
+    let data = call("CFDataCreate", [0, source, 5, 0], &[]).0;
+    assert_eq!(one("CFDataGetLength", data), 5);
+    let bytes = one("CFDataGetBytePtr", data);
+    assert_ne!(bytes, source, "CFDataCreate copies");
+    assert_eq!(mem().bytes(bytes, 5), b"hello");
+
+    // A capacity keeps the pointer; the game's writes through it are the data's bytes.
+    let fixed = call("CFDataCreateMutable", [0, 16, 0, 0], &[]).0;
+    let start = one("CFDataGetMutableBytePtr", fixed);
+    assert_ne!(start, 0);
+    call("CFDataSetLength", [fixed, 8, 0, 0], &[]);
+    assert_eq!(one("CFDataGetMutableBytePtr", fixed), start, "the pointer stays within the capacity");
+    assert_eq!(mem().bytes(start, 8), [0; 8], "new length reads as zeros");
+    mem().write_bytes(start, b"12345678");
+    assert_eq!(one("CFDataGetBytePtr", fixed), start);
+    assert_eq!(crate::fw::data::bytes(host_of(fixed)), b"12345678", "the host object holds what the game wrote");
+    let message = crate::objc::runtime::send(host_of(fixed), "bytes", &[]);
+    assert_eq!(mem().guest(message as *const u8), start, "-bytes is the same memory");
+
+    // Growing past the capacity moves the bytes and keeps them.
+    let growing = call("CFDataCreateMutable", [0, 0, 0, 0], &[]).0;
+    call("CFDataSetLength", [growing, 4, 0, 0], &[]);
+    mem().write_bytes(one("CFDataGetMutableBytePtr", growing), b"abcd");
+    call("CFDataSetLength", [growing, 5000, 0, 0], &[]);
+    let moved = one("CFDataGetBytePtr", growing);
+    assert_eq!(mem().bytes(moved, 4), b"abcd");
+    assert!(mem().bytes(moved + 4, 4996).iter().all(|&b| b == 0));
+    assert_eq!(one("CFDataGetLength", growing), 5000);
+
+    // No copy: the data reads the caller's own bytes.
+    let borrowed = call("CFDataCreateWithBytesNoCopy", [0, source, 5, 0], &[]).0;
+    assert_eq!(one("CFDataGetBytePtr", borrowed), source);
+    assert_eq!(one("CFDataGetLength", borrowed), 5);
+}
+
+#[test]
+fn cf_collections_and_numbers_use_32_bit_words() {
+    setup();
+    use crate::fw::{collections, string};
+    let (a, b) = (string::make("a"), string::make("b"));
+    let array = guest_of(collections::array_from(&[a, b, a]));
+    assert_eq!(call("CFArrayGetCount", [array, 0, 0, 0], &[]).0, 3);
+    // CFArrayGetValues(array, CFRange {1, 2}, values): two 4-byte words, nothing past them.
+    let values = alloc(12);
+    mem().write_u32(values + 8, 0xDEAD_BEEF);
+    call("CFArrayGetValues", [array, 1, 2, values], &[]);
+    assert_eq!([mem().read_u32(values), mem().read_u32(values + 4), mem().read_u32(values + 8)], [guest_of(b), guest_of(a), 0xDEAD_BEEF]);
+
+    let dictionary = guest_of(collections::dictionary_from(&[(a, b)]));
+    assert_eq!(call("CFDictionaryGetCount", [dictionary, 0, 0, 0], &[]).0, 1);
+    let (keys, objects) = (alloc(8), alloc(8));
+    mem().write_u32(keys + 4, 0xDEAD_BEEF);
+    call("CFDictionaryGetKeysAndValues", [dictionary, keys, objects, 0], &[]);
+    assert_eq!([mem().read_u32(keys), mem().read_u32(objects), mem().read_u32(keys + 4)], [guest_of(a), guest_of(b), 0xDEAD_BEEF]);
+    call("CFDictionaryGetKeysAndValues", [dictionary, keys, 0, 0], &[]);
+
+    // kCFNumberLongType (10) is 4 bytes here and kCFNumberCGFloatType (16) a float.
+    let value = alloc(8);
+    mem().write_u32(value, -7i32 as u32);
+    mem().write_u32(value + 4, 0x7FFF_FFFF);
+    let long = call("CFNumberCreate", [0, 10, value, 0], &[]).0;
+    assert_eq!(collections::number_as_i64(host_of(long)), -7);
+    mem().write_u32(value, 2.5f32.to_bits());
+    let float = call("CFNumberCreate", [0, 16, value, 0], &[]).0;
+    assert_eq!(collections::number_as_f64(host_of(float)), 2.5);
+
+    let other_a = guest_of(string::make("a"));
+    assert_eq!(call("CFEqual", [guest_of(a), other_a, 0, 0], &[]).0, 1);
+    assert_eq!(call("CFEqual", [guest_of(a), guest_of(b), 0, 0], &[]).0, 0);
+    assert_eq!(call("CFHash", [guest_of(a), 0, 0, 0], &[]).0, call("CFHash", [other_a, 0, 0, 0], &[]).0);
+}
+
+#[test]
+fn cf_string_bytes_use_32_bit_ranges_and_counts() {
+    setup();
+    let text = guest_of(crate::fw::string::make("h\u{e9}llo"));
+    assert_eq!(call("CFStringGetLength", [text, 0, 0, 0], &[]).0, 5);
+    let (buffer, used) = (alloc(16), alloc(8));
+    mem().write_u32(used + 4, 0xDEAD_BEEF);
+    // CFStringGetBytes(string, CFRange {1, 3}, UTF-8, loss byte, external, buffer, room, &used)
+    let converted = call("CFStringGetBytes", [text, 1, 3, CF_UTF8], &[0, 0, buffer, 16, used]).0;
+    assert_eq!((converted, mem().read_u32(used)), (3, 4));
+    assert_eq!(mem().bytes(buffer, 4), "\u{e9}ll".as_bytes());
+    assert_eq!(mem().read_u32(used + 4), 0xDEAD_BEEF, "a 4-byte CFIndex was written");
+    let converted = call("CFStringGetBytes", [text, 0, 5, CF_ASCII], &[b'?' as u32, 0, buffer, 16, used]).0;
+    assert_eq!((converted, mem().bytes(buffer, 5)), (5, &b"h?llo"[..]));
+    // CFStringCreateWithBytes(allocator, bytes, count, encoding, external representation)
+    mem().write_bytes(buffer, &[0xFF, 0xFE, b'h', 0, b'i', 0]);
+    let made = call("CFStringCreateWithBytes", [0, buffer, 6, CF_UNICODE], &[1]).0;
+    assert_eq!(crate::fw::string::get(host_of(made)), "hi");
+    assert_eq!(call("CFStringGetMaximumSizeForEncoding", [5, CF_UTF8, 0, 0], &[]).0, 15);
+}
+
+#[test]
+fn digest_contexts_stay_inside_apples_sizes() {
+    use crate::fw::crypto::{md5, sha1, sha256};
+    let data = alloc(3);
+    mem().write_bytes(data, b"abc");
+    let kinds: [(&str, u32, Vec<u8>); 3] =
+        [("CC_MD5", 92, md5(b"abc").to_vec()), ("CC_SHA1", 96, sha1(b"abc").to_vec()), ("CC_SHA256", 104, sha256(b"abc").to_vec())];
+    for (prefix, size, expected) in kinds {
+        let context = alloc(size + 4);
+        mem().write_u32(context + size, 0xDEAD_BEEF);
+        assert_eq!(call(&format!("{prefix}_Init"), [context, 0, 0, 0], &[]).0, 1);
+        call(&format!("{prefix}_Update"), [context, data, 1, 0], &[]);
+        call(&format!("{prefix}_Update"), [context, data + 1, 2, 0], &[]);
+        let out = alloc(32);
+        assert_eq!(call(&format!("{prefix}_Final"), [out, context, 0, 0], &[]).0, 1);
+        assert_eq!(mem().bytes(out, expected.len()), &expected[..], "{prefix}");
+        assert_eq!(mem().read_u32(context + size), 0xDEAD_BEEF, "{prefix} wrote past its {size}-byte context");
+    }
+}
+
+#[test]
+fn foundation_constants_have_32_bit_forms() {
+    setup();
+    let word = |name: &str| mem().read_u32(crate::guest32::data_address(name).unwrap_or_else(|| panic!("{name}")));
+    assert_eq!(word("vm_page_size"), 4096);
+    assert_eq!(word("OBJC_IVAR_$_NSObject.isa"), 0);
+    let ndr = crate::guest32::data_address("NDR_record").unwrap();
+    assert_eq!(mem().bytes(ndr, 8), [0, 0, 0, 0, 1, 0, 0, 0]);
+    assert_eq!(f32::from_bits(word("UIWindowLevelStatusBar")), 1000.0);
+    let object = |name: &str| host_of(word(name));
+    assert_eq!(crate::fw::string::get(object("kCAMediaTimingFunctionEaseInEaseOut")), "easeInEaseOut");
+    assert_eq!(crate::fw::string::get(object("kSecClassKey")), "keys");
+    assert!(crate::fw::collections::number_as_f64(object("kCFNumberNaN")).is_nan());
+    assert_eq!(object("kCFNull"), crate::objc::runtime::send(crate::objc::runtime::class_named("NSNull"), "null", &[]));
 }
 
 #[test]

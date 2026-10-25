@@ -139,6 +139,20 @@ pub fn functions() -> &'static [(&'static str, ObjcFn)] {
         ("dispatch_queue_create", super::dispatch::queue_create),
         ("dispatch_release", |_, _| ok(0)),
         ("dispatch_retain", |_, _| ok(0)),
+        ("dispatch_get_current_queue", super::dispatch::current_queue),
+        ("dispatch_time", super::dispatch::time),
+        ("dispatch_after", super::dispatch::after),
+        ("dispatch_suspend", super::dispatch::suspend),
+        ("dispatch_resume", super::dispatch::resume),
+        ("dispatch_source_create", super::dispatch::source_create),
+        ("dispatch_source_set_event_handler", super::dispatch::source_set_event_handler),
+        ("dispatch_source_set_timer", super::dispatch::source_set_timer),
+        ("dispatch_group_create", super::dispatch::group_create),
+        ("dispatch_group_enter", super::dispatch::group_enter),
+        ("dispatch_group_leave", super::dispatch::group_leave),
+        ("dispatch_group_wait", super::dispatch::group_wait),
+        ("dispatch_group_notify", super::dispatch::group_notify),
+        ("dispatch_group_async", super::dispatch::group_async),
         ("objc_getAssociatedObject", |_, w| ok(with_associated(|m| m.get(&(w(0), w(1))).map_or(0, |v| v.0)))),
         ("objc_setAssociatedObject", set_associated),
         ("objc_removeAssociatedObjects", |c, w| remove_associated(c, w(0)).map(|_| 0)),
@@ -204,6 +218,24 @@ pub fn functions() -> &'static [(&'static str, ObjcFn)] {
         ("class_getProperty", class_property),
         ("property_getName", |c, w| ok(if w(0) == 0 { 0 } else { c.word(w(0)) })),
         ("property_getAttributes", |c, w| ok(if w(0) == 0 { 0 } else { c.word(w(0) + 4) })),
+        ("NSAllocateObject", |c, w| {
+            if w(0) == 0 {
+                return ok(0);
+            }
+            let object = c.lock().allocate(c.g, w(0), w(1))?;
+            super::bridge::construct_pending(c.bridge, c.g)?;
+            ok(object)
+        }),
+        // Zones are only names (every allocation uses the one heap): a fixed block.
+        ("NSDefaultMallocZone", |c, _| {
+            static ZONE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+            ok(*ZONE.get_or_init(|| {
+                let zone = c.g.alloc_permanent(16);
+                c.g.write(zone, &[0; 16]);
+                zone
+            }))
+        }),
+        ("NSGetSizeAndAlignment", get_size_and_alignment),
         ("_Block_copy", |c, w| ok(block_copy(c, w(0))?)),
         ("_Block_release", |c, w| block_release(c, w(0)).map(|_| 0)),
         ("_Block_object_assign", block_object_assign),
@@ -219,7 +251,32 @@ pub fn functions() -> &'static [(&'static str, ObjcFn)] {
 /// framework_selectors.tsv, without self/_cmd), variadic arguments.
 pub const HOST_FUNCTIONS: &[(&str, &str, Varargs)] = &[
     ("NSLog", "v@", Varargs::Format),
+    // CFStringAppendFormat(string, format options, format, ...)
+    ("CFStringAppendFormat", "v@@@", Varargs::Format),
+    // The keychain: CFTypeRef results come back through `id *`.
+    ("SecItemAdd", "i@^@", Varargs::None),
+    ("SecItemCopyMatching", "i@^@", Varargs::None),
+    ("SecItemUpdate", "i@@", Varargs::None),
+    ("SecItemDelete", "i@", Varargs::None),
 ];
+
+/// NSGetSizeAndAlignment(type, &size, &alignment): armv7 sizes; returns
+/// the type after it, past its offset digits.
+fn get_size_and_alignment(c: &Ctx, w: Words) -> Result<u64, String> {
+    let (types, size, align) = (w(0), w(1), w(2));
+    if types == 0 {
+        return ok(0);
+    }
+    let text = c.cstr(types);
+    let (ty, used) = super::encoding::parse_one(&text)?;
+    if size != 0 {
+        c.set_word(size, ty.guest_size());
+    }
+    if align != 0 {
+        c.set_word(align, ty.guest_align());
+    }
+    ok(types + used as u32)
+}
 
 pub fn call_function(ctx: &Ctx, name: &str, words: Words) -> Result<u64, String> {
     static TABLE: std::sync::OnceLock<HashMap<&'static str, ObjcFn>> = std::sync::OnceLock::new();
@@ -527,11 +584,16 @@ fn instance_variable(c: &Ctx, w: Words) -> Result<u64, String> {
     ok(entry)
 }
 
-/// The guest property_t { name, attributes } of a class's property: made
-/// once, so the same property is the same entry every time.
+/// The guest property_t { name, attributes } of a declaration: the image's
+/// own entry, so each declaration (a category may redeclare a property with
+/// other attributes) is its own, as on Apple. Metadata without an address
+/// gets an entry made once per declaration.
 fn property_entry(c: &Ctx, class: u32, property: &guest32_image::Property32) -> u32 {
-    static ENTRIES: Mutex<Option<HashMap<(u32, String), u32>>> = Mutex::new(None);
-    let key = (class, property.name.clone());
+    static ENTRIES: Mutex<Option<HashMap<(u32, String, String), u32>>> = Mutex::new(None);
+    if property.address != 0 {
+        return property.address;
+    }
+    let key = (class, property.name.clone(), property.attributes.clone());
     if let Some(&entry) = ENTRIES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).get(&key) {
         return entry;
     }

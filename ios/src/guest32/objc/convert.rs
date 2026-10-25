@@ -904,7 +904,8 @@ fn format_kinds(format: &str) -> Vec<FormatArg> {
         let Some(&conversion) = f.get(i) else { break };
         i += 1;
         out.push(match conversion {
-            b'@' => FormatArg::Object,
+            // %K: a key path name in a predicate format.
+            b'@' | b'K' => FormatArg::Object,
             b's' | b'S' | b'p' => FormatArg::Pointer,
             b'f' | b'F' | b'e' | b'E' | b'g' | b'G' | b'a' | b'A' => FormatArg::Long,
             _ if longs >= 2 => FormatArg::Long,

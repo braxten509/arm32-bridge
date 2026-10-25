@@ -229,6 +229,53 @@ extern "C" fn set_adding(this: Id, _: Sel, item: Id) -> Id {
     object
 }
 
+extern "C" fn set_adding_set(this: Id, _: Sel, other: Id) -> Id {
+    let object = set_copy(this, 0, 0);
+    let more = if other == 0 { Vec::new() } else { collections::array_items(runtime::send(other, "allObjects", &[])) };
+    more.into_iter().for_each(|item| add(object, item));
+    object
+}
+
+extern "C" fn set_adding_array(this: Id, _: Sel, array: Id) -> Id {
+    let object = set_copy(this, 0, 0);
+    collections::array_items(array).into_iter().for_each(|item| add(object, item));
+    object
+}
+
+extern "C" fn set_intersect(this: Id, _: Sel, other: Id) {
+    let keep = if other == 0 { Vec::new() } else { collections::array_items(runtime::send(other, "allObjects", &[])) };
+    items(this).retain(|&i| keep.iter().any(|&k| same(i, k)));
+}
+
+/// The members a test block (object, &stop) -> BOOL picks, as a new set.
+extern "C" fn set_objects_passing(this: Id, _: Sel, block: usize) -> Id {
+    let header = block as *const crate::libsystem::mach::BlockHeader;
+    let invoke: extern "C" fn(usize, Id, *mut u8) -> u8 = unsafe { std::mem::transmute((*header).invoke) };
+    let result = set_empty(runtime::class_named("NSSet"), 0);
+    let mut stop = 0u8;
+    for item in items(this).clone() {
+        if invoke(block, item, &mut stop) != 0 {
+            add(result, item);
+        }
+        if stop != 0 {
+            break;
+        }
+    }
+    result
+}
+
+extern "C" fn set_enumerate_block(this: Id, _: Sel, block: usize) {
+    let header = block as *const crate::libsystem::mach::BlockHeader;
+    let invoke: extern "C" fn(usize, Id, *mut u8) = unsafe { std::mem::transmute((*header).invoke) };
+    let mut stop = 0u8;
+    for item in items(this).clone() {
+        invoke(block, item, &mut stop);
+        if stop != 0 {
+            break;
+        }
+    }
+}
+
 // ----- NSUUID: { isa, [u8; 16] } -----
 
 pub fn uuid_from_string(text: &str) -> Id {
@@ -310,6 +357,27 @@ extern "C" fn date_now(_: Class, _: Sel) -> Id {
 
 extern "C" fn date_init(this: Id, _: Sel) -> Id {
     unsafe { *((this + 8) as *mut f64) = now_since_2001() };
+    this
+}
+
+extern "C" fn date_init_since_1970(this: Id, _: Sel, seconds: f64) -> Id {
+    unsafe { *((this + 8) as *mut f64) = seconds - SINCE_1970 };
+    this
+}
+
+extern "C" fn date_init_since_now(this: Id, _: Sel, offset: f64) -> Id {
+    unsafe { *((this + 8) as *mut f64) = now_since_2001() + offset };
+    this
+}
+
+extern "C" fn date_init_since_reference(this: Id, _: Sel, seconds: f64) -> Id {
+    unsafe { *((this + 8) as *mut f64) = seconds };
+    this
+}
+
+extern "C" fn date_init_since_date(this: Id, _: Sel, seconds: f64, other: Id) -> Id {
+    let base = if other == 0 { now_since_2001() } else { date_value(other) };
+    unsafe { *((this + 8) as *mut f64) = base + seconds };
     this
 }
 
@@ -425,6 +493,19 @@ extern "C" fn error_description(this: Id, _: Sel) -> Id {
         return text;
     }
     string::make(&format!("{} error {}", string::get(error_domain(this, 0)), error_code(this, 0)))
+}
+
+/// A userInfo string (the reason, the suggestion), nil when the error has none.
+fn error_info_text(this: Id, key: &str) -> Id {
+    collections::dictionary_get(error_user_info(this, 0), string::make(key))
+}
+
+extern "C" fn error_failure_reason(this: Id, _: Sel) -> Id {
+    error_info_text(this, "NSLocalizedFailureReason")
+}
+
+extern "C" fn error_recovery_suggestion(this: Id, _: Sel) -> Id {
+    error_info_text(this, "NSLocalizedRecoverySuggestion")
 }
 
 // ----- NSURL: { isa, text } (file links keep the plain path) -----
@@ -631,6 +712,15 @@ extern "C" fn url_port(this: Id, _: Sel) -> Id {
     }
 }
 
+/// Everything after the scheme's colon ("//host/path?query#fragment").
+extern "C" fn url_resource_specifier(this: Id, _: Sel) -> Id {
+    let text = url_text(this);
+    match split_link(&text).scheme {
+        Some(scheme) => string::make(&text[scheme.len() + 1..]),
+        None => string::make(&text),
+    }
+}
+
 extern "C" fn url_self(this: Id, _: Sel) -> Id {
     this
 }
@@ -747,6 +837,10 @@ pub fn register(r: &mut Registry) {
             ("intersectsSet:", set_intersects as usize),
             ("isSubsetOfSet:", set_is_subset as usize),
             ("setByAddingObject:", set_adding as usize),
+            ("setByAddingObjectsFromSet:", set_adding_set as usize),
+            ("setByAddingObjectsFromArray:", set_adding_array as usize),
+            ("objectsPassingTest:", set_objects_passing as usize),
+            ("enumerateObjectsUsingBlock:", set_enumerate_block as usize),
         ],
     );
     class_methods(mutable, &[("setWithCapacity:", set_with_capacity as usize)]);
@@ -760,6 +854,7 @@ pub fn register(r: &mut Registry) {
             ("addObjectsFromArray:", set_add_from_array as usize),
             ("unionSet:", set_union as usize),
             ("minusSet:", set_minus as usize),
+            ("intersectSet:", set_intersect as usize),
         ],
     );
 
@@ -778,6 +873,8 @@ pub fn register(r: &mut Registry) {
 
     let null = define_class("NSNull", "NSObject", 8);
     class_methods(null, &[("null", null_object as usize)]);
+    // kCFNull is the one NSNull (toll-free bridged).
+    r.data("kCFNull", leak(null_object(0, 0)));
 
     let date_class = define_class("NSDate", "NSObject", 16);
     class_methods(
@@ -796,6 +893,10 @@ pub fn register(r: &mut Registry) {
         date_class,
         &[
             ("init", date_init as usize),
+            ("initWithTimeIntervalSince1970:", date_init_since_1970 as usize),
+            ("initWithTimeIntervalSinceNow:", date_init_since_now as usize),
+            ("initWithTimeIntervalSinceReferenceDate:", date_init_since_reference as usize),
+            ("initWithTimeInterval:sinceDate:", date_init_since_date as usize),
             ("timeIntervalSince1970", date_interval_1970 as usize),
             ("timeIntervalSinceReferenceDate", date_interval_reference as usize),
             ("timeIntervalSinceNow", date_interval_now as usize),
@@ -819,6 +920,8 @@ pub fn register(r: &mut Registry) {
             ("code", error_code as usize),
             ("userInfo", error_user_info as usize),
             ("localizedDescription", error_description as usize),
+            ("localizedFailureReason", error_failure_reason as usize),
+            ("localizedRecoverySuggestion", error_recovery_suggestion as usize),
             ("description", error_description as usize),
         ],
     );
@@ -848,6 +951,7 @@ pub fn register(r: &mut Registry) {
             ("query", url_query as usize),
             ("fragment", url_fragment as usize),
             ("port", url_port as usize),
+            ("resourceSpecifier", url_resource_specifier as usize),
             ("relativeString", url_absolute_string as usize),
             ("relativePath", url_path as usize),
             ("standardizedURL", url_self as usize),

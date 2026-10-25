@@ -1,4 +1,6 @@
-//! EAGLContext on top of EGL. Each EAGLContext is an OpenGL ES 3 context.
+//! EAGLContext on top of EGL. An EAGLContext asked for OpenGL ES 2 or 3 is
+//! an OpenGL ES 3 context; one asked for OpenGL ES 1 is an OpenGL ES 1.1
+//! context (fixed-function drawing, as the oldest games use).
 //! iPhone games draw into a renderbuffer whose memory comes from the
 //! layer (`renderbufferStorage:fromDrawable:`) and show it with
 //! `presentRenderbuffer:`. Here that renderbuffer is an ordinary one of the
@@ -52,6 +54,7 @@ const EGL_PBUFFER_BIT: i32 = 0x1;
 const EGL_WINDOW_BIT: i32 = 0x4;
 const EGL_RENDERABLE_TYPE: i32 = 0x3040;
 const EGL_OPENGL_ES3_BIT: i32 = 0x40;
+const EGL_OPENGL_ES_BIT: i32 = 0x1;
 const EGL_CONTEXT_CLIENT_VERSION: i32 = 0x3098;
 const EGL_WIDTH: i32 = 0x3057;
 const EGL_HEIGHT: i32 = 0x3056;
@@ -65,6 +68,9 @@ const EGL_DRAW: i32 = 0x3059;
 struct Egl {
     display: Display,
     config: Config,
+    /// The setting OpenGL ES 1 contexts use: the same one when it serves
+    /// both (so they can share the window); None when the system has no ES 1.
+    es1_config: Option<Config>,
     /// Started with a window (phone) rather than none (PC and hidden tests).
     has_window: bool,
     /// Contexts can be current without a surface.
@@ -163,22 +169,31 @@ fn egl() -> &'static Egl {
         // With a window, contexts that don't show anything (loading threads)
         // get a small private surface, so the same setting must allow both.
         let choices: &[i32] = if window != 0 { &[EGL_WINDOW_BIT | EGL_PBUFFER_BIT, EGL_WINDOW_BIT] } else { &[EGL_PBUFFER_BIT] };
-        let mut config = 0;
-        let mut count = 0;
-        for &surface_type in choices {
-            let attributes = [
-                EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
-                EGL_SURFACE_TYPE, surface_type, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT, EGL_NONE,
-            ];
-            eglChooseConfig(display, attributes.as_ptr(), &mut config, 1, &mut count);
-            if count > 0 {
-                break;
+        let choose = |renderable: i32| -> Option<Config> {
+            for &surface_type in choices {
+                let attributes = [
+                    EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+                    EGL_SURFACE_TYPE, surface_type, EGL_RENDERABLE_TYPE, renderable, EGL_NONE,
+                ];
+                let (mut config, mut count) = (0, 0);
+                eglChooseConfig(display, attributes.as_ptr(), &mut config, 1, &mut count);
+                if count > 0 {
+                    return Some(config);
+                }
             }
-        }
-        if count == 0 && !(window == 0 && surfaceless && extensions.contains("EGL_KHR_no_config_context")) {
+            None
+        };
+        // One setting for OpenGL ES 3 and 1 where there is one: an ES 1 game's
+        // context then draws into the same window.
+        let both = choose(EGL_OPENGL_ES3_BIT | EGL_OPENGL_ES_BIT);
+        let chosen = both.or_else(|| choose(EGL_OPENGL_ES3_BIT));
+        let no_config = window == 0 && surfaceless && extensions.contains("EGL_KHR_no_config_context");
+        if chosen.is_none() && !no_config {
             crate::log!("STOP: graphics: no OpenGL ES 3 setting fits (EGL {major}.{minor})");
             crate::report::finish(1);
         }
+        let config = chosen.unwrap_or(0);
+        let es1_config = both.or_else(|| choose(EGL_OPENGL_ES_BIT)).or(no_config.then_some(0));
         let mut surface = 0;
         if window != 0 {
             surface = eglCreateWindowSurface(display, config, window, [EGL_NONE].as_ptr());
@@ -189,7 +204,7 @@ fn egl() -> &'static Egl {
         }
         crate::log!("graphics: EGL {major}.{minor} ready ({})", if window != 0 { "window" } else { "no window" });
         WINDOW_SURFACE.store(surface, Ordering::SeqCst);
-        Egl { display, config: if count == 0 { 0 } else { config }, has_window: window != 0, surfaceless }
+        Egl { display, config, es1_config, has_window: window != 0, surfaceless }
     })
 }
 
@@ -198,11 +213,20 @@ fn egl() -> &'static Egl {
 #[derive(Default)]
 struct State {
     egl: Context,
+    /// The EGL setting it was made with (its surfaces must match it).
+    config: Config,
+    /// An OpenGL ES 1 context.
+    es1: bool,
     /// For a context made current without a window or surfaceless support.
     pbuffer: Surface,
     /// Our own framebuffer that reads the presented renderbuffer.
     present_framebuffer: u32,
     present_source: u32,
+    /// OpenGL ES 1: the texture a frame is copied into to be drawn to the
+    /// window, its size, and what the context offers (asked once).
+    present_texture: u32,
+    present_texture_size: (i32, i32),
+    es1_features: Option<Es1Features>,
     size: (i32, i32),
     /// The thread the context is current on (0 = none).
     owner: u64,
@@ -232,8 +256,13 @@ fn surface_for(egl: &Egl, context: Id, state: &mut State) -> Surface {
     if egl.surfaceless {
         return 0;
     }
+    hidden_surface(egl, state)
+}
+
+/// The context's own 1x1 surface, made on first use.
+fn hidden_surface(egl: &Egl, state: &mut State) -> Surface {
     if state.pbuffer == 0 {
-        state.pbuffer = unsafe { eglCreatePbufferSurface(egl.display, egl.config, [EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE].as_ptr()) };
+        state.pbuffer = unsafe { eglCreatePbufferSurface(egl.display, state.config, [EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE].as_ptr()) };
     }
     state.pbuffer
 }
@@ -253,25 +282,51 @@ fn state_of(context: Id) -> &'static Mutex<State> {
 
 thread_local! {
     static CURRENT: Cell<Id> = const { Cell::new(0) };
+    /// Whether this thread's current context is an OpenGL ES 1 one.
+    static CURRENT_ES1: Cell<bool> = const { Cell::new(false) };
+}
+
+/// The thread's current context is an OpenGL ES 1 one: the GL layer then
+/// leaves out what only OpenGL ES 2 and 3 have.
+pub fn current_is_es1() -> bool {
+    CURRENT_ES1.with(|c| c.get())
+}
+
+fn set_current_record(context: Id, es1: bool) {
+    CURRENT.with(|c| c.set(context));
+    CURRENT_ES1.with(|c| c.set(es1));
 }
 
 extern "C" fn init_with_api_sharegroup(this: Id, _: Sel, api: usize, sharegroup: Id) -> Id {
-    if !(2..=3).contains(&api) {
-        crate::log!("graphics: OpenGL ES {api} asked for; only 2 and 3 are offered");
+    if !(1..=3).contains(&api) {
+        crate::log!("graphics: OpenGL ES {api} asked for; only 1, 2 and 3 are offered");
         return 0;
     }
     let egl = egl();
+    let config = if api == 1 {
+        match egl.es1_config {
+            Some(config) => config,
+            None => {
+                crate::log!("graphics: OpenGL ES 1 asked for, but this system's EGL has no OpenGL ES 1 setting");
+                return 0;
+            }
+        }
+    } else {
+        egl.config
+    };
     let share = if sharegroup != 0 { state_of(sharegroup).lock().unwrap().egl } else { 0 };
-    let attributes = [EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE];
-    let context = unsafe { eglCreateContext(egl.display, egl.config, share, attributes.as_ptr()) };
+    let attributes = [EGL_CONTEXT_CLIENT_VERSION, if api == 1 { 1 } else { 3 }, EGL_NONE];
+    let context = unsafe { eglCreateContext(egl.display, config, share, attributes.as_ptr()) };
     if context == 0 {
-        crate::log!("graphics: OpenGL ES context not made (error {:#x})", unsafe { eglGetError() });
+        crate::log!("graphics: OpenGL ES {api} context not made (error {:#x})", unsafe { eglGetError() });
         return 0;
     }
     property_set(this, "api", api as u64);
     {
         let mut state = state_of(this).lock().unwrap();
         state.egl = context;
+        state.config = config;
+        state.es1 = api == 1;
         if share != 0 {
             state.share_with = counted::retain(sharegroup);
         }
@@ -340,7 +395,7 @@ extern "C" fn set_current(_: Class, _: Sel, context: Id) -> bool {
         if previous != 0 {
             state_of(previous).lock().unwrap().owner = 0;
         }
-        CURRENT.with(|c| c.set(0));
+        set_current_record(0, false);
         counted::release(previous);
         return true;
     }
@@ -353,14 +408,14 @@ extern "C" fn set_current(_: Class, _: Sel, context: Id) -> bool {
         counted::release(context);
         return false;
     }
-    let ok = unsafe {
+    let (ok, es1) = unsafe {
         let mut state = state_of(context).lock().unwrap();
         let surface = surface_for(egl, context, &mut state);
         let ok = eglMakeCurrent(egl.display, surface, surface, state.egl);
         if ok != 0 {
             state.owner = me;
         }
-        ok
+        (ok, state.es1)
     };
     if ok == 0 {
         crate::log!("graphics: context {context:#x} can't be made current on this thread (EGL error {:#x})", unsafe { eglGetError() });
@@ -370,7 +425,7 @@ extern "C" fn set_current(_: Class, _: Sel, context: Id) -> bool {
     if previous != 0 && previous != context {
         state_of(previous).lock().unwrap().owner = 0;
     }
-    CURRENT.with(|c| c.set(context));
+    set_current_record(context, es1);
     // Already held when it was current here before.
     counted::release(if previous == context { context } else { previous });
     true
@@ -401,7 +456,7 @@ fn take_from_main_thread(context: Id, holder: u64) -> bool {
         }
         if CURRENT.with(|c| c.get()) == context {
             if unsafe { eglMakeCurrent(egl().display, 0, 0, 0) } != 0 {
-                CURRENT.with(|c| c.set(0));
+                set_current_record(0, false);
                 state_of(context).lock().unwrap().owner = 0;
                 // This thread's reference (the asking thread holds its own).
                 counted::release(context);
@@ -481,6 +536,30 @@ extern "C" fn storage_from_drawable(this: Id, _: Sel, target: Enum, layer: Id) -
     true
 }
 
+/// Tests: the context's screen memory size, as renderbufferStorage:fromDrawable: sets it.
+#[cfg(test)]
+pub fn set_drawable_size(context: Id, width: i32, height: i32) {
+    state_of(context).lock().unwrap().size = (width, height);
+}
+
+/// Tests: a hidden surface of this size stands in for the window (0 x 0: no window again).
+#[cfg(test)]
+pub fn use_test_window(width: i32, height: i32) {
+    let egl = egl();
+    let surface = if width > 0 && height > 0 {
+        let surface = unsafe { eglCreatePbufferSurface(egl.display, egl.config, [EGL_WIDTH, width, EGL_HEIGHT, height, EGL_NONE].as_ptr()) };
+        assert_ne!(surface, 0, "a test window surface was made (EGL error {:#x})", unsafe { eglGetError() });
+        surface
+    } else {
+        0
+    };
+    let old = WINDOW_SURFACE.swap(surface, Ordering::SeqCst);
+    if old != 0 {
+        // Freed once no context has it current.
+        unsafe { eglDestroySurface(egl.display, old) };
+    }
+}
+
 /// Where the picture goes in a window (OpenGL corners, bottom-left origin):
 /// as large as fits, keeping the iPhone screen's shape, centred.
 pub fn picture_area(window_width: i32, window_height: i32) -> (i32, i32, i32, i32) {
@@ -534,31 +613,60 @@ extern "C" fn present(this: Id, _: Sel, _target: Enum) -> bool {
         // over (rare: games show frames from their screen context), or the
         // app came back with a new window.
         WINDOW_OWNER.store(this, Ordering::SeqCst);
+        // A context's first surface sets its viewport and scissor box to the
+        // surface's size (EGL); the game's own ones stay.
+        let (mut viewport, mut scissor) = ([0; 4], [0; 4]);
+        unsafe {
+            gl::glGetIntegerv(gl::VIEWPORT, viewport.as_mut_ptr());
+            gl::glGetIntegerv(gl::SCISSOR_BOX, scissor.as_mut_ptr());
+        }
         if unsafe { eglMakeCurrent(egl.display, window, window, state.egl) } == 0 {
             crate::log!("graphics: frame {frame} can't be shown: the window is in use (EGL error {:#x})", unsafe { eglGetError() });
             return false;
         }
+        unsafe {
+            gl::glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+            gl::glScissor(scissor[0], scissor[1], scissor[2], scissor[3]);
+        }
     } else if egl.has_window && window == 0 && WINDOW_OWNER.load(Ordering::SeqCst) == this && current != 0 && current != state.pbuffer {
         // The app went away: let go of the old window.
-        let hidden = if egl.surfaceless {
-            0
-        } else {
-            if state.pbuffer == 0 {
-                state.pbuffer = unsafe { eglCreatePbufferSurface(egl.display, egl.config, [EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE].as_ptr()) };
-            }
-            state.pbuffer
-        };
+        let hidden = if egl.surfaceless { 0 } else { hidden_surface(egl, &mut state) };
         unsafe { eglMakeCurrent(egl.display, hidden, hidden, state.egl) };
     }
     if WINDOW_OWNER.load(Ordering::SeqCst) == this {
         SHOWN_SURFACE.store(unsafe { eglGetCurrentSurface(EGL_DRAW) }, Ordering::SeqCst);
     }
     if frame <= 3 {
-        let status = unsafe { gl::glCheckFramebufferStatus(gl::DRAW_FRAMEBUFFER) };
+        // OpenGL ES 1 has one framebuffer binding (the same number as ES 3's draw one).
+        let target = if state.es1 { gl::FRAMEBUFFER } else { gl::DRAW_FRAMEBUFFER };
+        let status = unsafe { gl::glCheckFramebufferStatus(target) };
         let mut bound = 0;
         unsafe { gl::glGetIntegerv(gl::DRAW_FRAMEBUFFER_BINDING, &mut bound) };
         crate::log!("graphics: frame {frame}: the game's framebuffer {bound} is {}", if status == gl::FRAMEBUFFER_COMPLETE { "complete".to_string() } else { format!("not complete ({status:#x})") });
     }
+    if state.es1 {
+        unsafe { present_es1(egl, &mut state, frame, window) };
+    } else {
+        unsafe { present_es3(egl, &mut state, frame, window) };
+    }
+    drop(state);
+    gl::check_errors(&format!("in frame {frame}"));
+    let slow_frames = note_frame_gap(frame);
+    if frame <= 3 || frame % 300 == 0 {
+        crate::log!("graphics: frame {frame} shown ({width}x{height}) at {:.1} s, {slow_frames} slow so far", crate::report::seconds_since_start());
+    }
+    if let Some(limit) = std::env::var("IOS_FRAME_LIMIT").ok().and_then(|v| v.parse::<usize>().ok()) {
+        if frame >= limit {
+            crate::log!("graphics: {frame} frames shown; stopping as asked (IOS_FRAME_LIMIT)");
+            crate::report::finish(0);
+        }
+    }
+    true
+}
+
+/// OpenGL ES 3: the renderbuffer is blitted to the window.
+unsafe fn present_es3(egl: &Egl, state: &mut State, frame: usize, window: Surface) {
+    let (width, height) = state.size;
     unsafe {
         let mut renderbuffer = 0;
         gl::glGetIntegerv(gl::RENDERBUFFER_BINDING, &mut renderbuffer);
@@ -605,53 +713,356 @@ extern "C" fn present(this: Id, _: Sel, _target: Enum) -> bool {
             }
             eglSwapBuffers(egl.display, window);
         } else if !egl.has_window {
-            save_frame_if_asked(frame, width, height);
+            save_frame_if_asked(frame, width, height, false);
         }
         gl::glBindFramebuffer(gl::READ_FRAMEBUFFER, read as u32);
         gl::glBindFramebuffer(gl::DRAW_FRAMEBUFFER, draw as u32);
     }
-    drop(state);
-    gl::check_errors(&format!("in frame {frame}"));
-    let slow_frames = note_frame_gap(frame);
-    if frame <= 3 || frame % 300 == 0 {
-        crate::log!("graphics: frame {frame} shown ({width}x{height}) at {:.1} s, {slow_frames} slow so far", crate::report::seconds_since_start());
+}
+
+/// What an OpenGL ES 1 context offers that the present quad must switch
+/// off or step around (asked once per context).
+#[derive(Clone, Copy)]
+struct Es1Features {
+    texture_units: u32,
+    clip_planes: u32,
+    cube_maps: bool,
+    matrix_palette: bool,
+    point_size_array: bool,
+}
+
+unsafe fn es1_features() -> Es1Features {
+    let get = |name| {
+        let mut value = 0;
+        unsafe { gl::glGetIntegerv(name, &mut value) };
+        value.max(0) as u32
+    };
+    Es1Features {
+        texture_units: get(gl::es1::MAX_TEXTURE_UNITS).max(1),
+        clip_planes: get(gl::es1::MAX_CLIP_PLANES),
+        cube_maps: gl::system_has_extension("GL_OES_texture_cube_map"),
+        matrix_palette: gl::system_has_extension("GL_OES_matrix_palette"),
+        point_size_array: gl::system_has_extension("GL_OES_point_size_array"),
     }
-    if let Some(limit) = std::env::var("IOS_FRAME_LIMIT").ok().and_then(|v| v.parse::<usize>().ok()) {
-        if frame >= limit {
-            crate::log!("graphics: {frame} frames shown; stopping as asked (IOS_FRAME_LIMIT)");
-            crate::report::finish(0);
+}
+
+/// OpenGL ES 1 has no framebuffer blit: the presented renderbuffer is copied
+/// into a texture (on the graphics chip) and drawn to the window as one
+/// fixed-function quad. Every bit of state the quad touches is put back.
+unsafe fn present_es1(egl: &Egl, state: &mut State, frame: usize, window: Surface) {
+    use gl::es1::*;
+    let (width, height) = state.size;
+    unsafe {
+        let mut renderbuffer = 0;
+        gl::glGetIntegerv(gl::RENDERBUFFER_BINDING, &mut renderbuffer);
+        let mut framebuffer = 0;
+        gl::glGetIntegerv(FRAMEBUFFER_BINDING, &mut framebuffer);
+        if state.present_framebuffer == 0 {
+            gl::glGenFramebuffers(1, &mut state.present_framebuffer);
+        }
+        gl::glBindFramebuffer(gl::FRAMEBUFFER, state.present_framebuffer);
+        if state.present_source != renderbuffer as u32 {
+            gl::glFramebufferRenderbuffer(gl::FRAMEBUFFER, gl::COLOR_ATTACHMENT0, gl::RENDERBUFFER, renderbuffer as u32);
+            state.present_source = renderbuffer as u32;
+        }
+        if window != 0 {
+            let features = *state.es1_features.get_or_insert_with(|| es1_features());
+            let saved = Es1Saved::save(&features);
+            let (mut window_width, mut window_height) = (0, 0);
+            eglQuerySurface(egl.display, window, EGL_WIDTH, &mut window_width);
+            eglQuerySurface(egl.display, window, EGL_HEIGHT, &mut window_height);
+            draw_es1_frame(state, &features, (width, height), (window_width, window_height));
+            saved.restore(&features);
+            eglSwapBuffers(egl.display, window);
+        } else if !egl.has_window {
+            save_frame_if_asked(frame, width, height, true);
+        }
+        gl::glBindFramebuffer(gl::FRAMEBUFFER, framebuffer as u32);
+    }
+}
+
+/// The game's OpenGL ES 1 state that drawing the present quad changes.
+struct Es1Saved {
+    viewport: [i32; 4],
+    clear: [f32; 4],
+    mask: [u8; 4],
+    /// Switched-off capabilities that were on (switched back on after).
+    enabled: Vec<Enum>,
+    active_texture: i32,
+    client_texture: i32,
+    /// Per texture unit: 2D textures and cube maps on, texture coordinates array on.
+    unit_2d: Vec<bool>,
+    unit_cube: Vec<bool>,
+    unit_coords: Vec<bool>,
+    texture: i32,
+    environment: i32,
+    matrix_mode: i32,
+    matrices: [[f32; 16]; 3],
+    array_buffer: i32,
+    vertices: Option<ClientArray>,
+    coords: ClientArray,
+    /// Other arrays the draw must not read (colours, normals, point sizes, palette).
+    other_arrays: Vec<Enum>,
+}
+
+/// A client array's layout, to set it back as it was.
+struct ClientArray {
+    size: i32,
+    kind: i32,
+    stride: i32,
+    pointer: usize,
+    buffer: i32,
+}
+
+impl ClientArray {
+    unsafe fn save(size: Enum, kind: Enum, stride: Enum, pointer: Enum, buffer: Enum) -> Self {
+        let get = |name| {
+            let mut value = 0;
+            unsafe { gl::glGetIntegerv(name, &mut value) };
+            value
+        };
+        let mut address = 0usize;
+        unsafe { gl::es1::glGetPointerv(pointer, &mut address) };
+        ClientArray { size: get(size), kind: get(kind), stride: get(stride), pointer: address, buffer: get(buffer) }
+    }
+}
+
+impl Es1Saved {
+    unsafe fn save(features: &Es1Features) -> Self {
+        use gl::es1::*;
+        unsafe {
+            let get = |name| {
+                let mut value = 0;
+                gl::glGetIntegerv(name, &mut value);
+                value
+            };
+            let on = |cap| gl::glIsEnabled(cap) != 0;
+            let mut viewport = [0; 4];
+            gl::glGetIntegerv(gl::VIEWPORT, viewport.as_mut_ptr());
+            let mut clear = [0f32; 4];
+            gl::glGetFloatv(gl::COLOR_CLEAR_VALUE, clear.as_mut_ptr());
+            let mut mask = [0u8; 4];
+            gl::glGetBooleanv(gl::COLOR_WRITEMASK, mask.as_mut_ptr());
+            let mut capabilities = vec![LIGHTING, ALPHA_TEST, gl::BLEND, DEPTH_TEST, STENCIL_TEST, CULL_FACE, FOG, gl::SCISSOR_TEST, COLOR_LOGIC_OP];
+            capabilities.extend((0..features.clip_planes).map(|i| CLIP_PLANE0 + i));
+            if features.matrix_palette {
+                capabilities.push(MATRIX_PALETTE);
+            }
+            let enabled = capabilities.into_iter().filter(|&cap| on(cap)).collect();
+            let active_texture = get(ACTIVE_TEXTURE);
+            let client_texture = get(CLIENT_ACTIVE_TEXTURE);
+            let (mut unit_2d, mut unit_cube, mut unit_coords) = (Vec::new(), Vec::new(), Vec::new());
+            for unit in 0..features.texture_units {
+                glActiveTexture(TEXTURE0 + unit);
+                glClientActiveTexture(TEXTURE0 + unit);
+                unit_2d.push(on(TEXTURE_2D));
+                unit_cube.push(features.cube_maps && on(TEXTURE_CUBE_MAP));
+                unit_coords.push(on(TEXTURE_COORD_ARRAY));
+            }
+            glActiveTexture(TEXTURE0);
+            glClientActiveTexture(TEXTURE0);
+            // Unit 0 draws the quad: its texture, environment, matrix,
+            // coordinate generation (cube maps) and coordinates array.
+            let texture = get(TEXTURE_BINDING_2D);
+            let mut environment = 0;
+            glGetTexEnviv(TEXTURE_ENV, TEXTURE_ENV_MODE, &mut environment);
+            let matrix_mode = get(MATRIX_MODE);
+            let mut matrices = [[0f32; 16]; 3];
+            for (matrix, name) in matrices.iter_mut().zip([MODELVIEW_MATRIX, PROJECTION_MATRIX, TEXTURE_MATRIX]) {
+                gl::glGetFloatv(name, matrix.as_mut_ptr());
+            }
+            let array_buffer = get(ARRAY_BUFFER_BINDING);
+            let vertices = on(VERTEX_ARRAY).then(|| ClientArray::save(VERTEX_ARRAY_SIZE, VERTEX_ARRAY_TYPE, VERTEX_ARRAY_STRIDE, VERTEX_ARRAY_POINTER, VERTEX_ARRAY_BUFFER_BINDING));
+            let coords = ClientArray::save(TEXTURE_COORD_ARRAY_SIZE, TEXTURE_COORD_ARRAY_TYPE, TEXTURE_COORD_ARRAY_STRIDE, TEXTURE_COORD_ARRAY_POINTER, TEXTURE_COORD_ARRAY_BUFFER_BINDING);
+            let mut arrays = vec![COLOR_ARRAY, NORMAL_ARRAY];
+            if features.point_size_array {
+                arrays.push(POINT_SIZE_ARRAY);
+            }
+            if features.matrix_palette {
+                arrays.extend([MATRIX_INDEX_ARRAY, WEIGHT_ARRAY]);
+            }
+            let other_arrays = arrays.into_iter().filter(|&array| on(array)).collect();
+            let mut saved = Es1Saved {
+                viewport, clear, mask, enabled, active_texture, client_texture, unit_2d, unit_cube, unit_coords, texture,
+                environment, matrix_mode, matrices, array_buffer, vertices, coords, other_arrays,
+            };
+            // Unit 0's coordinate generation: set back with the capabilities (on unit 0).
+            if features.cube_maps && on(TEXTURE_GEN_STR) {
+                saved.enabled.push(TEXTURE_GEN_STR);
+            }
+            saved
         }
     }
-    true
+
+    unsafe fn restore(&self, features: &Es1Features) {
+        use gl::es1::*;
+        unsafe {
+            // Unit 0 first (the texture matrix and generation are its own).
+            glActiveTexture(TEXTURE0);
+            glClientActiveTexture(TEXTURE0);
+            for &cap in &self.enabled {
+                gl::glEnable(cap);
+            }
+            for &array in &self.other_arrays {
+                glEnableClientState(array);
+            }
+            glMatrixMode(TEXTURE);
+            glLoadMatrixf(self.matrices[2].as_ptr());
+            glMatrixMode(PROJECTION);
+            glLoadMatrixf(self.matrices[1].as_ptr());
+            glMatrixMode(MODELVIEW);
+            glLoadMatrixf(self.matrices[0].as_ptr());
+            glMatrixMode(self.matrix_mode as Enum);
+            glTexEnvi(TEXTURE_ENV, TEXTURE_ENV_MODE, self.environment);
+            gl::glBindTexture(TEXTURE_2D, self.texture as u32);
+            let set_array = |array: &ClientArray, set: unsafe fn(i32, Enum, i32, usize)| {
+                gl::glBindBuffer(ARRAY_BUFFER, array.buffer as u32);
+                set(array.size, array.kind as Enum, array.stride, array.pointer);
+            };
+            match &self.vertices {
+                Some(vertices) => set_array(vertices, glVertexPointer),
+                None => glDisableClientState(VERTEX_ARRAY),
+            }
+            set_array(&self.coords, glTexCoordPointer);
+            gl::glBindBuffer(ARRAY_BUFFER, self.array_buffer as u32);
+            for unit in 0..features.texture_units as usize {
+                glActiveTexture(TEXTURE0 + unit as u32);
+                glClientActiveTexture(TEXTURE0 + unit as u32);
+                let set = |on: bool, cap: Enum| if on { gl::glEnable(cap) } else { gl::glDisable(cap) };
+                set(self.unit_2d[unit], TEXTURE_2D);
+                if features.cube_maps && self.unit_cube[unit] {
+                    gl::glEnable(TEXTURE_CUBE_MAP);
+                }
+                if self.unit_coords[unit] {
+                    glEnableClientState(TEXTURE_COORD_ARRAY);
+                } else {
+                    glDisableClientState(TEXTURE_COORD_ARRAY);
+                }
+            }
+            glActiveTexture(self.active_texture as Enum);
+            glClientActiveTexture(self.client_texture as Enum);
+            gl::glViewport(self.viewport[0], self.viewport[1], self.viewport[2], self.viewport[3]);
+            gl::glClearColor(self.clear[0], self.clear[1], self.clear[2], self.clear[3]);
+            gl::glColorMask(self.mask[0], self.mask[1], self.mask[2], self.mask[3]);
+        }
+    }
+}
+
+/// Copies the bound framebuffer's picture into the context's texture and
+/// draws it over the window (framebuffer 0), as `present_es3` blits it.
+unsafe fn draw_es1_frame(state: &mut State, features: &Es1Features, (width, height): (i32, i32), (window_width, window_height): (i32, i32)) {
+    use gl::es1::*;
+    unsafe {
+        for &cap in &[LIGHTING, ALPHA_TEST, gl::BLEND, DEPTH_TEST, STENCIL_TEST, CULL_FACE, FOG, gl::SCISSOR_TEST, COLOR_LOGIC_OP] {
+            gl::glDisable(cap);
+        }
+        for plane in 0..features.clip_planes {
+            gl::glDisable(CLIP_PLANE0 + plane);
+        }
+        if features.matrix_palette {
+            gl::glDisable(MATRIX_PALETTE);
+            glDisableClientState(MATRIX_INDEX_ARRAY);
+            glDisableClientState(WEIGHT_ARRAY);
+        }
+        if features.point_size_array {
+            glDisableClientState(POINT_SIZE_ARRAY);
+        }
+        glDisableClientState(COLOR_ARRAY);
+        glDisableClientState(NORMAL_ARRAY);
+        for unit in (0..features.texture_units).rev() {
+            glActiveTexture(TEXTURE0 + unit);
+            glClientActiveTexture(TEXTURE0 + unit);
+            gl::glDisable(TEXTURE_2D);
+            if features.cube_maps {
+                gl::glDisable(TEXTURE_CUBE_MAP);
+            }
+            glDisableClientState(TEXTURE_COORD_ARRAY);
+        }
+        // Now on unit 0.
+        if features.cube_maps {
+            gl::glDisable(TEXTURE_GEN_STR);
+        }
+        gl::glEnable(TEXTURE_2D);
+        if state.present_texture == 0 {
+            glGenTextures(1, &mut state.present_texture);
+        }
+        gl::glBindTexture(TEXTURE_2D, state.present_texture);
+        // Sides of a power of two: OpenGL ES 1 needn't take other sizes.
+        let size = ((width.max(1) as u32).next_power_of_two() as i32, (height.max(1) as u32).next_power_of_two() as i32);
+        if state.present_texture_size != size {
+            // RGB: a copy into RGBA would need alpha in the picture (16-bit screens have none).
+            gl::glTexImage2D(TEXTURE_2D, 0, RGB as i32, size.0, size.1, 0, RGB, gl::UNSIGNED_BYTE, std::ptr::null());
+            gl::glTexParameteri(TEXTURE_2D, TEXTURE_MIN_FILTER, gl::LINEAR as i32);
+            gl::glTexParameteri(TEXTURE_2D, TEXTURE_MAG_FILTER, gl::LINEAR as i32);
+            gl::glTexParameteri(TEXTURE_2D, TEXTURE_WRAP_S, CLAMP_TO_EDGE as i32);
+            gl::glTexParameteri(TEXTURE_2D, TEXTURE_WRAP_T, CLAMP_TO_EDGE as i32);
+            state.present_texture_size = size;
+        }
+        glCopyTexSubImage2D(TEXTURE_2D, 0, 0, 0, 0, 0, width, height);
+        glTexEnvi(TEXTURE_ENV, TEXTURE_ENV_MODE, REPLACE as i32);
+        for mode in [TEXTURE, PROJECTION, MODELVIEW] {
+            glMatrixMode(mode);
+            glLoadIdentity();
+        }
+        gl::glBindFramebuffer(gl::FRAMEBUFFER, 0);
+        gl::glColorMask(1, 1, 1, 1);
+        gl::glClearColor(0.0, 0.0, 0.0, 1.0);
+        gl::glClear(gl::COLOR_BUFFER_BIT);
+        let (x0, y0, x1, y1) = picture_area(window_width, window_height);
+        gl::glViewport(x0, y0, x1 - x0, y1 - y0);
+        let (u, v) = (width as f32 / size.0 as f32, height as f32 / size.1 as f32);
+        let corners: [f32; 8] = [-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0];
+        let coords: [f32; 8] = [0.0, 0.0, u, 0.0, 0.0, v, u, v];
+        gl::glBindBuffer(ARRAY_BUFFER, 0);
+        glEnableClientState(VERTEX_ARRAY);
+        glVertexPointer(2, FLOAT, 0, corners.as_ptr() as usize);
+        glEnableClientState(TEXTURE_COORD_ARRAY);
+        glTexCoordPointer(2, FLOAT, 0, coords.as_ptr() as usize);
+        glDrawArrays(TRIANGLE_STRIP, 0, 4);
+        // The iPhone screen ignores alpha (see present_es3).
+        gl::glColorMask(0, 0, 0, 1);
+        gl::glClear(gl::COLOR_BUFFER_BIT);
+    }
 }
 
 /// IOS_FRAMES_DIR saves frames as PNG pictures: the first, and every
-/// IOS_FRAME_EVERY-th after it (default 60).
-fn save_frame_if_asked(frame: usize, width: i32, height: i32) {
+/// IOS_FRAME_EVERY-th after it (default 60). Reads the bound framebuffer.
+fn save_frame_if_asked(frame: usize, width: i32, height: i32, es1: bool) {
     let Ok(folder) = std::env::var("IOS_FRAMES_DIR") else { return };
     let every = std::env::var("IOS_FRAME_EVERY").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(60).max(1);
     if frame != 1 && frame % every != 0 {
         return;
     }
     let mut pixels = vec![0u8; width as usize * height as usize * 4];
-    unsafe {
-        let mut pack_buffer = 0;
-        gl::glGetIntegerv(gl::PIXEL_PACK_BUFFER_BINDING, &mut pack_buffer);
-        // Tightly packed rows into our buffer, whatever the game had set.
-        let settings = [gl::PACK_ALIGNMENT, gl::PACK_ROW_LENGTH, gl::PACK_SKIP_ROWS, gl::PACK_SKIP_PIXELS];
-        let mut saved = [0i32; 4];
-        for (name, value) in settings.iter().zip(saved.iter_mut()) {
-            gl::glGetIntegerv(*name, value);
+    if es1 {
+        // OpenGL ES 1 has only the row alignment (no pixel buffers or row lengths).
+        unsafe {
+            let mut alignment = 4;
+            gl::glGetIntegerv(gl::PACK_ALIGNMENT, &mut alignment);
+            gl::glPixelStorei(gl::PACK_ALIGNMENT, 4);
+            gl::glReadPixels(0, 0, width, height, gl::RGBA, gl::UNSIGNED_BYTE, pixels.as_mut_ptr());
+            gl::glPixelStorei(gl::PACK_ALIGNMENT, alignment);
         }
-        gl::glBindBuffer(gl::PIXEL_PACK_BUFFER, 0);
-        for (name, value) in settings.iter().zip([4, 0, 0, 0]) {
-            gl::glPixelStorei(*name, value);
+    } else {
+        unsafe {
+            let mut pack_buffer = 0;
+            gl::glGetIntegerv(gl::PIXEL_PACK_BUFFER_BINDING, &mut pack_buffer);
+            // Tightly packed rows into our buffer, whatever the game had set.
+            let settings = [gl::PACK_ALIGNMENT, gl::PACK_ROW_LENGTH, gl::PACK_SKIP_ROWS, gl::PACK_SKIP_PIXELS];
+            let mut saved = [0i32; 4];
+            for (name, value) in settings.iter().zip(saved.iter_mut()) {
+                gl::glGetIntegerv(*name, value);
+            }
+            gl::glBindBuffer(gl::PIXEL_PACK_BUFFER, 0);
+            for (name, value) in settings.iter().zip([4, 0, 0, 0]) {
+                gl::glPixelStorei(*name, value);
+            }
+            gl::glReadPixels(0, 0, width, height, gl::RGBA, gl::UNSIGNED_BYTE, pixels.as_mut_ptr());
+            for (name, value) in settings.iter().zip(saved) {
+                gl::glPixelStorei(*name, value);
+            }
+            gl::glBindBuffer(gl::PIXEL_PACK_BUFFER, pack_buffer as u32);
         }
-        gl::glReadPixels(0, 0, width, height, gl::RGBA, gl::UNSIGNED_BYTE, pixels.as_mut_ptr());
-        for (name, value) in settings.iter().zip(saved) {
-            gl::glPixelStorei(*name, value);
-        }
-        gl::glBindBuffer(gl::PIXEL_PACK_BUFFER, pack_buffer as u32);
     }
     // The iPhone screen ignores alpha; games often leave it at 0.
     for pixel in pixels.chunks_exact_mut(4) {

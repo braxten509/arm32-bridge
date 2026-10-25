@@ -1,7 +1,8 @@
 //! CommonCrypto's streaming cryptor for 32-bit programs (CCCryptorCreate,
-//! Update, Final, Release), on the 64-bit layer's ciphers (fw::crypto).
-//! A CCCryptorRef is a small guest allocation whose address names the
-//! host-side cryptor.
+//! Update, Final, Reset, Release), on the 64-bit layer's ciphers
+//! (fw::crypto). A CCCryptorRef is a small guest allocation whose address
+//! names the host-side cryptor. Also the streaming digests (their contexts
+//! are words, the same on both sides) and Security's signature check.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -9,6 +10,7 @@ use std::sync::Mutex;
 use arm32_bridge::handler;
 use arm32_bridge::runtime::{mem, ArgSource, Ret};
 
+use super::fw::{host_functions, Obj, Ptr, Word, I32, U32};
 use super::function;
 use crate::fw::crypto::Cryptor;
 
@@ -35,6 +37,24 @@ fn hand_out(output: &[u8], out: u32, available: u32, moved: u32) -> i32 {
 }
 
 pub fn register() {
+    let digests = host_functions! {
+        "CC_MD5_Init" => fn(context: Ptr) -> I32;
+        "CC_MD5_Update" => fn(context: Ptr, data: Ptr, length: U32) -> I32;
+        "CC_MD5_Final" => fn(digest: Ptr, context: Ptr) -> I32;
+        "CC_SHA1_Init" => fn(context: Ptr) -> I32;
+        "CC_SHA1_Update" => fn(context: Ptr, data: Ptr, length: U32) -> I32;
+        "CC_SHA1_Final" => fn(digest: Ptr, context: Ptr) -> I32;
+        "CC_SHA256_Init" => fn(context: Ptr) -> I32;
+        "CC_SHA256_Update" => fn(context: Ptr, data: Ptr, length: U32) -> I32;
+        "CC_SHA256_Final" => fn(digest: Ptr, context: Ptr) -> I32;
+        // SecKeyRawVerify(key, padding, data, length, signature, length): keys
+        // come from public keys stored in the keychain (fw::seckey).
+        "SecKeyRawVerify" => fn(key: Obj, padding: U32, data: Ptr, length: Word, signature: Ptr, signature_length: Word) -> I32;
+        "SecKeyGetBlockSize" => fn(key: Obj) -> Word;
+    };
+    for (name, handler) in digests {
+        function(name, handler);
+    }
     // CCCryptorCreate(operation, algorithm, options, key, key length, iv, &cryptor)
     function(
         "CCCryptorCreate",
@@ -101,6 +121,19 @@ pub fn register() {
                     }
                     Err(status) => status,
                 }
+            });
+            Ret::U32(status.unwrap_or(PARAM_ERROR) as u32)
+        })
+        .unwrap(),
+    );
+    // CCCryptorReset(cryptor, iv): a NULL iv is zeros.
+    function(
+        "CCCryptorReset",
+        handler!(|uc, a| {
+            let (reference, iv) = (a.u32(), a.u32());
+            let status = with_cryptor(reference, |cryptor| {
+                let iv = (iv != 0).then(|| mem().bytes(iv, cryptor.block_size()).to_vec());
+                cryptor.reset(iv.as_deref()).err().unwrap_or(0)
             });
             Ret::U32(status.unwrap_or(PARAM_ERROR) as u32)
         })

@@ -804,7 +804,7 @@ extern "C" fn image_create(width: usize, height: usize, bits_per_component: usiz
 
 /// CGImageMaskCreate: samples of 1, 2, 4 or 8 bits (rows from the top, the
 /// first pixel in a byte's top bits), through the decode range [Dmin Dmax]
-/// (default [0 1]); kept as 8-bit samples, where 1 hides and 0 paints.
+/// (default [0 1]); drawn from 8-bit samples, where 1 hides and 0 paints.
 #[allow(clippy::too_many_arguments)]
 extern "C" fn image_mask_create(width: usize, height: usize, bits_per_component: usize, bits_per_pixel: usize, bytes_per_row: usize, provider: Id, decode: *const f64, _interpolate: bool) -> Id {
     let Some(p) = provider_state(provider) else {
@@ -817,10 +817,10 @@ extern "C" fn image_mask_create(width: usize, height: usize, bits_per_component:
     let least = width.saturating_mul(bits).div_ceil(8);
     let pixels = width.checked_mul(height).filter(|&n| n <= MOST_PIXEL_BYTES);
     let needed = bytes_per_row.checked_mul(height).filter(|&n| usable && pixels.is_some() && bytes_per_row >= least && n <= MOST_PIXEL_BYTES);
-    p.with_bytes(|bytes| {
+    let samples = p.with_bytes(|bytes| {
         let Some(_) = needed.filter(|&n| n <= bytes.len()) else {
             crate::log!("CGImageMaskCreate: {width}x{height}, {bits} bits/component, {bits_per_pixel} bits/pixel, {bytes_per_row} bytes/row from {} bytes: not supported", bytes.len());
-            return 0;
+            return None;
         };
         let most = ((1u32 << bits) - 1) as f64;
         let mut data = Vec::with_capacity(width * height);
@@ -833,9 +833,14 @@ extern "C" fn image_mask_create(width: usize, height: usize, bits_per_component:
                 data.push(to_byte(value as f32));
             }
         }
-        let bitmap = Bitmap { width, height, bits_per_pixel: 8, bytes_per_row: width, info: ALPHA_NONE, space: Space::Gray, data };
-        make_mask(bitmap)
-    })
+        Some(Bitmap { width, height, bits_per_pixel: 8, bytes_per_row: width, info: ALPHA_NONE, space: Space::Gray, data })
+    });
+    let Some(samples) = samples else { return 0 };
+    // The mask keeps the game's own format, decode array and provider (its
+    // getters and CGImageGetDataProvider give them back); the decoded
+    // samples are only for drawing.
+    let decode = (!decode.is_null()).then_some([low, high]);
+    make_mask(samples, MaskFormat { bits_per_component, bits_per_pixel, bytes_per_row, decode }, provider)
 }
 
 // ----- paths for UIBezierPath and CAShapeLayer (fw/bezier.rs, render.rs) -----

@@ -746,7 +746,30 @@ extern "C" fn inv_invoke_with_target(this: Id, s: Sel, target: Id) {
     inv_invoke(this, s);
 }
 
-pub fn register(_: &mut Registry) {
+/// NSGetSizeAndAlignment(type, &size, &alignment): one type's size and
+/// alignment (either output may be NULL); returns the type after it, past
+/// its offset digits.
+extern "C" fn get_size_and_alignment(types: *const libc::c_char, size: *mut usize, align: *mut usize) -> *const libc::c_char {
+    if types.is_null() {
+        return types;
+    }
+    let text = unsafe { std::ffi::CStr::from_ptr(types) }.to_bytes();
+    let mut i = 0;
+    let ty = parse_type(text, &mut i);
+    skip_digits(text, &mut i);
+    unsafe {
+        if !size.is_null() {
+            *size = ty.size;
+        }
+        if !align.is_null() {
+            *align = ty.align;
+        }
+        types.add(i.min(text.len()))
+    }
+}
+
+pub fn register(r: &mut Registry) {
+    r.function("NSGetSizeAndAlignment", get_size_and_alignment as usize);
     let signature_class = define_class("NSMethodSignature", "NSObject", 16);
     class_methods(signature_class, &[("signatureWithObjCTypes:", ms_with_types as usize)]);
     methods(

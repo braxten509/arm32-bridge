@@ -194,6 +194,8 @@ pub fn register() {
 static OWN_PIXELS: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
 /// Guest copies of colours' components (CGColorGetComponents), per host colour.
 static COMPONENTS: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
+/// Guest copies of image masks' decode arrays (CGImageGetDecode), per host image.
+static DECODES: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
 /// Guest release callbacks of data providers by key: (callback, info, data, size).
 static RELEASES: Mutex<Option<HashMap<usize, (u32, u32, u32, u32)>>> = Mutex::new(None);
 static NEXT_KEY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
@@ -321,6 +323,22 @@ fn special() {
             let range = (decode != 0).then(|| guest_floats(decode, 2));
             let mask = unsafe { create(width, height, bpc, bpp, bpr, provider, range.as_ref().map_or(std::ptr::null(), |r| r.as_ptr()), interpolate) };
             Ret::U32(object_to_guest(mask))
+        }),
+    );
+    // CGImageGetDecode: a guest copy of a mask's two decode values as floats, kept per image.
+    function(
+        "CGImageGetDecode",
+        handler!(|uc, a| {
+            let image = object_to_host(a.u32());
+            let values = host_fn!("CGImageGetDecode": unsafe extern "C" fn(usize) -> *const f64).map_or(std::ptr::null(), |get| unsafe { get(image) });
+            if values.is_null() {
+                return Ret::U32(0);
+            }
+            let guest = *DECODES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).entry(image).or_insert_with(|| crate::guest32::alloc_permanent(8, 4));
+            for i in 0..2 {
+                mem().write_u32(guest + i as u32 * 4, (unsafe { *values.add(i) } as f32).to_bits());
+            }
+            Ret::U32(guest)
         }),
     );
     // CGPointMakeWithDictionaryRepresentation(dict, *point): the point as guest floats.

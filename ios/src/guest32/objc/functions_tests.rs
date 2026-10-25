@@ -471,7 +471,15 @@ fn property_lists_come_from_the_games_metadata() {
     let (bare, bare_meta) = (g.alloc_permanent(20), g.alloc_permanent(20));
     g.put_words(class, &[meta]);
     g.put_words(bare, &[bare_meta]);
-    let property = |name: &str, attributes: &str| Property32 { name: name.into(), attributes: attributes.into() };
+    // Each declaration is a property_t { name, attributes } in the image.
+    let property = |name: &str, attributes: &str| Property32 {
+        address: g.words(&[g.text(name), g.text(attributes)]),
+        name: name.into(),
+        attributes: attributes.into(),
+    };
+    let level = property("level", "Ti,R,N");
+    // The category redeclares "volume" read-only.
+    let volume_again = property("volume", "Tf,R,N");
     let class_record = |address: u32, meta_address: u32, name: &str, properties: Vec<Property32>| ObjcClass32 {
         address,
         name: name.into(),
@@ -494,7 +502,7 @@ fn property_lists_come_from_the_games_metadata() {
             instance_methods: Vec::new(),
             class_methods: Vec::new(),
             protocols: Vec::new(),
-            instance_properties: vec![property("level", "Ti,R,N")],
+            instance_properties: vec![level.clone(), volume_again.clone()],
         }],
         ..Default::default()
     };
@@ -508,16 +516,19 @@ fn property_lists_come_from_the_games_metadata() {
     let text = |address: u32| unsafe { runtime::cstr(g.host_address(address)) };
     let count = g.words(&[99]);
     let list = call("class_copyPropertyList", &[class, count]);
-    assert_eq!(g.u32_at(count), 3);
-    let entries: Vec<(String, String)> = (0..3)
-        .map(|i| g.u32_at(list + 4 * i))
-        .map(|p| (text(call("property_getName", &[p])), text(call("property_getAttributes", &[p]))))
-        .collect();
+    assert_eq!(g.u32_at(count), 4);
+    let pointers: Vec<u32> = (0..4).map(|i| g.u32_at(list + 4 * i)).collect();
+    let entries: Vec<(String, String)> =
+        pointers.iter().map(|&p| (text(call("property_getName", &[p])), text(call("property_getAttributes", &[p])))).collect();
     assert_eq!(
         entries,
-        [("level", "Ti,R,N"), ("volume", "Tf,N,V_volume"), ("name", "T@\"NSString\",C,N,V_name")].map(|(n, a)| (n.to_string(), a.to_string()))
+        [("level", "Ti,R,N"), ("volume", "Tf,R,N"), ("volume", "Tf,N,V_volume"), ("name", "T@\"NSString\",C,N,V_name")]
+            .map(|(n, a)| (n.to_string(), a.to_string()))
     );
-    assert_eq!(g.u32_at(list + 12), 0, "the list ends with NULL");
+    // Each declaration is its own entry: the image's.
+    assert_eq!((pointers[0], pointers[1]), (level.address, volume_again.address));
+    assert_ne!(pointers[1], pointers[2], "a redeclared property keeps both declarations");
+    assert_eq!(g.u32_at(list + 16), 0, "the list ends with NULL");
     // The same property is the same entry every time; the list itself is new.
     let again = call("class_copyPropertyList", &[class, 0]);
     assert_ne!(again, list);
@@ -530,4 +541,68 @@ fn property_lists_come_from_the_games_metadata() {
 
 extern "C" fn plain_root_bounds(_: Id, _: Sel) -> crate::fw::geometry::Rect {
     crate::fw::geometry::Rect::new(1.0, 2.0, 3.0, 4.0)
+}
+
+/// NSAllocateObject makes a zeroed game instance with room for its extra
+/// bytes; NSGetSizeAndAlignment measures armv7 layouts; CFStringAppendFormat
+/// formats the game's variadic arguments, objects included.
+#[test]
+fn foundation_allocation_layout_and_format_functions() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(crate::run::setup);
+    {
+        let mut rt = runtime::lock();
+        let class = rt.define_class("G32AllocRoot", 0, 16);
+        let meta = rt.classes[&class].partner;
+        let sel = rt.sel("alloc");
+        rt.add_method(meta, sel, alloc as usize);
+    }
+    let g = Fake::new();
+    let (class, meta) = (g.alloc_permanent(20), g.alloc_permanent(20));
+    g.put_words(class, &[meta]);
+    let md = ObjcMetadata32 {
+        classes: vec![ObjcClass32 {
+            address: class,
+            name: "G32Allocated".into(),
+            superclass: ClassTarget::External("G32AllocRoot".into()),
+            meta_address: meta,
+            meta_isa: ClassTarget::External("G32AllocRoot".into()),
+            meta_superclass: ClassTarget::External("G32AllocRoot".into()),
+            instance: ClassRo32 { instance_start: 4, instance_size: 12, ..Default::default() },
+            meta: ClassRo32 { flags: 1, ..Default::default() },
+        }],
+        ..Default::default()
+    };
+    let bridge: &'static Mutex<Bridge> = Box::leak(Box::new(Mutex::new(Bridge::new(&md).unwrap())));
+    install(bridge, g, &md).unwrap();
+    let ctx = Ctx { bridge, g };
+    let call = |name: &str, words: &[u32]| {
+        let w = |i: u32| words.get(i as usize).copied().unwrap_or(0);
+        call_function(&ctx, name, &w).unwrap() as u32
+    };
+
+    let zone = call("NSDefaultMallocZone", &[]);
+    assert_ne!(zone, 0);
+    let object = call("NSAllocateObject", &[class, 40, zone]);
+    assert_eq!(g.u32_at(object), class, "an instance of the game class");
+    assert_eq!(g.read(object + 4, 48), [0; 48], "its own and extra bytes, zeroed");
+    let host = bridge.lock().unwrap().host_object(object).expect("a host side");
+    assert_eq!(bridge.lock().unwrap().guest_object(g, host).unwrap(), object);
+    let next = g.alloc(4);
+    assert!(next >= object + 52, "the extra bytes are the object's ({object:#x}, next {next:#x})");
+
+    // NSGetSizeAndAlignment(type, &size, &align) -> the type after it (offsets skipped).
+    let (size, align) = (g.words(&[0]), g.words(&[0]));
+    let types = g.text("{Pair=cd}12@0");
+    let rest = call("NSGetSizeAndAlignment", &[types, size, align]);
+    assert_eq!((g.u32_at(size), g.u32_at(align), rest), (12, 4, types + 11), "a double is 4-byte aligned on armv7");
+    assert_eq!(call("NSGetSizeAndAlignment", &[rest, 0, align]), rest + 2, "NULL outputs are skipped");
+    assert_eq!(g.u32_at(align), 4);
+
+    // CFStringAppendFormat(string, options, format, ...)
+    let mutable = runtime::send(runtime::class_named("NSMutableString"), "stringWithString:", &[crate::fw::string::make("x")]);
+    let guest = |host: usize| bridge.lock().unwrap().guest_object(g, host).unwrap();
+    let (target, format, word) = (guest(mutable), guest(crate::fw::string::make("%d-%@")), guest(crate::fw::string::make("hi")));
+    call("CFStringAppendFormat", &[target, 0, format, 42, word]);
+    assert_eq!(crate::fw::string::get(mutable), "x42-hi");
 }

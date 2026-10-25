@@ -196,6 +196,112 @@ void at_exit() {
 }
 } // namespace
 
+// ---- GCC libstdc++'s out-of-line helpers (glue/libstdcxx.cpp), declared
+// as GCC's <bits/stl_tree.h> declares them, so the names are GCC's ----
+namespace std {
+enum _Rb_tree_color { _S_red = false, _S_black = true };
+struct _Rb_tree_node_base {
+    _Rb_tree_color _M_color;
+    _Rb_tree_node_base* _M_parent;
+    _Rb_tree_node_base* _M_left;
+    _Rb_tree_node_base* _M_right;
+};
+_Rb_tree_node_base* _Rb_tree_increment(_Rb_tree_node_base*);
+_Rb_tree_node_base* _Rb_tree_decrement(_Rb_tree_node_base*);
+void _Rb_tree_insert_and_rebalance(bool, _Rb_tree_node_base*, _Rb_tree_node_base*, _Rb_tree_node_base&);
+_Rb_tree_node_base* _Rb_tree_rebalance_for_erase(_Rb_tree_node_base*, _Rb_tree_node_base&);
+} // namespace std
+// std::__throw_length_error(const char*): by its symbol (libc++ has its own inline one in std::__1).
+extern "C" __attribute__((noreturn)) void gnu_throw_length_error(const char*) __asm__("_ZSt20__throw_length_errorPKc");
+
+namespace {
+typedef std::_Rb_tree_node_base TreeNode;
+struct Keyed : TreeNode {
+    int key;
+};
+int key(TreeNode* node) { return static_cast<Keyed*>(node)->key; }
+
+// The red-black rules below `node` (parent links, no red node with a red
+// child, the same number of black nodes on every path): that number, or -1.
+int black_height(TreeNode* node, TreeNode* parent) {
+    if (!node)
+        return 1;
+    if (node->_M_parent != parent)
+        return -1;
+    if (node->_M_color == std::_S_red && ((node->_M_left && node->_M_left->_M_color == std::_S_red) ||
+                                           (node->_M_right && node->_M_right->_M_color == std::_S_red)))
+        return -1;
+    int left = black_height(node->_M_left, node), right = black_height(node->_M_right, node);
+    if (left < 0 || left != right)
+        return -1;
+    return left + (node->_M_color == std::_S_black);
+}
+
+// The tree holds exactly the keys in `expected` (ascending), walked both
+// ways, with the header's root, leftmost and rightmost right.
+bool tree_is(TreeNode& header, const int* expected, int count) {
+    TreeNode* root = header._M_parent;
+    if (count == 0)
+        return !root && header._M_left == &header && header._M_right == &header;
+    if (!root || root->_M_color != std::_S_black || black_height(root, &header) < 0)
+        return false;
+    TreeNode* node = header._M_left;
+    for (int i = 0; i < count; ++i, node = std::_Rb_tree_increment(node))
+        if (node == &header || key(node) != expected[i])
+            return false;
+    if (node != &header)
+        return false;
+    for (int i = count - 1; i >= 0; --i)
+        if (key(node = std::_Rb_tree_decrement(node)) != expected[i])
+            return false;
+    return node == header._M_left && key(header._M_right) == expected[count - 1] &&
+           std::_Rb_tree_decrement(&header) == header._M_right;
+}
+
+void gnu_tree() {
+    // An empty tree's header: red, no root, leftmost and rightmost itself.
+    TreeNode header = {std::_S_red, nullptr, &header, &header};
+    static Keyed nodes[40];
+    // Inserted as std::map does: down from the root, then linked under the parent.
+    for (int i = 0; i < 40; ++i) {
+        Keyed* z = &nodes[i];
+        z->key = (i * 17) % 40;
+        TreeNode* parent = &header;
+        bool left = true;
+        for (TreeNode* x = header._M_parent; x; x = left ? x->_M_left : x->_M_right) {
+            parent = x;
+            left = z->key < key(x);
+        }
+        std::_Rb_tree_insert_and_rebalance(left, z, parent, header);
+    }
+    int all[40], odd[20];
+    for (int i = 0; i < 40; ++i)
+        all[i] = i;
+    for (int i = 0; i < 20; ++i)
+        odd[i] = 2 * i + 1;
+    bool inserted = tree_is(header, all, 40);
+    // Erase the even keys (the root, the leftmost, inner nodes), then the rest.
+    bool erased = true;
+    for (int i = 0; i < 40; ++i)
+        if (nodes[i].key % 2 == 0)
+            erased &= std::_Rb_tree_rebalance_for_erase(&nodes[i], header) == &nodes[i];
+    erased &= tree_is(header, odd, 20);
+    for (int i = 0; i < 40; ++i)
+        if (nodes[i].key % 2 == 1)
+            std::_Rb_tree_rebalance_for_erase(&nodes[i], header);
+    CHECK(15, inserted && erased && tree_is(header, odd, 0));
+
+    bool length = false;
+    try {
+        gnu_throw_length_error("too long");
+    } catch (const std::length_error& e) { // libc++'s std::length_error is GCC's type
+        length = std::string(e.what()) == "too long";
+    } catch (...) {
+    }
+    CHECK(16, length);
+}
+} // namespace
+
 extern "C" __attribute__((visibility("default"))) unsigned run_all() {
     failed = 0;
     strings();
@@ -204,5 +310,6 @@ extern "C" __attribute__((visibility("default"))) unsigned run_all() {
     streams();
     packed_pairs();
     at_exit();
+    gnu_tree();
     return failed;
 }

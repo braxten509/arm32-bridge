@@ -341,10 +341,20 @@ pub fn read_word(address: usize) -> Option<usize> {
     }
     let [read_end, write_end] = pipe.unwrap();
     unsafe {
+        // Leftovers from an earlier short read would be read back as this word.
+        while libc::read(read_end, word.as_mut_ptr() as *mut _, 8) > 0 {}
         if libc::write(write_end, address as *const _, 8) != 8 {
             return None;
         }
-        (libc::read(read_end, word.as_mut_ptr() as *mut _, 8) == 8).then(|| usize::from_ne_bytes(word))
+        let mut got = 0;
+        while got < 8 {
+            match libc::read(read_end, word[got..].as_mut_ptr() as *mut _, 8 - got) {
+                n if n > 0 => got += n as usize,
+                n if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) => {}
+                _ => return None,
+            }
+        }
+        Some(usize::from_ne_bytes(word))
     }
 }
 

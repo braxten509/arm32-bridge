@@ -182,6 +182,7 @@ pub fn register() {
         exceptions::framework_type("NSException", with_bridge(|b| b.framework_class(&Translator, "NSException").0))
     });
     super::super::data("_dispatch_main_q", super::dispatch::main_queue);
+    super::super::data("_dispatch_source_type_timer", super::dispatch::timer_type);
 }
 
 /// Reads the program's Objective-C metadata and registers the data its
@@ -302,12 +303,34 @@ fn with_bridge<R>(f: impl FnOnce(&mut Bridge) -> R) -> R {
     f(&mut bridge().expect("bridge set up in register_program").lock().unwrap_or_else(|e| e.into_inner()))
 }
 
+/// A game method's encoding as the host passes its values (the bridge turns
+/// a float into a CGFloat-sized double), for key-value coding.
+fn game_method_types(class: crate::objc::runtime::Class, sel: crate::objc::runtime::Sel) -> Option<String> {
+    let (name, meta, sel_name) = {
+        let rt = crate::objc::runtime::lock();
+        (rt.class_name(class), rt.classes.get(&class)?.meta, rt.sel_name(sel))
+    };
+    let b = bridge()?.lock().unwrap_or_else(|e| e.into_inner());
+    let guest = b.classes.class_named(&name)?;
+    let address = if meta { guest.partner } else { guest.address };
+    match b.classes.lookup(address, &sel_name) {
+        super::classes::Lookup::Guest(m) => Some(crate::fw::object::float_as_double(&m.types)),
+        _ => None,
+    }
+}
+
 /// Defines the host mirrors of the game's classes and makes selector
 /// references unique. Runs after `load`.
 pub fn install_program() -> Result<(), String> {
     let (bridge, md) = (bridge().ok_or("no Objective-C bridge")?, METADATA.get().ok_or("no metadata")?);
     install(bridge, &Translator, md)?;
     super::bridge::set_block_owner(&Translator);
+    crate::fw::object::set_extra_method_types(game_method_types);
+    crate::fw::system::set_guest_memory(crate::fw::system::GuestMemory {
+        owns: |host| Translator.guest_address(host).is_some(),
+        object_to_host: |guest| with_bridge(|b| b.host_object_for(&Translator, guest)).unwrap_or(0),
+        object_to_guest: |host| with_bridge(|b| b.guest_object(&Translator, host)).unwrap_or(0),
+    });
     // Guest copies kept for a host object go when it is finished with.
     crate::objc::runtime::on_object_finished(|host| with_bridge(|b| b.release_host_copies(&Translator, host)));
     mirror::set_dispatch(Box::new(|frame| {

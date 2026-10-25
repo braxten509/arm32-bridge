@@ -471,6 +471,7 @@ pub fn register(r: &mut Registry) {
         ("SKStoreProductParameterAffiliateToken", "at"),
         ("SKStoreProductParameterCampaignToken", "ct"),
         ("SKStoreProductParameterProviderToken", "pt"),
+        ("SKErrorDomain", "SKErrorDomain"),
     ] {
         r.data(name, crate::symbols::leak(crate::fw::string::make(value)));
     }

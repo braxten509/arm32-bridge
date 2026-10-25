@@ -167,7 +167,7 @@ const CXX_DESTRUCT: &str = ".cxx_destruct";
 /// Apple's object_cxxConstructFromClass for the game objects made since the
 /// last call: each game class's own .cxx_construct, superclass first. Runs
 /// before guest code next sees them (the bridge lock is not held then).
-fn construct_pending(bridge: &Mutex<Bridge>, g: &dyn GuestSide) -> Result<(), String> {
+pub(super) fn construct_pending(bridge: &Mutex<Bridge>, g: &dyn GuestSide) -> Result<(), String> {
     loop {
         let Some(object) = UNCONSTRUCTED.with(|u| u.borrow_mut().pop()) else { return Ok(()) };
         let (sel, constructors) = {
@@ -281,6 +281,8 @@ pub struct Bridge {
     /// The game has a category +initialize on a framework class, so
     /// framework classes (their guest copies) are initialized too.
     framework_initializers: bool,
+    /// Bytes the next game instance gets past its ivars (NSAllocateObject).
+    extra_bytes: u32,
 }
 
 /// Where a message goes.
@@ -308,6 +310,7 @@ impl Bridge {
             buffers: HashMap::new(),
             kept_copies: HashMap::new(),
             init_state: HashMap::new(),
+            extra_bytes: 0,
         })
     }
 
@@ -521,7 +524,7 @@ impl Bridge {
         }
         let guest = match mirror::mirror_guest_class(class) {
             Some(guest_class) => {
-                let size = self.classes.class(guest_class).map(|c| c.instance_size).unwrap_or(4).max(4);
+                let size = self.classes.class(guest_class).map(|c| c.instance_size).unwrap_or(4).max(4) + std::mem::take(&mut self.extra_bytes);
                 let object = g.alloc(size);
                 g.write(object, &vec![0u8; size as usize]);
                 g.write(object, &guest_class.to_le_bytes());
@@ -551,6 +554,18 @@ impl Bridge {
                 self.framework.get(&name).map(|p| p.0) == Some(isa)
             }
         }
+    }
+
+    /// NSAllocateObject: a new zeroed instance of guest class `class`, the
+    /// root allocator's way (no +alloc runs), with `extra` more bytes after a
+    /// game class's ivars (a framework object is its usual proxy). Its C++
+    /// constructors wait for construct_pending.
+    pub fn allocate(&mut self, g: &dyn GuestSide, class: u32, extra: u32) -> Result<u32, String> {
+        let host = runtime::alloc_instance(self.host_object_for(g, class)?);
+        self.extra_bytes = extra;
+        let object = self.guest_object(g, host);
+        self.extra_bytes = 0;
+        object
     }
 
     /// The host object for a guest object (a host form is made for game
@@ -1081,6 +1096,17 @@ pub fn send_from_guest(
                 PENDING_THROW.with(|p| p.set(Some(exception)));
                 return Ok(GuestRet { r0: 0, r1: 0 });
             }
+            // -doesNotRecognizeSelector: from game code: Apple's exception,
+            // thrown in the guest like -raise.
+            if name == "doesNotRecognizeSelector:" && !meta {
+                let asked = b.selector_name(g, get(first + 2));
+                let host = b.host_object_for(g, receiver)?;
+                drop(b);
+                let exception = crate::fw::object::unrecognized_selector_exception(host, &asked);
+                let exception = lock(bridge).guest_object(g, exception)?;
+                PENDING_THROW.with(|p| p.set(Some(exception)));
+                return Ok(GuestRet { r0: 0, r1: 0 });
+            }
             // The framework's -dealloc of a game object: its C++ ivars go first.
             let game_dealloc = name == "dealloc" && b.classes.class(u32_at(g, receiver)).is_some_and(|c| !c.meta);
             if game_dealloc {
@@ -1125,8 +1151,9 @@ pub fn send_from_guest(
             };
             let imp = imp.ok_or_else(|| format!("{}[{class} {name}] is not implemented by the host layer", if meta { "+" } else { "-" }))?;
             let mut ret = mirror::call_host(imp, &call.args);
-            // -bytes / -mutableBytes point into host memory: hand the guest a copy
-            // (writes through a mutableBytes copy do not reach the host object).
+            // -bytes / -mutableBytes: data bytes live in guest memory (fw::data)
+            // and pass as they are; bytes in host memory get a guest copy
+            // (writes through a mutableBytes copy would not reach the host object).
             // -length first, unlocked: a game subclass may answer it in guest code.
             let pointer = ret.x[0] as usize;
             let in_host = pointer != 0 && g.guest_address(pointer).is_none();

@@ -1250,15 +1250,16 @@ fn mix_music(out: &mut [f32], frames: usize, out_rate: f64) {
 }
 
 // ----- system sounds (AudioServices) -----
-// A sound made from a file plays once per AudioServicesPlaySystemSound, on
-// a player of its own (plays may overlap, as on iPhone). The phone's own
-// sounds (kSystemSoundID_Vibrate and the other built-in IDs) don't exist
-// here: they do nothing.
+// A sound made from a file plays once per AudioServicesPlaySystemSound.
+// System Sound Services plays one sound at a time: a new play stops the one
+// playing, whose decoding worker then ends. The phone's own sounds
+// (kSystemSoundID_Vibrate and the other built-in IDs) don't exist here:
+// they do nothing.
 
 /// Sounds made from files, by SystemSoundID.
 static SYSTEM_SOUNDS: Mutex<Option<HashMap<u32, Source>>> = Mutex::new(None);
-/// Plays still sounding.
-static SOUNDING: Mutex<Vec<Arc<Player>>> = Mutex::new(Vec::new());
+/// The system sound playing now.
+static SOUNDING: Mutex<Option<Arc<Player>>> = Mutex::new(None);
 /// The first ID handed out; Apple's start above the built-in ones too.
 const FIRST_SYSTEM_SOUND: u32 = 4097;
 /// kAudioServicesSystemSoundUnspecifiedError.
@@ -1289,31 +1290,44 @@ extern "C" fn dispose_system_sound(id: u32) -> i32 {
 extern "C" fn play_system_sound(id: u32) {
     let source = SYSTEM_SOUNDS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|s| s.get(&id).cloned());
     let Some(source) = source else { return };
+    start();
+    play_system_source(source);
+}
+
+/// Plays `source` as the system sound, stopping the one playing.
+fn play_system_source(source: Source) -> Option<Arc<Player>> {
     let rate = match open(&source) {
         Ok((_, rate)) => rate,
         Err(e) => {
             crate::log!("AudioServicesPlaySystemSound: {e}");
-            return;
+            return None;
         }
     };
     let player = Player::new(source, rate);
-    start();
     player.ensure_worker();
     player.playing.store(true, Ordering::Relaxed);
-    SOUNDING.lock().unwrap_or_else(|e| e.into_inner()).push(player);
+    let old = SOUNDING.lock().unwrap_or_else(|e| e.into_inner()).replace(player.clone());
+    if let Some(old) = old {
+        retire(&old);
+    }
+    Some(player)
+}
+
+/// Stops a system sound for good: its worker ends.
+fn retire(player: &Player) {
+    player.playing.store(false, Ordering::Relaxed);
+    player.queue().quit = true;
+    player.wake.notify_all();
 }
 
 fn mix_system_sounds(out: &mut [f32], frames: usize, out_rate: f64) {
     let Ok(mut sounding) = SOUNDING.try_lock() else { return };
-    sounding.retain(|player| {
-        if !player.mix_into(out, frames, out_rate) {
-            return true;
-        }
-        // Played to its end: its worker stops.
-        player.queue().quit = true;
-        player.wake.notify_all();
-        false
-    });
+    let Some(player) = sounding.as_ref() else { return };
+    if player.mix_into(out, frames, out_rate) {
+        // Played to its end.
+        retire(player);
+        *sounding = None;
+    }
 }
 
 // ----- the output: one stereo stream -----
@@ -1676,6 +1690,14 @@ mod tests {
         0
     }
 
+    /// Only the audio graphs at 44100 Hz: tests running meanwhile play music,
+    /// system sounds and OpenAL into the full mix.
+    fn mix_graphs(out: &mut [f32]) {
+        out.fill(0.0);
+        let frames = out.len() / 2;
+        mix_graph(out, frames, 44100.0);
+    }
+
     fn energy(out: &[f32], channel: usize) -> f32 {
         out.iter().skip(channel).step_by(2).map(|s| s * s).sum::<f32>()
     }
@@ -1699,7 +1721,7 @@ mod tests {
         unit_set_parameter(unit, 3, INPUT_SCOPE, 3, 0.0, 0);
         with_graph(|g| g.running.insert(0, true));
         let mut out = vec![0f32; 4410 * 2];
-        mix(&mut out, 44100);
+        mix_graphs(&mut out);
         let (left, right) = (energy(&out, 0), energy(&out, 1));
         assert!(left > 100.0 && (left - right).abs() < left * 0.01, "centred tone: {left} {right}");
         // 0.1 s needs about 2200 source frames, but one call never asks for more than iOS's maximum.
@@ -1707,14 +1729,14 @@ mod tests {
         assert!(most > 0 && most <= DEFAULT_MAX_FRAMES, "{most} frames in one call");
         // Hard right: the left side goes quiet.
         unit_set_parameter(unit, 0, INPUT_SCOPE, 3, 90.0, 0);
-        mix(&mut out, 44100);
+        mix_graphs(&mut out);
         assert!(energy(&out, 0) < energy(&out, 1) * 0.01);
         // 22050 Hz played at 44100: the tone keeps its pitch (441 Hz = 100 output frames a cycle).
         let crossings = out.chunks_exact(2).map(|f| f[1]).collect::<Vec<_>>().windows(2).filter(|w| w[0] < 0.0 && w[1] >= 0.0).count();
         assert!((43..=45).contains(&crossings), "{crossings} cycles in 0.1 s");
         // Disabled: silence.
         unit_set_parameter(unit, 5, INPUT_SCOPE, 3, 0.0, 0);
-        mix(&mut out, 44100);
+        mix_graphs(&mut out);
         assert_eq!(energy(&out, 1), 0.0);
         // A callback that disposes of its own graph is not called again.
         let mut graph = 0;
@@ -1729,7 +1751,7 @@ mod tests {
         graph_node_info(graph, node, std::ptr::null_mut(), &mut own);
         unit_set_property(own, MAXIMUM_FRAMES_PER_SLICE, 0, 0, &slice as *const u32 as *const u8, 4);
         graph_start(graph);
-        mix(&mut out, 44100);
+        mix_graphs(&mut out);
         assert_eq!(DISPOSING_CALLS.load(Ordering::Relaxed), 1, "called after its graph was disposed");
     }
 
@@ -1801,6 +1823,27 @@ mod tests {
         assert!((player.duration() - 1.0).abs() < 0.01);
         player.queue().quit = true;
         player.wake.notify_all();
+    }
+
+    /// System Sound Services plays one sound at a time: a new play stops the
+    /// one playing, and that one's worker thread ends.
+    #[test]
+    fn a_new_system_sound_stops_the_one_playing() {
+        let first = play_system_source(Source::Bytes(Arc::new(wav(22050, 1.0)))).unwrap();
+        let second = play_system_source(Source::Bytes(Arc::new(wav(22050, 1.0)))).unwrap();
+        assert!(!first.playing.load(Ordering::Relaxed), "the first sound stopped");
+        assert!(second.playing.load(Ordering::Relaxed));
+        assert!(SOUNDING.lock().unwrap().as_ref().is_some_and(|p| Arc::ptr_eq(p, &second)), "only the new one is playing");
+        // The worker holds its own reference until it ends.
+        for _ in 0..250 {
+            if Arc::strong_count(&first) == 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(Arc::strong_count(&first), 1, "the first sound's worker ended");
+        retire(&second);
+        *SOUNDING.lock().unwrap() = None;
     }
 
     #[test]

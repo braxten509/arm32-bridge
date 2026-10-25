@@ -292,6 +292,132 @@ extern "C" fn no_cookies_for(_this: Id, _: Sel, _url: Id) -> Id {
     collections::array_from(&[])
 }
 
+// ----- NSURLResponse / NSHTTPURLResponse: no server answers here, but a game
+// (or its test code) may make one; it keeps what it was made with -----
+
+fn object_of(this: Id, key: &'static str) -> Id {
+    property_get(this, key).unwrap_or(0) as Id
+}
+
+fn keep_copy(this: Id, key: &'static str, value: Id) {
+    let value = if value == 0 { 0 } else { runtime::send(value, "copy", &[]) };
+    crate::fw::uikit::property_set_object(this, key, value);
+}
+
+extern "C" fn response_init(this: Id, _: Sel, url: Id, mime: Id, length: isize, encoding: Id) -> Id {
+    keep_copy(this, "URL", url);
+    keep_copy(this, "MIMEType", mime);
+    keep_copy(this, "textEncodingName", encoding);
+    property_set(this, "expectedContentLength", length as u64);
+    this
+}
+
+extern "C" fn response_url(this: Id, _: Sel) -> Id {
+    object_of(this, "URL")
+}
+
+extern "C" fn response_mime_type(this: Id, _: Sel) -> Id {
+    object_of(this, "MIMEType")
+}
+
+extern "C" fn response_text_encoding(this: Id, _: Sel) -> Id {
+    object_of(this, "textEncodingName")
+}
+
+/// NSURLResponseUnknownLength (-1) unless it was given.
+extern "C" fn response_expected_length(this: Id, _: Sel) -> i64 {
+    property_get(this, "expectedContentLength").map_or(-1, |v| v as i64)
+}
+
+extern "C" fn response_suggested_filename(this: Id, _: Sel) -> Id {
+    let url = object_of(this, "URL");
+    let name = if url == 0 { String::new() } else { string::get(runtime::send(url, "lastPathComponent", &[])) };
+    string::make(if name.is_empty() || name == "/" { "Unknown" } else { &name })
+}
+
+/// The HTTP form: status and header fields (MIME type and text encoding
+/// read from its Content-Type, as Apple does).
+extern "C" fn http_response_init(this: Id, _: Sel, url: Id, status: isize, _version: Id, headers: Id) -> Id {
+    keep_copy(this, "URL", url);
+    property_set(this, "statusCode", status as u64);
+    let headers = if headers == 0 { collections::dictionary_from(&[]) } else { runtime::send(headers, "copy", &[]) };
+    crate::fw::uikit::property_set_object(this, "allHeaderFields", headers);
+    let content_type = collections::dictionary_pairs(headers)
+        .into_iter()
+        .find(|(k, _)| string::get(*k).eq_ignore_ascii_case("Content-Type"))
+        .map(|(_, v)| string::get(v));
+    if let Some(content_type) = content_type {
+        let mut parts = content_type.split(';');
+        let mime = parts.next().unwrap_or("").trim().to_string();
+        crate::fw::uikit::property_set_object(this, "MIMEType", string::make(&mime));
+        let charset = parts.find_map(|p| p.trim().strip_prefix("charset=").map(|c| c.trim_matches('"').to_string()));
+        if let Some(charset) = charset {
+            crate::fw::uikit::property_set_object(this, "textEncodingName", string::make(&charset));
+        }
+    }
+    if let Some(length) = collections::dictionary_pairs(headers)
+        .into_iter()
+        .find(|(k, _)| string::get(*k).eq_ignore_ascii_case("Content-Length"))
+        .and_then(|(_, v)| string::get(v).trim().parse::<i64>().ok())
+    {
+        property_set(this, "expectedContentLength", length as u64);
+    }
+    this
+}
+
+extern "C" fn http_status(this: Id, _: Sel) -> isize {
+    property_get(this, "statusCode").unwrap_or(0) as isize
+}
+
+extern "C" fn http_all_headers(this: Id, _: Sel) -> Id {
+    match object_of(this, "allHeaderFields") {
+        0 => collections::dictionary_from(&[]),
+        headers => headers,
+    }
+}
+
+extern "C" fn request_set_pipelining(this: Id, _: Sel, value: u8) {
+    property_set(this, "pipelining", u64::from(value != 0));
+}
+
+extern "C" fn request_pipelining(this: Id, _: Sel) -> bool {
+    property_get(this, "pipelining").unwrap_or(0) != 0
+}
+
+// ----- NSURLAuthenticationChallenge: never sent here (connections fail
+// offline before reaching a server); one a game makes keeps its parts -----
+
+extern "C" fn challenge_init(this: Id, _: Sel, space: Id, credential: Id, failures: isize, response: Id, error: Id, sender: Id) -> Id {
+    for (key, value) in [("protectionSpace", space), ("proposedCredential", credential), ("failureResponse", response), ("error", error), ("sender", sender)] {
+        crate::fw::uikit::property_set_object(this, key, value);
+    }
+    property_set(this, "previousFailureCount", failures as u64);
+    this
+}
+
+extern "C" fn challenge_space(this: Id, _: Sel) -> Id {
+    object_of(this, "protectionSpace")
+}
+extern "C" fn challenge_proposed(this: Id, _: Sel) -> Id {
+    object_of(this, "proposedCredential")
+}
+extern "C" fn challenge_response(this: Id, _: Sel) -> Id {
+    object_of(this, "failureResponse")
+}
+extern "C" fn challenge_error(this: Id, _: Sel) -> Id {
+    object_of(this, "error")
+}
+extern "C" fn challenge_sender(this: Id, _: Sel) -> Id {
+    object_of(this, "sender")
+}
+extern "C" fn challenge_failures(this: Id, _: Sel) -> isize {
+    property_get(this, "previousFailureCount").unwrap_or(0) as isize
+}
+
+/// The connection's answer to a challenge: its request has already failed
+/// (offline), so there is nothing left to send the credential to.
+extern "C" fn connection_answer_challenge(_this: Id, _: Sel, _credential: Id, _challenge: Id) {}
+
 pub fn register(r: &mut Registry) {
     let ns_string = runtime::class_named("NSString");
     methods(
@@ -344,8 +470,10 @@ pub fn register(r: &mut Registry) {
             ("setTimeoutInterval:", request_set_timeout as usize),
             ("setMainDocumentURL:", request_set_main_document_url as usize),
             ("setHTTPShouldHandleCookies:", ignore_bool as usize),
+            ("setHTTPShouldUsePipelining:", request_set_pipelining as usize),
         ],
     );
+    methods(request, &[("HTTPShouldUsePipelining", request_pipelining as usize)]);
 
     let connection = define_class("NSURLConnection", "NSObject", 8);
     class_methods(
@@ -366,6 +494,11 @@ pub fn register(r: &mut Registry) {
             ("cancel", nothing as usize),
             ("scheduleInRunLoop:forMode:", ignore_id_id as usize),
             ("unscheduleFromRunLoop:forMode:", ignore_id_id as usize),
+            ("useCredential:forAuthenticationChallenge:", connection_answer_challenge as usize),
+            ("continueWithoutCredentialForAuthenticationChallenge:", ignore_id as usize),
+            ("cancelAuthenticationChallenge:", ignore_id as usize),
+            ("performDefaultHandlingForAuthenticationChallenge:", ignore_id as usize),
+            ("rejectProtectionSpaceAndContinueWithChallenge:", ignore_id as usize),
         ],
     );
     let cookies = define_class("NSHTTPCookieStorage", "NSObject", 8);
@@ -379,8 +512,40 @@ pub fn register(r: &mut Registry) {
             ("setCookie:", ignore_id as usize),
         ],
     );
-    let _ = define_class("NSURLResponse", "NSObject", 8);
-    let _ = define_class("NSHTTPURLResponse", "NSURLResponse", 8);
+    let response = define_class("NSURLResponse", "NSObject", 8);
+    methods(
+        response,
+        &[
+            ("initWithURL:MIMEType:expectedContentLength:textEncodingName:", response_init as usize),
+            ("URL", response_url as usize),
+            ("MIMEType", response_mime_type as usize),
+            ("textEncodingName", response_text_encoding as usize),
+            ("expectedContentLength", response_expected_length as usize),
+            ("suggestedFilename", response_suggested_filename as usize),
+        ],
+    );
+    let http = define_class("NSHTTPURLResponse", "NSURLResponse", 8);
+    methods(
+        http,
+        &[
+            ("initWithURL:statusCode:HTTPVersion:headerFields:", http_response_init as usize),
+            ("statusCode", http_status as usize),
+            ("allHeaderFields", http_all_headers as usize),
+        ],
+    );
+    let challenge = define_class("NSURLAuthenticationChallenge", "NSObject", 8);
+    methods(
+        challenge,
+        &[
+            ("initWithProtectionSpace:proposedCredential:previousFailureCount:failureResponse:error:sender:", challenge_init as usize),
+            ("protectionSpace", challenge_space as usize),
+            ("proposedCredential", challenge_proposed as usize),
+            ("previousFailureCount", challenge_failures as usize),
+            ("failureResponse", challenge_response as usize),
+            ("error", challenge_error as usize),
+            ("sender", challenge_sender as usize),
+        ],
+    );
 }
 
 extern "C" fn nothing(_this: Id, _: Sel) {}
