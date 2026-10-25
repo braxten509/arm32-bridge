@@ -2,15 +2,16 @@
 //! a context, in the layer's own space (its bounds' origin at the context's
 //! origin), as Core Animation renders it.
 //!
-//! Drawn: background colours, a layer's contents picture (stretched over
-//! its bounds), gradient layers, shape layers, picture views' images, label
-//! text, replicator copies; each layer placed by its position, anchor point,
-//! bounds and transform, with its opacity, sorted by zPosition, clipped
-//! where it masks to its bounds. Not drawn: shadows, borders, round corners
-//! and masks (as on screen here).
+//! Drawn: background colours (round corners too), a layer's contents
+//! picture (stretched over its bounds), gradient layers, shape layers,
+//! picture views' images, label text, borders on top, replicator copies;
+//! each layer placed by its position, anchor point, bounds and transform,
+//! with its opacity, sorted by zPosition, clipped (round corners too) where
+//! it masks to its bounds. Not drawn here: shadows and masks (the screen
+//! draws those, fw/graphics/compose.rs).
 
 use super::*;
-use crate::fw::layers;
+use crate::fw::layers::{self, Child};
 
 pub fn render_layer(context: Id, layer: Id) {
     if layer == 0 || canvas("-[CALayer renderInContext:]", context).is_none() {
@@ -30,16 +31,15 @@ fn is_kind(object: Id, name: &str) -> bool {
 }
 
 /// The layers drawn inside `layer`, back to front: a view's subviews'
-/// layers, then the layers the game added, in zPosition order.
+/// layers with the layers the game added among them, in zPosition order.
 fn children(layer: Id) -> Vec<Id> {
-    let mut list = Vec::new();
-    let view = layers::view_of(layer);
-    if view != 0 {
-        for child in uikit::view_state(view).subviews.clone() {
-            list.push(runtime::send(child, "layer", &[]));
-        }
-    }
-    list.extend(layers::sublayers_of(layer));
+    let mut list: Vec<Id> = layers::children(layer)
+        .into_iter()
+        .map(|child| match child {
+            Child::View(view) => runtime::send(view, "layer", &[]),
+            Child::Layer(layer) => layer,
+        })
+        .collect();
     list.retain(|&l| l != 0);
     list.sort_by(|&a, &b| layers::z_position(a).total_cmp(&layers::z_position(b)));
     list
@@ -65,13 +65,16 @@ fn draw_layer(context: Id, layer: Id, parent_alpha: f64, depth: usize) {
     }
     context_set_alpha(context, alpha);
     let bounds = layers::bounds(layer);
-    draw_own(context, layer, bounds);
+    let looks = layers::looks(layer);
+    context_save_gstate(context);
+    draw_own(context, layer, bounds, looks.corner_radius);
     let (copies, step) = layers::replication(layer);
-    let step = layers::affine_of(step);
+    // Each copy one step further, the step turning around the replicator's middle.
+    let middle = Transform { tx: bounds.origin.x + bounds.size.width / 2.0, ty: bounds.origin.y + bounds.size.height / 2.0, ..IDENTITY };
+    let step = geometry::concat(geometry::concat(geometry::invert(middle).unwrap_or(IDENTITY), layers::affine_of(step)), middle);
     if layers::masks(layer) {
-        clip_to_rect_in(context, bounds);
+        clip_to_round_rect_in(context, bounds, looks.corner_radius);
     }
-    // A replicator shows `copies` of each sublayer, each one step further.
     for child in children(layer) {
         let mut offset = IDENTITY;
         for _ in 0..copies {
@@ -82,24 +85,48 @@ fn draw_layer(context: Id, layer: Id, parent_alpha: f64, depth: usize) {
             offset = geometry::concat(offset, step);
         }
     }
+    // The border on top of everything inside, inside the edge.
+    if let Some((color, width)) = looks.border {
+        if let Some(mut c) = canvas("-[CALayer renderInContext:]", context) {
+            let to_device = c.to_device();
+            let mut outline = shapes::Outline::default();
+            outline.rounded_rect(bounds, looks.corner_radius, &to_device);
+            let inner = Rect::new(bounds.origin.x + width, bounds.origin.y + width, bounds.size.width - 2.0 * width, bounds.size.height - 2.0 * width);
+            if inner.size.width > 0.0 && inner.size.height > 0.0 {
+                outline.rounded_rect(inner, (looks.corner_radius - width).max(0.0), &to_device);
+            }
+            let saved = c.state.fill;
+            c.state.fill = color;
+            c.fill_outline(&outline, true);
+            c.state.fill = saved;
+        }
+    }
+    context_restore_gstate(context);
 }
 
-fn clip_to_rect_in(context: Id, rect: Rect) {
+fn clip_to_round_rect_in(context: Id, rect: Rect, radius: f64) {
     if let Some(mut c) = canvas("-[CALayer renderInContext:]", context) {
         let mut outline = shapes::Outline::default();
         let to_device = c.to_device();
-        outline.rect(rect, &to_device);
+        outline.rounded_rect(rect, radius, &to_device);
         c.clip_to(&outline, false);
     }
 }
 
-/// What the layer itself shows, under its sublayers.
-fn draw_own(context: Id, layer: Id, bounds: Rect) {
+/// What the layer itself shows, under its sublayers (the background's
+/// corners rounded by `radius`).
+fn draw_own(context: Id, layer: Id, bounds: Rect, radius: f64) {
     if let Some(color) = color_rgba(layers::background(layer)) {
         if let Some(mut c) = canvas("-[CALayer renderInContext:]", context) {
             let saved = c.state.fill;
             c.state.fill = color;
-            c.fill_rect(bounds);
+            if radius > 0.0 {
+                let mut outline = shapes::Outline::default();
+                outline.rounded_rect(bounds, radius, &c.to_device());
+                c.fill_outline(&outline, false);
+            } else {
+                c.fill_rect(bounds);
+            }
             c.state.fill = saved;
         }
     }

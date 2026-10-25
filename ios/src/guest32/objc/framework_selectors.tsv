@@ -209,6 +209,7 @@ contentMode	i@:
 contentOffset	{CGPoint=ff}@:
 contentScaleFactor	f@:
 contentsOfDirectoryAtPath:error:	@@:@^@
+contentsScale	f@:
 continueTrackingWithTouch:withEvent:	c@:@@
 convertPoint:fromLayer:	{CGPoint=ff}@:{CGPoint=ff}@
 convertPoint:fromView:	{CGPoint=ff}@:{CGPoint=ff}@
@@ -873,6 +874,7 @@ setContentOffset:animated:	v@:{CGPoint=ff}c
 setContentScaleFactor:	v@:f
 setContentSize:	v@:{CGSize=ff}
 setContentSizeForViewInPopover:	v@:{CGSize=ff}
+setContentsScale:	v@:f
 setContext:	v@:@
 setControlStyle:	v@:i
 setCornerRadius:	v@:f
