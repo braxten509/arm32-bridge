@@ -311,14 +311,14 @@ extern "C" fn data_subdata(this: Id, _: Sel, range: crate::fw::string::Range) ->
         crate::log!("STOP: subdataWithRange: {}..{end} is past the end ({} bytes)", range.location, all.len());
         crate::report::finish(1);
     }
-    make(&all[range.location..end])
+    make(&all.as_slice()[range.location..end])
 }
 
 extern "C" fn data_get_bytes_length(this: Id, _: Sel, buffer: *mut u8, length: usize) {
     let all = store(this);
     let count = length.min(all.len());
     if !buffer.is_null() {
-        unsafe { std::ptr::copy_nonoverlapping(all.as_ptr(), buffer, count) };
+        unsafe { std::ptr::copy_nonoverlapping(all.as_slice().as_ptr(), buffer, count) };
     }
 }
 
@@ -327,17 +327,17 @@ extern "C" fn data_get_bytes_range(this: Id, _: Sel, buffer: *mut u8, range: cra
     let start = range.location.min(all.len());
     let end = range.location.saturating_add(range.length).min(all.len());
     if !buffer.is_null() {
-        unsafe { std::ptr::copy_nonoverlapping(all[start..end].as_ptr(), buffer, end - start) };
+        unsafe { std::ptr::copy_nonoverlapping(all.as_slice()[start..end].as_ptr(), buffer, end - start) };
     }
 }
 
 extern "C" fn data_increase_length(this: Id, _: Sel, extra: usize) {
     let all = store(this);
-    all.resize(all.len() + extra, 0);
+    all.resize(all.len() + extra);
 }
 
 extern "C" fn data_init_with_length(this: Id, _: Sel, length: usize) -> Id {
-    store(this).resize(length, 0);
+    store(this).resize(length);
     this
 }
 
@@ -347,10 +347,13 @@ extern "C" fn data_replace_bytes(this: Id, _: Sel, range: crate::fw::string::Ran
     let start = range.location.min(all.len());
     let end = range.location.saturating_add(range.length);
     if end > all.len() {
-        all.resize(end, 0);
+        all.resize(end);
     }
     let new: Vec<u8> = if bytes.is_null() { vec![0; length] } else { unsafe { std::slice::from_raw_parts(bytes, length) }.to_vec() };
-    all.splice(start..end, new);
+    let mut joined = all.as_slice()[..start].to_vec();
+    joined.extend_from_slice(&new);
+    joined.extend_from_slice(&all.as_slice()[end..]);
+    all.set(&joined);
 }
 
 /// NSFileReadNoSuchFileError and the other Cocoa file error codes.
@@ -377,7 +380,7 @@ extern "C" fn data_with_contents_of_file_options(class: Class, _: Sel, path: Id,
     match std::fs::read(&text) {
         Ok(bytes) => {
             let object = runtime::alloc_instance(class);
-            *store(object) = bytes;
+            store(object).set(&bytes);
             object
         }
         Err(e) => {
@@ -391,7 +394,7 @@ extern "C" fn data_init_with_contents_of_file_options(this: Id, _: Sel, path: Id
     let text = crate::fw::string::get(path);
     match std::fs::read(&text) {
         Ok(bytes) => {
-            *store(this) = bytes;
+            store(this).set(&bytes);
             this
         }
         Err(e) => {
@@ -410,9 +413,9 @@ extern "C" fn data_write_to_file_options(this: Id, _: Sel, path: Id, options: us
     }
     let result = if options & 1 != 0 {
         let temporary = format!("{path}.part");
-        std::fs::write(&temporary, store(this)).and_then(|_| std::fs::rename(&temporary, &path))
+        std::fs::write(&temporary, store(this).as_slice()).and_then(|_| std::fs::rename(&temporary, &path))
     } else {
-        std::fs::write(&path, store(this))
+        std::fs::write(&path, store(this).as_slice())
     };
     match result {
         Ok(()) => true,
