@@ -70,6 +70,7 @@ addOperation:	v@:@
 addPayment:	v@:@
 addSublayer:	v@:@
 addSubview:	v@:@
+addTarget:action:	v@:@:
 addTarget:action:forControlEvents:	v@:@:I
 addTimer:forMode:	v@:@@
 addToRunLoop:forMode:	v@:@@
@@ -86,6 +87,7 @@ allHeaderFields	@@:
 allHTTPHeaderFields	@@:
 allKeys	@@:
 allKeysForObject:	@@:@
+allowableMovement	f@:
 allTouches	@@:
 allValues	@@:
 alpha	f@:
@@ -154,6 +156,7 @@ cancelButtonIndex	i@:
 cancelLocalNotification:	v@:@
 cancelPreviousPerformRequestsWithTarget:	v@:@
 cancelPreviousPerformRequestsWithTarget:selector:object:	v@:@:@
+cancelsTouchesInView	c@:
 cancelTrackingWithEvent:	v@:@
 canGoBack	c@:
 canMakePayments	c@:
@@ -278,6 +281,9 @@ decodeValueOfObjCType:at:	v@:r*^v
 defaultCenter	@@:
 defaultManager	@@:
 defaultQueue	@@:
+delaysTouchesBegan	c@:
+delaysTouchesEnded	c@:
+delegate	@@:
 deleteCookie:	v@:@
 deleteRowsAtIndexPaths:withRowAnimation:	v@:@i
 dequeueReusableCellWithIdentifier:	@@:@
@@ -304,6 +310,7 @@ dictionaryWithObjectsAndKeys:	@@:@	nil-list
 dictionaryWithValuesForKeys:	@@:@
 didChangeValueForKey:	v@:@
 didMoveToParentViewController:	v@:@
+direction	I@:
 dismissModalViewControllerAnimated:	v@:c
 dismissPopoverAnimated:	v@:c
 dismissViewControllerAnimated:completion:	v@:c@?
@@ -364,6 +371,7 @@ formUnionWithCharacterSet:	v@:@
 fragment	@@:
 frame	{CGRect={CGPoint=ff}{CGSize=ff}}@:
 functionWithName:	@@:@
+gestureRecognizers	@@:
 getArgument:atIndex:	v@:^vi
 getArgumentTypeAtIndex:	r*@:I
 getBytes:length:	v@:^vI
@@ -554,6 +562,7 @@ localizedTitle	@@:
 localPlayer	@@:
 localTimeZone	@@:
 locationInView:	{CGPoint=ff}@:@
+locationOfTouch:inView:	{CGPoint=ff}@:I@
 lock	v@:
 lockWhenCondition:	v@:i
 lockWhenCondition:beforeDate:	c@:i@
@@ -570,6 +579,7 @@ makeObjectsPerformSelector:	v@::
 makeObjectsPerformSelector:withObject:	v@::@
 matchID	@@:
 matchOutcome	i@:
+maximumNumberOfTouches	I@:
 message	@@:
 methodForSelector:	^?@::
 methodReturnLength	I@:
@@ -577,6 +587,8 @@ methodSignature	@@:
 methodSignatureForSelector:	@@::
 MIMEType	@@:
 minimumFontSize	f@:
+minimumNumberOfTouches	I@:
+minimumPressDuration	d@:
 minusSet:	v@:@
 modalTransitionStyle	i@:
 modalViewController	@@:
@@ -604,6 +616,9 @@ numberOfArguments	I@:
 numberOfButtons	i@:
 numberOfLines	i@:
 numberOfRowsInSection:	i@:i
+numberOfTapsRequired	I@:
+numberOfTouches	I@:
+numberOfTouchesRequired	I@:
 numberWithBool:	@@:c
 numberWithDouble:	@@:d
 numberWithFloat:	@@:f	float
@@ -723,6 +738,7 @@ removeObjectsInRange:	v@:{_NSRange=II}
 removeObserver:	v@:@
 removeObserver:forKeyPath:	v@:@@
 removeObserver:name:object:	v@:@@@
+removeTarget:action:	v@:@:
 removeTarget:action:forControlEvents:	v@:@:I
 removeTransactionObserver:	v@:@
 renderbufferStorage:fromDrawable:	c@:I@
@@ -735,6 +751,8 @@ requestAccessToAccountsWithType:options:completion:	v@:@@@?
 requestAccessToAccountsWithType:withCompletionHandler:	v@:@@?
 requestWithURL:	@@:@
 requestWithURL:cachePolicy:timeoutInterval:	@@:@Id
+requireGestureRecognizerToFail:	v@:@
+reset	v@:
 resetAchievementsWithCompletionHandler:	v@:@?
 resignFirstResponder	c@:
 resizableImageWithCapInsets:	@@:{UIEdgeInsets=ffff}
@@ -795,6 +813,7 @@ setAlertAction:	v@:@
 setAlertBody:	v@:@
 setAlertViewStyle:	v@:i
 setAllHTTPHeaderFields:	v@:@
+setAllowableMovement:	v@:f
 setAllowsInlineMediaPlayback:	v@:c
 setAllowsSelection:	v@:c
 setAlpha:	v@:f
@@ -837,6 +856,7 @@ setByAddingObjectsFromSet:	@@:@
 setCachePolicy:	v@:I
 setCalculationMode:	v@:@
 setCancelButtonIndex:	v@:i
+setCancelsTouchesInView:	v@:c
 setCategory:	v@:@
 setCategory:error:	c@:@^@
 setCcRecipients:	v@:@
@@ -865,7 +885,11 @@ setCurrentTime:	v@:d
 setData:forPasteboardType:	v@:@@
 setDateFormat:	v@:@
 setDateStyle:	v@:I
+setDelaysTouchesBegan:	v@:c
+setDelaysTouchesEnded:	v@:c
+setDelegate:	v@:@
 setDictionary:	v@:@
+setDirection:	v@:I
 setDisableActions:	v@:c
 setDouble:forKey:	v@:d@
 setDrawableProperties:	v@:@
@@ -884,6 +908,7 @@ setFrameInterval:	v@:i
 setFromValue:	v@:@
 setFullscreen:	v@:c
 setGameCenterDelegate:	v@:@
+setGestureRecognizers:	v@:@
 setHidden:	v@:c
 setHighlighted:	v@:c
 setHighlightedImage:	v@:@
@@ -923,6 +948,7 @@ setMessageBody:isHTML:	v@:@c
 setMessageComposeDelegate:	v@:@
 setMinimumFontSize:	v@:f
 setMinimumNumberOfTouches:	v@:I
+setMinimumPressDuration:	v@:d
 setMinPlayers:	v@:I
 setModalPresentationStyle:	v@:i
 setModalTransitionStyle:	v@:i
@@ -934,6 +960,8 @@ setNetworkActivityIndicatorVisible:	v@:c
 setNumberOfLines:	v@:i
 setNumberOfLoops:	v@:i
 setNumberOfPages:	v@:i
+setNumberOfTapsRequired:	v@:I
+setNumberOfTouchesRequired:	v@:I
 setNumberStyle:	v@:I
 setObject:atIndex:	v@:@I
 setObject:atIndexedSubscript:	v@:@I
@@ -964,7 +992,9 @@ setReturnKeyType:	v@:i
 setReturnValue:	v@:^v
 setRightBarButtonItem:	v@:@
 setRootViewController:	v@:@
+setRotation:	v@:f
 setRowHeight:	v@:f
+setScale:	v@:f
 setScalesPageToFit:	v@:c
 setScalingMode:	v@:i
 setScrollEnabled:	v@:c
@@ -992,6 +1022,7 @@ setShowsVerticalScrollIndicator:	v@:c
 setSoundName:	v@:@
 setSpeed:	v@:f	float
 setStartPoint:	v@:{CGPoint=ff}
+setState:	v@:i
 setStatusBarHidden:	v@:c
 setStatusBarHidden:withAnimation:	v@:ci
 setStatusBarOrientation:animated:	v@:ic
@@ -1018,6 +1049,7 @@ setTrackImage:	v@:@
 setTrackTintColor:	v@:@
 setTransform:	v@:{CGAffineTransform=ffffff}
 setTransform:	v@:{CATransform3D=ffffffffffffffff}	class:CALayer
+setTranslation:inView:	v@:{CGPoint=ff}@
 setTurnBasedMatchmakerDelegate:	v@:@
 setType:	v@:@
 setURL:	v@:@
@@ -1154,6 +1186,7 @@ transactionState	i@:
 transform	{CGAffineTransform=ffffff}@:
 transform	{CATransform3D=ffffffffffffffff}@:	class:CALayer
 transitionFromViewController:toViewController:duration:options:animations:completion:	v@:@@dI@?@?
+translationInView:	{CGPoint=ff}@:@
 tryLock	c@:
 type	@@:
 type	i@:	class:UIEvent
@@ -1191,6 +1224,7 @@ valueWithCGRect:	@@:{CGRect={CGPoint=ff}{CGSize=ff}}
 valueWithCGSize:	@@:{CGSize=ff}
 valueWithNonretainedObject:	@@:@
 valueWithPointer:	@@:r^v
+velocity	f@:
 velocityInView:	{CGPoint=ff}@:@
 view	@@:
 viewDidAppear:	v@:c

@@ -152,6 +152,41 @@ fn scheduling_uses_darwins_policies_and_priorities() {
     assert_eq!(call("pthread_setschedparam", [me, 2, parameters, 0], &[]).0, 22, "above 47: EINVAL");
     assert_eq!(call("pthread_getschedparam", [me, policy, parameters, 0], &[]).0, 0);
     assert_eq!((mem().read_u32(policy), mem().read_u32(parameters)), (2, 46), "what the thread was given");
+    // A thread that doesn't exist (or has ended): ESRCH, nothing read or kept.
+    let gone = 0x7FFF_FFF0;
+    mem().write_u32(policy, 0xAAAA);
+    assert_eq!(call("pthread_getschedparam", [gone, policy, parameters, 0], &[]).0, 3, "ESRCH");
+    assert_eq!(mem().read_u32(policy), 0xAAAA, "left alone");
+    mem().write_u32(parameters, 40);
+    assert_eq!(call("pthread_setschedparam", [gone, 2, parameters, 0], &[]).0, 3, "ESRCH");
+}
+
+#[test]
+fn mbrtowc_keeps_a_partial_character_in_its_state() {
+    // UTF-8 é (C3 A9) a byte at a time: (size_t)-2 with the first byte kept
+    // in the caller's mbstate_t (Darwin's is 128 bytes), then é from the
+    // second, counting only the byte it read.
+    let (out, state, text) = (alloc(4), alloc(128), alloc(4));
+    mem().write_bytes(text, &[0xC3, 0xA9, 0x41, 0]);
+    assert_eq!(call("mbrtowc", [out, text, 1, state], &[]).0, u32::MAX - 1, "incomplete");
+    assert_ne!(mem().read_u32(state), 0, "the first byte is kept");
+    assert_eq!(call("mbrtowc", [out, text + 1, 3, state], &[]).0, 1);
+    assert_eq!(mem().read_u32(out), 0xE9, "é");
+    assert_eq!(mem().read_u32(state), 0, "back to the start");
+    assert_eq!(call("mbrtowc", [out, text + 2, 2, state], &[]).0, 1);
+    assert_eq!(mem().read_u32(out), 0x41);
+    // A NULL state is the function's own.
+    assert_eq!(call("mbrtowc", [out, text, 1, 0], &[]).0, u32::MAX - 1);
+    assert_eq!(call("mbrtowc", [out, text + 1, 1, 0], &[]).0, 1);
+    assert_eq!(mem().read_u32(out), 0xE9);
+    // A byte that can't follow what was kept: EILSEQ, and the state starts over.
+    assert_eq!(call("mbrtowc", [out, text, 1, state], &[]).0, u32::MAX - 1);
+    assert_eq!(call("mbrtowc", [out, text + 2, 1, state], &[]).0, u32::MAX);
+    assert_eq!(errno(), 92, "Darwin's EILSEQ");
+    assert_eq!(mem().read_u32(state), 0);
+    // mbrlen keeps a state the same way.
+    assert_eq!(call("mbrlen_l", [text, 1, state, 0], &[]).0, u32::MAX - 1);
+    assert_eq!(call("mbrlen_l", [text + 1, 1, state, 0], &[]).0, 1);
 }
 
 #[test]

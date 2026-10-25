@@ -34,6 +34,48 @@ fn vsnprintf(buffer: u32, size: u32, format: u32, list: u32) -> Ret {
     Ret::U32(text.len() as u32)
 }
 
+/// What a multibyte call made of the bytes given after those `kept` from
+/// before (a state's first bytes: the start of a character, zeros after).
+#[derive(Debug, PartialEq)]
+enum Utf8Step {
+    /// A whole character, and how many of the given bytes it took.
+    Character(u32, u32),
+    /// Not whole yet: every given byte is now kept.
+    Incomplete,
+    Invalid,
+}
+
+fn utf8_step(kept: &mut [u8; 4], input: &[u8]) -> Utf8Step {
+    let held = kept.iter().position(|&b| b == 0).unwrap_or(4);
+    let mut bytes = kept[..held].to_vec();
+    *kept = [0; 4];
+    let Some(&lead) = bytes.first().or(input.first()) else { return Utf8Step::Incomplete };
+    let needed = match lead {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF7 => 4,
+        _ => return Utf8Step::Invalid,
+    };
+    let mut used = 0;
+    while bytes.len() < needed {
+        let Some(&byte) = input.get(used) else { break };
+        if !bytes.is_empty() && byte & 0xC0 != 0x80 {
+            return Utf8Step::Invalid;
+        }
+        bytes.push(byte);
+        used += 1;
+    }
+    if bytes.len() < needed {
+        kept[..bytes.len()].copy_from_slice(&bytes);
+        return Utf8Step::Incomplete;
+    }
+    match std::str::from_utf8(&bytes).ok().and_then(|text| text.chars().next()) {
+        Some(character) => Utf8Step::Character(character as u32, used as u32),
+        None => Utf8Step::Invalid,
+    }
+}
+
 fn set_errno(uc: &Uc, value: i32) {
     let slot = uc.get_data().errno_slot;
     mem().write_u32(slot, crate::runtime::guest_errno(value) as u32);
@@ -813,44 +855,45 @@ pub fn handler(name: &str) -> Option<Handler> {
             Ret::U32(encoded.len() as u32)
         }),
         // mbrtowc(out, text, length, state) / mbtowc(out, text, length) / mbrlen(text, length, state).
+        // A character split over calls waits in the state (a NULL state is
+        // the function's own); mbtowc keeps none: UTF-8 has no shift states.
         "mbrtowc" | "mbtowc" | "mbrlen" => handler!(|uc, a| {
+            static MBRTOWC_STATE: std::sync::Mutex<[u8; 4]> = std::sync::Mutex::new([0; 4]);
+            static MBRLEN_STATE: std::sync::Mutex<[u8; 4]> = std::sync::Mutex::new([0; 4]);
             let name = uc.get_data().current_call;
             let out = if name == "mbrlen" { 0 } else { a.u32() };
             let (text, length) = (a.u32(), a.u32());
-            if text == 0 {
-                return Ret::U32(0);
-            }
-            let available = (length.min(4)) as usize;
-            let bytes = mem().bytes(text, available).to_vec();
-            let needed = match bytes.first() {
-                None => return Ret::U32(u32::MAX - 1),
-                Some(0) => {
-                    if out != 0 {
-                        mem().write_u32(out, 0);
-                    }
-                    return Ret::U32(0);
-                }
-                Some(&b) if b < 0x80 => 1,
-                Some(&b) if b >> 5 == 0b110 => 2,
-                Some(&b) if b >> 4 == 0b1110 => 3,
-                Some(&b) if b >> 3 == 0b11110 => 4,
-                Some(_) => {
-                    set_errno(uc, libc::EILSEQ);
-                    return Ret::U32(u32::MAX);
-                }
+            let state = if name == "mbtowc" { 0 } else { a.u32() };
+            let mut kept = match (name, state) {
+                ("mbtowc", _) => [0; 4],
+                ("mbrlen", 0) => *MBRLEN_STATE.lock().unwrap_or_else(|e| e.into_inner()),
+                (_, 0) => *MBRTOWC_STATE.lock().unwrap_or_else(|e| e.into_inner()),
+                (_, state) => mem().bytes(state, 4).try_into().unwrap(),
             };
-            if needed > bytes.len() {
-                // Incomplete: -2 (mbtowc reports it as invalid).
-                return Ret::U32(if name == "mbtowc" { u32::MAX } else { u32::MAX - 1 });
+            let decoded = if text == 0 {
+                // As for an empty string: back to the start (a half-read character there is an error).
+                let half_read = kept[0] != 0;
+                kept = [0; 4];
+                if half_read { Utf8Step::Invalid } else { Utf8Step::Character(0, 0) }
+            } else {
+                utf8_step(&mut kept, mem().bytes(text, length.min(4) as usize))
+            };
+            match (name, state) {
+                ("mbtowc", _) => {}
+                ("mbrlen", 0) => *MBRLEN_STATE.lock().unwrap_or_else(|e| e.into_inner()) = kept,
+                (_, 0) => *MBRTOWC_STATE.lock().unwrap_or_else(|e| e.into_inner()) = kept,
+                (_, state) => mem().write_bytes(state, &kept),
             }
-            match std::str::from_utf8(&bytes[..needed]).ok().and_then(|text| text.chars().next()) {
-                Some(character) => {
-                    if out != 0 {
-                        mem().write_u32(out, character as u32);
+            match decoded {
+                Utf8Step::Character(character, used) => {
+                    if out != 0 && text != 0 {
+                        mem().write_u32(out, character);
                     }
-                    Ret::U32(needed as u32)
+                    Ret::U32(if character == 0 { 0 } else { used })
                 }
-                None => {
+                // Incomplete: -2 (mbtowc reports it as invalid).
+                Utf8Step::Incomplete if name != "mbtowc" => Ret::U32(u32::MAX - 1),
+                Utf8Step::Incomplete | Utf8Step::Invalid => {
                     set_errno(uc, libc::EILSEQ);
                     Ret::U32(u32::MAX)
                 }

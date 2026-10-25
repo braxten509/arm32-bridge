@@ -1461,6 +1461,8 @@ fn threads() {
 // { int sched_priority; char opaque[4]; } ----
 
 const SCHED_OTHER: u32 = 1;
+/// No such thread (or it has ended).
+const ESRCH: u32 = 3;
 const DARWIN_POLICIES: [u32; 3] = [1, 2, 4];
 const DEFAULT_PRIORITY: u32 = 31;
 const PRIORITIES: std::ops::RangeInclusive<u32> = 15..=47;
@@ -1515,6 +1517,9 @@ fn scheduling() {
         "pthread_getschedparam",
         handler!(|uc, a| {
             let (thread, policy, parameters) = (a.u32(), a.u32(), a.u32());
+            if !arm32_bridge::imports::threads::is_live(thread) {
+                return Ret::U32(ESRCH);
+            }
             let given = thread_scheduling().lock().unwrap_or_else(|e| e.into_inner()).get(&thread).copied();
             let is_current = matches!(forward(uc, bionic!("pthread_self"), [0; 4]), Ret::U32(me) if me == thread);
             let (darwin_policy, priority) = given.unwrap_or_else(|| if is_current { host_scheduling() } else { (SCHED_OTHER, DEFAULT_PRIORITY) });
@@ -1532,6 +1537,9 @@ fn scheduling() {
         "pthread_setschedparam",
         handler!(|uc, a| {
             let (thread, policy, parameters) = (a.u32(), a.u32(), a.u32());
+            if !arm32_bridge::imports::threads::is_live(thread) {
+                return Ret::U32(ESRCH);
+            }
             let priority = mem().read_u32(parameters);
             if !valid_scheduling(policy, priority) {
                 return Ret::U32(22);
