@@ -825,6 +825,11 @@ fn attach_with_geometry(parent: Id, view: Id, index: Option<usize>, geometry: Ge
     if view == 0 || parent == 0 {
         return;
     }
+    // Controllers whose views come on screen or leave it with this one hear
+    // it before (will) and after (did), as in UIKit.
+    let (was_shown, will_show) = (on_screen(view), on_screen(parent));
+    let leaving = if was_shown && !will_show { disappearing(view) } else { Vec::new() };
+    let arriving = if !was_shown && will_show { appearing(view) } else { Vec::new() };
     detach(view);
     let list = &mut view_state(parent).subviews;
     match index {
@@ -851,6 +856,8 @@ fn attach_with_geometry(parent: Id, view: Id, index: Option<usize>, geometry: Ge
     if window_of(parent) != 0 && runtime::responds(view, "didMoveToWindow") {
         runtime::send(view, "didMoveToWindow", &[]);
     }
+    disappeared(leaving);
+    appeared(arriving);
 }
 
 extern "C" fn view_add_subview(this: Id, _: Sel, view: Id) {
@@ -872,7 +879,7 @@ extern "C" fn view_insert_below(this: Id, _: Sel, view: Id, sibling: Id) {
 }
 
 extern "C" fn view_remove_from_superview(this: Id, _: Sel) {
-    detach(this);
+    take_out(this);
     crate::fw::media::view_removed(this);
 }
 
@@ -1122,6 +1129,7 @@ pub fn windows() -> Vec<Id> {
 
 extern "C" fn window_make_key_and_visible(this: Id, _: Sel) {
     *KEY_WINDOW.lock().unwrap() = this;
+    let was_shown = on_screen(this);
     let mut windows = WINDOWS.lock().unwrap();
     if !windows.contains(&this) {
         windows.push(this);
@@ -1131,7 +1139,11 @@ extern "C" fn window_make_key_and_visible(this: Id, _: Sel) {
     property_set(this, "hidden", 0);
     crate::log!("window {this:#x} shown");
     let root = property_get(this, "rootViewController").unwrap_or(0) as Id;
-    if will_appear(root, false) {
+    let showing_root = will_appear(root, false);
+    // The other controllers whose views are in the window come on screen with it.
+    let arriving = if was_shown { Vec::new() } else { appearing(this) };
+    appeared(arriving);
+    if showing_root {
         did_appear(root, false);
     }
 }
@@ -1148,34 +1160,133 @@ fn tell_appearance(controller: Id, name: &str, animated: bool) {
     }
 }
 
-/// viewWillAppear: unless the controller is on screen already; whether it was sent.
+/// viewWillAppear: unless the controller is on screen already or on its
+/// way ("appearing": whoever sent viewWillAppear: sends viewDidAppear:);
+/// whether it was sent.
 fn will_appear(controller: Id, animated: bool) -> bool {
-    if controller == 0 || property_get(controller, "appeared") == Some(1) {
+    if controller == 0 || property_get(controller, "appeared") == Some(1) || property_get(controller, "appearing") == Some(1) {
         return false;
     }
+    property_set(controller, "appearing", 1);
     tell_appearance(controller, "viewWillAppear:", animated);
     true
 }
 
 fn did_appear(controller: Id, animated: bool) {
+    property_set(controller, "appearing", 0);
+    if property_get(controller, "appeared") == Some(1) {
+        return;
+    }
     property_set(controller, "appeared", 1);
     tell_appearance(controller, "viewDidAppear:", animated);
     // Tests tap on this line (IOS_TAPS "on=screen shown: <class>"), once it is drawn.
     crate::fw::pictures::on_next_draw(format!("screen shown: {}", crate::fw::string::describe_class_of(controller)));
 }
 
-/// viewWillDisappear: if the controller is on screen; whether it was sent.
+/// viewWillDisappear: if the controller is on screen and not already on its
+/// way out; whether it was sent.
 fn will_disappear(controller: Id, animated: bool) -> bool {
-    if controller == 0 || property_get(controller, "appeared") != Some(1) {
+    if controller == 0 || property_get(controller, "appeared") != Some(1) || property_get(controller, "disappearing") == Some(1) {
         return false;
     }
+    property_set(controller, "disappearing", 1);
     tell_appearance(controller, "viewWillDisappear:", animated);
     true
 }
 
 fn did_disappear(controller: Id, animated: bool) {
+    property_set(controller, "disappearing", 0);
+    if property_get(controller, "appeared") != Some(1) {
+        return;
+    }
     property_set(controller, "appeared", 0);
     tell_appearance(controller, "viewDidDisappear:", animated);
+}
+
+/// Whether a view is in a window that is shown.
+fn on_screen(view: Id) -> bool {
+    let window = window_of(view);
+    window != 0 && property_get(window, "hidden").unwrap_or(0) == 0 && WINDOWS.lock().unwrap().contains(&window)
+}
+
+/// Whether a container passes appearance on to its children (iOS 5's
+/// automaticallyForwardAppearanceAndRotationMethodsToChildViewControllers,
+/// iOS 6's shouldAutomaticallyForwardAppearanceMethods; yes unless it says NO).
+fn forwards_to_children(controller: Id) -> bool {
+    ["automaticallyForwardAppearanceAndRotationMethodsToChildViewControllers", "shouldAutomaticallyForwardAppearanceMethods"]
+        .iter()
+        .all(|name| !runtime::responds(controller, name) || runtime::send(controller, name, &[]) & 0xFF != 0)
+}
+
+/// The controllers whose own views are in `view`'s tree, outer ones first,
+/// that UIKit tells about appearance: not those inside a container that
+/// passes nothing on.
+fn controllers_in(view: Id) -> Vec<Id> {
+    fn walk(view: Id, forward: bool, out: &mut Vec<Id>, depth: usize) {
+        if view == 0 || depth > 256 {
+            return;
+        }
+        let mut forward_inside = forward;
+        let controller = property_get(view, "viewController").unwrap_or(0) as Id;
+        if controller != 0 && property_get(controller, "view") == Some(view as u64) {
+            if forward {
+                out.push(controller);
+            }
+            forward_inside = forward && forwards_to_children(controller);
+        }
+        for child in view_state(view).subviews.clone() {
+            walk(child, forward_inside, out, depth + 1);
+        }
+    }
+    let mut out = Vec::new();
+    walk(view, true, &mut out, 0);
+    out
+}
+
+/// `view` is about to come on screen: viewWillAppear: to the controllers
+/// in it (not those already told by whoever is showing them); the ones told,
+/// for `appeared` once it is there.
+fn appearing(view: Id) -> Vec<Id> {
+    controllers_in(view).into_iter().filter(|&controller| will_appear(controller, false)).collect()
+}
+
+fn appeared(controllers: Vec<Id>) {
+    for controller in controllers {
+        did_appear(controller, false);
+    }
+}
+
+/// `view` is about to leave the screen: viewWillDisappear: to the controllers in it.
+fn disappearing(view: Id) -> Vec<Id> {
+    controllers_in(view).into_iter().filter(|&controller| will_disappear(controller, false)).collect()
+}
+
+fn disappeared(controllers: Vec<Id>) {
+    for controller in controllers {
+        did_disappear(controller, false);
+    }
+}
+
+/// Takes a view out of its superview, with the appearance calls for the
+/// controllers that leave the screen with it.
+fn take_out(view: Id) {
+    let leaving = if on_screen(view) { disappearing(view) } else { Vec::new() };
+    detach(view);
+    disappeared(leaving);
+}
+
+/// A shown window hidden or unhidden: what is in it leaves or comes back.
+extern "C" fn window_set_hidden(this: Id, s: Sel, hidden: u8) {
+    let listed = WINDOWS.lock().unwrap().contains(&this);
+    let was_shown = listed && property_get(this, "hidden").unwrap_or(0) == 0;
+    let (leaving, arriving) = match (listed, was_shown, hidden != 0) {
+        (true, true, true) => (disappearing(this), Vec::new()),
+        (true, false, false) => (Vec::new(), appearing(this)),
+        _ => (Vec::new(), Vec::new()),
+    };
+    view_set_hidden(this, s, hidden);
+    disappeared(leaving);
+    appeared(arriving);
 }
 
 extern "C" fn window_make_key(this: Id, _: Sel) {
@@ -1197,7 +1308,7 @@ extern "C" fn window_set_root_controller(this: Id, _: Sel, controller: Id) {
         close_presented(old, false, false);
         let hiding = shown && will_disappear(old, false);
         if let Some(view) = property_get(old, "view").map(|view| view as Id).filter(|&view| view != 0 && view_state(view).superview == this) {
-            detach(view);
+            take_out(view);
         }
         if hiding {
             did_disappear(old, false);
@@ -1352,7 +1463,7 @@ fn show_presented(presenter: Id, controller: Id, animated: bool) {
     attach(window, view, None);
     property_set(controller, "presentedInWindow", window as u64);
     if covered != 0 {
-        detach(covered);
+        take_out(covered);
         property_set(controller, "coveredView", covered as u64);
     }
     if hiding {
@@ -1379,7 +1490,7 @@ fn hide_presented(controller: Id, uncovered: Id, animated: bool, restore: bool) 
         attach(window, covered, index);
     }
     if view != 0 && view_state(view).superview == window {
-        detach(view);
+        take_out(view);
     }
     property_set(controller, "presentedInWindow", 0);
     property_set(controller, "coveredView", 0);
@@ -2123,6 +2234,7 @@ pub fn register(r: &mut Registry) {
         window,
         &[
             ("makeKeyAndVisible", window_make_key_and_visible as usize),
+            ("setHidden:", window_set_hidden as usize),
             ("makeKeyWindow", window_make_key as usize),
             ("rootViewController", window_root_controller as usize),
             ("setRootViewController:", window_set_root_controller as usize),
