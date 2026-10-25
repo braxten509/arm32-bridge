@@ -1040,7 +1040,13 @@ pub(super) fn throw_in_guest(b: &mut Bridge, g: &dyn GuestSide, exception: usize
 fn host_signature(b: &Bridge, class: &str, meta: bool, sel: &str) -> Result<(Signature, HostCallOptions), String> {
     if let Some(entry) = framework_row(class, sel) {
         let options =
-            HostCallOptions { real_float: entry.real_float, varargs: entry.varargs, arrays: entry.arrays, host_bytes: entry.host_bytes };
+            HostCallOptions {
+                real_float: entry.real_float,
+                varargs: entry.varargs,
+                arrays: entry.arrays,
+                host_bytes: entry.host_bytes,
+                not_found: entry.not_found,
+            };
         return Ok((entry.signature.clone(), options));
     }
     if let Some(types) = b.classes.types_for_selector(sel) {

@@ -734,7 +734,7 @@ pub fn responds(receiver: Id, sel_name: &str) -> bool {
 /// Sends a message from Rust with up to four pointer-sized arguments.
 pub fn send(receiver: Id, sel_name: &str, args: &[usize]) -> usize {
     let s = sel(sel_name);
-    if receiver == 0 {
+    if receiver == 0 || crate::fw::exception::pending() {
         return 0;
     }
     let mut receiver = receiver;

@@ -691,6 +691,47 @@ fn host_raises_reach_game_code_as_game_throws() {
     assert!(error.contains("uncaught Objective-C exception: NSUnknownKeyException"), "{error}");
 }
 
+/// A game exception escaping game code that host code called (game → host
+/// → game) stops at that call instead of unwinding past the host's frames
+/// into an outer game frame: the host gets it as a raise, which the bridge
+/// throws again in the game code that called the host.
+#[test]
+fn game_exceptions_stop_at_the_host_call_they_escape() {
+    use super::objc::bridge::GuestSide;
+    use super::objc::wire::Translator;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static OUTER_ASKED: AtomicU32 = AtomicU32::new(0);
+    fn outer_personality(_uc: &mut runtime::Uc, _: &mut Args) -> runtime::Ret {
+        OUTER_ASKED.fetch_add(1, Ordering::SeqCst);
+        runtime::Ret::U32(8) // _URC_CONTINUE_UNWIND
+    }
+    cxx();
+    let class = crate::objc::runtime::class_named("NSException");
+    let host = crate::objc::runtime::send(class, "exceptionWithName:reason:userInfo:", &[crate::fw::string::make("Escaping"), 0, 0]);
+    let exception = super::objc::wire::test_bridge().lock().unwrap().guest_object(&Translator, host).unwrap();
+    ios32::register_function("test_outer_personality", outer_personality);
+    // An outer game frame's SjLj context, as the game code that called the host registered it.
+    let top = {
+        let _gil = runtime::hold_gil();
+        runtime::engine().get_data().tls_block + 18 * 4
+    };
+    let outer = alloc(64);
+    mem().write_u32(outer, mem().read_u32(top));
+    mem().write_u32(outer + 24, runtime::stub_for("test_outer_personality"));
+    mem().write_u32(top, outer);
+    let (result, raised) = crate::fw::exception::catching(|| Translator.call(runtime::stub_for("objc_exception_throw"), &[exception]));
+    let left = mem().read_u32(top);
+    mem().write_u32(top, mem().read_u32(outer));
+    {
+        let _gil = runtime::hold_gil();
+        runtime::engine().get_data_mut().fault = None;
+    }
+    assert!(result.is_ok(), "the call ends at the host: {result:?}");
+    assert_eq!(raised, Some(host), "the host has the game's exception");
+    assert_eq!(OUTER_ASKED.load(Ordering::SeqCst), 0, "unwinding never reached the outer game frame");
+    assert_eq!(left, outer, "the outer frame's context is the top again");
+}
+
 #[test]
 fn objc_catch_clauses_match_by_class_and_hand_over_the_object() {
     use super::objc::wire::{test_bridge, Translator};

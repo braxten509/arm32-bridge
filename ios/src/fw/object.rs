@@ -690,7 +690,7 @@ extern "C" fn value_for_key(this: Id, _: Sel, key: Id) -> Id {
 fn raise_unknown_key(this: Id, method: &str, key: Id) {
     let class = crate::fw::string::describe_class_of(this);
     let key_text = crate::fw::string::get(key);
-    crate::log!("{method} {class} has no key {key_text}; raising NSUnknownKeyException");
+    crate::log!("{method} {class} has no key {key_text}; raising {}", crate::fw::exception::UNDEFINED_KEY);
     let reason = format!("[<{class} {this:#x}> {method}]: this class is not key value coding-compliant for the key {key_text}.");
     let info = crate::fw::collections::dictionary_from(&[
         (crate::fw::string::make("NSTargetObjectUserInfoKey"), this),
@@ -699,7 +699,7 @@ fn raise_unknown_key(this: Id, method: &str, key: Id) {
     let exception = runtime::send(
         runtime::class_named("NSException"),
         "exceptionWithName:reason:userInfo:",
-        &[crate::fw::string::make("NSUnknownKeyException"), crate::fw::string::make(&reason), info],
+        &[crate::fw::string::make(crate::fw::exception::UNDEFINED_KEY), crate::fw::string::make(&reason), info],
     );
     crate::fw::exception::raise(exception);
 }
@@ -1048,9 +1048,20 @@ mod tests {
             (crate::fw::exception::catching(|| runtime::send(one, "setValue:forKey:", &[s("x"), s("nope")])).1, "set"),
         ] {
             let raised = raised.unwrap_or_else(|| panic!("{what} of an unknown key raised nothing"));
-            assert_eq!(string::get(runtime::send(raised, "name", &[])), "NSUnknownKeyException");
+            // Apple: the constant NSUndefinedKeyException is @"NSUnknownKeyException".
+            let (constant, _) = crate::symbols::lookup("NSUndefinedKeyException").expect("NSUndefinedKeyException exported");
+            let constant = string::get(unsafe { *(constant as *const Id) });
+            assert_eq!(constant, "NSUnknownKeyException");
+            assert_eq!(string::get(runtime::send(raised, "name", &[])), constant);
             assert!(string::get(runtime::send(raised, "reason", &[])).contains("not key value coding-compliant for the key nope"));
         }
+        // A raise ends the host method: members after the one that raised are left alone.
+        let plain = runtime::send(runtime::class_named("NSObject"), "new", &[]);
+        let after = thing("after", 1, 0);
+        let mixed = collections::array_from(&[plain, after]);
+        let (_, raised) = crate::fw::exception::catching(|| runtime::send(mixed, "setValue:forKey:", &[s("changed"), s("title")]));
+        assert!(raised.is_some(), "the plain object has no title");
+        assert_eq!(string::get(thing_title(after, 0)), "after");
     }
 
     /// Fields of a 32-bit game's object: long is 4 bytes, 8-byte values may

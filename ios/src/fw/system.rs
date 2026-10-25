@@ -353,13 +353,14 @@ fn decode_object(coder: Id, number: u64) -> Id {
             }
             return made;
         }
-        if r.depth >= MAX_DEPTH {
+        let Some(value) = r.objects.get(number as usize).cloned() else { return 0 };
+        // As in encode_object: plain strings and numbers don't count.
+        if matches!(value, Value::Dict(_)) && r.depth >= MAX_DEPTH {
             r.failed = true;
             drop(r);
             crate::log!("NSKeyedUnarchiver: objects nested too deep; nil");
             return 0;
         }
-        let Some(value) = r.objects.get(number as usize).cloned() else { return 0 };
         let class = value.get("$class").and_then(Value::as_uid).and_then(|c| r.objects.get(c as usize).cloned());
         (value, class)
     };
@@ -1323,7 +1324,13 @@ mod tests {
         assert_eq!(items[1], back, "the array holds itself again");
 
         let mut deep = string::make("bottom");
-        for _ in 0..MAX_DEPTH + 10 {
+        for _ in 0..MAX_DEPTH {
+            deep = collections::array_from(&[deep]);
+        }
+        let back = unarchive(&archive(deep).expect("nesting up to the limit is written")).expect("and read back");
+        let bottom = (0..MAX_DEPTH).fold(back, |list, _| collections::array_items(list)[0]);
+        assert_eq!(string::get(bottom), "bottom");
+        for _ in 0..10 {
             deep = collections::array_from(&[deep]);
         }
         assert!(archive(deep).is_none(), "nesting past the limit isn't written");
