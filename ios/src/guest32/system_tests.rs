@@ -449,7 +449,9 @@ fn gil_mode_sqlite_callbacks_let_other_threads_wait_for_the_connection() {
         let answer = call("sqlite3_exec", [DB.load(Ordering::SeqCst), sql, callback, 0], &[0]).0;
         done.send(answer).unwrap();
     });
-    let wait = std::time::Duration::from_millis(500);
+    // Only a deadlock runs into this (a passing run answers at once); a slow
+    // PC under load needed more than 500 ms.
+    let wait = std::time::Duration::from_secs(5);
     assert_eq!(exec.recv_timeout(wait), Ok(0), "deadlock: the callback couldn't get the guest lock back");
     let other = OTHER.lock().unwrap().take().expect("the callback ran");
     assert_eq!(other.recv_timeout(wait), Ok(0), "the other thread's prepare went through after exec");
