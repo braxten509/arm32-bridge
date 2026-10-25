@@ -1690,6 +1690,14 @@ mod tests {
         0
     }
 
+    /// Only the audio graphs at 44100 Hz: tests running meanwhile play music,
+    /// system sounds and OpenAL into the full mix.
+    fn mix_graphs(out: &mut [f32]) {
+        out.fill(0.0);
+        let frames = out.len() / 2;
+        mix_graph(out, frames, 44100.0);
+    }
+
     fn energy(out: &[f32], channel: usize) -> f32 {
         out.iter().skip(channel).step_by(2).map(|s| s * s).sum::<f32>()
     }
@@ -1713,7 +1721,7 @@ mod tests {
         unit_set_parameter(unit, 3, INPUT_SCOPE, 3, 0.0, 0);
         with_graph(|g| g.running.insert(0, true));
         let mut out = vec![0f32; 4410 * 2];
-        mix(&mut out, 44100);
+        mix_graphs(&mut out);
         let (left, right) = (energy(&out, 0), energy(&out, 1));
         assert!(left > 100.0 && (left - right).abs() < left * 0.01, "centred tone: {left} {right}");
         // 0.1 s needs about 2200 source frames, but one call never asks for more than iOS's maximum.
@@ -1721,14 +1729,14 @@ mod tests {
         assert!(most > 0 && most <= DEFAULT_MAX_FRAMES, "{most} frames in one call");
         // Hard right: the left side goes quiet.
         unit_set_parameter(unit, 0, INPUT_SCOPE, 3, 90.0, 0);
-        mix(&mut out, 44100);
+        mix_graphs(&mut out);
         assert!(energy(&out, 0) < energy(&out, 1) * 0.01);
         // 22050 Hz played at 44100: the tone keeps its pitch (441 Hz = 100 output frames a cycle).
         let crossings = out.chunks_exact(2).map(|f| f[1]).collect::<Vec<_>>().windows(2).filter(|w| w[0] < 0.0 && w[1] >= 0.0).count();
         assert!((43..=45).contains(&crossings), "{crossings} cycles in 0.1 s");
         // Disabled: silence.
         unit_set_parameter(unit, 5, INPUT_SCOPE, 3, 0.0, 0);
-        mix(&mut out, 44100);
+        mix_graphs(&mut out);
         assert_eq!(energy(&out, 1), 0.0);
         // A callback that disposes of its own graph is not called again.
         let mut graph = 0;
@@ -1743,7 +1751,7 @@ mod tests {
         graph_node_info(graph, node, std::ptr::null_mut(), &mut own);
         unit_set_property(own, MAXIMUM_FRAMES_PER_SLICE, 0, 0, &slice as *const u32 as *const u8, 4);
         graph_start(graph);
-        mix(&mut out, 44100);
+        mix_graphs(&mut out);
         assert_eq!(DISPOSING_CALLS.load(Ordering::Relaxed), 1, "called after its graph was disposed");
     }
 

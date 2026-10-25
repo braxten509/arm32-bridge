@@ -275,6 +275,19 @@ fn offset_or_guest(buffer: u32, pointer: u32) -> *mut c_void {
     }
 }
 
+/// The guest's view of a pointer GL hands back: guest memory as a guest
+/// address, a buffer offset as itself, anything else as NULL.
+fn guest_pointer_or_offset(pointer: *mut c_void) -> u32 {
+    let in_guest = (pointer as usize).wrapping_sub(mem().host(0) as usize);
+    if !pointer.is_null() && in_guest < (1usize << 32) {
+        in_guest as u32
+    } else if (pointer as usize) < (1usize << 32) {
+        pointer as usize as u32
+    } else {
+        0
+    }
+}
+
 /// A vertex array pointer.
 pub fn array_pointer(pointer: u32) -> *mut c_void {
     offset_or_guest(bound(GL_ARRAY_BUFFER), pointer)
@@ -712,17 +725,19 @@ fn special(name: &str) -> Option<Handler> {
             };
             Ret::Void
         }),
+        // One guest copy per text: contexts of different kinds (OpenGL ES 1
+        // and 2 in one game) give different versions and extension lists.
         "glGetString" => handler!(|uc, a| {
             let which = a.u32();
-            let key = format!("glGetString:{which:#x}");
-            if let Some(&address) = shared().state.data_imports.get(&key) {
-                return Ret::U32(address);
-            }
             let text = unsafe { host!("glGetString", fn(u32) -> *const libc::c_char)(which) };
             if text.is_null() {
                 return Ret::U32(0);
             }
             let text = unsafe { std::ffi::CStr::from_ptr(text) }.to_string_lossy().into_owned();
+            let key = format!("glGetString:{which:#x}:{text}");
+            if let Some(&address) = shared().state.data_imports.get(&key) {
+                return Ret::U32(address);
+            }
             Ret::U32(shared().cached_cstr(key, &text))
         }),
         "glMapBufferOES" => handler!(|uc, a| {
@@ -834,11 +849,15 @@ fn special(name: &str) -> Option<Handler> {
             crate::log::line("[bridge] the game set a GL debug callback; ignored");
             Ret::Void
         }),
+        // The array pointers the game set: a guest pointer (it was made a host
+        // one) or a buffer offset. Anything else (the debug callback, which is
+        // never passed on) reads as NULL.
         "glGetPointerv" => handler!(|uc, a| {
-            crate::log::line("[bridge] the game asked GL for a pointer; returning NULL");
-            let (_name, out) = (a.u32(), a.u32());
+            let (name, out) = (a.u32(), a.u32());
+            let mut pointer: *mut c_void = std::ptr::null_mut();
+            unsafe { host!("glGetPointerv", fn(u32, *mut *mut c_void))(name, &mut pointer) };
             if out != 0 {
-                mem().write_u32(out, 0);
+                mem().write_u32(out, guest_pointer_or_offset(pointer));
             }
             Ret::Void
         }),

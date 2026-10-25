@@ -508,6 +508,203 @@ fn freed_eagl_contexts_leave_the_gles_tracking() {
     assert!(!gles::context_tracked(current_egl), "then goes once let go");
 }
 
+// ----- OpenGL ES 1 -----
+
+const GL_FRAMEBUFFER_OES: u32 = 0x8D40;
+const GL_RENDERBUFFER_OES: u32 = 0x8D41;
+const GL_TEXTURE_2D: u32 = 0x0DE1;
+const GL_FLOAT: u32 = 0x1406;
+const GL_UNSIGNED_BYTE: u32 = 0x1401;
+const GL_RGBA: u32 = 0x1908;
+const GL_MODELVIEW: u32 = 0x1700;
+const GL_PROJECTION: u32 = 0x1701;
+const GL_VERTEX_ARRAY: u32 = 0x8074;
+const GL_COLOR_ARRAY: u32 = 0x8076;
+const GL_TEXTURE_COORD_ARRAY: u32 = 0x8078;
+const GL_TEXTURE_ENV: u32 = 0x2300;
+const GL_TEXTURE_ENV_MODE: u32 = 0x2200;
+
+/// [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES1], made current.
+fn es1_context() -> usize {
+    let class = crate::objc::runtime::class_named("EAGLContext");
+    let context = crate::objc::runtime::send(crate::objc::runtime::send(class, "alloc", &[]), "initWithAPI:", &[1]);
+    assert_ne!(context, 0, "an OpenGL ES 1 context was made");
+    assert_eq!(crate::objc::runtime::send(context, "API", &[]), 1);
+    make_current(context);
+    context
+}
+
+/// A framebuffer with a `width` x `height` colour renderbuffer, made the
+/// OES way an ES 1 game makes it; left bound. Returns (framebuffer, renderbuffer).
+fn es1_framebuffer(width: u32, height: u32) -> (u32, u32) {
+    let names = alloc(8);
+    call("glGenFramebuffersOES", [1, names, 0, 0], &[]);
+    call("glGenRenderbuffersOES", [1, names + 4, 0, 0], &[]);
+    let (framebuffer, renderbuffer) = (mem().read_u32(names), mem().read_u32(names + 4));
+    call("glBindFramebufferOES", [GL_FRAMEBUFFER_OES, framebuffer, 0, 0], &[]);
+    call("glBindRenderbufferOES", [GL_RENDERBUFFER_OES, renderbuffer, 0, 0], &[]);
+    call("glRenderbufferStorageOES", [GL_RENDERBUFFER_OES, 0x8058, width, height], &[]);
+    call("glFramebufferRenderbufferOES", [GL_FRAMEBUFFER_OES, 0x8CE0, GL_RENDERBUFFER_OES, renderbuffer], &[]);
+    assert_eq!(call("glCheckFramebufferStatusOES", [GL_FRAMEBUFFER_OES, 0, 0, 0], &[]).0, 0x8CD5, "the framebuffer is complete");
+    (framebuffer, renderbuffer)
+}
+
+/// Guest words with these values.
+fn words(values: &[u32]) -> u32 {
+    let address = alloc(values.len() as u32 * 4);
+    for (i, value) in values.iter().enumerate() {
+        mem().write_u32(address + i as u32 * 4, *value);
+    }
+    address
+}
+
+fn gl_ints(name: u32, count: u32) -> Vec<u32> {
+    let out = alloc(count * 4);
+    call("glGetIntegerv", [name, out, 0, 0], &[]);
+    (0..count).map(|i| mem().read_u32(out + i * 4)).collect()
+}
+
+fn gl_floats(name: u32, count: u32) -> Vec<f32> {
+    let out = alloc(count * 4);
+    call("glGetFloatv", [name, out, 0, 0], &[]);
+    floats(out, count)
+}
+
+/// glReadPixels of the bound framebuffer, RGBA rows from the bottom.
+fn read_pixels(width: u32, height: u32) -> Vec<u8> {
+    let out = alloc(width * height * 4);
+    call("glReadPixels", [0, 0, width, height], &[GL_RGBA, GL_UNSIGNED_BYTE, out]);
+    mem().bytes(out, (width * height * 4) as usize).to_vec()
+}
+
+fn pixel(pixels: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
+    let at = ((y * width + x) * 4) as usize;
+    pixels[at..at + 4].try_into().unwrap()
+}
+
+#[test]
+fn es1_contexts_draw_textured_coloured_client_arrays() {
+    setup();
+    es1_context();
+    es1_framebuffer(8, 8);
+    call("glViewport", [0, 0, 8, 8], &[]);
+    call("glClearColor", [f(0.0), f(0.0), f(0.0), f(1.0)], &[]);
+    call("glClear", [0x4000, 0, 0, 0], &[]);
+    // A 2x1 texture: white, then red.
+    let name = alloc(4);
+    call("glGenTextures", [1, name, 0, 0], &[]);
+    call("glBindTexture", [GL_TEXTURE_2D, mem().read_u32(name), 0, 0], &[]);
+    call("glTexParameteri", [GL_TEXTURE_2D, 0x2801, 0x2600, 0], &[]);
+    call("glTexParameteri", [GL_TEXTURE_2D, 0x2800, 0x2600, 0], &[]);
+    let texels = words(&[0xFFFF_FFFF, 0xFF00_00FF]);
+    call("glTexImage2D", [GL_TEXTURE_2D, 0, GL_RGBA, 2], &[1, 0, GL_RGBA, GL_UNSIGNED_BYTE, texels]);
+    call("glEnable", [GL_TEXTURE_2D, 0, 0, 0], &[]);
+    call("glTexEnvi", [GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, 0x2100, 0], &[]);
+    // Fixed-function matrices: glOrthof's six floats run from r0-r3 onto the stack.
+    call("glMatrixMode", [GL_PROJECTION, 0, 0, 0], &[]);
+    call("glLoadIdentity", [0; 4], &[]);
+    call("glOrthof", [f(0.0), f(8.0), f(0.0), f(8.0)], &[f(-1.0), f(1.0)]);
+    call("glMatrixMode", [GL_MODELVIEW, 0, 0, 0], &[]);
+    call("glLoadIdentity", [0; 4], &[]);
+    call("glScalef", [f(2.0), f(2.0), f(1.0), 0], &[]);
+    // Client-side arrays (no buffer bound): read by the driver at draw time.
+    let vertices = words(&[0.0, 0.0, 4.0, 0.0, 0.0, 4.0, 4.0, 4.0].map(f32::to_bits));
+    let coords = words(&[0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0].map(f32::to_bits));
+    let colours = words(&[0xFF00_FFFF; 4]); // yellow
+    let indices = words(&[0x0001_0000, 0x0001_0002, 0x0003_0002]);
+    call("glEnableClientState", [GL_VERTEX_ARRAY, 0, 0, 0], &[]);
+    call("glEnableClientState", [GL_TEXTURE_COORD_ARRAY, 0, 0, 0], &[]);
+    call("glEnableClientState", [GL_COLOR_ARRAY, 0, 0, 0], &[]);
+    call("glVertexPointer", [2, GL_FLOAT, 0, vertices], &[]);
+    call("glTexCoordPointer", [2, GL_FLOAT, 0, coords], &[]);
+    call("glColorPointer", [4, GL_UNSIGNED_BYTE, 0, colours], &[]);
+    call("glDrawElements", [4, 6, 0x1403, indices], &[]);
+    // The game can ask where its arrays are: its own guest pointer back.
+    let out = alloc(4);
+    call("glGetPointerv", [0x808E, out, 0, 0], &[]);
+    assert_eq!(mem().read_u32(out), vertices, "GL_VERTEX_ARRAY_POINTER is the game's pointer");
+    let pixels = read_pixels(8, 8);
+    assert_eq!(call("glGetError", [0; 4], &[]).0, 0, "no GL error");
+    assert_eq!(pixel(&pixels, 8, 1, 4), [255, 255, 0, 255], "white texel times yellow");
+    assert_eq!(pixel(&pixels, 8, 6, 4), [255, 0, 0, 255], "red texel times yellow");
+    make_current(0);
+}
+
+#[test]
+fn es1_frames_reach_the_window_and_the_game_state_stays() {
+    setup();
+    let context = es1_context();
+    let (framebuffer, _) = es1_framebuffer(16, 24);
+    crate::fw::eagl::set_drawable_size(context, 16, 24);
+    // The game drew red, then left all kinds of state set.
+    call("glClearColor", [f(1.0), f(0.0), f(0.0), f(1.0)], &[]);
+    call("glClear", [0x4000, 0, 0, 0], &[]);
+    call("glClearColor", [f(0.25), f(0.5), f(0.75), f(1.0)], &[]);
+    call("glColorMask", [1, 0, 1, 1], &[]);
+    call("glViewport", [1, 2, 3, 4], &[]);
+    call("glEnable", [0x0C11, 0, 0, 0], &[]); // scissor
+    call("glScissor", [0, 0, 1, 1], &[]);
+    call("glEnable", [0x0BE2, 0, 0, 0], &[]); // blend
+    call("glMatrixMode", [GL_MODELVIEW, 0, 0, 0], &[]);
+    call("glLoadIdentity", [0; 4], &[]);
+    call("glTranslatef", [f(5.0), f(0.0), f(0.0), 0], &[]);
+    call("glMatrixMode", [GL_PROJECTION, 0, 0, 0], &[]);
+    call("glLoadIdentity", [0; 4], &[]);
+    call("glOrthof", [f(0.0), f(16.0), f(0.0), f(16.0)], &[f(-1.0), f(1.0)]);
+    let name = alloc(4);
+    call("glGenTextures", [1, name, 0, 0], &[]);
+    let texture = mem().read_u32(name);
+    call("glBindTexture", [GL_TEXTURE_2D, texture, 0, 0], &[]);
+    call("glTexEnvi", [GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, 0x0104, 0], &[]); // GL_ADD
+    let vertices = words(&[0; 8]);
+    call("glEnableClientState", [GL_VERTEX_ARRAY, 0, 0, 0], &[]);
+    call("glVertexPointer", [3, GL_FLOAT, 12, vertices], &[]);
+    let before = (gl_floats(0x0BA6, 16), gl_floats(0x0BA7, 16)); // modelview, projection
+
+    let (window_width, window_height) = (64u32, 48u32);
+    crate::fw::eagl::use_test_window(window_width as i32, window_height as i32);
+    assert_ne!(crate::objc::runtime::send(context, "presentRenderbuffer:", &[GL_RENDERBUFFER_OES as usize]), 0, "the frame was shown");
+    assert_eq!(call("glGetError", [0; 4], &[]).0, 0, "no GL error");
+
+    // Everything the game set is as it was.
+    assert_eq!(gl_ints(0x8CA6, 1), [framebuffer], "framebuffer binding");
+    assert_eq!(gl_ints(0x0BA2, 4), [1, 2, 3, 4], "viewport");
+    assert_eq!(gl_floats(0x0C22, 4), [0.25, 0.5, 0.75, 1.0], "clear colour");
+    assert_eq!(gl_ints(0x0C23, 4), [1, 0, 1, 1], "colour mask");
+    assert_eq!(call("glIsEnabled", [0x0C11, 0, 0, 0], &[]).0 & 0xff, 1, "scissor test");
+    assert_eq!(gl_ints(0x0C10, 4), [0, 0, 1, 1], "scissor box");
+    assert_eq!(call("glIsEnabled", [0x0BE2, 0, 0, 0], &[]).0 & 0xff, 1, "blending");
+    assert_eq!(call("glIsEnabled", [GL_TEXTURE_2D, 0, 0, 0], &[]).0 & 0xff, 0, "2D textures stay off");
+    assert_eq!(gl_ints(0x0BA0, 1), [GL_PROJECTION], "matrix mode");
+    assert_eq!((gl_floats(0x0BA6, 16), gl_floats(0x0BA7, 16)), before, "matrices");
+    assert_eq!(gl_ints(0x8069, 1), [texture], "texture binding");
+    assert_eq!(gl_ints(0x84E0, 1), [0x84C0], "active texture");
+    let mode = alloc(4);
+    call("glGetTexEnviv", [GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, mode, 0], &[]);
+    assert_eq!(mem().read_u32(mode), 0x0104, "texture environment");
+    assert_eq!(call("glIsEnabled", [GL_VERTEX_ARRAY, 0, 0, 0], &[]).0 & 0xff, 1, "vertex array on");
+    assert_eq!(call("glIsEnabled", [GL_TEXTURE_COORD_ARRAY, 0, 0, 0], &[]).0 & 0xff, 0, "texture coordinates off");
+    assert_eq!([gl_ints(0x807A, 1)[0], gl_ints(0x807B, 1)[0], gl_ints(0x807C, 1)[0]], [3, GL_FLOAT, 12], "vertex array size, type, stride");
+    let out = alloc(4);
+    call("glGetPointerv", [0x808E, out, 0, 0], &[]);
+    assert_eq!(mem().read_u32(out), vertices, "vertex array pointer");
+
+    // The window shows the game's red picture in its area, black around it.
+    call("glBindFramebufferOES", [GL_FRAMEBUFFER_OES, 0, 0, 0], &[]);
+    call("glColorMask", [1, 1, 1, 1], &[]);
+    let pixels = read_pixels(window_width, window_height);
+    call("glBindFramebufferOES", [GL_FRAMEBUFFER_OES, framebuffer, 0, 0], &[]);
+    let (x0, y0, x1, y1) = crate::fw::eagl::picture_area(window_width as i32, window_height as i32);
+    let (cx, cy) = (((x0 + x1) / 2) as u32, ((y0 + y1) / 2) as u32);
+    assert_eq!(pixel(&pixels, window_width, cx, cy), [255, 0, 0, 255], "the picture reached the window");
+    assert_eq!(pixel(&pixels, window_width, x0 as u32 + 1, y0 as u32 + 1), [255, 0, 0, 255], "all of it");
+    if x0 > 0 || y0 > 0 {
+        assert_eq!(pixel(&pixels, window_width, 0, 0), [0, 0, 0, 255], "black around the picture");
+    }
+    crate::fw::eagl::use_test_window(0, 0);
+    make_current(0);
+}
+
 #[test]
 fn game_retains_autoreleases_and_releases_reach_the_eagl_context_count() {
     use crate::guest32::objc::bridge::Bridge;
