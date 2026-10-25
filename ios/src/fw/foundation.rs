@@ -163,6 +163,25 @@ extern "C" fn bundle_path(this: Id, _: Sel) -> Id {
     string::make(&bundle_path_of(this))
 }
 
+/// -[NSBundle bundleURL]: a file URL of the bundle's folder.
+extern "C" fn bundle_url(this: Id, _: Sel) -> Id {
+    let path = string::make(&bundle_path_of(this));
+    runtime::send(runtime::class_named("NSURL"), "fileURLWithPath:", &[path])
+}
+
+/// CFBundleGetMainBundle: the same object as +[NSBundle mainBundle].
+extern "C" fn cf_bundle_get_main_bundle() -> Id {
+    main_bundle(0, 0)
+}
+
+/// CFBundleCopyBundleURL: a file URL of the bundle's folder (+1).
+extern "C" fn cf_bundle_copy_bundle_url(bundle: Id) -> Id {
+    if bundle == 0 {
+        return 0;
+    }
+    runtime::send(bundle, "bundleURL", &[])
+}
+
 extern "C" fn executable_path(_this: Id, _: Sel) -> Id {
     string::make(&crate::loader::program_path())
 }
@@ -548,6 +567,8 @@ pub fn register(r: &mut Registry) {
     r.function("NSTemporaryDirectory", temporary_directory as usize);
     r.function("NSLog", ios_nslog as usize);
     r.function("NSLogv", nslogv as usize);
+    r.function("CFBundleGetMainBundle", cf_bundle_get_main_bundle as usize);
+    r.function("CFBundleCopyBundleURL", cf_bundle_copy_bundle_url as usize);
     r.function("NSSetUncaughtExceptionHandler", set_uncaught_exception_handler as usize);
     r.function("NSGetUncaughtExceptionHandler", get_uncaught_exception_handler as usize);
 
@@ -558,6 +579,7 @@ pub fn register(r: &mut Registry) {
         &[
             ("initWithPath:", bundle_init_with_path as usize),
             ("bundlePath", bundle_path as usize),
+            ("bundleURL", bundle_url as usize),
             ("resourcePath", bundle_path as usize),
             ("executablePath", executable_path as usize),
             ("bundleIdentifier", bundle_identifier_method as usize),

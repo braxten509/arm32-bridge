@@ -716,6 +716,9 @@ fn foundation_constants_have_32_bit_forms() {
     assert_eq!(crate::fw::string::get(object("kSecClassKey")), "keys");
     assert!(crate::fw::collections::number_as_f64(object("kCFNumberNaN")).is_nan());
     assert_eq!(object("kCFNull"), crate::objc::runtime::send(crate::objc::runtime::class_named("NSNull"), "null", &[]));
+    assert_eq!(crate::fw::string::get(object("NSFileModificationDate")), "NSFileModificationDate");
+    let version = crate::guest32::data_address("kCFCoreFoundationVersionNumber").expect("kCFCoreFoundationVersionNumber");
+    assert_eq!(f64::from_bits(mem().read_u64(version)), 793.0, "iOS 6.1's CoreFoundation version");
 }
 
 #[test]
@@ -724,4 +727,126 @@ fn indexed_gl_queries_reach_the_guest_registry() {
     for name in ["glGetIntegeri_v", "glGetInteger64i_v", "glGetBooleani_v"] {
         assert!(ios32::provides_function(name), "{name} is registered");
     }
+}
+
+#[test]
+fn address_book_records_and_multivalues_round_trip() {
+    setup();
+    let word = |name: &str| mem().read_u32(crate::guest32::data_address(name).unwrap_or_else(|| panic!("{name}")));
+    assert_eq!(word("kABPersonFirstNameProperty"), 0);
+    assert_eq!(word("kABPersonLastNameProperty"), 1);
+    assert_eq!(word("kABPersonEmailProperty"), 4);
+    assert_eq!(word("kABPersonPhoneProperty"), 3);
+    assert_eq!(crate::fw::string::get(host_of(word("kABWorkLabel"))), "_$!<Work>!$_");
+
+    // An address book with no people in it.
+    let book = call("ABAddressBookCreate", [0; 4], &[]).0;
+    assert_ne!(book, 0);
+    let people = call("ABAddressBookCopyArrayOfAllPeople", [book, 0, 0, 0], &[]).0;
+    assert_ne!(people, 0);
+    assert_eq!(call("CFArrayGetCount", [people, 0, 0, 0], &[]).0, 0);
+    assert_eq!(call("CFArrayGetValueAtIndex", [people, 0, 0, 0], &[]).0, 0);
+    // CFArrayGetValueAtIndex hands back the item itself (array objects are NSArray here).
+    let list = guest_of(crate::fw::collections::array_from(&[crate::fw::string::make("one")]));
+    assert_eq!(crate::fw::string::get(host_of(call("CFArrayGetValueAtIndex", [list, 0, 0, 0], &[]).0)), "one");
+    assert_eq!(call("CFArrayGetValueAtIndex", [list, 1, 0, 0], &[]).0, 0, "past the end is NULL");
+
+    // Record values are stored per property, replaced on a second set, and read back +1.
+    let person = call("ABPersonCreate", [0; 4], &[]).0;
+    assert_ne!(person, 0);
+    let (first, last) = (word("kABPersonFirstNameProperty"), word("kABPersonLastNameProperty"));
+    let grace = guest_of(crate::fw::string::make("Grace"));
+    let hopper = guest_of(crate::fw::string::make("Hopper"));
+    assert_eq!(call("ABRecordSetValue", [person, first, grace, 0], &[]).0, 1);
+    assert_eq!(call("ABRecordSetValue", [person, last, hopper, 0], &[]).0, 1);
+    assert_eq!(call("ABRecordCopyValue", [person, first, 0, 0], &[]).0, grace);
+    assert_eq!(crate::fw::string::get(host_of(call("ABRecordCopyValue", [person, last, 0, 0], &[]).0)), "Hopper");
+    assert_eq!(call("ABRecordCopyValue", [person, word("kABPersonEmailProperty"), 0, 0], &[]).0, 0);
+    let admiral = guest_of(crate::fw::string::make("Admiral"));
+    assert_eq!(call("ABRecordSetValue", [person, first, admiral, 0], &[]).0, 1);
+    assert_eq!(crate::fw::string::get(host_of(call("ABRecordCopyValue", [person, first, 0, 0], &[]).0)), "Admiral");
+    assert_eq!(call("ABPersonGetSortOrdering", [0; 4], &[]).0, 0, "kABPersonSortByFirstName");
+
+    // A multi value keeps its (value, label) pairs in order; identifiers are their indexes.
+    let phones = call("ABMultiValueCreateMutable", [word("kABPersonPhoneProperty"), 0, 0, 0], &[]).0;
+    assert_ne!(phones, 0);
+    let work = guest_of(crate::fw::string::make("_$!<Work>!$_"));
+    let home = guest_of(crate::fw::string::make("_$!<Home>!$_"));
+    let number1 = guest_of(crate::fw::string::make("+1 555 0100"));
+    let number2 = guest_of(crate::fw::string::make("+1 555 0199"));
+    let identifier = alloc(4);
+    mem().write_u32(identifier, 0xDEAD_BEEF);
+    assert_eq!(call("ABMultiValueAddValueAndLabel", [phones, number1, work, identifier], &[]).0, 1);
+    assert_eq!(mem().read_u32(identifier), 0);
+    assert_eq!(call("ABMultiValueAddValueAndLabel", [phones, number2, home, 0], &[]).0, 1);
+    assert_eq!(call("ABMultiValueGetCount", [phones, 0, 0, 0], &[]).0, 2);
+    assert_eq!(call("ABMultiValueCopyValueAtIndex", [phones, 1, 0, 0], &[]).0, number2);
+    assert_eq!(crate::fw::string::get(host_of(call("ABMultiValueCopyValueAtIndex", [phones, 0, 0, 0], &[]).0)), "+1 555 0100");
+    assert_eq!(call("ABMultiValueCopyValueAtIndex", [phones, 2, 0, 0], &[]).0, 0);
+
+    // The comparator: first then last name, or last then first with ordering 1.
+    let other = call("ABPersonCreate", [0; 4], &[]).0;
+    call("ABRecordSetValue", [other, first, guest_of(crate::fw::string::make("Ada")), 0], &[]);
+    assert_eq!(call("ABPersonComparePeopleByName", [other, person, 0, 0], &[]).0 as i32, -1);
+    assert_eq!(call("ABPersonComparePeopleByName", [person, other, 0, 0], &[]).0 as i32, 1);
+    assert_eq!(call("ABPersonComparePeopleByName", [person, person, 0, 0], &[]).0 as i32, 0);
+    assert_eq!(call("ABPersonComparePeopleByName", [other, person, 1, 0], &[]).0 as i32, -1);
+    // Taken as data (a pointer bind), the loader resolves the function stand-in.
+    assert!(ios32::provides_function("ABPersonComparePeopleByName"));
+}
+
+#[test]
+fn the_bundle_url_path_is_the_bundle_path() {
+    setup();
+    if crate::loader::try_app_dir().is_none() {
+        // An existing folder, so other tests can put their pictures there too.
+        let folder = std::env::temp_dir().to_string_lossy().into_owned();
+        crate::loader::set_guest32_app("", &folder);
+    }
+    let bundle = call("CFBundleGetMainBundle", [0; 4], &[]).0;
+    assert_ne!(bundle, 0);
+    assert_eq!(
+        bundle,
+        guest_of(crate::objc::runtime::send(crate::objc::runtime::class_named("NSBundle"), "mainBundle", &[])),
+        "the same object as +[NSBundle mainBundle]"
+    );
+    let url = call("CFBundleCopyBundleURL", [bundle, 0, 0, 0], &[]).0;
+    assert_ne!(url, 0);
+    let path = call("CFURLCopyFileSystemPath", [url, 0, 0, 0], &[]).0;
+    assert_eq!(crate::fw::string::get(host_of(path)), crate::loader::app_dir());
+    // A non-file URL has no file system path.
+    let remote = guest_of(crate::objc::runtime::send(
+        crate::objc::runtime::class_named("NSURL"),
+        "URLWithString:",
+        &[crate::fw::string::make("http://example.com/a")],
+    ));
+    assert_eq!(call("CFURLCopyFileSystemPath", [remote, 0, 0, 0], &[]).0, 0);
+    // NSHomeDirectory is the same string the host already hands to 64-bit games.
+    let home = call("NSHomeDirectory", [0; 4], &[]).0;
+    assert_eq!(crate::fw::string::get(host_of(home)), crate::fw::foundation::home());
+}
+
+#[test]
+fn cf_run_loop_run_in_mode_takes_the_guest_double_and_times_out() {
+    setup();
+    let mode = guest_of(crate::fw::string::make("kCFRunLoopDefaultMode"));
+    let bits = 0.1f64.to_bits();
+    let start = std::time::Instant::now();
+    let (result, _) = call("CFRunLoopRunInMode", [mode, bits as u32, (bits >> 32) as u32, 0], &[]);
+    let elapsed = start.elapsed().as_secs_f64();
+    assert_eq!(result, 3, "kCFRunLoopRunTimedOut");
+    assert!(elapsed >= 0.08, "the timeout double arrived ({elapsed}s)");
+    assert!(elapsed < 0.5, "and was not misread");
+}
+
+#[test]
+fn class_responds_to_selector_answers_for_framework_classes() {
+    setup();
+    let _ = crate::guest32::objc::wire::test_bridge();
+    let selector = |name: &str| call("sel_registerName", [cstring(name), 0, 0, 0], &[]).0;
+    let class = call("objc_getClass", [cstring("NSString"), 0, 0, 0], &[]).0;
+    assert_ne!(class, 0);
+    assert_eq!(call("class_respondsToSelector", [class, selector("length"), 0, 0], &[]).0, 1);
+    assert_eq!(call("class_respondsToSelector", [class, selector("noSuchSelectorAnywhere"), 0, 0], &[]).0, 0);
+    assert_eq!(call("class_respondsToSelector", [0, selector("length"), 0, 0], &[]).0, 0);
 }

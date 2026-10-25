@@ -3,7 +3,7 @@
 //! pointer-sized results converted; also the framework string and number
 //! constants the games bind as data.
 
-use super::{host_fn, host_functions, object_to_guest, object_to_host, register_all, Bool, CStr, Handle, Long, Obj, Ptr, Word, F64, U32};
+use super::{host_fn, host_functions, object_to_guest, object_to_host, register_all, Bool, CStr, Handle, I32, Long, Obj, Ptr, Word, F64, U32};
 use crate::fw::cfbridge::CFRange;
 use arm32_bridge::handler;
 use arm32_bridge::runtime::{mem, ArgSource, Ret};
@@ -38,6 +38,7 @@ pub fn register() {
         "CFAbsoluteTimeGetCurrent" => fn() -> F64;
         "CFLocaleGetSystem" => fn() -> Obj;
         "CFArrayGetCount" => fn(array: Obj) -> Long;
+        "CFArrayGetValueAtIndex" => fn(array: Obj, index: Long) -> Obj;
         "CFDictionaryGetCount" => fn(dictionary: Obj) -> Long;
         // Data bytes live in guest memory (fw::data), so their pointers cross as they are.
         "CFDataCreate" => fn(allocator: Ptr, bytes: Ptr, length: Long) -> Obj;
@@ -58,6 +59,11 @@ pub fn register() {
         "NSTemporaryDirectory" => fn() -> Obj;
         "CFGetTypeID" => fn(object: Obj) -> Word;
         "CFRunLoopGetCurrent" => fn() -> Obj;
+        "CFRunLoopRunInMode" => fn(mode: Obj, seconds: F64, return_after: Bool) -> I32;
+        "CFBundleGetMainBundle" => fn() -> Obj;
+        "CFBundleCopyBundleURL" => fn(bundle: Obj) -> Obj;
+        "CFURLCopyFileSystemPath" => fn(url: Obj, style: I32) -> Obj;
+        "NSHomeDirectory" => fn() -> Obj;
         "CFUUIDCreate" => fn(allocator: Ptr) -> Obj;
         "CFUUIDCreateString" => fn(allocator: Ptr, uuid: Obj) -> Obj;
         "CFUUIDCreateFromString" => fn(allocator: Ptr, text: Obj) -> Obj;
@@ -217,6 +223,13 @@ pub fn register() {
     for name in ["UIWindowLevelNormal", "UIWindowLevelStatusBar", "UIWindowLevelAlert"] {
         super::float_constant(name);
     }
+    // iOS 6.1's CoreFoundation version: the era these armv7 games were built
+    // for (Apple's constant is a double, four-byte aligned on armv7).
+    super::super::data("kCFCoreFoundationVersionNumber", || {
+        let cell = crate::guest32::alloc_permanent(8, 4);
+        mem().write_u64(cell, 793.0f64.to_bits());
+        cell
+    });
 }
 
 /// Pointer-sized number constants.
@@ -253,7 +266,9 @@ const OBJECT_CONSTANTS: &[&str] = &[
     "NSURLErrorDomain", "NSLocaleLanguageCode", "NSLocaleCountryCode", "NSLocaleCurrencyCode", "NSLocaleCurrencySymbol",
     "NSGregorianCalendar", "NSCalendarIdentifierGregorian", "NSMetadataItemFSNameKey", "NSMetadataItemFSCreationDateKey",
     "NSMetadataItemURLKey", "NSMetadataQueryDidFinishGatheringNotification", "NSMetadataQueryUbiquitousDocumentsScope",
-    "NSURLUbiquitousItemIsDownloadedKey", "NSFileSystemFreeSize", "NSFileSystemSize",
+    "NSURLUbiquitousItemIsDownloadedKey", "NSFileSystemFreeSize", "NSFileSystemSize", "NSFileModificationDate",
+    // AddressBook
+    "kABWorkLabel",
     // UIKit
     "UIApplicationDidBecomeActiveNotification", "UIApplicationWillResignActiveNotification",
     "UIApplicationWillTerminateNotification", "UIApplicationDidEnterBackgroundNotification",
