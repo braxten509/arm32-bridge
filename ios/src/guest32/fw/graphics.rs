@@ -186,6 +186,7 @@ pub fn register() {
     }
     super::struct_constant::<Point>("CGPointZero");
     super::struct_constant::<Size>("CGSizeZero");
+    super::struct_constant::<[f64; 4]>("UIEdgeInsetsZero");
     super::struct_constant::<Transform>("CGAffineTransformIdentity");
     super::struct_constant::<Transform3D>("CATransform3DIdentity");
 }

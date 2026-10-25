@@ -44,6 +44,7 @@ int putchar(int);
 int fputs(const char *__restrict, FILE *__restrict);
 int puts(const char *);
 char *fgets(char *__restrict, int, FILE *__restrict);
+char *gets(char *);
 int fseek(FILE *, long, int);
 long ftell(FILE *);
 int fseeko(FILE *, off_t, int);

@@ -79,8 +79,11 @@ struct Recognizer {
     /// Tap: taps so far and when the last one ended.
     taps: usize,
     last_tap: f64,
-    /// Pinch and rotation: the two fingers' distance and angle at the start.
+    /// Pinch and rotation: the two fingers' distance and angle at the start
+    /// (or when the game last set the scale or rotation, or a finger came),
+    /// and the scale or rotation then.
     start_spread: Option<(f64, f64)>,
+    spread_base: f64,
     scale: f64,
     rotation: f64,
     /// When it last recognized (for requireGestureRecognizerToFail:).
@@ -109,6 +112,7 @@ impl Recognizer {
             taps: 0,
             last_tap: f64::NEG_INFINITY,
             start_spread: None,
+            spread_base: 1.0,
             scale: 1.0,
             rotation: 0.0,
             recognized_at: f64::NEG_INFINITY,
@@ -149,6 +153,13 @@ impl Recognizer {
     /// Hasn't recognized or failed yet in this sequence.
     fn undecided(&self) -> bool {
         self.state == POSSIBLE && self.pending()
+    }
+
+    /// Pinch and rotation count on from here: the fingers as they are now
+    /// and the scale or rotation as it is.
+    fn rebase_spread(&mut self) {
+        self.start_spread = self.spread();
+        self.spread_base = if self.kind == Kind::Rotation { self.rotation } else { self.scale };
     }
 }
 
@@ -356,8 +367,18 @@ extern "C" fn scale(this: Id, _: Sel) -> f64 {
     with(this, |r| r.scale).unwrap_or(1.0)
 }
 
+/// -setScale: / -setRotation:: later changes count from the value set.
+fn set_spread_value(r: &mut Recognizer, value: f64) {
+    if r.kind == Kind::Rotation {
+        r.rotation = value;
+    } else {
+        r.scale = value;
+    }
+    r.rebase_spread();
+}
+
 extern "C" fn set_scale(this: Id, _: Sel, value: f64) {
-    with(this, |r| r.scale = value);
+    with(this, |r| set_spread_value(r, value));
 }
 
 extern "C" fn rotation(this: Id, _: Sel) -> f64 {
@@ -365,7 +386,7 @@ extern "C" fn rotation(this: Id, _: Sel) -> f64 {
 }
 
 extern "C" fn set_rotation(this: Id, _: Sel, value: f64) {
-    with(this, |r| r.rotation = value);
+    with(this, |r| set_spread_value(r, value));
 }
 
 /// Pinch speed (scale per second) and rotation speed (radians per second).
@@ -530,7 +551,7 @@ fn step(r: &mut Recognizer, settings: &Settings, finger: i32, phase: Phase, poin
                 r.origin = c;
             }
             if matches!(r.kind, Kind::Pinch | Kind::Rotation) {
-                r.start_spread = r.spread();
+                r.rebase_spread();
             }
             if r.kind == Kind::LongPress && r.state == POSSIBLE && r.fingers.len() as isize == settings.touches {
                 out.hold_check = Some(settings.press);
@@ -595,7 +616,9 @@ fn step(r: &mut Recognizer, settings: &Settings, finger: i32, phase: Phase, poin
                 Kind::Pinch | Kind::Rotation => {
                     if let (Some((d0, a0)), Some((d, a))) = (r.start_spread, r.spread()) {
                         let old = (r.scale, r.rotation);
-                        r.scale = if d0 > 0.0 { d / d0 } else { 1.0 };
+                        if r.kind == Kind::Pinch && d0 > 0.0 {
+                            r.scale = r.spread_base * d / d0;
+                        }
                         let mut turn = a - a0;
                         while turn > std::f64::consts::PI {
                             turn -= std::f64::consts::TAU;
@@ -603,7 +626,9 @@ fn step(r: &mut Recognizer, settings: &Settings, finger: i32, phase: Phase, poin
                         while turn < -std::f64::consts::PI {
                             turn += std::f64::consts::TAU;
                         }
-                        r.rotation = turn;
+                        if r.kind == Kind::Rotation {
+                            r.rotation = r.spread_base + turn;
+                        }
                         if dt > 1e-4 {
                             r.velocity.x = if r.kind == Kind::Pinch { (r.scale - old.0) / dt } else { (r.rotation - old.1) / dt };
                         }
@@ -625,8 +650,10 @@ fn step(r: &mut Recognizer, settings: &Settings, finger: i32, phase: Phase, poin
                 f.now = point;
             }
             let all_up = r.fingers.len() <= 1;
+            // Fingers held still before lifting: no speed left.
+            let still = now - r.last.1 > 0.1;
             r.last = (r.centroid(), now);
-            if all_up && now - r.last.1 > 0.1 {
+            if still && (all_up || matches!(r.kind, Kind::Pinch | Kind::Rotation)) {
                 r.velocity = Point::default();
             }
             if phase == Phase::Cancelled {
@@ -1295,5 +1322,67 @@ mod tests {
         step(&mut pinch, &settings(1), 2, Phase::Began, p(20.0, 0.0), 0.0);
         assert!(step(&mut pinch, &settings(1), 2, Phase::Moved, p(40.0, 0.0), 0.1).recognized);
         assert!((pinch.scale - 2.0).abs() < 1e-9);
+    }
+
+    /// Games zoom step by step: they apply `scale` and set it back to 1, so
+    /// the next change counts from there (UIKit's own sample does this);
+    /// a third finger doesn't make it jump; it goes still once the fingers
+    /// stop before lifting. Rotation works the same way.
+    #[test]
+    fn pinch_and_rotation_count_from_a_scale_the_game_set() {
+        let settings = Settings { taps: 1, touches: 1, min_touches: 1, max_touches: isize::MAX, direction: 1, press: 0.5, movement: 10.0 };
+        let mut pinch = Recognizer::new(Kind::Pinch);
+        step(&mut pinch, &settings, 1, Phase::Began, p(0.0, 0.0), 0.0);
+        step(&mut pinch, &settings, 2, Phase::Began, p(20.0, 0.0), 0.0);
+        step(&mut pinch, &settings, 2, Phase::Moved, p(40.0, 0.0), 0.1);
+        assert!((pinch.scale - 2.0).abs() < 1e-9);
+        set_spread_value(&mut pinch, 1.0);
+        step(&mut pinch, &settings, 2, Phase::Moved, p(60.0, 0.0), 0.2);
+        assert!((pinch.scale - 1.5).abs() < 1e-9, "40 to 60 points apart since it was set: {}", pinch.scale);
+        step(&mut pinch, &settings, 3, Phase::Began, p(100.0, 100.0), 0.3);
+        step(&mut pinch, &settings, 2, Phase::Moved, p(60.0, 0.0), 0.35);
+        assert!((pinch.scale - 1.5).abs() < 1e-9, "a third finger: {}", pinch.scale);
+        step(&mut pinch, &settings, 2, Phase::Ended, p(60.0, 0.0), 0.8);
+        assert_eq!(pinch.state, ENDED);
+        assert_eq!(pinch.velocity.x, 0.0, "held still before lifting");
+
+        let mut turn = Recognizer::new(Kind::Rotation);
+        step(&mut turn, &settings, 1, Phase::Began, p(0.0, 0.0), 0.0);
+        step(&mut turn, &settings, 2, Phase::Began, p(10.0, 0.0), 0.0);
+        step(&mut turn, &settings, 2, Phase::Moved, p(0.0, 10.0), 0.1);
+        assert!((turn.rotation - std::f64::consts::FRAC_PI_2).abs() < 1e-9);
+        set_spread_value(&mut turn, 0.0);
+        step(&mut turn, &settings, 2, Phase::Moved, p(-10.0, 0.0), 0.2);
+        assert!((turn.rotation - std::f64::consts::FRAC_PI_2).abs() < 1e-9, "a quarter turn since it was set: {}", turn.rotation);
+    }
+
+    /// 32-bit games reach these methods only through a framework_selectors.tsv row.
+    #[test]
+    fn every_gesture_method_has_a_32_bit_row() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let table = crate::guest32::objc::selectors::FrameworkSelectors::builtin();
+        let classes = [
+            "UIGestureRecognizer", "UITapGestureRecognizer", "UIPanGestureRecognizer", "UISwipeGestureRecognizer",
+            "UILongPressGestureRecognizer", "UIPinchGestureRecognizer", "UIRotationGestureRecognizer",
+        ];
+        let mut missing = Vec::new();
+        let rt = lock();
+        for name in classes {
+            let class = rt.by_name[name];
+            for &sel in rt.classes[&class].methods.keys() {
+                let selector = rt.sel_name(sel);
+                if table.get(&selector).is_none() {
+                    missing.push(format!("-[{name} {selector}]"));
+                }
+            }
+        }
+        for selector in ["addGestureRecognizer:", "removeGestureRecognizer:", "gestureRecognizers", "setGestureRecognizers:"] {
+            if table.get(selector).is_none() {
+                missing.push(format!("-[UIView {selector}]"));
+            }
+        }
+        missing.sort();
+        assert!(missing.is_empty(), "no framework_selectors.tsv row for {missing:?}");
     }
 }

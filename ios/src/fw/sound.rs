@@ -658,6 +658,16 @@ fn pull(input: &Input, bus: u32, frames: usize, sample_time: f64, scratch: &mut 
     }
 }
 
+/// One render call of `unit`'s input `bus`, as the sound thread makes it:
+/// stereo floats (tests).
+#[cfg(test)]
+pub(crate) fn render_input(unit: usize, bus: u32, frames: usize) -> Vec<f32> {
+    let input = with_input(unit, bus, |i| i.clone()).unwrap_or_default();
+    let mut out = Vec::new();
+    pull(&input, bus, frames, 0.0, &mut Vec::new(), &mut out);
+    out
+}
+
 /// A source's samples waiting to be played, and where playback is in them.
 #[derive(Default)]
 pub(crate) struct Stream {
@@ -1690,14 +1700,6 @@ mod tests {
         0
     }
 
-    /// Only the audio graphs at 44100 Hz: tests running meanwhile play music,
-    /// system sounds and OpenAL into the full mix.
-    fn mix_graphs(out: &mut [f32]) {
-        out.fill(0.0);
-        let frames = out.len() / 2;
-        mix_graph(out, frames, 44100.0);
-    }
-
     fn energy(out: &[f32], channel: usize) -> f32 {
         out.iter().skip(channel).step_by(2).map(|s| s * s).sum::<f32>()
     }
@@ -1721,7 +1723,13 @@ mod tests {
         unit_set_parameter(unit, 3, INPUT_SCOPE, 3, 0.0, 0);
         with_graph(|g| g.running.insert(0, true));
         let mut out = vec![0f32; 4410 * 2];
-        mix_graphs(&mut out);
+        // This graph's mixer only: the full mix also pulls in other
+        // subsystems' audio, which other tests run in parallel.
+        let render = |out: &mut [f32]| {
+            out.fill(0.0);
+            mix_graph(out, 4410, 44100.0);
+        };
+        render(&mut out);
         let (left, right) = (energy(&out, 0), energy(&out, 1));
         assert!(left > 100.0 && (left - right).abs() < left * 0.01, "centred tone: {left} {right}");
         // 0.1 s needs about 2200 source frames, but one call never asks for more than iOS's maximum.
@@ -1729,14 +1737,15 @@ mod tests {
         assert!(most > 0 && most <= DEFAULT_MAX_FRAMES, "{most} frames in one call");
         // Hard right: the left side goes quiet.
         unit_set_parameter(unit, 0, INPUT_SCOPE, 3, 90.0, 0);
-        mix_graphs(&mut out);
-        assert!(energy(&out, 0) < energy(&out, 1) * 0.01);
+        render(&mut out);
+        let (left, right) = (energy(&out, 0), energy(&out, 1));
+        assert!(left < right * 0.01, "hard right: {left} {right}");
         // 22050 Hz played at 44100: the tone keeps its pitch (441 Hz = 100 output frames a cycle).
         let crossings = out.chunks_exact(2).map(|f| f[1]).collect::<Vec<_>>().windows(2).filter(|w| w[0] < 0.0 && w[1] >= 0.0).count();
         assert!((43..=45).contains(&crossings), "{crossings} cycles in 0.1 s");
         // Disabled: silence.
         unit_set_parameter(unit, 5, INPUT_SCOPE, 3, 0.0, 0);
-        mix_graphs(&mut out);
+        render(&mut out);
         assert_eq!(energy(&out, 1), 0.0);
         // A callback that disposes of its own graph is not called again.
         let mut graph = 0;
@@ -1751,7 +1760,7 @@ mod tests {
         graph_node_info(graph, node, std::ptr::null_mut(), &mut own);
         unit_set_property(own, MAXIMUM_FRAMES_PER_SLICE, 0, 0, &slice as *const u32 as *const u8, 4);
         graph_start(graph);
-        mix_graphs(&mut out);
+        render(&mut out);
         assert_eq!(DISPOSING_CALLS.load(Ordering::Relaxed), 1, "called after its graph was disposed");
     }
 

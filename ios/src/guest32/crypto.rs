@@ -55,6 +55,26 @@ pub fn register() {
     for (name, handler) in digests {
         function(name, handler);
     }
+    // CCCrypt(operation, algorithm, options, key, key length, iv, in, in length,
+    // out, room, &moved): the 64-bit one on guest memory; size_t is 4 bytes here.
+    function(
+        "CCCrypt",
+        handler!(|uc, a| {
+            let (operation, algorithm, options, key, key_length, iv) = (a.u32(), a.u32(), a.u32(), a.u32(), a.u32(), a.u32());
+            let (input, input_length, out, room, moved) = (a.u32(), a.u32(), a.u32(), a.u32(), a.u32());
+            let host = |address: u32| if address == 0 { std::ptr::null_mut() } else { mem().host(address) };
+            let mut host_moved = 0usize;
+            let status = crate::fw::crypto::cc_crypt(
+                operation, algorithm, options, host(key), key_length as usize, host(iv), host(input), input_length as usize,
+                host(out), room as usize, &mut host_moved,
+            );
+            if moved != 0 {
+                mem().write_u32(moved, host_moved as u32);
+            }
+            Ret::U32(status as u32)
+        })
+        .unwrap(),
+    );
     // CCCryptorCreate(operation, algorithm, options, key, key length, iv, &cryptor)
     function(
         "CCCryptorCreate",

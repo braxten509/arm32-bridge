@@ -1042,6 +1042,11 @@ fn take_gil() {
             guard
         }
     };
+    install_gil(guard);
+}
+
+/// Makes `guard` this thread's hold on the guest lock.
+fn install_gil(guard: MutexGuard<'static, ()>) {
     LOCKS_TAKEN.fetch_add(1, Ordering::Relaxed);
     *GIL_HOLDER.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::thread::current().id());
     let now = ticks();
@@ -1124,6 +1129,37 @@ pub fn hold_gil() -> GilToken {
     }
     take_gil();
     GilToken(true)
+}
+
+/// Like [`hold_gil`], for a host thread with a deadline (the sound device
+/// asking for samples): None when the lock wasn't had within `limit`.
+pub fn try_hold_gil(limit: Duration) -> Option<GilToken> {
+    if parallel() || gil_held() {
+        return Some(GilToken(false));
+    }
+    let guard = match GIL.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            // Waiting counts as wanting: the holder hands over after its time slice.
+            start_preempt_ticker();
+            let (started, deadline) = (ticks(), Instant::now() + limit);
+            WANTING.fetch_add(1, Ordering::Relaxed);
+            let got = loop {
+                match GIL.try_lock() {
+                    Ok(guard) => break Some(guard),
+                    Err(std::sync::TryLockError::Poisoned(e)) => break Some(e.into_inner()),
+                    Err(std::sync::TryLockError::WouldBlock) if Instant::now() >= deadline => break None,
+                    // Spinning, not sleeping: a handover only waits ~100 us for a taker.
+                    Err(std::sync::TryLockError::WouldBlock) => std::thread::yield_now(),
+                }
+            };
+            WANTING.fetch_sub(1, Ordering::Relaxed);
+            LOCK_WAIT_TICKS.with(|t| t.set(t.get() + ticks().wrapping_sub(started)));
+            got?
+        }
+    };
+    install_gil(guard);
+    Some(GilToken(true))
 }
 
 /// Runs `work` with the guest lock released (for anything that may block).

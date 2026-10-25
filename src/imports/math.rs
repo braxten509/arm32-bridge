@@ -196,6 +196,15 @@ pub fn handler(name: &str) -> Option<Handler> {
             let (x, y) = (a.f32(), a.f32());
             Ret::F32(x.min(y))
         }),
+        // Like C's: a NaN gives way to the other number.
+        "fmax" => handler!(|uc, a| {
+            let (x, y) = (a.f64(), a.f64());
+            Ret::F64(x.max(y))
+        }),
+        "fmin" => handler!(|uc, a| {
+            let (x, y) = (a.f64(), a.f64());
+            Ret::F64(x.min(y))
+        }),
         "ldexpf" | "scalbnf" => handler!(|uc, a| {
             let (x, exponent) = (a.f32(), a.i32());
             Ret::F32((x as f64 * 2f64.powi(exponent)) as f32)

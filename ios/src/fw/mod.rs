@@ -2,6 +2,7 @@
 
 pub mod animation;
 pub mod app;
+pub mod addressbook;
 pub mod attributed;
 pub mod bezier;
 pub mod cfbridge;
@@ -73,6 +74,7 @@ pub fn register(r: &mut Registry) {
     object::define(r);
     object::define_proxy();
     string::register(r);
+    addressbook::register(r);
     attributed::register(r);
     collections::register(r);
     data::register(r);

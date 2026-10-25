@@ -22,7 +22,9 @@ use super::libsystem::{
 
 /// Android handlers with Darwin's call and meaning.
 const REUSED: &[&str] = &[
-    "strtold", "setlocale", "wcslen", "wmemchr", "wmemcmp", "getwc", "fputwc", "ungetwc",
+    "strtold", "setlocale", "wcslen", "wmemchr", "wmemcmp", "wmemcpy", "wmemmove", "wmemset", "getwc", "fputwc",
+    "putwc", "ungetwc", "btowc", "wctob", "mbrtowc", "wcrtomb", "strcoll", "strxfrm", "wcscoll", "wcsxfrm",
+    "towlower", "towupper", "wcsftime",
 ];
 
 /// (Darwin `_l` call, Android handler): the same arguments plus a trailing
@@ -153,6 +155,8 @@ fn locales() {
     function("newlocale", handler!(|uc, a| Ret::U32(locale_handle())).unwrap());
     function("freelocale", handler!(|uc, a| Ret::U32(0)).unwrap());
     function("___mb_cur_max_l", handler!(|uc, a| Ret::U32(4)).unwrap());
+    // int __mb_cur_max (Darwin's MB_CUR_MAX), the same as ___mb_cur_max_l's.
+    super::data_bytes("__mb_cur_max", 4u32.to_le_bytes().to_vec(), 4);
     function("localeconv_l", handler!(|uc, a| Ret::U32(c_lconv())).unwrap());
     function("iswctype_l", handler!(|uc, a| {
         let (c, mask) = (a.u32(), a.u32());

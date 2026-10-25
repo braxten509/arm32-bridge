@@ -30,7 +30,8 @@ extern "C" fn audio_session_get_property(id: u32, size: *mut u32, data: *mut u8)
             write(&0u32.to_le_bytes());
         } else if id == four(b"chsr") {
             write(&44100.0f64.to_le_bytes());
-        } else if id == four(b"cbuf") {
+        } else if id == four(b"cbuf") || id == four(b"chbd") {
+            // The preferred and current I/O buffer: 512 frames at 44100 Hz.
             write(&0.0116f32.to_le_bytes());
         } else if id == four(b"choc") {
             write(&2u32.to_le_bytes());
@@ -652,9 +653,13 @@ pub fn register(r: &mut Registry) {
         "MPMoviePlayerNowPlayingMovieDidChangeNotification",
         "MPMoviePlayerWillEnterFullscreenNotification",
         "MPMoviePlayerDidExitFullscreenNotification",
+        "MPMediaLibraryDidChangeNotification",
+        "MPMusicPlayerControllerNowPlayingItemDidChangeNotification",
+        "MPMusicPlayerControllerPlaybackStateDidChangeNotification",
     ] {
         r.data(name, leak(string::make(name)));
     }
+    r.data("MPMediaItemPropertyPersistentID", leak(string::make("persistentID")));
     r.function("CMTimeGetSeconds", cm_time_get_seconds as usize);
     r.data("kCMTimeZero", leak(CmTime { value: 0, timescale: 1, flags: 1, epoch: 0 }));
     r.function("AudioSessionInitialize", audio_session_initialize as usize);

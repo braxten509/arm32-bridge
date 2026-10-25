@@ -357,6 +357,8 @@ const SAME_AS_STANDARD: &[(&str, &str)] = &[
     ("glWaitSyncAPPLE", "glWaitSync"),
     ("glGetInteger64vAPPLE", "glGetInteger64v"),
     ("glGetSyncivAPPLE", "glGetSynciv"),
+    // OES_framebuffer_object, OpenGL ES 1's names for framebuffers: iOS
+    // answers them in ES 2 contexts too, and older engines use them there.
     ("glGenFramebuffersOES", "glGenFramebuffers"),
     ("glDeleteFramebuffersOES", "glDeleteFramebuffers"),
     ("glBindFramebufferOES", "glBindFramebuffer"),
@@ -1382,6 +1384,22 @@ pub fn register(r: &mut Registry) {
 #[cfg(test)]
 mod merged_tests {
     use super::*;
+
+    #[test]
+    fn extension_names_reach_this_layers_own_version_of_their_function() {
+        // glBindFramebufferOES must bind the drawable's framebuffer as
+        // glBindFramebuffer does here, not go straight to the system's.
+        let mut r = Registry::default();
+        register(&mut r);
+        let function = |name: &str| r.get(name).map(|(address, _)| address);
+        assert_eq!(function("glBindFramebufferOES"), Some(bind_framebuffer as usize));
+        assert_eq!(function("glRenderbufferStorageOES"), Some(renderbuffer_storage as usize));
+        for (extension, standard) in SAME_AS_STANDARD {
+            if function(standard).is_some() {
+                assert_eq!(function(extension), function(standard), "{extension}");
+            }
+        }
+    }
 
     #[test]
     fn no_saved_shader_programs_like_the_iphone() {

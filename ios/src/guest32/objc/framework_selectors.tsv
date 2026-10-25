@@ -72,6 +72,7 @@ addOperation:	v@:@
 addPayment:	v@:@
 addSublayer:	v@:@
 addSubview:	v@:@
+addTarget:action:	v@:@:
 addTarget:action:forControlEvents:	v@:@:I
 addTimer:forMode:	v@:@@
 addToRunLoop:forMode:	v@:@@
@@ -88,6 +89,7 @@ allHeaderFields	@@:
 allHTTPHeaderFields	@@:
 allKeys	@@:
 allKeysForObject:	@@:@
+allowableMovement	f@:
 allTouches	@@:
 allValues	@@:
 alpha	f@:
@@ -156,6 +158,7 @@ cancelButtonIndex	i@:
 cancelLocalNotification:	v@:@
 cancelPreviousPerformRequestsWithTarget:	v@:@
 cancelPreviousPerformRequestsWithTarget:selector:object:	v@:@:@
+cancelsTouchesInView	c@:
 cancelTrackingWithEvent:	v@:@
 canGoBack	c@:
 canMakePayments	c@:
@@ -286,6 +289,9 @@ decodeValueOfObjCType:at:	v@:r*^v
 defaultCenter	@@:
 defaultManager	@@:
 defaultQueue	@@:
+delaysTouchesBegan	c@:
+delaysTouchesEnded	c@:
+delegate	@@:
 deleteCookie:	v@:@
 deleteRowsAtIndexPaths:withRowAnimation:	v@:@i
 dequeueReusableCellWithIdentifier:	@@:@
@@ -312,6 +318,7 @@ dictionaryWithObjectsAndKeys:	@@:@	nil-list
 dictionaryWithValuesForKeys:	@@:@
 didChangeValueForKey:	v@:@
 didMoveToParentViewController:	v@:@
+direction	I@:
 dismissModalViewControllerAnimated:	v@:c
 dismissPopoverAnimated:	v@:c
 dismissViewControllerAnimated:completion:	v@:c@?
@@ -376,6 +383,7 @@ fragment	@@:
 frame	{CGRect={CGPoint=ff}{CGSize=ff}}@:
 frameLength	I@:
 functionWithName:	@@:@
+gestureRecognizers	@@:
 getArgument:atIndex:	v@:^vi
 getArgumentTypeAtIndex:	r*@:I
 getBytes:length:	v@:^vI
@@ -572,6 +580,7 @@ localizedTitle	@@:
 localPlayer	@@:
 localTimeZone	@@:
 locationInView:	{CGPoint=ff}@:@
+locationOfTouch:inView:	{CGPoint=ff}@:I@
 lock	v@:
 lockWhenCondition:	v@:i
 lockWhenCondition:beforeDate:	c@:i@
@@ -588,6 +597,7 @@ makeObjectsPerformSelector:	v@::
 makeObjectsPerformSelector:withObject:	v@::@
 matchID	@@:
 matchOutcome	i@:
+maximumNumberOfTouches	I@:
 message	@@:
 methodForSelector:	^?@::
 methodReturnLength	I@:
@@ -596,6 +606,8 @@ methodSignature	@@:
 methodSignatureForSelector:	@@::
 MIMEType	@@:
 minimumFontSize	f@:
+minimumNumberOfTouches	I@:
+minimumPressDuration	d@:
 minusSet:	v@:@
 modalTransitionStyle	i@:
 modalViewController	@@:
@@ -623,6 +635,9 @@ numberOfArguments	I@:
 numberOfButtons	i@:
 numberOfLines	i@:
 numberOfRowsInSection:	i@:i
+numberOfTapsRequired	I@:
+numberOfTouches	I@:
+numberOfTouchesRequired	I@:
 numberWithBool:	@@:c
 numberWithDouble:	@@:d
 numberWithFloat:	@@:f	float
@@ -742,6 +757,7 @@ removeObjectsInRange:	v@:{_NSRange=II}
 removeObserver:	v@:@
 removeObserver:forKeyPath:	v@:@@
 removeObserver:name:object:	v@:@@@
+removeTarget:action:	v@:@:
 removeTarget:action:forControlEvents:	v@:@:I
 removeTransactionObserver:	v@:@
 renderbufferStorage:fromDrawable:	c@:I@
@@ -754,6 +770,8 @@ requestAccessToAccountsWithType:options:completion:	v@:@@@?
 requestAccessToAccountsWithType:withCompletionHandler:	v@:@@?
 requestWithURL:	@@:@
 requestWithURL:cachePolicy:timeoutInterval:	@@:@Id
+requireGestureRecognizerToFail:	v@:@
+reset	v@:
 resetAchievementsWithCompletionHandler:	v@:@?
 resignFirstResponder	c@:
 resizableImageWithCapInsets:	@@:{UIEdgeInsets=ffff}
@@ -817,6 +835,7 @@ setAlertAction:	v@:@
 setAlertBody:	v@:@
 setAlertViewStyle:	v@:i
 setAllHTTPHeaderFields:	v@:@
+setAllowableMovement:	v@:f
 setAllowsInlineMediaPlayback:	v@:c
 setAllowsSelection:	v@:c
 setAlpha:	v@:f
@@ -859,6 +878,7 @@ setByAddingObjectsFromSet:	@@:@
 setCachePolicy:	v@:I
 setCalculationMode:	v@:@
 setCancelButtonIndex:	v@:i
+setCancelsTouchesInView:	v@:c
 setCategory:	v@:@
 setCategory:error:	c@:@^@
 setCcRecipients:	v@:@
@@ -888,7 +908,11 @@ setCurrentTime:	v@:d
 setData:forPasteboardType:	v@:@@
 setDateFormat:	v@:@
 setDateStyle:	v@:I
+setDelaysTouchesBegan:	v@:c
+setDelaysTouchesEnded:	v@:c
+setDelegate:	v@:@
 setDictionary:	v@:@
+setDirection:	v@:I
 setDisableActions:	v@:c
 setDouble:forKey:	v@:d@
 setDrawableProperties:	v@:@
@@ -908,6 +932,7 @@ setFromValue:	v@:@
 setFullscreen:	v@:c
 setGameCenterDelegate:	v@:@
 setGeometryFlipped:	v@:c
+setGestureRecognizers:	v@:@
 setHidden:	v@:c
 setHighlighted:	v@:c
 setHighlightedImage:	v@:@
@@ -947,6 +972,7 @@ setMessageBody:isHTML:	v@:@c
 setMessageComposeDelegate:	v@:@
 setMinimumFontSize:	v@:f
 setMinimumNumberOfTouches:	v@:I
+setMinimumPressDuration:	v@:d
 setMinPlayers:	v@:I
 setModalPresentationStyle:	v@:i
 setModalTransitionStyle:	v@:i
@@ -958,6 +984,8 @@ setNetworkActivityIndicatorVisible:	v@:c
 setNumberOfLines:	v@:i
 setNumberOfLoops:	v@:i
 setNumberOfPages:	v@:i
+setNumberOfTapsRequired:	v@:I
+setNumberOfTouchesRequired:	v@:I
 setNumberStyle:	v@:I
 setObject:atIndex:	v@:@I
 setObject:atIndexedSubscript:	v@:@I
@@ -988,7 +1016,9 @@ setReturnKeyType:	v@:i
 setReturnValue:	v@:^v
 setRightBarButtonItem:	v@:@
 setRootViewController:	v@:@
+setRotation:	v@:f
 setRowHeight:	v@:f
+setScale:	v@:f
 setScalesPageToFit:	v@:c
 setScalingMode:	v@:i
 setScrollEnabled:	v@:c
@@ -1016,6 +1046,7 @@ setShowsVerticalScrollIndicator:	v@:c
 setSoundName:	v@:@
 setSpeed:	v@:f	float
 setStartPoint:	v@:{CGPoint=ff}
+setState:	v@:i
 setStatusBarHidden:	v@:c
 setStatusBarHidden:withAnimation:	v@:ci
 setStatusBarOrientation:animated:	v@:ic
@@ -1042,9 +1073,11 @@ setTrackImage:	v@:@
 setTrackTintColor:	v@:@
 setTransform:	v@:{CGAffineTransform=ffffff}
 setTransform:	v@:{CATransform3D=ffffffffffffffff}	class:CALayer
+setTranslation:inView:	v@:{CGPoint=ff}@
 setTurnBasedMatchmakerDelegate:	v@:@
 setType:	v@:@
 setURL:	v@:@
+setUpdateInterval:	v@:d
 setUserInteractionEnabled:	v@:c
 setValue:	v@:f	float,ambiguous:UISlider
 setValue:forHTTPHeaderField:	v@:@@
@@ -1070,6 +1103,7 @@ sharedAccelerometer	@@:
 sharedApplication	@@:
 sharedHTTPCookieStorage	@@:
 sharedInstance	@@:
+sharedManager	@@:
 sharedTurnBasedEventHandler	@@:
 sharegroup	@@:
 shouldPerformSegueWithIdentifier:sender:	c@:@@
@@ -1179,6 +1213,7 @@ transactionState	i@:
 transform	{CGAffineTransform=ffffff}@:
 transform	{CATransform3D=ffffffffffffffff}@:	class:CALayer
 transitionFromViewController:toViewController:duration:options:animations:completion:	v@:@@dI@?@?
+translationInView:	{CGPoint=ff}@:@
 tryLock	c@:
 type	@@:
 type	i@:	class:UIEvent
@@ -1216,6 +1251,7 @@ valueWithCGRect:	@@:{CGRect={CGPoint=ff}{CGSize=ff}}
 valueWithCGSize:	@@:{CGSize=ff}
 valueWithNonretainedObject:	@@:@
 valueWithPointer:	@@:r^v
+velocity	f@:
 velocityInView:	{CGPoint=ff}@:@
 view	@@:
 viewDidAppear:	v@:c
@@ -1248,3 +1284,137 @@ isMemberOfClass:	c@:#
 retainCount	I@:
 superclass	#@:
 zone	^{_NSZone=}@:
+# Monster Life (2026-10-25, the same derivation), its Apple selectors not
+# listed above (API: EAGLContext's; without it the game took its context
+# for OpenGL ES 1). Left out: its Facebook/Twitter SDK names, and
+# sortUsingFunction:context: (a guest C function the host would call).
+albumsQuery	@@:
+API	I@:
+artistsQuery	@@:
+attitude	@@:
+attributesOfItemAtPath:error:	@@:@^@
+availableModes	@@:
+backBarButtonItem	@@:
+batteryLevel	f@:
+beginGeneratingLibraryChangeNotifications	v@:
+beginGeneratingPlaybackNotifications	v@:
+cancelAllLocalNotifications	v@:
+carrierName	@@:
+collections	@@:
+collectionWithItems:	@@:@
+contentSize	{CGSize=ff}@:
+contentView	@@:
+continueWithoutCredentialForAuthenticationChallenge:	v@:@
+createDirectoryAtURL:withIntermediateDirectories:attributes:error:	c@:@c@^@
+credentialWithUser:password:persistence:	@@:@@I
+currentPlaybackTime	d@:
+currentVersionOfItemAtURL:	@@:@
+defaultCStringEncoding	I@:
+defaultMediaLibrary	@@:
+defaultTimeZone	@@:
+deviceMotion	@@:
+displayNameForKey:value:	@@:@@
+enabledRemoteNotificationTypes	I@:
+endGeneratingDeviceOrientationNotifications	v@:
+endGeneratingLibraryChangeNotifications	v@:
+endGeneratingPlaybackNotifications	v@:
+error	@@:
+getCString:maxLength:encoding:	c@:*II
+hasAction	c@:
+hasText	c@:
+HTTPBody	@@:
+initWithBarButtonSystemItem:target:action:	@@:i@:
+initWithFileURL:	@@:@
+initWithFrame:reuseIdentifier:	@@:{CGRect={CGPoint=ff}{CGSize=ff}}@
+initWithStyle:	@@:i
+initWithStyle:reuseIdentifier:	@@:i@
+initWithTitle:delegate:cancelButtonTitle:destructiveButtonTitle:otherButtonTitles:	@@:@@@@@	nil-list
+initWithUTF8String:	@@:r*
+iPodMusicPlayer	@@:
+isEqualToData:	c@:@
+isGyroAvailable	c@:
+isMultiThreaded	c@:
+isoCountryCode	@@:
+isSourceTypeAvailable:	c@:i
+isStatusBarHidden	c@:
+isValid	c@:
+items	@@:
+leading	f@:
+modificationDate	@@:
+multiplyByInverseOfAttitude:	v@:@
+nowPlayingItem	@@:
+openWithCompletionHandler:	v@:@?
+parentViewController	@@:
+pause	v@:
+pitch	d@:
+playlistsQuery	@@:
+popNavigationItemAnimated:	@@:c
+previousFailureCount	i@:
+products	@@:
+propertyList	@@:
+pushNavigationItem:animated:	v@:@c
+quantity	i@:
+query	@@:
+registerForRemoteNotificationTypes:	v@:I
+reload	v@:
+removeAllCachedResponses	v@:
+removeObjectAtIndex:	v@:I
+removeOtherVersionsOfItemAtURL:error:	c@:@^@
+replaceObjectAtIndex:withObject:	v@:I@
+representativeItem	@@:
+resourcePath	@@:
+roll	d@:
+rootViewController	@@:
+saveToURL:forSaveOperation:completionHandler:	v@:@i@?
+screens	@@:
+scrollView	@@:
+section	i@:
+selectedRange	{_NSRange=II}@:
+setAllowsImageEditing:	v@:c
+setAnimationsEnabled:	v@:c
+setApplicationIconBadgeNumber:	v@:i
+setBody:	v@:@
+setCurrentMode:	v@:@
+setDataDetectorTypes:	v@:I
+setDataSource:	v@:@
+setDetectsPhoneNumbers:	v@:c
+setEditable:	v@:c
+setExclusiveTouch:	v@:c
+setGyroUpdateInterval:	v@:d
+setHasAction:	v@:c
+setMediaPlaybackRequiresUserAction:	v@:c
+setQuantity:	v@:i
+setQueueWithItemCollection:	v@:@
+setQueueWithQuery:	v@:@
+setRecipients:	v@:@
+setRepeatInterval:	v@:I
+setRepeatMode:	v@:i
+setSharedURLCache:	v@:@
+setShowsCancelButton:	v@:c
+setShuffleMode:	v@:i
+setSourceType:	v@:i
+setStatusBarHidden:animated:	v@:cc
+setStatusBarOrientation:	v@:i
+setSubtype:	v@:@
+setTimeZone:	v@:@
+setUbiquitous:itemAtURL:destinationURL:error:	c@:c@@^@
+setUserInfo:	v@:@
+sharedURLCache	@@:
+showInView:	v@:@
+size	{CGSize=ff}@:	ambiguous:UIImage
+skipToNextItem	v@:
+skipToPreviousItem	v@:
+songsQuery	@@:
+start	v@:
+startDeviceMotionUpdates	v@:
+statusCode	i@:
+stop	v@:
+subscriberCellularProvider	@@:
+titleLabel	@@:
+URLByAppendingPathComponent:isDirectory:	@@:@c
+valueForProperty:	@@:@
+writeToFile:atomically:encoding:error:	c@:@cI^@
+x	d@:	ambiguous:UIAcceleration
+y	d@:	ambiguous:UIAcceleration
+yaw	d@:
+z	d@:	ambiguous:UIAcceleration

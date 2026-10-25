@@ -966,6 +966,27 @@ fn digest_contexts_stay_inside_apples_sizes() {
 }
 
 #[test]
+fn cccrypt_round_trips_with_32_bit_sizes() {
+    // CCCrypt(op, alg, options, key | key length, iv, in, in length, out,
+    // room, &moved): the last seven on the stack, size_t 4 bytes.
+    let (key, text, sealed, opened, moved) = (alloc(16), alloc(5), alloc(32), alloc(32), alloc(8));
+    mem().write_bytes(key, b"0123456789abcdef");
+    mem().write_bytes(text, b"hello");
+    mem().write_u32(moved + 4, 0xDEAD_BEEF);
+    let crypt = |operation: u32, input: u32, length: u32, out: u32, room: u32| {
+        call("CCCrypt", [operation, 0, 1 | 2, key], &[16, 0, input, length, out, room, moved]).0 as i32
+    };
+    assert_eq!(crypt(0, text, 5, sealed, 32), 0, "AES-128 ECB with PKCS7 padding");
+    assert_eq!(mem().read_u32(moved), 16, "one padded block");
+    assert_eq!(mem().read_u32(moved + 4), 0xDEAD_BEEF, "moved is a 4-byte size_t");
+    assert_ne!(mem().bytes(sealed, 5), b"hello");
+    assert_eq!(crypt(1, sealed, 16, opened, 32), 0);
+    assert_eq!((mem().read_u32(moved), mem().bytes(opened, 5)), (5, &b"hello"[..]));
+    assert_eq!(crypt(0, text, 5, sealed, 8), -4301, "kCCBufferTooSmall");
+    assert_eq!(mem().read_u32(moved), 16, "with the room it needs");
+}
+
+#[test]
 fn foundation_constants_have_32_bit_forms() {
     setup();
     let word = |name: &str| mem().read_u32(crate::guest32::data_address(name).unwrap_or_else(|| panic!("{name}")));
@@ -979,6 +1000,22 @@ fn foundation_constants_have_32_bit_forms() {
     assert_eq!(crate::fw::string::get(object("kSecClassKey")), "keys");
     assert!(crate::fw::collections::number_as_f64(object("kCFNumberNaN")).is_nan());
     assert_eq!(object("kCFNull"), crate::objc::runtime::send(crate::objc::runtime::class_named("NSNull"), "null", &[]));
+    assert_eq!(crate::fw::string::get(object("NSFileModificationDate")), "NSFileModificationDate");
+    // Read straight away by games that schedule notifications or watch the music library.
+    for name in [
+        "UILocalNotificationDefaultSoundName",
+        "UIApplicationDidChangeStatusBarFrameNotification",
+        "MPMediaLibraryDidChangeNotification",
+        "MPMusicPlayerControllerNowPlayingItemDidChangeNotification",
+        "MPMusicPlayerControllerPlaybackStateDidChangeNotification",
+    ] {
+        assert_eq!(crate::fw::string::get(object(name)), name);
+    }
+    assert_eq!(crate::fw::string::get(object("MPMediaItemPropertyPersistentID")), "persistentID");
+    let insets = crate::guest32::data_address("UIEdgeInsetsZero").expect("UIEdgeInsetsZero");
+    assert_eq!(mem().bytes(insets, 16), [0; 16], "four float zeros");
+    let version = crate::guest32::data_address("kCFCoreFoundationVersionNumber").expect("kCFCoreFoundationVersionNumber");
+    assert_eq!(f64::from_bits(mem().read_u64(version)), 793.0, "iOS 6.1's CoreFoundation version");
 }
 
 #[test]
@@ -987,4 +1024,358 @@ fn indexed_gl_queries_reach_the_guest_registry() {
     for name in ["glGetIntegeri_v", "glGetInteger64i_v", "glGetBooleani_v"] {
         assert!(ios32::provides_function(name), "{name} is registered");
     }
+}
+
+fn four_cc(text: &[u8; 4]) -> u32 {
+    u32::from_be_bytes(*text)
+}
+
+/// A RemoteIO unit made from 32-bit structs: the guest gets handles, and its
+/// stream format (a 40-byte AudioStreamBasicDescription) reaches the host unit.
+fn remote_io_unit(rate: f64, channels: u32) -> u32 {
+    let description = alloc(20);
+    for (i, word) in [four_cc(b"auou"), four_cc(b"rioc"), four_cc(b"appl"), 0, 0].iter().enumerate() {
+        mem().write_u32(description + i as u32 * 4, *word);
+    }
+    let (component, _) = call("AudioComponentFindNext", [0, description, 0, 0], &[]);
+    assert_ne!(component, 0, "RemoteIO found");
+    let out = alloc(4);
+    assert_eq!(call("AudioComponentInstanceNew", [component, out, 0, 0], &[]).0, 0);
+    let unit = mem().read_u32(out);
+    assert_ne!(unit, 0);
+    set_format(unit, 0, rate, channels);
+    unit
+}
+
+/// A 16-bit stream format on input `element` of a unit.
+fn set_format(unit: u32, element: u32, rate: f64, channels: u32) {
+    let format = alloc(40);
+    mem().write_bytes(format, &rate.to_ne_bytes());
+    for (i, word) in [four_cc(b"lpcm"), 0xC, 2 * channels, 1, 2 * channels, channels, 16, 0].iter().enumerate() {
+        mem().write_u32(format + 8 + i as u32 * 4, *word);
+    }
+    // AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat, input scope, element, format, 40).
+    assert_eq!(call("AudioUnitSetProperty", [unit, 8, 1, element], &[format, 40]).0, 0);
+}
+
+/// Writes Thumb halfwords into guest memory; returns the address with the Thumb bit.
+fn thumb_code(code: &[u16]) -> u32 {
+    let address = alloc(code.len() as u32 * 2);
+    for (i, half) in code.iter().enumerate() {
+        mem().write_bytes(address + i as u32 * 2, &half.to_le_bytes());
+    }
+    address | 1
+}
+
+/// AURenderCallbackStruct { inputProc, inputProcRefCon }: two guest words
+/// for game code callback(refCon, *flags, *stamp, bus, frames, ioData) that
+/// writes the 16-bit ramp 0, 1, 2 ... into ioData->mBuffers[0].mData
+/// (offset 12 in the 32-bit AudioBufferList) and returns noErr.
+fn ramp_callback() -> u32 {
+    let code = thumb_code(&[
+        0x9A01, // ldr r2, [sp, #4]   ioData
+        0x9900, // ldr r1, [sp]       frames
+        0x68D2, // ldr r2, [r2, #12]  mData
+        0x2300, // movs r3, #0
+        0x8013, // strh r3, [r2]
+        0x3202, // adds r2, #2
+        0x3301, // adds r3, #1
+        0x428B, // cmp r3, r1
+        0xDBFA, // blt (the strh)
+        0x2000, // movs r0, #0
+        0x4770, // bx lr
+    ]);
+    let callback = alloc(8);
+    mem().write_u32(callback, code);
+    mem().write_u32(callback + 4, 0x1234);
+    callback
+}
+
+#[test]
+fn audio_unit_structs_cross_from_32_bit() {
+    let unit = remote_io_unit(22050.0, 1);
+    let (format, size) = (alloc(40), alloc(4));
+    mem().write_u32(size, 40);
+    assert_eq!(call("AudioUnitGetProperty", [unit, 8, 1, 0], &[format, size]).0, 0);
+    assert_eq!(f64::from_ne_bytes(mem().bytes(format, 8).try_into().unwrap()), 22050.0);
+    assert_eq!(mem().read_u32(format + 8), four_cc(b"lpcm"));
+    assert_eq!(mem().read_u32(format + 28), 1, "channels");
+    assert_eq!(mem().read_u32(format + 32), 16, "bits");
+    assert_eq!(call("AudioOutputUnitStop", [unit, 0, 0, 0], &[]).0, 0);
+    assert_eq!(call("AudioComponentInstanceDispose", [unit, 0, 0, 0], &[]).0, 0);
+}
+
+/// A mono 16-bit RemoteIO unit whose render callback is game code writing a ramp.
+fn ramp_unit() -> u32 {
+    let unit = remote_io_unit(44100.0, 1);
+    assert_eq!(call("AudioUnitSetProperty", [unit, 23, 0, 0], &[ramp_callback(), 8]).0, 0);
+    unit
+}
+
+fn ramp(frames: usize) -> Vec<f32> {
+    (0..frames).flat_map(|i| [i as f32 / 32768.0; 2]).collect()
+}
+
+#[test]
+fn a_guest_render_callback_fills_the_host_buffer() {
+    let unit = ramp_unit();
+    let out = crate::fw::sound::render_input(super::handle_to_host(unit), 0, 64);
+    assert_eq!(out, ramp(64));
+    call("AudioComponentInstanceDispose", [unit, 0, 0, 0], &[]);
+}
+
+/// GIL mode: while another thread keeps the guest lock, the sound device
+/// gets silence for that buffer at once instead of waiting for game code.
+#[test]
+#[ignore = "GIL mode: test-pc.sh runs it with ARM32_PARALLEL=0"]
+fn a_render_call_is_silent_while_the_guest_lock_is_kept() {
+    let unit = super::handle_to_host(ramp_unit());
+    assert!(!runtime::parallel(), "run with ARM32_PARALLEL=0 (test-pc.sh does)");
+    // The keeper holds the lock until the render call is over (not longer:
+    // the other GIL-mode tests run meanwhile).
+    let ((held, holding), (over, wait_over)) = (std::sync::mpsc::channel(), std::sync::mpsc::channel::<()>());
+    let keeper = std::thread::spawn(move || {
+        let _gil = runtime::hold_gil();
+        held.send(()).unwrap();
+        let _ = wait_over.recv_timeout(std::time::Duration::from_millis(500));
+    });
+    holding.recv().unwrap();
+    let started = std::time::Instant::now();
+    let out = crate::fw::sound::render_input(unit, 0, 64);
+    let waited = started.elapsed();
+    over.send(()).unwrap();
+    keeper.join().unwrap();
+    assert!(waited < std::time::Duration::from_millis(150), "waited {waited:?} for the guest lock");
+    assert!(out.iter().all(|&s| s == 0.0), "silence while the lock is kept");
+    // Holding it here: the other GIL-mode tests may be using it right now.
+    let _gil = runtime::hold_gil();
+    assert_eq!(crate::fw::sound::render_input(unit, 0, 64), ramp(64), "game code runs with the lock");
+}
+
+/// A host AudioBufferList with one buffer of `size` bytes and no data
+/// pointer: count, then { channels, size, data (8 bytes) } from offset 8.
+fn host_list(size: u32) -> [u64; 4] {
+    let mut list = [0u64; 4];
+    list[0] = 1;
+    list[1] = 1 | (size as u64) << 32;
+    list
+}
+
+#[test]
+fn a_render_callback_with_its_own_buffer_hands_the_host_a_copy() {
+    setup();
+    let own = alloc(128);
+    for i in 0..64u32 {
+        mem().write_bytes(own + i * 2, &(i as i16).to_le_bytes());
+    }
+    // refCon -> { own buffer, the time stamp pointer the game was given }.
+    let context = alloc(8);
+    mem().write_u32(context, own);
+    let code = thumb_code(&[
+        0x9B01, // ldr r3, [sp, #4]   ioData
+        0x6801, // ldr r1, [r0]       own buffer
+        0x60D9, // str r1, [r3, #12]  mData = own buffer
+        0x6042, // str r2, [r0, #4]   the stamp pointer
+        0x2000, // movs r0, #0
+        0x4770, // bx lr
+    ]);
+    let render = super::audio::guest_render_for(code, context);
+    let mut list = host_list(128);
+    let (mut flags, stamp) = (0u32, [0u8; 64]);
+    let status = super::audio::guest_render(render, &mut flags, stamp.as_ptr(), 0, 64, list.as_mut_ptr() as *mut u8);
+    assert_eq!(status, 0);
+    let (size, data) = ((list[1] >> 32) as usize, list[2] as usize);
+    let base = mem().host(0) as usize;
+    assert!(!(base..base + (1 << 32)).contains(&data), "the host reads a copy, not guest memory another thread may reuse");
+    let samples = |data: usize| unsafe { std::slice::from_raw_parts(data as *const u8, 128) }.to_vec();
+    assert_eq!(size, 128);
+    assert_eq!(samples(data), mem().bytes(own, 128));
+    mem().write_bytes(own, &[0; 128]);
+    assert_ne!(samples(data), vec![0; 128], "the game reusing its buffer leaves the copy alone");
+    assert_eq!(mem().read_u32(context + 4) % 8, 0, "AudioTimeStamp (doubles) is 8-aligned");
+}
+
+/// The AUGraph route: a multichannel mixer's input bus pulls game code.
+#[test]
+fn a_32_bit_graph_pulls_its_mixer_input_from_game_code() {
+    let out = alloc(4);
+    assert_eq!(call("NewAUGraph", [out, 0, 0, 0], &[]).0, 0);
+    let graph = mem().read_u32(out);
+    assert_ne!(graph, 0);
+    let description = alloc(20);
+    for (i, word) in [four_cc(b"aumx"), four_cc(b"mcmx"), four_cc(b"appl"), 0, 0].iter().enumerate() {
+        mem().write_u32(description + i as u32 * 4, *word);
+    }
+    assert_eq!(call("AUGraphAddNode", [graph, description, out, 0], &[]).0, 0);
+    let node = mem().read_u32(out);
+    let found = alloc(20);
+    assert_eq!(call("AUGraphNodeInfo", [graph, node, found, out], &[]).0, 0);
+    assert_eq!(mem().read_u32(found + 4), four_cc(b"mcmx"));
+    let unit = mem().read_u32(out);
+    assert_ne!(unit, 0);
+    for name in ["AUGraphOpen", "AUGraphInitialize", "AUGraphStart"] {
+        assert_eq!(call(name, [graph, 0, 0, 0], &[]).0, 0, "{name}");
+    }
+    set_format(unit, 2, 44100.0, 1);
+    assert_eq!(call("AUGraphSetNodeInputCallback", [graph, node, 2, ramp_callback()], &[]).0, 0);
+    assert_eq!(crate::fw::sound::render_input(super::handle_to_host(unit), 2, 64), ramp(64));
+    for name in ["AUGraphStop", "AUGraphUninitialize", "AUGraphClose", "DisposeAUGraph"] {
+        assert_eq!(call(name, [graph, 0, 0, 0], &[]).0, 0, "{name}");
+    }
+}
+
+/// AudioUnitRender from a 32-bit caller (the microphone, which is silent
+/// here): buffers it leaves empty get guest memory the game can read.
+#[test]
+fn audio_unit_render_gives_32_bit_callers_guest_buffers() {
+    let unit = remote_io_unit(44100.0, 1);
+    let (list, flags, stamp) = (alloc(16), alloc(4), alloc(64));
+    for (i, word) in [1, 1, 0, 0].iter().enumerate() {
+        mem().write_u32(list + i as u32 * 4, *word);
+    }
+    mem().write_u32(flags, 0);
+    assert_eq!(call("AudioUnitRender", [unit, flags, stamp, 1], &[64, list]).0, 0);
+    let (size, data) = (mem().read_u32(list + 8), mem().read_u32(list + 12));
+    assert_ne!(data, 0, "a guest buffer");
+    assert!(size >= 128, "{size} bytes for 64 frames");
+    assert!(mem().bytes(data, size as usize).iter().all(|&b| b == 0), "silence");
+    assert_ne!(mem().read_u32(flags) & 16, 0, "kAudioUnitRenderAction_OutputIsSilence");
+    call("AudioComponentInstanceDispose", [unit, 0, 0, 0], &[]);
+}
+
+/// A sound thread that ends (AAudio opens each stream on a new thread)
+/// gives its guest thread back.
+#[test]
+fn a_sound_thread_that_ends_gives_back_its_guest_thread() {
+    let unit = super::handle_to_host(ramp_unit());
+    let id = std::thread::spawn(move || {
+        assert_eq!(crate::fw::sound::render_input(unit, 0, 64), ramp(64));
+        let _gil = runtime::hold_gil();
+        runtime::engine().get_data().id
+    })
+    .join()
+    .unwrap();
+    assert!(super::audio::retired_render_threads().contains(&id), "guest thread {id} given back");
+}
+
+#[test]
+fn address_book_records_and_multivalues_round_trip() {
+    setup();
+    let word = |name: &str| mem().read_u32(crate::guest32::data_address(name).unwrap_or_else(|| panic!("{name}")));
+    assert_eq!(word("kABPersonFirstNameProperty"), 0);
+    assert_eq!(word("kABPersonLastNameProperty"), 1);
+    assert_eq!(word("kABPersonEmailProperty"), 4);
+    assert_eq!(word("kABPersonPhoneProperty"), 3);
+    assert_eq!(crate::fw::string::get(host_of(word("kABWorkLabel"))), "_$!<Work>!$_");
+
+    // An address book with no people in it.
+    let book = call("ABAddressBookCreate", [0; 4], &[]).0;
+    assert_ne!(book, 0);
+    let people = call("ABAddressBookCopyArrayOfAllPeople", [book, 0, 0, 0], &[]).0;
+    assert_ne!(people, 0);
+    assert_eq!(call("CFArrayGetCount", [people, 0, 0, 0], &[]).0, 0);
+    assert_eq!(call("CFArrayGetValueAtIndex", [people, 0, 0, 0], &[]).0, 0);
+    // CFArrayGetValueAtIndex hands back the item itself (array objects are NSArray here).
+    let list = guest_of(crate::fw::collections::array_from(&[crate::fw::string::make("one")]));
+    assert_eq!(crate::fw::string::get(host_of(call("CFArrayGetValueAtIndex", [list, 0, 0, 0], &[]).0)), "one");
+    assert_eq!(call("CFArrayGetValueAtIndex", [list, 1, 0, 0], &[]).0, 0, "past the end is NULL");
+
+    // Record values are stored per property, replaced on a second set, and read back +1.
+    let person = call("ABPersonCreate", [0; 4], &[]).0;
+    assert_ne!(person, 0);
+    let (first, last) = (word("kABPersonFirstNameProperty"), word("kABPersonLastNameProperty"));
+    let grace = guest_of(crate::fw::string::make("Grace"));
+    let hopper = guest_of(crate::fw::string::make("Hopper"));
+    assert_eq!(call("ABRecordSetValue", [person, first, grace, 0], &[]).0, 1);
+    assert_eq!(call("ABRecordSetValue", [person, last, hopper, 0], &[]).0, 1);
+    assert_eq!(call("ABRecordCopyValue", [person, first, 0, 0], &[]).0, grace);
+    assert_eq!(crate::fw::string::get(host_of(call("ABRecordCopyValue", [person, last, 0, 0], &[]).0)), "Hopper");
+    assert_eq!(call("ABRecordCopyValue", [person, word("kABPersonEmailProperty"), 0, 0], &[]).0, 0);
+    let admiral = guest_of(crate::fw::string::make("Admiral"));
+    assert_eq!(call("ABRecordSetValue", [person, first, admiral, 0], &[]).0, 1);
+    assert_eq!(crate::fw::string::get(host_of(call("ABRecordCopyValue", [person, first, 0, 0], &[]).0)), "Admiral");
+    assert_eq!(call("ABPersonGetSortOrdering", [0; 4], &[]).0, 0, "kABPersonSortByFirstName");
+
+    // A multi value keeps its (value, label) pairs in order; identifiers are their indexes.
+    let phones = call("ABMultiValueCreateMutable", [word("kABPersonPhoneProperty"), 0, 0, 0], &[]).0;
+    assert_ne!(phones, 0);
+    let work = guest_of(crate::fw::string::make("_$!<Work>!$_"));
+    let home = guest_of(crate::fw::string::make("_$!<Home>!$_"));
+    let number1 = guest_of(crate::fw::string::make("+1 555 0100"));
+    let number2 = guest_of(crate::fw::string::make("+1 555 0199"));
+    let identifier = alloc(4);
+    mem().write_u32(identifier, 0xDEAD_BEEF);
+    assert_eq!(call("ABMultiValueAddValueAndLabel", [phones, number1, work, identifier], &[]).0, 1);
+    assert_eq!(mem().read_u32(identifier), 0);
+    assert_eq!(call("ABMultiValueAddValueAndLabel", [phones, number2, home, 0], &[]).0, 1);
+    assert_eq!(call("ABMultiValueGetCount", [phones, 0, 0, 0], &[]).0, 2);
+    assert_eq!(call("ABMultiValueCopyValueAtIndex", [phones, 1, 0, 0], &[]).0, number2);
+    assert_eq!(crate::fw::string::get(host_of(call("ABMultiValueCopyValueAtIndex", [phones, 0, 0, 0], &[]).0)), "+1 555 0100");
+    assert_eq!(call("ABMultiValueCopyValueAtIndex", [phones, 2, 0, 0], &[]).0, 0);
+
+    // The comparator: first then last name, or last then first with ordering 1.
+    let other = call("ABPersonCreate", [0; 4], &[]).0;
+    call("ABRecordSetValue", [other, first, guest_of(crate::fw::string::make("Ada")), 0], &[]);
+    assert_eq!(call("ABPersonComparePeopleByName", [other, person, 0, 0], &[]).0 as i32, -1);
+    assert_eq!(call("ABPersonComparePeopleByName", [person, other, 0, 0], &[]).0 as i32, 1);
+    assert_eq!(call("ABPersonComparePeopleByName", [person, person, 0, 0], &[]).0 as i32, 0);
+    assert_eq!(call("ABPersonComparePeopleByName", [other, person, 1, 0], &[]).0 as i32, -1);
+    // Taken as data (a pointer bind), the loader resolves the function stand-in.
+    assert!(ios32::provides_function("ABPersonComparePeopleByName"));
+}
+
+#[test]
+fn the_bundle_url_path_is_the_bundle_path() {
+    setup();
+    if crate::loader::try_app_dir().is_none() {
+        // An existing folder, so other tests can put their pictures there too.
+        let folder = std::env::temp_dir().to_string_lossy().into_owned();
+        crate::loader::set_guest32_app("", &folder);
+    }
+    let bundle = call("CFBundleGetMainBundle", [0; 4], &[]).0;
+    assert_ne!(bundle, 0);
+    assert_eq!(
+        bundle,
+        guest_of(crate::objc::runtime::send(crate::objc::runtime::class_named("NSBundle"), "mainBundle", &[])),
+        "the same object as +[NSBundle mainBundle]"
+    );
+    let url = call("CFBundleCopyBundleURL", [bundle, 0, 0, 0], &[]).0;
+    assert_ne!(url, 0);
+    let path = call("CFURLCopyFileSystemPath", [url, 0, 0, 0], &[]).0;
+    assert_eq!(crate::fw::string::get(host_of(path)), crate::loader::app_dir());
+    // A non-file URL has no file system path.
+    let remote = guest_of(crate::objc::runtime::send(
+        crate::objc::runtime::class_named("NSURL"),
+        "URLWithString:",
+        &[crate::fw::string::make("http://example.com/a")],
+    ));
+    assert_eq!(call("CFURLCopyFileSystemPath", [remote, 0, 0, 0], &[]).0, 0);
+    // NSHomeDirectory is the same string the host already hands to 64-bit games.
+    let home = call("NSHomeDirectory", [0; 4], &[]).0;
+    assert_eq!(crate::fw::string::get(host_of(home)), crate::fw::foundation::home());
+}
+
+#[test]
+fn cf_run_loop_run_in_mode_takes_the_guest_double_and_times_out() {
+    setup();
+    let mode = guest_of(crate::fw::string::make("kCFRunLoopDefaultMode"));
+    let bits = 0.1f64.to_bits();
+    let start = std::time::Instant::now();
+    let (result, _) = call("CFRunLoopRunInMode", [mode, bits as u32, (bits >> 32) as u32, 0], &[]);
+    let elapsed = start.elapsed().as_secs_f64();
+    assert_eq!(result, 3, "kCFRunLoopRunTimedOut");
+    assert!(elapsed >= 0.08, "the timeout double arrived ({elapsed}s)");
+    assert!(elapsed < 0.5, "and was not misread");
+}
+
+#[test]
+fn class_responds_to_selector_answers_for_framework_classes() {
+    setup();
+    let _ = crate::guest32::objc::wire::test_bridge();
+    let selector = |name: &str| call("sel_registerName", [cstring(name), 0, 0, 0], &[]).0;
+    let class = call("objc_getClass", [cstring("NSString"), 0, 0, 0], &[]).0;
+    assert_ne!(class, 0);
+    assert_eq!(call("class_respondsToSelector", [class, selector("length"), 0, 0], &[]).0, 1);
+    assert_eq!(call("class_respondsToSelector", [class, selector("noSuchSelectorAnywhere"), 0, 0], &[]).0, 0);
+    assert_eq!(call("class_respondsToSelector", [0, selector("length"), 0, 0], &[]).0, 0);
 }

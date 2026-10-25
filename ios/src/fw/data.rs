@@ -288,12 +288,30 @@ extern "C" fn data_with_contents_of_file(class: Class, _: Sel, path: Id) -> Id {
     }
 }
 
-/// Only file URLs: the path of the URL.
-extern "C" fn data_with_contents_of_url(class: Class, s: Sel, url: Id) -> Id {
-    if url == 0 || !runtime::responds(url, "path") {
+/// The path of a file URL; 0 for any other URL (there is no network, so web
+/// URLs fail as on an iPhone with no connection).
+fn file_url_path(url: Id) -> Id {
+    if url == 0 || !runtime::responds(url, "isFileURL") || runtime::send(url, "isFileURL", &[]) & 0xFF == 0 {
         return 0;
     }
-    data_with_contents_of_file(class, s, runtime::send(url, "path", &[]))
+    runtime::send(url, "path", &[])
+}
+
+extern "C" fn data_with_contents_of_url(class: Class, s: Sel, url: Id) -> Id {
+    match file_url_path(url) {
+        0 => 0,
+        path => data_with_contents_of_file(class, s, path),
+    }
+}
+
+extern "C" fn data_init_with_contents_of_url(this: Id, s: Sel, url: Id) -> Id {
+    match file_url_path(url) {
+        0 => {
+            counted::release(this);
+            0
+        }
+        path => data_init_with_contents_of_file(this, s, path),
+    }
 }
 
 extern "C" fn data_with_capacity(class: Class, _: Sel, capacity: usize) -> Id {
@@ -599,6 +617,7 @@ pub fn register(_: &mut Registry) {
             ("initWithData:", data_init_with_data as usize),
             ("initWithContentsOfFile:", data_init_with_contents_of_file as usize),
             ("initWithContentsOfMappedFile:", data_init_with_contents_of_file as usize),
+            ("initWithContentsOfURL:", data_init_with_contents_of_url as usize),
             ("retain", data_retain as usize),
             ("release", data_release as usize),
             ("autorelease", data_autorelease as usize),
@@ -641,6 +660,26 @@ mod tests {
     use crate::objc::runtime::{class_named, send};
         use crate::libsystem::heap::{malloc, malloc_size};
     use crate::fw::string::Range;
+
+    /// Data from a URL: a file URL's file; a web URL is nil, as on an
+    /// offline iPhone (never a local file at the URL's path).
+    #[test]
+    fn data_from_urls_reads_files_only() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let path = std::env::temp_dir().join(format!("data-url-{}", std::process::id()));
+        std::fs::write(&path, b"saved").unwrap();
+        let text = path.to_str().unwrap();
+        let url_class = class_named("NSURL");
+        let file = send(url_class, "fileURLWithPath:", &[crate::fw::string::make(text)]);
+        let web = send(url_class, "URLWithString:", &[crate::fw::string::make(&format!("http://example.com{text}"))]);
+        let made = send(send(class_named("NSData"), "alloc", &[]), "initWithContentsOfURL:", &[file]);
+        assert_eq!(bytes(made), b"saved");
+        assert_eq!(bytes(send(class_named("NSData"), "dataWithContentsOfURL:", &[file])), b"saved");
+        assert_eq!(send(send(class_named("NSData"), "alloc", &[]), "initWithContentsOfURL:", &[web]), 0, "offline");
+        assert_eq!(send(class_named("NSData"), "dataWithContentsOfURL:", &[web]), 0, "not the file at its path");
+        std::fs::remove_file(&path).unwrap();
+    }
 
     /// Ranges of bytes: copied out, replaced (growing or shrinking the
     /// data), read into a buffer; length grows with zeros; files written

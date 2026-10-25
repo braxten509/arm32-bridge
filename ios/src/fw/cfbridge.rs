@@ -64,7 +64,7 @@ fn ns_encoding(cf: u32) -> Option<u64> {
 
 /// The characters of bytes 0x80-0xFF in Mac Roman (Apple's mapping, with
 /// the euro sign at 0xDB) and Windows Latin-1 (cp1252; 0 = no character).
-const MAC_ROMAN_HIGH: [u16; 128] = [
+pub(crate) const MAC_ROMAN_HIGH: [u16; 128] = [
     0x00C4, 0x00C5, 0x00C7, 0x00C9, 0x00D1, 0x00D6, 0x00DC, 0x00E1, 0x00E0, 0x00E2, 0x00E4, 0x00E3, 0x00E5, 0x00E7, 0x00E9, 0x00E8,
     0x00EA, 0x00EB, 0x00ED, 0x00EC, 0x00EE, 0x00EF, 0x00F1, 0x00F3, 0x00F2, 0x00F4, 0x00F6, 0x00F5, 0x00FA, 0x00F9, 0x00FB, 0x00FC,
     0x2020, 0x00B0, 0x00A2, 0x00A3, 0x00A7, 0x2022, 0x00B6, 0x00DF, 0x00AE, 0x00A9, 0x2122, 0x00B4, 0x00A8, 0x2260, 0x00C6, 0x00D8,
@@ -74,7 +74,7 @@ const MAC_ROMAN_HIGH: [u16; 128] = [
     0x2021, 0x00B7, 0x201A, 0x201E, 0x2030, 0x00C2, 0x00CA, 0x00C1, 0x00CB, 0x00C8, 0x00CD, 0x00CE, 0x00CF, 0x00CC, 0x00D3, 0x00D4,
     0xF8FF, 0x00D2, 0x00DA, 0x00DB, 0x00D9, 0x0131, 0x02C6, 0x02DC, 0x00AF, 0x02D8, 0x02D9, 0x02DA, 0x00B8, 0x02DD, 0x02DB, 0x02C7,
 ];
-const WINDOWS_LATIN1_HIGH: [u16; 128] = [
+pub(crate) const WINDOWS_LATIN1_HIGH: [u16; 128] = [
     0x20AC, 0, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0, 0x017D, 0,
     0, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014, 0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0, 0x017E, 0x0178,
     0x00A0, 0x00A1, 0x00A2, 0x00A3, 0x00A4, 0x00A5, 0x00A6, 0x00A7, 0x00A8, 0x00A9, 0x00AA, 0x00AB, 0x00AC, 0x00AD, 0x00AE, 0x00AF,
@@ -281,6 +281,14 @@ extern "C" fn cf_array_get_values(array: Id, range: CFRange, values: *mut Id) {
         let item = crate::objc::runtime::send(array, "objectAtIndex:", &[(range.location + i) as usize]);
         unsafe { *values.add(i as usize) = item };
     }
+}
+
+/// CFArrayGetValueAtIndex: the item itself (no retain); NULL past the end.
+extern "C" fn cf_array_get_value_at_index(array: Id, index: isize) -> Id {
+    if array == 0 || index < 0 || index >= count(array) {
+        return 0;
+    }
+    crate::objc::runtime::send(array, "objectAtIndex:", &[index as usize])
 }
 
 /// Keys and values in the same order; either list may be NULL.
@@ -656,6 +664,22 @@ extern "C" fn cf_url_copy_path_extension(url: Id) -> Id {
     string::make(&string::get(extension))
 }
 
+/// CFURLCopyFileSystemPath(url, style): the path of a file URL in POSIX (0),
+/// HFS (1, colon-separated) or Windows (2, backslashes) form; NULL for a URL
+/// that isn't a file URL, or an unknown style.
+extern "C" fn cf_url_copy_file_system_path(url: Id, style: i32) -> Id {
+    if url == 0 || crate::objc::runtime::send(url, "isFileURL", &[]) as u8 == 0 {
+        return 0;
+    }
+    let path = string::get(crate::objc::runtime::send(url, "path", &[]));
+    match style {
+        0 => string::make(&path),
+        1 => string::make(&path.trim_start_matches('/').replace('/', ":")),
+        2 => string::make(&path.replace('/', "\\")),
+        _ => 0,
+    }
+}
+
 extern "C" fn cf_string_append_characters(text: Id, characters: *const u16, count: isize) {
     if characters.is_null() || count <= 0 {
         return;
@@ -742,6 +766,7 @@ pub fn register(r: &mut Registry) {
     }
     r.function("CFStringCompare", cf_string_compare as usize);
     r.function("CFURLCopyPathExtension", cf_url_copy_path_extension as usize);
+    r.function("CFURLCopyFileSystemPath", cf_url_copy_file_system_path as usize);
     r.function("CFStringAppendCharacters", cf_string_append_characters as usize);
     r.function("CFPropertyListCreateFromXMLData", cf_property_list_create_from_xml_data as usize);
     r.function("CFBitVectorCreate", cf_bit_vector_create as usize);
@@ -762,6 +787,7 @@ pub fn register(r: &mut Registry) {
     r.function("CFNumberCreate", cf_number_create as usize);
     r.function("CFArrayGetCount", count as usize);
     r.function("CFArrayGetValues", cf_array_get_values as usize);
+    r.function("CFArrayGetValueAtIndex", cf_array_get_value_at_index as usize);
     r.function("CFDictionaryGetCount", count as usize);
     r.function("CFDictionaryGetKeysAndValues", cf_dictionary_get_keys_and_values as usize);
     r.function("CFDataCreate", cf_data_create as usize);
