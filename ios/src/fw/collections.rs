@@ -54,12 +54,23 @@ pub fn array_from(list: &[Id]) -> Id {
     object
 }
 
+/// The most entries read from a foreign collection through its primitive
+/// methods (see array_items).
+const MAX_FOREIGN_ITEMS: usize = 16 * 1024 * 1024;
+
 pub fn array_items(object: Id) -> Vec<Id> {
     if object == 0 {
         return Vec::new();
     }
     if !keeps_our_storage(object, "count", array_count as usize) && answers(object, "objectAtIndex:") {
         let count = runtime::send(object, "count", &[]);
+        // A foreign count is the game's word: a wrong one (a non-collection,
+        // or a count read before the entries exist) must not loop for ages.
+        if count > MAX_FOREIGN_ITEMS {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| crate::log!("a foreign collection says it has {count} entries; reading none (more than {MAX_FOREIGN_ITEMS})"));
+            return Vec::new();
+        }
         return (0..count).map(|index| runtime::send(object, "objectAtIndex:", &[index])).collect();
     }
     items(object).clone()
@@ -256,7 +267,9 @@ extern "C" fn array_copy(this: Id, _: Sel, _zone: usize) -> Id {
 
 extern "C" fn array_mutable_copy(this: Id, _: Sel, _zone: usize) -> Id {
     let object = runtime::alloc_instance(classes().mutable_array);
-    *items(object) = array_items(this);
+    let list = array_items(this);
+    keep_all(&list);
+    *items(object) = list;
     object
 }
 
@@ -682,7 +695,9 @@ extern "C" fn dict_copy(this: Id, _: Sel, _zone: usize) -> Id {
 
 extern "C" fn dict_mutable_copy(this: Id, _: Sel, _zone: usize) -> Id {
     let object = runtime::alloc_instance(classes().mutable_dictionary);
-    *pairs(object) = dictionary_pairs(this);
+    let entries = dictionary_pairs(this);
+    entries.iter().for_each(|&(k, v)| keep_all(&[k, v]));
+    *pairs(object) = entries;
     object
 }
 
@@ -2008,6 +2023,33 @@ mod tests {
         assert!(runtime::send(mine, "isEqual:", &[other]) & 0xFF != 0, "{}", crate::fw::string::describe(mine));
         runtime::send(mine, "setDictionary:", &[0]);
         assert_eq!(dictionary_pairs(mine).len(), 0, "nil empties it");
+    }
+
+    /// mutableCopy keeps each entry, as -copy and arrayWithArray: /
+    /// dictionaryWithDictionary: do: the copy outlives every other holder.
+    #[test]
+    fn mutable_copies_keep_their_entries() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        use crate::fw::counted;
+        let data = runtime::send(runtime::class_named("NSMutableData"), "alloc", &[]);
+        let data = runtime::send(data, "initWithLength:", &[1]);
+        assert_eq!(counted::count(data), Some(1), "one reference, the caller's");
+        let key = crate::fw::string::make("pixels");
+        let list = array_from(&[data]);
+        let words = dictionary_from(&[(key, data)]);
+        assert_eq!(counted::count(data), Some(3), "the source collections keep it");
+        let list_copy = runtime::send(list, "mutableCopy", &[]);
+        let words_copy = runtime::send(words, "mutableCopy", &[]);
+        assert_eq!(counted::count(data), Some(5), "both copies keep their entry");
+        // The caller lets go, and so do the source collections (ours never
+        // release, so their holds are dropped here): only the copies' holds remain.
+        for _ in 0..4 {
+            counted::release(data);
+        }
+        assert_eq!(counted::count(data), Some(1), "the copies' entries are alive");
+        assert_eq!(runtime::send(list_copy, "objectAtIndex:", &[0]), data);
+        assert_eq!(runtime::send(words_copy, "objectForKey:", &[key]), data);
     }
 
     static FOREIGN: std::sync::Mutex<Vec<(Id, Id)>> = std::sync::Mutex::new(Vec::new());

@@ -112,15 +112,10 @@ extern "C" fn mutable_copy(this: Id, _: Sel) -> Id {
 }
 
 extern "C" fn perform(this: Id, _: Sel, selector: Sel) -> Id {
-    let class = lock().class_of(this);
-    let found = lock().lookup(class, selector);
-    match found {
-        Some(imp) => unsafe { std::mem::transmute::<usize, extern "C" fn(Id, Sel) -> Id>(imp)(this, selector) },
-        None => {
-            let name = lock().sel_name(selector);
-            runtime::send(this, &name, &[])
-        }
-    }
+    // Through runtime::send, as -performSelector:withObject: goes: a setter
+    // of an observed key announces the change.
+    let name = lock().sel_name(selector);
+    runtime::send(this, &name, &[])
 }
 
 extern "C" fn perform_with(this: Id, _: Sel, selector: Sel, a: Id) -> Id {
@@ -900,6 +895,13 @@ fn call_setter(receiver: Id, sel: Sel, value: Id, key: Id) {
         runtime::send(receiver, "setNilValueForKey:", &[key]);
         return;
     }
+    // A setter of an observed key announces the change, as objc_msgSend's
+    // does (runtime::send). No setter ran when a nil was refused above.
+    let setter = lock().sel_name(sel);
+    let observed = observed_setter_key(receiver, &setter);
+    if let Some(key) = observed.as_deref() {
+        will_change(receiver, key);
+    }
     let number = |v: Id| if is_number(v) { number_as_f64(v) } else { crate::fw::string::get(v).trim().parse().unwrap_or(0.0) };
     let integer = |v: Id| if is_number(v) { number_as_i64(v) } else { number(v) as i64 };
     unsafe {
@@ -917,6 +919,9 @@ fn call_setter(receiver: Id, sel: Sel, value: Id, key: Id) {
             },
             _ => std::mem::transmute::<usize, extern "C" fn(Id, Sel, Id)>(imp)(receiver, sel, value),
         }
+    }
+    if let Some(key) = observed {
+        did_change(receiver, &key);
     }
 }
 
@@ -1281,6 +1286,41 @@ mod tests {
         msg_send(object, runtime::sel("setTitle:"), s("gone"));
         assert_eq!(take(), [], "removed");
         assert_eq!(string::get(thing_title(object, 0)), "gone");
+    }
+
+    static SET_VALUE_HEARD: std::sync::Mutex<Vec<(String, Option<String>, Option<String>)>> = std::sync::Mutex::new(Vec::new());
+
+    extern "C" fn set_value_watcher(_this: Id, _: Sel, path: Id, _object: Id, change: Id, _context: usize) {
+        let entry = |key: &str| {
+            let value = collections::dictionary_get(change, string::make(key));
+            (value != 0).then(|| if string::is_string(value) { string::get(value) } else { string::describe(value) })
+        };
+        SET_VALUE_HEARD.lock().unwrap().push((string::get(path), entry("new"), entry("old")));
+    }
+
+    /// Key-value coding's setter path announces a change of an observed key,
+    /// as objc_msgSend's does: SpellCraft sets a wand's spell with
+    /// setValue:forKey:. The direct-ivar fallback (no setter) stays quiet.
+    #[test]
+    fn setting_an_observed_key_by_key_value_coding_notifies() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let s = string::make;
+        let watcher_class = define_class("KvcSetValueWatcher", "NSObject", 8);
+        methods(watcher_class, &[("observeValueForKeyPath:ofObject:change:context:", set_value_watcher as usize)]);
+        let watcher = runtime::alloc_instance(watcher_class);
+        let object = thing("before", 0, 0);
+        let take = || std::mem::take(&mut *SET_VALUE_HEARD.lock().unwrap());
+        let text = |t: &str| Some(t.to_string());
+        runtime::send(object, "addObserver:forKeyPath:options:context:", &[watcher, s("title"), 1 | 2, 0]);
+        runtime::send(object, "setValue:forKey:", &[s("after"), s("title")]);
+        assert_eq!(take(), [("title".to_string(), text("after"), text("before"))], "setValue:forKey: tells the observer once");
+        runtime::send(object, "setValue:forKeyPath:", &[s("last"), s("title")]);
+        assert_eq!(take(), [("title".to_string(), text("last"), text("after"))], "a key path's last key too");
+        runtime::send(object, "removeObserver:forKeyPath:", &[watcher, s("title")]);
+        runtime::send(object, "setValue:forKey:", &[s("quiet"), s("title")]);
+        assert_eq!(take(), [], "removed");
+        assert_eq!(string::get(thing_title(object, 0)), "quiet");
     }
 
     /// Fields of a 32-bit game's object: long is 4 bytes, 8-byte values may

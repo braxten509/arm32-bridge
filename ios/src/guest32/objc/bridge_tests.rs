@@ -715,6 +715,77 @@ fn a_game_setter_on_an_observed_game_object_tells_the_observer() {
     assert_eq!(heard, [("spell".to_string(), host, hex)]);
 }
 
+static MANUAL_KVO_HEARD: Mutex<Vec<(String, Id, Id)>> = Mutex::new(Vec::new());
+
+extern "C" fn host_observe_manual(_this: Id, _: Sel, path: Id, object: Id, change: Id, _context: usize) {
+    let new = crate::fw::collections::dictionary_get(change, crate::fw::string::make("new"));
+    MANUAL_KVO_HEARD.lock().unwrap().push((crate::fw::string::get(path), object, new));
+}
+
+/// A game class may turn the automatic notice off and announce changes
+/// itself (+automaticallyNotifiesObserversForKey: returning NO). The
+/// bridge must ask the game's own class method: inheriting NSObject's YES
+/// would announce every change a second time.
+#[test]
+fn a_game_that_announces_its_own_changes_is_not_announced_for_twice() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(crate::run::setup);
+    let watcher_class = {
+        let mut rt = runtime::lock();
+        let root = rt.by_name["NSObject"];
+        let class = rt.define_class("G32ManualKvoWatcher", root, 8);
+        let observe = rt.sel("observeValueForKeyPath:ofObject:change:context:");
+        rt.add_method(class, observe, host_observe_manual as usize);
+        class
+    };
+    let fake = Fake::new();
+    let mut wand = class32(fake, "G32ManualWand", ClassTarget::External("NSObject".into()), "NSObject", vec![method("setSpell:", "v12@0:4@8", 0x2401), method("spell", "@8@0:4", 0x2411)]);
+    wand.meta = ClassRo32 { flags: 1, methods: vec![method("automaticallyNotifiesObserversForKey:", "c12@0:4@8", 0x2421)], ..Default::default() };
+    let class = wand.address;
+    let md = ObjcMetadata32 { classes: vec![wand], ..Default::default() };
+    let bridge: &'static Mutex<Bridge> = Box::leak(Box::new(Mutex::new(Bridge::new(&md).unwrap())));
+    install(bridge, fake, &md).unwrap();
+    let _hook = mirror::DISPATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    mirror::set_dispatch(Box::new(move |frame: &mut HostFrame| {
+        dispatch_from_host(bridge, fake, frame).unwrap();
+    }));
+    let sel = |name: &str| bridge.lock().unwrap().guest_selector(fake, name);
+    let guest = |host: Id| bridge.lock().unwrap().guest_object(fake, host).unwrap();
+    let key = guest(crate::fw::string::make("spell"));
+    let (will, did) = (sel("willChangeValueForKey:"), sel("didChangeValueForKey:"));
+    static SPELL: Mutex<u32> = Mutex::new(0);
+    static OVERRIDE_ASKED: Mutex<Option<Id>> = Mutex::new(None);
+    fake.code(0x2401, move |w| {
+        let announce = |s: u32| {
+            let words = [w[0], s, key];
+            let get = |i: u32| words.get(i as usize).copied().unwrap_or(0);
+            send_from_guest(bridge, fake, SendKind::Normal, &get).unwrap();
+        };
+        announce(will);
+        *SPELL.lock().unwrap() = w[2];
+        announce(did);
+        0
+    });
+    fake.code(0x2411, |_| u64::from(*SPELL.lock().unwrap()));
+    // NO for the observed key; the key it was asked about is kept.
+    fake.code(0x2421, move |w| {
+        let asked = bridge.lock().unwrap().host_object(w[2]).unwrap_or(0);
+        *OVERRIDE_ASKED.lock().unwrap() = Some(asked);
+        0
+    });
+    let object = send(bridge, fake, &[class, sel("alloc")]).unwrap() as u32;
+    let watcher = guest(runtime::alloc_instance(watcher_class));
+    let hex = crate::fw::string::make("Hex of Chaos");
+    send(bridge, fake, &[object, sel("addObserver:forKeyPath:options:context:"), watcher, key, 1, 0]).unwrap();
+    send(bridge, fake, &[object, sel("setSpell:"), guest(hex)]).unwrap();
+    let host = bridge.lock().unwrap().host_object(object).unwrap();
+    let heard = std::mem::take(&mut *MANUAL_KVO_HEARD.lock().unwrap());
+    assert_eq!(heard, [("spell".to_string(), host, hex)], "one notice, the game's own");
+    let asked = OVERRIDE_ASKED.lock().unwrap().expect("the game's own class method was asked");
+    assert_eq!(crate::fw::string::get(asked), "spell", "asked about the observed key");
+    assert_eq!(send(bridge, fake, &[object, sel("spell")]).unwrap() as u32, guest(hex));
+}
+
 #[test]
 fn a_va_list_of_format_arguments_reaches_the_host() {
     // -initWithFormat:arguments: from a game's logging helper: the va_list
