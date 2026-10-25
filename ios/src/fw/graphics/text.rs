@@ -4,7 +4,9 @@
 //! The font file is the game's own when the UIFont's name matches one of
 //! its Info.plist UIAppFonts (by family, full or PostScript name, or file
 //! name), else the system's sans-serif font (its bold for bold names).
-//! Glyph outlines go through the CTM into the context's path filler
+//! A character the chosen file has no glyph for comes from the system's
+//! font at the same size, as iOS does, so a game's font without "&" still
+//! has one. Glyph outlines go through the CTM into the context's path filler
 //! (shapes.rs), so text is anti-aliased, clipped and transformed like any
 //! other shape, upright in UIKit's flipped coordinates, and cut at the
 //! rect's edges; the context's text drawing mode picks fill, stroke or
@@ -117,15 +119,18 @@ fn face_named(name: &str) -> Option<&'static Face<'static>> {
         return found;
     }
     let wanted = simple(name);
-    let found = app_fonts().iter().find(|(names, _)| names.contains(&wanted)).map(|(_, face)| *face).or_else(|| {
-        let lower = name.to_lowercase();
-        system_face(["bold", "medium", "heavy", "black"].iter().any(|w| lower.contains(w)))
-    });
+    let found = app_fonts().iter().find(|(names, _)| names.contains(&wanted)).map(|(_, face)| *face).or_else(|| system_face(bold_name(name)));
     if found.is_none() {
         crate::log!("font {name}: no font file found; text is measured but not drawn");
     }
     CACHE.lock().unwrap().get_or_insert_with(HashMap::new).insert(name.to_string(), found);
     found
+}
+
+/// Whether a UIFont name asks for a bold face.
+fn bold_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    ["bold", "medium", "heavy", "black"].iter().any(|w| lower.contains(w))
 }
 
 // ----- measuring and line breaking -----
@@ -134,12 +139,15 @@ fn face_named(name: &str) -> Option<&'static Face<'static>> {
 struct Font {
     face: Option<&'static Face<'static>>,
     size: f64,
+    /// The name asks for a bold face: letters the chosen file lacks come
+    /// from the system's bold font.
+    bold: bool,
 }
 
 impl Font {
     fn of(font: Id) -> Font {
         let (name, size) = controls::font_name_and_size(font);
-        Font { face: face_named(&name), size }
+        Font { face: face_named(&name), size, bold: bold_name(&name) }
     }
 
     /// Points per font unit.
@@ -147,13 +155,26 @@ impl Font {
         self.size / f64::from(face.units_per_em().max(1))
     }
 
-    fn glyph(face: &Face, c: char) -> GlyphId {
-        face.glyph_index(if c == '\t' { ' ' } else { c }).unwrap_or(GlyphId(0))
+    /// The font and glyph that draw `c`: the chosen face's own, else the
+    /// system font's (as iOS fills a game font's missing letter in), else
+    /// the chosen face's missing-glyph box. Tabs are spaces.
+    fn glyph(&self, c: char) -> Option<(&'static Face<'static>, GlyphId)> {
+        let c = if c == '\t' { ' ' } else { c };
+        let face = self.face?;
+        if let Some(id) = face.glyph_index(c) {
+            return Some((face, id));
+        }
+        if let Some(system) = system_face(self.bold) {
+            if let Some(id) = system.glyph_index(c) {
+                return Some((system, id));
+            }
+        }
+        Some((face, GlyphId(0)))
     }
 
     fn advance(&self, c: char) -> f64 {
-        match self.face {
-            Some(face) => f64::from(face.glyph_hor_advance(Font::glyph(face, c)).unwrap_or(0)) * self.scale(face),
+        match self.glyph(c) {
+            Some((face, id)) => f64::from(face.glyph_hor_advance(id).unwrap_or(0)) * self.scale(face),
             None => self.size * 11.0 / 20.0,
         }
     }
@@ -352,7 +373,7 @@ impl Canvas {
     /// line's top), aligned in its width and cut at its edges, filled
     /// and/or stroked as the context's text drawing mode says; the clip
     /// modes then add the glyphs' shapes to the context's clip.
-    fn draw_text(&mut self, face: &Face, font: &Font, lines: &[Vec<char>], rect: Rect, align: isize) {
+    fn draw_text(&mut self, font: &Font, lines: &[Vec<char>], rect: Rect, align: isize) {
         // CGTextDrawingMode: fill, stroke, fill+stroke, invisible, then the same four adding to the clip.
         let mode = self.state.text_mode;
         let (fill, stroke) = match mode & 3 {
@@ -376,9 +397,13 @@ impl Canvas {
                     _ => 0.0,
                 };
             let baseline = rect.origin.y + i as f64 * font.line_height() + font.ascender();
-            let mut pen = Pen { outline: &mut outline, ctm: self.state.ctm, x, baseline, scale: font.scale(face), last: (0.0, 0.0) };
+            let scale = font.face.map_or(0.0, |face| font.scale(face));
+            let mut pen = Pen { outline: &mut outline, ctm: self.state.ctm, x, baseline, scale, last: (0.0, 0.0) };
             for &c in line {
-                face.outline_glyph(Font::glyph(face, c), &mut pen);
+                if let Some((face, id)) = font.glyph(c) {
+                    pen.scale = font.scale(face);
+                    face.outline_glyph(id, &mut pen);
+                }
                 pen.x += font.advance(c);
             }
         }
@@ -412,9 +437,9 @@ fn draw(text: Id, rect: Rect, font: Id, mode: isize, align: isize, single_line: 
     let font = Font::of(font);
     let text = string::get(text);
     let lines = lay_out(&font, &text, rect.size.width, single_line, lines_in(&font, rect.size.height), mode);
-    if let Some(face) = font.face {
+    if font.face.is_some() {
         if let Some(mut c) = canvas("-[NSString drawInRect:withFont:]", current_context()) {
-            c.draw_text(face, &font, &lines, rect, align);
+            c.draw_text(&font, &lines, rect, align);
         }
     }
     size_of(&font, &text, &lines, rect.size.width)
@@ -485,7 +510,7 @@ pub struct TextLook {
 
 impl Font {
     fn named(name: &str, size: f64) -> Font {
-        Font { face: face_named(name), size }
+        Font { face: face_named(name), size, bold: bold_name(name) }
     }
 }
 
@@ -540,7 +565,7 @@ pub(super) fn look_bitmap(look: &TextLook, scale: f64) -> Option<Bitmap> {
         return None;
     }
     let (font, lines) = label_lines(look);
-    let face = font.face?;
+    font.face?;
     let mut canvas = Canvas::new(std::ptr::null_mut(), width as usize, height as usize, 8, 0, Space::Rgb, PREMULTIPLIED_LAST).ok()?;
     // UIKit's flip: (0, 0) at the top left, `scale` pixels per point.
     canvas.state.ctm = Transform { a: scale, b: 0.0, c: 0.0, d: -scale, tx: 0.0, ty: height };
@@ -548,10 +573,10 @@ pub(super) fn look_bitmap(look: &TextLook, scale: f64) -> Option<Bitmap> {
     let rect = Rect::new(0.0, (look.size.1 - block) / 2.0, look.size.0, block);
     if let Some((color, (right, down))) = look.shadow {
         canvas.state.fill = color;
-        canvas.draw_text(face, &font, &lines, Rect::new(rect.origin.x + right, rect.origin.y + down, rect.size.width, rect.size.height), look.alignment);
+        canvas.draw_text(&font, &lines, Rect::new(rect.origin.x + right, rect.origin.y + down, rect.size.width, rect.size.height), look.alignment);
     }
     canvas.state.fill = look.color;
-    canvas.draw_text(face, &font, &lines, rect, look.alignment);
+    canvas.draw_text(&font, &lines, rect, look.alignment);
     Some(canvas.snapshot())
 }
 
@@ -839,6 +864,28 @@ mod tests {
         let (_, painted) = draw("W", Rect::new(0.0, 0.0, 6.0, H as f64), 0, 0);
         let x = columns(&painted);
         assert!(!x.is_empty() && *x.last().unwrap() < 6, "painted past the rect: columns {x:?}");
+    }
+
+    /// A letter the game's own font has no glyph for is measured with the
+    /// system font at the same point size, the way iOS draws it, not as the
+    /// game font's missing-glyph box.
+    #[test]
+    fn a_letter_the_game_font_lacks_is_measured_with_the_system_font() {
+        let path = "/usr/share/tessdata/pdf.ttf";
+        if !std::path::Path::new(path).is_file() {
+            eprintln!("skipped: {path} (a nearly glyphless font) is not installed");
+            return;
+        }
+        let face = load(path).expect("pdf.ttf parses as a font");
+        assert!(face.glyph_index('&').is_none(), "pdf.ttf unexpectedly has an &");
+        let font = Font { face: Some(face), size: 20.0, bold: false };
+        let system = system_face(false).expect("a system font file");
+        let id = system.glyph_index('&').expect("the system font's &");
+        let expected = f64::from(system.glyph_hor_advance(id).unwrap_or(0)) * font.scale(system);
+        assert!(expected > 1.0, "the system font gives & no width");
+        let measured = font.width(&['&']);
+        let boxed = f64::from(face.glyph_hor_advance(GlyphId(0)).unwrap_or(0)) * font.scale(face);
+        assert!((measured - expected).abs() < 1e-9, "& measured {measured}, the system font's {expected} (the game font's box measures {boxed})");
     }
 
     /// The clip text modes (4-7) add the glyphs to the context's clip;
