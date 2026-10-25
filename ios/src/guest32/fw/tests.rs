@@ -725,3 +725,115 @@ fn indexed_gl_queries_reach_the_guest_registry() {
         assert!(ios32::provides_function(name), "{name} is registered");
     }
 }
+
+fn four_cc(text: &[u8; 4]) -> u32 {
+    u32::from_be_bytes(*text)
+}
+
+/// A RemoteIO unit made from 32-bit structs: the guest gets handles, and its
+/// stream format (a 40-byte AudioStreamBasicDescription) reaches the host unit.
+fn remote_io_unit(rate: f64, channels: u32) -> u32 {
+    let description = alloc(20);
+    for (i, word) in [four_cc(b"auou"), four_cc(b"rioc"), four_cc(b"appl"), 0, 0].iter().enumerate() {
+        mem().write_u32(description + i as u32 * 4, *word);
+    }
+    let (component, _) = call("AudioComponentFindNext", [0, description, 0, 0], &[]);
+    assert_ne!(component, 0, "RemoteIO found");
+    let out = alloc(4);
+    assert_eq!(call("AudioComponentInstanceNew", [component, out, 0, 0], &[]).0, 0);
+    let unit = mem().read_u32(out);
+    assert_ne!(unit, 0);
+    let format = alloc(40);
+    mem().write_bytes(format, &rate.to_ne_bytes());
+    for (i, word) in [four_cc(b"lpcm"), 0xC, 2 * channels, 1, 2 * channels, channels, 16, 0].iter().enumerate() {
+        mem().write_u32(format + 8 + i as u32 * 4, *word);
+    }
+    // AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat, input scope, 0, format, 40).
+    assert_eq!(call("AudioUnitSetProperty", [unit, 8, 1, 0], &[format, 40]).0, 0);
+    unit
+}
+
+#[test]
+fn audio_unit_structs_cross_from_32_bit() {
+    let unit = remote_io_unit(22050.0, 1);
+    let (format, size) = (alloc(40), alloc(4));
+    mem().write_u32(size, 40);
+    assert_eq!(call("AudioUnitGetProperty", [unit, 8, 1, 0], &[format, size]).0, 0);
+    assert_eq!(f64::from_ne_bytes(mem().bytes(format, 8).try_into().unwrap()), 22050.0);
+    assert_eq!(mem().read_u32(format + 8), four_cc(b"lpcm"));
+    assert_eq!(mem().read_u32(format + 28), 1, "channels");
+    assert_eq!(mem().read_u32(format + 32), 16, "bits");
+    assert_eq!(call("AudioOutputUnitStop", [unit, 0, 0, 0], &[]).0, 0);
+    assert_eq!(call("AudioComponentInstanceDispose", [unit, 0, 0, 0], &[]).0, 0);
+}
+
+/// A mono 16-bit RemoteIO unit whose render callback is game code writing a ramp.
+fn ramp_unit() -> u32 {
+    let unit = remote_io_unit(44100.0, 1);
+    // Thumb: callback(refCon, *flags, *stamp, bus, frames, ioData) writes the
+    // 16-bit ramp 0, 1, 2 ... into ioData->mBuffers[0].mData (offset 12 in
+    // the 32-bit AudioBufferList) and returns noErr.
+    let code = alloc(24);
+    let thumb: [u16; 11] = [
+        0x9A01, // ldr r2, [sp, #4]   ioData
+        0x9900, // ldr r1, [sp]       frames
+        0x68D2, // ldr r2, [r2, #12]  mData
+        0x2300, // movs r3, #0
+        0x8013, // strh r3, [r2]
+        0x3202, // adds r2, #2
+        0x3301, // adds r3, #1
+        0x428B, // cmp r3, r1
+        0xDBFA, // blt (the strh)
+        0x2000, // movs r0, #0
+        0x4770, // bx lr
+    ];
+    for (i, half) in thumb.iter().enumerate() {
+        mem().write_bytes(code + i as u32 * 2, &half.to_le_bytes());
+    }
+    // AURenderCallbackStruct { inputProc, inputProcRefCon }: two guest words.
+    let callback = alloc(8);
+    mem().write_u32(callback, code | 1);
+    mem().write_u32(callback + 4, 0x1234);
+    assert_eq!(call("AudioUnitSetProperty", [unit, 23, 0, 0], &[callback, 8]).0, 0);
+    unit
+}
+
+fn ramp(frames: usize) -> Vec<f32> {
+    (0..frames).flat_map(|i| [i as f32 / 32768.0; 2]).collect()
+}
+
+#[test]
+fn a_guest_render_callback_fills_the_host_buffer() {
+    let unit = ramp_unit();
+    let out = crate::fw::sound::render_input(super::handle_to_host(unit), 0, 64);
+    assert_eq!(out, ramp(64));
+    call("AudioComponentInstanceDispose", [unit, 0, 0, 0], &[]);
+}
+
+/// GIL mode: while another thread keeps the guest lock, the sound device
+/// gets silence for that buffer at once instead of waiting for game code.
+#[test]
+#[ignore = "GIL mode: test-pc.sh runs it with ARM32_PARALLEL=0"]
+fn a_render_call_is_silent_while_the_guest_lock_is_kept() {
+    let unit = super::handle_to_host(ramp_unit());
+    assert!(!runtime::parallel(), "run with ARM32_PARALLEL=0 (test-pc.sh does)");
+    // The keeper holds the lock until the render call is over (not longer:
+    // the other GIL-mode tests run meanwhile).
+    let ((held, holding), (over, wait_over)) = (std::sync::mpsc::channel(), std::sync::mpsc::channel::<()>());
+    let keeper = std::thread::spawn(move || {
+        let _gil = runtime::hold_gil();
+        held.send(()).unwrap();
+        let _ = wait_over.recv_timeout(std::time::Duration::from_millis(500));
+    });
+    holding.recv().unwrap();
+    let started = std::time::Instant::now();
+    let out = crate::fw::sound::render_input(unit, 0, 64);
+    let waited = started.elapsed();
+    over.send(()).unwrap();
+    keeper.join().unwrap();
+    assert!(waited < std::time::Duration::from_millis(150), "waited {waited:?} for the guest lock");
+    assert!(out.iter().all(|&s| s == 0.0), "silence while the lock is kept");
+    // Holding it here: the other GIL-mode tests may be using it right now.
+    let _gil = runtime::hold_gil();
+    assert_eq!(crate::fw::sound::render_input(unit, 0, 64), ramp(64), "game code runs with the lock");
+}
