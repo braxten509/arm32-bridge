@@ -73,6 +73,9 @@ pub struct Runtime {
     selectors: HashMap<String, Sel>,
     selector_names: HashMap<Sel, String>,
     cache: HashMap<(Class, Sel), Imp>,
+    /// (lookup class, selector) whose resolver was called and added nothing:
+    /// it is not asked again until the class's method table changes.
+    resolutions_refused: HashSet<(Class, Sel)>,
     protocols: HashMap<String, usize>,
     missing_methods: HashMap<String, u64>,
     /// Method handles given out, one per (defining class, selector).
@@ -158,6 +161,20 @@ impl Runtime {
             unsafe { (*(method as *mut MethodObject)).imp = imp };
         }
         self.cache.clear();
+        // A class that gains a method may now answer selectors whose resolver
+        // said no: forget its refusals with its methods (Apple clears the
+        // class's method cache, refusals included).
+        self.resolutions_refused.retain(|&(owner, _)| owner != class);
+    }
+
+    /// Whether `class`'s resolver already said no for `sel` and added nothing.
+    pub fn resolution_refused(&self, class: Class, sel: Sel) -> bool {
+        self.resolutions_refused.contains(&(class, sel))
+    }
+
+    /// Remembers that `class`'s resolver said no for `sel`.
+    pub fn refuse_resolution(&mut self, class: Class, sel: Sel) {
+        self.resolutions_refused.insert((class, sel));
     }
 
     /// The class in `class`'s parent chain that defines `sel` itself.

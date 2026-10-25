@@ -730,6 +730,17 @@ impl Bridge {
         framework(class, *meta)
     }
 
+    /// A guest class (or framework class's guest copy): whether it is a
+    /// metaclass and its partner (the class for a metaclass, the metaclass
+    /// for a class).
+    pub(super) fn class_pair(&self, class: u32) -> Option<(bool, u32)> {
+        if let Some(c) = self.classes.class(class) {
+            return Some((c.meta, c.partner));
+        }
+        let (name, meta) = self.framework_by_guest.get(&class)?;
+        self.framework.get(name).map(|&(c, m)| (*meta, if *meta { c } else { m }))
+    }
+
     /// The name of the class the guest sees for a receiver's isa, and whether
     /// that isa is a metaclass (the receiver is the class itself).
     pub(super) fn class_display(&self, isa: u32) -> (String, bool) {
@@ -1105,6 +1116,8 @@ pub fn send_from_guest(
     let mut b = lock(bridge);
     let sel = words(first + 1);
     let name = b.selector_name(g, sel);
+    // The class the lookup starts at (a super call's starting superclass).
+    let start;
     let (receiver, target) = match kind {
         SendKind::Normal | SendKind::Stret => {
             let receiver = words(first);
@@ -1112,6 +1125,7 @@ pub fn send_from_guest(
                 return Ok(GuestRet { r0: if stret { words(0) } else { 0 }, r1: 0 });
             }
             let isa = u32_at(g, receiver);
+            start = isa;
             if b.special(isa).is_some_and(Special::is_block) {
                 drop(b);
                 let ctx = super::functions::Ctx { bridge, g };
@@ -1137,8 +1151,16 @@ pub fn send_from_guest(
             let pair = words(first);
             let (receiver, current) = (u32_at(g, pair), u32_at(g, pair + 4));
             let c = b.classes.class(current).ok_or_else(|| format!("super call {name} from unknown class {current:#x}"))?;
-            let meta = c.meta;
-            let target = match c.superclass.clone() {
+            let (meta, superclass) = (c.meta, c.superclass.clone());
+            start = match &superclass {
+                super::classes::Super::Game(parent) => *parent,
+                super::classes::Super::Framework(class) => {
+                    let (class, metaclass) = b.framework_class(g, class);
+                    if meta { metaclass } else { class }
+                }
+                super::classes::Super::None => return Err(format!("super call {name} from a root class")),
+            };
+            let target = match superclass {
                 super::classes::Super::Game(parent) => b.resolve_super(parent, &name)?,
                 super::classes::Super::Framework(class) => b.framework_target(&class, meta, &name, true)?,
                 super::classes::Super::None => return Err(format!("super call {name} from a root class")),
@@ -1159,7 +1181,7 @@ pub fn send_from_guest(
     match target {
         Target::Missing(error) => {
             drop(b);
-            super::forward::forward_message(bridge, g, kind, words, receiver, &error)
+            super::forward::forward_message(bridge, g, kind, words, receiver, start, &error)
         }
         Target::Guest { imp, types } => {
             drop(b);
@@ -1262,7 +1284,7 @@ pub fn send_from_guest(
             };
             let Some(imp) = imp else {
                 let error = format!("{MISSING_METHOD}{}[{class} {name}]: not implemented by the host layer", if meta { "+" } else { "-" });
-                return super::forward::forward_message(bridge, g, kind, words, receiver, &error);
+                return super::forward::forward_message(bridge, g, kind, words, receiver, start, &error);
             };
             b = lock(bridge);
             // The framework's -dealloc of a game object: its C++ ivars go first.
