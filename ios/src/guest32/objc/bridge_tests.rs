@@ -583,6 +583,82 @@ fn a_float_host_property_reaches_the_host_as_a_float() {
     assert_eq!(HOST_VOLUME.lock().unwrap().clone(), vec![(host, 1.0f32)]);
 }
 
+#[test]
+fn game_protocols_cross_the_bridge_and_game_classes_conform_to_them() {
+    // SpellCraft asks -conformsToProtocol: with its own protocols: each is a
+    // protocol_t in the game's image (isa 0 there), which the host's
+    // NSObject reads in its own layout, and the class's host mirror must
+    // list the protocols the game class adopts.
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(crate::run::setup);
+    let fake = Fake::new();
+    let (class, meta) = (fake.alloc_permanent(20), fake.alloc_permanent(20));
+    fake.write(class, &meta.to_le_bytes());
+    let (drawing, base, other) = (fake.alloc_permanent(32), fake.alloc_permanent(32), fake.alloc_permanent(32));
+    let protocol = |address: u32, name: &str, protocols: Vec<u32>| guest32_image::ObjcProtocol32 {
+        address,
+        name: name.into(),
+        protocols,
+        instance_methods: vec![method("draw", "v8@0:4", 0)],
+        class_methods: vec![],
+        optional_instance_methods: vec![],
+        optional_class_methods: vec![],
+        properties: vec![],
+    };
+    let md = ObjcMetadata32 {
+        classes: vec![ObjcClass32 {
+            address: class,
+            name: "G32Shape".into(),
+            superclass: ClassTarget::External("NSObject".into()),
+            meta_address: meta,
+            meta_isa: ClassTarget::External("NSObject".into()),
+            meta_superclass: ClassTarget::External("NSObject".into()),
+            instance: ClassRo32 { instance_start: 4, instance_size: 4, protocols: vec![drawing], ..Default::default() },
+            meta: ClassRo32 { flags: 1, protocols: vec![drawing], ..Default::default() },
+        }],
+        protocols_by_address: [
+            (drawing, protocol(drawing, "G32Drawing", vec![base])),
+            (base, protocol(base, "G32Base", vec![])),
+            (other, protocol(other, "G32Other", vec![])),
+        ]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+    let bridge = Mutex::new(Bridge::new(&md).unwrap());
+    install(&bridge, fake, &md).unwrap();
+    let host = bridge.lock().unwrap().host_object_for(fake, drawing).unwrap();
+    assert_eq!(unsafe { runtime::cstr(*((host + 8) as *const usize)) }, "G32Drawing");
+    assert_eq!(bridge.lock().unwrap().guest_object(fake, host).unwrap(), drawing, "the same protocol comes back");
+    assert_eq!(runtime::protocol_named("G32Drawing"), host, "objc_getProtocol finds it");
+    let sel = |name: &str| bridge.lock().unwrap().guest_selector(fake, name);
+    let object = send(&bridge, fake, &[class, sel("alloc")]).unwrap() as u32;
+    let conforms = sel("conformsToProtocol:");
+    assert_eq!(send(&bridge, fake, &[object, conforms, drawing]).unwrap() & 0xff, 1);
+    assert_eq!(send(&bridge, fake, &[object, conforms, base]).unwrap() & 0xff, 1, "a protocol it includes");
+    assert_eq!(send(&bridge, fake, &[object, conforms, other]).unwrap() & 0xff, 0);
+    assert_eq!(send(&bridge, fake, &[class, conforms, drawing]).unwrap() & 0xff, 1, "the class too");
+}
+
+#[test]
+fn a_va_list_of_format_arguments_reaches_the_host() {
+    // -initWithFormat:arguments: from a game's logging helper: the va_list
+    // points at the guest's variadic words (armv7), read by the format.
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(crate::run::setup);
+    let fake = Fake::new();
+    let bridge = Mutex::new(Bridge::new(&ObjcMetadata32::default()).unwrap());
+    let proxy = |host: Id| bridge.lock().unwrap().guest_object(fake, host).unwrap();
+    let string = proxy(runtime::send(runtime::class_named("NSString"), "alloc", &[]));
+    let (format, name) = (proxy(crate::fw::string::make("%d %@ %lld")), proxy(crate::fw::string::make("wizards")));
+    let va = fake.alloc_permanent(16);
+    fake.write(va, &[7u32.to_le_bytes(), name.to_le_bytes(), 5u32.to_le_bytes(), 1u32.to_le_bytes()].concat());
+    let sel = bridge.lock().unwrap().guest_selector(fake, "initWithFormat:arguments:");
+    let made = send(&bridge, fake, &[string, sel, format, va]).unwrap() as u32;
+    let host = bridge.lock().unwrap().host_object(made).unwrap();
+    assert_eq!(crate::fw::string::get(host), format!("7 wizards {}", 5u64 | 1 << 32));
+}
+
 extern "C" fn host_picture_size(_this: Id, _: Sel) -> crate::fw::geometry::Size {
     crate::fw::geometry::Size { width: 3.0, height: 4.0 }
 }

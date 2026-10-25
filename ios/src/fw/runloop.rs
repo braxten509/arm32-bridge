@@ -67,6 +67,8 @@ pub struct Loop {
     ran: std::sync::atomic::AtomicBool,
     /// Set when its thread ended: it takes no more work.
     ended: std::sync::atomic::AtomicBool,
+    /// The mode it is running in (-currentMode), None while it isn't running.
+    mode: Mutex<Option<String>>,
 }
 
 impl Loop {
@@ -77,6 +79,7 @@ impl Loop {
             wake: Condvar::new(),
             ran: std::sync::atomic::AtomicBool::new(false),
             ended: std::sync::atomic::AtomicBool::new(false),
+            mode: Mutex::new(None),
         }
     }
 
@@ -529,6 +532,14 @@ fn fire_due_timers(run_loop: &'static Loop) -> (usize, Option<f64>) {
 /// handled. Returns true if anything was.
 fn run_loop_until(run_loop: &'static Loop, until: Option<f64>, once: bool, mode: &str) -> bool {
     run_loop.ran.store(true, Ordering::Relaxed);
+    /// Puts the mode the loop ran in before back when this run ends (runs nest).
+    struct Running(&'static Loop, Option<String>);
+    impl Drop for Running {
+        fn drop(&mut self) {
+            *self.0.mode.lock().unwrap_or_else(|e| e.into_inner()) = self.1.take();
+        }
+    }
+    let _running = Running(run_loop, run_loop.mode.lock().unwrap_or_else(|e| e.into_inner()).replace(mode.to_string()));
     let mut handled = false;
     // Each turn of the loop has its own autorelease pool, as on Apple.
     let pool = crate::fw::counted::pool_mark();
@@ -665,6 +676,20 @@ extern "C" fn run_loop_current(_: Class, _: Sel) -> Id {
 
 extern "C" fn run_loop_main(_: Class, _: Sel) -> Id {
     main_run_loop()
+}
+
+/// -currentMode: the default mode is Foundation's own NSDefaultRunLoopMode
+/// object (games compare it by pointer too); nil while the loop isn't running.
+extern "C" fn run_loop_current_mode(this: Id, _: Sel) -> Id {
+    let mode = loop_of(this).mode.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    match mode.as_deref() {
+        None => 0,
+        Some(DEFAULT_MODE) => match crate::symbols::lookup("NSDefaultRunLoopMode") {
+            Some((address, _)) => unsafe { *(address as *const Id) },
+            None => string::make(DEFAULT_MODE),
+        },
+        Some(other) => string::make(other),
+    }
 }
 
 extern "C" fn run_loop_add_timer(this: Id, _: Sel, timer_object: Id, _mode: Id) {
@@ -1033,6 +1058,7 @@ pub fn register(r: &mut Registry) {
             ("addTimer:forMode:", run_loop_add_timer as usize),
             ("runUntilDate:", run_loop_run_until as usize),
             ("runMode:beforeDate:", run_loop_run_mode as usize),
+            ("currentMode", run_loop_current_mode as usize),
             ("run", run_loop_run as usize),
             ("getCFRunLoop", run_loop_get_cf as usize),
         ],
@@ -1210,6 +1236,40 @@ mod perform_tests {
         }
         assert_eq!(heard(), ["soon"]);
         STOP.store(true, Ordering::Relaxed);
+    }
+
+    static MODE_SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    extern "C" fn record_current_mode(_this: Id, _: Sel, _: Id) {
+        let run_loop = runtime::send(runtime::class_named("NSRunLoop"), "currentRunLoop", &[]);
+        let mode = runtime::send(run_loop, "currentMode", &[]);
+        MODE_SEEN.lock().unwrap().push(if mode == 0 { "nil".into() } else { string::get(mode) });
+    }
+
+    /// -currentMode: the mode the run loop is running in, nil while it isn't
+    /// running (on a thread of its own here, whose loop runs only when asked).
+    #[test]
+    fn a_run_loop_tells_the_mode_it_runs_in() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let class = define_class("ModeTestTarget", "NSObject", 8);
+        methods(class, &[("noteMode:", record_current_mode as usize)]);
+        std::thread::spawn(move || {
+            // A thread of its own even when no test marked a main thread
+            // (then every thread counts as main and shares its loop).
+            CURRENT_THREAD.with(|cell| cell.set(new_thread(0, 0, 0)));
+            let target = runtime::send(runtime::send(class, "alloc", &[]), "init", &[]);
+            record_current_mode(target, 0, 0);
+            let s = runtime::sel("performSelector:withObject:afterDelay:");
+            let imp = runtime::imp_for(target, s).expect("performSelector:withObject:afterDelay:");
+            let f: extern "C" fn(Id, Sel, Sel, Id, f64) = unsafe { std::mem::transmute(imp) };
+            f(target, s, runtime::sel("noteMode:"), 0, 0.0);
+            run_this_threads_loop_briefly();
+            record_current_mode(target, 0, 0);
+        })
+        .join()
+        .unwrap();
+        assert_eq!(*MODE_SEEN.lock().unwrap(), ["nil", "kCFRunLoopDefaultMode", "nil"]);
     }
 
     /// Reference counts of the objects below (counted through their own

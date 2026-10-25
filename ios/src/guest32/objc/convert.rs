@@ -698,6 +698,8 @@ pub struct PreparedHostCall {
     indirect: Option<Box<[u64]>>,
     stret: Option<u32>,
     outs: Vec<OutParam>,
+    /// Host memory the call's arguments point at (va_lists), kept until it ran.
+    _kept: Vec<Box<[u64]>>,
 }
 
 /// What the framework selector table says about a message beyond its types.
@@ -729,7 +731,23 @@ pub fn prepare_host_call(
         IdArrays::None => None,
         _ => sig.args.iter().zip(sig.guest_arg_words()).filter(|(t, _)| matches!(t, Ty::Int { .. })).last().map(|(_, at)| words(at)),
     };
-    for (ty, at) in sig.args.iter().zip(sig.guest_arg_words()) {
+    let mut kept = Vec::new();
+    let last_word = sig.guest_arg_words().last().copied();
+    for (index, (ty, at)) in sig.args.iter().zip(sig.guest_arg_words()).enumerate() {
+        if options.varargs == Varargs::VaList && Some(at) == last_word && index >= 1 {
+            // The guest's va_list: the format's arguments, one word after
+            // another; the host gets an arm64 va_list (8-byte slots) of them.
+            let format_at = sig.guest_arg_words()[index - 1];
+            let text = format_text(&sig.args[index - 1], words(format_at), b)?;
+            let needed: u32 = format_kinds(&text).iter().map(|kind| if matches!(kind, FormatArg::Long) { 2 } else { 1 }).sum();
+            let place = words(at);
+            let raw = if place == 0 || needed == 0 { Vec::new() } else { b.read(place, needed * 4) };
+            let mut next = raw.chunks_exact(4).map(|w| u32::from_le_bytes(w.try_into().unwrap()));
+            let slots = format_slots(&text, || next.next().unwrap_or(0), b)?.into_boxed_slice();
+            args.push(&HostTy::Ptr, &(slots.as_ptr() as u64).to_le_bytes());
+            kept.push(slots);
+            continue;
+        }
         let guest = guest_bytes(words, at, ty.guest_size());
         if let Ty::Pointer(pointee) = ty {
             let address = guest_u32(&guest);
@@ -764,7 +782,7 @@ pub fn prepare_host_call(
     }
     let next = sig.guest_total_words();
     match options.varargs {
-        Varargs::None => {}
+        Varargs::None | Varargs::VaList => {}
         Varargs::NilList => {
             for i in next.. {
                 let object = words(i);
@@ -776,37 +794,17 @@ pub fn prepare_host_call(
         }
         Varargs::Format => {
             let at = *sig.guest_arg_words().last().unwrap();
-            let format_arg = words(at);
-            let text = match sig.args.last() {
-                Some(Ty::CString) => {
-                    let host = b.host_address(format_arg) as *const libc::c_char;
-                    unsafe { std::ffi::CStr::from_ptr(host) }.to_string_lossy().into_owned()
-                }
-                _ => b.object_text(format_arg).ok_or("format string is not a string object")?,
-            };
+            let text = format_text(sig.args.last().unwrap(), words(at), b)?;
             let mut word = next;
-            for kind in format_kinds(&text) {
-                let slot = match kind {
-                    FormatArg::Int => {
-                        word += 1;
-                        words(word - 1) as i32 as i64 as u64
-                    }
-                    FormatArg::Long => {
-                        word += 2;
-                        u64::from(words(word - 2)) | u64::from(words(word - 1)) << 32
-                    }
-                    FormatArg::Object => {
-                        word += 1;
-                        b.id_to_host(words(word - 1))? as u64
-                    }
-                    FormatArg::Pointer => {
-                        word += 1;
-                        let g = words(word - 1);
-                        if g == 0 { 0 } else { b.host_address(g) as u64 }
-                    }
-                };
-                args.stack.push(slot);
-            }
+            let slots = format_slots(
+                &text,
+                || {
+                    word += 1;
+                    words(word - 1)
+                },
+                b,
+            )?;
+            args.stack.extend(slots);
         }
     }
     let ret_hty = host_ty(&sig.ret, false)?;
@@ -815,7 +813,40 @@ pub fn prepare_host_call(
         args.x[8] = buffer.as_ptr() as u64;
     }
     let stret = sig.ret.guest_returns_in_memory().then(|| words(0));
-    Ok(PreparedHostCall { args, ret: sig.ret.clone(), ret_hty, indirect, stret, outs })
+    Ok(PreparedHostCall { args, ret: sig.ret.clone(), ret_hty, indirect, stret, outs, _kept: kept })
+}
+
+/// The text of a printf-style format argument (a C string or a string object).
+fn format_text(ty: &Ty, format: u32, b: &mut dyn Boundary) -> Result<String, String> {
+    match ty {
+        Ty::CString => {
+            let host = b.host_address(format) as *const libc::c_char;
+            Ok(unsafe { std::ffi::CStr::from_ptr(host) }.to_string_lossy().into_owned())
+        }
+        _ => b.object_text(format).ok_or_else(|| "format string is not a string object".to_string()),
+    }
+}
+
+/// The arguments a format reads, as arm64 passes variadic ones (8-byte
+/// slots, which an arm64 va_list points at too), taken a guest word at a
+/// time from `next` (64-bit values: two words, low first).
+fn format_slots(text: &str, mut next: impl FnMut() -> u32, b: &mut dyn Boundary) -> Result<Vec<u64>, String> {
+    let mut slots = Vec::new();
+    for kind in format_kinds(text) {
+        slots.push(match kind {
+            FormatArg::Int => next() as i32 as i64 as u64,
+            FormatArg::Long => {
+                let low = next();
+                u64::from(low) | u64::from(next()) << 32
+            }
+            FormatArg::Object => b.id_to_host(next())? as u64,
+            FormatArg::Pointer => match next() {
+                0 => 0,
+                g => b.host_address(g) as u64,
+            },
+        });
+    }
+    Ok(slots)
 }
 
 impl PreparedHostCall {

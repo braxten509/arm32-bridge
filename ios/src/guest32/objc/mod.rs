@@ -24,6 +24,7 @@ pub mod functions;
 #[cfg(test)]
 mod functions_tests;
 pub mod mirror;
+pub mod protocols;
 pub mod selectors;
 pub mod wire;
 #[cfg(test)]

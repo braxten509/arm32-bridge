@@ -19,6 +19,9 @@
 #   format       the last fixed argument is a printf-style format and
 #                variadic arguments follow (read by the format);
 #   nil-list     variadic object arguments follow, ended by nil;
+#   va-list      the last argument is a va_list (armv7: a pointer to the
+#                variadic words) of the printf-style format before it; the
+#                host gets an arm64 va_list of the same arguments;
 #   ambiguous    classes disagree on the types; the encoding is for the
 #                class the games use (named after the colon);
 #   class        the row is for receivers of the class named after the
@@ -437,6 +440,7 @@ initWithDomain:code:userInfo:	@@:@i@
 initWithFireDate:interval:target:selector:userInfo:repeats:	@@:@d@:@c
 initWithFloat:	@@:f	float
 initWithFormat:	@@:@	format
+initWithFormat:arguments:	@@:@*	va-list
 initWithIdentifier:	@@:@
 initWithIdentifier:source:destination:	@@:@@@
 initWithImage:	@@:@
@@ -671,6 +675,7 @@ postNotification:	v@:@
 postNotificationName:object:	v@:@@
 postNotificationName:object:userInfo:	v@:@@@
 predicateWithFormat:	@@:@	format
+predicateWithFormat:arguments:	@@:@*	va-list
 predicateWithValue:	@@:c
 preferredLanguages	@@:
 preferredLocalizationsFromArray:	@@:@
@@ -699,6 +704,7 @@ proxyForJson	@@:
 purpleColor	@@:
 raise	v@:
 raise:format:	v@:@@	format
+raise:format:arguments:	v@:@@*	va-list
 rangeAtIndex:	{_NSRange=II}@:I
 rangeOfCharacterFromSet:	{_NSRange=II}@:@
 rangeOfString:	{_NSRange=II}@:@

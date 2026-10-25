@@ -630,6 +630,22 @@ fn es1_contexts_draw_textured_coloured_client_arrays() {
     make_current(0);
 }
 
+/// iPhone ES 1 games discard Apple's read and draw framebuffers
+/// (GL_APPLE_framebuffer_multisample names); an ES 1 context has one
+/// framebuffer binding, which both names mean, so no GL error follows.
+#[test]
+fn es1_discarding_the_read_or_draw_framebuffer_is_no_error() {
+    setup();
+    es1_context();
+    es1_framebuffer(8, 8);
+    let attachments = words(&[0x8CE0]);
+    for target in [0x8CA8, 0x8CA9, GL_FRAMEBUFFER_OES] {
+        call("glDiscardFramebufferEXT", [target, 1, attachments, 0], &[]);
+        assert_eq!(call("glGetError", [0; 4], &[]).0, 0, "no GL error discarding target {target:#x}");
+    }
+    make_current(0);
+}
+
 #[test]
 fn es1_frames_reach_the_window_and_the_game_state_stays() {
     setup();

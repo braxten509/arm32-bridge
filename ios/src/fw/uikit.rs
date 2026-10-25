@@ -1896,7 +1896,8 @@ extern "C" fn image_named(_: Class, _: Sel, name: Id) -> Id {
         _ => (name.clone(), "png".to_string()),
     };
     for candidate in [format!("{dir}/{stem}@2x.{ext}"), format!("{dir}/{stem}.{ext}"), format!("{dir}/{name}")] {
-        if std::path::Path::new(&candidate).exists() {
+        // A file only: an empty name would otherwise find the app's folder.
+        if std::path::Path::new(&candidate).is_file() {
             // UIKit keeps named images in its cache (which holds its own reference).
             static CACHE: Mutex<Option<HashMap<String, Id>>> = Mutex::new(None);
             let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
