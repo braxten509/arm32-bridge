@@ -208,6 +208,7 @@ containsValueForKey:	c@:@
 contentMode	i@:
 contentOffset	{CGPoint=ff}@:
 contentScaleFactor	f@:
+contentsAreFlipped	c@:
 contentsOfDirectoryAtPath:error:	@@:@^@
 contentsScale	f@:
 continueTrackingWithTouch:withEvent:	c@:@@
@@ -514,6 +515,7 @@ isEqualToNumber:	c@:@
 isEqualToString:	c@:@
 isFileURL	c@:
 isFirstResponder	c@:
+isGeometryFlipped	c@:
 isHidden	c@:
 isHighlighted	c@:
 isKindOfClass:	c@:#
@@ -905,6 +907,7 @@ setFrameInterval:	v@:i
 setFromValue:	v@:@
 setFullscreen:	v@:c
 setGameCenterDelegate:	v@:@
+setGeometryFlipped:	v@:c
 setHidden:	v@:c
 setHighlighted:	v@:c
 setHighlightedImage:	v@:@

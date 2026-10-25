@@ -582,6 +582,18 @@ crate::fw::uikit::property!(layer_mask, layer_set_mask, "mask", id, 0);
 crate::fw::uikit::property!(layer_contents, layer_set_contents, "contents", id, 0);
 crate::fw::uikit::property!(layer_contents_gravity, layer_set_contents_gravity, "contentsGravity", id, 0);
 crate::fw::uikit::property!(layer_contents_scale, layer_set_contents_scale, "contentsScale", f64, 1.0);
+crate::fw::uikit::property!(layer_geometry_flipped, layer_set_geometry_flipped, "geometryFlipped", bool, false);
+
+/// On iOS a layer's contents are drawn flipped (Core Animation's y goes up,
+/// UIKit's down) unless its geometry is flipped; contentsGravity's "top"
+/// and "bottom" are then the other way round.
+extern "C" fn layer_contents_are_flipped(this: Id, _: Sel) -> bool {
+    !layer_geometry_flipped(this, 0)
+}
+
+pub fn contents_are_flipped(layer: Id) -> bool {
+    layer_contents_are_flipped(layer, 0)
+}
 crate::fw::uikit::property!(layer_name, layer_set_name, "name", id, 0);
 crate::fw::uikit::property!(layer_double_sided, layer_set_double_sided, "doubleSided", bool, true);
 crate::fw::uikit::property!(layer_bounds_redraw, layer_set_bounds_redraw, "needsDisplayOnBoundsChange", bool, false);
@@ -1143,6 +1155,9 @@ pub fn register() {
             ("setContentsGravity:", layer_set_contents_gravity as usize),
             ("contentsScale", layer_contents_scale as usize),
             ("setContentsScale:", layer_set_contents_scale as usize),
+            ("isGeometryFlipped", layer_geometry_flipped as usize),
+            ("setGeometryFlipped:", layer_set_geometry_flipped as usize),
+            ("contentsAreFlipped", layer_contents_are_flipped as usize),
             ("name", layer_name as usize),
             ("setName:", layer_set_name as usize),
             ("isDoubleSided", layer_double_sided as usize),
@@ -1283,6 +1298,26 @@ mod tests {
         assert_eq!(layer_convert_point_from(scaled, 0, p(0.0, 0.0), own), p(2.5, 2.5));
         assert_eq!(layer_convert_rect_to(scaled, 0, Rect::new(0.0, 0.0, 10.0, 10.0), host), Rect::new(40.0, 40.0, 20.0, 20.0));
         assert_eq!(layer_convert_rect_from(host, 0, Rect::new(0.0, 0.0, 10.0, 10.0), own), Rect::new(45.0, 45.0, 10.0, 10.0));
+    }
+
+    /// Layers put above or below a subview's layer, or in place of one of
+    /// the game's, sit among the subviews as in Apple's one sublayer list.
+    #[test]
+    fn sublayers_go_among_subviews_where_put() {
+        setup();
+        let view = new_view(Rect::new(0.0, 0.0, 100.0, 100.0));
+        let (first, second) = (new_view(Rect::new(0.0, 0.0, 10.0, 10.0)), new_view(Rect::new(0.0, 0.0, 10.0, 10.0)));
+        runtime::send(view, "addSubview:", &[first]);
+        runtime::send(view, "addSubview:", &[second]);
+        let host = runtime::send(view, "layer", &[]);
+        let layer_of = |v: Id| runtime::send(v, "layer", &[]);
+        let class = runtime::class_named("CALayer");
+        let (below, above, swapped) = (layer_class_layer(class, 0), layer_class_layer(class, 0), layer_class_layer(class, 0));
+        layer_insert_below(host, 0, below, layer_of(second));
+        layer_insert_above(host, 0, above, layer_of(first));
+        assert_eq!(children(host), [Child::View(first), Child::Layer(above), Child::Layer(below), Child::View(second)]);
+        layer_replace_sublayer(host, 0, below, swapped);
+        assert_eq!(children(host), [Child::View(first), Child::Layer(above), Child::Layer(swapped), Child::View(second)]);
     }
 
     /// A new anchor point keeps the layer's position and moves its frame;

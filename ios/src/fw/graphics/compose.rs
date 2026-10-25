@@ -10,17 +10,35 @@ use super::*;
 use crate::fw::pictures::{meet, screen_box, Group, Picture};
 use std::collections::HashMap;
 
-/// Most pixels a group's picture has (it is made coarser past this).
+/// Most pixels a made picture has (it is made coarser past this), so a
+/// layer with absurd bounds can't ask for more memory than there is.
 const MOST_PIXELS: f64 = 4.0e6;
 
-/// How long a made picture is kept unused. The screen asks for what it
-/// shows on every check (20 a second), so what shows stays; what an
-/// animation made a moment ago goes, file and all.
-const KEPT_UNUSED: std::time::Duration = std::time::Duration::from_secs(2);
+/// `scale` pixels per point, or fewer so `width` x `height` points stay
+/// within MOST_PIXELS.
+fn capped(scale: f64, width: f64, height: f64) -> f64 {
+    scale.min((MOST_PIXELS / (width * height)).sqrt())
+}
+
+/// Screen checks a made picture is kept unused. The screen asks for what
+/// it shows on every check (20 a second), so what shows stays; what an
+/// animation made a moment ago goes, file and all, about 2 s later. Counted
+/// in checks, not time, so a check that takes long to make its pictures
+/// never loses its own first ones.
+const KEPT_CHECKS: u64 = 40;
+
+/// Screen checks so far (fw/pictures.rs counts them).
+static CHECKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A new screen check starts: what goes unused from now on counts toward going.
+pub fn new_screen_check() {
+    CHECKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
 
 struct Made {
     file: Option<String>,
-    used: std::time::Instant,
+    /// The screen check it was last used in.
+    used: u64,
 }
 
 /// What was made, by what it shows.
@@ -28,27 +46,32 @@ static MADE: Mutex<Option<HashMap<String, Made>>> = Mutex::new(None);
 
 /// The file made for `key`: made by `make` the first time it is asked for.
 fn made(key: String, make: impl FnOnce() -> Option<String>) -> Option<String> {
-    let now = std::time::Instant::now();
+    let check = CHECKS.load(std::sync::atomic::Ordering::Relaxed);
     if let Some(found) = MADE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).get_mut(&key) {
-        found.used = now;
+        found.used = check;
         return found.file.clone();
     }
     let file = make();
     let mut all = MADE.lock().unwrap_or_else(|e| e.into_inner());
     let kept = all.get_or_insert_with(HashMap::new);
     kept.retain(|_, m| {
-        let keep = now.saturating_duration_since(m.used) < KEPT_UNUSED;
+        let keep = check.saturating_sub(m.used) < KEPT_CHECKS;
         if let (false, Some(file)) = (keep, &m.file) {
             let _ = std::fs::remove_file(file);
         }
         keep
     });
-    kept.insert(key, Made { file: file.clone(), used: now });
+    kept.insert(key, Made { file: file.clone(), used: check });
     file
 }
 
 fn pixels(points: f64, scale: f64) -> usize {
     (points * scale).ceil().max(1.0) as usize
+}
+
+/// A size worth drawing: some area, and finite.
+fn drawable(width: f64, height: f64) -> bool {
+    width > 0.0 && height > 0.0 && width.is_finite() && height.is_finite()
 }
 
 /// A clear canvas of `width` x `height` pixels whose user space is points
@@ -68,9 +91,10 @@ fn save(c: &mut Canvas, what: &str) -> Option<String> {
 /// rounded by `radius`, filled with `fill`; the border (colour, width) lies
 /// inside its edge, following the corners (Core Animation's way).
 pub fn box_picture(size: (f64, f64), radius: f64, fill: [f64; 4], border: ([f64; 4], f64), scale: f64) -> Option<String> {
-    if !(size.0 > 0.0 && size.1 > 0.0) {
+    if !drawable(size.0, size.1) {
         return None;
     }
+    let scale = capped(scale, size.0, size.1);
     made(format!("box {size:?} {radius} {fill:?} {border:?} {scale}"), || {
         let mut c = canvas_at(Point::default(), pixels(size.0, scale), pixels(size.1, scale), scale)?;
         let to_device = c.to_device();
@@ -98,15 +122,19 @@ pub fn box_picture(size: (f64, f64), radius: f64, fill: [f64; 4], border: ([f64;
 }
 
 /// A gradient layer's colours over `size` points, from `start` to `end` (unit
-/// points of the layer), the stops (straight colour, location) in order.
+/// points of the layer), the stops (straight colour, location) taken in
+/// location order, as renderInContext: takes them.
 pub fn gradient_picture(size: (f64, f64), start: Point, end: Point, stops: &[([f64; 4], f64)], scale: f64) -> Option<String> {
-    if !(size.0 > 0.0 && size.1 > 0.0) || stops.is_empty() {
+    if !drawable(size.0, size.1) || stops.is_empty() {
         return None;
     }
+    let scale = capped(scale, size.0, size.1);
+    let mut stops: Vec<(f64, [f64; 4])> = stops.iter().map(|&(color, at)| (at, color)).collect();
+    stops.sort_by(|a, b| a.0.total_cmp(&b.0));
     made(format!("gradient {size:?} {start:?} {end:?} {stops:?} {scale}"), || {
         let mut c = canvas_at(Point::default(), pixels(size.0, scale), pixels(size.1, scale), scale)?;
         let at = |p: Point| Point { x: p.x * size.0, y: p.y * size.1 };
-        let gradient = Gradient { stops: stops.iter().map(|&(color, at)| (at, color)).collect() };
+        let gradient = Gradient { stops };
         c.draw_linear_gradient(&gradient, at(start), at(end), 3);
         save(&mut c, "a gradient layer")
     })
@@ -115,9 +143,10 @@ pub fn gradient_picture(size: (f64, f64), start: Point, end: Point, stops: &[([f
 /// A shape layer's path (figures in the layer's points, a closed one ending
 /// at its start) filled and stroked, over `area` of the layer's points.
 pub fn shape_picture(area: Rect, figures: &[Vec<Point>], fill: Option<[f64; 4]>, even_odd: bool, stroke: Option<([f64; 4], f64)>, scale: f64) -> Option<String> {
-    if !(area.size.width > 0.0 && area.size.height > 0.0) {
+    if !drawable(area.size.width, area.size.height) {
         return None;
     }
+    let scale = capped(scale, area.size.width, area.size.height);
     made(format!("shape {area:?} {figures:?} {fill:?} {even_odd} {stroke:?} {scale}"), || {
         let mut c = canvas_at(area.origin, pixels(area.size.width, scale), pixels(area.size.height, scale), scale)?;
         let outline = outline_of(figures, &c.to_device());
@@ -250,7 +279,7 @@ pub fn group_pictures(start: &Picture, content: &[Picture], mask: &[Picture], sc
         return fallback;
     }
     let Some(area) = region(group, start.clip, content, mask) else { return fallback };
-    let k = scale.min((MOST_PIXELS / (area.size.width * area.size.height)).sqrt());
+    let k = capped(scale, area.size.width, area.size.height);
     let key = format!("group {k} {area:?} {group:?} {content:?} {mask:?}");
     let Some(file) = made(key, || composite(group, area, k, content, mask, only_shadow)) else { return fallback };
     let size = (pixels(area.size.width, k) as f64 / k, pixels(area.size.height, k) as f64 / k);
@@ -402,4 +431,45 @@ fn composite(group: &Group, area: Rect, k: f64, content: &[Picture], mask: &[Pic
         layout.write(pixel, *color);
     }
     save(&mut picture, "a layer drawn with its corners, mask or shadow")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A made picture file's pixels: width, height, straight RGBA rows.
+    fn pixels_of(file: &str) -> (usize, usize, Vec<u8>) {
+        let (bitmap, _) = decode(&std::fs::read(file).unwrap()).unwrap();
+        (bitmap.width, bitmap.height, bitmap.straight_rgba().unwrap())
+    }
+
+    /// However big a layer is, its drawn pictures stay within the pixels a
+    /// group may have (made coarser past that), so huge bounds can't use up
+    /// the memory.
+    #[test]
+    fn drawn_pictures_have_at_most_so_many_pixels() {
+        let big = (3000.0, 3000.0);
+        let red = [1.0, 0.0, 0.0, 1.0];
+        let files = [
+            box_picture(big, 10.0, red, ([0.0; 4], 0.0), 1.0),
+            gradient_picture(big, Point { x: 0.0, y: 0.0 }, Point { x: 1.0, y: 1.0 }, &[(red, 0.0), ([0.0, 0.0, 1.0, 1.0], 1.0)], 1.0),
+            shape_picture(Rect::new(0.0, 0.0, big.0, big.1), &[vec![Point { x: 0.0, y: 0.0 }, Point { x: 3000.0, y: 0.0 }, Point { x: 0.0, y: 3000.0 }, Point { x: 0.0, y: 0.0 }]], Some(red), false, None, 1.0),
+        ];
+        for file in files {
+            let (width, height, _) = pixels_of(&file.expect("a picture"));
+            assert!((width * height) as f64 <= MOST_PIXELS * 1.01, "{width}x{height}");
+        }
+    }
+
+    /// A gradient's stops are taken in location order, whatever order they
+    /// were given in (as renderInContext: draws them).
+    #[test]
+    fn gradient_stops_go_by_location() {
+        let (red, blue) = ([1.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]);
+        let file = gradient_picture((10.0, 1.0), Point { x: 0.0, y: 0.5 }, Point { x: 1.0, y: 0.5 }, &[(blue, 1.0), (red, 0.0)], 1.0).expect("a picture");
+        let (width, _, rgba) = pixels_of(&file);
+        assert!(rgba[0] > 200 && rgba[2] < 50, "red at the start: {:?}", &rgba[..4]);
+        let last = (width - 1) * 4;
+        assert!(rgba[last + 2] > 200 && rgba[last] < 50, "blue at the end: {:?}", &rgba[last..last + 4]);
+    }
 }

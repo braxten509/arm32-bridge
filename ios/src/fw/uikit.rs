@@ -2595,6 +2595,19 @@ mod tests {
         assert!(near(r.origin, p(-50.0, -50.0)) && (r.size.width - 200.0).abs() < 1e-9, "{r:?}");
         let r = view_convert_rect_from(b, 0, Rect::new(0.0, 0.0, 10.0, 10.0), a);
         assert_eq!(r, Rect::new(5.0, -5.0, 10.0, 10.0));
+        // nil is the receiver's window's own coordinates, not the screen: the
+        // second window is 100 points to the right.
+        assert!(near(view_convert_point_to(other, 0, p(0.0, 0.0), 0), p(0.0, 0.0)), "nil: its window, not the screen");
+        assert!(near(view_convert_point_from(other, 0, p(5.0, 5.0), 0), p(5.0, 5.0)));
+        assert!(near(view_convert_point_to(second, 0, p(1.0, 2.0), 0), p(1.0, 2.0)), "a window to nil: itself");
+        // Turned 45 degrees: the box around all four turned corners.
+        let turned = make("UIView", Rect::new(0.0, 0.0, 100.0, 50.0));
+        runtime::send(first, "addSubview:", &[turned]);
+        let (s, c) = std::f64::consts::FRAC_PI_4.sin_cos();
+        view_set_transform(turned, 0, Transform { a: c, b: s, c: -s, d: c, tx: 0.0, ty: 0.0 });
+        let r = view_convert_rect_to(turned, 0, Rect::new(0.0, 0.0, 100.0, 50.0), 0);
+        let side = 150.0 / 2f64.sqrt();
+        assert!(near(r.origin, p(50.0 - side / 2.0, 25.0 - side / 2.0)) && (r.size.width - side).abs() < 1e-9 && (r.size.height - side).abs() < 1e-9, "{r:?}");
     }
 
     /// Asking to rotate to the device's orientation is fine; the interface is already there.

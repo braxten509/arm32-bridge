@@ -631,7 +631,7 @@ fn layer_content(layer: Id, bounds: Rect, classes: &Classes) -> Vec<Shown> {
         crate::fw::graphics::cg_size(contents).map(|(w, h)| (format!("{CG_IMAGE_PREFIX}{contents:x}"), (w as f64 / scale, h as f64 / scale)))
     };
     if let Some((path, own)) = own {
-        out.push(Shown { size: own, ..plain(path, gravity_rect(&layers::contents_gravity(layer), own, size)) });
+        out.push(Shown { size: own, ..plain(path, gravity_rect(&layers::contents_gravity(layer), own, size, layers::contents_are_flipped(layer))) });
     }
     let whole = Rect { origin: Point::default(), size };
     if Classes::is(layer, classes.gradient_layer) {
@@ -672,7 +672,8 @@ fn layer_content(layer: Id, bounds: Rect, classes: &Classes) -> Vec<Shown> {
 }
 
 /// Where contents of `own` size go in a layer of `size` for a contentsGravity.
-fn gravity_rect(gravity: &str, own: (f64, f64), size: crate::fw::geometry::Size) -> Rect {
+/// `flipped`: contentsAreFlipped (an iOS layer whose geometry isn't flipped).
+fn gravity_rect(gravity: &str, own: (f64, f64), size: crate::fw::geometry::Size, flipped: bool) -> Rect {
     let ((w, h), (cw, ch)) = ((size.width, size.height), own);
     match gravity {
         "resizeAspect" | "resizeAspectFill" if cw > 0.0 && ch > 0.0 => {
@@ -687,11 +688,13 @@ fn gravity_rect(gravity: &str, own: (f64, f64), size: crate::fw::geometry::Size)
             } else {
                 (w - cw) / 2.0
             };
-            // Core Animation's "top" is where its y is greatest: on iOS (y down) the bottom.
+            // Flipped contents (Apple's contentsGravity note) put "top" at the
+            // visual bottom and "bottom" at the top; otherwise as named.
+            let (top, bottom) = if flipped { (h - ch, 0.0) } else { (0.0, h - ch) };
             let y = if gravity.starts_with("top") {
-                h - ch
+                top
             } else if gravity.starts_with("bottom") {
-                0.0
+                bottom
             } else {
                 (h - ch) / 2.0
             };
@@ -913,6 +916,7 @@ pub fn encode(screen: (f64, f64), pictures: &[Picture]) -> String {
 /// Every window's pictures, back to front, with files to draw them from
 /// (made for all windows at once, so no window's text files are let go).
 fn screen_pictures(windows: &[Id], classes: &Classes) -> Vec<Picture> {
+    crate::fw::graphics::new_screen_check();
     compose_groups(resolve(windows.iter().flat_map(|&window| flatten(&snapshot(window, classes, 0))).collect()))
 }
 
@@ -1668,6 +1672,57 @@ mod tests {
         assert_eq!(shadow, Some(Shadow { color: [0.0, 0.0, 0.0, 0.5], radius: 3.0, offset: (0.0, -3.0), path: None }), "Core Animation's defaults");
         let contents = &pictures[4];
         assert_eq!((at(contents, 0.0, 0.0), contents.area, contents.alpha), ((15.0, 25.0), (20.0, 10.0), 0.5));
+    }
+
+    /// Every contentsGravity, for a plain iOS layer (contentsAreFlipped:
+    /// Core Animation's "top" is the visual bottom) and a geometryFlipped one
+    /// (not flipped: "top" is the top). 20x20 contents in a 100x50 layer.
+    #[test]
+    fn contents_gravity_places_contents() {
+        let size = Size { width: 100.0, height: 50.0 };
+        // Name, then where it goes flipped (iOS's default) and not flipped.
+        let table = [
+            ("center", rect(40.0, 15.0, 20.0, 20.0), rect(40.0, 15.0, 20.0, 20.0)),
+            ("top", rect(40.0, 30.0, 20.0, 20.0), rect(40.0, 0.0, 20.0, 20.0)),
+            ("bottom", rect(40.0, 0.0, 20.0, 20.0), rect(40.0, 30.0, 20.0, 20.0)),
+            ("left", rect(0.0, 15.0, 20.0, 20.0), rect(0.0, 15.0, 20.0, 20.0)),
+            ("right", rect(80.0, 15.0, 20.0, 20.0), rect(80.0, 15.0, 20.0, 20.0)),
+            ("topLeft", rect(0.0, 30.0, 20.0, 20.0), rect(0.0, 0.0, 20.0, 20.0)),
+            ("topRight", rect(80.0, 30.0, 20.0, 20.0), rect(80.0, 0.0, 20.0, 20.0)),
+            ("bottomLeft", rect(0.0, 0.0, 20.0, 20.0), rect(0.0, 30.0, 20.0, 20.0)),
+            ("bottomRight", rect(80.0, 0.0, 20.0, 20.0), rect(80.0, 30.0, 20.0, 20.0)),
+            ("resize", rect(0.0, 0.0, 100.0, 50.0), rect(0.0, 0.0, 100.0, 50.0)),
+            ("resizeAspect", rect(25.0, 0.0, 50.0, 50.0), rect(25.0, 0.0, 50.0, 50.0)),
+            ("resizeAspectFill", rect(0.0, -25.0, 100.0, 100.0), rect(0.0, -25.0, 100.0, 100.0)),
+        ];
+        for (name, flipped, upright) in table {
+            assert_eq!(gravity_rect(name, (20.0, 20.0), size, true), flipped, "{name}, flipped");
+            assert_eq!(gravity_rect(name, (20.0, 20.0), size, false), upright, "{name}, geometryFlipped");
+        }
+    }
+
+    /// A CGImage as a layer's contents shows at contentsScale pixels per
+    /// point where its gravity puts it; geometryFlipped turns "bottom" up.
+    #[test]
+    fn cg_image_contents_follow_scale_and_gravity() {
+        setup();
+        let window = new_view("UIWindow", rect(0.0, 0.0, 200.0, 200.0));
+        let host = runtime::send(window, "layer", &[]);
+        let layer = new_layer("CALayer", rect(10.0, 10.0, 100.0, 100.0));
+        let bitmap = crate::fw::graphics::Bitmap { width: 40, height: 20, bits_per_pixel: 32, bytes_per_row: 160, info: crate::fw::graphics::ALPHA_LAST, space: crate::fw::graphics::Space::Rgb, data: vec![255; 3200] };
+        runtime::send(layer, "setContents:", &[crate::fw::graphics::make_image(bitmap)]);
+        send_struct(layer, "setContentsScale:", 2.0f64);
+        runtime::send(layer, "setContentsGravity:", &[crate::fw::string::make("bottomRight")]);
+        runtime::send(host, "addSublayer:", &[layer]);
+        let contents = || {
+            let pictures = flatten(&snapshot(window, &Classes::find(), 0));
+            let p = pictures.into_iter().find(|p| p.path.starts_with(CG_IMAGE_PREFIX)).expect("the contents");
+            (at(&p, 0.0, 0.0), p.area)
+        };
+        assert_eq!(contents(), ((90.0, 10.0), (20.0, 10.0)), "40x20 pixels at 2x, Core Animation's bottom: the visual top");
+        runtime::send(layer, "setGeometryFlipped:", &[1]);
+        assert_eq!(runtime::send(layer, "contentsAreFlipped", &[]) & 0xFF, 0);
+        assert_eq!(contents(), ((90.0, 100.0), (20.0, 10.0)), "geometryFlipped: the bottom");
     }
 
     /// Round corners that clip, masks and shadows are drawn into pictures:
