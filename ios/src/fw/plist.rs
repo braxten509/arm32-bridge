@@ -40,16 +40,33 @@ impl Value {
     }
 }
 
+/// A property list: XML, binary, or a real old-style `{..}` or `(..)`
+/// document (a `.strings` table without its braces is not a list: see
+/// `parse_strings`).
 pub fn parse(bytes: &[u8]) -> Option<Value> {
+    parse_any(bytes, false)
+}
+
+/// A `.strings` table, whose old-style text may leave out the braces:
+/// `"key";` alone means the key is its own value, and an empty file is an
+/// empty table.
+pub fn parse_strings(bytes: &[u8]) -> Option<Value> {
+    parse_any(bytes, true)
+}
+
+fn parse_any(bytes: &[u8], strings: bool) -> Option<Value> {
     if bytes.starts_with(b"bplist00") {
         return parse_binary(bytes);
     }
     let text = decode_text(bytes);
     let head = text.trim_start();
     if head.starts_with("<?xml") || head.starts_with("<!DOCTYPE") || head.starts_with("<plist") {
-        parse_xml(&text)
-    } else {
+        return parse_xml(&text);
+    }
+    if strings || head.starts_with('{') || head.starts_with('(') {
         parse_text(&text)
+    } else {
+        None
     }
 }
 
@@ -836,6 +853,21 @@ mod tests {
         let back = runtime::send(class, "propertyListWithData:options:format:error:", &[junk, 0, 0, &mut error as *mut Id as usize]);
         assert_eq!(back, 0);
         assert!(error != 0, "an error for data that isn't a list");
+    }
+
+    /// Plain list parsing takes XML, binary and real old-style `{..}` or
+    /// `(..)` documents; empty text, comments alone or a stray word is not a
+    /// list (a damaged keychain file, say), so callers can tell corruption.
+    #[test]
+    fn plain_property_list_parsing_refuses_text_that_is_not_a_list() {
+        assert!(parse(b"").is_none(), "empty text");
+        assert!(parse(b"/* nothing */\n").is_none(), "comments alone");
+        assert!(parse(b"stray").is_none(), "a bare word");
+        assert!(matches!(parse(b"{ key = value; }"), Some(Value::Dict(entries)) if entries.len() == 1));
+        assert!(matches!(parse(b"( one, two )"), Some(Value::Array(items)) if items.len() == 2));
+        // .strings tables still load leniently, an empty one as an empty table.
+        assert!(matches!(parse_strings(b""), Some(Value::Dict(entries)) if entries.is_empty()));
+        assert!(matches!(parse_strings(b"\"key\";"), Some(Value::Dict(entries)) if entries.len() == 1 && entries[0].0 == "key"));
     }
 
     /// Numbers keep their kind and exact value through a list, both formats:

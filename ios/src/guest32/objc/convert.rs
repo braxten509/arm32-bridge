@@ -910,7 +910,7 @@ pub fn finish_host_call(call: PreparedHostCall, ret: &HostRet, b: &mut dyn Bound
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FormatArg {
+pub(super) enum FormatArg {
     /// 4 guest bytes, sign-extended into a slot (%d %u %x %c %ld %zu %hd ...)
     Int,
     /// 8 guest bytes (%lld %qd %jd, doubles)
@@ -922,9 +922,11 @@ enum FormatArg {
 }
 
 /// The variadic arguments a printf-style format reads, in order.
-fn format_kinds(format: &str) -> Vec<FormatArg> {
+pub(super) fn format_kinds(format: &str) -> Vec<FormatArg> {
     let f = format.as_bytes();
     let mut out = Vec::new();
+    // `%2$@` names the second argument: kinds are kept by place instead.
+    let mut positional: Vec<Option<FormatArg>> = Vec::new();
     let mut i = 0;
     while i < f.len() {
         if f[i] != b'%' {
@@ -936,6 +938,18 @@ fn format_kinds(format: &str) -> Vec<FormatArg> {
             i += 1;
             continue;
         }
+        // A place number is digits right after the %, followed by '$'.
+        let digits = i;
+        while i < f.len() && f[i].is_ascii_digit() {
+            i += 1;
+        }
+        let place = if i > digits && f.get(i) == Some(&b'$') {
+            i += 1;
+            Some(f[digits..i - 1].iter().fold(0usize, |n, &d| n.saturating_mul(10).saturating_add((d - b'0') as usize)))
+        } else {
+            i = digits;
+            None
+        };
         while i < f.len() && b"-+ #0'".contains(&f[i]) {
             i += 1;
         }
@@ -962,16 +976,30 @@ fn format_kinds(format: &str) -> Vec<FormatArg> {
         }
         let Some(&conversion) = f.get(i) else { break };
         i += 1;
-        out.push(match conversion {
+        let kind = match conversion {
             // %K: a key path name in a predicate format.
             b'@' | b'K' => FormatArg::Object,
             b's' | b'S' | b'p' => FormatArg::Pointer,
             b'f' | b'F' | b'e' | b'E' | b'g' | b'G' | b'a' | b'A' => FormatArg::Long,
             _ if longs >= 2 => FormatArg::Long,
             _ => FormatArg::Int,
-        });
+        };
+        match place {
+            Some(place) if place > 0 => {
+                if positional.len() < place {
+                    positional.resize(place, None);
+                }
+                positional[place - 1] = Some(kind);
+            }
+            _ => out.push(kind),
+        }
     }
-    out
+    if positional.is_empty() {
+        return out;
+    }
+    let mut kinds: Vec<FormatArg> = positional.into_iter().map(|kind| kind.unwrap_or(FormatArg::Int)).collect();
+    kinds.extend(out);
+    kinds
 }
 
 // ---------- host -> guest ----------

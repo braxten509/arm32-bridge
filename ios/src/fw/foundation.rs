@@ -237,7 +237,7 @@ fn strings_table(base: &str, table: &str) -> std::sync::Arc<std::collections::Ha
         .unwrap_or_default();
     let folders = pick_localization(&languages).map(|l| format!("{base}/{l}.lproj")).into_iter().chain([format!("{base}/Base.lproj"), base.to_string()]);
     let mut words = std::collections::HashMap::new();
-    if let Some(plist::Value::Dict(entries)) = folders.filter_map(|f| std::fs::read(format!("{f}/{table}.strings")).ok()).find_map(|bytes| plist::parse(&bytes)) {
+    if let Some(plist::Value::Dict(entries)) = folders.filter_map(|f| std::fs::read(format!("{f}/{table}.strings")).ok()).find_map(|bytes| plist::parse_strings(&bytes)) {
         words.extend(entries.into_iter().filter_map(|(k, v)| match v {
             plist::Value::String(s) => Some((k, s)),
             _ => None,

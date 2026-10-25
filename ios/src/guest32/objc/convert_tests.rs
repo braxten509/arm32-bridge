@@ -303,6 +303,16 @@ fn variadic_arguments_go_to_stack_slots() {
     assert_eq!(call.args.stack, [(HOST_ID + 0x20) as u64, (HOST_ID + 0x30) as u64, 0]);
 }
 
+/// A positional specifier ("%2$@") names one argument by place: the highest
+/// place sets how many arguments are read, and each place keeps its kind.
+#[test]
+fn positional_format_arguments_are_counted_once() {
+    assert_eq!(format_kinds("%1$@"), [FormatArg::Object]);
+    assert_eq!(format_kinds("%2$d"), [FormatArg::Int, FormatArg::Int]);
+    assert_eq!(format_kinds("%2$@ %1$d"), [FormatArg::Int, FormatArg::Object]);
+    assert_eq!(format_kinds("%1$lld"), [FormatArg::Long]);
+}
+
 #[test]
 fn host_calls_into_guest_methods_convert_both_ways() {
     let mut b = Fake::new();

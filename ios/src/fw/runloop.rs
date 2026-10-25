@@ -719,18 +719,30 @@ extern "C" fn run_loop_main(_: Class, _: Sel) -> Id {
     main_run_loop()
 }
 
-/// -currentMode: the default mode is Foundation's own NSDefaultRunLoopMode
-/// object (games compare it by pointer too); nil while the loop isn't running.
+/// The objects given out for modes Foundation doesn't export, one per name.
+static MODE_OBJECTS: Mutex<Vec<(String, Id)>> = Mutex::new(Vec::new());
+
+/// The object for a mode name: Foundation's own constant when it exports
+/// one, else one cached string (games compare modes by pointer too).
+fn mode_object(name: &str) -> Id {
+    let symbol = if name == DEFAULT_MODE { "NSDefaultRunLoopMode" } else { name };
+    if let Some((address, _)) = crate::symbols::lookup(symbol) {
+        return unsafe { *(address as *const Id) };
+    }
+    let mut objects = MODE_OBJECTS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, object)) = objects.iter().find(|(text, _)| text == name) {
+        return object;
+    }
+    let object = string::make(name);
+    objects.push((name.to_string(), object));
+    object
+}
+
+/// -currentMode: the same object every time for a mode, and nil while the
+/// loop isn't running.
 extern "C" fn run_loop_current_mode(this: Id, _: Sel) -> Id {
     let mode = loop_of(this).mode.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    match mode.as_deref() {
-        None => 0,
-        Some(DEFAULT_MODE) => match crate::symbols::lookup("NSDefaultRunLoopMode") {
-            Some((address, _)) => unsafe { *(address as *const Id) },
-            None => string::make(DEFAULT_MODE),
-        },
-        Some(other) => string::make(other),
-    }
+    mode.as_deref().map_or(0, mode_object)
 }
 
 extern "C" fn run_loop_add_timer(this: Id, _: Sel, timer_object: Id, _mode: Id) {
@@ -1311,6 +1323,26 @@ mod perform_tests {
         .join()
         .unwrap();
         assert_eq!(*MODE_SEEN.lock().unwrap(), ["nil", "kCFRunLoopDefaultMode", "nil"]);
+    }
+
+    /// A loop mode answers with the same object every time it is asked for,
+    /// so a game can compare it with its mode constant by pointer.
+    #[test]
+    fn a_run_loop_mode_is_the_same_object_every_time() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        static MODE_LOOP: Loop = Loop::new();
+        let object = run_loop_object(&MODE_LOOP);
+        *MODE_LOOP.mode.lock().unwrap() = Some("UITrackingRunLoopMode".into());
+        let tracking = run_loop_current_mode(object, 0);
+        assert_eq!(string::get(tracking), "UITrackingRunLoopMode");
+        assert_eq!(run_loop_current_mode(object, 0), tracking, "the same object every time");
+        *MODE_LOOP.mode.lock().unwrap() = Some("GameMode".into());
+        let custom = run_loop_current_mode(object, 0);
+        assert_eq!(string::get(custom), "GameMode");
+        assert_eq!(run_loop_current_mode(object, 0), custom, "a mode of the game's own keeps its object");
+        *MODE_LOOP.mode.lock().unwrap() = None;
+        assert_eq!(run_loop_current_mode(object, 0), 0, "nil while it isn't running");
     }
 
     /// Reference counts of the objects below (counted through their own

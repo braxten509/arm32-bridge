@@ -920,7 +920,9 @@ fn decode_packet(opened: &mut Opened) -> Option<Vec<f32>> {
                 count = (JOINED_FRAMES / first.frames.max(1) as u64).max(1).min(file.packet_count() - *next);
             }
             let size = first.size as usize * count as usize;
-            let bytes = file.data.get(first.offset..first.offset + size)?;
+            // The table may claim more than the file holds: decode what is
+            // there; only a missing packet is the end of the sound.
+            let bytes = file.data.get(first.offset..first.offset.saturating_add(size)).unwrap_or(&[]);
             *next += count;
             let mut samples = Vec::new();
             decoder.decode(bytes, first.frames * count as u32, &mut samples);
@@ -1983,6 +1985,27 @@ mod tests {
         assert!(play_for(&player, 0.5), "then it ends");
         player.queue().quit = true;
         player.wake.notify_all();
+    }
+
+    /// A packet whose table size runs past the data still decodes the bytes
+    /// there; the sound only ends when no packet is left.
+    #[test]
+    fn a_packet_running_past_the_data_is_not_the_end_of_the_sound() {
+        let format = crate::fw::audiofile::pcm(22050.0, 1, 16, false, false);
+        let file = crate::fw::audiofile::Parsed {
+            format,
+            data: vec![0u8; 4],
+            packets: vec![
+                crate::fw::audiofile::Packet { offset: 0, size: 8, frames: 4 },
+                crate::fw::audiofile::Packet { offset: 4, size: 2, frames: 1 },
+            ],
+            ..Default::default()
+        };
+        let decoder = crate::fw::audioqueue::Decoder::new(&format, &[]).expect("PCM decodes");
+        let mut opened = Opened::Packets { file, decoder, next: 0, skip: 0 };
+        assert!(decode_packet(&mut opened).is_some(), "the short first packet is still decoded");
+        assert!(decode_packet(&mut opened).is_some(), "the packet after it is decoded");
+        assert!(decode_packet(&mut opened).is_none(), "the end comes when no packet is left");
     }
 
     #[test]
