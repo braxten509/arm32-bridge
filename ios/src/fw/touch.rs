@@ -579,7 +579,9 @@ fn next_test_tap(taps: &mut std::collections::VecDeque<TestTap>, text: &str) -> 
     for tap in taps.iter_mut().filter(|tap| tap.every && !tap.armed) {
         tap.armed = text.contains(&drawn_after(tap.to));
     }
-    for tap in taps.iter_mut().filter(|tap| tap.every && tap.settled && tap.armed && holds(tap)) {
+    // A settled step's line counts even before it is armed again (a second
+    // box opening while the first one's tap is still being drawn).
+    for tap in taps.iter_mut().filter(|tap| tap.every && tap.settled && holds(tap)) {
         tap.due = true;
     }
     if let Some(tap) = taps.iter_mut().find(|tap| tap.every && !tap.settled && tap.armed && holds(tap)) {
@@ -615,7 +617,7 @@ fn screen_settled_with(takes_touches: impl Fn(Point) -> bool) {
     }
     let tap = {
         let mut taps = TEST_TAPS.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(tap) = taps.iter_mut().find(|tap| tap.due && takes_touches(tap.from)) {
+        if let Some(tap) = taps.iter_mut().find(|tap| tap.due && tap.armed && takes_touches(tap.from)) {
             (tap.due, tap.armed) = (false, false);
             Some(tap.clone())
         } else {
@@ -1085,9 +1087,8 @@ mod tests {
         screen_settled_with(|_| true);
         assert_eq!(sent(), [] as [f64; 0], "not again before its own tap's screen is drawn");
         line_logged("screen drawn after tap at 7,7");
-        line_logged("box shown");
         screen_settled_with(|_| true);
-        assert_eq!(sent(), [7.0], "again after that");
+        assert_eq!(sent(), [7.0], "then for the box that opened meanwhile");
         TAPS_ARMED.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
