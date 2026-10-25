@@ -1250,15 +1250,16 @@ fn mix_music(out: &mut [f32], frames: usize, out_rate: f64) {
 }
 
 // ----- system sounds (AudioServices) -----
-// A sound made from a file plays once per AudioServicesPlaySystemSound, on
-// a player of its own (plays may overlap, as on iPhone). The phone's own
-// sounds (kSystemSoundID_Vibrate and the other built-in IDs) don't exist
-// here: they do nothing.
+// A sound made from a file plays once per AudioServicesPlaySystemSound.
+// System Sound Services plays one sound at a time: a new play stops the one
+// playing, whose decoding worker then ends. The phone's own sounds
+// (kSystemSoundID_Vibrate and the other built-in IDs) don't exist here:
+// they do nothing.
 
 /// Sounds made from files, by SystemSoundID.
 static SYSTEM_SOUNDS: Mutex<Option<HashMap<u32, Source>>> = Mutex::new(None);
-/// Plays still sounding.
-static SOUNDING: Mutex<Vec<Arc<Player>>> = Mutex::new(Vec::new());
+/// The system sound playing now.
+static SOUNDING: Mutex<Option<Arc<Player>>> = Mutex::new(None);
 /// The first ID handed out; Apple's start above the built-in ones too.
 const FIRST_SYSTEM_SOUND: u32 = 4097;
 /// kAudioServicesSystemSoundUnspecifiedError.
@@ -1289,31 +1290,44 @@ extern "C" fn dispose_system_sound(id: u32) -> i32 {
 extern "C" fn play_system_sound(id: u32) {
     let source = SYSTEM_SOUNDS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|s| s.get(&id).cloned());
     let Some(source) = source else { return };
+    start();
+    play_system_source(source);
+}
+
+/// Plays `source` as the system sound, stopping the one playing.
+fn play_system_source(source: Source) -> Option<Arc<Player>> {
     let rate = match open(&source) {
         Ok((_, rate)) => rate,
         Err(e) => {
             crate::log!("AudioServicesPlaySystemSound: {e}");
-            return;
+            return None;
         }
     };
     let player = Player::new(source, rate);
-    start();
     player.ensure_worker();
     player.playing.store(true, Ordering::Relaxed);
-    SOUNDING.lock().unwrap_or_else(|e| e.into_inner()).push(player);
+    let old = SOUNDING.lock().unwrap_or_else(|e| e.into_inner()).replace(player.clone());
+    if let Some(old) = old {
+        retire(&old);
+    }
+    Some(player)
+}
+
+/// Stops a system sound for good: its worker ends.
+fn retire(player: &Player) {
+    player.playing.store(false, Ordering::Relaxed);
+    player.queue().quit = true;
+    player.wake.notify_all();
 }
 
 fn mix_system_sounds(out: &mut [f32], frames: usize, out_rate: f64) {
     let Ok(mut sounding) = SOUNDING.try_lock() else { return };
-    sounding.retain(|player| {
-        if !player.mix_into(out, frames, out_rate) {
-            return true;
-        }
-        // Played to its end: its worker stops.
-        player.queue().quit = true;
-        player.wake.notify_all();
-        false
-    });
+    let Some(player) = sounding.as_ref() else { return };
+    if player.mix_into(out, frames, out_rate) {
+        // Played to its end.
+        retire(player);
+        *sounding = None;
+    }
 }
 
 // ----- the output: one stereo stream -----
@@ -1801,6 +1815,27 @@ mod tests {
         assert!((player.duration() - 1.0).abs() < 0.01);
         player.queue().quit = true;
         player.wake.notify_all();
+    }
+
+    /// System Sound Services plays one sound at a time: a new play stops the
+    /// one playing, and that one's worker thread ends.
+    #[test]
+    fn a_new_system_sound_stops_the_one_playing() {
+        let first = play_system_source(Source::Bytes(Arc::new(wav(22050, 1.0)))).unwrap();
+        let second = play_system_source(Source::Bytes(Arc::new(wav(22050, 1.0)))).unwrap();
+        assert!(!first.playing.load(Ordering::Relaxed), "the first sound stopped");
+        assert!(second.playing.load(Ordering::Relaxed));
+        assert!(SOUNDING.lock().unwrap().as_ref().is_some_and(|p| Arc::ptr_eq(p, &second)), "only the new one is playing");
+        // The worker holds its own reference until it ends.
+        for _ in 0..250 {
+            if Arc::strong_count(&first) == 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(Arc::strong_count(&first), 1, "the first sound's worker ended");
+        retire(&second);
+        *SOUNDING.lock().unwrap() = None;
     }
 
     #[test]

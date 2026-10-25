@@ -527,11 +527,16 @@ fn instance_variable(c: &Ctx, w: Words) -> Result<u64, String> {
     ok(entry)
 }
 
-/// The guest property_t { name, attributes } of a class's property: made
-/// once, so the same property is the same entry every time.
+/// The guest property_t { name, attributes } of a declaration: the image's
+/// own entry, so each declaration (a category may redeclare a property with
+/// other attributes) is its own, as on Apple. Metadata without an address
+/// gets an entry made once per declaration.
 fn property_entry(c: &Ctx, class: u32, property: &guest32_image::Property32) -> u32 {
-    static ENTRIES: Mutex<Option<HashMap<(u32, String), u32>>> = Mutex::new(None);
-    let key = (class, property.name.clone());
+    static ENTRIES: Mutex<Option<HashMap<(u32, String, String), u32>>> = Mutex::new(None);
+    if property.address != 0 {
+        return property.address;
+    }
+    let key = (class, property.name.clone(), property.attributes.clone());
     if let Some(&entry) = ENTRIES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).get(&key) {
         return entry;
     }

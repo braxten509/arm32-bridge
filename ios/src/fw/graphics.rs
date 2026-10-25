@@ -401,11 +401,21 @@ pub fn file_orientation(path: &str) -> i64 {
 /// A CGImage: its pixels never change; they go (None) when the last reference does.
 struct ImageState {
     bitmap: RwLock<Option<Arc<Bitmap>>>,
-    /// An image mask (CGImageMaskCreate): 8-bit gray samples, 1 hides and 0 paints.
-    mask: bool,
-    /// CGImageGetDataProvider's provider of the pixels: made when first asked
-    /// for, released with the image.
+    /// An image mask (CGImageMaskCreate): its pixels are the samples decoded
+    /// to 8-bit gray for drawing (1 hides, 0 paints); this is the format it
+    /// was made with, which its getters report.
+    mask: Option<MaskFormat>,
+    /// CGImageGetDataProvider's provider: the one a mask was made with, else
+    /// one of the pixels made when first asked for; released with the image.
     provider: OnceLock<Id>,
+}
+
+/// An image mask as the game made it.
+struct MaskFormat {
+    bits_per_component: usize,
+    bits_per_pixel: usize,
+    bytes_per_row: usize,
+    decode: Option<[f64; 2]>,
 }
 
 static CLASSES: OnceLock<Classes> = OnceLock::new();
@@ -443,18 +453,24 @@ fn wrap<T>(class: Class, value: T) -> Id {
 
 /// A new CGImage with one reference (the caller's, as CGBitmapContextCreateImage gives).
 pub fn make_image(bitmap: Bitmap) -> Id {
-    make_picture(bitmap, false)
+    make_picture(ImageState { bitmap: RwLock::new(Some(Arc::new(bitmap))), mask: None, provider: OnceLock::new() })
 }
 
-/// A new image mask (8-bit gray samples) with one reference.
-fn make_mask(bitmap: Bitmap) -> Id {
-    make_picture(bitmap, true)
+/// A new image mask with one reference: `samples` decoded to 8-bit gray,
+/// `format` and `provider` as the game gave them (the mask holds the provider).
+fn make_mask(samples: Bitmap, format: MaskFormat, provider: Id) -> Id {
+    counted::retain(provider);
+    make_picture(ImageState { bitmap: RwLock::new(Some(Arc::new(samples))), mask: Some(format), provider: OnceLock::from(provider) })
 }
 
-fn make_picture(bitmap: Bitmap, mask: bool) -> Id {
-    let object = wrap(classes().image, ImageState { bitmap: RwLock::new(Some(Arc::new(bitmap))), mask, provider: OnceLock::new() });
+fn make_picture(picture: ImageState) -> Id {
+    let object = wrap(classes().image, picture);
     counted::track(object, free_image);
     object
+}
+
+fn mask_format(object: Id) -> Option<&'static MaskFormat> {
+    state::<ImageState>(object, classes().image)?.mask.as_ref()
 }
 
 fn free_image(object: Id) {
@@ -472,22 +488,30 @@ fn image(object: Id) -> Option<Arc<Bitmap>> {
 }
 
 fn is_mask(object: Id) -> bool {
-    state::<ImageState>(object, classes().image).is_some_and(|s| s.mask)
+    mask_format(object).is_some()
 }
 
 /// The image's own provider (not the caller's to release, as on Apple):
-/// its pixels as they are stored.
+/// the one a mask was made with, or the pixels as they are stored.
 extern "C" fn image_get_data_provider(object: Id) -> Id {
     let Some(s) = state::<ImageState>(object, classes().image) else {
         complain("CGImageGetDataProvider", "image", object);
         return 0;
     };
+    if let Some(&provider) = s.provider.get() {
+        return provider;
+    }
     let Some(bitmap) = image(object) else { return 0 };
     *s.provider.get_or_init(|| shapes::picture_provider(bitmap))
 }
 
 extern "C" fn image_is_mask(object: Id) -> bool {
     is_mask(object)
+}
+
+/// A mask's decode array (two values), or NULL: other images keep none here.
+extern "C" fn image_get_decode(object: Id) -> *const f64 {
+    mask_format(object).and_then(|f| f.decode.as_ref()).map_or(std::ptr::null(), |d| d.as_ptr())
 }
 
 /// How much (0..1) a mask lets through at (s, t) (0..1, t down from its
@@ -509,7 +533,8 @@ fn mask_alpha(mask: &Bitmap, layout: &Layout, image_mask: bool, s: f64, t: f64) 
 
 /// CGImageCreateWithMask: a new picture of `picture` with the mask's alpha
 /// (premultiplied RGBA). The picture can't be a mask itself, and a picture
-/// used as the mask can't have alpha (Apple's rules: nil otherwise).
+/// used as the mask must be DeviceGray without alpha (Apple's rules: nil
+/// otherwise).
 extern "C" fn image_create_with_mask(picture: Id, mask: Id) -> Id {
     let (Some(source), Some(cover)) = (image(picture), image(mask)) else {
         complain("CGImageCreateWithMask", "image", if image(picture).is_none() { picture } else { mask });
@@ -517,7 +542,8 @@ extern "C" fn image_create_with_mask(picture: Id, mask: Id) -> Id {
     };
     let image_mask = is_mask(mask);
     let (Some(from), Some(through)) = (source.layout(), cover.layout()) else { return 0 };
-    if is_mask(picture) || (!image_mask && through.has_alpha()) || cover.width == 0 || cover.height == 0 {
+    let gray_picture = cover.space == Space::Gray && !through.has_alpha();
+    if is_mask(picture) || !(image_mask || gray_picture) || cover.width == 0 || cover.height == 0 {
         crate::log!("CGImageCreateWithMask: this image and mask can't be combined");
         return 0;
     }
@@ -566,14 +592,24 @@ extern "C" fn image_get_width(object: Id) -> usize {
 extern "C" fn image_get_height(object: Id) -> usize {
     image(object).map_or(0, |b| b.height)
 }
+// A mask reports the format it was made with (its pixels are only for drawing).
 extern "C" fn image_get_bits_per_component(object: Id) -> usize {
-    image(object).map_or(0, |_| 8)
+    match mask_format(object) {
+        Some(f) => f.bits_per_component,
+        None => image(object).map_or(0, |_| 8),
+    }
 }
 extern "C" fn image_get_bits_per_pixel(object: Id) -> usize {
-    image(object).map_or(0, |b| b.bits_per_pixel)
+    match mask_format(object) {
+        Some(f) => f.bits_per_pixel,
+        None => image(object).map_or(0, |b| b.bits_per_pixel),
+    }
 }
 extern "C" fn image_get_bytes_per_row(object: Id) -> usize {
-    image(object).map_or(0, |b| b.bytes_per_row)
+    match mask_format(object) {
+        Some(f) => f.bytes_per_row,
+        None => image(object).map_or(0, |b| b.bytes_per_row),
+    }
 }
 extern "C" fn image_get_bitmap_info(object: Id) -> u32 {
     image(object).map_or(0, |b| b.info)
@@ -581,7 +617,11 @@ extern "C" fn image_get_bitmap_info(object: Id) -> u32 {
 extern "C" fn image_get_alpha_info(object: Id) -> u32 {
     image(object).map_or(0, |b| b.info & ALPHA_MASK)
 }
+/// An image mask has no colour space (NULL, as on Apple).
 extern "C" fn image_get_color_space(object: Id) -> Id {
+    if is_mask(object) {
+        return 0;
+    }
     image(object).map_or(0, |b| space_object(b.space))
 }
 
@@ -1845,6 +1885,7 @@ pub fn register(r: &mut Registry) {
     r.function("CGImageGetColorSpace", image_get_color_space as usize);
     r.function("CGImageGetDataProvider", image_get_data_provider as usize);
     r.function("CGImageIsMask", image_is_mask as usize);
+    r.function("CGImageGetDecode", image_get_decode as usize);
     r.function("CGImageCreateWithMask", image_create_with_mask as usize);
     r.function("CGImageRetain", cf_style_retain as usize);
     r.function("CGImageRelease", cf_style_release as usize);
