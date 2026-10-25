@@ -70,6 +70,30 @@ fn write_dirent(buffer: u32, entry: &libc::dirent) {
 const WIDE_CLASSES: [&str; 12] =
     ["alnum", "alpha", "blank", "cntrl", "digit", "graph", "lower", "print", "punct", "space", "upper", "xdigit"];
 
+/// Whether a wide character is in one of WIDE_CLASSES (digits and hex digits are ASCII only, as in bionic).
+fn in_wide_class(character: u32, class: &str) -> bool {
+    let Some(c) = char::from_u32(character) else { return false };
+    match class {
+        "alnum" => c.is_alphanumeric(),
+        "alpha" => c.is_alphabetic(),
+        "blank" => c == ' ' || c == '\t',
+        "cntrl" => c.is_control(),
+        "digit" => c.is_ascii_digit(),
+        "graph" => !c.is_control() && !c.is_whitespace(),
+        "lower" => c.is_lowercase(),
+        "print" => !c.is_control(),
+        "punct" => c.is_ascii_punctuation() || (!c.is_ascii() && !c.is_alphanumeric() && !c.is_whitespace() && !c.is_control()),
+        "space" => c.is_whitespace(),
+        "upper" => c.is_uppercase(),
+        _ => c.is_ascii_hexdigit(),
+    }
+}
+
+/// The C locale's character tests: only 0..=255 (and EOF) are valid arguments.
+fn narrow_class(character: i32, test: unsafe extern "C" fn(libc::c_int) -> libc::c_int) -> Ret {
+    Ret::U32(((0..=255).contains(&character) && unsafe { test(character) } != 0) as u32)
+}
+
 /// A guest wchar_t string (4-byte characters), without its end mark. Characters that aren't valid become U+FFFD.
 fn guest_wide_text(guest: u32) -> Vec<char> {
     let mut text = Vec::new();
@@ -670,6 +694,20 @@ pub fn handler(name: &str) -> Option<Handler> {
             }
             Ret::U32(text.len() as u32)
         }),
+        // Appends while the whole text fits in `size` bytes; returns the length it tried to make.
+        "strlcat" | "__strlcat_chk" => handler!(|uc, a| {
+            let (destination, source, size) = (a.u32(), a.u32(), a.u32());
+            let m = mem();
+            let start = (m.c_str(destination).to_bytes().len() as u32).min(size);
+            let text = m.c_str(source).to_bytes().to_vec();
+            if start == size {
+                return Ret::U32(size + text.len() as u32);
+            }
+            let copy = text.len().min((size - start - 1) as usize);
+            m.write_bytes(destination + start, &text[..copy]);
+            m.write_u8(destination + start + copy as u32, 0);
+            Ret::U32(start + text.len() as u32)
+        }),
         "strdup" => handler!(|uc, a| {
             let source = a.u32();
             let text = mem().c_str(source).to_bytes().to_vec();
@@ -776,6 +814,10 @@ pub fn handler(name: &str) -> Option<Handler> {
         "isalpha" => handler!(|uc, a| Ret::U32((unsafe { libc::isalpha(a.i32()) } != 0) as u32)),
         "isalnum" => handler!(|uc, a| Ret::U32((unsafe { libc::isalnum(a.i32()) } != 0) as u32)),
         "isascii" => handler!(|uc, a| Ret::U32((a.u32() < 0x80) as u32)),
+        "iscntrl" => handler!(|uc, a| narrow_class(a.i32(), libc::iscntrl)),
+        "isprint" => handler!(|uc, a| narrow_class(a.i32(), libc::isprint)),
+        "ispunct" => handler!(|uc, a| narrow_class(a.i32(), libc::ispunct)),
+        "islower" => handler!(|uc, a| narrow_class(a.i32(), libc::islower)),
         "iswlower" => handler!(|uc, a| Ret::U32(char::from_u32(a.u32()).is_some_and(|c| c.is_lowercase()) as u32)),
         // wchar_t is 32 bits for the guest too; the C library is always UTF-8.
         "wcslen" => handler!(|uc, a| {
@@ -912,22 +954,24 @@ pub fn handler(name: &str) -> Option<Handler> {
         }),
         "iswctype" => handler!(|uc, a| {
             let (character, class) = (a.u32(), a.u32());
-            let Some(c) = char::from_u32(character) else { return Ret::U32(0) };
             let Some(&name) = (class as usize).checked_sub(1).and_then(|i| WIDE_CLASSES.get(i)) else { return Ret::U32(0) };
-            Ret::U32(match name {
-                "alnum" => c.is_alphanumeric(),
-                "alpha" => c.is_alphabetic(),
-                "blank" => c == ' ' || c == '\t',
-                "cntrl" => c.is_control(),
-                "digit" => c.is_ascii_digit(),
-                "graph" => !c.is_control() && !c.is_whitespace(),
-                "lower" => c.is_lowercase(),
-                "print" => !c.is_control(),
-                "punct" => c.is_ascii_punctuation() || (!c.is_ascii() && !c.is_alphanumeric() && !c.is_whitespace() && !c.is_control()),
-                "space" => c.is_whitespace(),
-                "upper" => c.is_uppercase(),
-                _ => c.is_ascii_hexdigit(),
-            } as u32)
+            Ret::U32(in_wide_class(character, name) as u32)
+        }),
+        "iswalpha" | "iswcntrl" | "iswdigit" | "iswprint" | "iswpunct" | "iswspace" | "iswupper" | "iswxdigit" => handler!(|uc, a| {
+            let class = &uc.get_data().current_call[3..];
+            Ret::U32(in_wide_class(a.u32(), class) as u32)
+        }),
+        "wcsncpy" => handler!(|uc, a| {
+            // Copies up to `count` characters and pads the rest of the count with zeros.
+            let (destination, source, count) = (a.u32(), a.u32(), a.u32());
+            let m = mem();
+            let mut ended = false;
+            for i in 0..count {
+                let c = if ended { 0 } else { m.read_u32(source + i * 4) };
+                ended |= c == 0;
+                m.write_u32(destination + i * 4, c);
+            }
+            Ret::U32(destination)
         }),
         // UTF-8: only the 7-bit characters are single bytes. EOF and WEOF are -1.
         "btowc" => handler!(|uc, a| {
@@ -1283,6 +1327,27 @@ pub fn handler(name: &str) -> Option<Handler> {
                 Some(HostFile::Stream(stream)) => checked(uc, unsafe { libc::ftello(stream as *mut libc::FILE) } as i64),
                 _ => Ret::U32(u32::MAX),
             }
+        }),
+        // fpos_t is a 32-bit off_t on 32-bit bionic.
+        "fgetpos" => handler!(|uc, a| {
+            let (file, position) = (a.u32(), a.u32());
+            let Some(HostFile::Stream(stream)) = host_file(file) else { return Ret::U32(u32::MAX) };
+            let at = unsafe { libc::ftello(stream as *mut libc::FILE) };
+            if at < 0 {
+                return checked(uc, -1);
+            }
+            if at > i32::MAX as i64 {
+                set_errno(uc, libc::EOVERFLOW);
+                return Ret::U32(u32::MAX);
+            }
+            mem().write_u32(position, at as u32);
+            Ret::U32(0)
+        }),
+        "fsetpos" => handler!(|uc, a| {
+            let (file, position) = (a.u32(), a.u32());
+            let Some(HostFile::Stream(stream)) = host_file(file) else { return Ret::U32(u32::MAX) };
+            let at = mem().read_u32(position) as i32;
+            checked(uc, unsafe { libc::fseeko(stream as *mut libc::FILE, at as libc::off_t, libc::SEEK_SET) } as i64)
         }),
         "rewind" => handler!(|uc, a| {
             if let Some(HostFile::Stream(stream)) = host_file(a.u32()) {

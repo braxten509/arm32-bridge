@@ -50,6 +50,27 @@
 // Broken Age's libpollen exports function pointers named after the GL functions it fetches.
 extern "C" __attribute__((visibility("default"))) void *glGenVertexArraysOES = nullptr;
 
+// C library functions called by their symbol names, so the bridge's handler runs
+// (the NDK headers inline the character tests and may build in the string ones).
+extern "C" {
+int c_iscntrl(int) __asm__("iscntrl");
+int c_isprint(int) __asm__("isprint");
+int c_ispunct(int) __asm__("ispunct");
+int c_islower(int) __asm__("islower");
+int c_iswalpha(wint_t) __asm__("iswalpha");
+int c_iswcntrl(wint_t) __asm__("iswcntrl");
+int c_iswdigit(wint_t) __asm__("iswdigit");
+int c_iswprint(wint_t) __asm__("iswprint");
+int c_iswpunct(wint_t) __asm__("iswpunct");
+int c_iswspace(wint_t) __asm__("iswspace");
+int c_iswupper(wint_t) __asm__("iswupper");
+int c_iswxdigit(wint_t) __asm__("iswxdigit");
+wchar_t *c_wcsncpy(wchar_t *, const wchar_t *, size_t) __asm__("wcsncpy");
+size_t c_strlcat(char *, const char *, size_t) __asm__("strlcat");
+int c_fgetpos(FILE *, fpos_t *) __asm__("fgetpos");
+int c_fsetpos(FILE *, const fpos_t *) __asm__("fsetpos");
+}
+
 #define TAG "selftest"
 static int failures = 0;
 static void check(bool ok, const char *what) {
@@ -3132,6 +3153,39 @@ extern "C" int run_all() {
         while (!spin_flag && spins < 2000000000u) spins++;
         check(spin_flag == 1, "spinning thread lets others run");
         pthread_join(setter, nullptr);
+    }
+
+    {
+        // Functions Rule the Kingdom needs (2026-10-25). Called by symbol name:
+        // the NDK headers would inline the character tests.
+        check(c_iscntrl('\n') && !c_iscntrl('a') && c_isprint(' ') && !c_isprint('\t') && c_ispunct('!') && !c_ispunct('a') &&
+                  !c_ispunct(' ') && c_islower('q') && !c_islower('Q') && !c_isprint(200),
+              "iscntrl / isprint / ispunct / islower");
+        check(c_iswalpha(L'é') && !c_iswalpha(L'3') && c_iswcntrl(L'\n') && c_iswdigit(L'7') && !c_iswdigit(L'٣') &&
+                  c_iswprint(L'é') && !c_iswprint(L'\n') && c_iswpunct(L'?') && !c_iswpunct(L'b') && c_iswspace(L'\t') &&
+                  !c_iswspace(L'x') && c_iswupper(L'É') && !c_iswupper(L'e') && c_iswxdigit(L'F') && !c_iswxdigit(L'g'),
+              "iswalpha / iswcntrl / iswdigit / iswprint / iswpunct / iswspace / iswupper / iswxdigit");
+        wchar_t padded[6];
+        wmemset(padded, L'#', 6);
+        wchar_t cut[3];
+        bool wide_copy = c_wcsncpy(padded, L"ab", 5) == padded && wcscmp(padded, L"ab") == 0 && padded[4] == 0 && padded[5] == L'#' &&
+                         c_wcsncpy(cut, L"xyz", 3) == cut && cut[2] == L'z';
+        char joined[8] = "abc";
+        size_t full = c_strlcat(joined, "defgh", sizeof joined);
+        char small[4] = "ab";
+        size_t over = c_strlcat(small, "xyz", 2);
+        check(wide_copy && full == 8 && strcmp(joined, "abcdefg") == 0 && over == 5 && strcmp(small, "ab") == 0, "wcsncpy / strlcat");
+        FILE *scratch = tmpfile();
+        bool positions = false;
+        if (scratch) {
+            fputs("hello world", scratch);
+            fseek(scratch, 6, SEEK_SET);
+            fpos_t mark;
+            positions = c_fgetpos(scratch, &mark) == 0 && fgetc(scratch) == 'w' && fseek(scratch, 0, SEEK_SET) == 0 &&
+                        c_fsetpos(scratch, &mark) == 0 && fgetc(scratch) == 'w' && ftell(scratch) == 7;
+            fclose(scratch);
+        }
+        check(positions, "fgetpos / fsetpos");
     }
 
     __android_log_print(ANDROID_LOG_INFO, TAG, "%d failures", failures);
