@@ -505,9 +505,16 @@ setAlertViewStyle:	v@:i
 setAllHTTPHeaderFields:	v@:@
 setAlpha:	v@:f
 setAnimationBeginsFromCurrentState:	v@:c
+setAnimationCurve:	v@:i
+setAnimationDelay:	v@:d
 setAnimationDelegate:	v@:@
 setAnimationDidStopSelector:	v@::
 setAnimationDuration:	v@:d
+setAnimationRepeatAutoreverses:	v@:c
+setAnimationRepeatCount:	v@:f	float
+setAnimationStartDate:	v@:@
+setAnimationTransition:forView:cache:	v@:i@c
+setAnimationWillStartSelector:	v@::
 setArgument:atIndex:	v@:^vi
 setAttributedText:	v@:@
 setAttributedTitle:forState:	v@:@I
