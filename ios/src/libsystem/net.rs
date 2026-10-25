@@ -18,6 +18,7 @@ extern "C" {
     fn inet_aton(text: *const libc::c_char, out: *mut u32) -> i32;
     fn inet_ntoa(address: u32) -> usize;
     fn inet_ntop(family: i32, source: *const u8, out: *mut libc::c_char, size: u32) -> usize;
+    fn inet_pton(family: i32, text: *const libc::c_char, out: *mut u8) -> i32;
     fn if_nametoindex(name: *const libc::c_char) -> u32;
 }
 
@@ -159,7 +160,7 @@ unsafe fn write_apple_address(host: &HostAddress, out: *mut u8, room: *mut u32) 
 
 // ----- sockets -----
 
-extern "C" fn ios_socket(family: i32, kind: i32, protocol: i32) -> i32 {
+pub(crate) extern "C" fn ios_socket(family: i32, kind: i32, protocol: i32) -> i32 {
     unsafe { libc::socket(host_family(family), kind, protocol) }
 }
 
@@ -184,7 +185,7 @@ fn loopback_number(family: usize) -> &'static [u8] {
 /// socket), and binding to any other address isn't possible. An IPv6 TCP
 /// socket that also takes IPv4 (the default) keeps "any address", so both
 /// ::1 and 127.0.0.1 clients reach it; accept drops peers off the device.
-extern "C" fn ios_bind(fd: i32, address: *const u8, length: u32) -> i32 {
+pub(crate) extern "C" fn ios_bind(fd: i32, address: *const u8, length: u32) -> i32 {
     let Some(mut host) = (unsafe { host_address(address, length) }) else { return -1 };
     let mut keep_any = false;
     if let Some(part) = ip_part(&mut host) {
@@ -236,12 +237,12 @@ fn bind_loopback_if_unbound(fd: i32) {
     unsafe { libc::bind(fd, host.pointer(), host.length) };
 }
 
-extern "C" fn ios_listen(fd: i32, backlog: i32) -> i32 {
+pub(crate) extern "C" fn ios_listen(fd: i32, backlog: i32) -> i32 {
     bind_loopback_if_unbound(fd);
     unsafe { libc::listen(fd, backlog) }
 }
 
-extern "C" fn ios_connect(fd: i32, address: *const u8, length: u32) -> i32 {
+pub(crate) extern "C" fn ios_connect(fd: i32, address: *const u8, length: u32) -> i32 {
     let Some(host) = (unsafe { host_address(address, length) }) else { return -1 };
     if !on_this_device(&host) {
         unreachable("connect");
@@ -251,7 +252,7 @@ extern "C" fn ios_connect(fd: i32, address: *const u8, length: u32) -> i32 {
     result
 }
 
-extern "C" fn ios_accept(fd: i32, address: *mut u8, length: *mut u32) -> i32 {
+pub(crate) extern "C" fn ios_accept(fd: i32, address: *mut u8, length: *mut u32) -> i32 {
     loop {
         let mut host = HostAddress::empty();
         let result = blocking(|| unsafe { libc::accept(fd, host.pointer_mut(), &mut host.length) });
@@ -268,9 +269,18 @@ extern "C" fn ios_accept(fd: i32, address: *mut u8, length: *mut u32) -> i32 {
     }
 }
 
-extern "C" fn ios_getsockname(fd: i32, address: *mut u8, length: *mut u32) -> i32 {
+pub(crate) extern "C" fn ios_getsockname(fd: i32, address: *mut u8, length: *mut u32) -> i32 {
     let mut host = HostAddress::empty();
     let result = unsafe { libc::getsockname(fd, host.pointer_mut(), &mut host.length) };
+    if result == 0 {
+        unsafe { write_apple_address(&host, address, length) };
+    }
+    result
+}
+
+pub(crate) extern "C" fn ios_getpeername(fd: i32, address: *mut u8, length: *mut u32) -> i32 {
+    let mut host = HostAddress::empty();
+    let result = unsafe { libc::getpeername(fd, host.pointer_mut(), &mut host.length) };
     if result == 0 {
         unsafe { write_apple_address(&host, address, length) };
     }
@@ -295,12 +305,12 @@ fn host_message_flags(apple: i32) -> i32 {
     APPLE_MSG.iter().filter(|(a, _)| apple & a != 0).fold(libc::MSG_NOSIGNAL, |flags, (_, host)| flags | host)
 }
 
-extern "C" fn ios_send(fd: i32, data: *const libc::c_void, length: usize, flags: i32) -> isize {
+pub(crate) extern "C" fn ios_send(fd: i32, data: *const libc::c_void, length: usize, flags: i32) -> isize {
     let result = blocking(|| unsafe { libc::send(fd, data, length, host_message_flags(flags)) });
     result
 }
 
-extern "C" fn ios_sendto(fd: i32, data: *const libc::c_void, length: usize, flags: i32, address: *const u8, address_length: u32) -> isize {
+pub(crate) extern "C" fn ios_sendto(fd: i32, data: *const libc::c_void, length: usize, flags: i32, address: *const u8, address_length: u32) -> isize {
     let host = if address.is_null() {
         None
     } else {
@@ -321,12 +331,12 @@ extern "C" fn ios_sendto(fd: i32, data: *const libc::c_void, length: usize, flag
     result
 }
 
-extern "C" fn ios_recv(fd: i32, data: *mut libc::c_void, length: usize, flags: i32) -> isize {
+pub(crate) extern "C" fn ios_recv(fd: i32, data: *mut libc::c_void, length: usize, flags: i32) -> isize {
     let result = blocking(|| unsafe { libc::recv(fd, data, length, host_message_flags(flags)) });
     result
 }
 
-extern "C" fn ios_recvfrom(fd: i32, data: *mut libc::c_void, length: usize, flags: i32, address: *mut u8, address_length: *mut u32) -> isize {
+pub(crate) extern "C" fn ios_recvfrom(fd: i32, data: *mut libc::c_void, length: usize, flags: i32, address: *mut u8, address_length: *mut u32) -> isize {
     let mut host = HostAddress::empty();
     let result = blocking(|| unsafe { libc::recvfrom(fd, data, length, host_message_flags(flags), host.pointer_mut(), &mut host.length) });
     if result >= 0 {
@@ -419,7 +429,7 @@ fn host_option(level: i32, name: i32) -> Option<(i32, i32, Value)> {
     Some((level, host_name, value))
 }
 
-extern "C" fn ios_setsockopt(fd: i32, level: i32, name: i32, value: *const u8, length: u32) -> i32 {
+pub(crate) extern "C" fn ios_setsockopt(fd: i32, level: i32, name: i32, value: *const u8, length: u32) -> i32 {
     let Some((host_level, host_name, kind)) = host_option(level, name) else {
         crate::log!("setsockopt level {level:#x} option {name:#x}: not translated, refusing");
         set_errno(libc::ENOPROTOOPT);
@@ -450,7 +460,7 @@ extern "C" fn ios_setsockopt(fd: i32, level: i32, name: i32, value: *const u8, l
     }
 }
 
-extern "C" fn ios_getsockopt(fd: i32, level: i32, name: i32, value: *mut u8, length: *mut u32) -> i32 {
+pub(crate) extern "C" fn ios_getsockopt(fd: i32, level: i32, name: i32, value: *mut u8, length: *mut u32) -> i32 {
     let Some((host_level, host_name, kind)) = host_option(level, name) else {
         crate::log!("getsockopt level {level:#x} option {name:#x}: not translated, refusing");
         set_errno(libc::ENOPROTOOPT);
@@ -550,7 +560,7 @@ unsafe fn host_time(apple: *const u8) -> Option<libc::timeval> {
 }
 
 /// Apple's descriptor sets have the same bit layout as the system's.
-extern "C" fn ios_select(count: i32, read: *mut libc::fd_set, write: *mut libc::fd_set, error: *mut libc::fd_set, timeout: *const u8) -> i32 {
+pub(crate) extern "C" fn ios_select(count: i32, read: *mut libc::fd_set, write: *mut libc::fd_set, error: *mut libc::fd_set, timeout: *const u8) -> i32 {
     let mut time = unsafe { host_time(timeout) };
     let time_pointer = time.as_mut().map_or(std::ptr::null_mut(), |t| t as *mut _);
     let result = blocking(|| unsafe { libc::select(count, read, write, error, time_pointer) });
@@ -582,7 +592,7 @@ fn apple_poll_events(host: i16) -> i16 {
     apple
 }
 
-extern "C" fn ios_poll(fds: *mut libc::pollfd, count: u32, timeout: i32) -> i32 {
+pub(crate) extern "C" fn ios_poll(fds: *mut libc::pollfd, count: u32, timeout: i32) -> i32 {
     let entries = if fds.is_null() { &mut [][..] } else { unsafe { std::slice::from_raw_parts_mut(fds, count as usize) } };
     let mut host: Vec<libc::pollfd> = entries.iter().map(|e| libc::pollfd { fd: e.fd, events: host_poll_events(e.events), revents: 0 }).collect();
     // A retry after our wake waits only for what is left of the time limit.
@@ -601,7 +611,7 @@ extern "C" fn ios_poll(fds: *mut libc::pollfd, count: u32, timeout: i32) -> i32 
 
 /// Apple's addrinfo: flags, family, socktype, protocol, addrlen, canonname, addr, next.
 #[repr(C)]
-struct AppleAddrinfo {
+pub(crate) struct AppleAddrinfo {
     flags: i32,
     family: i32,
     socktype: i32,
@@ -623,7 +633,7 @@ const APPLE_AI: [(i32, i32); 7] = [
 ];
 
 /// The system's lookup error as Apple's (Android already uses Apple's numbers).
-fn apple_lookup_error(host: i32) -> i32 {
+pub(crate) fn apple_lookup_error(host: i32) -> i32 {
     match host {
         0 => 0,
         libc::EAI_AGAIN => 2,
@@ -649,12 +659,29 @@ fn is_localhost(name: &[u8]) -> bool {
     name.eq_ignore_ascii_case(b"localhost")
 }
 
-fn hints_flags(hints: *const AppleAddrinfo) -> i32 {
-    unsafe { hints.as_ref() }.map_or(0, |h| h.flags)
+/// An address lookup's hints, already in Apple's numbers (family 30 for IPv6).
+#[derive(Clone, Copy)]
+pub(crate) struct Hints {
+    pub flags: i32,
+    pub family: i32,
+    pub socktype: i32,
+    pub protocol: i32,
+}
+
+/// One address getaddrinfo found: its hints, the socket address in Apple's
+/// form, and the canonical name if one was asked for.
+pub(crate) struct AddressEntry {
+    pub flags: i32,
+    pub family: i32,
+    pub socktype: i32,
+    pub protocol: i32,
+    pub address: Vec<u8>,
+    /// With its end mark, ready to copy.
+    pub canonname: Option<Vec<u8>>,
 }
 
 /// gethostbyname: numbers and "localhost" only (offline: other names aren't found).
-extern "C" fn ios_gethostbyname(name: *const libc::c_char) -> usize {
+pub(crate) extern "C" fn ios_gethostbyname(name: *const libc::c_char) -> usize {
     if name.is_null() {
         return 0;
     }
@@ -667,9 +694,24 @@ extern "C" fn ios_gethostbyname(name: *const libc::c_char) -> usize {
     unsafe { gethostbyname(name) }
 }
 
-extern "C" fn ios_getaddrinfo(node: *const libc::c_char, service: *const libc::c_char, hints: *const AppleAddrinfo, out: *mut *mut AppleAddrinfo) -> i32 {
+pub(crate) extern "C" fn ios_getaddrinfo(node: *const libc::c_char, service: *const libc::c_char, hints: *const AppleAddrinfo, out: *mut *mut AppleAddrinfo) -> i32 {
+    let hints = unsafe { hints.as_ref() }.map(|h| Hints { flags: h.flags, family: h.family, socktype: h.socktype, protocol: h.protocol });
+    match find_addresses(node, service, hints) {
+        Ok(entries) => {
+            unsafe { *out = host_chain(&entries) };
+            0
+        }
+        Err(error) => apple_lookup_error(error),
+    }
+}
+
+/// getaddrinfo's answer offline, in Apple's form; Err is the system's lookup
+/// error. 32-bit games build their own list from this, so the offline rules
+/// and numbers exist once.
+pub(crate) fn find_addresses(node: *const libc::c_char, service: *const libc::c_char, hints: Option<Hints>) -> Result<Vec<AddressEntry>, i32> {
     let mut host_hints: libc::addrinfo = unsafe { std::mem::zeroed() };
-    if let Some(hints) = unsafe { hints.as_ref() } {
+    let apple_flags = hints.map_or(0, |h| h.flags);
+    if let Some(hints) = hints {
         host_hints.ai_flags = APPLE_AI.iter().filter(|(a, _)| hints.flags & a != 0).fold(0, |f, (_, h)| f | h);
         host_hints.ai_family = host_family(hints.family);
         host_hints.ai_socktype = hints.socktype;
@@ -677,16 +719,15 @@ extern "C" fn ios_getaddrinfo(node: *const libc::c_char, service: *const libc::c
     } else {
         host_hints.ai_flags = libc::AI_V4MAPPED | libc::AI_ADDRCONFIG;
     }
-    let apple_flags = hints_flags(hints);
     // Offline: only numbers are read, so the system never asks the network.
     host_hints.ai_flags |= libc::AI_NUMERICHOST;
     let localhost = !node.is_null() && is_localhost(unsafe { std::ffi::CStr::from_ptr(node) }.to_bytes());
     if !localhost {
         let result = host_lookup(node, service, &host_hints, apple_flags);
-        if result == Err(libc::EAI_NONAME) && apple_flags & 0x4 == 0 {
+        if matches!(result, Err(error) if error == libc::EAI_NONAME) && apple_flags & 0x4 == 0 {
             log_once("getaddrinfo", "of a name: answered 'not known' (offline)");
         }
-        return finish_lookup(result, out);
+        return result;
     }
     // "localhost" is this device's loopback addresses (IPv6 first, as on Apple),
     // whether or not any network is set up.
@@ -696,73 +737,83 @@ extern "C" fn ios_getaddrinfo(node: *const libc::c_char, service: *const libc::c
         libc::AF_INET6 => &[c"::1"],
         _ => &[c"::1", c"127.0.0.1"],
     };
-    let mut head: *mut AppleAddrinfo = std::ptr::null_mut();
+    let mut entries = Vec::new();
     let mut first_error = None;
-    for number in numbers.iter().rev() {
+    for number in numbers {
         match host_lookup(number.as_ptr(), service, &host_hints, apple_flags) {
-            Ok(list) => unsafe {
-                let mut last = list;
-                while !(*last).next.is_null() {
-                    last = (*last).next;
-                }
-                (*last).next = head;
-                head = list;
-            },
+            Ok(mut list) => entries.append(&mut list),
             Err(error) => first_error = first_error.or(Some(error)),
         }
     }
-    match (head.is_null(), first_error) {
-        (true, Some(error)) => finish_lookup(Err(error), out),
-        _ => finish_lookup(Ok(head), out),
-    }
-}
-
-fn finish_lookup(result: Result<*mut AppleAddrinfo, i32>, out: *mut *mut AppleAddrinfo) -> i32 {
-    match result {
-        Ok(list) => {
-            unsafe { *out = list };
-            0
+    if entries.is_empty() {
+        if let Some(error) = first_error {
+            return Err(error);
         }
-        Err(error) => apple_lookup_error(error),
     }
+    Ok(entries)
 }
 
-/// The system's getaddrinfo, its answer copied into Apple's layout.
-fn host_lookup(node: *const libc::c_char, service: *const libc::c_char, hints: &libc::addrinfo, apple_flags: i32) -> Result<*mut AppleAddrinfo, i32> {
+/// The Apple addrinfo nodes for `entries`, in the host heap.
+fn host_chain(entries: &[AddressEntry]) -> *mut AppleAddrinfo {
+    let mut head: *mut AppleAddrinfo = std::ptr::null_mut();
+    let mut tail: *mut *mut AppleAddrinfo = &mut head;
+    for entry in entries {
+        unsafe {
+            let node = libc::calloc(1, std::mem::size_of::<AppleAddrinfo>() + 128) as *mut AppleAddrinfo;
+            let place = (node as *mut u8).add(std::mem::size_of::<AppleAddrinfo>());
+            std::ptr::copy_nonoverlapping(entry.address.as_ptr(), place, entry.address.len().min(128));
+            (*node).flags = entry.flags;
+            (*node).family = entry.family;
+            (*node).socktype = entry.socktype;
+            (*node).protocol = entry.protocol;
+            (*node).addrlen = entry.address.len() as u32;
+            (*node).addr = place;
+            (*node).canonname = match &entry.canonname {
+                Some(name) => libc::strdup(name.as_ptr() as *const libc::c_char),
+                None => std::ptr::null_mut(),
+            };
+            *tail = node;
+            tail = &mut (*node).next;
+        }
+    }
+    head
+}
+
+/// The system's getaddrinfo, its answer copied into Apple's entries.
+fn host_lookup(node: *const libc::c_char, service: *const libc::c_char, hints: &libc::addrinfo, apple_flags: i32) -> Result<Vec<AddressEntry>, i32> {
     let mut found: *mut libc::addrinfo = std::ptr::null_mut();
     let error = unsafe { libc::getaddrinfo(node, service, hints, &mut found) };
     if error != 0 {
         return Err(error);
     }
-    let mut head: *mut AppleAddrinfo = std::ptr::null_mut();
-    let mut tail: *mut *mut AppleAddrinfo = &mut head;
+    let mut entries = Vec::new();
     let mut at = found;
     while let Some(entry) = unsafe { at.as_ref() } {
-        unsafe {
-            let node = libc::calloc(1, std::mem::size_of::<AppleAddrinfo>() + 128) as *mut AppleAddrinfo;
-            let place = (node as *mut u8).add(std::mem::size_of::<AppleAddrinfo>());
-            let mut host = HostAddress::empty();
-            let size = (entry.ai_addrlen as usize).min(std::mem::size_of::<libc::sockaddr_storage>());
-            if !entry.ai_addr.is_null() {
-                std::ptr::copy_nonoverlapping(entry.ai_addr as *const u8, host.pointer_mut() as *mut u8, size);
-            }
-            host.length = size as u32;
-            let mut room = 128u32;
-            write_apple_address(&host, place, &mut room);
-            (*node).flags = apple_flags;
-            (*node).family = apple_family(entry.ai_family);
-            (*node).socktype = entry.ai_socktype;
-            (*node).protocol = entry.ai_protocol;
-            (*node).addrlen = room;
-            (*node).addr = place;
-            (*node).canonname = if entry.ai_canonname.is_null() { std::ptr::null_mut() } else { libc::strdup(entry.ai_canonname) };
-            *tail = node;
-            tail = &mut (*node).next;
+        let mut host = HostAddress::empty();
+        let size = (entry.ai_addrlen as usize).min(std::mem::size_of::<libc::sockaddr_storage>());
+        if !entry.ai_addr.is_null() {
+            unsafe { std::ptr::copy_nonoverlapping(entry.ai_addr as *const u8, host.pointer_mut() as *mut u8, size) };
         }
+        host.length = size as u32;
+        let mut place = [0u8; 128];
+        let mut room = 128u32;
+        unsafe { write_apple_address(&host, place.as_mut_ptr(), &mut room) };
+        entries.push(AddressEntry {
+            flags: apple_flags,
+            family: apple_family(entry.ai_family),
+            socktype: entry.ai_socktype,
+            protocol: entry.ai_protocol,
+            address: place[..(room as usize).min(place.len())].to_vec(),
+            canonname: if entry.ai_canonname.is_null() {
+                None
+            } else {
+                Some(unsafe { std::ffi::CStr::from_ptr(entry.ai_canonname) }.to_bytes_with_nul().to_vec())
+            },
+        });
         at = entry.ai_next;
     }
     unsafe { libc::freeaddrinfo(found) };
-    Ok(head)
+    Ok(entries)
 }
 
 extern "C" fn ios_freeaddrinfo(mut list: *mut AppleAddrinfo) {
@@ -814,7 +865,7 @@ fn is_localhost_address(host: &HostAddress) -> bool {
 
 /// Offline, names are never looked up: addresses come back as numbers,
 /// except that 127.0.0.1 and ::1 are "localhost", as on an iPhone.
-extern "C" fn ios_getnameinfo(address: *const u8, length: u32, host: *mut libc::c_char, host_length: u32, service: *mut libc::c_char, service_length: u32, flags: i32) -> i32 {
+pub(crate) extern "C" fn ios_getnameinfo(address: *const u8, length: u32, host: *mut libc::c_char, host_length: u32, service: *mut libc::c_char, service_length: u32, flags: i32) -> i32 {
     let Some(converted) = (unsafe { host_address(address, length) }) else { return 5 };
     let host_flags = APPLE_NI.iter().filter(|(a, _)| flags & a != 0).fold(0, |f, (_, h)| f | h);
     let wants_name = !host.is_null() && host_length > 0 && host_flags & libc::NI_NUMERICHOST == 0;
@@ -839,8 +890,12 @@ extern "C" fn ios_getnameinfo(address: *const u8, length: u32, host: *mut libc::
     apple_lookup_error(error)
 }
 
-extern "C" fn ios_inet_ntop(family: i32, source: *const u8, out: *mut libc::c_char, size: u32) -> usize {
+pub(crate) extern "C" fn ios_inet_ntop(family: i32, source: *const u8, out: *mut libc::c_char, size: u32) -> usize {
     unsafe { inet_ntop(host_family(family), source, out, size) }
+}
+
+pub(crate) extern "C" fn ios_inet_pton(family: i32, text: *const libc::c_char, out: *mut u8) -> i32 {
+    unsafe { inet_pton(host_family(family), text, out) }
 }
 
 pub fn register(r: &mut Registry) {
@@ -851,6 +906,7 @@ pub fn register(r: &mut Registry) {
     r.function("listen", ios_listen as usize);
     r.function("shutdown", libc::shutdown as usize);
     r.function("getsockname", ios_getsockname as usize);
+    r.function("getpeername", ios_getpeername as usize);
     r.function("send", ios_send as usize);
     r.function("sendto", ios_sendto as usize);
     r.function("recv", ios_recv as usize);
@@ -870,6 +926,7 @@ pub fn register(r: &mut Registry) {
     r.function("inet_aton", inet_aton as usize);
     r.function("inet_ntoa", inet_ntoa as usize);
     r.function("inet_ntop", ios_inet_ntop as usize);
+    r.function("inet_pton", ios_inet_pton as usize);
     r.function("if_nametoindex", if_nametoindex as usize);
 }
 

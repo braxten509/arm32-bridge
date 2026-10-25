@@ -166,10 +166,11 @@ pub fn write_stat(guest: u32, st: &libc::stat) {
 }
 
 /// Darwin open() flags to the host's.
-fn host_open_flags(darwin: u32) -> i32 {
-    const FLAGS: [(u32, i32); 9] = [
+pub(crate) fn host_open_flags(darwin: u32) -> i32 {
+    const FLAGS: [(u32, i32); 11] = [
         (0x4, libc::O_NONBLOCK),
         (0x8, libc::O_APPEND),
+        (0x40, libc::O_ASYNC),
         (0x80, libc::O_SYNC),
         (0x100, libc::O_NOFOLLOW),
         (0x200, libc::O_CREAT),
@@ -177,6 +178,7 @@ fn host_open_flags(darwin: u32) -> i32 {
         (0x800, libc::O_EXCL),
         (0x10_0000, libc::O_DIRECTORY),
         (0x100_0000, libc::O_CLOEXEC),
+        (0x2_0000, libc::O_NOCTTY),
     ];
     let mut host = (darwin & 3) as i32;
     for (apple, linux) in FLAGS {
@@ -185,6 +187,24 @@ fn host_open_flags(darwin: u32) -> i32 {
         }
     }
     host
+}
+
+/// The host's open()/fcntl() status flags as Darwin's (unknown host bits,
+/// like O_LARGEFILE, are not Darwin flags and are dropped).
+pub(crate) fn apple_status_flags(linux: i32) -> u32 {
+    const FLAGS: [(i32, u32); 4] = [
+        (libc::O_NONBLOCK, 0x4),
+        (libc::O_APPEND, 0x8),
+        (libc::O_ASYNC, 0x40),
+        (libc::O_SYNC, 0x80),
+    ];
+    let mut apple = (linux & 3) as u32;
+    for (host, darwin) in FLAGS {
+        if linux & host != 0 {
+            apple |= darwin;
+        }
+    }
+    apple
 }
 
 fn stat_into(uc: &Uc, result: i32, st: &libc::stat, out: u32) -> Ret {
