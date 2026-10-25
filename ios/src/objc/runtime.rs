@@ -1059,6 +1059,24 @@ pub fn protocol_named(name: &str) -> usize {
     lock().protocols.get(name).copied().unwrap_or(0)
 }
 
+/// Makes `protocol` (a protocol_t) known by its name, unless one of that
+/// name is known already; the one kept.
+pub fn register_protocol(name: &str, protocol: usize) -> usize {
+    *lock().protocols.entry(name.to_string()).or_insert(protocol)
+}
+
+/// Adds protocols to the ones `class` adopts (a protocol already there is not repeated).
+pub fn add_protocols(class: Class, protocols: &[usize]) {
+    let mut rt = lock();
+    if let Some(rec) = rt.classes.get_mut(&class) {
+        for &protocol in protocols {
+            if protocol != 0 && !rec.protocols.contains(&protocol) {
+                rec.protocols.push(protocol);
+            }
+        }
+    }
+}
+
 pub fn conforms(class: Class, protocol: usize) -> bool {
     let rt = lock();
     let target = unsafe { cstr(read::<usize>(protocol + 8)) };

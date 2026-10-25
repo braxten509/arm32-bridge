@@ -198,6 +198,36 @@ impl GuestClasses {
         out
     }
 
+    /// Apple's ivar sliding (moveIvars): a class compiled when its game
+    /// superclass was smaller (ivars declared in the superclass's
+    /// @implementation are not seen by subclasses) starts where the
+    /// superclass now ends, its ivars moved by one amount that keeps their
+    /// largest alignment. Parents first, so slides add up. Returns each moved
+    /// ivar offset variable and how far it moved, for guest memory.
+    pub fn slide_ivars(&mut self) -> Vec<(u32, u32)> {
+        let order: Vec<u32> = self.classes_parents_first().iter().map(|c| c.address).collect();
+        let mut moved = Vec::new();
+        for address in order {
+            let Super::Game(parent) = self.classes[&address].superclass else { continue };
+            let super_size = self.classes.get(&parent).map_or(0, |p| p.instance_size);
+            let class = self.classes.get_mut(&address).unwrap();
+            if class.instance_start >= super_size {
+                continue;
+            }
+            let align = class.ivars.iter().map(|i| 1u32 << i.alignment.min(4)).max().unwrap_or(1);
+            let diff = (super_size - class.instance_start).div_ceil(align) * align;
+            for ivar in &mut class.ivars {
+                ivar.offset += diff;
+                if ivar.offset_address != 0 {
+                    moved.push((ivar.offset_address, diff));
+                }
+            }
+            class.instance_start += diff;
+            class.instance_size += diff;
+        }
+        moved
+    }
+
     pub fn framework_category_method(&self, class: &str, meta: bool, sel: &str) -> Option<&GuestMethod> {
         self.framework_categories.get(&(class.to_string(), meta))?.get(sel)
     }

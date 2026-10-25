@@ -696,6 +696,9 @@ extern "C" fn discard_framebuffer(target: Enum, count: i32, attachments: *const 
     static OFFERED: OnceLock<bool> = OnceLock::new();
     let address = system_extension_function(&SYSTEM, "glDiscardFramebufferEXT");
     if address != 0 && *OFFERED.get_or_init(|| system_has_extension("GL_EXT_discard_framebuffer")) {
+        // Apple's ES 1 takes its multisample extension's read and draw
+        // names too; an ES 1 context has one binding, which both mean.
+        let target = if target == READ_FRAMEBUFFER || target == DRAW_FRAMEBUFFER { FRAMEBUFFER } else { target };
         let f: unsafe extern "C" fn(Enum, i32, *const Enum) = unsafe { std::mem::transmute(address) };
         unsafe { f(target, count, attachments) };
     }

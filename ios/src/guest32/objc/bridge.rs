@@ -269,6 +269,8 @@ pub struct Bridge {
     framework_by_guest: HashMap<u32, (String, bool)>,
     /// Game class (not metaclass) -> host mirror class.
     mirrors: HashMap<u32, usize>,
+    /// Host protocol -> the game's protocol_t (see protocols.rs).
+    protocols: HashMap<usize, u32>,
     sel_names: HashMap<u32, String>,
     sel_guest: HashMap<String, u32>,
     specials: HashMap<u32, Special>,
@@ -306,6 +308,7 @@ impl Bridge {
             framework: HashMap::new(),
             framework_by_guest: HashMap::new(),
             mirrors: HashMap::new(),
+            protocols: HashMap::new(),
             sel_names: HashMap::new(),
             sel_guest: HashMap::new(),
             specials: HashMap::new(),
@@ -492,6 +495,10 @@ impl Bridge {
         }
         if let Some(block) = wrapper_guest(host) {
             return Ok(block);
+        }
+        // A protocol (no class to read) goes back as the game's own.
+        if let Some(&protocol) = self.protocols.get(&host) {
+            return Ok(protocol);
         }
         let (class, is_class, name, meta, partner) = {
             let rt = runtime::lock();
@@ -816,10 +823,15 @@ fn lock(bridge: &Mutex<Bridge>) -> std::sync::MutexGuard<'_, Bridge> {
     bridge.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Defines the host mirror of every game class (parents first) and makes
-/// every selector reference point at one string per selector name.
+/// Slides game ivars past grown superclasses, defines the host mirror of
+/// every game class (parents first) and makes every selector reference
+/// point at one string per selector name.
 pub fn install(bridge: &Mutex<Bridge>, g: &dyn GuestSide, md: &ObjcMetadata32) -> Result<(), String> {
     let mut b = lock(bridge);
+    // The game's code reads the offset variables: they move with the ivars.
+    for (variable, diff) in b.classes.slide_ivars() {
+        g.write(variable, &(u32_at(g, variable) + diff).to_le_bytes());
+    }
     let order: Vec<(u32, String, super::classes::Super, u32)> = b
         .classes
         .classes_parents_first()
@@ -841,6 +853,27 @@ pub fn install(bridge: &Mutex<Bridge>, g: &dyn GuestSide, md: &ObjcMetadata32) -
         let class: Vec<&str> = class.iter().map(String::as_str).collect();
         let mirror = mirror::define_mirror_class(&name, host_super, address, &instance, &class)?;
         b.mirrors.insert(address, mirror);
+    }
+    // Game protocols: a host form each way, and the classes adopt theirs
+    // (categories' too, on game and framework classes).
+    let protocols = super::protocols::host_protocols(md);
+    for (&guest, &host) in &protocols {
+        b.pair(guest, host);
+        b.protocols.insert(host, guest);
+    }
+    let hosts_of = |list: &[u32]| -> Vec<usize> { list.iter().filter_map(|p| protocols.get(p).copied()).collect() };
+    for c in &md.classes {
+        if let Some(&mirror) = b.mirrors.get(&c.address) {
+            runtime::add_protocols(mirror, &hosts_of(&c.instance.protocols));
+        }
+    }
+    for category in &md.categories {
+        let class = match &category.class {
+            guest32_image::ClassTarget::Local(address) => b.mirrors.get(address).copied().unwrap_or(0),
+            guest32_image::ClassTarget::External(name) => Bridge::host_class_named(name, false),
+            _ => 0,
+        };
+        runtime::add_protocols(class, &hosts_of(&category.protocols));
     }
     // Game category methods on framework classes answer host messages too.
     for (class, meta, sel) in b.classes.framework_category_entries() {

@@ -939,6 +939,20 @@ thread_local! {
     static CURRENT_RUNNER: RefCell<Option<Arc<Runner>>> = const { RefCell::new(None) };
     static HELD_SINCE: Cell<u64> = const { Cell::new(0) };
     static LOCK_WAIT_TICKS: Cell<u64> = const { Cell::new(0) };
+    /// Gives this thread's engine back when the thread ends (`EngineReturn`).
+    static ENGINE_RETURN: EngineReturn = const { EngineReturn };
+}
+
+/// A thread the host made (a dispatch worker, a timer) that ran guest code
+/// ends without drop_engine: its engine, thread id and guest stack go back
+/// then, or every such thread would keep a stack and the guest's room for
+/// stacks would run out. (Guest threads drop theirs before this.)
+struct EngineReturn;
+
+impl Drop for EngineReturn {
+    fn drop(&mut self) {
+        drop_engine();
+    }
 }
 
 pub fn lock_wait_time() -> std::time::Duration {
@@ -1413,6 +1427,7 @@ pub fn engine() -> &'static mut Uc {
     adopt_engine(&mut uc);
     let engine = Box::into_raw(uc);
     ENGINE.with(|e| e.set(engine));
+    ENGINE_RETURN.with(|_| {});
     unsafe { &mut *engine }
 }
 
@@ -1423,7 +1438,8 @@ pub fn drop_engine() {
         return;
     }
     let mut engine = unsafe { Box::from_raw(existing) };
-    CURRENT_RUNNER.with(|current| current.borrow_mut().take());
+    // At thread end this slot may be gone already (it went with the thread).
+    let _ = CURRENT_RUNNER.try_with(|current| current.borrow_mut().take());
     // The thread has finished: nothing runs on its stack any more (a helper
     // standing in for it is done before this). Thread 1 has the main stack.
     let thread = engine.get_data();

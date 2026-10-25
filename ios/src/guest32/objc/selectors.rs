@@ -10,6 +10,8 @@ pub enum Varargs {
     None,
     Format,
     NilList,
+    /// The last argument is a va_list of the format before it (`va-list`).
+    VaList,
 }
 
 /// Pointer-to-id arguments of a counted message (`objects:count:`): they
@@ -73,6 +75,8 @@ impl FrameworkSelectors {
                 Varargs::Format
             } else if notes.contains(&"nil-list") {
                 Varargs::NilList
+            } else if notes.contains(&"va-list") {
+                Varargs::VaList
             } else {
                 Varargs::None
             };

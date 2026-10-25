@@ -222,8 +222,42 @@ extern "C" fn path_for_resource_in(this: Id, _: Sel, name: Id, kind: Id, folder:
     find_resource(this, name, kind, folder).map(|p| string::make(&p)).unwrap_or(0)
 }
 
-extern "C" fn localized_string(_this: Id, _: Sel, key: Id, value: Id, _table: Id) -> Id {
-    if value != 0 && string::get(value).len() > 0 { value } else { key }
+/// A strings table of a bundle, read once: `<table>.strings` from the picked
+/// language folder, then Base.lproj, then the bundle's own folder.
+fn strings_table(base: &str, table: &str) -> std::sync::Arc<std::collections::HashMap<String, String>> {
+    type Tables = std::collections::HashMap<(String, String), std::sync::Arc<std::collections::HashMap<String, String>>>;
+    static TABLES: OnceLock<Mutex<Tables>> = OnceLock::new();
+    let tables = TABLES.get_or_init(Default::default);
+    let wanted = (base.to_string(), table.to_string());
+    if let Some(found) = tables.lock().unwrap().get(&wanted) {
+        return found.clone();
+    }
+    let languages: Vec<String> = std::fs::read_dir(base)
+        .map(|entries| entries.filter_map(|e| e.ok()?.file_name().to_str()?.strip_suffix(".lproj").map(String::from)).collect())
+        .unwrap_or_default();
+    let folders = pick_localization(&languages).map(|l| format!("{base}/{l}.lproj")).into_iter().chain([format!("{base}/Base.lproj"), base.to_string()]);
+    let mut words = std::collections::HashMap::new();
+    if let Some(plist::Value::Dict(entries)) = folders.filter_map(|f| std::fs::read(format!("{f}/{table}.strings")).ok()).find_map(|bytes| plist::parse(&bytes)) {
+        words.extend(entries.into_iter().filter_map(|(k, v)| match v {
+            plist::Value::String(s) => Some((k, s)),
+            _ => None,
+        }));
+    }
+    let words = std::sync::Arc::new(words);
+    tables.lock().unwrap().insert(wanted, words.clone());
+    words
+}
+
+/// The key's text in the table (nil or "" means Localizable); a missing key
+/// gives the value, or the key when the value is nil or empty.
+extern "C" fn localized_string(this: Id, _: Sel, key: Id, value: Id, table: Id) -> Id {
+    let name = Some(string::get(table)).filter(|t| !t.is_empty()).unwrap_or_else(|| "Localizable".into());
+    if key != 0 {
+        if let Some(text) = strings_table(&bundle_path_of(this), &name).get(&string::get(key)) {
+            return string::make(text);
+        }
+    }
+    if value != 0 && !string::get(value).is_empty() { value } else { key }
 }
 
 extern "C" fn preferred_localizations(_this: Id, _: Sel) -> Id {
@@ -792,6 +826,12 @@ pub fn register(r: &mut Registry) {
         ("NSMetadataItemPathKey", "kMDItemPath"),
         ("ACAccountTypeIdentifierTwitter", "com.apple.twitter"),
         ("ACAccountTypeIdentifierFacebook", "com.apple.facebook"),
+        ("ACFacebookAppIdKey", "ACFacebookAppIdKey"),
+        ("ACFacebookPermissionsKey", "ACFacebookPermissionsKey"),
+        ("ACFacebookAudienceKey", "ACFacebookAudienceKey"),
+        ("ACFacebookAudienceEveryone", "everyone"),
+        ("ACFacebookAudienceFriends", "friends"),
+        ("ACFacebookAudienceOnlyMe", "me"),
         ("NSLocalizedDescriptionKey", "NSLocalizedDescription"),
         ("NSLocalizedFailureReasonErrorKey", "NSLocalizedFailureReason"),
         ("NSUnderlyingErrorKey", "NSUnderlyingError"),
@@ -840,6 +880,36 @@ mod tests {
         assert_eq!(runtime::send(class, "bundleWithPath:", &[string::make(&format!("{path}/hero.png"))]), 0);
         let fresh = runtime::send(runtime::alloc_instance(class), "initWithPath:", &[string::make(&format!("{path}/nothing"))]);
         assert_eq!(fresh, 0);
+        std::fs::remove_dir_all(&folder).unwrap();
+    }
+
+    /// Localized strings come from the bundle's tables: text .strings files
+    /// (UTF-16 or UTF-8, with comments and escapes) and binary ones; a
+    /// missing key gives the value, else the key itself.
+    #[test]
+    fn localized_strings_come_from_the_bundles_tables() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let folder = std::env::temp_dir().join(format!("gamebridge-strings-{}", std::process::id()));
+        let lproj = folder.join("Words.bundle/en.lproj");
+        std::fs::create_dir_all(&lproj).unwrap();
+        let text = "/* the room */\n\"Llb_Dormitory\" = \"Dormitory\";\n// a line comment\nHello = \"Hi \\\"you\\\"\\n\\U00e9\";\n";
+        let mut utf16 = vec![0xFF, 0xFE];
+        utf16.extend(text.encode_utf16().flat_map(|u| u.to_le_bytes()));
+        std::fs::write(lproj.join("Localizable.strings"), utf16).unwrap();
+        let table = crate::fw::plist::Value::Dict(vec![("Start".into(), crate::fw::plist::Value::String("Begin".into()))]);
+        std::fs::write(lproj.join("Menu.strings"), crate::fw::plist::to_binary(&table)).unwrap();
+        let path = folder.join("Words.bundle").to_string_lossy().into_owned();
+        let bundle = runtime::send(runtime::class_named("NSBundle"), "bundleWithPath:", &[string::make(&path)]);
+        let look = |key: &str, value: Id, table: Id| {
+            string::get(runtime::send(bundle, "localizedStringForKey:value:table:", &[string::make(key), value, table]))
+        };
+        assert_eq!(look("Llb_Dormitory", 0, 0), "Dormitory");
+        assert_eq!(look("Hello", 0, string::make("")), "Hi \"you\"\n\u{e9}");
+        assert_eq!(look("Start", 0, string::make("Menu")), "Begin");
+        assert_eq!(look("Start", 0, 0), "Start");
+        assert_eq!(look("Missing", string::make("Fallback"), string::make("Menu")), "Fallback");
+        assert_eq!(look("Missing", 0, string::make("NoSuchTable")), "Missing");
         std::fs::remove_dir_all(&folder).unwrap();
     }
 

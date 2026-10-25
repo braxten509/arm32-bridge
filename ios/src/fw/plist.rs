@@ -42,9 +42,218 @@ impl Value {
 
 pub fn parse(bytes: &[u8]) -> Option<Value> {
     if bytes.starts_with(b"bplist00") {
-        parse_binary(bytes)
+        return parse_binary(bytes);
+    }
+    let text = decode_text(bytes);
+    let head = text.trim_start();
+    if head.starts_with("<?xml") || head.starts_with("<!DOCTYPE") || head.starts_with("<plist") {
+        parse_xml(&text)
     } else {
-        parse_xml(&String::from_utf8_lossy(bytes))
+        parse_text(&text)
+    }
+}
+
+/// Text in a list file: UTF-16 with a byte order mark, else UTF-8.
+fn decode_text(bytes: &[u8]) -> String {
+    let units = |big: bool| bytes[2..].chunks_exact(2).map(move |c| if big { u16::from_be_bytes([c[0], c[1]]) } else { u16::from_le_bytes([c[0], c[1]]) });
+    match bytes {
+        [0xFF, 0xFE, ..] => char::decode_utf16(units(false)).map(|c| c.unwrap_or('\u{FFFD}')).collect(),
+        [0xFE, 0xFF, ..] => char::decode_utf16(units(true)).map(|c| c.unwrap_or('\u{FFFD}')).collect(),
+        [0xEF, 0xBB, 0xBF, rest @ ..] => String::from_utf8_lossy(rest).into_owned(),
+        _ => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
+// ----- old-style text (.strings files and OpenStep lists) -----
+
+/// An OpenStep text list: `{ key = value; }`, `( a, b )`, quoted or bare
+/// strings and `<hex>` data. A .strings file is a dictionary without the
+/// braces, where `"key";` alone means the key is its own value.
+fn parse_text(text: &str) -> Option<Value> {
+    let mut reader = Text { chars: text.chars().collect(), at: 0 };
+    reader.skip_space();
+    if reader.peek().is_none() {
+        return Some(Value::Dict(Vec::new()));
+    }
+    if reader.peek() == Some('{') || reader.peek() == Some('(') || reader.peek() == Some('<') {
+        let value = reader.value()?;
+        reader.skip_space();
+        if reader.peek().is_none() {
+            return Some(value);
+        }
+        reader.at = 0;
+    }
+    let entries = reader.entries(None)?;
+    Some(Value::Dict(entries))
+}
+
+struct Text {
+    chars: Vec<char>,
+    at: usize,
+}
+
+impl Text {
+    fn peek(&self) -> Option<char> {
+        self.chars.get(self.at).copied()
+    }
+
+    /// Skips white space and `/* */` and `//` comments.
+    fn skip_space(&mut self) {
+        loop {
+            match (self.peek(), self.chars.get(self.at + 1)) {
+                (Some(c), _) if c.is_whitespace() => self.at += 1,
+                (Some('/'), Some('*')) => {
+                    self.at += 2;
+                    while self.at < self.chars.len() && !(self.chars[self.at] == '*' && self.chars.get(self.at + 1) == Some(&'/')) {
+                        self.at += 1;
+                    }
+                    self.at = (self.at + 2).min(self.chars.len());
+                }
+                (Some('/'), Some('/')) => {
+                    while self.peek().is_some_and(|c| c != '\n') {
+                        self.at += 1;
+                    }
+                }
+                _ => return,
+            }
+        }
+    }
+
+    /// `key = value;` pairs up to `close` (or the end of the text).
+    fn entries(&mut self, close: Option<char>) -> Option<Vec<(String, Value)>> {
+        let mut entries = Vec::new();
+        loop {
+            self.skip_space();
+            match self.peek() {
+                None if close.is_none() => return Some(entries),
+                c if c == close => {
+                    self.at += 1;
+                    return Some(entries);
+                }
+                None => return None,
+                _ => {}
+            }
+            let key = self.string()?;
+            self.skip_space();
+            let value = match self.peek()? {
+                ';' => Value::String(key.clone()),
+                '=' => {
+                    self.at += 1;
+                    let value = self.value()?;
+                    self.skip_space();
+                    value
+                }
+                _ => return None,
+            };
+            if self.peek()? != ';' {
+                return None;
+            }
+            self.at += 1;
+            entries.push((key, value));
+        }
+    }
+
+    fn value(&mut self) -> Option<Value> {
+        self.skip_space();
+        match self.peek()? {
+            '{' => {
+                self.at += 1;
+                self.entries(Some('}')).map(Value::Dict)
+            }
+            '(' => {
+                self.at += 1;
+                let mut items = Vec::new();
+                loop {
+                    self.skip_space();
+                    if self.peek()? == ')' {
+                        self.at += 1;
+                        return Some(Value::Array(items));
+                    }
+                    items.push(self.value()?);
+                    self.skip_space();
+                    match self.peek()? {
+                        ',' => self.at += 1,
+                        ')' => {}
+                        _ => return None,
+                    }
+                }
+            }
+            '<' => {
+                self.at += 1;
+                let mut hex = String::new();
+                loop {
+                    match self.peek()? {
+                        '>' => break,
+                        c if c.is_ascii_hexdigit() => hex.push(c),
+                        c if c.is_whitespace() => {}
+                        _ => return None,
+                    }
+                    self.at += 1;
+                }
+                self.at += 1;
+                if hex.len() % 2 != 0 {
+                    return None;
+                }
+                (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok()).collect::<Option<Vec<u8>>>().map(Value::Data)
+            }
+            _ => self.string().map(Value::String),
+        }
+    }
+
+    /// A quoted string with C escapes, or a bare word.
+    fn string(&mut self) -> Option<String> {
+        let quote = self.peek()?;
+        if quote != '"' && quote != '\'' {
+            let start = self.at;
+            while self.peek().is_some_and(|c| c.is_alphanumeric() || "_$+/:.-".contains(c)) {
+                self.at += 1;
+            }
+            return (self.at > start).then(|| self.chars[start..self.at].iter().collect());
+        }
+        self.at += 1;
+        let mut out = String::new();
+        loop {
+            let c = self.peek()?;
+            self.at += 1;
+            if c == quote {
+                return Some(out);
+            }
+            if c != '\\' {
+                out.push(c);
+                continue;
+            }
+            let e = self.peek()?;
+            self.at += 1;
+            match e {
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                'r' => out.push('\r'),
+                'a' => out.push('\u{7}'),
+                'b' => out.push('\u{8}'),
+                'f' => out.push('\u{c}'),
+                'v' => out.push('\u{b}'),
+                'U' | 'u' => {
+                    let digits: String = self.chars[self.at..].iter().take(4).take_while(|c| c.is_ascii_hexdigit()).collect();
+                    self.at += digits.len();
+                    let unit = u32::from_str_radix(&digits, 16).ok()?;
+                    out.push(char::from_u32(unit).unwrap_or('\u{FFFD}'));
+                }
+                '0'..='7' => {
+                    let mut code = e.to_digit(8)?;
+                    for _ in 0..2 {
+                        match self.peek().and_then(|c| c.to_digit(8)) {
+                            Some(d) => {
+                                code = code * 8 + d;
+                                self.at += 1;
+                            }
+                            None => break,
+                        }
+                    }
+                    out.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
+                }
+                other => out.push(other),
+            }
+        }
     }
 }
 
