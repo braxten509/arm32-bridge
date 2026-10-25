@@ -946,12 +946,60 @@ extern "C" fn view_size_that_fits(this: Id, _: Sel, _size: Size) -> Size {
     view_state(this).frame.size
 }
 
-extern "C" fn view_convert_point(_this: Id, _: Sel, point: Point, _other: Id) -> Point {
-    point
+/// A view's points to screen points; nil stands for `beside`'s window (its
+/// top view when it is in none), as UIKit's convert methods take it.
+fn to_screen(view: Id, beside: Id) -> Transform {
+    if view != 0 {
+        return crate::fw::touch::view_to_screen(view);
+    }
+    let mut top = beside;
+    for _ in 0..256 {
+        match view_state(top).superview {
+            0 => break,
+            parent => top = parent,
+        }
+    }
+    if top == 0 {
+        IDENTITY
+    } else {
+        crate::fw::touch::view_step(top)
+    }
 }
 
-extern "C" fn view_convert_rect(_this: Id, _: Sel, rect: Rect, _other: Id) -> Rect {
-    rect
+/// From `from`'s points to `to`'s (either may be nil: see `to_screen`).
+fn conversion(from: Id, to: Id, receiver: Id) -> Transform {
+    let back = crate::fw::geometry::invert(to_screen(to, receiver)).unwrap_or(IDENTITY);
+    crate::fw::geometry::concat(to_screen(from, receiver), back)
+}
+
+fn convert_point(t: Transform, p: Point) -> Point {
+    let (x, y) = crate::fw::geometry::apply(t, p.x, p.y);
+    Point { x, y }
+}
+
+/// The smallest rectangle holding the rect's converted corners.
+pub(crate) fn convert_rect(t: Transform, r: Rect) -> Rect {
+    let (x0, y0, x1, y1) = (r.origin.x, r.origin.y, r.origin.x + r.size.width, r.origin.y + r.size.height);
+    let corners = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)].map(|(x, y)| crate::fw::geometry::apply(t, x, y));
+    let (lx, hx) = corners.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), c| (lo.min(c.0), hi.max(c.0)));
+    let (ly, hy) = corners.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), c| (lo.min(c.1), hi.max(c.1)));
+    Rect::new(lx, ly, hx - lx, hy - ly)
+}
+
+extern "C" fn view_convert_point_from(this: Id, _: Sel, point: Point, other: Id) -> Point {
+    convert_point(conversion(other, this, this), point)
+}
+
+extern "C" fn view_convert_point_to(this: Id, _: Sel, point: Point, other: Id) -> Point {
+    convert_point(conversion(this, other, this), point)
+}
+
+extern "C" fn view_convert_rect_from(this: Id, _: Sel, rect: Rect, other: Id) -> Rect {
+    convert_rect(conversion(other, this, this), rect)
+}
+
+extern "C" fn view_convert_rect_to(this: Id, _: Sel, rect: Rect, other: Id) -> Rect {
+    convert_rect(conversion(this, other, this), rect)
 }
 
 // ----- block animations: nothing moves on screen here, so the changes the
@@ -2270,10 +2318,10 @@ pub fn register(r: &mut Registry) {
             ("layoutSubviews", nothing as usize),
             ("sizeToFit", nothing as usize),
             ("sizeThatFits:", view_size_that_fits as usize),
-            ("convertPoint:fromView:", view_convert_point as usize),
-            ("convertPoint:toView:", view_convert_point as usize),
-            ("convertRect:fromView:", view_convert_rect as usize),
-            ("convertRect:toView:", view_convert_rect as usize),
+            ("convertPoint:fromView:", view_convert_point_from as usize),
+            ("convertPoint:toView:", view_convert_point_to as usize),
+            ("convertRect:fromView:", view_convert_rect_from as usize),
+            ("convertRect:toView:", view_convert_rect_to as usize),
             ("endEditing:", no_with as usize),
             ("setClearsContextBeforeDrawing:", ignore_bool as usize),
         ],
@@ -2506,6 +2554,48 @@ extern "C" fn screen_scale_one(_this: Id, _: Sel) -> f64 {
 mod tests {
     use super::*;
     use crate::fw::plist::Value;
+
+    /// convertPoint:/convertRect: go through frames, bounds origins and
+    /// transforms (around the center) up to the window and, between
+    /// windows, the screen; nil is the receiver's window; a rect becomes the
+    /// box around its turned corners.
+    #[test]
+    fn points_and_rects_convert_between_views() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let make = |class: &str, frame: Rect| {
+            let view = runtime::send(runtime::class_named(class), "alloc", &[]);
+            send_rect(view, "initWithFrame:", frame);
+            view
+        };
+        let p = |x: f64, y: f64| Point { x, y };
+        let near = |a: Point, b: Point| (a.x - b.x).abs() < 1e-9 && (a.y - b.y).abs() < 1e-9;
+        let first = make("UIWindow", Rect::new(0.0, 0.0, 320.0, 480.0));
+        let second = make("UIWindow", Rect::new(100.0, 0.0, 320.0, 480.0));
+        let a = make("UIView", Rect::new(10.0, 20.0, 100.0, 100.0));
+        let b = make("UIView", Rect::new(5.0, 5.0, 50.0, 50.0));
+        let scaled = make("UIView", Rect::new(0.0, 0.0, 100.0, 100.0));
+        let other = make("UIView", Rect::new(0.0, 0.0, 10.0, 10.0));
+        runtime::send(first, "addSubview:", &[a]);
+        runtime::send(a, "addSubview:", &[b]);
+        runtime::send(first, "addSubview:", &[scaled]);
+        runtime::send(second, "addSubview:", &[other]);
+        send_rect(b, "setBounds:", Rect::new(10.0, 0.0, 50.0, 50.0));
+        view_set_transform(scaled, 0, Transform { a: 2.0, b: 0.0, c: 0.0, d: 2.0, tx: 0.0, ty: 0.0 });
+
+        assert_eq!(view_convert_point_to(a, 0, p(0.0, 0.0), 0), p(10.0, 20.0), "nil: the window");
+        assert_eq!(view_convert_point_to(b, 0, p(10.0, 0.0), 0), p(15.0, 25.0), "bounds origin");
+        assert_eq!(view_convert_point_from(a, 0, p(10.0, 20.0), 0), p(0.0, 0.0));
+        assert_eq!(view_convert_point_from(a, 0, p(10.0, 0.0), b), p(5.0, 5.0));
+        assert_eq!(view_convert_point_to(b, 0, p(10.0, 0.0), a), p(5.0, 5.0));
+        assert!(near(view_convert_point_to(scaled, 0, p(0.0, 0.0), 0), p(-50.0, -50.0)), "scaled around its center");
+        assert!(near(view_convert_point_from(scaled, 0, p(50.0, 50.0), 0), p(50.0, 50.0)));
+        assert!(near(view_convert_point_to(other, 0, p(0.0, 0.0), a), p(90.0, -20.0)), "another window: through the screen");
+        let r = view_convert_rect_to(scaled, 0, Rect::new(0.0, 0.0, 100.0, 100.0), 0);
+        assert!(near(r.origin, p(-50.0, -50.0)) && (r.size.width - 200.0).abs() < 1e-9, "{r:?}");
+        let r = view_convert_rect_from(b, 0, Rect::new(0.0, 0.0, 10.0, 10.0), a);
+        assert_eq!(r, Rect::new(5.0, -5.0, 10.0, 10.0));
+    }
 
     /// Asking to rotate to the device's orientation is fine; the interface is already there.
     #[test]

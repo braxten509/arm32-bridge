@@ -151,23 +151,39 @@ pub(crate) fn origin_in_window(view: Id) -> Point {
 /// origin, its transform around its anchor point (its center unless the
 /// layer's anchor moved) and its place in its superview, up to the window.
 pub(crate) fn view_to_window(view: Id) -> Transform {
+    view_chain(view, false)
+}
+
+/// The same up to the screen: the top view's own place too (a window's
+/// frame is in screen points).
+pub(crate) fn view_to_screen(view: Id) -> Transform {
+    view_chain(view, true)
+}
+
+/// One view's points to its superview's.
+pub(crate) fn view_step(view: Id) -> Transform {
+    let state = view_state(view);
+    let anchor = crate::fw::layers::view_anchor(view);
+    let size = state.frame.size;
+    let (ax, ay) = (size.width * anchor.x, size.height * anchor.y);
+    let to_anchor = Transform { tx: -(state.bounds_origin.x + ax), ty: -(state.bounds_origin.y + ay), ..IDENTITY };
+    let to_superview = Transform { tx: state.frame.origin.x + ax, ty: state.frame.origin.y + ay, ..IDENTITY };
+    concat(concat(to_anchor, state.transform), to_superview)
+}
+
+fn view_chain(view: Id, with_top: bool) -> Transform {
     let mut t = IDENTITY;
     let mut current = view;
     for _ in 0..64 {
         if current == 0 {
             break;
         }
-        let state = view_state(current);
-        if state.superview == 0 {
+        let superview = view_state(current).superview;
+        if superview == 0 && !with_top {
             break;
         }
-        let anchor = crate::fw::layers::view_anchor(current);
-        let size = state.frame.size;
-        let (ax, ay) = (size.width * anchor.x, size.height * anchor.y);
-        let to_anchor = Transform { tx: -(state.bounds_origin.x + ax), ty: -(state.bounds_origin.y + ay), ..IDENTITY };
-        let to_superview = Transform { tx: state.frame.origin.x + ax, ty: state.frame.origin.y + ay, ..IDENTITY };
-        t = concat(concat(concat(t, to_anchor), state.transform), to_superview);
-        current = state.superview;
+        t = concat(t, view_step(current));
+        current = superview;
     }
     t
 }

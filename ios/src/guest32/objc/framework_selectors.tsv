@@ -209,10 +209,15 @@ contentMode	i@:
 contentOffset	{CGPoint=ff}@:
 contentScaleFactor	f@:
 contentsOfDirectoryAtPath:error:	@@:@^@
+contentsScale	f@:
 continueTrackingWithTouch:withEvent:	c@:@@
+convertPoint:fromLayer:	{CGPoint=ff}@:{CGPoint=ff}@
 convertPoint:fromView:	{CGPoint=ff}@:{CGPoint=ff}@
+convertPoint:toLayer:	{CGPoint=ff}@:{CGPoint=ff}@
 convertPoint:toView:	{CGPoint=ff}@:{CGPoint=ff}@
+convertRect:fromLayer:	{CGRect={CGPoint=ff}{CGSize=ff}}@:{CGRect={CGPoint=ff}{CGSize=ff}}@
 convertRect:fromView:	{CGRect={CGPoint=ff}{CGSize=ff}}@:{CGRect={CGPoint=ff}{CGSize=ff}}@
+convertRect:toLayer:	{CGRect={CGPoint=ff}{CGSize=ff}}@:{CGRect={CGPoint=ff}{CGSize=ff}}@
 convertRect:toView:	{CGRect={CGPoint=ff}{CGSize=ff}}@:{CGRect={CGPoint=ff}{CGSize=ff}}@
 convertTime:fromLayer:	d@:d@
 cookiesForURL:	@@:@
@@ -869,6 +874,7 @@ setContentOffset:animated:	v@:{CGPoint=ff}c
 setContentScaleFactor:	v@:f
 setContentSize:	v@:{CGSize=ff}
 setContentSizeForViewInPopover:	v@:{CGSize=ff}
+setContentsScale:	v@:f
 setContext:	v@:@
 setControlStyle:	v@:i
 setCornerRadius:	v@:f

@@ -16,10 +16,17 @@
 //!
 //! Places follow UIKit: each view sits at its centre in its parent, turned
 //! and scaled by its transform, its bounds shifting what is inside it; so
-//! sideways launch pictures in older games come out right. Clipping and
-//! background colours are not drawn; picture files are PNGs as UIImage
-//! reads them here. Pictures made in memory (or turned photos) are shown
-//! through an upright PNG made once.
+//! sideways launch pictures in older games come out right. Picture files
+//! are PNGs as UIImage reads them here. Pictures made in memory (or turned
+//! photos) are shown through an upright PNG made once.
+//!
+//! Layers draw as Core Animation draws them: the layers a game adds (among
+//! a view's subviews where it put them), each with its background (round
+//! corners), contents, gradient or shape, sublayers by zPosition, and the
+//! border on top. A layer cut to round or turned bounds, masked, or with a
+//! shadow is drawn into one picture with what it holds, its shadow under
+//! it (fw/graphics/compose.rs); other clips are the screen areas pictures
+//! may draw in.
 
 use crate::fw::geometry::{Point, Rect, Transform, IDENTITY};
 use crate::fw::graphics::TextLook;
@@ -46,7 +53,45 @@ pub struct Picture {
     /// The screen area it may draw in, in screen points: the bounds of the
     /// views around it that clip to their bounds, else the whole screen.
     pub clip: Rect,
+    /// On a GROUP_MARK: how the pictures up to its END_MARK are drawn together.
+    pub group: Option<Box<Group>>,
 }
+
+/// A layer whose pictures are drawn together (fw/graphics/compose.rs):
+/// cut to its round corners, through its mask, or with a shadow under them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Group {
+    /// The layer's own points to screen points.
+    pub place: Transform,
+    /// Its bounds in its own points.
+    pub bounds: Rect,
+    /// What shows is cut to the bounds, their corners rounded by `radius` (masksToBounds).
+    pub clips: bool,
+    pub radius: f64,
+    /// Its mask layer's pictures come after a MASK_MARK: where they are clear, it is too.
+    pub masked: bool,
+    pub shadow: Option<Shadow>,
+}
+
+/// A layer's shadow.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Shadow {
+    /// Straight colour, its alpha times shadowOpacity and the layer's opacity.
+    pub color: [f64; 4],
+    /// Blur radius in the layer's points.
+    pub radius: f64,
+    /// Moved by this in the layer's points (iOS: y goes down).
+    pub offset: (f64, f64),
+    /// The shadowPath's figures in the layer's points; None: the shadow of what the layer shows.
+    pub path: Option<Vec<Vec<Point>>>,
+}
+
+/// Starts a group of pictures drawn together (see `Group`).
+pub const GROUP_MARK: &str = "\u{1}group";
+/// In a masked group: the mask's pictures follow.
+pub const MASK_MARK: &str = "\u{1}mask";
+/// Ends the group.
+pub const END_MARK: &str = "\u{1}end";
 
 /// A picture a view shows.
 #[derive(Clone, Debug, PartialEq)]
@@ -90,8 +135,17 @@ pub struct Node {
     pub gl: bool,
     /// Its background colour (straight red, green, blue, alpha).
     pub background: Option<[f64; 4]>,
-    /// It clips what it holds to its bounds (clipsToBounds).
+    /// It clips what it holds to its bounds (clipsToBounds, masksToBounds).
     pub clips: bool,
+    /// Its layer's corner radius: the background and border are rounded, and
+    /// so is the clip when it clips.
+    pub radius: f64,
+    /// Its layer's border (straight colour, width), drawn over everything inside.
+    pub border: Option<([f64; 4], f64)>,
+    /// Its layer's shadow (the colour's alpha not yet times the opacity).
+    pub shadow: Option<Shadow>,
+    /// Its layer's mask, in its own points.
+    pub mask: Option<Box<Node>>,
     pub children: Vec<Node>,
 }
 
@@ -114,12 +168,17 @@ fn moved(x: f64, y: f64) -> Transform {
 /// The pictures under `node` (a window, at the screen's top-left), back to front.
 pub fn flatten(node: &Node) -> Vec<Picture> {
     let mut out = Vec::new();
-    walk(node, None, 1.0, Rect { origin: Point::default(), size: node.frame.size }, &mut out);
+    // A window clips nothing (its own clipsToBounds aside), the screen does:
+    // on an iPhone 5 a 320x480 window still shows its views below 480. The
+    // area reaches over the window too; past the screen the phone cuts it.
+    let (wide, high, _) = crate::fw::uikit::screen_points();
+    let area = Rect::new(0.0, 0.0, wide.max(node.frame.size.width), high.max(node.frame.size.height));
+    walk(node, None, 1.0, area, &mut out);
     out
 }
 
 /// The screen area (axis-aligned) a rect in some view's own points covers.
-fn screen_box(place: Transform, rect: Rect) -> Rect {
+pub(crate) fn screen_box(place: Transform, rect: Rect) -> Rect {
     let corners = [(0.0, 0.0), (rect.size.width, 0.0), (0.0, rect.size.height), (rect.size.width, rect.size.height)]
         .map(|(x, y)| (rect.origin.x + x, rect.origin.y + y))
         .map(|(x, y)| (place.a * x + place.c * y + place.tx, place.b * x + place.d * y + place.ty));
@@ -129,7 +188,7 @@ fn screen_box(place: Transform, rect: Rect) -> Rect {
 }
 
 /// Where two areas meet (no size when they don't).
-fn meet(a: Rect, b: Rect) -> Rect {
+pub(crate) fn meet(a: Rect, b: Rect) -> Rect {
     let (left, top) = (a.origin.x.max(b.origin.x), a.origin.y.max(b.origin.y));
     let right = (a.origin.x + a.size.width).min(b.origin.x + b.size.width);
     let bottom = (a.origin.y + a.size.height).min(b.origin.y + b.size.height);
@@ -160,19 +219,44 @@ fn walk(node: &Node, parent: Option<Transform>, parent_alpha: f64, clip: Rect, o
         out.clear();
     }
     let visible = Rect { origin: node.bounds_origin, size };
-    let clip = if node.clips { meet(clip, screen_box(own, visible)) } else { clip };
-    // The background colour first, under what the view shows (the GL picture covers a GL view's).
-    let background = node.background.filter(|color| color[3] > 0.0 && !node.gl).map(|color| Shown {
-        path: color_path(color),
-        mode: 0,
-        size: (1.0, 1.0),
-        rect: Rect { origin: Point::default(), size },
-        caps: None,
-        tile: false,
-        text: None,
-        alpha: 1.0,
+    // Drawn together (after resolve, by fw/graphics/compose.rs) when cut to
+    // round or turned bounds, masked, or shadowed.
+    let turned = own.b.abs() > 1e-9 || own.c.abs() > 1e-9;
+    let group = (node.clips && (node.radius > 0.0 || turned) || node.mask.is_some() || node.shadow.is_some()).then(|| Group {
+        place: own,
+        bounds: visible,
+        clips: node.clips,
+        radius: node.radius,
+        masked: node.mask.is_some(),
+        shadow: node.shadow.clone().map(|shadow| Shadow { color: [shadow.color[0], shadow.color[1], shadow.color[2], shadow.color[3] * alpha], ..shadow }),
     });
-    for shown in background.iter().chain(&node.pictures) {
+    let mark = |path: &str, group: Option<Group>| Picture {
+        path: path.into(),
+        place: own,
+        area: (size.width, size.height),
+        alpha,
+        mode: 0,
+        size: (size.width, size.height),
+        text: None,
+        clip,
+        group: group.map(Box::new),
+    };
+    let grouped = group.is_some();
+    if let Some(group) = group {
+        out.push(mark(GROUP_MARK, Some(group)));
+    }
+    let clip = if node.clips { meet(clip, screen_box(own, visible)) } else { clip };
+    let over_bounds = |path: String| Shown { path, mode: 0, size: (1.0, 1.0), rect: Rect { origin: Point::default(), size }, caps: None, tile: false, text: None, alpha: 1.0 };
+    // The background colour first, under what the view shows (the GL picture covers a GL view's).
+    let background = node.background.filter(|color| color[3] > 0.0 && !node.gl).map(|color| {
+        if node.radius > 0.0 {
+            over_bounds(box_path((size.width, size.height), node.radius, color, None))
+        } else {
+            over_bounds(color_path(color))
+        }
+    });
+    let border = node.border.map(|border| over_bounds(box_path((size.width, size.height), node.radius, [0.0; 4], Some(border))));
+    let draw = |shown: &Shown, out: &mut Vec<Picture>| {
         for (path, rect, picture_size, cut) in parts(shown) {
             if rect.size.width > 0.0 && rect.size.height > 0.0 {
                 let place = then(moved(node.bounds_origin.x + rect.origin.x, node.bounds_origin.y + rect.origin.y), own);
@@ -187,12 +271,27 @@ fn walk(node: &Node, parent: Option<Transform>, parent_alpha: f64, clip: Rect, o
                 }
                 let text = shown.text.clone();
                 let alpha = alpha * shown.alpha;
-                out.push(Picture { path, place, area: (rect.size.width, rect.size.height), alpha, mode: shown.mode, size: picture_size, text, clip });
+                out.push(Picture { path, place, area: (rect.size.width, rect.size.height), alpha, mode: shown.mode, size: picture_size, text, clip, group: None });
             }
         }
+    };
+    // Core Animation's order: background, contents, sublayers, the border on top.
+    for shown in background.iter().chain(&node.pictures) {
+        draw(shown, out);
     }
     for child in &node.children {
         walk(child, Some(own), alpha, clip, out);
+    }
+    if let Some(border) = &border {
+        draw(border, out);
+    }
+    if grouped {
+        if let Some(mask) = &node.mask {
+            out.push(mark(MASK_MARK, None));
+            // The mask counts by its own opacity alone, wherever the layer's clip is.
+            walk(mask, Some(own), 1.0, Rect::new(-1e9, -1e9, 2e9, 2e9), out);
+        }
+        out.push(mark(END_MARK, None));
     }
 }
 
@@ -251,11 +350,17 @@ struct Classes {
     cell: Class,
     progress: Class,
     gl_layer: Class,
+    gradient_layer: Class,
+    shape_layer: Class,
+    image: Class,
 }
 
 impl Classes {
     fn find() -> Classes {
         Classes {
+            gradient_layer: runtime::class_named("CAGradientLayer"),
+            shape_layer: runtime::class_named("CAShapeLayer"),
+            image: runtime::class_named("UIImage"),
             image_view: runtime::class_named("UIImageView"),
             label: runtime::class_named("UILabel"),
             button: runtime::class_named("UIButton"),
@@ -381,26 +486,26 @@ fn snapshot(view: Id, classes: &Classes, depth: usize) -> Node {
     if let Some(pieces) = crate::fw::pickers::pieces(view) {
         pictures.extend(pieces.into_iter().map(piece_shown));
     }
-    let alpha = property_get(view, "alpha").map(f64::from_bits).unwrap_or(1.0);
-    let (mut frame, mut transform, mut alpha) = (state.frame, state.transform, alpha);
-    let anchor = if state.layer == 0 { Point { x: 0.5, y: 0.5 } } else { crate::fw::layers::anchor(state.layer) };
-    // Core Animation animations on the view's layer show over its own values.
-    if state.layer != 0 && crate::fw::animation::animating(state.layer) {
-        let size = frame.size;
-        let position = Point { x: frame.origin.x + size.width * anchor.x, y: frame.origin.y + size.height * anchor.y };
-        let shown = crate::fw::animation::presented(state.layer, crate::fw::animation::Shown { opacity: alpha, position, transform });
-        frame.origin = Point { x: shown.position.x - size.width * anchor.x, y: shown.position.y - size.height * anchor.y };
-        (transform, alpha) = (shown.transform, shown.opacity);
+    if state.layer != 0 {
+        // What its layer shows (contents, a gradient or shape layer's) comes first.
+        let mut own = layer_content(state.layer, Rect { origin: state.bounds_origin, size: state.frame.size }, classes);
+        own.append(&mut pictures);
+        pictures = own;
     }
-    let mut children: Vec<(f64, Node)> = if depth < 64 {
-        state.subviews.iter().map(|&child| (z_of(child), snapshot(child, classes, depth + 1))).collect()
-    } else {
+    let alpha = property_get(view, "alpha").map(f64::from_bits).unwrap_or(1.0);
+    let anchor = if state.layer == 0 { Point { x: 0.5, y: 0.5 } } else { crate::fw::layers::anchor(state.layer) };
+    let size = state.frame.size;
+    let position = Point { x: state.frame.origin.x + size.width * anchor.x, y: state.frame.origin.y + size.height * anchor.y };
+    let (position, transform, alpha) = presented(state.layer, position, state.transform, alpha);
+    let children = if depth >= 64 {
         Vec::new()
+    } else if state.layer != 0 {
+        layer_children(state.layer, view, classes, depth)
+    } else {
+        in_z_order(state.subviews.iter().map(|&child| (z_of(child), snapshot(child, classes, depth + 1))).collect())
     };
-    // Layers with a higher zPosition show in front of their siblings (a stable sort keeps the rest in order).
-    children.sort_by(|a, b| a.0.total_cmp(&b.0));
-    Node {
-        frame,
+    let mut node = Node {
+        frame: Rect { origin: Point { x: position.x - size.width * anchor.x, y: position.y - size.height * anchor.y }, size },
         bounds_origin: state.bounds_origin,
         transform: Some(transform),
         anchor: Some(anchor),
@@ -411,7 +516,188 @@ fn snapshot(view: Id, classes: &Classes, depth: usize) -> Node {
         gl: state.layer != 0 && Classes::is(state.layer, classes.gl_layer),
         background,
         clips: property_get(view, "clips").unwrap_or(0) != 0,
-        children: children.into_iter().map(|(_, node)| node).collect(),
+        children,
+        ..Default::default()
+    };
+    if state.layer != 0 {
+        dress(&mut node, state.layer, classes, depth);
+    }
+    node
+}
+
+/// Where a layer is, how it is turned and how see-through, with a running
+/// Core Animation animation shown over its own values.
+fn presented(layer: Id, position: Point, transform: Transform, opacity: f64) -> (Point, Transform, f64) {
+    if layer == 0 || !crate::fw::animation::animating(layer) {
+        return (position, transform, opacity);
+    }
+    let shown = crate::fw::animation::presented(layer, crate::fw::animation::Shown { opacity, position, transform });
+    (shown.position, shown.transform, shown.opacity)
+}
+
+/// Layers with a higher zPosition show in front of their siblings (a stable sort keeps the rest in order).
+fn in_z_order(mut children: Vec<(f64, Node)>) -> Vec<Node> {
+    children.sort_by(|a, b| a.0.total_cmp(&b.0));
+    children.into_iter().map(|(_, node)| node).collect()
+}
+
+/// What is drawn inside a layer: its view's subviews (`view`: 0 for a layer
+/// of its own) and the layers the game added, in order; a replicator
+/// layer's, once per copy.
+fn layer_children(layer: Id, view: Id, classes: &Classes, depth: usize) -> Vec<Node> {
+    use crate::fw::layers::{self, Child};
+    if depth >= 64 {
+        return Vec::new();
+    }
+    let nodes = || {
+        in_z_order(
+            if view != 0 { layers::view_children(view, layer) } else { layers::children(layer) }
+                .into_iter()
+                .map(|child| match child {
+                    Child::View(view) => (z_of(view), snapshot(view, classes, depth + 1)),
+                    Child::Layer(sub) => (layers::z_position(sub), layer_node(sub, classes, depth + 1)),
+                })
+                .collect(),
+        )
+    };
+    if !Classes::is(layer, runtime::class_named("CAReplicatorLayer")) {
+        return nodes();
+    }
+    let (copies, step) = layers::replication(layer);
+    // Each copy one instanceTransform further than the last, around the replicator's middle.
+    let (bounds, step) = (layers::bounds(layer), layers::affine_of(step));
+    let mut turn = IDENTITY;
+    (0..copies)
+        .map(|_| {
+            let copy = Node { frame: bounds, bounds_origin: bounds.origin, transform: Some(turn), alpha: 1.0, children: nodes(), ..Default::default() };
+            turn = then(turn, step);
+            copy
+        })
+        .collect()
+}
+
+/// A layer of its own (made by the game) as `flatten` reads it.
+fn layer_node(layer: Id, classes: &Classes, depth: usize) -> Node {
+    use crate::fw::layers;
+    let (bounds, anchor) = (layers::bounds(layer), layers::anchor(layer));
+    let size = bounds.size;
+    let (position, transform, alpha) = presented(layer, layers::position(layer), layers::affine_of(layers::transform(layer)), layers::opacity(layer));
+    let mut node = Node {
+        frame: Rect { origin: Point { x: position.x - size.width * anchor.x, y: position.y - size.height * anchor.y }, size },
+        bounds_origin: bounds.origin,
+        transform: Some(transform),
+        anchor: Some(anchor),
+        hidden: layers::hidden(layer),
+        alpha,
+        pictures: layer_content(layer, bounds, classes),
+        background: crate::fw::graphics::color_rgba(layers::background(layer)),
+        clips: layers::masks(layer),
+        children: layer_children(layer, 0, classes, depth),
+        ..Default::default()
+    };
+    dress(&mut node, layer, classes, depth);
+    node
+}
+
+/// A layer's corners, border, shadow and mask.
+fn dress(node: &mut Node, layer: Id, classes: &Classes, depth: usize) {
+    let looks = crate::fw::layers::looks(layer);
+    node.radius = looks.corner_radius;
+    node.border = looks.border;
+    node.shadow = looks.shadow.map(|(color, radius, offset, path)| Shadow { color, radius, offset, path: (path != 0).then(|| crate::fw::graphics::path_points(path)) });
+    if looks.mask != 0 && depth < 64 {
+        node.mask = Some(Box::new(layer_node(looks.mask, classes, depth + 1)));
+    }
+}
+
+/// What a layer itself shows over its background: its contents (placed by
+/// its contentsGravity), a gradient layer's colours, a shape layer's path.
+/// `bounds`: the layer's bounds.
+fn layer_content(layer: Id, bounds: Rect, classes: &Classes) -> Vec<Shown> {
+    use crate::fw::layers;
+    let size = bounds.size;
+    let plain = |path: String, rect: Rect| Shown { path, mode: 0, size: (rect.size.width, rect.size.height), rect, caps: None, tile: false, text: None, alpha: 1.0 };
+    let mut out = Vec::new();
+    let contents = layers::contents(layer);
+    // A UIImage as contents shows (some games set one); a CGImage at contentsScale pixels per point.
+    let own = if contents == 0 {
+        None
+    } else if Classes::is(contents, classes.image) {
+        let points = crate::fw::uikit::image_points(contents);
+        Some((format!("{IMAGE_PREFIX}{contents:x}"), (points.width, points.height)))
+    } else {
+        let scale = layers::contents_scale(layer);
+        let scale = if scale > 0.0 { scale } else { 1.0 };
+        crate::fw::graphics::cg_size(contents).map(|(w, h)| (format!("{CG_IMAGE_PREFIX}{contents:x}"), (w as f64 / scale, h as f64 / scale)))
+    };
+    if let Some((path, own)) = own {
+        out.push(Shown { size: own, ..plain(path, gravity_rect(&layers::contents_gravity(layer), own, size)) });
+    }
+    let whole = Rect { origin: Point::default(), size };
+    if Classes::is(layer, classes.gradient_layer) {
+        let stops = layers::gradient_stops(layer);
+        if !stops.is_empty() {
+            let (start, end) = layers::gradient_points(layer);
+            let mut path = format!("{GRADIENT_PREFIX}{},{},{},{},{},{}", size.width, size.height, start.x, start.y, end.x, end.y);
+            for ([r, g, b, a], at) in stops {
+                path += &format!(";{r},{g},{b},{a},{at}");
+            }
+            out.push(plain(path, whole));
+        }
+    }
+    if Classes::is(layer, classes.shape_layer) {
+        let (path, fill, stroke, width, even_odd) = layers::shape_look(layer);
+        let figures = if path == 0 { Vec::new() } else { crate::fw::graphics::path_points(path) };
+        let points: Vec<&Point> = figures.iter().flatten().collect();
+        let fill = crate::fw::graphics::color_rgba(fill).unwrap_or([0.0; 4]);
+        let stroke = crate::fw::graphics::color_rgba(stroke).filter(|_| width > 0.0).unwrap_or([0.0; 4]);
+        if !points.is_empty() {
+            // The path may reach past the bounds (often a layer with no size draws it all).
+            let reach = if stroke[3] > 0.0 { width / 2.0 } else { 0.0 } + 1.0;
+            let (x0, x1) = points.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| (lo.min(p.x), hi.max(p.x)));
+            let (y0, y1) = points.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| (lo.min(p.y), hi.max(p.y)));
+            let area = Rect::new(x0 - reach, y0 - reach, x1 - x0 + 2.0 * reach, y1 - y0 + 2.0 * reach);
+            let mut key = format!(
+                "{SHAPE_PREFIX}{},{},{},{},{},{},{},{},{},{},{},{},{},{width}",
+                area.origin.x, area.origin.y, area.size.width, area.size.height, even_odd as u8, fill[0], fill[1], fill[2], fill[3], stroke[0], stroke[1], stroke[2], stroke[3]
+            );
+            for figure in &figures {
+                key.push(';');
+                key += &figure.iter().map(|p| format!("{},{}", p.x, p.y)).collect::<Vec<_>>().join(",");
+            }
+            out.push(plain(key, Rect { origin: Point { x: area.origin.x - bounds.origin.x, y: area.origin.y - bounds.origin.y }, size: area.size }));
+        }
+    }
+    out
+}
+
+/// Where contents of `own` size go in a layer of `size` for a contentsGravity.
+fn gravity_rect(gravity: &str, own: (f64, f64), size: crate::fw::geometry::Size) -> Rect {
+    let ((w, h), (cw, ch)) = ((size.width, size.height), own);
+    match gravity {
+        "resizeAspect" | "resizeAspectFill" if cw > 0.0 && ch > 0.0 => {
+            let k = if gravity == "resizeAspect" { (w / cw).min(h / ch) } else { (w / cw).max(h / ch) };
+            Rect::new((w - cw * k) / 2.0, (h - ch * k) / 2.0, cw * k, ch * k)
+        }
+        "center" | "top" | "bottom" | "left" | "right" | "topLeft" | "topRight" | "bottomLeft" | "bottomRight" => {
+            let x = if gravity == "left" || gravity.ends_with("Left") {
+                0.0
+            } else if gravity == "right" || gravity.ends_with("Right") {
+                w - cw
+            } else {
+                (w - cw) / 2.0
+            };
+            // Core Animation's "top" is where its y is greatest: on iOS (y down) the bottom.
+            let y = if gravity.starts_with("top") {
+                h - ch
+            } else if gravity.starts_with("bottom") {
+                0.0
+            } else {
+                (h - ch) / 2.0
+            };
+            Rect::new(x, y, cw, ch)
+        }
+        _ => Rect::new(0.0, 0.0, w, h),
     }
 }
 
@@ -445,6 +731,70 @@ fn color_path(rgba: [f64; 4]) -> String {
     format!("{COLOR_PREFIX}{},{},{},{}", rgba[0], rgba[1], rgba[2], rgba[3])
 }
 
+/// Stands for a CGImage (a layer's contents) until `resolve`.
+const CG_IMAGE_PREFIX: &str = "\u{1}cgimage:";
+
+/// Stands for a layer's background or border until `resolve`.
+const BOX_PREFIX: &str = "\u{1}box:";
+
+/// Stands for a gradient layer's colours until `resolve`: its size, start
+/// and end points, then `;` and each stop's colour and location.
+const GRADIENT_PREFIX: &str = "\u{1}gradient:";
+
+/// Stands for a shape layer's path until `resolve`: the area drawn (layer
+/// points), even-odd, fill and stroke colours, line width, then `;` and
+/// each figure's points.
+const SHAPE_PREFIX: &str = "\u{1}shape:";
+
+/// The numbers in a comma-separated list (None if one isn't a number).
+fn numbers(text: &str) -> Option<Vec<f64>> {
+    text.split(',').map(|n| n.parse().ok()).collect()
+}
+
+/// The file for a picture `resolve` draws itself (None: not one of those;
+/// Some(None): it can't be made).
+fn drawn_file(path: &str, scale: f64) -> Option<Option<String>> {
+    use crate::fw::graphics;
+    let rgba = |n: &[f64]| [n[0], n[1], n[2], n[3]];
+    if let Some(id) = path.strip_prefix(CG_IMAGE_PREFIX) {
+        return Some(usize::from_str_radix(id, 16).ok().and_then(graphics::cg_picture));
+    }
+    if let Some(rest) = path.strip_prefix(BOX_PREFIX) {
+        return Some(numbers(rest).filter(|n| n.len() == 12).and_then(|n| graphics::box_picture((n[0], n[1]), n[2], rgba(&n[3..7]), (rgba(&n[7..11]), n[11]), scale)));
+    }
+    if let Some(rest) = path.strip_prefix(GRADIENT_PREFIX) {
+        let mut lists = rest.split(';').map(numbers);
+        let made = (|| {
+            let head = lists.next()??;
+            let stops: Option<Vec<([f64; 4], f64)>> = lists.map(|stop| stop.filter(|s| s.len() == 5).map(|s| (rgba(&s), s[4]))).collect();
+            let point = |x: f64, y: f64| Point { x, y };
+            (head.len() == 6).then_some(())?;
+            graphics::gradient_picture((head[0], head[1]), point(head[2], head[3]), point(head[4], head[5]), &stops?, scale)
+        })();
+        return Some(made);
+    }
+    if let Some(rest) = path.strip_prefix(SHAPE_PREFIX) {
+        let mut lists = rest.split(';').map(numbers);
+        let made = (|| {
+            let n = lists.next()??;
+            (n.len() == 14).then_some(())?;
+            let figures: Option<Vec<Vec<Point>>> = lists.map(|figure| figure.map(|f| f.chunks_exact(2).map(|p| Point { x: p[0], y: p[1] }).collect())).collect();
+            let (fill, stroke) = (rgba(&n[5..9]), rgba(&n[9..13]));
+            let stroke = (stroke[3] > 0.0 && n[13] > 0.0).then_some((stroke, n[13]));
+            graphics::shape_picture(Rect::new(n[0], n[1], n[2], n[3]), &figures?, (fill[3] > 0.0).then_some(fill), n[4] != 0.0, stroke, scale)
+        })();
+        return Some(made);
+    }
+    None
+}
+
+/// The path standing for a box of `size` points with corners rounded by
+/// `radius`: filled with `fill`, and a border of a colour and width inside its edge.
+fn box_path(size: (f64, f64), radius: f64, fill: [f64; 4], border: Option<([f64; 4], f64)>) -> String {
+    let ([r, g, b, a], width) = border.unwrap_or(([0.0; 4], 0.0));
+    format!("{BOX_PREFIX}{},{},{radius},{},{},{},{},{r},{g},{b},{a},{width}", size.0, size.1, fill[0], fill[1], fill[2], fill[3])
+}
+
 /// Stands for a UIImage in a snapshot's picture path until `resolve`.
 const IMAGE_PREFIX: &str = "\u{1}uiimage:";
 
@@ -467,12 +817,17 @@ fn pixels_per_point() -> f64 {
 fn resolve(pictures: Vec<Picture>) -> Vec<Picture> {
     // All the screen's text at once, so none of its files is let go.
     let looks: Vec<&crate::fw::graphics::TextLook> = pictures.iter().filter_map(|p| p.text.as_ref()).collect();
-    let mut text_files = crate::fw::graphics::text_pictures(&looks, pixels_per_point()).into_iter();
+    let scale = pixels_per_point();
+    let mut text_files = crate::fw::graphics::text_pictures(&looks, scale).into_iter();
     pictures
         .into_iter()
         .filter_map(|mut p| {
             if p.text.is_some() {
                 p.path = text_files.next()??;
+                return Some(p);
+            }
+            if let Some(file) = drawn_file(&p.path, scale) {
+                p.path = file?;
                 return Some(p);
             }
             if let Some(color) = p.path.strip_prefix(COLOR_PREFIX) {
@@ -558,7 +913,40 @@ pub fn encode(screen: (f64, f64), pictures: &[Picture]) -> String {
 /// Every window's pictures, back to front, with files to draw them from
 /// (made for all windows at once, so no window's text files are let go).
 fn screen_pictures(windows: &[Id], classes: &Classes) -> Vec<Picture> {
-    resolve(windows.iter().flat_map(|&window| flatten(&snapshot(window, classes, 0))).collect())
+    compose_groups(resolve(windows.iter().flat_map(|&window| flatten(&snapshot(window, classes, 0))).collect()))
+}
+
+/// Draws each group of pictures together, innermost first (see `Group`),
+/// so the list holds only pictures to show.
+fn compose_groups(pictures: Vec<Picture>) -> Vec<Picture> {
+    let is_mark = |p: &Picture| [GROUP_MARK, MASK_MARK, END_MARK].contains(&p.path.as_str());
+    if !pictures.iter().any(is_mark) {
+        return pictures;
+    }
+    let scale = pixels_per_point();
+    let mut out: Vec<Picture> = Vec::new();
+    let mut starts = Vec::new();
+    for p in pictures {
+        if p.path == GROUP_MARK {
+            starts.push(out.len());
+            out.push(p);
+        } else if p.path == END_MARK {
+            // Inner groups are drawn already: a mark left inside is this group's mask.
+            let Some(at) = starts.pop() else { continue };
+            let mut content = out.split_off(at + 1);
+            let start = out.pop().expect("the group's mark");
+            let mask = match content.iter().position(|q| q.path == MASK_MARK) {
+                Some(i) => content.split_off(i).split_off(1),
+                None => Vec::new(),
+            };
+            out.extend(crate::fw::graphics::group_pictures(&start, &content, &mask, scale));
+        } else {
+            out.push(p);
+        }
+    }
+    // Marks of groups a covering view (video, GL) cut short.
+    out.retain(|p| !is_mark(p));
+    out
 }
 
 /// Lines to log once the screen has drawn what they are about: tests tap on
@@ -1202,5 +1590,144 @@ mod tests {
             ]
         );
         assert!(encode((960.0, 540.0), &pictures[2..3]).ends_with("\t130\t100\t20\t30\tdeep.png\n"));
+    }
+
+    /// A window does not clip what it holds, the screen does: a game's
+    /// 320x480 window on a 568x320 screen still shows the right side of its
+    /// 568x320 views (as on an iPhone 5, where only touches miss there).
+    #[test]
+    fn windows_do_not_clip_what_they_hold() {
+        let small = Node { alpha: 1.0, frame: rect(0.0, 0.0, 320.0, 480.0), children: vec![view(rect(0.0, 0.0, 568.0, 320.0), Some("menu.png"), vec![])], ..Default::default() };
+        let pictures = flatten(&small);
+        let (wide, high, _) = crate::fw::uikit::screen_points();
+        assert_eq!(pictures[0].clip, rect(0.0, 0.0, wide.max(320.0), high.max(480.0)));
+    }
+
+    /// A new layer of a Core Animation class with a frame.
+    fn new_layer(class: &str, frame: Rect) -> Id {
+        let layer = runtime::send(runtime::send(runtime::class_named(class), "alloc", &[]), "init", &[]);
+        send_struct(layer, "setFrame:", frame);
+        layer
+    }
+
+    /// Layers show on screen as Core Animation draws them: the shadow under
+    /// everything, then the background (round corners), the contents, the
+    /// sublayers (one put at index 0 behind the view's subviews, a higher
+    /// zPosition in front, hidden ones not at all, opacity multiplied), and
+    /// the border on top.
+    #[test]
+    fn layers_draw_in_core_animation_order() {
+        setup();
+        let rgba = crate::fw::graphics::make_color;
+        let (red, green, blue, yellow, white) = ([1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0], [1.0, 1.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]);
+        let window = new_view("UIWindow", rect(0.0, 0.0, 480.0, 320.0));
+        let panel = new_view("UIView", rect(10.0, 20.0, 100.0, 50.0));
+        runtime::send(window, "addSubview:", &[panel]);
+        let child = new_view("UIView", rect(0.0, 0.0, 10.0, 10.0));
+        runtime::send(child, "setBackgroundColor:", &[rgba(blue)]);
+        runtime::send(panel, "addSubview:", &[child]);
+        let host = runtime::send(panel, "layer", &[]);
+        runtime::send(host, "setBackgroundColor:", &[rgba(red)]);
+        send_struct(host, "setCornerRadius:", 8.0f64);
+        send_struct(host, "setBorderWidth:", 2.0f64);
+        runtime::send(host, "setBorderColor:", &[rgba(green)]);
+        send_struct(host, "setShadowOpacity:", 0.5f32);
+        let under = new_layer("CALayer", rect(0.0, 0.0, 100.0, 50.0));
+        runtime::send(under, "setBackgroundColor:", &[rgba(yellow)]);
+        runtime::send(host, "insertSublayer:atIndex:", &[under, 0]);
+        let front = new_layer("CALayer", rect(0.0, 0.0, 5.0, 5.0));
+        runtime::send(front, "setBackgroundColor:", &[rgba(white)]);
+        send_struct(front, "setZPosition:", 1.0f64);
+        runtime::send(host, "addSublayer:", &[front]);
+        let over = new_layer("CALayer", rect(5.0, 5.0, 20.0, 10.0));
+        let bitmap = crate::fw::graphics::Bitmap { width: 2, height: 1, bits_per_pixel: 32, bytes_per_row: 8, info: crate::fw::graphics::ALPHA_LAST, space: crate::fw::graphics::Space::Rgb, data: vec![255; 8] };
+        runtime::send(over, "setContents:", &[crate::fw::graphics::make_image(bitmap)]);
+        send_struct(over, "setOpacity:", 0.5f32);
+        runtime::send(host, "addSublayer:", &[over]);
+        let hidden = new_layer("CALayer", rect(0.0, 0.0, 5.0, 5.0));
+        runtime::send(hidden, "setBackgroundColor:", &[rgba(white)]);
+        runtime::send(hidden, "setHidden:", &[1]);
+        runtime::send(host, "addSublayer:", &[hidden]);
+        let pictures = flatten(&snapshot(window, &Classes::find(), 0));
+        let kinds: Vec<String> = pictures.iter().map(|p| if p.path.starts_with(CG_IMAGE_PREFIX) { CG_IMAGE_PREFIX.into() } else { p.path.clone() }).collect();
+        let size = (100.0, 50.0);
+        assert_eq!(
+            kinds,
+            [
+                GROUP_MARK.to_string(),
+                box_path(size, 8.0, red, None),
+                color_path(yellow),
+                color_path(blue),
+                CG_IMAGE_PREFIX.into(),
+                color_path(white),
+                box_path(size, 8.0, [0.0; 4], Some((green, 2.0))),
+                END_MARK.into(),
+            ]
+        );
+        let shadow = pictures[0].group.as_ref().and_then(|g| g.shadow.clone());
+        assert_eq!(shadow, Some(Shadow { color: [0.0, 0.0, 0.0, 0.5], radius: 3.0, offset: (0.0, -3.0), path: None }), "Core Animation's defaults");
+        let contents = &pictures[4];
+        assert_eq!((at(contents, 0.0, 0.0), contents.area, contents.alpha), ((15.0, 25.0), (20.0, 10.0), 0.5));
+    }
+
+    /// Round corners that clip, masks and shadows are drawn into pictures:
+    /// what the corners, the bounds or the mask's clear part cut away is
+    /// clear, and the shadow lies under the layer, moved by its offset.
+    #[test]
+    fn clipped_masked_and_shadowed_layers_become_pictures() {
+        setup();
+        let _files = TEXT_FILES.lock().unwrap_or_else(|e| e.into_inner());
+        let rgba = crate::fw::graphics::make_color;
+        let (red, blue, black) = ([1.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 0.0, 1.0]);
+        let window = new_view("UIWindow", rect(0.0, 0.0, 200.0, 200.0));
+        let host = runtime::send(window, "layer", &[]);
+        let round = new_layer("CALayer", rect(10.0, 10.0, 40.0, 40.0));
+        runtime::send(round, "setBackgroundColor:", &[rgba(red)]);
+        send_struct(round, "setCornerRadius:", 20.0f64);
+        runtime::send(round, "setMasksToBounds:", &[1]);
+        let inside = new_layer("CALayer", rect(-10.0, -10.0, 60.0, 60.0));
+        runtime::send(inside, "setBackgroundColor:", &[rgba(blue)]);
+        runtime::send(round, "addSublayer:", &[inside]);
+        let masked = new_layer("CALayer", rect(100.0, 10.0, 40.0, 40.0));
+        runtime::send(masked, "setBackgroundColor:", &[rgba(red)]);
+        let mask = new_layer("CALayer", rect(0.0, 0.0, 20.0, 40.0));
+        runtime::send(mask, "setBackgroundColor:", &[rgba(black)]);
+        runtime::send(masked, "setMask:", &[mask]);
+        let shadowed = new_layer("CALayer", rect(10.0, 100.0, 40.0, 40.0));
+        runtime::send(shadowed, "setBackgroundColor:", &[rgba(red)]);
+        send_struct(shadowed, "setShadowOpacity:", 1.0f32);
+        send_struct(shadowed, "setShadowRadius:", 0.0f64);
+        send_struct(shadowed, "setShadowOffset:", Size { width: 10.0, height: 10.0 });
+        for layer in [round, masked, shadowed] {
+            runtime::send(host, "addSublayer:", &[layer]);
+        }
+        let pictures = screen_pictures(&[window], &Classes::find());
+        assert!(pictures.iter().all(|p| !p.path.starts_with('\u{1}')), "every picture has its file: {pictures:?}");
+        // The colour of the topmost picture not clear at a screen point.
+        let seen = |x: f64, y: f64| -> [u8; 4] {
+            for p in pictures.iter().rev() {
+                let Some(back) = crate::fw::geometry::invert(p.place) else { continue };
+                let (u, v) = crate::fw::geometry::apply(back, x, y);
+                if !(0.0..p.area.0).contains(&u) || !(0.0..p.area.1).contains(&v) {
+                    continue;
+                }
+                let (bitmap, _) = crate::fw::graphics::decode(&std::fs::read(&p.path).unwrap()).unwrap();
+                let (px, py) = ((u / p.area.0 * bitmap.width as f64) as usize, (v / p.area.1 * bitmap.height as f64) as usize);
+                let at = py * bitmap.bytes_per_row + px * 4;
+                let pixel: [u8; 4] = bitmap.data[at..at + 4].try_into().unwrap();
+                if pixel[3] > 0 {
+                    return pixel;
+                }
+            }
+            [0; 4]
+        };
+        assert_eq!(seen(30.0, 30.0), [0, 0, 255, 255], "the sublayer inside the round layer");
+        assert_eq!(seen(13.0, 13.0), [0; 4], "cut by the round corner");
+        assert_eq!(seen(5.0, 30.0), [0; 4], "cut at the bounds");
+        assert_eq!(seen(110.0, 30.0), [255, 0, 0, 255], "the mask lets it show");
+        assert_eq!(seen(130.0, 30.0), [0; 4], "the mask is clear there");
+        assert_eq!(seen(30.0, 120.0), [255, 0, 0, 255]);
+        assert_eq!(seen(55.0, 145.0), [0, 0, 0, 255], "the shadow, 10 points right and down");
+        assert_eq!(seen(15.0, 145.0), [0; 4], "no shadow where it was moved away from");
     }
 }

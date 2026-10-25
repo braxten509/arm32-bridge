@@ -907,22 +907,33 @@ pub fn path_oval(path: Id, rect: Rect) {
 
 /// A rectangle with round corners (the radius at most half the shorter side).
 pub fn path_rounded_rect(path: Id, rect: Rect, radius: f64) {
-    let rect = standard(rect);
-    let r = radius.max(0.0).min(rect.size.width / 2.0).min(rect.size.height / 2.0);
-    let (x0, y0, x1, y1) = (rect.origin.x, rect.origin.y, rect.origin.x + rect.size.width, rect.origin.y + rect.size.height);
-    let half = std::f64::consts::FRAC_PI_2;
-    edit(path, |o| {
-        o.move_to((x0 + r, y0));
-        o.line_to((x1 - r, y0));
-        o.arc((x1 - r, y0 + r), r, -half, 0.0, false, &|p| p);
-        o.line_to((x1, y1 - r));
-        o.arc((x1 - r, y1 - r), r, 0.0, half, false, &|p| p);
-        o.line_to((x0 + r, y1));
-        o.arc((x0 + r, y1 - r), r, half, 2.0 * half, false, &|p| p);
-        o.line_to((x0, y0 + r));
-        o.arc((x0 + r, y0 + r), r, 2.0 * half, 3.0 * half, false, &|p| p);
-        o.close();
-    });
+    edit(path, |o| o.rounded_rect(rect, radius, &|p| p));
+}
+
+impl Outline {
+    /// Adds a rectangle with round corners (the radius at most half the
+    /// shorter side), its points passed through `map`.
+    pub(super) fn rounded_rect(&mut self, rect: Rect, radius: f64, map: &dyn Fn((f64, f64)) -> (f64, f64)) {
+        let rect = standard(rect);
+        let r = radius.max(0.0).min(rect.size.width / 2.0).min(rect.size.height / 2.0);
+        let (x0, y0, x1, y1) = (rect.origin.x, rect.origin.y, rect.origin.x + rect.size.width, rect.origin.y + rect.size.height);
+        let half = std::f64::consts::FRAC_PI_2;
+        self.move_to(map((x0 + r, y0)));
+        self.line_to(map((x1 - r, y0)));
+        self.arc((x1 - r, y0 + r), r, -half, 0.0, false, map);
+        self.line_to(map((x1, y1 - r)));
+        self.arc((x1 - r, y1 - r), r, 0.0, half, false, map);
+        self.line_to(map((x0 + r, y1)));
+        self.arc((x0 + r, y1 - r), r, half, 2.0 * half, false, map);
+        self.line_to(map((x0, y0 + r)));
+        self.arc((x0 + r, y0 + r), r, 2.0 * half, 3.0 * half, false, map);
+        self.close();
+    }
+
+    /// How much (0..1) of each device pixel (rows from the bottom) the filled shape covers.
+    pub(super) fn cover(&self, even_odd: bool, width: usize, height: usize) -> Vec<f32> {
+        coverage(&self.edges(), even_odd, width, height).into_iter().map(|v| v.min(1.0)).collect()
+    }
 }
 
 pub fn path_current(path: Id) -> Option<Point> {

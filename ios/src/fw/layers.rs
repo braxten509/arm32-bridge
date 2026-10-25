@@ -5,11 +5,11 @@
 //! A view's layer is the view's other face, as in UIKit: its bounds,
 //! position (the view's center), frame, transform, opacity (alpha), hidden
 //! and background colour are the view's. A layer of its own (made by the
-//! game) keeps them itself. Only views are drawn on screen (fw/pictures.rs),
-//! with their layer's anchor point, z order and animations (fw/animation.rs);
-//! layers of their own are kept, and drawn by -renderInContext:.
+//! game) keeps them itself. Views and layers are drawn on screen by
+//! fw/pictures.rs (with their animations, fw/animation.rs) and into
+//! contexts by -renderInContext: (fw/graphics/render.rs).
 
-use crate::fw::geometry::{Point, Rect, Size, Transform, Transform3D, IDENTITY_3D};
+use crate::fw::geometry::{apply, concat, invert, Point, Rect, Size, Transform, Transform3D, IDENTITY, IDENTITY_3D};
 use crate::fw::object::{class_methods, define_class, methods};
 use crate::fw::uikit::{property_get, property_set, property_set_object, view_state};
 use crate::fw::{collections, string};
@@ -27,6 +27,11 @@ struct LayerState {
     transform: Transform3D,
     superlayer: Id,
     sublayers: Vec<Id>,
+    /// In a view's layer: the subview this layer is drawn just above (0: under
+    /// every subview). On Apple a view's layer keeps its subviews' layers and
+    /// the game's in one list; here subviews are the view's, so this says
+    /// where among them the game put it.
+    above: Id,
     /// CAMediaTiming: the layer's own time is (parent time - begin) * speed + offset.
     begin: f64,
     speed: f64,
@@ -45,6 +50,7 @@ impl Default for LayerState {
             transform: IDENTITY_3D,
             superlayer: 0,
             sublayers: Vec::new(),
+            above: 0,
             begin: 0.0,
             speed: 1.0,
             offset: 0.0,
@@ -280,33 +286,57 @@ extern "C" fn layer_visible_rect(this: Id, _: Sel) -> Rect {
     bounds(this)
 }
 
-/// A point in `other`'s own space (nil: the window's) to this layer's: both
-/// through the window, by frames and bounds origins.
-fn origin_in_root(layer: Id) -> Point {
-    let mut point = Point::default();
+/// One layer's space to its superlayer's: bounds origin, transform around
+/// the anchor point, position (a view's layer: its view's geometry).
+pub fn to_parent(layer: Id) -> Transform {
+    if let view @ 1.. = view_of(layer) {
+        return crate::fw::touch::view_step(view);
+    }
+    read(layer, |s| {
+        let (ax, ay) = (s.bounds.size.width * s.anchor.x, s.bounds.size.height * s.anchor.y);
+        let to_anchor = Transform { tx: -(s.bounds.origin.x + ax), ty: -(s.bounds.origin.y + ay), ..IDENTITY };
+        let to_parent = Transform { tx: s.position.x, ty: s.position.y, ..IDENTITY };
+        concat(concat(to_anchor, affine_of(s.transform)), to_parent)
+    })
+}
+
+/// A layer's space to its root layer's (the window's for views' layers).
+pub fn to_root(layer: Id) -> Transform {
+    let mut t = IDENTITY;
     let mut current = layer;
-    for _ in 0..64 {
+    for _ in 0..256 {
         let parent = parent_of(current);
         if current == 0 || parent == 0 {
             break;
         }
-        let (f, b) = (frame(current), bounds(current));
-        point.x += f.origin.x - b.origin.x;
-        point.y += f.origin.y - b.origin.y;
+        t = concat(t, to_parent(current));
         current = parent;
     }
-    point
+    t
+}
+
+/// From `from`'s space to `to`'s, through their root (nil: the root's own space).
+fn conversion(from: Id, to: Id) -> Transform {
+    let root = |layer: Id| if layer == 0 { IDENTITY } else { to_root(layer) };
+    concat(root(from), invert(root(to)).unwrap_or(IDENTITY))
 }
 
 extern "C" fn layer_convert_point_from(this: Id, _: Sel, point: Point, other: Id) -> Point {
-    let (from, to) = (if other == 0 { Point::default() } else { origin_in_root(other) }, origin_in_root(this));
-    Point { x: point.x + from.x - to.x, y: point.y + from.y - to.y }
+    let (x, y) = apply(conversion(other, this), point.x, point.y);
+    Point { x, y }
 }
 
-extern "C" fn layer_convert_point_to(this: Id, s: Sel, point: Point, other: Id) -> Point {
-    let (from, to) = (origin_in_root(this), if other == 0 { Point::default() } else { origin_in_root(other) });
-    let _ = s;
-    Point { x: point.x + from.x - to.x, y: point.y + from.y - to.y }
+extern "C" fn layer_convert_point_to(this: Id, _: Sel, point: Point, other: Id) -> Point {
+    let (x, y) = apply(conversion(this, other), point.x, point.y);
+    Point { x, y }
+}
+
+extern "C" fn layer_convert_rect_from(this: Id, _: Sel, rect: Rect, other: Id) -> Rect {
+    crate::fw::uikit::convert_rect(conversion(other, this), rect)
+}
+
+extern "C" fn layer_convert_rect_to(this: Id, _: Sel, rect: Rect, other: Id) -> Rect {
+    crate::fw::uikit::convert_rect(conversion(this, other), rect)
 }
 
 // ----- hierarchy -----
@@ -330,6 +360,66 @@ fn detach(layer: Id) {
     }
 }
 
+/// Something drawn inside a layer: a subview (its layer) or a layer the game added.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Child {
+    View(Id),
+    Layer(Id),
+}
+
+/// What is drawn inside `layer`, back to front before zPosition: a view's
+/// layer has its subviews, with the game's layers among them where they
+/// were put (as Apple's one list of sublayers has them).
+pub fn children(layer: Id) -> Vec<Child> {
+    match view_of(layer) {
+        0 => sublayers_of(layer).into_iter().map(Child::Layer).collect(),
+        view => view_children(view, layer),
+    }
+}
+
+/// `children` of a view's layer.
+pub fn view_children(view: Id, layer: Id) -> Vec<Child> {
+    let own = sublayers_of(layer);
+    let above: Vec<Id> = own.iter().map(|&l| read(l, |s| s.above)).collect();
+    let mut placed = vec![false; own.len()];
+    let mut out = Vec::new();
+    let mut put_above = |subview: Id, out: &mut Vec<Child>| {
+        for (i, &l) in own.iter().enumerate() {
+            if above[i] == subview && !placed[i] {
+                placed[i] = true;
+                out.push(Child::Layer(l));
+            }
+        }
+    };
+    put_above(0, &mut out);
+    for subview in view_state(view).subviews.clone() {
+        out.push(Child::View(subview));
+        put_above(subview, &mut out);
+    }
+    // Above a subview that has gone: where it was is unknown, so on top.
+    out.extend(own.iter().zip(&placed).filter(|(_, &p)| !p).map(|(&l, _)| Child::Layer(l)));
+    out
+}
+
+/// Where a layer put at `index` of `parent`'s whole list (`children`) goes:
+/// the subview it is just above and its place in the parent's own sublayers.
+fn place_at(parent: Id, index: usize) -> (Id, usize) {
+    let order = children(parent);
+    let own = sublayers_of(parent);
+    match order.get(index.min(order.len()).wrapping_sub(1)) {
+        None => (0, 0),
+        Some(&Child::View(subview)) => (subview, own.iter().position(|&l| read(l, |s| s.above) == subview).unwrap_or(own.len())),
+        Some(&Child::Layer(before)) => (read(before, |s| s.above), own.iter().position(|&l| l == before).map_or(own.len(), |i| i + 1)),
+    }
+}
+
+/// Where `sibling` is in `parent`'s whole list: one of its layers or a subview's.
+fn index_of(parent: Id, sibling: Id) -> Option<usize> {
+    let view = view_of(sibling);
+    children(parent).iter().position(|&child| child == Child::Layer(sibling) || (view != 0 && child == Child::View(view)))
+}
+
+/// Puts `layer` in `parent` at `index` of its whole list (`children`; None: on top).
 fn attach(parent: Id, layer: Id, index: Option<usize>) {
     if parent == 0 || layer == 0 || parent == layer {
         return;
@@ -338,13 +428,22 @@ fn attach(parent: Id, layer: Id, index: Option<usize>) {
     runtime::send(layer, "retain", &[]);
     let old = read(layer, |s| s.superlayer);
     detach(layer);
-    with(parent, |s| match index {
-        Some(i) => s.sublayers.insert(i.min(s.sublayers.len()), layer),
-        None => s.sublayers.push(layer),
-    });
-    with(layer, |s| s.superlayer = parent);
+    let (above, at) = match index {
+        Some(i) => place_at(parent, i),
+        None => (view_state_of_layer(parent).and_then(|subviews| subviews.last().copied()).unwrap_or(0), usize::MAX),
+    };
+    with(parent, |s| s.sublayers.insert(at.min(s.sublayers.len()), layer));
+    with(layer, |s| (s.superlayer, s.above) = (parent, above));
     if old != 0 {
         runtime::send(layer, "release", &[]);
+    }
+}
+
+/// A view's layer's subviews (None for a layer of its own).
+fn view_state_of_layer(layer: Id) -> Option<Vec<Id>> {
+    match view_of(layer) {
+        0 => None,
+        view => Some(view_state(view).subviews.clone()),
     }
 }
 
@@ -380,19 +479,22 @@ extern "C" fn layer_insert_at(this: Id, _: Sel, layer: Id, index: u32) {
 }
 
 extern "C" fn layer_insert_above(this: Id, _: Sel, layer: Id, sibling: Id) {
-    let at = sublayers_of(this).iter().position(|&l| l == sibling).map(|i| i + 1);
+    let at = index_of(this, sibling).map(|i| i + 1);
     attach(this, layer, at);
 }
 
 extern "C" fn layer_insert_below(this: Id, _: Sel, layer: Id, sibling: Id) {
-    let at = sublayers_of(this).iter().position(|&l| l == sibling);
+    let at = index_of(this, sibling);
     attach(this, layer, at);
 }
 
 extern "C" fn layer_replace_sublayer(this: Id, _: Sel, old: Id, new: Id) {
-    let Some(at) = sublayers_of(this).iter().position(|&l| l == old) else { return };
+    if !sublayers_of(this).contains(&old) {
+        return;
+    }
+    let at = index_of(this, old);
     detach(old);
-    attach(this, new, Some(at));
+    attach(this, new, at);
     runtime::send(old, "release", &[]);
 }
 
@@ -479,6 +581,7 @@ crate::fw::uikit::property!(layer_rasterization_scale, layer_set_rasterization_s
 crate::fw::uikit::property!(layer_mask, layer_set_mask, "mask", id, 0);
 crate::fw::uikit::property!(layer_contents, layer_set_contents, "contents", id, 0);
 crate::fw::uikit::property!(layer_contents_gravity, layer_set_contents_gravity, "contentsGravity", id, 0);
+crate::fw::uikit::property!(layer_contents_scale, layer_set_contents_scale, "contentsScale", f64, 1.0);
 crate::fw::uikit::property!(layer_name, layer_set_name, "name", id, 0);
 crate::fw::uikit::property!(layer_double_sided, layer_set_double_sided, "doubleSided", bool, true);
 crate::fw::uikit::property!(layer_bounds_redraw, layer_set_bounds_redraw, "needsDisplayOnBoundsChange", bool, false);
@@ -531,6 +634,46 @@ pub fn background(layer: Id) -> Id {
 
 pub fn contents(layer: Id) -> Id {
     layer_contents(layer, 0)
+}
+
+/// contentsGravity's name ("resize" until the game sets one).
+pub fn contents_gravity(layer: Id) -> String {
+    match layer_contents_gravity(layer, 0) {
+        0 => "resize".into(),
+        name => string::get(name),
+    }
+}
+
+pub fn contents_scale(layer: Id) -> f64 {
+    layer_contents_scale(layer, 0)
+}
+
+/// How a layer's edge and shadow look (Core Animation's defaults until set).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Looks {
+    pub corner_radius: f64,
+    /// Colour (straight) and width, when there is one to see.
+    pub border: Option<([f64; 4], f64)>,
+    /// Colour with shadowOpacity in its alpha, blur radius, offset and shadowPath (0: none).
+    pub shadow: Option<([f64; 4], f64, (f64, f64), Id)>,
+    pub mask: Id,
+}
+
+pub fn looks(layer: Id) -> Looks {
+    let rgba = |color: Id| crate::fw::graphics::color_rgba(color);
+    // Borders and shadows are opaque black until given a colour (nil: none).
+    let colour = |key: &'static str| match property_get(layer, key) {
+        None => Some([0.0, 0.0, 0.0, 1.0]),
+        Some(color) => rgba(color as Id),
+    };
+    let width = layer_border_width(layer, 0);
+    let border = colour("borderColor").filter(|c| width > 0.0 && c[3] > 0.0).map(|c| (c, width));
+    let opacity = layer_shadow_opacity(layer, 0) as f64;
+    let shadow = colour("shadowColor").map(|[r, g, b, a]| [r, g, b, a * opacity.clamp(0.0, 1.0)]).filter(|c| c[3] > 0.0).map(|c| {
+        let offset = layer_shadow_offset(layer, 0);
+        (c, layer_shadow_radius(layer, 0).max(0.0), (offset.width, offset.height), layer_shadow_path(layer, 0))
+    });
+    Looks { corner_radius: layer_corner_radius(layer, 0).max(0.0), border, shadow, mask: layer_mask(layer, 0) }
 }
 
 /// A shape layer's path, fill and stroke colours (nil for none), line width
@@ -953,6 +1096,8 @@ pub fn register() {
             ("visibleRect", layer_visible_rect as usize),
             ("convertPoint:fromLayer:", layer_convert_point_from as usize),
             ("convertPoint:toLayer:", layer_convert_point_to as usize),
+            ("convertRect:fromLayer:", layer_convert_rect_from as usize),
+            ("convertRect:toLayer:", layer_convert_rect_to as usize),
             ("superlayer", layer_superlayer as usize),
             ("sublayers", layer_sublayers as usize),
             ("setSublayers:", layer_set_sublayers as usize),
@@ -996,6 +1141,8 @@ pub fn register() {
             ("setContents:", layer_set_contents as usize),
             ("contentsGravity", layer_contents_gravity as usize),
             ("setContentsGravity:", layer_set_contents_gravity as usize),
+            ("contentsScale", layer_contents_scale as usize),
+            ("setContentsScale:", layer_set_contents_scale as usize),
             ("name", layer_name as usize),
             ("setName:", layer_set_name as usize),
             ("isDoubleSided", layer_double_sided as usize),
@@ -1106,6 +1253,36 @@ mod tests {
 
     fn call_point(object: Id, name: &str) -> Point {
         unboxed::<Point>(object, name).unwrap()
+    }
+
+    /// Layers convert points and rects through positions, anchors, bounds
+    /// origins and transforms, views' layers by their views' geometry; nil
+    /// is the root layer's space (a window's).
+    #[test]
+    fn layers_convert_points_and_rects() {
+        setup();
+        let window = runtime::send(runtime::class_named("UIWindow"), "alloc", &[]);
+        crate::fw::uikit::send_rect(window, "initWithFrame:", Rect::new(0.0, 0.0, 320.0, 480.0));
+        let view = new_view(Rect::new(10.0, 20.0, 100.0, 100.0));
+        runtime::send(window, "addSubview:", &[view]);
+        let host = runtime::send(view, "layer", &[]);
+        let own = layer_class_layer(runtime::class_named("CALayer"), 0);
+        layer_set_bounds(own, 0, Rect::new(0.0, 0.0, 10.0, 10.0));
+        layer_set_position(own, 0, Point { x: 50.0, y: 50.0 });
+        layer_add_sublayer(host, 0, own);
+        let scaled = layer_class_layer(runtime::class_named("CALayer"), 0);
+        layer_set_bounds(scaled, 0, Rect::new(0.0, 0.0, 10.0, 10.0));
+        layer_set_position(scaled, 0, Point { x: 50.0, y: 50.0 });
+        layer_set_affine_transform(scaled, 0, Transform { a: 2.0, b: 0.0, c: 0.0, d: 2.0, tx: 0.0, ty: 0.0 });
+        layer_add_sublayer(host, 0, scaled);
+        let p = |x: f64, y: f64| Point { x, y };
+        assert_eq!(layer_convert_point_to(own, 0, p(0.0, 0.0), host), p(45.0, 45.0));
+        assert_eq!(layer_convert_point_to(own, 0, p(0.0, 0.0), 0), p(55.0, 65.0), "nil: the window's layer");
+        assert_eq!(layer_convert_point_from(own, 0, p(55.0, 65.0), 0), p(0.0, 0.0));
+        assert_eq!(layer_convert_point_to(scaled, 0, p(0.0, 0.0), host), p(40.0, 40.0), "scaled around its anchor");
+        assert_eq!(layer_convert_point_from(scaled, 0, p(0.0, 0.0), own), p(2.5, 2.5));
+        assert_eq!(layer_convert_rect_to(scaled, 0, Rect::new(0.0, 0.0, 10.0, 10.0), host), Rect::new(40.0, 40.0, 20.0, 20.0));
+        assert_eq!(layer_convert_rect_from(host, 0, Rect::new(0.0, 0.0, 10.0, 10.0), own), Rect::new(45.0, 45.0, 10.0, 10.0));
     }
 
     /// A new anchor point keeps the layer's position and moves its frame;
