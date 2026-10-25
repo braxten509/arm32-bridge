@@ -809,6 +809,8 @@ pub fn register(r: &mut Registry) {
     r.data("NSLocaleLanguageCode", leak(string::make("kCFLocaleLanguageCodeKey")));
     r.data("NSLocaleCurrencyCode", leak(string::make("currency")));
     r.data("NSLocaleVariantCode", leak(string::make("kCFLocaleVariantCodeKey")));
+    r.data("NSLocaleIdentifier", leak(string::make("kCFLocaleIdentifierKey")));
+    r.data("NSLocaleScriptCode", leak(string::make("kCFLocaleScriptCodeKey")));
 }
 
 #[cfg(test)]

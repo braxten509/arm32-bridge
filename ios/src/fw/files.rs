@@ -290,6 +290,91 @@ extern "C" fn locale_object_for_key(this: Id, _: Sel, key: Id) -> Id {
     string::make(&value)
 }
 
+/// (code, English name, its own name): the languages games offer. The
+/// iPhone's full lists are Apple's locale data, which isn't here; a code
+/// not listed is named nil, as Apple names an unknown one.
+const LANGUAGE_NAMES: &[(&str, &str, &str)] = &[
+    ("ar", "Arabic", "العربية"), ("ca", "Catalan", "català"), ("cs", "Czech", "čeština"), ("da", "Danish", "dansk"),
+    ("de", "German", "Deutsch"), ("el", "Greek", "Ελληνικά"), ("en", "English", "English"), ("es", "Spanish", "español"),
+    ("fi", "Finnish", "suomi"), ("fr", "French", "français"), ("he", "Hebrew", "עברית"), ("hi", "Hindi", "हिन्दी"),
+    ("hr", "Croatian", "hrvatski"), ("hu", "Hungarian", "magyar"), ("id", "Indonesian", "Bahasa Indonesia"),
+    ("it", "Italian", "italiano"), ("ja", "Japanese", "日本語"), ("ko", "Korean", "한국어"), ("ms", "Malay", "Bahasa Melayu"),
+    ("nb", "Norwegian Bokmål", "norsk bokmål"), ("nl", "Dutch", "Nederlands"), ("no", "Norwegian", "norsk"),
+    ("pl", "Polish", "polski"), ("pt", "Portuguese", "português"), ("ro", "Romanian", "română"), ("ru", "Russian", "русский"),
+    ("sk", "Slovak", "slovenčina"), ("sv", "Swedish", "svenska"), ("th", "Thai", "ไทย"), ("tr", "Turkish", "Türkçe"),
+    ("uk", "Ukrainian", "українська"), ("vi", "Vietnamese", "Tiếng Việt"), ("zh", "Chinese", "中文"),
+];
+
+const COUNTRY_NAMES: &[(&str, &str)] = &[
+    ("AE", "United Arab Emirates"), ("AR", "Argentina"), ("AT", "Austria"), ("AU", "Australia"), ("BE", "Belgium"),
+    ("BR", "Brazil"), ("CA", "Canada"), ("CH", "Switzerland"), ("CL", "Chile"), ("CN", "China"), ("CO", "Colombia"),
+    ("CZ", "Czech Republic"), ("DE", "Germany"), ("DK", "Denmark"), ("EG", "Egypt"), ("ES", "Spain"), ("FI", "Finland"),
+    ("FR", "France"), ("GB", "United Kingdom"), ("GR", "Greece"), ("HK", "Hong Kong SAR China"), ("HU", "Hungary"),
+    ("ID", "Indonesia"), ("IE", "Ireland"), ("IL", "Israel"), ("IN", "India"), ("IT", "Italy"), ("JP", "Japan"),
+    ("KR", "South Korea"), ("MX", "Mexico"), ("MY", "Malaysia"), ("NL", "Netherlands"), ("NO", "Norway"),
+    ("NZ", "New Zealand"), ("PH", "Philippines"), ("PL", "Poland"), ("PT", "Portugal"), ("RO", "Romania"), ("RU", "Russia"),
+    ("SA", "Saudi Arabia"), ("SE", "Sweden"), ("SG", "Singapore"), ("TH", "Thailand"), ("TR", "Turkey"), ("TW", "Taiwan"),
+    ("UA", "Ukraine"), ("US", "United States"), ("VN", "Vietnam"), ("ZA", "South Africa"),
+];
+
+/// (code, English name, symbol in an English locale).
+const CURRENCY_NAMES: &[(&str, &str, &str)] = &[
+    ("AUD", "Australian Dollar", "A$"), ("BRL", "Brazilian Real", "R$"), ("CAD", "Canadian Dollar", "CA$"),
+    ("CHF", "Swiss Franc", "CHF"), ("CNY", "Chinese Yuan", "CN¥"), ("DKK", "Danish Krone", "DKK"), ("EUR", "Euro", "€"),
+    ("GBP", "British Pound", "£"), ("INR", "Indian Rupee", "₹"), ("JPY", "Japanese Yen", "¥"), ("KRW", "South Korean Won", "₩"),
+    ("MXN", "Mexican Peso", "MX$"), ("NOK", "Norwegian Krone", "NOK"), ("RUB", "Russian Ruble", "RUB"),
+    ("SEK", "Swedish Krona", "SEK"), ("USD", "US Dollar", "$"),
+];
+
+/// A language's name: its own name to a locale of that language, else English.
+fn language_name(code: &str, viewer_language: &str) -> Option<String> {
+    let &(_, english, own) = LANGUAGE_NAMES.iter().find(|(c, _, _)| *c == code)?;
+    Some(if code == viewer_language { own } else { english }.to_string())
+}
+
+fn locale_display_name(viewer: &str, key: &str, value: &str) -> Option<String> {
+    let (viewer_language, _, _) = locale_parts(viewer);
+    let currency = || CURRENCY_NAMES.iter().find(|(c, _, _)| *c == value.to_uppercase());
+    match key {
+        "kCFLocaleLanguageCodeKey" => language_name(&value.to_lowercase(), &viewer_language),
+        "kCFLocaleCountryCodeKey" => COUNTRY_NAMES.iter().find(|(c, _)| *c == value.to_uppercase()).map(|(_, n)| n.to_string()),
+        "currency" | "kCFLocaleCurrencyCodeKey" => currency().map(|(_, name, _)| name.to_string()),
+        "kCFLocaleCurrencySymbolKey" => currency().map(|(_, _, symbol)| symbol.to_string()),
+        "kCFLocaleScriptCodeKey" => match value {
+            "Hans" => Some("Simplified".into()),
+            "Hant" => Some("Traditional".into()),
+            _ => None,
+        },
+        // "French (France)", "Chinese (Simplified, China)".
+        "kCFLocaleIdentifierKey" => {
+            let (language, script, country) = locale_parts(value);
+            let mut name = language_name(&language, &viewer_language)?;
+            let extras: Vec<String> = [
+                script.map(|s| locale_display_name(viewer, "kCFLocaleScriptCodeKey", &s).unwrap_or(s)),
+                country.map(|c| locale_display_name(viewer, "kCFLocaleCountryCodeKey", &c).unwrap_or(c)),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            if !extras.is_empty() {
+                name += &format!(" ({})", extras.join(", "));
+            }
+            Some(name)
+        }
+        _ => None,
+    }
+}
+
+extern "C" fn locale_display_name_for_key(this: Id, _: Sel, key: Id, value: Id) -> Id {
+    if key == 0 || value == 0 {
+        return 0;
+    }
+    match locale_display_name(&identifier_of(this), &string::get(key), &string::get(value)) {
+        Some(name) => string::make(&name),
+        None => 0,
+    }
+}
+
 extern "C" fn locale_init_with_identifier(this: Id, _: Sel, identifier: Id) -> Id {
     let identifier = if identifier == 0 { string::make("") } else { runtime::send(identifier, "copy", &[]) };
     crate::fw::uikit::property_set_object(this, "localeIdentifier", identifier);
@@ -358,7 +443,41 @@ pub fn register(r: &mut Registry) {
         &[
             ("localeIdentifier", locale_identifier as usize),
             ("objectForKey:", locale_object_for_key as usize),
+            ("displayNameForKey:value:", locale_display_name_for_key as usize),
             ("initWithLocaleIdentifier:", locale_init_with_identifier as usize),
         ],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// -displayNameForKey:value: names codes as the iPhone does in English;
+    /// a language is named in itself by its own locale; unknown keys and
+    /// codes are nil.
+    #[test]
+    fn locales_name_languages_countries_and_currencies() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let class = runtime::class_named("NSLocale");
+        let english = runtime::send(class, "localeWithLocaleIdentifier:", &[string::make("en_US")]);
+        let name = |locale: Id, key: &str, value: &str| {
+            let result = runtime::send(locale, "displayNameForKey:value:", &[string::make(key), string::make(value)]);
+            if result == 0 { None } else { Some(string::get(result)) }
+        };
+        let some = |text: &str| Some(text.to_string());
+        assert_eq!(name(english, "kCFLocaleLanguageCodeKey", "de"), some("German"));
+        assert_eq!(name(english, "kCFLocaleCountryCodeKey", "JP"), some("Japan"));
+        assert_eq!(name(english, "kCFLocaleIdentifierKey", "fr_FR"), some("French (France)"));
+        assert_eq!(name(english, "kCFLocaleIdentifierKey", "zh-Hans"), some("Chinese (Simplified)"));
+        assert_eq!(name(english, "currency", "EUR"), some("Euro"));
+        assert_eq!(name(english, "kCFLocaleCurrencySymbolKey", "GBP"), some("£"));
+        assert_eq!(name(english, "kCFLocaleLanguageCodeKey", "xx"), None, "unknown code");
+        assert_eq!(name(english, "someOtherKey", "en"), None, "unknown key");
+        let french = runtime::send(class, "localeWithLocaleIdentifier:", &[string::make("fr")]);
+        assert_eq!(name(french, "kCFLocaleIdentifierKey", "fr"), some("français"));
+        let japanese = runtime::send(class, "localeWithLocaleIdentifier:", &[string::make("ja_JP")]);
+        assert_eq!(name(japanese, "kCFLocaleLanguageCodeKey", "ja"), some("日本語"));
+    }
 }
