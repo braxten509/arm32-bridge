@@ -103,6 +103,49 @@ fn stat_fills_darwins_layout() {
 }
 
 #[test]
+fn uname_fills_darwins_five_256_byte_fields() {
+    let names = alloc(5 * 256);
+    assert_eq!(call("uname", [names, 0, 0, 0], &[]).0, 0);
+    assert_eq!(mem().string(names), "Darwin", "sysname");
+    assert!(mem().string(names + 2 * 256).starts_with("14."), "release at 512");
+    assert!(mem().string(names + 3 * 256).starts_with("Darwin Kernel Version"), "version at 768");
+    assert_eq!(mem().string(names + 4 * 256), crate::libsystem::io::device_model(), "machine at 1024, as hw.machine");
+}
+
+#[test]
+fn scheduling_uses_darwins_policies_and_priorities() {
+    // Darwin: SCHED_OTHER 1, SCHED_RR 2, SCHED_FIFO 4; priorities 15-47 for
+    // every policy, 31 by default; struct sched_param { int priority; char opaque[4]; }.
+    for policy in [1, 2, 4] {
+        assert_eq!(call("sched_get_priority_min", [policy, 0, 0, 0], &[]).0, 15);
+        assert_eq!(call("sched_get_priority_max", [policy, 0, 0, 0], &[]).0, 47);
+    }
+    let (attributes, policy, parameters) = (alloc(40), alloc(4), alloc(8));
+    assert_eq!(call("pthread_attr_init", [attributes, 0, 0, 0], &[]).0, 0);
+    call("pthread_attr_getschedpolicy", [attributes, policy, 0, 0], &[]);
+    call("pthread_attr_getschedparam", [attributes, parameters, 0, 0], &[]);
+    assert_eq!((mem().read_u32(policy), mem().read_u32(parameters)), (1, 31), "SCHED_OTHER at 31 by default");
+    assert_eq!(call("pthread_attr_setschedpolicy", [attributes, 4, 0, 0], &[]).0, 0);
+    assert_eq!(call("pthread_attr_setschedpolicy", [attributes, 3, 0, 0], &[]).0, 22, "no policy 3: EINVAL");
+    mem().write_u32(parameters, 40);
+    assert_eq!(call("pthread_attr_setschedparam", [attributes, parameters, 0, 0], &[]).0, 0);
+    mem().write_u32(parameters, 0);
+    call("pthread_attr_getschedpolicy", [attributes, policy, 0, 0], &[]);
+    call("pthread_attr_getschedparam", [attributes, parameters, 0, 0], &[]);
+    assert_eq!((mem().read_u32(policy), mem().read_u32(parameters)), (4, 40));
+
+    let (me, _) = call("pthread_self", [0; 4], &[]);
+    assert_eq!(call("pthread_getschedparam", [me, policy, parameters, 0], &[]).0, 0);
+    assert_eq!((mem().read_u32(policy), mem().read_u32(parameters)), (1, 31), "a normal host thread");
+    mem().write_u32(parameters, 46);
+    assert_eq!(call("pthread_setschedparam", [me, 2, parameters, 0], &[]).0, 0);
+    mem().write_u32(parameters, 50);
+    assert_eq!(call("pthread_setschedparam", [me, 2, parameters, 0], &[]).0, 22, "above 47: EINVAL");
+    assert_eq!(call("pthread_getschedparam", [me, policy, parameters, 0], &[]).0, 0);
+    assert_eq!((mem().read_u32(policy), mem().read_u32(parameters)), (2, 46), "what the thread was given");
+}
+
+#[test]
 fn poll_and_ioctl_use_darwins_numbers() {
     // GNU libstdc++'s filebuf asks ioctl(FIONREAD) and poll how much it can read.
     let mut fds = [0i32; 2];

@@ -1006,6 +1006,7 @@ setTrackTintColor:	v@:@
 setTransform:	v@:{CGAffineTransform=ffffff}
 setTurnBasedMatchmakerDelegate:	v@:@
 setURL:	v@:@
+setUpdateInterval:	v@:d
 setUserInteractionEnabled:	v@:c
 setValue:	v@:f	float,ambiguous:UISlider
 setValue:forHTTPHeaderField:	v@:@@
@@ -1202,3 +1203,140 @@ isMemberOfClass:	c@:#
 retainCount	I@:
 superclass	#@:
 zone	^{_NSZone=}@:
+# Monster Life (2026-10-25, the same derivation), its Apple selectors not
+# listed above (API: EAGLContext's; without it the game took its context
+# for OpenGL ES 1). Left out: its Facebook/Twitter SDK names, and
+# sortUsingFunction:context: (a guest C function the host would call).
+albumsQuery	@@:
+API	I@:
+artistsQuery	@@:
+attitude	@@:
+attributesOfItemAtPath:error:	@@:@^@
+availableModes	@@:
+backBarButtonItem	@@:
+batteryLevel	f@:
+beginGeneratingLibraryChangeNotifications	v@:
+beginGeneratingPlaybackNotifications	v@:
+cancelAllLocalNotifications	v@:
+carrierName	@@:
+collections	@@:
+collectionWithItems:	@@:@
+contentSize	{CGSize=ff}@:
+contentView	@@:
+continueWithoutCredentialForAuthenticationChallenge:	v@:@
+createDirectoryAtURL:withIntermediateDirectories:attributes:error:	c@:@c@^@
+credentialWithUser:password:persistence:	@@:@@I
+currentPlaybackTime	d@:
+currentVersionOfItemAtURL:	@@:@
+defaultCStringEncoding	I@:
+defaultMediaLibrary	@@:
+defaultTimeZone	@@:
+deviceMotion	@@:
+displayNameForKey:value:	@@:@@
+enabledRemoteNotificationTypes	I@:
+endGeneratingDeviceOrientationNotifications	v@:
+endGeneratingLibraryChangeNotifications	v@:
+endGeneratingPlaybackNotifications	v@:
+error	@@:
+getCString:maxLength:encoding:	c@:*II
+hasAction	c@:
+hasText	c@:
+HTTPBody	@@:
+initWithBarButtonSystemItem:target:action:	@@:i@:
+initWithFileURL:	@@:@
+initWithFrame:reuseIdentifier:	@@:{CGRect={CGPoint=ff}{CGSize=ff}}@
+initWithStyle:	@@:i
+initWithStyle:reuseIdentifier:	@@:i@
+initWithTitle:delegate:cancelButtonTitle:destructiveButtonTitle:otherButtonTitles:	@@:@@@@@	nil-list
+initWithUTF8String:	@@:r*
+iPodMusicPlayer	@@:
+isEqualToData:	c@:@
+isGyroAvailable	c@:
+isMultiThreaded	c@:
+isoCountryCode	@@:
+isSourceTypeAvailable:	c@:i
+isStatusBarHidden	c@:
+isValid	c@:
+items	@@:
+leading	f@:
+modificationDate	@@:
+multiplyByInverseOfAttitude:	v@:@
+nowPlayingItem	@@:
+openWithCompletionHandler:	v@:@?
+parentViewController	@@:
+pause	v@:
+pitch	d@:
+playlistsQuery	@@:
+popNavigationItemAnimated:	@@:c
+previousFailureCount	i@:
+products	@@:
+propertyList	@@:
+pushNavigationItem:animated:	v@:@c
+quantity	i@:
+query	@@:
+registerForRemoteNotificationTypes:	v@:I
+reload	v@:
+removeAllCachedResponses	v@:
+removeObjectAtIndex:	v@:I
+removeOtherVersionsOfItemAtURL:error:	c@:@^@
+replaceObjectAtIndex:withObject:	v@:I@
+representativeItem	@@:
+resourcePath	@@:
+roll	d@:
+rootViewController	@@:
+saveToURL:forSaveOperation:completionHandler:	v@:@i@?
+screens	@@:
+scrollView	@@:
+section	i@:
+selectedRange	{_NSRange=II}@:
+setAllowsImageEditing:	v@:c
+setAnimationsEnabled:	v@:c
+setApplicationIconBadgeNumber:	v@:i
+setBody:	v@:@
+setCurrentMode:	v@:@
+setDataDetectorTypes:	v@:I
+setDataSource:	v@:@
+setDetectsPhoneNumbers:	v@:c
+setDuration:	v@:d	ambiguous:CAAnimation
+setEditable:	v@:c
+setExclusiveTouch:	v@:c
+setGyroUpdateInterval:	v@:d
+setHasAction:	v@:c
+setMediaPlaybackRequiresUserAction:	v@:c
+setQuantity:	v@:i
+setQueueWithItemCollection:	v@:@
+setQueueWithQuery:	v@:@
+setRecipients:	v@:@
+setRepeatInterval:	v@:I
+setRepeatMode:	v@:i
+setSharedURLCache:	v@:@
+setShowsCancelButton:	v@:c
+setShuffleMode:	v@:i
+setSourceType:	v@:i
+setStatusBarHidden:animated:	v@:cc
+setStatusBarOrientation:	v@:i
+setSubtype:	v@:@
+setTimeZone:	v@:@
+setType:	v@:@	ambiguous:CATransition
+setUbiquitous:itemAtURL:destinationURL:error:	c@:c@@^@
+setUserInfo:	v@:@
+sharedURLCache	@@:
+showInView:	v@:@
+size	{CGSize=ff}@:	ambiguous:UIImage
+skipToNextItem	v@:
+skipToPreviousItem	v@:
+songsQuery	@@:
+start	v@:
+startDeviceMotionUpdates	v@:
+statusCode	i@:
+stop	v@:
+subscriberCellularProvider	@@:
+titleLabel	@@:
+transform	{CGAffineTransform=ffffff}@:	ambiguous:UIView
+URLByAppendingPathComponent:isDirectory:	@@:@c
+valueForProperty:	@@:@
+writeToFile:atomically:encoding:error:	c@:@cI^@
+x	d@:	ambiguous:UIAcceleration
+y	d@:	ambiguous:UIAcceleration
+yaw	d@:
+z	d@:	ambiguous:UIAcceleration

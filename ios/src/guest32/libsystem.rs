@@ -820,6 +820,22 @@ fn process() {
         })
         .unwrap(),
     );
+    // struct utsname: five 256-byte strings (bionic's are 65 bytes), the 64-bit layer's values.
+    function(
+        "uname",
+        handler!(|uc, a| {
+            let names = a.u32();
+            for (index, text) in crate::libsystem::extra::uname_fields().iter().enumerate() {
+                let field = names + index as u32 * 256;
+                let mut bytes = [0u8; 256];
+                let count = text.len().min(255);
+                bytes[..count].copy_from_slice(&text.as_bytes()[..count]);
+                mem().write_bytes(field, &bytes);
+            }
+            Ret::U32(0)
+        })
+        .unwrap(),
+    );
     // Darwin's _SC_ numbers.
     function(
         "sysconf",
@@ -1355,10 +1371,14 @@ fn threads() {
         handler!(|uc, a| {
             let attributes = a.u32();
             mem().write_u32(attributes, ATTR_SIGNATURE);
+            mem().write_u32(attributes + ATTR_POLICY, SCHED_OTHER);
+            mem().write_u32(attributes + ATTR_PRIORITY, DEFAULT_PRIORITY);
+            mem().write_u32(attributes + ATTR_SCHED_SET, 0);
             forward(uc, bionic!("pthread_attr_init"), [attributes + 4, 0, 0, 0])
         })
         .unwrap(),
     );
+    scheduling();
     function("pthread_attr_destroy", handler!(|uc, a| Ret::U32(0)).unwrap());
     // Darwin: JOINABLE 1, DETACHED 2; bionic: 0 and 1.
     function(
@@ -1406,7 +1426,14 @@ fn threads() {
         "pthread_create",
         handler!(|uc, a| {
             let (thread, attributes, routine, argument) = (a.u32(), a.u32(), a.u32(), a.u32());
-            error_code(forward(uc, bionic!("pthread_create"), [thread, inner(attributes), routine, argument]))
+            let result = error_code(forward(uc, bionic!("pthread_create"), [thread, inner(attributes), routine, argument]));
+            if matches!(result, Ret::U32(0)) {
+                // As Apple's: settings given through the attributes are the new thread's.
+                let given = attributes != 0 && mem().read_u32(attributes + ATTR_SCHED_SET) != 0;
+                let settings = given.then(|| (mem().read_u32(attributes + ATTR_POLICY), mem().read_u32(attributes + ATTR_PRIORITY)));
+                set_thread_scheduling(mem().read_u32(thread), settings);
+            }
+            result
         })
         .unwrap(),
     );
@@ -1427,6 +1454,138 @@ fn threads() {
         function(name, handler);
     }
     function("pthread_rwlock_init", handler!(|uc, a| { let lock = a.u32(); error_code(forward(uc, bionic!("pthread_rwlock_init"), [lock + 4, 0, 0, 0])) }).unwrap());
+}
+
+// ---- scheduling: Darwin's policies (SCHED_OTHER 1, SCHED_RR 2, SCHED_FIFO 4),
+// priorities 15-47 (31 normal) for every policy, struct sched_param
+// { int sched_priority; char opaque[4]; } ----
+
+const SCHED_OTHER: u32 = 1;
+const DARWIN_POLICIES: [u32; 3] = [1, 2, 4];
+const DEFAULT_PRIORITY: u32 = 31;
+const PRIORITIES: std::ops::RangeInclusive<u32> = 15..=47;
+/// Darwin-only words of a pthread_attr_t, after bionic's 24 bytes at +4:
+/// the policy, the priority, and Apple's "schedset" (the game set them).
+const ATTR_POLICY: u32 = 28;
+const ATTR_PRIORITY: u32 = 32;
+const ATTR_SCHED_SET: u32 = 36;
+
+/// What each thread was given (pthread_setschedparam, or its attributes).
+/// Android keeps real-time policies from apps, so host threads stay as they
+/// are; games read back what they set, as on the iPhone.
+fn thread_scheduling() -> &'static Mutex<std::collections::HashMap<u32, (u32, u32)>> {
+    static SETTINGS: OnceLock<Mutex<std::collections::HashMap<u32, (u32, u32)>>> = OnceLock::new();
+    SETTINGS.get_or_init(Default::default)
+}
+
+fn set_thread_scheduling(thread: u32, settings: Option<(u32, u32)>) {
+    let mut all = thread_scheduling().lock().unwrap_or_else(|e| e.into_inner());
+    match settings {
+        Some(settings) => all.insert(thread, settings),
+        None => all.remove(&thread),
+    };
+}
+
+/// The calling host thread's policy and priority in Darwin's numbers
+/// (Linux: SCHED_OTHER 0, SCHED_FIFO 1, SCHED_RR 2 with priorities 1-99).
+fn host_scheduling() -> (u32, u32) {
+    let (mut policy, mut parameters) = (0, libc::sched_param { sched_priority: 0 });
+    if unsafe { libc::pthread_getschedparam(libc::pthread_self(), &mut policy, &mut parameters) } != 0 {
+        return (SCHED_OTHER, DEFAULT_PRIORITY);
+    }
+    let darwin = match policy {
+        libc::SCHED_FIFO => 4,
+        libc::SCHED_RR => 2,
+        _ => return (SCHED_OTHER, DEFAULT_PRIORITY),
+    };
+    let priority = parameters.sched_priority.clamp(1, 99) as u32;
+    (darwin, PRIORITIES.start() + (priority - 1) * (PRIORITIES.end() - PRIORITIES.start()) / 98)
+}
+
+/// EINVAL unless `policy` and `priority` are Darwin's.
+fn valid_scheduling(policy: u32, priority: u32) -> bool {
+    DARWIN_POLICIES.contains(&policy) && PRIORITIES.contains(&priority)
+}
+
+fn scheduling() {
+    function("sched_get_priority_min", handler!(|uc, a| Ret::U32(*PRIORITIES.start())).unwrap());
+    function("sched_get_priority_max", handler!(|uc, a| Ret::U32(*PRIORITIES.end())).unwrap());
+    // pthread_getschedparam(thread, &policy, &parameters)
+    function(
+        "pthread_getschedparam",
+        handler!(|uc, a| {
+            let (thread, policy, parameters) = (a.u32(), a.u32(), a.u32());
+            let given = thread_scheduling().lock().unwrap_or_else(|e| e.into_inner()).get(&thread).copied();
+            let is_current = matches!(forward(uc, bionic!("pthread_self"), [0; 4]), Ret::U32(me) if me == thread);
+            let (darwin_policy, priority) = given.unwrap_or_else(|| if is_current { host_scheduling() } else { (SCHED_OTHER, DEFAULT_PRIORITY) });
+            if policy != 0 {
+                mem().write_u32(policy, darwin_policy);
+            }
+            if parameters != 0 {
+                mem().write_u32(parameters, priority);
+            }
+            Ret::U32(0)
+        })
+        .unwrap(),
+    );
+    function(
+        "pthread_setschedparam",
+        handler!(|uc, a| {
+            let (thread, policy, parameters) = (a.u32(), a.u32(), a.u32());
+            let priority = mem().read_u32(parameters);
+            if !valid_scheduling(policy, priority) {
+                return Ret::U32(22);
+            }
+            set_thread_scheduling(thread, Some((policy, priority)));
+            Ret::U32(0)
+        })
+        .unwrap(),
+    );
+    function(
+        "pthread_attr_setschedpolicy",
+        handler!(|uc, a| {
+            let (attributes, policy) = (a.u32(), a.u32());
+            if !DARWIN_POLICIES.contains(&policy) {
+                return Ret::U32(22);
+            }
+            mem().write_u32(attributes + ATTR_POLICY, policy);
+            mem().write_u32(attributes + ATTR_SCHED_SET, 1);
+            Ret::U32(0)
+        })
+        .unwrap(),
+    );
+    function(
+        "pthread_attr_getschedpolicy",
+        handler!(|uc, a| {
+            let (attributes, out) = (a.u32(), a.u32());
+            mem().write_u32(out, mem().read_u32(attributes + ATTR_POLICY));
+            Ret::U32(0)
+        })
+        .unwrap(),
+    );
+    function(
+        "pthread_attr_setschedparam",
+        handler!(|uc, a| {
+            let (attributes, parameters) = (a.u32(), a.u32());
+            let priority = mem().read_u32(parameters);
+            if !PRIORITIES.contains(&priority) {
+                return Ret::U32(22);
+            }
+            mem().write_u32(attributes + ATTR_PRIORITY, priority);
+            mem().write_u32(attributes + ATTR_SCHED_SET, 1);
+            Ret::U32(0)
+        })
+        .unwrap(),
+    );
+    function(
+        "pthread_attr_getschedparam",
+        handler!(|uc, a| {
+            let (attributes, out) = (a.u32(), a.u32());
+            mem().write_u32(out, mem().read_u32(attributes + ATTR_PRIORITY));
+            Ret::U32(0)
+        })
+        .unwrap(),
+    );
 }
 
 // ---- OSAtomic, OSSpinLock ----

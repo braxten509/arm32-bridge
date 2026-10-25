@@ -230,6 +230,23 @@ const SAME_AS_STANDARD: &[(&str, &str)] = &[
     ("glWaitSyncAPPLE", "glWaitSync"),
     ("glGetInteger64vAPPLE", "glGetInteger64v"),
     ("glGetSyncivAPPLE", "glGetSynciv"),
+    // OES_framebuffer_object, OpenGL ES 1's names for framebuffers: iOS
+    // answers them in ES 2 contexts too, and older engines use them there.
+    ("glGenFramebuffersOES", "glGenFramebuffers"),
+    ("glDeleteFramebuffersOES", "glDeleteFramebuffers"),
+    ("glBindFramebufferOES", "glBindFramebuffer"),
+    ("glIsFramebufferOES", "glIsFramebuffer"),
+    ("glCheckFramebufferStatusOES", "glCheckFramebufferStatus"),
+    ("glFramebufferRenderbufferOES", "glFramebufferRenderbuffer"),
+    ("glFramebufferTexture2DOES", "glFramebufferTexture2D"),
+    ("glGetFramebufferAttachmentParameterivOES", "glGetFramebufferAttachmentParameteriv"),
+    ("glGenRenderbuffersOES", "glGenRenderbuffers"),
+    ("glDeleteRenderbuffersOES", "glDeleteRenderbuffers"),
+    ("glBindRenderbufferOES", "glBindRenderbuffer"),
+    ("glIsRenderbufferOES", "glIsRenderbuffer"),
+    ("glRenderbufferStorageOES", "glRenderbufferStorage"),
+    ("glGetRenderbufferParameterivOES", "glGetRenderbufferParameteriv"),
+    ("glGenerateMipmapOES", "glGenerateMipmap"),
 ];
 
 /// Extension functions translated in this file (beyond `SAME_AS_STANDARD`).
@@ -1080,40 +1097,63 @@ pub fn check_errors(when: &str) {
     }
 }
 
+/// Standard functions this layer has its own version of (the drawable's
+/// framebuffer, Apple's formats, shader fixes, the iPhone's answers).
+fn own_versions() -> [(&'static str, usize); 19] {
+    [
+        ("glGetString", get_string as usize),
+        ("glGetIntegerv", get_integerv as usize),
+        ("glRenderbufferStorage", renderbuffer_storage as usize),
+        ("glFramebufferRenderbuffer", framebuffer_renderbuffer as usize),
+        ("glFramebufferTexture2D", framebuffer_texture_2d as usize),
+        ("glCheckFramebufferStatus", check_framebuffer_status as usize),
+        ("glGenFramebuffers", gen_framebuffers as usize),
+        ("glDeleteFramebuffers", delete_framebuffers as usize),
+        ("glBindFramebuffer", bind_framebuffer as usize),
+        ("glTexImage2D", tex_image_2d as usize),
+        ("glTexSubImage2D", tex_sub_image_2d as usize),
+        ("glCompressedTexImage2D", compressed_tex_image_2d as usize),
+        ("glTexParameteri", tex_parameter_i as usize),
+        ("glTexParameterf", tex_parameter_f as usize),
+        ("glTexParameteriv", tex_parameter_iv as usize),
+        ("glTexParameterfv", tex_parameter_fv as usize),
+        ("glShaderSource", shader_source as usize),
+        ("glCompileShader", compile_shader as usize),
+        ("glLinkProgram", link_program as usize),
+    ]
+}
+
+/// What an extension function the same as `standard` calls: this layer's
+/// own version of `standard` if it has one, else the system's.
+fn standard_address(standard: &str) -> usize {
+    if let Some(&(_, own)) = own_versions().iter().find(|(name, _)| *name == standard) {
+        return own;
+    }
+    let found = symbol(gles_library(), standard);
+    if found != 0 {
+        found
+    } else {
+        get_proc_address(standard)
+    }
+}
+
 pub fn register(r: &mut Registry) {
     if gles_library() == 0 || egl_library() == 0 {
         crate::log!("graphics: no OpenGL ES library on this system; drawing calls will stop the run");
         return;
     }
     for (apple, standard) in SAME_AS_STANDARD {
-        let found = symbol(gles_library(), standard);
-        let found = if found != 0 { found } else { get_proc_address(standard) };
+        let found = standard_address(standard);
         if found != 0 {
             r.function(apple, found);
         }
     }
-    r.function("glGetString", get_string as usize);
-    r.function("glGetIntegerv", get_integerv as usize);
-    r.function("glRenderbufferStorage", renderbuffer_storage as usize);
-    r.function("glFramebufferRenderbuffer", framebuffer_renderbuffer as usize);
-    r.function("glFramebufferTexture2D", framebuffer_texture_2d as usize);
-    r.function("glCheckFramebufferStatus", check_framebuffer_status as usize);
-    r.function("glGenFramebuffers", gen_framebuffers as usize);
-    r.function("glDeleteFramebuffers", delete_framebuffers as usize);
-    r.function("glBindFramebuffer", bind_framebuffer as usize);
+    for (name, own) in own_versions() {
+        r.function(name, own);
+    }
     r.function("glRenderbufferStorageMultisampleAPPLE", storage_multisample_apple as usize);
     r.function("glResolveMultisampleFramebufferAPPLE", resolve_multisample_apple as usize);
     r.function("glMapBufferOES", map_buffer_oes as usize);
-    r.function("glTexImage2D", tex_image_2d as usize);
-    r.function("glTexSubImage2D", tex_sub_image_2d as usize);
-    r.function("glCompressedTexImage2D", compressed_tex_image_2d as usize);
-    r.function("glTexParameteri", tex_parameter_i as usize);
-    r.function("glTexParameterf", tex_parameter_f as usize);
-    r.function("glTexParameteriv", tex_parameter_iv as usize);
-    r.function("glTexParameterfv", tex_parameter_fv as usize);
-    r.function("glShaderSource", shader_source as usize);
-    r.function("glCompileShader", compile_shader as usize);
-    r.function("glLinkProgram", link_program as usize);
     r.function("glLabelObjectEXT", debug_label as usize);
     r.function("glGetObjectLabelEXT", debug_get_label as usize);
     r.function("glInsertEventMarkerEXT", debug_marker as usize);
@@ -1124,6 +1164,19 @@ pub fn register(r: &mut Registry) {
 #[cfg(test)]
 mod merged_tests {
     use super::*;
+
+    #[test]
+    fn extension_names_reach_this_layers_own_version_of_their_function() {
+        // glBindFramebufferOES must bind the drawable's framebuffer as
+        // glBindFramebuffer does here, not go straight to the system's.
+        assert_eq!(standard_address("glBindFramebuffer"), bind_framebuffer as usize);
+        assert_eq!(standard_address("glRenderbufferStorage"), renderbuffer_storage as usize);
+        for (extension, standard) in SAME_AS_STANDARD {
+            if let Some(&(_, own)) = own_versions().iter().find(|(name, _)| name == standard) {
+                assert_eq!(standard_address(standard), own, "{extension}");
+            }
+        }
+    }
 
     #[test]
     fn no_saved_shader_programs_like_the_iphone() {
