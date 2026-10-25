@@ -966,6 +966,27 @@ fn digest_contexts_stay_inside_apples_sizes() {
 }
 
 #[test]
+fn cccrypt_round_trips_with_32_bit_sizes() {
+    // CCCrypt(op, alg, options, key | key length, iv, in, in length, out,
+    // room, &moved): the last seven on the stack, size_t 4 bytes.
+    let (key, text, sealed, opened, moved) = (alloc(16), alloc(5), alloc(32), alloc(32), alloc(8));
+    mem().write_bytes(key, b"0123456789abcdef");
+    mem().write_bytes(text, b"hello");
+    mem().write_u32(moved + 4, 0xDEAD_BEEF);
+    let crypt = |operation: u32, input: u32, length: u32, out: u32, room: u32| {
+        call("CCCrypt", [operation, 0, 1 | 2, key], &[16, 0, input, length, out, room, moved]).0 as i32
+    };
+    assert_eq!(crypt(0, text, 5, sealed, 32), 0, "AES-128 ECB with PKCS7 padding");
+    assert_eq!(mem().read_u32(moved), 16, "one padded block");
+    assert_eq!(mem().read_u32(moved + 4), 0xDEAD_BEEF, "moved is a 4-byte size_t");
+    assert_ne!(mem().bytes(sealed, 5), b"hello");
+    assert_eq!(crypt(1, sealed, 16, opened, 32), 0);
+    assert_eq!((mem().read_u32(moved), mem().bytes(opened, 5)), (5, &b"hello"[..]));
+    assert_eq!(crypt(0, text, 5, sealed, 8), -4301, "kCCBufferTooSmall");
+    assert_eq!(mem().read_u32(moved), 16, "with the room it needs");
+}
+
+#[test]
 fn foundation_constants_have_32_bit_forms() {
     setup();
     let word = |name: &str| mem().read_u32(crate::guest32::data_address(name).unwrap_or_else(|| panic!("{name}")));

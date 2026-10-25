@@ -700,7 +700,7 @@ static CRYPT_KINDS: std::sync::Mutex<Vec<(u32, u32, u32, usize)>> = std::sync::M
 static CRYPT_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 #[allow(clippy::too_many_arguments)]
-extern "C" fn cc_crypt(
+pub(crate) extern "C" fn cc_crypt(
     operation: u32,
     algorithm: u32,
     options: u32,
