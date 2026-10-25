@@ -168,7 +168,12 @@ fn moved(x: f64, y: f64) -> Transform {
 /// The pictures under `node` (a window, at the screen's top-left), back to front.
 pub fn flatten(node: &Node) -> Vec<Picture> {
     let mut out = Vec::new();
-    walk(node, None, 1.0, Rect { origin: Point::default(), size: node.frame.size }, &mut out);
+    // A window clips nothing (its own clipsToBounds aside), the screen does:
+    // on an iPhone 5 a 320x480 window still shows its views below 480. The
+    // area reaches over the window too; past the screen the phone cuts it.
+    let (wide, high, _) = crate::fw::uikit::screen_points();
+    let area = Rect::new(0.0, 0.0, wide.max(node.frame.size.width), high.max(node.frame.size.height));
+    walk(node, None, 1.0, area, &mut out);
     out
 }
 
@@ -1585,6 +1590,17 @@ mod tests {
             ]
         );
         assert!(encode((960.0, 540.0), &pictures[2..3]).ends_with("\t130\t100\t20\t30\tdeep.png\n"));
+    }
+
+    /// A window does not clip what it holds, the screen does: a game's
+    /// 320x480 window on a 568x320 screen still shows the right side of its
+    /// 568x320 views (as on an iPhone 5, where only touches miss there).
+    #[test]
+    fn windows_do_not_clip_what_they_hold() {
+        let small = Node { alpha: 1.0, frame: rect(0.0, 0.0, 320.0, 480.0), children: vec![view(rect(0.0, 0.0, 568.0, 320.0), Some("menu.png"), vec![])], ..Default::default() };
+        let pictures = flatten(&small);
+        let (wide, high, _) = crate::fw::uikit::screen_points();
+        assert_eq!(pictures[0].clip, rect(0.0, 0.0, wide.max(320.0), high.max(480.0)));
     }
 
     /// A new layer of a Core Animation class with a frame.
