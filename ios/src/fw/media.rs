@@ -653,9 +653,13 @@ pub fn register(r: &mut Registry) {
         "MPMoviePlayerNowPlayingMovieDidChangeNotification",
         "MPMoviePlayerWillEnterFullscreenNotification",
         "MPMoviePlayerDidExitFullscreenNotification",
+        "MPMediaLibraryDidChangeNotification",
+        "MPMusicPlayerControllerNowPlayingItemDidChangeNotification",
+        "MPMusicPlayerControllerPlaybackStateDidChangeNotification",
     ] {
         r.data(name, leak(string::make(name)));
     }
+    r.data("MPMediaItemPropertyPersistentID", leak(string::make("persistentID")));
     r.function("CMTimeGetSeconds", cm_time_get_seconds as usize);
     r.data("kCMTimeZero", leak(CmTime { value: 0, timescale: 1, flags: 1, epoch: 0 }));
     r.function("AudioSessionInitialize", audio_session_initialize as usize);

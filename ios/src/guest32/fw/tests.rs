@@ -1001,6 +1001,19 @@ fn foundation_constants_have_32_bit_forms() {
     assert!(crate::fw::collections::number_as_f64(object("kCFNumberNaN")).is_nan());
     assert_eq!(object("kCFNull"), crate::objc::runtime::send(crate::objc::runtime::class_named("NSNull"), "null", &[]));
     assert_eq!(crate::fw::string::get(object("NSFileModificationDate")), "NSFileModificationDate");
+    // Read straight away by games that schedule notifications or watch the music library.
+    for name in [
+        "UILocalNotificationDefaultSoundName",
+        "UIApplicationDidChangeStatusBarFrameNotification",
+        "MPMediaLibraryDidChangeNotification",
+        "MPMusicPlayerControllerNowPlayingItemDidChangeNotification",
+        "MPMusicPlayerControllerPlaybackStateDidChangeNotification",
+    ] {
+        assert_eq!(crate::fw::string::get(object(name)), name);
+    }
+    assert_eq!(crate::fw::string::get(object("MPMediaItemPropertyPersistentID")), "persistentID");
+    let insets = crate::guest32::data_address("UIEdgeInsetsZero").expect("UIEdgeInsetsZero");
+    assert_eq!(mem().bytes(insets, 16), [0; 16], "four float zeros");
     let version = crate::guest32::data_address("kCFCoreFoundationVersionNumber").expect("kCFCoreFoundationVersionNumber");
     assert_eq!(f64::from_bits(mem().read_u64(version)), 793.0, "iOS 6.1's CoreFoundation version");
 }

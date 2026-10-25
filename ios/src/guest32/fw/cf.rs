@@ -254,7 +254,9 @@ const OBJECT_CONSTANTS: &[&str] = &[
     "SKErrorDomain", "MPMovieDurationAvailableNotification", "MPMoviePlayerContentPreloadDidFinishNotification",
     "MPMoviePlayerLoadStateDidChangeNotification", "MPMoviePlayerPlaybackDidFinishNotification",
     "MPMoviePlayerPlaybackDidFinishReasonUserInfoKey", "MPMoviePlayerPlaybackStateDidChangeNotification",
-    "MPMoviePlayerNowPlayingMovieDidChangeNotification",
+    "MPMoviePlayerNowPlayingMovieDidChangeNotification", "MPMediaLibraryDidChangeNotification",
+    "MPMusicPlayerControllerNowPlayingItemDidChangeNotification",
+    "MPMusicPlayerControllerPlaybackStateDidChangeNotification", "MPMediaItemPropertyPersistentID",
     // (Core Animation's are fw::animation::CONSTANT_NAMES, below.)
     // Foundation
     "NSDefaultRunLoopMode", "NSRunLoopCommonModes", "NSInternalInconsistencyException", "NSInvalidArgumentException",
@@ -272,6 +274,7 @@ const OBJECT_CONSTANTS: &[&str] = &[
     "UIApplicationLaunchOptionsURLKey", "UIApplicationDidReceiveMemoryWarningNotification",
     "UIApplicationWillChangeStatusBarOrientationNotification", "UIApplicationDidChangeStatusBarOrientationNotification",
     "UIApplicationStatusBarOrientationUserInfoKey", "UITrackingRunLoopMode",
+    "UIApplicationDidChangeStatusBarFrameNotification", "UILocalNotificationDefaultSoundName",
     "UIDeviceOrientationDidChangeNotification", "UIKeyboardWillShowNotification",
     "UIKeyboardDidShowNotification", "UIKeyboardWillHideNotification", "UIKeyboardDidHideNotification",
     "UIKeyboardWillChangeFrameNotification", "UIKeyboardFrameBeginUserInfoKey", "UIKeyboardFrameEndUserInfoKey",

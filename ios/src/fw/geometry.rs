@@ -408,4 +408,6 @@ pub fn register(r: &mut Registry) {
     r.data("CGRectZero", leak(Rect::default()));
     r.data("CGPointZero", leak(Point::default()));
     r.data("CGSizeZero", leak(Size::default()));
+    // UIEdgeInsets: top, left, bottom, right.
+    r.data("UIEdgeInsetsZero", leak([0.0f64; 4]));
 }

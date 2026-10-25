@@ -420,6 +420,16 @@ impl GuestStruct for Rect {
         vec![self.origin.x, self.origin.y, self.size.width, self.size.height]
     }
 }
+/// UIEdgeInsets (top, left, bottom, right).
+impl GuestStruct for [f64; 4] {
+    const FIELDS: usize = 4;
+    fn from_fields(f: &[f64]) -> [f64; 4] {
+        f.try_into().unwrap()
+    }
+    fn fields(&self) -> Vec<f64> {
+        self.to_vec()
+    }
+}
 impl GuestStruct for Transform {
     const FIELDS: usize = 6;
     fn from_fields(f: &[f64]) -> Transform {
