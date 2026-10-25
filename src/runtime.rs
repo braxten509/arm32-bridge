@@ -944,18 +944,22 @@ thread_local! {
     static HELD_SINCE: Cell<u64> = const { Cell::new(0) };
     static LOCK_WAIT_TICKS: Cell<u64> = const { Cell::new(0) };
     /// Gives this thread's engine back when the thread ends (`EngineReturn`).
-    static ENGINE_RETURN: EngineReturn = const { EngineReturn };
+    static ENGINE_RETURN: EngineReturn = const { EngineReturn(Cell::new(std::ptr::null_mut())) };
 }
 
 /// A thread the host made (a dispatch worker, a timer) that ran guest code
 /// ends without drop_engine: its engine, thread id and guest stack go back
 /// then, or every such thread would keep a stack and the guest's room for
 /// stacks would run out. (Guest threads drop theirs before this.)
-struct EngineReturn;
+/// It keeps its own copy of the engine: on Android a thread's other slots
+/// (ENGINE included) may be cleared before this runs.
+struct EngineReturn(Cell<*mut Uc>);
 
 impl Drop for EngineReturn {
     fn drop(&mut self) {
-        drop_engine();
+        let mine = self.0.replace(std::ptr::null_mut());
+        let slot = ENGINE.try_with(|e| e.replace(std::ptr::null_mut())).unwrap_or(std::ptr::null_mut());
+        release_engine(if mine.is_null() { slot } else { mine });
     }
 }
 
@@ -1431,13 +1435,26 @@ pub fn engine() -> &'static mut Uc {
     adopt_engine(&mut uc);
     let engine = Box::into_raw(uc);
     ENGINE.with(|e| e.set(engine));
-    ENGINE_RETURN.with(|_| {});
+    ENGINE_RETURN.with(|r| r.0.set(engine));
     unsafe { &mut *engine }
+}
+
+/// Test hook: forgets this thread's engine slot the way Android's thread
+/// end can (its thread-local slots may be cleared before `EngineReturn` runs).
+#[doc(hidden)]
+pub fn lose_engine_slot() {
+    ENGINE.with(|e| e.set(std::ptr::null_mut()));
 }
 
 /// Frees this thread's engine (guest threads call this when they finish).
 pub fn drop_engine() {
-    let existing = ENGINE.with(|e| e.replace(std::ptr::null_mut()));
+    let slot = ENGINE.with(|e| e.replace(std::ptr::null_mut()));
+    let kept = ENGINE_RETURN.try_with(|r| r.0.replace(std::ptr::null_mut())).unwrap_or(std::ptr::null_mut());
+    release_engine(if slot.is_null() { kept } else { slot });
+}
+
+/// Gives a finished thread's engine, thread id and guest stack back.
+fn release_engine(existing: *mut Uc) {
     if existing.is_null() {
         return;
     }

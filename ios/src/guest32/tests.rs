@@ -77,6 +77,24 @@ fn errno() -> u32 {
 }
 
 #[test]
+fn host_threads_give_their_guest_stack_back_even_when_android_clears_the_slot_first() {
+    // SpellCraft on the Pixel: every dispatch worker took a new 1 MB guest
+    // stack and none came back (Android cleared the engine slot before the
+    // thread-end hook read it), so after ~247 workers the game stopped with
+    // "out of guest stack space". More workers than there is room for must run.
+    setup();
+    for round in 0..300 {
+        let ran = std::thread::spawn(|| {
+            let _gil = runtime::hold_gil();
+            runtime::engine();
+            runtime::lose_engine_slot();
+        })
+        .join();
+        assert!(ran.is_ok(), "worker {round} could not get a guest stack");
+    }
+}
+
+#[test]
 fn doubles_take_the_next_two_words() {
     // __sincos_stret(struct*, double): the double is in r1:r2, not r2:r3.
     let out = alloc(16);
