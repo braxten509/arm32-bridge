@@ -479,6 +479,8 @@ struct TestTap {
     /// `jump=`: goes as soon as its line comes, dropping the steps still
     /// waiting before it (walks on random maps end at a screen any time).
     jump: bool,
+    /// `x,y until <text>`: the finger stays down until a log line holds the text.
+    until: Option<String>,
 }
 
 /// IOS_TAPS="on=screen shown: IntroViewController=>505,29;ready=>284,297;on=frame 1 shown=>420,250>460,250":
@@ -487,7 +489,8 @@ struct TestTap {
 /// something at that place to take it; nothing waits or counts seconds. A
 /// swipe goes from x,y to x2,y2 over about 150 ms. A `jump=` step goes the
 /// moment its line comes even while steps before it still wait (those are
-/// dropped). A step that isn't whole is left out.
+/// dropped). `x,y until <text>` holds the finger down until a log line holds
+/// the text. A step that isn't whole is left out.
 fn parse_test_taps(text: &str) -> Vec<TestTap> {
     let point = |text: &str| -> Option<Point> {
         let (x, y) = text.split_once(',')?;
@@ -504,11 +507,15 @@ fn parse_test_taps(text: &str) -> Vec<TestTap> {
                     when.strip_prefix("on=").or_else(|| when.strip_prefix("after=")).or_else(|| when.strip_prefix("jump=")).filter(|text| !text.is_empty())?.to_string(),
                 ),
             };
+            let (place, until) = match place.split_once(" until ") {
+                Some((place, line)) => (place, Some(line.trim().to_string()).filter(|line| !line.is_empty())),
+                None => (place, None),
+            };
             let (from, to) = match place.trim().split_once('>') {
                 Some((from, to)) => (point(from)?, point(to)?),
                 None => (point(place.trim())?, point(place.trim())?),
             };
-            Some(TestTap { on, from, to, jump })
+            Some(TestTap { on, from, to, jump, until })
         })
         .collect()
 }
@@ -537,14 +544,36 @@ fn arm_test_taps(taps: Vec<TestTap>, sender: fn(TestTap)) {
 /// Every log line comes here (see `report::line`): if it is the next test
 /// tap's line, the tap is sent right now, from inside the log call.
 pub fn line_logged(text: &str) {
-    if !TAPS_ARMED.load(std::sync::atomic::Ordering::Relaxed) || text.starts_with("test tap") || text.starts_with("test swipe") {
+    if !TAPS_ARMED.load(std::sync::atomic::Ordering::Relaxed) || text.starts_with("test tap") || text.starts_with("test swipe") || text.starts_with("test hold") {
         return;
+    }
+    for (finger, at) in lifted(&mut TEST_HOLDS.lock().unwrap_or_else(|e| e.into_inner()), text) {
+        crate::fw::runloop::post(crate::fw::runloop::Work::Native(Box::new(move || {
+            deliver_now(finger, Phase::Ended, at);
+            crate::fw::pictures::on_next_draw(format!("screen drawn after hold at {:.0},{:.0}", at.x, at.y));
+        })));
     }
     let tap = next_test_tap(&mut TEST_TAPS.lock().unwrap_or_else(|e| e.into_inner()), text);
     if let Some(tap) = tap {
         let sender = *TEST_TAP_SENDER.lock().unwrap_or_else(|e| e.into_inner());
         sender(tap);
     }
+}
+
+/// Fingers held down (`until`): the line that lifts each, its finger and place.
+static TEST_HOLDS: std::sync::Mutex<Vec<(String, i32, Point)>> = std::sync::Mutex::new(Vec::new());
+
+/// The held fingers this log line lifts (taken off the list).
+fn lifted(held: &mut Vec<(String, i32, Point)>, text: &str) -> Vec<(i32, Point)> {
+    let mut lifted = Vec::new();
+    held.retain(|(line, finger, at)| {
+        let lifts = text.contains(line.as_str());
+        if lifts {
+            lifted.push((*finger, *at));
+        }
+        !lifts
+    });
+    lifted
 }
 
 /// The step this log line sends: the next one if its line is this, else
@@ -596,11 +625,17 @@ fn send_test_tap(tap: TestTap) {
         Trigger::Line(line) => format!("on the line \"{line}\""),
         Trigger::Ready => "something there takes it now".to_string(),
     };
-    crate::log!("test {} at {:.0},{:.0} ({why})", if swipe { "swipe" } else { "tap" }, from.x, from.y);
     let finger = TEST_FINGER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let send = move |phase: Phase, at: Point| {
         crate::fw::runloop::post(crate::fw::runloop::Work::Native(Box::new(move || deliver_now(finger, phase, at))));
     };
+    if let Some(line) = tap.until {
+        crate::log!("test hold at {:.0},{:.0} ({why}) until \"{line}\"", from.x, from.y);
+        TEST_HOLDS.lock().unwrap_or_else(|e| e.into_inner()).push((line, finger, from));
+        send(Phase::Began, from);
+        return;
+    }
+    crate::log!("test {} at {:.0},{:.0} ({why})", if swipe { "swipe" } else { "tap" }, from.x, from.y);
     let ended = move || {
         crate::fw::runloop::post(crate::fw::runloop::Work::Native(Box::new(move || {
             deliver_now(finger, Phase::Ended, to);
@@ -985,6 +1020,20 @@ mod tests {
         assert_eq!(sent(), [(10.0, 20.0)], "the tap went out inside the log call, nothing waited");
         crate::log!("tap test: screen two");
         assert_eq!(sent(), [(10.0, 20.0), (30.0, 40.0)]);
+    }
+
+    #[test]
+    fn a_held_finger_lifts_when_its_line_is_logged() {
+        // Monster Life warms an egg while the finger stays on it.
+        let taps = parse_test_taps("on=egg shown=>290,200 until frame 660 shown;on=next=>1,2");
+        assert_eq!(taps.len(), 2, "{taps:?}");
+        assert_eq!(taps[0].until.as_deref(), Some("frame 660 shown"));
+        assert_eq!((taps[0].from, taps[0].to), (Point { x: 290.0, y: 200.0 }, Point { x: 290.0, y: 200.0 }));
+        assert_eq!(taps[1].until, None);
+        let mut held = vec![("frame 660 shown".to_string(), 7, Point { x: 290.0, y: 200.0 })];
+        assert_eq!(lifted(&mut held, "graphics: frame 630 shown"), [], "still held");
+        assert_eq!(lifted(&mut held, "graphics: frame 660 shown (640x1136)"), [(7, Point { x: 290.0, y: 200.0 })]);
+        assert!(held.is_empty());
     }
 
     #[test]

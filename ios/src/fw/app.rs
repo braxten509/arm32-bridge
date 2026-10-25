@@ -106,6 +106,24 @@ extern "C" fn ui_application_main(_argc: i32, _argv: usize, principal: Id, deleg
         };
         crate::fw::runloop::run_main_loop(Some(end));
         crate::log!("run loop time is up ({} timer calls)", crate::fw::runloop::timers_fired());
+        // Test switch IOS_HOME_AT_END: leave as through the Home button first
+        // (games save then), so a later run can start from the saved game.
+        if std::env::var_os("IOS_HOME_AT_END").is_some() {
+            crate::log!("going to the background (IOS_HOME_AT_END)");
+            std::thread::spawn(|| change_state(true));
+            let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
+            let start = t.tv_sec as f64 + t.tv_nsec as f64 / 1e9;
+            // Until the game has answered (or 30 s on a slow PC run), and at
+            // least 10 s: games often save on their next update, not in the call.
+            for step in 1..=60 {
+                crate::fw::runloop::run_main_loop(Some(start + step as f64 * 0.5));
+                if step >= 20 && settled() {
+                    break;
+                }
+            }
+            crate::log!("in the background; the game {}", if settled() { "has answered" } else { "is still answering" });
+        }
         crate::report::finish(0);
     }
     crate::log!("run loop running");
