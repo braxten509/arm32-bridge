@@ -54,7 +54,7 @@ pub fn register() {
         "CFStringGetFastestEncoding" => fn(text: Obj) -> U32;
         "CFStringGetMaximumSizeForEncoding" => fn(length: Long, encoding: U32) -> Long;
         "CFStringCreateWithBytes" => fn(allocator: Ptr, bytes: Ptr, length: Long, encoding: U32, external: Bool) -> Obj;
-        "CFStringCreateWithBytesNoCopy" => fn(allocator: Ptr, bytes: Ptr, length: Long, encoding: U32, external: Bool, deallocator: Ptr) -> Obj;
+        "CFStringCreateWithBytesNoCopy" => fn(allocator: Ptr, bytes: Ptr, length: Long, encoding: U32, external: Bool, deallocator: Obj) -> Obj;
         "NSTemporaryDirectory" => fn() -> Obj;
         "CFGetTypeID" => fn(object: Obj) -> Word;
         "CFRunLoopGetCurrent" => fn() -> Obj;

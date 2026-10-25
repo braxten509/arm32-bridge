@@ -611,9 +611,9 @@ pub fn float_constant(name: &'static str) {
 }
 
 /// Makes the host's data bytes (NSData, CFData) come from the guest heap,
-/// so the pointers to them the game is given are guest addresses. Call
-/// once guest memory is set up.
-pub fn keep_data_bytes_in_guest_memory() {
+/// so the pointers to them the game is given are guest addresses, until the
+/// answer is dropped (the session's end). Call once guest memory is set up.
+pub fn keep_data_bytes_in_guest_memory() -> crate::fw::data::HeapHeld {
     crate::fw::data::keep_bytes_in(crate::fw::data::ByteHeap {
         alloc: |size| match u32::try_from(size) {
             Ok(size) => match runtime::heap().malloc(size) {
@@ -638,7 +638,7 @@ pub fn keep_data_bytes_in_guest_memory() {
             };
             crate::log!("data: bytes {pointer:p} handed over to be freed are not a block of the game's malloc ({why}); left alone");
         },
-    });
+    })
 }
 
 /// A guest copy of the host's pointer-sized constant `name` (e.g. kCFAllocatorDefault, NULL).

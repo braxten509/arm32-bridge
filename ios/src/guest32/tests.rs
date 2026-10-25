@@ -15,8 +15,17 @@ pub(crate) fn setup() {
         let _ = runtime::set_platform(&ios32::APPLE32);
         super::register_all();
         runtime::init(false);
-        super::fw::keep_data_bytes_in_guest_memory();
     });
+}
+
+/// Data bytes come from the guest heap while the first part is held, as
+/// in a 32-bit game's run; the second keeps the tests that need it apart
+/// (it goes last).
+pub(crate) fn guest_data_bytes() -> (crate::fw::data::HeapHeld, std::sync::MutexGuard<'static, ()>) {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    setup();
+    let serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    (super::fw::keep_data_bytes_in_guest_memory(), serial)
 }
 
 pub(crate) fn alloc(size: u32) -> u32 {

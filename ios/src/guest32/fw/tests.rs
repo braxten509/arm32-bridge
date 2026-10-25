@@ -586,6 +586,7 @@ fn guest_of(host: usize) -> u32 {
 
 #[test]
 fn cf_data_bytes_live_in_guest_memory_and_follow_the_length() {
+    let _guest_bytes = crate::guest32::tests::guest_data_bytes();
     let source = alloc(5);
     mem().write_bytes(source, b"hello");
     let one = |name: &str, data: u32| call(name, [data, 0, 0, 0], &[]).0;
@@ -628,15 +629,24 @@ fn cf_data_bytes_live_in_guest_memory_and_follow_the_length() {
 fn released_data_gives_its_guest_heap_bytes_back() {
     use crate::fw::counted;
     use crate::objc::runtime::{class_named, send};
-    setup();
+    let (guest_bytes, _serial) = crate::guest32::tests::guest_data_bytes();
     const SIZE: u32 = 4 << 20;
     let arena = || runtime::heap().arena_size();
     let malloc = || runtime::heap().malloc(SIZE);
+    let text = || {
+        let block = malloc();
+        mem().write_bytes(block, b"hi");
+        block
+    };
     let live = |guest: u32| runtime::heap().not_owned(guest).is_none();
     let (data, mutable) = (class_named("NSData"), class_named("NSMutableData"));
     let before = arena();
-    // 12 rounds of 7 data of 4 MiB each: 336 MiB if nothing came back.
+    // 12 rounds of 9 blocks of 4 MiB each: 432 MiB if nothing came back.
     for _ in 0..12 {
+        // Strings over handed-over bytes take them over (default deallocator, freeWhenDone).
+        call("CFStringCreateWithBytesNoCopy", [0, text(), 2, CF_UTF8], &[0, 0]);
+        let string = send(class_named("NSString"), "alloc", &[]);
+        send(string, "initWithBytesNoCopy:length:encoding:freeWhenDone:", &[mem().host(text()) as usize, 2, 4, 1]);
         // Core Foundation from game code: Create is +1, CFRelease the last.
         let cf = call("CFDataCreateMutable", [0, SIZE, 0, 0], &[]).0;
         call("CFRelease", [cf, 0, 0, 0], &[]);
@@ -662,14 +672,22 @@ fn released_data_gives_its_guest_heap_bytes_back() {
 
     // Bytes the caller keeps are never freed: kCFAllocatorNull, freeWhenDone:NO.
     let null_allocator = mem().read_u32(crate::guest32::data_address("kCFAllocatorNull").expect("kCFAllocatorNull"));
-    let kept = malloc();
+    let kept = text();
     let borrowed = call("CFDataCreateWithBytesNoCopy", [0, kept, SIZE, null_allocator], &[]).0;
     call("CFRelease", [borrowed, 0, 0, 0], &[]);
     let pool = counted::pool_push();
     send(data, "dataWithBytesNoCopy:length:freeWhenDone:", &[mem().host(kept) as usize, 16, 0]);
     counted::pool_pop(pool);
+    let string = call("CFStringCreateWithBytesNoCopy", [0, kept, 2, CF_UTF8], &[0, null_allocator]).0;
+    assert_eq!(crate::fw::string::get(host_of(string)), "hi");
     assert!(live(kept), "the caller's bytes are still the caller's");
     runtime::heap().free(kept);
+
+    // Once the 32-bit session lets go, new bytes come from the host's heap again.
+    drop(guest_bytes);
+    let after = crate::fw::data::make(b"x");
+    let at = send(after, "bytes", &[]).wrapping_sub(mem().host(0) as usize);
+    assert!(at >> 32 != 0, "data bytes still made in guest memory");
 }
 
 #[test]

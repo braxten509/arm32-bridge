@@ -43,10 +43,32 @@ fn heap() -> ByteHeap {
     *HEAP.read().unwrap_or_else(|e| e.into_inner())
 }
 
+/// How many hold the heap choice (see [`keep_bytes_in`]).
+static HOLDERS: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+
+/// New data bytes come from the chosen heap while this is held; when the
+/// last holder lets go, from the host's again.
+#[must_use]
+pub struct HeapHeld(());
+
+impl Drop for HeapHeld {
+    fn drop(&mut self) {
+        let mut holders = HOLDERS.lock().unwrap_or_else(|e| e.into_inner());
+        *holders -= 1;
+        if *holders == 0 {
+            *HEAP.write().unwrap_or_else(|e| e.into_inner()) = HOST_HEAP;
+        }
+    }
+}
+
 /// Makes new data bytes come from `heap` (a 32-bit game's, so its 32-bit
-/// pointers reach them). Bytes made before keep their own heap.
-pub fn keep_bytes_in(heap: ByteHeap) {
+/// pointers reach them) for as long as the answer is held. Bytes made
+/// before or after keep their own heap.
+pub fn keep_bytes_in(heap: ByteHeap) -> HeapHeld {
+    let mut holders = HOLDERS.lock().unwrap_or_else(|e| e.into_inner());
+    *holders += 1;
     *HEAP.write().unwrap_or_else(|e| e.into_inner()) = heap;
+    HeapHeld(())
 }
 
 /// A data object's bytes; dropping them frees what is ours to free.

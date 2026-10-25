@@ -314,16 +314,23 @@ extern "C" fn cf_data_create_mutable(_allocator: usize, capacity: isize) -> Id {
 /// kCFAllocatorNull, kCFAllocatorMalloc, kCFAllocatorSystemDefault.
 static ALLOCATORS: std::sync::OnceLock<[Id; 3]> = std::sync::OnceLock::new();
 
-/// Reads the caller's bytes in place; the data frees them with
-/// `deallocator` when it goes. kCFAllocatorNull leaves them the caller's;
-/// CFAllocatorCreate isn't offered, so no allocator of the game's can
-/// exist and any other value is left alone too.
-extern "C" fn cf_data_create_with_bytes_no_copy(_allocator: usize, bytes: *const u8, length: isize, deallocator: Id) -> Id {
+/// Whether a contents deallocator frees with malloc's free: kCFAllocatorDefault
+/// (NULL), Malloc and SystemDefault do; kCFAllocatorNull leaves the bytes the
+/// caller's. CFAllocatorCreate isn't offered, so no allocator of the game's
+/// can exist and any other value is left alone too.
+fn allocator_frees(deallocator: Id, function: &str) -> bool {
     let [null, malloc, system] = *ALLOCATORS.get().unwrap();
     let frees = deallocator == 0 || deallocator == malloc || deallocator == system;
-    if deallocator != 0 && deallocator != null && !frees {
-        crate::log!("CFDataCreateWithBytesNoCopy: deallocator {deallocator:#x} isn't an allocator; the bytes stay the caller's");
+    if deallocator != null && !frees {
+        crate::log!("{function}: deallocator {deallocator:#x} isn't an allocator; the bytes stay the caller's");
     }
+    frees
+}
+
+/// Reads the caller's bytes in place; the data frees them with
+/// `deallocator` when it goes (see `allocator_frees`).
+extern "C" fn cf_data_create_with_bytes_no_copy(_allocator: usize, bytes: *const u8, length: isize, deallocator: Id) -> Id {
+    let frees = allocator_frees(deallocator, "CFDataCreateWithBytesNoCopy");
     crate::fw::data::make_over(bytes, length.max(0) as usize, frees.then(crate::fw::data::game_free))
 }
 
@@ -514,10 +521,15 @@ extern "C" fn cf_string_get_bytes(
     let end = (start + range.length.max(0) as usize).min(units.len());
     let room = if buffer.is_null() { usize::MAX } else { room.max(0) as usize };
     let mut out = Vec::new();
+    // An external representation starts with its byte-order mark; with no
+    // room for it, nothing is converted (as Apple's UTF-32 path does).
     if external && matches!(encoding, CF_UTF16 | CF_UTF32) {
         out.extend(if encoding == CF_UTF16 { vec![0xFF, 0xFE] } else { vec![0xFF, 0xFE, 0, 0] });
         if out.len() > room {
-            out.clear();
+            if !used.is_null() {
+                unsafe { *used = 0 };
+            }
+            return 0;
         }
     }
     let mut at = start;
@@ -544,9 +556,13 @@ extern "C" fn cf_string_get_bytes(
     (at - start) as isize
 }
 
-/// Bytes in a CF encoding as UTF-16 units; None when they aren't valid in it.
-/// A byte-order mark picks the order for plain UTF-16/32 (else little-endian).
-fn decoded(bytes: &[u8], encoding: u32) -> Option<Vec<u16>> {
+/// Bytes in a CF encoding as UTF-16 units; None when they aren't valid in
+/// it. As Apple's: plain UTF-16 that isn't an external representation is
+/// host-order units as they are (U+FEFF stays a character); external
+/// UTF-16 and plain UTF-32 read a leading byte-order mark (dropped), else
+/// are big-endian; fixed-order encodings keep U+FEFF; UTF-8 drops its
+/// mark; an odd byte or two at the end is left out.
+fn decoded(bytes: &[u8], encoding: u32, external: bool) -> Option<Vec<u16>> {
     let from_table = |high: &[u16; 128]| bytes.iter().map(|&b| if b < 0x80 { b as u16 } else { high[b as usize - 0x80] }).collect();
     let utf16 = |bytes: &[u8], big: bool| -> Vec<u16> {
         bytes.chunks_exact(2).map(|c| if big { u16::from_be_bytes([c[0], c[1]]) } else { u16::from_le_bytes([c[0], c[1]]) }).collect()
@@ -572,17 +588,18 @@ fn decoded(bytes: &[u8], encoding: u32) -> Option<Vec<u16>> {
                 c => c,
             },
         }).collect(),
+        CF_UTF16 if !external => utf16(bytes, false),
         CF_UTF16 => match bytes {
             [0xFE, 0xFF, rest @ ..] => utf16(rest, true),
             [0xFF, 0xFE, rest @ ..] => utf16(rest, false),
-            _ => utf16(bytes, false),
+            _ => utf16(bytes, true),
         },
         CF_UTF16_BE => utf16(bytes, true),
         CF_UTF16_LE => utf16(bytes, false),
         CF_UTF32 => match bytes {
             [0, 0, 0xFE, 0xFF, rest @ ..] => utf32(rest, true)?,
             [0xFF, 0xFE, 0, 0, rest @ ..] => utf32(rest, false)?,
-            _ => utf32(bytes, false)?,
+            _ => utf32(bytes, true)?,
         },
         CF_UTF32_BE => utf32(bytes, true)?,
         CF_UTF32_LE => utf32(bytes, false)?,
@@ -594,26 +611,31 @@ fn decoded(bytes: &[u8], encoding: u32) -> Option<Vec<u16>> {
 }
 
 /// A new string from bytes in a CF encoding, or NULL when they aren't valid
-/// in it. (The byte-order mark is read with or without the external flag.)
-extern "C" fn cf_string_create_with_bytes(_allocator: usize, bytes: *const u8, length: isize, encoding: u32, _external: bool) -> Id {
+/// in it (see `decoded` for the byte-order mark).
+extern "C" fn cf_string_create_with_bytes(_allocator: usize, bytes: *const u8, length: isize, encoding: u32, external: bool) -> Id {
     let bytes = if bytes.is_null() || length <= 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(bytes, length as usize) } };
-    match decoded(bytes, encoding) {
+    match decoded(bytes, encoding, external) {
         Some(units) => string::make(&String::from_utf16_lossy(&units)),
         None => 0,
     }
 }
 
-/// Copies the bytes. They belong to the string now and would be freed with
-/// the deallocator when it goes; strings here never go, so they never are.
+/// The bytes belong to the string now. It keeps a copy, so they are freed
+/// with the deallocator at once; not when the string can't be made (as on
+/// Apple), nor with kCFAllocatorNull.
 extern "C" fn cf_string_create_with_bytes_no_copy(
     allocator: usize,
     bytes: *const u8,
     length: isize,
     encoding: u32,
     external: bool,
-    _deallocator: usize,
+    deallocator: Id,
 ) -> Id {
-    cf_string_create_with_bytes(allocator, bytes, length, encoding, external)
+    let made = cf_string_create_with_bytes(allocator, bytes, length, encoding, external);
+    if made != 0 && !bytes.is_null() && allocator_frees(deallocator, "CFStringCreateWithBytesNoCopy") {
+        crate::fw::data::game_free()(bytes as *mut u8);
+    }
+    made
 }
 
 /// Core Foundation and Foundation of iOS 8.2, the version UIDevice reports.
@@ -836,6 +858,42 @@ mod tests {
         assert_eq!(cf_encoding(0x9400_0100), CF_UTF16_LE);
         assert_eq!(cf_encoding(30), CF_MAC_ROMAN);
         assert_eq!(cf_string_convert_encoding_to_ns(CF_UTF8), 4);
+    }
+
+    /// Byte-order marks as Apple's CFStringEncodings.c handles them: an
+    /// external conversion that has no room for its mark converts nothing;
+    /// plain kCFStringEncodingUTF16 bytes that aren't external keep U+FEFF,
+    /// external ones (and UTF-32 always) read the mark, else big-endian; an
+    /// odd byte at the end is dropped (`len / sizeof(UTF16Char)`).
+    #[test]
+    fn byte_order_marks_follow_apple() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let text = string::make("hi");
+        let all = CFRange { location: 0, length: 2 };
+        let mut out = [0xAAu8; 16];
+        let mut get = |encoding, room| {
+            let mut used = -1isize;
+            let converted = cf_string_get_bytes(text, all, encoding, 0, true, out.as_mut_ptr(), room, &mut used);
+            (converted, used)
+        };
+        assert_eq!(get(CF_UTF16, 1), (0, 0), "no room for the mark: nothing");
+        assert_eq!(get(CF_UTF32, 3), (0, 0));
+        assert_eq!(get(CF_UTF16, 2), (0, 2), "the mark alone");
+        assert_eq!(get(CF_UTF16, 5), (1, 4));
+        assert_eq!(&out[..4], &[0xFF, 0xFE, b'h', 0]);
+
+        let make = |bytes: &[u8], encoding: u32, external: bool| {
+            let made = cf_string_create_with_bytes(0, bytes.as_ptr(), bytes.len() as isize, encoding, external);
+            (made != 0).then(|| string::get(made))
+        };
+        assert_eq!(make(&[0xFF, 0xFE, b'h', 0], CF_UTF16, false).as_deref(), Some("\u{feff}h"), "not external: kept");
+        assert_eq!(make(&[0xFF, 0xFE, b'h', 0], CF_UTF16, true).as_deref(), Some("h"));
+        assert_eq!(make(&[0, b'h'], CF_UTF16, true).as_deref(), Some("h"), "external, no mark: big-endian");
+        assert_eq!(make(&[0xFF, 0xFE, b'h', 0], CF_UTF16_LE, true).as_deref(), Some("\u{feff}h"), "a fixed order keeps it");
+        assert_eq!(make(&[0xFF, 0xFE, 0, 0, b'h', 0, 0, 0], CF_UTF32, false).as_deref(), Some("h"));
+        assert_eq!(make(&[0, 0, 0, b'h'], CF_UTF32, false).as_deref(), Some("h"), "UTF-32, no mark: big-endian");
+        assert_eq!(make(&[b'h', 0, b'i'], CF_UTF16, false).as_deref(), Some("h"), "the odd byte is dropped");
     }
 
     /// CFStringGetBytes counts UTF-16 units in and bytes out, stops before a
