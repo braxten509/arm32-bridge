@@ -211,6 +211,10 @@ fn setting(object: Id, key: &'static str, default: isize) -> isize {
 /// Turning a recognizer off cancels what it is doing; it follows none of
 /// the fingers down then, even if turned on again.
 extern "C" fn set_enabled(this: Id, s: Sel, value: u8) {
+    on_main(|| turn_on_or_off(this, s, value))
+}
+
+fn turn_on_or_off(this: Id, s: Sel, value: u8) {
     set_enabled_raw(this, s, value);
     if value == 0 {
         if let Some(fingers) = FINGERS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
@@ -736,6 +740,22 @@ fn holding(finger: i32) -> bool {
 /// view hears it: feeds the recognizers following the finger, and says
 /// what becomes of the view's touch.
 pub fn touch_changed(view: Id, touch: Id, finger: i32, phase: Phase, point: Point) -> Verdict {
+    on_main(|| decide_touch(view, touch, finger, phase, point))
+}
+
+/// Recognizers are main-thread state, decided one change at a time. On the
+/// phone only the main thread gets here; in PC tests, where several test
+/// threads run the main loop, this takes its turn like any main-loop work,
+/// so one test's touches can't decide (or tell) another test's recognizers
+/// halfway through its steps.
+fn on_main<R>(work: impl FnOnce() -> R) -> R {
+    #[cfg(test)]
+    return runloop::as_main(work);
+    #[cfg(not(test))]
+    work()
+}
+
+fn decide_touch(view: Id, touch: Id, finger: i32, phase: Phase, point: Point) -> Verdict {
     let now = runloop::media_time();
     if phase == Phase::Began {
         let list: Vec<Id> = recognizers_for(view).into_iter().filter(|&g| may_receive(g, touch)).collect();
@@ -834,20 +854,24 @@ fn resolve() {
             RECOGNIZERS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|all| all.iter().filter(|(_, r)| r.waiting.is_some()).map(|(&id, _)| id).collect()).unwrap_or_default();
         let mut changed = false;
         for waiter in waiters {
-            let Some((others, since)) = with(waiter, |r| (r.requires.clone(), r.wait_since)) else { continue };
+            // Each step claims the waiter only if it still waits: an earlier
+            // one's action may have turned it off or failed it meanwhile.
+            let Some((others, since)) = with(waiter, |r| r.waiting.map(|_| (r.requires.clone(), r.wait_since))).flatten() else { continue };
             let beaten = others.iter().any(|&o| with(o, |r| r.recognized_at >= since).unwrap_or(false));
             let deciding = others.iter().any(|&o| enabled(o, 0) && with(o, |r| r.pending()).unwrap_or(false));
             if beaten {
-                with(waiter, |r| (r.waiting, r.state) = (None, FAILED));
-                settle(waiter);
-                changed = true;
+                if with(waiter, |r| r.waiting.take().map(|_| r.state = FAILED)).flatten().is_some() {
+                    settle(waiter);
+                    changed = true;
+                }
             } else if !deciding {
                 let now = runloop::media_time();
                 let Some((state, fingers)) = with(waiter, |r| {
-                    let state = r.waiting.take().unwrap_or(ENDED);
+                    let state = r.waiting.take()?;
                     (r.state, r.recognized_at) = (state, now);
-                    (state, r.fingers.keys().copied().collect::<Vec<i32>>())
-                }) else {
+                    Some((state, r.fingers.keys().copied().collect::<Vec<i32>>()))
+                })
+                .flatten() else {
                     continue;
                 };
                 if take_touch(waiter, &fingers) {
@@ -893,18 +917,24 @@ fn release_holds() {
 /// A multi-tap's time for its next tap ran out: it fails (UIKit's tap
 /// recognizers fail when the gap passes), which may let others go on.
 pub(crate) fn tap_gap_passed(recognizer: Id) {
-    with(recognizer, |r| {
-        if r.taps > 0 && r.fingers.is_empty() && r.waiting.is_none() {
-            r.taps = 0;
-        }
-    });
-    resolve();
+    on_main(|| {
+        with(recognizer, |r| {
+            if r.taps > 0 && r.fingers.is_empty() && r.waiting.is_none() {
+                r.taps = 0;
+            }
+        });
+        resolve();
+    })
 }
 
 /// A long press held long enough: it begins if the finger is still down
 /// and hasn't moved too far (after others it must wait for have failed),
 /// and takes the touch from the view as any recognizer does.
 pub(crate) fn held(recognizer: Id, finger: i32) {
+    on_main(|| hold_check(recognizer, finger))
+}
+
+fn hold_check(recognizer: Id, finger: i32) {
     let movement = allowed_movement(recognizer, 0);
     let now = runloop::media_time();
     let ready = with(recognizer, |r| r.state == POSSIBLE && r.waiting.is_none() && r.fingers.contains_key(&finger) && r.farthest_move() <= movement).unwrap_or(false);
@@ -1059,6 +1089,53 @@ mod tests {
         Point { x, y }
     }
 
+    /// The crossing test's log, and each recognizer's partner its action turns off.
+    static CROSS_HEARD: Mutex<Vec<Id>> = Mutex::new(Vec::new());
+    static PARTNERS: Mutex<Vec<(Id, Id)>> = Mutex::new(Vec::new());
+
+    extern "C" fn handle_cross(_this: Id, _: Sel, recognizer: Id) {
+        CROSS_HEARD.lock().unwrap().push(recognizer);
+        let partner = PARTNERS.lock().unwrap().iter().find(|pair| pair.0 == recognizer).map(|pair| pair.1);
+        if let Some(partner) = partner {
+            set_enabled(partner, 0, 0);
+        }
+    }
+
+    /// A recognizer that stops waiting while the waiters are being decided
+    /// (turned off by an earlier one's action) is not told: two single taps
+    /// waiting for one double tap, each turning the other off when told, so
+    /// only the first is told.
+    #[test]
+    fn a_waiter_that_stopped_waiting_is_not_told() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let target_class = define_class("GestureTestCrossTarget", "NSObject", 8);
+        methods(target_class, &[("handle:", handle_cross as usize)]);
+        let target = runtime::send(runtime::send(target_class, "alloc", &[]), "init", &[]);
+        let view = runtime::send(runtime::class_named("UIView"), "alloc", &[]);
+        crate::fw::uikit::send_rect(view, "initWithFrame:", Rect::new(0.0, 0.0, 300.0, 300.0));
+        let make = |class: &str| init_with_target(runtime::alloc_instance(runtime::class_named(class)), 0, target, runtime::sel("handle:"));
+        let (first, second, double) = (make("UITapGestureRecognizer"), make("UITapGestureRecognizer"), make("UITapGestureRecognizer"));
+        set_taps_required(double, 0, 2);
+        for single in [first, second] {
+            require_to_fail(single, 0, double);
+            view_add(view, 0, single);
+        }
+        view_add(view, 0, double);
+        PARTNERS.lock().unwrap().extend([(first, second), (second, first)]);
+        let heard = crate::fw::runloop::as_main(|| {
+            touch_changed(view, 0, 811, Phase::Began, p(50.0, 50.0));
+            touch_changed(view, 0, 811, Phase::Ended, p(50.0, 50.0));
+            assert!(CROSS_HEARD.lock().unwrap().is_empty(), "both wait for the double tap");
+            tap_gap_passed(double);
+            std::mem::take(&mut *CROSS_HEARD.lock().unwrap())
+        });
+        assert_eq!(heard.len(), 1, "only the one decided first: {heard:?}");
+        for recognizer in [first, second, double] {
+            view_remove(view, 0, recognizer);
+        }
+    }
+
     /// Taps and pans on one view, as UIKit recognizes them: a still press
     /// and release taps (and the pan fails); a drag begins the pan after 10
     /// points (the tap fails, the view's touch is cancelled), changes, ends,
@@ -1068,6 +1145,11 @@ mod tests {
     fn taps_and_pans_are_recognized_and_take_the_touch() {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(crate::run::setup);
+        // As the main thread would, so no other test's main loop decides recognizers meanwhile.
+        crate::fw::runloop::as_main(taps_and_pans);
+    }
+
+    fn taps_and_pans() {
         let target_class = define_class("GestureTestTarget", "NSObject", 8);
         methods(target_class, &[("handle:", handle as usize)]);
         let target = runtime::send(runtime::send(target_class, "alloc", &[]), "init", &[]);
@@ -1116,6 +1198,13 @@ mod tests {
     fn recognizers_wait_for_failure_stay_off_and_measure_in_their_view() {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(crate::run::setup);
+        // All of it as one piece of main-loop work: no other test's main loop
+        // decides these recognizers or runs their tap-gap timers between the
+        // steps, however slow the machine is.
+        crate::fw::runloop::as_main(wait_for_failure_stay_off_and_measure);
+    }
+
+    fn wait_for_failure_stay_off_and_measure() {
         let target_class = define_class("GestureTestWaitTarget", "NSObject", 8);
         methods(target_class, &[("handle:", handle_wait as usize)]);
         let target = runtime::send(runtime::send(target_class, "alloc", &[]), "init", &[]);
@@ -1134,22 +1223,20 @@ mod tests {
         require_to_fail(single, 0, double);
         view_add(view, 0, single);
         view_add(view, 0, double);
-        // As main-loop work: other tests' main loops run the recognizers' timers too.
-        let touch = |finger: i32, phase: Phase, at: Point| crate::fw::runloop::as_main(|| touch_changed(view, 0, finger, phase, at));
+        let touch = |finger: i32, phase: Phase, at: Point| touch_changed(view, 0, finger, phase, at);
         let tap = |finger: i32| {
             touch(finger, Phase::Began, p(50.0, 50.0));
             touch(finger, Phase::Ended, p(50.0, 50.0));
         };
-        let mine = |list: Vec<(Id, isize)>| list;
         tap(801);
-        assert!(mine(take()).is_empty(), "the single tap waits for the double tap");
-        crate::fw::runloop::as_main(|| tap_gap_passed(double));
-        assert_eq!(mine(take()), [(single, ENDED)], "the double tap failed: the single one is told");
+        assert!(take().is_empty(), "the single tap waits for the double tap");
+        tap_gap_passed(double);
+        assert_eq!(take(), [(single, ENDED)], "the double tap failed: the single one is told");
         tap(802);
         tap(803);
-        assert_eq!(mine(take()), [(double, ENDED)], "the double tap won");
-        crate::fw::runloop::as_main(|| tap_gap_passed(double));
-        assert!(mine(take()).is_empty(), "the single tap failed with it");
+        assert_eq!(take(), [(double, ENDED)], "the double tap won");
+        tap_gap_passed(double);
+        assert!(take().is_empty(), "the single tap failed with it");
         view_remove(view, 0, single);
         view_remove(view, 0, double);
 

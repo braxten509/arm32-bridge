@@ -697,9 +697,15 @@ mod tests {
     /// could still come.
     #[test]
     fn recognizers_hold_back_and_cancel_the_views_touches() {
-        use crate::fw::geometry::Rect;
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(crate::run::setup);
+        // All of it as one piece of main-loop work: no other test's main loop
+        // runs the recognizers' timers or lets held touches go between steps.
+        crate::fw::runloop::as_main(hold_back_and_cancel);
+    }
+
+    fn hold_back_and_cancel() {
+        use crate::fw::geometry::Rect;
         extern "C" fn note(_this: Id, s: Sel, _: Id, _: Id) {
             GESTURE_HEARD.lock().unwrap().push(lock().sel_name(s).trim_end_matches(":withEvent:").to_string());
         }
@@ -716,8 +722,7 @@ mod tests {
         let view = new_view("TouchTestGestureView", Rect::new(0.0, 0.0, 568.0, 320.0));
         runtime::send(window, "addSubview:", &[view]);
         let finger = 710; // not a finger other tests use
-        // As main-loop work: other tests' main loops may let held touches go too.
-        let touch = |phase: Phase, x: f64| crate::fw::runloop::as_main(|| deliver_in(window, finger, phase, Point { x, y: 100.0 }));
+        let touch = |phase: Phase, x: f64| deliver_in(window, finger, phase, Point { x, y: 100.0 });
         let recognizer = |class: &str| {
             let object = runtime::send(runtime::send(runtime::class_named(class), "alloc", &[]), "init", &[]);
             runtime::send(view, "addGestureRecognizer:", &[object]);
@@ -726,7 +731,7 @@ mod tests {
 
         let press = recognizer("UILongPressGestureRecognizer");
         touch(Phase::Began, 100.0);
-        crate::fw::runloop::as_main(|| crate::fw::gestures::held(press, finger));
+        crate::fw::gestures::held(press, finger);
         touch(Phase::Ended, 100.0);
         assert_eq!(heard(), ["touchesBegan", "touchesCancelled"], "the long press took the touch");
         runtime::send(view, "removeGestureRecognizer:", &[press]);
@@ -749,7 +754,7 @@ mod tests {
         touch(Phase::Began, 100.0);
         touch(Phase::Ended, 100.0);
         assert_eq!(heard(), ["touchesBegan"], "the end waits for a second tap");
-        crate::fw::runloop::as_main(|| crate::fw::gestures::tap_gap_passed(double));
+        crate::fw::gestures::tap_gap_passed(double);
         assert_eq!(heard(), ["touchesEnded"], "no second tap: the end comes");
         runtime::send(view, "removeGestureRecognizer:", &[double]);
     }
