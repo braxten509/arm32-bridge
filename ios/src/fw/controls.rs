@@ -899,6 +899,10 @@ pub struct ButtonParts {
     /// How the background and the picture are drawn.
     pub background_shade: Shade,
     pub image_shade: Shade,
+    /// The background and picture a press would show that are the pressed
+    /// state's own (0: none, or pressed already), so their files can be made
+    /// before the press.
+    pub pressed_own: [Id; 2],
 }
 
 /// How a button's picture is drawn for its state.
@@ -1025,6 +1029,10 @@ pub fn button_parts(button: Id) -> ButtonParts {
         title: title_part,
         background_shade: shade_of(button, "backgroundImage", state),
         image_shade: shade_of(button, "image", state),
+        pressed_own: ["backgroundImage", "image"].map(|key| match state & 1 {
+            0 => STATE_VALUES.lock().unwrap().as_ref().and_then(|values| values.get(&(button, key, state | 1)).copied()).unwrap_or(0),
+            _ => 0,
+        }),
     }
 }
 

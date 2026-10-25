@@ -280,16 +280,22 @@ fn image_shown(image: Id, mode: i64, rect: Rect) -> Option<Shown> {
 /// How see-through a disabled button's pictures are drawn.
 const DIMMED: f64 = 0.5;
 
+/// Starts making the files a picture will be drawn from (its parts when it
+/// is stretchable), so it can show the moment it is needed.
+fn start_files(image: Id) {
+    match crate::fw::uikit::image_info(image).map(|info| info.caps) {
+        Some(Some(_)) => drop(crate::fw::graphics::picture_part_file(image, 0)),
+        Some(None) => drop(crate::fw::graphics::picture_file(image)),
+        None => {}
+    }
+}
+
 /// A button's picture as its state draws it: a darker copy when pressed,
 /// dimmed when disabled.
 fn shaded(image: Id, shade: crate::fw::controls::Shade, rect: Rect) -> Option<Shown> {
     if !shade.darker && shade.darker_when_pressed && image != 0 {
         // A press may last one frame: the darker copy and its files are made now.
-        let darker = crate::fw::graphics::darker_image(image);
-        match crate::fw::uikit::image_info(darker).and_then(|info| info.caps) {
-            Some(_) => drop(crate::fw::graphics::picture_part_file(darker, 0)),
-            None => drop(crate::fw::graphics::picture_file(darker)),
-        }
+        start_files(crate::fw::graphics::darker_image(image));
     }
     let darker = if shade.darker { crate::fw::graphics::darker_image(image) } else { 0 };
     let mut shown = image_shown(if darker != 0 { darker } else { image }, 0, rect)?;
@@ -329,6 +335,8 @@ fn snapshot(view: Id, classes: &Classes, depth: usize) -> Node {
         if let Some((look, rect)) = parts.title {
             pictures.extend(text_shown(Some(look), rect));
         }
+        // The pressed state's own pictures, as for the darker copies in `shaded`.
+        parts.pressed_own.into_iter().for_each(start_files);
     }
     if Classes::is(view, classes.progress) {
         // The track over the bounds, the part done from the left: each its picture or colour.
@@ -874,6 +882,30 @@ mod tests {
         // No title and no pictures: nothing.
         let plain = new_view("UIButton", rect(0.0, 0.0, 100.0, 40.0));
         assert!(snapshot(plain, &Classes::find(), 0).pictures.is_empty());
+    }
+
+    /// A press may last one frame, and picture files are made on their own
+    /// thread: the pictures a pressed button would show of its own (not the
+    /// normal ones drawn darker) have their files started while it is shown
+    /// unpressed, so the first press doesn't show the button without them.
+    #[test]
+    fn a_shown_buttons_own_pressed_pictures_are_made_beforehand() {
+        use crate::fw::uikit::{image_info, make_image, ImageInfo};
+        setup();
+        let picture = |caps| make_image(ImageInfo { path: "/nowhere/pressed.png".to_string(), pixels: (20, 20), scale: 1.0, orientation: 1, caps, ..Default::default() });
+        let started = |image: Id| {
+            let info = image_info(image).unwrap();
+            info.parts_started.load(std::sync::atomic::Ordering::Relaxed) || info.picture_started.load(std::sync::atomic::Ordering::Relaxed)
+        };
+        let (normal, pressed_background, pressed_icon) = (picture(Some([5.0; 4])), picture(Some([5.0; 4])), picture(None));
+        let button = new_view("UIButton", rect(0.0, 0.0, 100.0, 40.0));
+        runtime::send(button, "setBackgroundImage:forState:", &[normal, 0]);
+        runtime::send(button, "setBackgroundImage:forState:", &[pressed_background, 1]);
+        runtime::send(button, "setImage:forState:", &[pressed_icon, 1]);
+        assert!(!started(pressed_background) && !started(pressed_icon));
+        snapshot(button, &Classes::find(), 0);
+        assert!(started(pressed_background), "the pressed background's parts");
+        assert!(started(pressed_icon), "the pressed picture's file");
     }
 
     /// A title given only as an attributed string is drawn with its text,
