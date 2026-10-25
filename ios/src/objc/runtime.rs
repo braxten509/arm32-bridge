@@ -485,9 +485,48 @@ std::arch::global_asm!(
     "ldp x0, x1, [sp, #16]",
     "ldp x29, x30, [sp], #224",
     "br x16",
+    // A setter of an observed key, sent by objc_msgSend (see observed_setter
+    // below): -willChangeValueForKey:, the setter with the caller's
+    // registers, -didChangeValueForKey:, the setter's result registers back.
+    ".globl ios_kvo_setter",
+    ".p2align 2",
+    "ios_kvo_setter:",
+    "stp x29, x30, [sp, #-224]!",
+    "mov x29, sp",
+    "stp x0, x1, [sp, #16]",
+    "stp x2, x3, [sp, #32]",
+    "stp x4, x5, [sp, #48]",
+    "stp x6, x7, [sp, #64]",
+    "str x8, [sp, #80]",
+    "stp q0, q1, [sp, #96]",
+    "stp q2, q3, [sp, #128]",
+    "stp q4, q5, [sp, #160]",
+    "stp q6, q7, [sp, #192]",
+    "bl ios_kvo_will",
+    "mov x16, x0",
+    "ldp q6, q7, [sp, #192]",
+    "ldp q4, q5, [sp, #160]",
+    "ldp q2, q3, [sp, #128]",
+    "ldp q0, q1, [sp, #96]",
+    "ldr x8, [sp, #80]",
+    "ldp x6, x7, [sp, #64]",
+    "ldp x4, x5, [sp, #48]",
+    "ldp x2, x3, [sp, #32]",
+    "ldp x0, x1, [sp, #16]",
+    "blr x16",
+    "stp x0, x1, [sp, #16]",
+    "stp q0, q1, [sp, #96]",
+    "stp q2, q3, [sp, #128]",
+    "bl ios_kvo_did",
+    "ldp q2, q3, [sp, #128]",
+    "ldp q0, q1, [sp, #96]",
+    "ldp x0, x1, [sp, #16]",
+    "ldp x29, x30, [sp], #224",
+    "ret",
 );
 
 extern "C" {
+    fn ios_kvo_setter();
     pub fn ios_objc_msgSend();
     pub fn ios_objc_msgSendSuper2();
     pub fn ios_objc_msgSendSuper();
@@ -603,7 +642,40 @@ extern "C" fn ios_objc_lookup(receiver: Id, sel: Sel, caller: usize, saved_recei
     let mut receiver = receiver;
     let imp = find_method(&mut receiver, sel, caller);
     unsafe { *saved_receiver = receiver };
+    observed_setter(receiver, sel, imp).unwrap_or(imp)
+}
+
+thread_local! {
+    /// Observed setters under way on this thread (innermost last): the
+    /// object, the key, and the setter's own code.
+    static KVO_SETTERS: std::cell::RefCell<Vec<(Id, String, Imp)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// objc_msgSend's code for a setter of a key someone observes on
+/// `receiver`: ios_kvo_setter, which announces the change around `imp`, as
+/// Apple's KVO subclass does (see fw/object.rs).
+fn observed_setter(receiver: Id, sel: Sel, imp: Imp) -> Option<Imp> {
+    if !crate::fw::object::is_observed_setter(sel) {
+        return None;
+    }
+    let name = lock().sel_name(sel);
+    let key = crate::fw::object::observed_setter_key(receiver, &name)?;
+    KVO_SETTERS.with(|s| s.borrow_mut().push((receiver, key, imp)));
+    Some(ios_kvo_setter as Imp)
+}
+
+#[no_mangle]
+extern "C" fn ios_kvo_will() -> Imp {
+    let (object, key, imp) = KVO_SETTERS.with(|s| s.borrow().last().cloned()).expect("a KVO setter was looked up");
+    crate::fw::object::will_change(object, &key);
     imp
+}
+
+#[no_mangle]
+extern "C" fn ios_kvo_did() {
+    if let Some((object, key, _)) = KVO_SETTERS.with(|s| s.borrow_mut().pop()) {
+        crate::fw::object::did_change(object, &key);
+    }
 }
 
 /// objc_msgSend's search: the method `*receiver` runs for `sel`, forwarded
@@ -766,6 +838,19 @@ pub fn send(receiver: Id, sel_name: &str, args: &[usize]) -> usize {
             super::forward::after_miss(&mut receiver, isa, s, 0).unwrap_or_else(|| missing_method(isa, is_class, s, 0))
         }
     };
+    // A setter of an observed key: announced around the call (fw/object.rs).
+    if crate::fw::object::is_observed_setter(s) {
+        if let Some(key) = crate::fw::object::observed_setter_key(receiver, sel_name) {
+            crate::fw::object::will_change(receiver, &key);
+            let result = call_with_words(imp, receiver, s, args);
+            crate::fw::object::did_change(receiver, &key);
+            return result;
+        }
+    }
+    call_with_words(imp, receiver, s, args)
+}
+
+fn call_with_words(imp: Imp, receiver: Id, s: Sel, args: &[usize]) -> usize {
     unsafe {
         match args {
             [] => std::mem::transmute::<Imp, extern "C" fn(Id, Sel) -> usize>(imp)(receiver, s),

@@ -127,6 +127,7 @@ attributedTitleForState:	@@:I
 attributesAtIndex:effectiveRange:	@@:I^{_NSRange=II}
 authenticateWithCompletionHandler:	v@:@?
 autorelease	@@:
+automaticallyNotifiesObserversForKey:	c@:@
 awakeFromNib	v@:
 backgroundColor	@@:
 baselineAdjustment	i@:
@@ -762,6 +763,7 @@ removeObjectsInArray:	v@:@
 removeObjectsInRange:	v@:{_NSRange=II}
 removeObserver:	v@:@
 removeObserver:forKeyPath:	v@:@@
+removeObserver:forKeyPath:context:	v@:@@^v
 removeObserver:name:object:	v@:@@@
 removeTarget:action:	v@:@:
 removeTarget:action:forControlEvents:	v@:@:I

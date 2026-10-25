@@ -1111,6 +1111,45 @@ pub fn send_from_guest(
     kind: SendKind,
     words: &dyn Fn(u32) -> u32,
 ) -> Result<GuestRet, String> {
+    // A setter of a key something observes on the receiver: announced
+    // around the call, as Apple's KVO does (fw/object.rs). Not for super
+    // calls: the setter the game sent already announces it.
+    if kind == SendKind::Normal && crate::fw::object::kvo_active() {
+        if let Some((object, key)) = observed_setter(bridge, g, words) {
+            crate::fw::object::will_change(object, &key);
+            let result = send_unobserved(bridge, g, kind, words);
+            crate::fw::object::did_change(object, &key);
+            return result;
+        }
+    }
+    send_unobserved(bridge, g, kind, words)
+}
+
+/// The receiver (as the host knows it) and key, when this message is the
+/// setter of an observed key.
+fn observed_setter(bridge: &Mutex<Bridge>, g: &dyn GuestSide, words: &dyn Fn(u32) -> u32) -> Option<(runtime::Id, String)> {
+    let (object, name) = {
+        let mut b = lock(bridge);
+        let receiver = words(0);
+        if receiver == 0 {
+            return None;
+        }
+        let name = b.selector_name(g, words(1));
+        if !(name.starts_with("set") || name.starts_with("_set")) {
+            return None;
+        }
+        (b.host_object(receiver)?, name)
+    };
+    let key = crate::fw::object::observed_setter_key(object, &name)?;
+    Some((object, key))
+}
+
+fn send_unobserved(
+    bridge: &Mutex<Bridge>,
+    g: &dyn GuestSide,
+    kind: SendKind,
+    words: &dyn Fn(u32) -> u32,
+) -> Result<GuestRet, String> {
     let stret = matches!(kind, SendKind::Stret | SendKind::Super2Stret);
     let first = u32::from(stret);
     let mut b = lock(bridge);

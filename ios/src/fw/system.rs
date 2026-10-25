@@ -535,7 +535,7 @@ fn entry_real(value: Option<Value>) -> f64 {
 // --- values by their type encoding (-encodeValueOfObjCType:at:) ---
 
 /// Size and alignment of one encoded type, in host or 32-bit game layout.
-fn type_size(code: &str, guest: bool) -> (usize, usize) {
+pub(crate) fn type_size(code: &str, guest: bool) -> (usize, usize) {
     let word = if guest { 4 } else { 8 };
     let wide_align = if guest { 4 } else { 8 };
     match code.as_bytes().first() {
@@ -1301,6 +1301,28 @@ mod tests {
         assert_eq!(collections::number_as_f64(items[3]), 1.5);
         assert_eq!(crate::fw::data::bytes(collections::dictionary_get(back, string::make("blob"))), b"xyz");
         assert_eq!(crate::fw::misc::date_value(collections::dictionary_get(back, string::make("when"))), 12345.5);
+    }
+
+    /// Boxed geometry saves the way Foundation writes it ("NS.special" and
+    /// the text form) and comes back as the same value; other structs come
+    /// back too.
+    #[test]
+    fn keyed_archives_keep_boxed_values() {
+        use crate::fw::geometry::{Point, Rect, Transform};
+        ready();
+        let point = collections::value_with(collections::POINT_TYPE, &Point { x: 1.5, y: -2.0 });
+        let rect = collections::value_with(collections::RECT_TYPE, &Rect::new(0.1, 2.0, 30.0, 40.0));
+        let range = collections::value_with(collections::RANGE_TYPE, &string::Range { location: 3, length: 9 });
+        let turn = Transform { a: 0.0, b: 1.0, c: -1.0, d: 0.0, tx: 7.0, ty: 8.0 };
+        let transform = collections::value_with(collections::TRANSFORM_TYPE, &turn);
+        let object = collections::array_from(&[point, rect, range, transform]);
+        let text = plist::to_xml(&archive(object).expect("boxed values save"));
+        assert!(text.contains("<key>NS.pointval</key>") && text.contains("{1.5, -2}"), "{text}");
+        let back = collections::array_items(unarchive(&plist::parse(text.as_bytes()).unwrap()).unwrap());
+        assert_eq!(back.len(), 4);
+        for (before, after) in [point, rect, range, transform].into_iter().zip(back) {
+            assert_eq!(runtime::send(before, "isEqualToValue:", &[after]) & 0xFF, 1, "{} came back as {}", string::describe(before), string::describe(after));
+        }
     }
 
     #[test]

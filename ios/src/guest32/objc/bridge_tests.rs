@@ -640,6 +640,81 @@ fn game_protocols_cross_the_bridge_and_game_classes_conform_to_them() {
     assert_eq!(send(&bridge, fake, &[class, conforms, drawing]).unwrap() & 0xff, 1, "the class too");
 }
 
+/// An `id *` out-parameter the host leaves alone keeps the game's value (a
+/// failed NSScanner scan leaves *into as it was); one it sets is the new
+/// value. SpellCraft scans each map cell, then tries a second scan into the
+/// same variable: the cell was wiped to nil, so the dungeon had no rooms.
+#[test]
+fn an_out_object_the_host_does_not_set_keeps_the_games_value() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(crate::run::setup);
+    let fake = Fake::new();
+    let bridge = Mutex::new(Bridge::new(&ObjcMetadata32::default()).unwrap());
+    let guest = |host: Id| bridge.lock().unwrap().guest_object(fake, host).unwrap();
+    let text = |guest: u32| crate::fw::string::get(bridge.lock().unwrap().host_object(guest).unwrap());
+    let s = crate::fw::string::make;
+    let scanner = guest(runtime::send(runtime::class_named("NSScanner"), "scannerWithString:", &[s("0,#")]));
+    let slot = fake.alloc_permanent(4);
+    let scan = |selector: &str, wanted: &str| {
+        let sel = bridge.lock().unwrap().guest_selector(fake, selector);
+        send(&bridge, fake, &[scanner, sel, guest(s(wanted)), slot]).unwrap() & 0xff
+    };
+    assert_eq!(scan("scanUpToString:intoString:", ","), 1);
+    assert_eq!(text(fake.u32_at(slot)), "0");
+    assert_eq!(scan("scanString:intoString:", "#"), 0, "the next character is a comma");
+    assert_eq!(text(fake.u32_at(slot)), "0", "a failed scan leaves the variable alone");
+}
+
+static KVO_HEARD: Mutex<Vec<(String, Id, Id)>> = Mutex::new(Vec::new());
+
+extern "C" fn host_observe(_this: Id, _: Sel, path: Id, object: Id, change: Id, _context: usize) {
+    let new = crate::fw::collections::dictionary_get(change, crate::fw::string::make("new"));
+    KVO_HEARD.lock().unwrap().push((crate::fw::string::get(path), object, new));
+}
+
+/// A game's own setter sent to an object something observes tells the
+/// observer, as Apple's automatic KVO does. SpellCraft's wand learns of its
+/// new spell this way; without it the wand never charged.
+#[test]
+fn a_game_setter_on_an_observed_game_object_tells_the_observer() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(crate::run::setup);
+    let watcher_class = {
+        let mut rt = runtime::lock();
+        let root = rt.by_name["NSObject"];
+        let class = rt.define_class("G32KvoWatcher", root, 8);
+        let observe = rt.sel("observeValueForKeyPath:ofObject:change:context:");
+        rt.add_method(class, observe, host_observe as usize);
+        class
+    };
+    let fake = Fake::new();
+    let wand = class32(fake, "G32Wand", ClassTarget::External("NSObject".into()), "NSObject", vec![method("setSpell:", "v12@0:4@8", 0x2401), method("spell", "@8@0:4", 0x2411)]);
+    let class = wand.address;
+    let md = ObjcMetadata32 { classes: vec![wand], ..Default::default() };
+    let bridge: &'static Mutex<Bridge> = Box::leak(Box::new(Mutex::new(Bridge::new(&md).unwrap())));
+    install(bridge, fake, &md).unwrap();
+    let _hook = mirror::DISPATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    mirror::set_dispatch(Box::new(move |frame: &mut HostFrame| {
+        dispatch_from_host(bridge, fake, frame).unwrap();
+    }));
+    static SPELL: Mutex<u32> = Mutex::new(0);
+    fake.code(0x2401, |w| {
+        *SPELL.lock().unwrap() = w[2];
+        0
+    });
+    fake.code(0x2411, |_| u64::from(*SPELL.lock().unwrap()));
+    let sel = |name: &str| bridge.lock().unwrap().guest_selector(fake, name);
+    let guest = |host: Id| bridge.lock().unwrap().guest_object(fake, host).unwrap();
+    let object = send(bridge, fake, &[class, sel("alloc")]).unwrap() as u32;
+    let watcher = guest(runtime::alloc_instance(watcher_class));
+    let hex = crate::fw::string::make("Hex of Chaos");
+    send(bridge, fake, &[object, sel("addObserver:forKeyPath:options:context:"), watcher, guest(crate::fw::string::make("spell")), 1, 0]).unwrap();
+    send(bridge, fake, &[object, sel("setSpell:"), guest(hex)]).unwrap();
+    let host = bridge.lock().unwrap().host_object(object).unwrap();
+    let heard = std::mem::take(&mut *KVO_HEARD.lock().unwrap());
+    assert_eq!(heard, [("spell".to_string(), host, hex)]);
+}
+
 #[test]
 fn a_va_list_of_format_arguments_reaches_the_host() {
     // -initWithFormat:arguments: from a game's logging helper: the va_list

@@ -306,7 +306,7 @@ extern "C" fn point_make_with_dictionary(dictionary: crate::objc::runtime::Id, p
 // ----- UIKit's text forms: "{x, y}", "{w, h}", "{{x, y}, {w, h}}" -----
 
 /// The numbers in `text` in order (missing ones are 0, as UIKit gives).
-fn numbers<const N: usize>(text: &str) -> [f64; N] {
+pub(crate) fn numbers<const N: usize>(text: &str) -> [f64; N] {
     let mut out = [0.0; N];
     let parsed = text
         .split(|c: char| !(c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | 'e' | 'E')))
