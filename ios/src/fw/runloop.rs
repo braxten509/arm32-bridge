@@ -557,6 +557,13 @@ fn main_work<R>(main: bool, f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// For tests: runs `f` as main-loop work (taking turns with other test
+/// threads running the main loop), as the main thread would.
+#[cfg(test)]
+pub fn as_main<R>(f: impl FnOnce() -> R) -> R {
+    main_work(true, f)
+}
+
 /// Runs a loop's queued work and due timers until `until` (or forever), in
 /// run loop mode `mode`. With `once`, returns as soon as something was
 /// handled. Returns true if anything was.

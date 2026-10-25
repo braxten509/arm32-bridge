@@ -11,11 +11,13 @@
 //! follow two fingers. A recognizer that recognizes takes the touch: the
 //! others following it fail, and (cancelsTouchesInView, the default) the
 //! view gets touchesCancelled:withEvent: and no more of that touch. Its
-//! targets get their action with the recognizer; a tap that must wait for
-//! another to fail (requireGestureRecognizerToFail:) is told once that one
-//! had its chance.
+//! targets get their action with the recognizer. One that must wait for
+//! others to fail (requireGestureRecognizerToFail:) recognizes once they
+//! have all failed, and fails if one of them recognizes. delaysTouchesBegan
+//! and delaysTouchesEnded hold the view's touches back (fw/touch.rs) until
+//! the recognizers decide.
 
-use crate::fw::geometry::Point;
+use crate::fw::geometry::{apply, invert, Point, IDENTITY};
 use crate::fw::object::{define_class, methods};
 use crate::fw::touch::Phase;
 use crate::fw::uikit::{property, property_get, property_set, view_state};
@@ -83,8 +85,12 @@ struct Recognizer {
     rotation: f64,
     /// When it last recognized (for requireGestureRecognizerToFail:).
     recognized_at: f64,
-    /// Recognizers that must fail before this one is told.
+    /// Recognizers that must fail before this one recognizes.
     requires: Vec<Id>,
+    /// Recognized, but waiting for `requires` to fail: the state it enters then.
+    waiting: Option<isize>,
+    /// When the sequence it waits in began.
+    wait_since: f64,
 }
 
 impl Recognizer {
@@ -107,6 +113,8 @@ impl Recognizer {
             rotation: 0.0,
             recognized_at: f64::NEG_INFINITY,
             requires: Vec::new(),
+            waiting: None,
+            wait_since: 0.0,
         }
     }
 
@@ -130,6 +138,17 @@ impl Recognizer {
 
     fn active(&self) -> bool {
         matches!(self.state, BEGAN | CHANGED)
+    }
+
+    /// Still deciding: fingers down, a multi-tap between taps, or waiting
+    /// for others to fail.
+    fn pending(&self) -> bool {
+        !self.fingers.is_empty() || self.taps > 0 || self.waiting.is_some()
+    }
+
+    /// Hasn't recognized or failed yet in this sequence.
+    fn undecided(&self) -> bool {
+        self.state == POSSIBLE && self.pending()
     }
 }
 
@@ -189,14 +208,21 @@ fn setting(object: Id, key: &'static str, default: isize) -> isize {
     property_get(object, key).map(|v| v as isize).unwrap_or(default)
 }
 
-/// Turning a recognizer off cancels what it is doing.
+/// Turning a recognizer off cancels what it is doing; it follows none of
+/// the fingers down then, even if turned on again.
 extern "C" fn set_enabled(this: Id, s: Sel, value: u8) {
     set_enabled_raw(this, s, value);
     if value == 0 {
+        if let Some(fingers) = FINGERS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            for list in fingers.values_mut() {
+                list.retain(|&g| g != this);
+            }
+        }
         let was_active = with(this, |r| {
             let active = r.active();
             r.state = if active { CANCELLED } else { POSSIBLE };
             r.fingers.clear();
+            (r.taps, r.waiting) = (0, None);
             active
         });
         if was_active == Some(true) {
@@ -261,13 +287,24 @@ extern "C" fn number_of_touches(this: Id, _: Sel) -> usize {
     with(this, |r| r.fingers.len()).unwrap_or(0)
 }
 
-/// A window point in `view`'s own points (nil: the window's).
+/// A window point in `view`'s own points (nil: the window's), through
+/// the transforms of the view and the views it is in.
 fn in_view(point: Point, view: Id) -> Point {
     if view == 0 {
         return point;
     }
-    let origin = crate::fw::touch::origin_in_window(view);
-    Point { x: point.x - origin.x, y: point.y - origin.y }
+    let to_view = invert(crate::fw::touch::view_to_window(view)).unwrap_or(IDENTITY);
+    let (x, y) = apply(to_view, point.x, point.y);
+    Point { x, y }
+}
+
+/// A distance or speed in window points as `view`'s points (no moving).
+fn along_view(vector: Point, view: Id) -> Point {
+    if view == 0 {
+        return vector;
+    }
+    let t = invert(crate::fw::touch::view_to_window(view)).unwrap_or(IDENTITY);
+    Point { x: t.a * vector.x + t.c * vector.y, y: t.b * vector.x + t.d * vector.y }
 }
 
 /// The fingers' middle; once they're up, where they were last.
@@ -286,24 +323,29 @@ extern "C" fn location_of_touch(this: Id, _: Sel, index: usize, view: Id) -> Poi
     in_view(point, view)
 }
 
-/// Translation and speed are the same in any view without a turn or scale.
-extern "C" fn translation_in_view(this: Id, _: Sel, _view: Id) -> Point {
-    with(this, |r| {
+/// Translation and speed in the view's own points (a scaled or turned
+/// view measures them its way).
+extern "C" fn translation_in_view(this: Id, _: Sel, view: Id) -> Point {
+    let moved = with(this, |r| {
         let now = if r.fingers.is_empty() { r.last.0 } else { r.centroid() };
         Point { x: now.x - r.origin.x, y: now.y - r.origin.y }
     })
-    .unwrap_or_default()
+    .unwrap_or_default();
+    along_view(moved, view)
 }
 
-extern "C" fn set_translation(this: Id, _: Sel, translation: Point, _view: Id) {
+extern "C" fn set_translation(this: Id, _: Sel, translation: Point, view: Id) {
+    // The view's points back to the window's.
+    let t = if view == 0 { IDENTITY } else { crate::fw::touch::view_to_window(view) };
+    let moved = Point { x: t.a * translation.x + t.c * translation.y, y: t.b * translation.x + t.d * translation.y };
     with(this, |r| {
         let now = if r.fingers.is_empty() { r.last.0 } else { r.centroid() };
-        r.origin = Point { x: now.x - translation.x, y: now.y - translation.y };
+        r.origin = Point { x: now.x - moved.x, y: now.y - moved.y };
     });
 }
 
-extern "C" fn velocity_in_view(this: Id, _: Sel, _view: Id) -> Point {
-    with(this, |r| r.velocity).unwrap_or_default()
+extern "C" fn velocity_in_view(this: Id, _: Sel, view: Id) -> Point {
+    along_view(with(this, |r| r.velocity).unwrap_or_default(), view)
 }
 
 extern "C" fn scale(this: Id, _: Sel) -> f64 {
@@ -438,8 +480,8 @@ fn simultaneous(a: Id, b: Id) -> bool {
 struct Step {
     recognized: bool,
     tell: bool,
-    /// A tap waiting for others to fail first.
-    wait_for: Vec<Id>,
+    /// A multi-tap between taps: it fails unless the next comes in time.
+    tap_gap: bool,
     /// A long press to check once it has been held long enough.
     hold_check: Option<f64>,
 }
@@ -447,6 +489,22 @@ struct Step {
 /// The rules for one recognizer (settings read before: no messages here).
 fn step(r: &mut Recognizer, settings: &Settings, finger: i32, phase: Phase, point: Point, now: f64) -> Step {
     let mut out = Step::default();
+    if r.waiting.is_some() {
+        // Decided, waiting for others: it only follows the fingers.
+        match phase {
+            Phase::Began => drop(r.fingers.insert(finger, Finger { start: point, now: point })),
+            Phase::Moved => {
+                if let Some(f) = r.fingers.get_mut(&finger) {
+                    f.now = point;
+                }
+            }
+            Phase::Ended | Phase::Cancelled => drop(r.fingers.remove(&finger)),
+        }
+        if !r.fingers.is_empty() {
+            r.last = (r.centroid(), now);
+        }
+        return out;
+    }
     if matches!(r.state, FAILED | CANCELLED) {
         if phase == Phase::Ended || phase == Phase::Cancelled {
             r.fingers.remove(&finger);
@@ -586,13 +644,11 @@ fn step(r: &mut Recognizer, settings: &Settings, finger: i32, phase: Phase, poin
                     r.state = FAILED;
                 } else if r.taps as isize >= settings.taps {
                     r.taps = 0;
-                    if r.requires.is_empty() {
-                        r.state = ENDED;
-                        out.recognized = true;
-                        out.tell = true;
-                    } else {
-                        out.wait_for = r.requires.clone();
-                    }
+                    r.state = ENDED;
+                    out.recognized = true;
+                    out.tell = true;
+                } else {
+                    out.tap_gap = true;
                 }
             } else if all_up && r.state == POSSIBLE && r.kind != Kind::Tap {
                 r.state = FAILED;
@@ -632,9 +688,9 @@ fn settings_of(recognizer: Id) -> Settings {
 /// After a sequence: a recognizer that ended, failed or was cancelled goes
 /// back to possible once its fingers are all up.
 fn settle(recognizer: Id) {
-    let done = with(recognizer, |r| r.fingers.is_empty() && matches!(r.state, ENDED | FAILED | CANCELLED)).unwrap_or(false);
+    let done = with(recognizer, |r| r.fingers.is_empty() && r.waiting.is_none() && matches!(r.state, ENDED | FAILED | CANCELLED)).unwrap_or(false);
     if done {
-        with(recognizer, |r| r.state = POSSIBLE);
+        with(recognizer, |r| (r.state, r.taps) = (POSSIBLE, 0));
         if runtime::responds(recognizer, "reset") {
             runtime::send(recognizer, "reset", &[]);
         }
@@ -656,15 +712,35 @@ fn recognizers_for(view: Id) -> Vec<Id> {
     list
 }
 
+/// What fw/touch.rs does with the view's touch once the recognizers saw a change.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Verdict {
+    /// The view hears it.
+    Pass,
+    /// A recognizer took the touch (cancelsTouchesInView): the view's touch is cancelled.
+    Took,
+    /// Held back from the view until the recognizers decide (delaysTouchesBegan,
+    /// delaysTouchesEnded); then `touch::release`.
+    Hold,
+}
+
+/// Fingers whose touches are held back from their view: the recognizers
+/// that may still take them, and since when.
+static HOLDS: Mutex<Option<HashMap<i32, (Vec<Id>, f64)>>> = Mutex::new(None);
+
+fn holding(finger: i32) -> bool {
+    HOLDS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|h| h.contains_key(&finger))
+}
+
 /// From fw/touch.rs, for each finger change on the main thread, before the
-/// view hears it: feeds the recognizers following the finger. Returns
-/// whether a recognizer took the touch from the view (cancelsTouchesInView).
-pub fn touch_changed(view: Id, touch: Id, finger: i32, phase: Phase, point: Point) -> bool {
+/// view hears it: feeds the recognizers following the finger, and says
+/// what becomes of the view's touch.
+pub fn touch_changed(view: Id, touch: Id, finger: i32, phase: Phase, point: Point) -> Verdict {
     let now = runloop::media_time();
     if phase == Phase::Began {
         let list: Vec<Id> = recognizers_for(view).into_iter().filter(|&g| may_receive(g, touch)).collect();
         if list.is_empty() {
-            return false;
+            return if holding(finger) { Verdict::Hold } else { Verdict::Pass };
         }
         FINGERS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(finger, list);
     }
@@ -677,24 +753,30 @@ pub fn touch_changed(view: Id, touch: Id, finger: i32, phase: Phase, point: Poin
             with(recognizer, |r| r.state = FAILED);
             out = Step::default();
         }
+        if out.recognized && with(recognizer, |r| !r.requires.is_empty()).unwrap_or(false) {
+            // It must wait for the others to fail first (`resolve`).
+            with(recognizer, |r| {
+                r.waiting = Some(r.state);
+                (r.state, r.wait_since, r.recognized_at) = (POSSIBLE, r.began_at, f64::NEG_INFINITY);
+            });
+            (out.recognized, out.tell) = (false, false);
+        }
         if out.recognized {
-            // It takes the touch: the others following it fail.
-            for &other in &list {
-                if other != recognizer && !simultaneous(recognizer, other) {
-                    with(other, |r| {
-                        if r.state == POSSIBLE {
-                            r.state = FAILED;
-                        }
-                    });
-                }
-            }
-            took |= cancels_touches(recognizer, 0);
+            took |= take_touch(recognizer, &[finger]);
         }
         if out.tell {
             fire(recognizer);
         }
-        if !out.wait_for.is_empty() {
-            wait_then_tap(recognizer, out.wait_for, now);
+        if out.tap_gap {
+            let stamp = with(recognizer, |r| r.last_tap).unwrap_or(0.0);
+            runloop::post_after(
+                TAP_GAP,
+                Box::new(move || {
+                    if with(recognizer, |r| r.last_tap == stamp) == Some(true) {
+                        tap_gap_passed(recognizer);
+                    }
+                }),
+            );
         }
         if let Some(seconds) = out.hold_check {
             runloop::post_after(seconds, Box::new(move || held(recognizer, finger)));
@@ -708,56 +790,148 @@ pub fn touch_changed(view: Id, touch: Id, finger: i32, phase: Phase, point: Poin
             settle(recognizer);
         }
     }
-    took
+    resolve();
+    if took {
+        return Verdict::Took;
+    }
+    // Held while a recognizer that delays this part of the touch may still take it.
+    let delays = |g: Id| if matches!(phase, Phase::Began | Phase::Moved) { delays_began(g, 0) } else { delays_ended(g, 0) };
+    if holding(finger) || list.iter().any(|&g| delays(g) && with(g, |r| r.undecided()).unwrap_or(false)) {
+        HOLDS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).entry(finger).or_insert((list, now));
+        Verdict::Hold
+    } else {
+        Verdict::Pass
+    }
 }
 
-/// A tap that waits for others to fail: told after they had their chance,
-/// unless one recognized since.
-fn wait_then_tap(recognizer: Id, others: Vec<Id>, at: f64) {
-    runloop::post_after(
-        TAP_GAP,
-        Box::new(move || {
-            let beaten = others.iter().any(|&o| with(o, |r| r.recognized_at >= at).unwrap_or(false));
-            if !beaten {
-                with(recognizer, |r| {
-                    r.state = ENDED;
-                    r.recognized_at = runloop::media_time();
-                });
-                fire(recognizer);
-                with(recognizer, |r| r.state = POSSIBLE);
+/// `recognizer` recognized on these fingers: the others following them
+/// fail (unless they may recognize alongside it). Whether it takes the
+/// touches from the view (cancelsTouchesInView).
+fn take_touch(recognizer: Id, fingers: &[i32]) -> bool {
+    let lists: Vec<Id> = {
+        let all = FINGERS.lock().unwrap_or_else(|e| e.into_inner());
+        fingers.iter().filter_map(|f| all.as_ref().and_then(|a| a.get(f)).cloned()).flatten().collect()
+    };
+    for other in lists {
+        if other != recognizer && !simultaneous(recognizer, other) {
+            with(other, |r| {
+                if r.state == POSSIBLE {
+                    (r.state, r.waiting) = (FAILED, None);
+                }
+            });
+            settle(other);
+        }
+    }
+    cancels_touches(recognizer, 0)
+}
+
+/// Recognizers waiting for others to fail: one fails as soon as one of
+/// those recognized; it recognizes once none of them is still deciding.
+/// Then the touches held back are let go or cancelled.
+fn resolve() {
+    for _ in 0..16 {
+        let waiters: Vec<Id> =
+            RECOGNIZERS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|all| all.iter().filter(|(_, r)| r.waiting.is_some()).map(|(&id, _)| id).collect()).unwrap_or_default();
+        let mut changed = false;
+        for waiter in waiters {
+            let Some((others, since)) = with(waiter, |r| (r.requires.clone(), r.wait_since)) else { continue };
+            let beaten = others.iter().any(|&o| with(o, |r| r.recognized_at >= since).unwrap_or(false));
+            let deciding = others.iter().any(|&o| enabled(o, 0) && with(o, |r| r.pending()).unwrap_or(false));
+            if beaten {
+                with(waiter, |r| (r.waiting, r.state) = (None, FAILED));
+                settle(waiter);
+                changed = true;
+            } else if !deciding {
+                let now = runloop::media_time();
+                let Some((state, fingers)) = with(waiter, |r| {
+                    let state = r.waiting.take().unwrap_or(ENDED);
+                    (r.state, r.recognized_at) = (state, now);
+                    (state, r.fingers.keys().copied().collect::<Vec<i32>>())
+                }) else {
+                    continue;
+                };
+                if take_touch(waiter, &fingers) {
+                    for &finger in &fingers {
+                        crate::fw::touch::take_from_view(finger);
+                    }
+                }
+                fire(waiter);
+                if fingers.is_empty() {
+                    // The fingers left while it waited: a continuous one ends too.
+                    if state == BEGAN {
+                        with(waiter, |r| r.state = ENDED);
+                        fire(waiter);
+                    }
+                    settle(waiter);
+                }
+                changed = true;
             }
-        }),
-    );
+        }
+        if !changed {
+            break;
+        }
+    }
+    release_holds();
+}
+
+/// Touches held back from views whose recognizers have decided: cancelled
+/// if one of them recognized (and takes touches), else handed on.
+fn release_holds() {
+    let holds: Vec<(i32, (Vec<Id>, f64))> = HOLDS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|h| h.iter().map(|(&f, v)| (f, v.clone())).collect()).unwrap_or_default();
+    for (finger, (list, since)) in holds {
+        let taken = list.iter().any(|&g| with(g, |r| r.recognized_at >= since).unwrap_or(false) && cancels_touches(g, 0));
+        let deciding = list.iter().any(|&g| (delays_began(g, 0) || delays_ended(g, 0)) && with(g, |r| r.undecided()).unwrap_or(false));
+        if taken || !deciding {
+            if let Some(holds) = HOLDS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                holds.remove(&finger);
+            }
+            crate::fw::touch::release(finger, taken);
+        }
+    }
+}
+
+/// A multi-tap's time for its next tap ran out: it fails (UIKit's tap
+/// recognizers fail when the gap passes), which may let others go on.
+pub(crate) fn tap_gap_passed(recognizer: Id) {
+    with(recognizer, |r| {
+        if r.taps > 0 && r.fingers.is_empty() && r.waiting.is_none() {
+            r.taps = 0;
+        }
+    });
+    resolve();
 }
 
 /// A long press held long enough: it begins if the finger is still down
-/// and hasn't moved too far.
-fn held(recognizer: Id, finger: i32) {
+/// and hasn't moved too far (after others it must wait for have failed),
+/// and takes the touch from the view as any recognizer does.
+pub(crate) fn held(recognizer: Id, finger: i32) {
     let movement = allowed_movement(recognizer, 0);
-    let began = with(recognizer, |r| {
-        let ok = r.state == POSSIBLE && r.fingers.contains_key(&finger) && r.farthest_move() <= movement;
-        if ok {
-            r.state = BEGAN;
-            r.recognized_at = runloop::media_time();
+    let now = runloop::media_time();
+    let ready = with(recognizer, |r| r.state == POSSIBLE && r.waiting.is_none() && r.fingers.contains_key(&finger) && r.farthest_move() <= movement).unwrap_or(false);
+    if !ready {
+        return;
+    }
+    if !may_begin(recognizer) {
+        with(recognizer, |r| r.state = FAILED);
+        return;
+    }
+    let waits = with(recognizer, |r| {
+        if r.requires.is_empty() {
+            (r.state, r.recognized_at) = (BEGAN, now);
+            false
+        } else {
+            (r.waiting, r.wait_since) = (Some(BEGAN), r.began_at);
+            true
         }
-        ok
     })
     .unwrap_or(false);
-    if began && may_begin(recognizer) {
-        let others = FINGERS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|f| f.get(&finger)).cloned().unwrap_or_default();
-        for other in others {
-            if other != recognizer && !simultaneous(recognizer, other) {
-                with(other, |r| {
-                    if r.state == POSSIBLE {
-                        r.state = FAILED;
-                    }
-                });
-            }
+    if !waits {
+        if take_touch(recognizer, &[finger]) {
+            crate::fw::touch::take_from_view(finger);
         }
         fire(recognizer);
-    } else if began {
-        with(recognizer, |r| r.state = FAILED);
     }
+    resolve();
 }
 
 pub fn register() {
@@ -874,6 +1048,13 @@ mod tests {
         std::mem::take(&mut *HEARD.lock().unwrap())
     }
 
+    /// The waiting test's own log (tests run side by side).
+    static WAIT_HEARD: Mutex<Vec<(Id, isize)>> = Mutex::new(Vec::new());
+
+    extern "C" fn handle_wait(_this: Id, _: Sel, recognizer: Id) {
+        WAIT_HEARD.lock().unwrap().push((recognizer, state(recognizer, 0)));
+    }
+
     fn p(x: f64, y: f64) -> Point {
         Point { x, y }
     }
@@ -902,16 +1083,16 @@ mod tests {
         assert_eq!(view(tap, 0), outer);
 
         // A tap on the inner view.
-        assert!(!touch_changed(inner, 0, 1, Phase::Began, p(50.0, 50.0)));
-        assert!(touch_changed(inner, 0, 1, Phase::Ended, p(51.0, 50.0)), "the tap takes the touch");
+        assert_eq!(touch_changed(inner, 0, 1, Phase::Began, p(50.0, 50.0)), Verdict::Pass);
+        assert_eq!(touch_changed(inner, 0, 1, Phase::Ended, p(51.0, 50.0)), Verdict::Took, "the tap takes the touch");
         assert_eq!(take(), [(tap, ENDED, p(51.0, 50.0))]);
         assert_eq!((state(tap, 0), state(pan, 0)), (POSSIBLE, POSSIBLE), "both ready again");
 
         // A drag.
         touch_changed(inner, 0, 2, Phase::Began, p(50.0, 50.0));
-        assert!(!touch_changed(inner, 0, 2, Phase::Moved, p(55.0, 50.0)), "not yet 10 points");
+        assert_eq!(touch_changed(inner, 0, 2, Phase::Moved, p(55.0, 50.0)), Verdict::Pass, "not yet 10 points");
         assert!(take().is_empty());
-        assert!(touch_changed(inner, 0, 2, Phase::Moved, p(70.0, 50.0)), "the pan takes the touch");
+        assert_eq!(touch_changed(inner, 0, 2, Phase::Moved, p(70.0, 50.0)), Verdict::Took, "the pan takes the touch");
         touch_changed(inner, 0, 2, Phase::Moved, p(80.0, 60.0));
         touch_changed(inner, 0, 2, Phase::Ended, p(90.0, 60.0));
         assert_eq!(take(), [(pan, BEGAN, p(20.0, 0.0)), (pan, CHANGED, p(30.0, 10.0)), (pan, ENDED, p(40.0, 10.0))]);
@@ -920,22 +1101,95 @@ mod tests {
         // Turned off: nothing.
         set_enabled(pan, 0, 0);
         set_enabled(tap, 0, 0);
-        assert!(!touch_changed(inner, 0, 3, Phase::Began, p(1.0, 1.0)));
+        assert_eq!(touch_changed(inner, 0, 3, Phase::Began, p(1.0, 1.0)), Verdict::Pass);
         touch_changed(inner, 0, 3, Phase::Ended, p(1.0, 1.0));
         assert!(take().is_empty());
         view_remove(outer, 0, tap);
         assert_eq!(recognizers_of(outer), [pan]);
     }
 
-    /// A double tap needs both taps within the gap; a single tap that must
-    /// wait for it to fail is told only when no second tap came.
+    /// A single tap that must wait for a double tap to fail is told once the
+    /// double tap really failed (its gap passed), never when it recognized;
+    /// a recognizer turned off mid-touch stays out of that touch; a pan
+    /// measures in the asked view's points (a view scaled 2x halves them).
+    #[test]
+    fn recognizers_wait_for_failure_stay_off_and_measure_in_their_view() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let target_class = define_class("GestureTestWaitTarget", "NSObject", 8);
+        methods(target_class, &[("handle:", handle_wait as usize)]);
+        let target = runtime::send(runtime::send(target_class, "alloc", &[]), "init", &[]);
+        let take = || std::mem::take(&mut *WAIT_HEARD.lock().unwrap());
+        let new_view = |frame: Rect| {
+            let view = runtime::send(runtime::class_named("UIView"), "alloc", &[]);
+            crate::fw::uikit::send_rect(view, "initWithFrame:", frame);
+            view
+        };
+        let window = new_view(Rect::new(0.0, 0.0, 400.0, 400.0));
+        let view = new_view(Rect::new(0.0, 0.0, 300.0, 300.0));
+        runtime::send(window, "addSubview:", &[view]);
+        let make = |class: &str| init_with_target(runtime::alloc_instance(runtime::class_named(class)), 0, target, runtime::sel("handle:"));
+        let (single, double) = (make("UITapGestureRecognizer"), make("UITapGestureRecognizer"));
+        set_taps_required(double, 0, 2);
+        require_to_fail(single, 0, double);
+        view_add(view, 0, single);
+        view_add(view, 0, double);
+        // As main-loop work: other tests' main loops run the recognizers' timers too.
+        let touch = |finger: i32, phase: Phase, at: Point| crate::fw::runloop::as_main(|| touch_changed(view, 0, finger, phase, at));
+        let tap = |finger: i32| {
+            touch(finger, Phase::Began, p(50.0, 50.0));
+            touch(finger, Phase::Ended, p(50.0, 50.0));
+        };
+        let mine = |list: Vec<(Id, isize)>| list;
+        tap(801);
+        assert!(mine(take()).is_empty(), "the single tap waits for the double tap");
+        crate::fw::runloop::as_main(|| tap_gap_passed(double));
+        assert_eq!(mine(take()), [(single, ENDED)], "the double tap failed: the single one is told");
+        tap(802);
+        tap(803);
+        assert_eq!(mine(take()), [(double, ENDED)], "the double tap won");
+        crate::fw::runloop::as_main(|| tap_gap_passed(double));
+        assert!(mine(take()).is_empty(), "the single tap failed with it");
+        view_remove(view, 0, single);
+        view_remove(view, 0, double);
+
+        // Turned off mid-drag, then on again: nothing from that drag.
+        let pan = make("UIPanGestureRecognizer");
+        view_add(view, 0, pan);
+        touch(804, Phase::Began, p(50.0, 50.0));
+        set_enabled(pan, 0, 0);
+        touch(804, Phase::Moved, p(90.0, 50.0));
+        set_enabled(pan, 0, 1);
+        touch(804, Phase::Moved, p(120.0, 50.0));
+        touch(804, Phase::Ended, p(120.0, 50.0));
+        assert!(take().iter().all(|h| h.0 != pan), "off during the touch");
+
+        // Scaled 2x: 30 window points are 15 of the view's.
+        let s = runtime::sel("setTransform:");
+        let set_transform: extern "C" fn(Id, Sel, crate::fw::geometry::Transform) = unsafe { std::mem::transmute(runtime::imp_for(view, s).unwrap()) };
+        set_transform(view, s, crate::fw::geometry::Transform { a: 2.0, b: 0.0, c: 0.0, d: 2.0, tx: 0.0, ty: 0.0 });
+        touch(805, Phase::Began, p(50.0, 50.0));
+        touch(805, Phase::Moved, p(80.0, 50.0));
+        assert_eq!(translation_in_view(pan, 0, view), p(15.0, 0.0));
+        assert_eq!(translation_in_view(pan, 0, 0), p(30.0, 0.0), "the window's points");
+        set_translation(pan, 0, p(0.0, 0.0), view);
+        touch(805, Phase::Moved, p(90.0, 50.0));
+        assert_eq!(translation_in_view(pan, 0, view), p(5.0, 0.0));
+        touch(805, Phase::Ended, p(90.0, 50.0));
+        view_remove(view, 0, pan);
+        take();
+    }
+
+    /// A double tap needs both taps within the gap (between them it waits
+    /// for the next); swipes and pinches follow their fingers.
     #[test]
     fn multi_taps_count_their_taps() {
         let settings = |taps| Settings { taps, touches: 1, min_touches: 1, max_touches: isize::MAX, direction: 1, press: 0.5, movement: 10.0 };
         let mut double = Recognizer::new(Kind::Tap);
         let at = p(5.0, 5.0);
         step(&mut double, &settings(2), 1, Phase::Began, at, 0.0);
-        assert!(!step(&mut double, &settings(2), 1, Phase::Ended, at, 0.1).tell);
+        let first = step(&mut double, &settings(2), 1, Phase::Ended, at, 0.1);
+        assert!(!first.tell && first.tap_gap, "waits for the next tap");
         step(&mut double, &settings(2), 1, Phase::Began, at, 0.2);
         assert!(step(&mut double, &settings(2), 1, Phase::Ended, at, 0.3).recognized);
         let mut slow = Recognizer::new(Kind::Tap);
@@ -943,11 +1197,6 @@ mod tests {
         step(&mut slow, &settings(2), 1, Phase::Ended, at, 0.1);
         step(&mut slow, &settings(2), 1, Phase::Began, at, 1.0);
         assert!(!step(&mut slow, &settings(2), 1, Phase::Ended, at, 1.1).recognized, "too slow");
-        let mut single = Recognizer::new(Kind::Tap);
-        single.requires.push(0x1234);
-        step(&mut single, &settings(1), 1, Phase::Began, at, 0.0);
-        let out = step(&mut single, &settings(1), 1, Phase::Ended, at, 0.1);
-        assert_eq!((out.tell, out.wait_for), (false, vec![0x1234]));
         // A swipe right: 50 points mostly across, quickly.
         let mut swipe = Recognizer::new(Kind::Swipe);
         step(&mut swipe, &settings(1), 1, Phase::Began, p(0.0, 0.0), 0.0);
