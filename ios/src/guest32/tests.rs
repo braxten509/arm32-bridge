@@ -302,6 +302,9 @@ fn mbrtowc_keeps_a_partial_character_in_its_state() {
     // in the caller's mbstate_t (Darwin's is 128 bytes), then é from the
     // second, counting only the byte it read.
     let (out, state, text) = (alloc(4), alloc(128), alloc(4));
+    // A new mbstate_t starts zeroed, as C code makes it (malloc may hand back
+    // memory another test used).
+    mem().write_bytes(state, &[0; 128]);
     mem().write_bytes(text, &[0xC3, 0xA9, 0x41, 0]);
     assert_eq!(call("mbrtowc", [out, text, 1, state], &[]).0, u32::MAX - 1, "incomplete");
     assert_ne!(mem().read_u32(state), 0, "the first byte is kept");
