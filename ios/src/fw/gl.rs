@@ -58,6 +58,87 @@ pub fn required(name: &str) -> usize {
     crate::report::finish(1);
 }
 
+/// The system function a framebuffer call goes to in the current context:
+/// an OpenGL ES 1 context gets the OES_framebuffer_object name, as some
+/// drivers (the Pixel's PowerVR) have no standard name there and jump to 0.
+pub fn framebuffer_function(name: &'static str) -> usize {
+    pick_framebuffer_function(&OnceLock::new(), &OnceLock::new(), name)
+}
+
+fn pick_framebuffer_function(standard: &OnceLock<usize>, oes: &OnceLock<usize>, name: &'static str) -> usize {
+    if es1_current() {
+        *oes.get_or_init(|| required(&format!("{name}OES")))
+    } else {
+        *standard.get_or_init(|| required(name))
+    }
+}
+
+/// Whether this thread's current context is OpenGL ES 1 (asked once per context).
+fn es1_current() -> bool {
+    thread_local! {
+        static LAST: std::cell::Cell<(usize, bool)> = const { std::cell::Cell::new((0, false)) };
+    }
+    let context = unsafe { eglGetCurrentContext() };
+    if context == 0 {
+        return false;
+    }
+    LAST.with(|last| {
+        let (known, es1) = last.get();
+        if known == context {
+            return es1;
+        }
+        let mut version = 0;
+        unsafe { eglQueryContext(eglGetCurrentDisplay(), context, EGL_CONTEXT_CLIENT_VERSION, &mut version) };
+        let es1 = version == 1;
+        last.set((context, es1));
+        es1
+    })
+}
+
+const EGL_CONTEXT_CLIENT_VERSION: i32 = 0x3098;
+
+/// Like `system!`, for the framebuffer functions OpenGL ES 1 names with OES:
+/// each call goes to the name the current context has.
+macro_rules! framebuffer_system {
+    ($($name:ident ( $($arg:ident : $ty:ty),* ) $(-> $ret:ty)? ;)*) => {
+        $(
+            #[allow(non_snake_case, dead_code, clippy::too_many_arguments)]
+            pub unsafe extern "C" fn $name($($arg: $ty),*) $(-> $ret)? {
+                static STANDARD: OnceLock<usize> = OnceLock::new();
+                static OES: OnceLock<usize> = OnceLock::new();
+                let address = pick_framebuffer_function(&STANDARD, &OES, stringify!($name));
+                let f: unsafe extern "C" fn($($ty),*) $(-> $ret)? = unsafe { std::mem::transmute(address) };
+                unsafe { f($($arg),*) }
+            }
+        )*
+        /// Every function above with its standard name (for games' imports).
+        fn framebuffer_family() -> Vec<(&'static str, usize)> {
+            vec![$((stringify!($name), $name as usize)),*]
+        }
+    };
+}
+
+framebuffer_system! {
+    glBindFramebuffer(target: Enum, framebuffer: u32);
+    glGenFramebuffers(count: i32, out: *mut u32);
+    glDeleteFramebuffers(count: i32, names: *const u32);
+    glIsFramebuffer(framebuffer: u32) -> u8;
+    glFramebufferRenderbuffer(target: Enum, attachment: Enum, rb_target: Enum, renderbuffer: u32);
+    glFramebufferTexture2D(target: Enum, attachment: Enum, texture_target: Enum, texture: u32, level: i32);
+    glCheckFramebufferStatus(target: Enum) -> Enum;
+    glGetFramebufferAttachmentParameteriv(target: Enum, attachment: Enum, name: Enum, out: *mut i32);
+    glBindRenderbuffer(target: Enum, renderbuffer: u32);
+    glGenRenderbuffers(count: i32, out: *mut u32);
+    glDeleteRenderbuffers(count: i32, names: *const u32);
+    glIsRenderbuffer(renderbuffer: u32) -> u8;
+    glRenderbufferStorage(target: Enum, format: Enum, width: i32, height: i32);
+    glGetRenderbufferParameteriv(target: Enum, name: Enum, out: *mut i32);
+    glGenerateMipmap(target: Enum);
+    glBlendEquation(mode: Enum);
+    glBlendEquationSeparate(rgb: Enum, alpha: Enum);
+    glBlendFuncSeparate(src_rgb: Enum, dst_rgb: Enum, src_alpha: Enum, dst_alpha: Enum);
+}
+
 fn get_proc_address(name: &str) -> usize {
     let address = symbol(egl_library(), "eglGetProcAddress");
     if address == 0 {
@@ -132,6 +213,8 @@ pub type Enum = u32;
 
 system! {
     eglGetCurrentContext() -> usize;
+    eglGetCurrentDisplay() -> usize;
+    eglQueryContext(display: usize, context: usize, attribute: i32, value: *mut i32) -> u32;
     glGetError() -> Enum;
     glGetIntegerv(name: Enum, out: *mut i32);
     glGetString(name: Enum) -> *const u8;
@@ -140,16 +223,7 @@ system! {
     glDisable(cap: Enum);
     glColorMask(r: u8, g: u8, b: u8, a: u8);
     glGetBooleanv(name: Enum, out: *mut u8);
-    glBindFramebuffer(target: Enum, framebuffer: u32);
-    glGenFramebuffers(count: i32, out: *mut u32);
-    glDeleteFramebuffers(count: i32, names: *const u32);
-    glFramebufferRenderbuffer(target: Enum, attachment: Enum, rb_target: Enum, renderbuffer: u32);
-    glCheckFramebufferStatus(target: Enum) -> Enum;
-    glBindRenderbuffer(target: Enum, renderbuffer: u32);
-    glRenderbufferStorage(target: Enum, format: Enum, width: i32, height: i32);
     glRenderbufferStorageMultisample(target: Enum, samples: i32, format: Enum, width: i32, height: i32);
-    glGetRenderbufferParameteriv(target: Enum, name: Enum, out: *mut i32);
-    glGetFramebufferAttachmentParameteriv(target: Enum, attachment: Enum, name: Enum, out: *mut i32);
     glGetTexLevelParameteriv(target: Enum, level: i32, name: Enum, out: *mut i32);
     glBindTexture(target: Enum, texture: u32);
     glBlitFramebuffer(sx0: i32, sy0: i32, sx1: i32, sy1: i32, dx0: i32, dy0: i32, dx1: i32, dy1: i32, mask: u32, filter: Enum);
@@ -172,7 +246,6 @@ system! {
     glGetProgramiv(program: u32, name: Enum, out: *mut i32);
     glGetProgramInfoLog(program: u32, size: i32, length: *mut i32, out: *mut u8);
     glFinish();
-    glFramebufferTexture2D(target: Enum, attachment: Enum, texture_target: Enum, texture: u32, level: i32);
     glClear(mask: u32);
     glClearColor(r: f32, g: f32, b: f32, a: f32);
     glGetFloatv(name: Enum, out: *mut f32);
@@ -1369,6 +1442,12 @@ pub fn register(r: &mut Registry) {
     r.function("glPushGroupMarkerEXT", debug_marker as usize);
     r.function("glPopGroupMarkerEXT", debug_pop as usize);
     r.function("glDiscardFramebufferEXT", discard_framebuffer as usize);
+    // Framebuffer functions go to the name the current context has (ES 1: OES).
+    for (name, address) in framebuffer_family() {
+        if r.get(name).is_none() {
+            r.function(name, address);
+        }
+    }
     // An extension name of a standard function translated here takes the translation too.
     for (apple, standard) in SAME_AS_STANDARD {
         if let Some((address, crate::symbols::Kind::Function)) = r.get(standard) {
@@ -1397,6 +1476,7 @@ mod merged_tests {
         let function = |name: &str| r.get(name).map(|(address, _)| address);
         assert_eq!(function("glBindFramebufferOES"), Some(bind_framebuffer as usize));
         assert_eq!(function("glRenderbufferStorageOES"), Some(renderbuffer_storage as usize));
+        assert_eq!(function("glGenRenderbuffersOES"), Some(glGenRenderbuffers as usize), "picks ES 1's name in ES 1 contexts");
         for (extension, standard) in SAME_AS_STANDARD {
             if function(standard).is_some() {
                 assert_eq!(function(extension), function(standard), "{extension}");

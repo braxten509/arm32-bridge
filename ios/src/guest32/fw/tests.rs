@@ -583,6 +583,19 @@ fn pixel(pixels: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
 }
 
 #[test]
+fn es1_contexts_get_the_systems_oes_framebuffer_functions() {
+    // The Pixel's PowerVR driver has no glGenFramebuffers in an OpenGL ES 1
+    // context (the call jumped to address 0), so SpellCraft stopped at Play.
+    // ES 1 contexts must reach the system's OES functions instead.
+    setup();
+    es1_context();
+    for name in ["glGenFramebuffers", "glBindFramebuffer", "glGenRenderbuffers", "glRenderbufferStorage", "glCheckFramebufferStatus"] {
+        let oes = crate::fw::gl::required(&format!("{name}OES"));
+        assert_eq!(crate::fw::gl::framebuffer_function(name), oes, "{name} in an ES 1 context");
+    }
+}
+
+#[test]
 fn es1_contexts_draw_textured_coloured_client_arrays() {
     setup();
     es1_context();
