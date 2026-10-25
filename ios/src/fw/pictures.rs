@@ -499,6 +499,49 @@ fn screen_pictures(windows: &[Id], classes: &Classes) -> Vec<Picture> {
     resolve(windows.iter().flat_map(|&window| flatten(&snapshot(window, classes, 0))).collect())
 }
 
+/// Lines to log once the screen has drawn what they are about: tests tap on
+/// them ("screen shown: <class>", "screen drawn after tap at x,y"). Each
+/// waits for a draw that changed something and then a screen check that
+/// finds nothing new (a table's rows come one draw after the table), so a
+/// tap goes to what is really on screen. The bool: a change came since.
+static AFTER_DRAW: Mutex<Vec<(String, bool)>> = Mutex::new(Vec::new());
+
+pub fn on_next_draw(line: String) {
+    AFTER_DRAW.lock().unwrap_or_else(|e| e.into_inner()).push((line, false));
+}
+
+/// Whether the screen changed since it last settled.
+static UNSETTLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// After each screen check: a change, or (the first check with nothing new
+/// after one) the screen has settled.
+fn after_check(changed: bool) {
+    let settled = !changed && UNSETTLED.swap(changed, std::sync::atomic::Ordering::Relaxed);
+    if changed {
+        UNSETTLED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    announce_drawn(changed);
+    if settled {
+        crate::fw::touch::screen_settled();
+    }
+}
+
+fn announce_drawn(changed: bool) {
+    let ready: Vec<String> = {
+        let mut waiting = AFTER_DRAW.lock().unwrap_or_else(|e| e.into_inner());
+        if changed {
+            waiting.iter_mut().for_each(|(_, seen)| *seen = true);
+            return;
+        }
+        let (ready, still): (Vec<_>, Vec<_>) = std::mem::take(&mut *waiting).into_iter().partition(|(_, seen)| *seen);
+        *waiting = still;
+        ready.into_iter().map(|(line, _)| line).collect()
+    };
+    for line in ready {
+        crate::log!("{line}");
+    }
+}
+
 /// From the main loop: sends the pictures when they changed (at most 20 times a second).
 pub fn tick() {
     let Some(screen) = screen() else { return };
@@ -524,6 +567,8 @@ pub fn tick() {
         (screen.show)(&text);
     }
     *last = Some((std::time::Instant::now(), text));
+    drop(last);
+    after_check(changed);
 }
 
 #[cfg(test)]
@@ -554,6 +599,23 @@ mod tests {
 
     /// PC runs without a phone screen keep each list in the frames folder,
     /// numbered, to see what the phone would show.
+    #[test]
+    fn a_line_waiting_for_the_next_draw_comes_once_the_screen_has_changed_and_settled() {
+        let mut watch = crate::report::LineWatch::now();
+        let seen = |watch: &mut crate::report::LineWatch| watch.wait_for("draw test: the screen after a tap", std::time::Duration::ZERO);
+        on_next_draw("draw test: the screen after a tap".to_string());
+        announce_drawn(false);
+        assert!(!seen(&mut watch), "nothing new was drawn yet");
+        announce_drawn(true);
+        assert!(!seen(&mut watch), "still drawing (a table's rows come one draw later)");
+        announce_drawn(true);
+        announce_drawn(false);
+        assert!(seen(&mut watch), "logged once a check finds nothing new after the change");
+        announce_drawn(true);
+        announce_drawn(false);
+        assert!(!watch.wait_for("draw test: the screen after a tap", std::time::Duration::ZERO), "logged once");
+    }
+
     #[test]
     fn lists_are_kept_in_the_frames_folder_on_the_pc() {
         let folder = std::env::temp_dir().join(format!("gamebridge-pictures-{}", std::process::id()));

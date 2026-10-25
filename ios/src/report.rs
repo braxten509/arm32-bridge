@@ -110,6 +110,12 @@ pub fn stop_when_line_appears() {
 }
 
 pub fn line(text: &str) {
+    write_line(text);
+    // After the log lock is let go: a test tap waiting for this line goes now.
+    crate::fw::touch::line_logged(text);
+}
+
+fn write_line(text: &str) {
     let _guard = OUT.lock().unwrap_or_else(|e| e.into_inner());
     let tid = unsafe { libc::gettid() };
     let _ = writeln!(std::io::stderr(), "[ios {tid}] {text}");
@@ -559,11 +565,9 @@ mod tests {
     #[test]
     fn a_line_wait_still_sees_a_line_written_while_the_one_before_waited() {
         let mut watch = LineWatch::now();
-        std::thread::spawn(|| {
-            std::thread::sleep(Duration::from_millis(20));
-            line("line wait test: the first gate");
-            line("line wait test: the second gate");
-        });
+        // Both lines are in before the first wait looks, so it goes past the second.
+        line("line wait test: the first gate");
+        line("line wait test: the second gate");
         assert!(watch.wait_for("the first gate", Duration::from_millis(400)));
         assert!(watch.wait_for("the second gate", Duration::from_millis(0)), "a later wait looks at the lines the earlier wait went past");
     }

@@ -2,7 +2,7 @@
 # Builds the iPhone layer for ARM64 Linux and runs a game under qemu on the PC.
 # usage: run-pc.sh <App.app> [ios-run options...]
 #   env: IOS_HOME (game's writable folder), IOS_RUN_SECONDS, IOS_LIST_MISSING,
-#        IOS_TAPS (taps, see docs/ios-plan.md), IOS_WAIT_LIMIT, IOS_STOP_AFTER,
+#        IOS_TAPS (taps, see docs/ios-plan.md), IOS_STOP_AFTER,
 #        LOG (log file, default ~/.cache/ios-run.log), TAIL (lines shown, default 20),
 #        TIMEOUT (seconds, default 300)
 # Exits with the run's own exit code (124 = timed out); stops if the build fails.
@@ -13,7 +13,7 @@ LOG=${LOG:-$HOME/.cache/ios-run.log}
 export LIBGL_ALWAYS_SOFTWARE=${LIBGL_ALWAYS_SOFTWARE:-1}
 BUILD_LOG=$(mktemp)
 trap 'rm -f "$BUILD_LOG"' EXIT
-(cd "$ROOT" && ~/.cache/aarch64-cross/build.sh -p gamebridge-ios) > "$BUILD_LOG" 2>&1
+(cd "$ROOT" && SRC="$ROOT" ~/.cache/aarch64-cross/build.sh -p gamebridge-ios) > "$BUILD_LOG" 2>&1
 BUILD_STATUS=$?
 grep -E '^(error|warning)' -A6 "$BUILD_LOG" | head -60
 if [ "$BUILD_STATUS" -ne 0 ]; then

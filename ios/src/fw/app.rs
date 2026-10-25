@@ -37,6 +37,9 @@ fn class_for_name(name: Id, fallback: &str) -> Class {
 /// UIApplicationMain(argc, argv, principal class name, delegate class name).
 extern "C" fn ui_application_main(_argc: i32, _argv: usize, principal: Id, delegate_name: Id) -> i32 {
     crate::fw::runloop::mark_main_thread();
+    // Before anything is shown: the first screen's line must find its tap.
+    crate::fw::touch::schedule_test_taps();
+    crate::report::stop_when_line_appears();
     let app_class = class_for_name(principal, "UIApplication");
     let app = runtime::send(runtime::send(app_class, "alloc", &[]), "init", &[]);
     APPLICATION.store(app, Ordering::Relaxed);
@@ -83,8 +86,6 @@ extern "C" fn ui_application_main(_argc: i32, _argv: usize, principal: Id, deleg
     crate::fw::foundation::post("UIApplicationDidBecomeActiveNotification", app, 0);
     let seconds: f64 = std::env::var("IOS_RUN_SECONDS").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
     crate::report::reached_run_loop();
-    crate::fw::touch::schedule_test_taps();
-    crate::report::stop_when_line_appears();
     crate::fw::typing::schedule_test_typing();
     if seconds > 0.0 {
         crate::log!("run loop running for {seconds} s");

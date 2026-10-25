@@ -316,25 +316,29 @@ pub fn window_to_points(x: f64, y: f64, width: i32, height: i32) -> Point {
     Point { x: across * points_wide, y: down * points_high }
 }
 
-/// When a test tap fires: after a number of seconds from the start, or as
-/// soon as a log line holds some text.
+/// When a test tap goes, one step after another.
 #[derive(Clone, Debug, PartialEq)]
-enum When {
-    Time(f64),
+enum Trigger {
+    /// The moment a log line holds this (a plain part of the line, not a pattern).
     Line(String),
+    /// At the first drawn screen where something at the tap's place takes
+    /// touches (a button that shows up a while after its screen).
+    Ready,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 struct TestTap {
-    when: When,
+    on: Trigger,
     from: Point,
     to: Point,
 }
 
-/// IOS_TAPS="20:283,211;after=Mainmenu.jpg=>283,211;after=the menu=>389,297>400,300":
-/// taps at those times (seconds after start) or as soon as a log line holds
-/// the text after `after=` (points); a swipe goes from x,y to x2,y2 over
-/// about 150 ms. A step that isn't whole is left out.
+/// IOS_TAPS="on=screen shown: IntroViewController=>505,29;ready=>284,297;on=frame 1 shown=>420,250>460,250":
+/// each tap goes out the moment a log line holds the text after `on=`
+/// (`after=` means the same), or with `ready` once the drawn screen has
+/// something at that place to take it; nothing waits or counts seconds. A
+/// swipe goes from x,y to x2,y2 over about 150 ms. A step that isn't whole
+/// is left out.
 fn parse_test_taps(text: &str) -> Vec<TestTap> {
     let point = |text: &str| -> Option<Point> {
         let (x, y) = text.split_once(',')?;
@@ -342,74 +346,128 @@ fn parse_test_taps(text: &str) -> Vec<TestTap> {
     };
     text.split(';')
         .filter_map(|step| {
-            let (when, place) = match step.split_once("=>") {
-                Some((wait, place)) => (When::Line(wait.trim().strip_prefix("after=")?.to_string()), place),
-                None => {
-                    let (time, place) = step.split_once(':')?;
-                    (When::Time(time.trim().parse().ok()?), place)
-                }
+            let (when, place) = step.split_once("=>")?;
+            let when = when.trim();
+            let on = match when {
+                "ready" => Trigger::Ready,
+                _ => Trigger::Line(when.strip_prefix("on=").or_else(|| when.strip_prefix("after=")).filter(|text| !text.is_empty())?.to_string()),
             };
             let (from, to) = match place.trim().split_once('>') {
                 Some((from, to)) => (point(from)?, point(to)?),
                 None => (point(place.trim())?, point(place.trim())?),
             };
-            Some(TestTap { when, from, to })
+            Some(TestTap { on, from, to })
         })
         .collect()
 }
 
-/// How long a tap waits for its line before it taps anyway: IOS_WAIT_LIMIT,
-/// 60 s by default. The limit only shows up when a test is broken; a test
-/// that passes taps as soon as its line comes.
-fn test_wait_limit() -> std::time::Duration {
-    let seconds: f64 = std::env::var("IOS_WAIT_LIMIT").ok().and_then(|text| text.parse().ok()).unwrap_or(60.0);
-    std::time::Duration::from_secs_f64(seconds.max(0.0))
-}
+/// The test taps still to come, in order, and who sends them.
+static TEST_TAPS: std::sync::Mutex<std::collections::VecDeque<TestTap>> = std::sync::Mutex::new(std::collections::VecDeque::new());
+static TEST_TAP_SENDER: std::sync::Mutex<fn(TestTap)> = std::sync::Mutex::new(send_test_tap);
+static TAPS_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static TEST_FINGER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 /// IOS_TAPS makes the test taps on the PC (the phone hands touches over its
 /// own way, see `deliver`).
 pub fn schedule_test_taps() {
     let Ok(text) = std::env::var("IOS_TAPS") else { return };
     let taps = parse_test_taps(&text);
-    let limit = test_wait_limit();
-    std::thread::spawn(move || {
-        let start = now();
-        let mut watch = crate::report::LineWatch::now();
-        for (finger, tap) in taps.into_iter().enumerate() {
-            match &tap.when {
-                When::Time(time) => {
-                    let wait = start + time - now();
-                    if wait > 0.0 {
-                        crate::log!("test tap at {time:.1} s: a fixed wait, slower than an after= line (IOS_TAPS)");
-                        std::thread::sleep(std::time::Duration::from_secs_f64(wait));
-                    }
-                }
-                When::Line(text) => {
-                    let began = now();
-                    if watch.wait_for(text, limit) {
-                        crate::log!("test tap kept by the line \"{text}\" after {:.1} s", now() - began);
-                    } else {
-                        crate::log!("test tap waited {:.0} s for a line holding \"{text}\" and did not see one (IOS_WAIT_LIMIT); tapping anyway", limit.as_secs_f64());
-                    }
-                }
-            }
-            let (from, to) = (tap.from, tap.to);
-            let swipe = from.x != to.x || from.y != to.y;
-            crate::log!("test {} at {:.0},{:.0}", if swipe { "swipe" } else { "tap" }, from.x, from.y);
-            let finger = finger as i32;
-            let send = |phase: Phase, at: Point| {
-                crate::fw::runloop::post(crate::fw::runloop::Work::Native(Box::new(move || deliver_now(finger, phase, at))));
-            };
-            send(Phase::Began, from);
-            let steps = if swipe { 6 } else { 0 };
-            for step in 1..=steps {
-                std::thread::sleep(std::time::Duration::from_millis(25));
-                let f = step as f64 / steps as f64;
-                send(Phase::Moved, Point { x: from.x + (to.x - from.x) * f, y: from.y + (to.y - from.y) * f });
-            }
-            std::thread::sleep(std::time::Duration::from_millis(if swipe { 25 } else { 80 }));
-            send(Phase::Ended, to);
+    crate::log!("test taps: {} steps, each sent the moment its line is logged", taps.len());
+    arm_test_taps(taps, send_test_tap);
+}
+
+fn arm_test_taps(taps: Vec<TestTap>, sender: fn(TestTap)) {
+    *TEST_TAP_SENDER.lock().unwrap_or_else(|e| e.into_inner()) = sender;
+    *TEST_TAPS.lock().unwrap_or_else(|e| e.into_inner()) = taps.into();
+    TAPS_ARMED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Every log line comes here (see `report::line`): if it is the next test
+/// tap's line, the tap is sent right now, from inside the log call.
+pub fn line_logged(text: &str) {
+    if !TAPS_ARMED.load(std::sync::atomic::Ordering::Relaxed) || text.starts_with("test tap") || text.starts_with("test swipe") {
+        return;
+    }
+    let tap = {
+        let mut taps = TEST_TAPS.lock().unwrap_or_else(|e| e.into_inner());
+        match taps.front().map(|next| &next.on) {
+            Some(Trigger::Line(line)) if text.contains(line.as_str()) => taps.pop_front(),
+            _ => None,
         }
+    };
+    if let Some(tap) = tap {
+        let sender = *TEST_TAP_SENDER.lock().unwrap_or_else(|e| e.into_inner());
+        sender(tap);
+    }
+}
+
+/// From the main loop each time the drawn screen has settled (see
+/// `pictures::tick`): sends the next tap if it is a `ready` one and
+/// something there takes touches now.
+pub fn screen_settled() {
+    screen_settled_with(|at| {
+        let window = key_window();
+        let mut handler = if window == 0 { 0 } else { hit_test(window, at) };
+        while handler != 0 && !runtime::responds(handler, "touchesBegan:withEvent:") {
+            handler = view_state(handler).superview;
+        }
+        handler != 0
+    });
+}
+
+fn screen_settled_with(takes_touches: impl Fn(Point) -> bool) {
+    if !TAPS_ARMED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let tap = {
+        let mut taps = TEST_TAPS.lock().unwrap_or_else(|e| e.into_inner());
+        match taps.front() {
+            Some(next) if next.on == Trigger::Ready && takes_touches(next.from) => taps.pop_front(),
+            _ => None,
+        }
+    };
+    if let Some(tap) = tap {
+        let sender = *TEST_TAP_SENDER.lock().unwrap_or_else(|e| e.into_inner());
+        sender(tap);
+    }
+}
+
+/// Like a finger: a tap is held 80 ms (games that walk while the finger is
+/// down, such as cocos2d maps, ignore a press and release in one go); a
+/// swipe's moves come 25 ms apart.
+fn send_test_tap(tap: TestTap) {
+    let (from, to) = (tap.from, tap.to);
+    let swipe = from.x != to.x || from.y != to.y;
+    let why = match &tap.on {
+        Trigger::Line(line) => format!("on the line \"{line}\""),
+        Trigger::Ready => "something there takes it now".to_string(),
+    };
+    crate::log!("test {} at {:.0},{:.0} ({why})", if swipe { "swipe" } else { "tap" }, from.x, from.y);
+    let finger = TEST_FINGER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let send = move |phase: Phase, at: Point| {
+        crate::fw::runloop::post(crate::fw::runloop::Work::Native(Box::new(move || deliver_now(finger, phase, at))));
+    };
+    let ended = move || {
+        crate::fw::runloop::post(crate::fw::runloop::Work::Native(Box::new(move || {
+            deliver_now(finger, Phase::Ended, to);
+            // The next tap can go on this line: the screen after this one.
+            crate::fw::pictures::on_next_draw(format!("screen drawn after tap at {:.0},{:.0}", to.x, to.y));
+        })));
+    };
+    send(Phase::Began, from);
+    std::thread::spawn(move || {
+        if !swipe {
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            ended();
+            return;
+        }
+        for step in 1..=6 {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            let f = step as f64 / 6.0;
+            send(Phase::Moved, Point { x: from.x + (to.x - from.x) * f, y: from.y + (to.y - from.y) * f });
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        ended();
     });
 }
 
@@ -643,22 +701,57 @@ mod tests {
     }
 
     #[test]
-    fn test_taps_fire_on_a_log_line_or_a_time() {
-        let taps = parse_test_taps("after=Mainmenu.jpg=>283,211;20:100,50;after=-[TileMapLayer init]=>389,297>400,300");
+    fn test_taps_name_the_line_they_tap_on() {
+        let taps = parse_test_taps("on=screen shown: IntroViewController=>505,29;after=Mainmenu.jpg=>283,211;on=-[TileMapLayer init]=>389,297>400,300");
         let at = |x: f64, y: f64| Point { x, y };
         assert_eq!(taps.len(), 3, "three steps: {taps:?}");
-        assert_eq!(taps[0].when, When::Line("Mainmenu.jpg".to_string()));
-        assert_eq!((taps[0].from, taps[0].to), (at(283.0, 211.0), at(283.0, 211.0)));
-        assert_eq!(taps[1].when, When::Time(20.0));
-        assert_eq!((taps[1].from, taps[1].to), (at(100.0, 50.0), at(100.0, 50.0)));
-        assert_eq!(taps[2].when, When::Line("-[TileMapLayer init]".to_string()));
+        assert_eq!(taps[0].on, Trigger::Line("screen shown: IntroViewController".to_string()));
+        assert_eq!((taps[0].from, taps[0].to), (at(505.0, 29.0), at(505.0, 29.0)));
+        assert_eq!(taps[1].on, Trigger::Line("Mainmenu.jpg".to_string()), "after= still means the same");
+        assert_eq!(taps[2].on, Trigger::Line("-[TileMapLayer init]".to_string()));
         assert_eq!((taps[2].from, taps[2].to), (at(389.0, 297.0), at(400.0, 300.0)), "a swipe still goes from one place to another");
     }
 
     #[test]
     fn test_tap_steps_that_make_no_sense_are_left_out() {
-        let taps = parse_test_taps("after=a line with no place;soon:1,2;30:3,4;after=ready=>");
-        assert_eq!(taps.len(), 1, "only the time step is whole: {taps:?}");
-        assert_eq!(taps[0].when, When::Time(30.0));
+        // Fixed-time steps ("30:3,4") are gone: a tap only comes from a line.
+        let taps = parse_test_taps("after=a line with no place;soon:1,2;30:3,4;on=ready=>;on=go=>3,4");
+        assert_eq!(taps.len(), 1, "only the last step is whole: {taps:?}");
+        assert_eq!(taps[0].on, Trigger::Line("go".to_string()));
+    }
+
+    #[test]
+    fn a_ready_tap_goes_once_the_drawn_screen_has_something_there_to_take_it() {
+        let taps = parse_test_taps("ready=>505,29;on=after=>1,2");
+        assert_eq!(taps.len(), 2, "{taps:?}");
+        assert_eq!(taps[0].on, Trigger::Ready);
+        static SENT: std::sync::Mutex<Vec<(f64, f64)>> = std::sync::Mutex::new(Vec::new());
+        fn record(tap: TestTap) {
+            SENT.lock().unwrap().push((tap.from.x, tap.from.y));
+        }
+        let sent = || SENT.lock().unwrap().clone();
+        arm_test_taps(taps, record);
+        crate::log!("after (a line step waits its turn behind the ready step)");
+        assert_eq!(sent(), []);
+        screen_settled_with(|_| false);
+        assert_eq!(sent(), [], "nothing at 505,29 takes a tap yet");
+        screen_settled_with(|at| at.x == 505.0 && at.y == 29.0);
+        assert_eq!(sent(), [(505.0, 29.0)], "sent at the first drawn screen with a taker there");
+    }
+
+    #[test]
+    fn a_test_tap_is_sent_the_moment_its_line_is_logged() {
+        static SENT: std::sync::Mutex<Vec<(f64, f64)>> = std::sync::Mutex::new(Vec::new());
+        fn record(tap: TestTap) {
+            SENT.lock().unwrap().push((tap.from.x, tap.from.y));
+        }
+        let sent = || SENT.lock().unwrap().clone();
+        arm_test_taps(parse_test_taps("on=tap test: screen one=>10,20;on=tap test: screen two=>30,40"), record);
+        crate::log!("tap test: screen two (too early: the first step comes first)");
+        assert_eq!(sent(), [], "steps go in order");
+        crate::log!("tap test: screen one");
+        assert_eq!(sent(), [(10.0, 20.0)], "the tap went out inside the log call, nothing waited");
+        crate::log!("tap test: screen two");
+        assert_eq!(sent(), [(10.0, 20.0), (30.0, 40.0)]);
     }
 }

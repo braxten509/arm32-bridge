@@ -1065,6 +1065,8 @@ fn will_appear(controller: Id, animated: bool) -> bool {
 fn did_appear(controller: Id, animated: bool) {
     property_set(controller, "appeared", 1);
     tell_appearance(controller, "viewDidAppear:", animated);
+    // Tests tap on this line (IOS_TAPS "on=screen shown: <class>"), once it is drawn.
+    crate::fw::pictures::on_next_draw(format!("screen shown: {}", crate::fw::string::describe_class_of(controller)));
 }
 
 /// viewWillDisappear: if the controller is on screen; whether it was sent.

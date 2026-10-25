@@ -54,19 +54,23 @@ Or build and run in one go (log in `~/.cache/ios-run.log`):
 IOS_RUN_SECONDS=15 ios/tools/run-pc.sh <App>.app [--keep-going]
 ```
 
-A test waits for lines, not seconds: each tap fires as soon as a log line
-says the screen before it is ready, and the run ends the moment the check
-passes (the run seconds are then only the cap for a broken test):
+A test never waits: each tap goes out the moment the log line of its
+screen is written (from inside that log call), and the run ends the moment
+the check passes (the run seconds are then only the cap for a broken test).
+Each game screen logs `screen shown: <controller class>` once it has
+appeared and been drawn, and every test tap logs `screen drawn after tap at
+x,y` once the screen it led to is drawn (both need a screen: the phone's, or
+`IOS_FRAMES_DIR` on the PC):
 
 ```bash
-IOS_TAPS="after=ScrollLogoHeader@2x.png=>283,211;after=pictures: 6 shown=>505,29" \
+IOS_TAPS="on=screen shown: DungeonHeroViewController=>283,211;on=screen drawn after tap at 283,211=>389,297" \
 IOS_STOP_AFTER="graphics: frame 1 shown" \
 IOS_RUN_SECONDS=240 ios/tools/run-pc.sh <App>.app [--keep-going]
 ```
 
-`after=` takes a plain part of a line (not a pattern) and ends at `=>`; a
-step whose line never comes taps anyway after `IOS_WAIT_LIMIT` seconds (60
-by default) and says so in the log.
+`on=` (or the older `after=`) takes a plain part of a line (not a pattern)
+and ends at `=>`; steps go in order. There are no fixed-time taps: a step
+whose line never comes is never tapped, and the run cap ends the test.
 
 Check that our fix-up lists match Apple's tool exactly:
 
@@ -152,11 +156,9 @@ Bugs found on the way (details in `ios/DEBUGGING.md`):
 
 Test switches: `IOS_FRAMES_DIR` (save frames), `IOS_FRAME_EVERY` (default
 60), `IOS_FRAME_LIMIT` (stop after that many frames), `IOS_TAPS`
-(`"20:283,211;after=Mainmenu.jpg=>283,211;after=the menu=>389,297>400,300"`
-in points: a tap at that many seconds, or as soon as a log line holds the
-text after `after=`; a swipe goes from x,y to x2,y2), `IOS_WAIT_LIMIT`
-(the seconds a tap waits for its line before tapping anyway, default 60),
-`IOS_STOP_AFTER` (ends the run, code 0, as soon as a log line holds that
+(`"on=screen shown: IntroViewController=>505,29;on=the menu=>389,297>400,300"`
+in points: a tap the moment a log line holds the text after `on=`; a swipe
+goes from x,y to x2,y2), `IOS_STOP_AFTER` (ends the run, code 0, as soon as a log line holds that
 text), `IOS_STACKS_AT` (every thread's call chain
 at that time). Tests wait for lines, not seconds: a tap waits for the
 screen it needs, so a slow start costs nothing and a happy run ends the

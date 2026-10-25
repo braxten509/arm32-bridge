@@ -448,8 +448,12 @@ struct State {
 }
 
 /// How long Stop, Reset and Dispose wait for a callback another thread is
-/// running before giving up (it may be waiting on their caller).
+/// running before giving up (it may be waiting on their caller). Tests
+/// use a short one so the give-up case doesn't sit out two seconds.
+#[cfg(not(test))]
 const CALLBACK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+#[cfg(test)]
+const CALLBACK_WAIT: std::time::Duration = std::time::Duration::from_millis(300);
 
 /// Which thread is running one of the queue's callbacks, and how deeply.
 #[derive(Default)]
@@ -1434,7 +1438,7 @@ mod tests {
         let thread = std::thread::spawn(move || {
             deliver(&queue_ref, None, || {
                 s.store(true, std::sync::atomic::Ordering::SeqCst);
-                std::thread::sleep(CALLBACK_WAIT + std::time::Duration::from_millis(300));
+                std::thread::sleep(CALLBACK_WAIT + std::time::Duration::from_millis(100));
                 d.store(true, std::sync::atomic::Ordering::SeqCst);
             })
         });

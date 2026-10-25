@@ -816,7 +816,58 @@ impl Canvas {
         self.paint(rect, Blend::Over, &|_, _| color);
     }
 
+    /// The device pixels (x0, x1, y0, y1; y from the bottom, not cut to the
+    /// canvas) a user rectangle covers when it covers whole pixels: no
+    /// turn and every edge on a pixel edge.
+    fn whole_pixels(&self, rect: Rect) -> Option<(i64, i64, i64, i64)> {
+        let ctm = self.state.ctm;
+        if ctm.b != 0.0 || ctm.c != 0.0 {
+            return None;
+        }
+        let rect = standard(rect);
+        let whole = |v: f64| (v - v.round()).abs() < 1e-9 && v.abs() < 1e9;
+        let xs = [ctm.a * rect.origin.x + ctm.tx, ctm.a * (rect.origin.x + rect.size.width) + ctm.tx];
+        let ys = [ctm.d * rect.origin.y + ctm.ty, ctm.d * (rect.origin.y + rect.size.height) + ctm.ty];
+        if !xs.iter().chain(&ys).all(|&v| whole(v)) {
+            return None;
+        }
+        let (x0, x1) = (xs[0].min(xs[1]).round() as i64, xs[0].max(xs[1]).round() as i64);
+        let (y0, y1) = (ys[0].min(ys[1]).round() as i64, ys[0].max(ys[1]).round() as i64);
+        Some((x0, x1, y0, y1))
+    }
+
+    /// The canvas rows and columns of a whole-pixel box, cut to the canvas.
+    fn cut(&self, (x0, x1, y0, y1): (i64, i64, i64, i64)) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
+        let range = |a: i64, b: i64, most: usize| a.clamp(0, most as i64) as usize..b.clamp(0, most as i64) as usize;
+        (range(x0, x1, self.width), range(y0, y1, self.height))
+    }
+
+    /// ClearRect over whole pixels with no clip: every pixel there becomes
+    /// the same cleared bytes, so they are set row by row (as `paint` would
+    /// set them one by one). Whether it applied.
+    fn clear_whole_pixels(&mut self, rect: Rect) -> bool {
+        if self.state.clip.is_some() {
+            return false;
+        }
+        let Some(area) = self.whole_pixels(rect) else { return false };
+        let (xs, ys) = self.cut(area);
+        let (layout, height, bytes_per_row) = (self.layout, self.height, self.bytes_per_row);
+        let mut cleared = [0u8; 4];
+        layout.write(&mut cleared[..layout.bytes], [0.0; 4]);
+        let memory = self.memory();
+        for y in ys {
+            let row = (height - 1 - y) * bytes_per_row;
+            for pixel in memory[row + xs.start * layout.bytes..row + xs.end * layout.bytes].chunks_exact_mut(layout.bytes) {
+                pixel.copy_from_slice(&cleared[..layout.bytes]);
+            }
+        }
+        true
+    }
+
     fn clear_rect(&mut self, rect: Rect) {
+        if self.clear_whole_pixels(rect) {
+            return;
+        }
         let alpha = self.state.alpha;
         self.state.alpha = 1.0;
         self.paint(rect, Blend::Clear, &|_, _| [0.0, 0.0, 0.0, 1.0]);
@@ -844,6 +895,39 @@ impl Canvas {
             let (s, t) = map(u, v);
             bitmap.sample(&source, s, t)
         });
+    }
+
+    /// CGContextDrawImage: a picture landing pixel for pixel (one picture
+    /// pixel per device pixel, on pixel edges, no turn) is read straight
+    /// from its pixels; anything else is sampled by `draw_bitmap`.
+    fn draw_image(&mut self, rect: Rect, bitmap: &Bitmap) {
+        if !self.draw_whole_pixels(rect, bitmap) {
+            self.draw_bitmap(rect, bitmap, &|u, v| (u, v));
+        }
+    }
+
+    fn draw_whole_pixels(&mut self, rect: Rect, bitmap: &Bitmap) -> bool {
+        let Some(source) = bitmap.layout() else { return false };
+        let Some(area) = self.whole_pixels(rect) else { return false };
+        let (x0, x1, y0, y1) = area;
+        if bitmap.width == 0 || (x1 - x0) as usize != bitmap.width || (y1 - y0) as usize != bitmap.height {
+            return false;
+        }
+        // The picture's first row is the rectangle's top (user max y): the
+        // device top when y goes up, the device bottom when flipped.
+        let (mirrored, upright) = (self.state.ctm.a < 0.0, self.state.ctm.d > 0.0);
+        let alpha = self.state.alpha as f32;
+        let (xs, ys) = self.cut(area);
+        for y in ys {
+            let row = (if upright { y1 - 1 - y as i64 } else { y as i64 - y0 }) as usize;
+            for x in xs.clone() {
+                let column = (if mirrored { x1 - 1 - x as i64 } else { x as i64 - x0 }) as usize;
+                let at = row * bitmap.bytes_per_row + column * source.bytes;
+                let color = source.read(&bitmap.data[at..at + source.bytes]);
+                self.blend(x, y, scaled(color, alpha), &Blend::Over);
+            }
+        }
+        true
     }
 
     fn draw_linear_gradient(&mut self, gradient: &Gradient, start: Point, end: Point, options: u32) {
@@ -1034,7 +1118,7 @@ extern "C" fn context_draw_image(context: Id, rect: Rect, picture: Id) {
         return;
     };
     if let Some(mut c) = canvas("CGContextDrawImage", context) {
-        c.draw_bitmap(rect, &bitmap, &|u, v| (u, v));
+        c.draw_image(rect, &bitmap);
     }
 }
 extern "C" fn context_draw_linear_gradient(context: Id, gradient: Id, start: Point, end: Point, options: u32) {
@@ -1717,6 +1801,36 @@ mod tests {
         // Left mirrored: the stored first row runs down the left side.
         assert_eq!(orient(6, 0.0, 1.0), (1.0, 0.0));
         assert_eq!(orient(7, 0.0, 0.0), (1.0, 1.0));
+    }
+
+    #[test]
+    fn pixel_exact_draws_and_clears_match_the_general_path() {
+        // 7x5 picture with every kind of alpha (premultiplied, so colour <= alpha).
+        let data: Vec<u8> = (0..35u32).flat_map(|i| { let a = [255u8, 0, 128, 37][i as usize % 4]; [((i * 53) % 256) as u8 & a, ((i * 31) % 256) as u8 & a, (i * 7) as u8 & a, a] }).collect();
+        let picture = Bitmap { width: 7, height: 5, bits_per_pixel: 32, bytes_per_row: 28, info: PREMULTIPLIED_LAST, space: Space::Rgb, data };
+        let start = |c: &mut Canvas, flip: bool| {
+            if flip {
+                c.state.ctm = Transform { a: 1.0, b: 0.0, c: 0.0, d: -1.0, tx: 0.0, ty: 6.0 };
+            }
+            c.state.fill = [0.2, 0.6, 0.9, 0.7];
+            c.fill_rect(Rect::new(0.0, 0.0, 9.0, 6.0));
+        };
+        for (flip, info) in [(false, PREMULTIPLIED_LAST), (true, PREMULTIPLIED_FIRST | ORDER_32_LITTLE), (true, NONE_SKIP_LAST)] {
+            // Partly off the canvas, so the edges are cut too.
+            for at in [Rect::new(1.0, 0.0, 7.0, 5.0), Rect::new(4.0, 3.0, 7.0, 5.0)] {
+                let (mut quick, mut general) = (canvas(9, 6, info), canvas(9, 6, info));
+                start(&mut quick, flip);
+                start(&mut general, flip);
+                quick.draw_image(at, &picture);
+                general.draw_bitmap(at, &picture, &|u, v| (u, v));
+                let (q, g) = (quick.memory().to_vec(), general.memory().to_vec());
+                assert!(q.iter().zip(&g).all(|(a, b)| a.abs_diff(*b) <= 1), "draw flip={flip} info={info:#x} at {at:?}:\n{q:?}\n{g:?}");
+                quick.clear_rect(Rect::new(2.0, 1.0, 3.0, 2.0));
+                general.paint(Rect::new(2.0, 1.0, 3.0, 2.0), Blend::Clear, &|_, _| [0.0, 0.0, 0.0, 1.0]);
+                let (q, g) = (quick.memory().to_vec(), general.memory().to_vec());
+                assert!(q.iter().zip(&g).all(|(a, b)| a.abs_diff(*b) <= 1), "clear flip={flip} info={info:#x}");
+            }
+        }
     }
 
     #[test]
