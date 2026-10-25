@@ -241,12 +241,8 @@ const OBJECT_CONSTANTS: &[&str] = &[
     "SKErrorDomain", "MPMovieDurationAvailableNotification", "MPMoviePlayerContentPreloadDidFinishNotification",
     "MPMoviePlayerLoadStateDidChangeNotification", "MPMoviePlayerPlaybackDidFinishNotification",
     "MPMoviePlayerPlaybackDidFinishReasonUserInfoKey", "MPMoviePlayerPlaybackStateDidChangeNotification",
-    "MPMoviePlayerNowPlayingMovieDidChangeNotification", "kCAFillModeForwards", "kCAFillModeBackwards",
-    "kCAFillModeBoth", "kCAFillModeRemoved", "kCAMediaTimingFunctionLinear", "kCAMediaTimingFunctionEaseIn",
-    "kCAMediaTimingFunctionEaseOut", "kCAMediaTimingFunctionEaseInEaseOut", "kCAMediaTimingFunctionDefault",
-    "kCATransitionFade", "kCATransitionMoveIn", "kCATransitionPush", "kCATransitionReveal", "kCATransitionFromRight",
-    "kCATransitionFromLeft", "kCATransitionFromTop", "kCATransitionFromBottom", "kCAAnimationLinear",
-    "kCAAnimationDiscrete", "kCAAnimationPaced", "kCAAnimationCubic", "kCAAnimationCubicPaced",
+    "MPMoviePlayerNowPlayingMovieDidChangeNotification",
+    // (Core Animation's are fw::animation::CONSTANT_NAMES, below.)
     // Foundation
     "NSDefaultRunLoopMode", "NSRunLoopCommonModes", "NSInternalInconsistencyException", "NSInvalidArgumentException",
     "NSLocalizedDescriptionKey", "NSLocalizedFailureReasonErrorKey", "NSUnderlyingErrorKey", "NSPOSIXErrorDomain",

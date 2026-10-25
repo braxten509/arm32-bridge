@@ -2330,33 +2330,7 @@ pub fn register(r: &mut Registry) {
     r.data("UIWindowLevelNormal", leak(0.0f64));
     r.data("UIWindowLevelStatusBar", leak(1000.0f64));
     r.data("UIWindowLevelAlert", leak(2000.0f64));
-    // Core Animation's names (fill modes, timing functions, transitions, key frame modes).
-    for (name, value) in [
-        ("kCAFillModeForwards", "forwards"),
-        ("kCAFillModeBackwards", "backwards"),
-        ("kCAFillModeBoth", "both"),
-        ("kCAFillModeRemoved", "removed"),
-        ("kCAMediaTimingFunctionLinear", "linear"),
-        ("kCAMediaTimingFunctionEaseIn", "easeIn"),
-        ("kCAMediaTimingFunctionEaseOut", "easeOut"),
-        ("kCAMediaTimingFunctionEaseInEaseOut", "easeInEaseOut"),
-        ("kCAMediaTimingFunctionDefault", "default"),
-        ("kCATransitionFade", "fade"),
-        ("kCATransitionMoveIn", "moveIn"),
-        ("kCATransitionPush", "push"),
-        ("kCATransitionReveal", "reveal"),
-        ("kCATransitionFromRight", "fromRight"),
-        ("kCATransitionFromLeft", "fromLeft"),
-        ("kCATransitionFromTop", "fromTop"),
-        ("kCATransitionFromBottom", "fromBottom"),
-        ("kCAAnimationLinear", "linear"),
-        ("kCAAnimationDiscrete", "discrete"),
-        ("kCAAnimationPaced", "paced"),
-        ("kCAAnimationCubic", "cubic"),
-        ("kCAAnimationCubicPaced", "cubicPaced"),
-    ] {
-        r.data(name, leak(string::make(value)));
-    }
+    // Core Animation's names (fill modes, timing functions, ...) are in fw/animation.rs.
     r.data("UIBackgroundTaskInvalid", leak(0usize));
     let _ = ignore_id_bool;
 }
