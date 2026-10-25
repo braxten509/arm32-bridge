@@ -439,6 +439,12 @@ fn stack_size(id: u32) -> u32 {
     }
 }
 
+/// The guest stack (top, size) of live thread `handle`, once it has run guest code.
+pub fn guest_stack(handle: u32) -> Option<(u32, u32)> {
+    let runner = identity(handle)?.runner.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
+    (runner.stack_top != 0).then(|| (runner.stack_top, stack_size(runner.thread_id)))
+}
+
 /// Fills a guest pthread_attr_t.
 fn write_attributes(attributes: u32, flags: u32, stack_base: u32, stack_size: u32) {
     let values = [flags, stack_base, stack_size, 4096, 0, 0];

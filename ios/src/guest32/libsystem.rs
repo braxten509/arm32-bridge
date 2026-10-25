@@ -41,9 +41,11 @@ const REUSED: &[&str] = &[
     "time", "gettimeofday", "clock", "localtime", "localtime_r", "gmtime", "gmtime_r", "mktime", "difftime",
     "strftime", "nanosleep", "usleep", "sleep", "sched_yield",
     // process
-    "getpid", "getuid", "geteuid", "getgid", "getegid", "getenv", "setenv", "_exit", "abort",
+    "getpid", "getppid", "getuid", "geteuid", "getgid", "getegid", "getenv", "setenv", "_exit", "abort",
     "__stack_chk_fail", "setjmp", "_setjmp", "longjmp", "_longjmp", "sigsetjmp", "siglongjmp", "arc4random_buf",
-    "gethostname", "getpagesize",
+    "gethostname", "getpagesize", "mkstemp", "syslog",
+    // struct in_addr by value: one word on both
+    "inet_ntoa",
     // math
     "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh", "exp", "exp2", "log", "log10", "log2",
     "log1p", "expm1", "cbrt", "ceil", "floor", "sqrt", "rint", "atan2", "pow", "fmod", "hypot", "round", "trunc",
@@ -960,6 +962,156 @@ fn process() {
         }))
         .unwrap(),
     );
+    // The program file's name, as argv[0] gives it.
+    function(
+        "getprogname",
+        handler!(|uc, a| {
+            let path = super::main_image().map_or("", |image| image.2.as_str());
+            Ret::U32(super::cstring_permanent(path.rsplit('/').next().unwrap_or(path)))
+        })
+        .unwrap(),
+    );
+    // _NSGetExecutablePath(buffer, uint32_t *size): 0, or -1 with the size needed.
+    function(
+        "_NSGetExecutablePath",
+        handler!(|uc, a| {
+            let (buffer, size) = (a.u32(), a.u32());
+            let path = super::main_image().map_or("", |image| image.2.as_str()).as_bytes();
+            let needed = path.len() as u32 + 1;
+            if mem().read_u32(size) < needed {
+                mem().write_u32(size, needed);
+                return Ret::U32(u32::MAX);
+            }
+            mem().write_bytes(buffer, path);
+            mem().write_u8(buffer + path.len() as u32, 0);
+            Ret::U32(0)
+        })
+        .unwrap(),
+    );
+    // Halfway cases away from zero, as Rust's round.
+    function("lround", handler!(|uc, a| Ret::U32(a.f64().round() as i32 as u32)).unwrap());
+    function("lroundf", handler!(|uc, a| Ret::U32(a.f32().round() as i32 as u32)).unwrap());
+    // reallocf: realloc that frees the old block when it fails.
+    function(
+        "reallocf",
+        handler!(|uc, a| {
+            let (block, size) = (a.u32(), a.u32());
+            let moved = runtime::heap().realloc(block, size);
+            if moved == 0 && block != 0 && size != 0 {
+                super::free(block);
+            }
+            Ret::U32(moved)
+        })
+        .unwrap(),
+    );
+    // perror(prefix): "prefix: text" for the guest's (Darwin) errno, on stderr.
+    function(
+        "perror",
+        handler!(|uc, a| {
+            let prefix = a.u32();
+            let text = darwin_strerror(mem().read_u32(uc.get_data().errno_slot) as i32);
+            let prefix = if prefix == 0 { String::new() } else { mem().string(prefix) };
+            let line = if prefix.is_empty() { format!("{text}\n") } else { format!("{prefix}: {text}\n") };
+            unsafe { libc::write(2, line.as_ptr().cast(), line.len()) };
+            Ret::Void
+        })
+        .unwrap(),
+    );
+    function("backtrace", handler!(|uc, a| { let (buffer, size) = (a.u32(), a.u32()); Ret::U32(backtrace(uc, buffer, size)) }).unwrap());
+    function(
+        "backtrace_symbols",
+        handler!(|uc, a| {
+            let (addresses, count) = (a.u32(), a.u32());
+            Ret::U32(backtrace_symbols(addresses, count as i32))
+        })
+        .unwrap(),
+    );
+    // dladdr(address, Dl_info *{ fname, fbase, sname, saddr }): the program
+    // only (its symbols aren't kept, so no symbol name: NULL, as Apple gives
+    // when none is found).
+    function(
+        "dladdr",
+        handler!(|uc, a| {
+            let (address, info) = (a.u32(), a.u32());
+            let Some((header, path)) = image_of(address) else { return Ret::U32(0) };
+            for (i, word) in [super::cstring_permanent(&path), header, 0, 0].iter().enumerate() {
+                mem().write_u32(info + i as u32 * 4, *word);
+            }
+            Ret::U32(1)
+        })
+        .unwrap(),
+    );
+}
+
+/// The image (header address, path) holding guest address `address`.
+fn image_of(address: u32) -> Option<(u32, String)> {
+    let (start, end) = super::main_image_span()?;
+    let (header, _, path) = super::main_image()?;
+    (start..end).contains(&address).then(|| (*header, path.clone()))
+}
+
+/// backtrace(buffer, size): return addresses along the frame chain. Apple
+/// armv7 code keeps the frame pointer in r7, pointing at { saved r7, lr };
+/// callers' frames sit higher on the stack. The first entry is the caller's
+/// return address (lr).
+fn backtrace(uc: &Uc, buffer: u32, size: u32) -> u32 {
+    let m = mem();
+    let readable = |at: u32| {
+        at % 4 == 0 && arm32_bridge::mem::layout().regions.iter().any(|&(from, to, _)| from <= at && at.checked_add(8).is_some_and(|end| end <= to))
+    };
+    let mut count = 0;
+    let add = |address: u32, count: &mut u32| {
+        m.write_u32(buffer + *count * 4, address);
+        *count += 1;
+    };
+    if size == 0 {
+        return 0;
+    }
+    add(uc.reg(14), &mut count);
+    let mut frame = uc.reg(7);
+    while count < size && frame != 0 && readable(frame) {
+        let (next, address) = (m.read_u32(frame), m.read_u32(frame + 4));
+        if address == 0 {
+            break;
+        }
+        add(address, &mut count);
+        if next <= frame {
+            break;
+        }
+        frame = next;
+    }
+    count
+}
+
+/// backtrace_symbols(addresses, count): one heap block (the caller frees
+/// it) with `count` text pointers, in Apple's
+/// "index image address symbol + offset" form.
+fn backtrace_symbols(addresses: u32, count: i32) -> u32 {
+    if count <= 0 {
+        return 0;
+    }
+    let m = mem();
+    let lines: Vec<String> = (0..count as u32)
+        .map(|i| {
+            let address = m.read_u32(addresses + i * 4);
+            let (image, base) = match image_of(address) {
+                Some((header, path)) => (path.rsplit('/').next().unwrap_or("").to_string(), header),
+                None => ("???".to_string(), 0),
+            };
+            format!("{i:<4}{image:<35} 0x{address:08x} 0x{base:x} + {}", address.wrapping_sub(base))
+        })
+        .collect();
+    let table = count as u32 * 4;
+    let total = table + lines.iter().map(|line| line.len() as u32 + 1).sum::<u32>();
+    let block = super::alloc(total);
+    let mut text = block + table;
+    for (i, line) in lines.iter().enumerate() {
+        m.write_u32(block + i as u32 * 4, text);
+        m.write_bytes(text, line.as_bytes());
+        m.write_u8(text + line.len() as u32, 0);
+        text += line.len() as u32 + 1;
+    }
+    block
 }
 
 /// getifaddrs(): lo0 (127.0.0.1) and en0 (an address and the MAC address

@@ -1,6 +1,6 @@
 //! Plain-C framework functions for 32-bit games (OpenGL ES, OpenAL,
 //! Core Graphics, Core Foundation, AudioToolbox, UIKit's C functions,
-//! libxml2's text writer). Each one reads the guest's arguments by Apple's
+//! libxml2's text writer, SQLite). Each one reads the guest's arguments by Apple's
 //! armv7 rules and calls this layer's 64-bit implementation, found by name
 //! in the symbol table, so the framework logic exists once.
 //!
@@ -23,6 +23,7 @@ mod cf;
 mod gl;
 mod graphics;
 mod openal;
+mod sqlite;
 #[cfg(test)]
 mod tests;
 mod xml;
@@ -594,4 +595,5 @@ pub fn register() {
     cf::register();
     audio::register();
     xml::register();
+    sqlite::register();
 }
