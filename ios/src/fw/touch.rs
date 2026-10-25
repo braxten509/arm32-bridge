@@ -484,6 +484,11 @@ struct TestTap {
     /// to be drawn before it can go again.
     every: bool,
     armed: bool,
+    /// `settled x,y` (with `every=`): its line only readies it; it goes at
+    /// the next settled screen with something there to take it (a box that
+    /// fades in, whose button can't be touched yet when its line comes).
+    settled: bool,
+    due: bool,
 }
 
 /// IOS_TAPS="on=screen shown: IntroViewController=>505,29;ready=>284,297;on=frame 1 shown=>420,250>460,250":
@@ -493,8 +498,9 @@ struct TestTap {
 /// swipe goes from x,y to x2,y2 over about 150 ms. A `jump=` step goes the
 /// moment its line comes even while steps before it still wait (those are
 /// dropped). An `every=` step stands outside the order and goes each time
-/// its line comes once its last tap's screen is drawn. A step that isn't
-/// whole is left out.
+/// its line comes once its last tap's screen is drawn; with `settled x,y`
+/// it waits after its line for the screen to settle with something at x,y
+/// to take the tap. A step that isn't whole is left out.
 fn parse_test_taps(text: &str) -> Vec<TestTap> {
     let point = |text: &str| -> Option<Point> {
         let (x, y) = text.split_once(',')?;
@@ -512,11 +518,16 @@ fn parse_test_taps(text: &str) -> Vec<TestTap> {
                     ["on=", "after=", "jump=", "every="].iter().find_map(|prefix| when.strip_prefix(prefix)).filter(|text| !text.is_empty())?.to_string(),
                 ),
             };
-            let (from, to) = match place.trim().split_once('>') {
-                Some((from, to)) => (point(from)?, point(to)?),
-                None => (point(place.trim())?, point(place.trim())?),
+            let place = place.trim();
+            let (settled, place) = match place.strip_prefix("settled ") {
+                Some(rest) if every => (true, rest.trim()),
+                _ => (false, place),
             };
-            Some(TestTap { on, from, to, jump, every, armed: true })
+            let (from, to) = match place.split_once('>') {
+                Some((from, to)) => (point(from)?, point(to)?),
+                None => (point(place)?, point(place)?),
+            };
+            Some(TestTap { on, from, to, jump, every, armed: true, settled, due: false })
         })
         .collect()
 }
@@ -568,7 +579,10 @@ fn next_test_tap(taps: &mut std::collections::VecDeque<TestTap>, text: &str) -> 
     for tap in taps.iter_mut().filter(|tap| tap.every && !tap.armed) {
         tap.armed = text.contains(&drawn_after(tap.to));
     }
-    if let Some(tap) = taps.iter_mut().find(|tap| tap.every && tap.armed && holds(tap)) {
+    for tap in taps.iter_mut().filter(|tap| tap.every && tap.settled && tap.armed && holds(tap)) {
+        tap.due = true;
+    }
+    if let Some(tap) = taps.iter_mut().find(|tap| tap.every && !tap.settled && tap.armed && holds(tap)) {
         tap.armed = false;
         return Some(tap.clone());
     }
@@ -601,9 +615,14 @@ fn screen_settled_with(takes_touches: impl Fn(Point) -> bool) {
     }
     let tap = {
         let mut taps = TEST_TAPS.lock().unwrap_or_else(|e| e.into_inner());
-        match taps.iter().position(|tap| !tap.every) {
-            Some(next) if taps[next].on == Trigger::Ready && takes_touches(taps[next].from) => taps.remove(next),
-            _ => None,
+        if let Some(tap) = taps.iter_mut().find(|tap| tap.due && takes_touches(tap.from)) {
+            (tap.due, tap.armed) = (false, false);
+            Some(tap.clone())
+        } else {
+            match taps.iter().position(|tap| !tap.every) {
+                Some(next) if taps[next].on == Trigger::Ready && takes_touches(taps[next].from) => taps.remove(next),
+                _ => None,
+            }
         }
     };
     if let Some(tap) = tap {
@@ -1040,5 +1059,35 @@ mod tests {
         assert_eq!(from(next_test_tap(&mut taps, "help shown")), Some(7.0), "again after that");
         assert_eq!(from(next_test_tap(&mut taps, "round")), Some(2.0));
         assert_eq!(taps.len(), 1, "the every step stays");
+    }
+
+    #[test]
+    fn a_settled_every_step_waits_for_the_screen_to_settle() {
+        // A box that fades in: its line comes before its button takes
+        // touches, so the tap waits for the screen to settle after the line.
+        let _turn = ARMED_TAPS.lock().unwrap_or_else(|e| e.into_inner());
+        static SENT: std::sync::Mutex<Vec<f64>> = std::sync::Mutex::new(Vec::new());
+        fn sender(tap: TestTap) {
+            SENT.lock().unwrap().push(tap.from.x);
+        }
+        let sent = || std::mem::take(&mut *SENT.lock().unwrap());
+        arm_test_taps(parse_test_taps("every=box shown=>settled 7,7"), sender);
+        screen_settled_with(|_| true);
+        assert_eq!(sent(), [] as [f64; 0], "nothing before its line");
+        line_logged("box shown");
+        assert_eq!(sent(), [] as [f64; 0], "not on the line itself");
+        screen_settled_with(|_| false);
+        assert_eq!(sent(), [] as [f64; 0], "not while nothing there takes touches");
+        screen_settled_with(|_| true);
+        assert_eq!(sent(), [7.0]);
+        screen_settled_with(|_| true);
+        line_logged("box shown");
+        screen_settled_with(|_| true);
+        assert_eq!(sent(), [] as [f64; 0], "not again before its own tap's screen is drawn");
+        line_logged("screen drawn after tap at 7,7");
+        line_logged("box shown");
+        screen_settled_with(|_| true);
+        assert_eq!(sent(), [7.0], "again after that");
+        TAPS_ARMED.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }

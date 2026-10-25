@@ -314,7 +314,9 @@ extern "C" fn paths_for_resources(this: Id, _: Sel, kind: Id, folder: Id) -> Id 
         let mut names: Vec<String> = entries.filter_map(|e| e.ok()?.file_name().to_str().map(String::from)).collect();
         names.sort();
         for name in names {
-            let matches = kind.is_empty() || name.rsplit_once('.').is_some_and(|(_, ext)| ext == kind);
+            // A type of several parts ("uispec.plist") matches the whole end
+            // of the name, as CFBundle's does.
+            let matches = kind.is_empty() || name.strip_suffix(kind).and_then(|stem| stem.strip_suffix('.')).is_some_and(|stem| !stem.is_empty());
             if matches && !name.ends_with(".lproj") {
                 found.push(string::make(&format!("{place}/{name}")));
             }
@@ -874,6 +876,15 @@ mod tests {
         assert_eq!(string::get(runtime::send(bundle, "bundlePath", &[])), path);
         let found = runtime::send(bundle, "pathForResource:ofType:", &[string::make("hero"), string::make("png")]);
         assert_eq!(string::get(found), format!("{path}/hero.png"));
+        // A type of several parts matches whole names ending in it.
+        std::fs::write(folder.join("Art.bundle/Deck.uispec.plist"), b"plist").unwrap();
+        std::fs::write(folder.join("Art.bundle/Info.plist"), b"plist").unwrap();
+        let listed = |kind: &str| -> Vec<String> {
+            let paths = runtime::send(bundle, "pathsForResourcesOfType:inDirectory:", &[string::make(kind), 0]);
+            crate::fw::collections::array_items(paths).into_iter().map(string::get).collect()
+        };
+        assert_eq!(listed("uispec.plist"), [format!("{path}/Deck.uispec.plist")]);
+        assert_eq!(listed("plist"), [format!("{path}/Deck.uispec.plist"), format!("{path}/Info.plist")]);
         // The same folder gives the same bundle; a missing one or a file gives nil.
         assert_eq!(runtime::send(class, "bundleWithPath:", &[string::make(&format!("{path}/"))]), bundle);
         assert_eq!(runtime::send(class, "bundleWithPath:", &[string::make(&format!("{path}/nothing"))]), 0);
