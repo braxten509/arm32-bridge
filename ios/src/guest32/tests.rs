@@ -670,6 +670,27 @@ fn raise_and_raise_format_from_game_code_throw_through_the_guest_runtime() {
     assert!(error.contains("uncaught Objective-C exception: FormatException: value 42 of ten"), "{error}");
 }
 
+/// An exception host code raises while answering a game's message (here
+/// key-value coding's NSUnknownKeyException) is thrown in the game, where
+/// its @catch could take it; uncaught, it ends at the terminate handler.
+#[test]
+fn host_raises_reach_game_code_as_game_throws() {
+    use super::objc::wire::{test_bridge, Translator};
+    use crate::fw::string::make;
+    cxx();
+    let (object, value_for_key, key) = {
+        let mut b = test_bridge().lock().unwrap();
+        let host = crate::objc::runtime::send(crate::objc::runtime::send(crate::objc::runtime::class_named("NSObject"), "alloc", &[]), "init", &[]);
+        (b.guest_object(&Translator, host).unwrap(), b.guest_selector(&Translator, "valueForKey:"), b.guest_object(&Translator, make("nope")).unwrap())
+    };
+    let _gil = runtime::hold_gil();
+    let uc = runtime::engine();
+    let result = runtime::call_guest(uc, runtime::stub_for("objc_msgSend"), &[object, value_for_key, key]);
+    uc.get_data_mut().fault = None;
+    let error = result.expect_err("the raise reaches the game");
+    assert!(error.contains("uncaught Objective-C exception: NSUnknownKeyException"), "{error}");
+}
+
 #[test]
 fn objc_catch_clauses_match_by_class_and_hand_over_the_object() {
     use super::objc::wire::{test_bridge, Translator};

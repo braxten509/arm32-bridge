@@ -285,7 +285,7 @@ pub fn set_extra_method_types(hook: TypesHook) {
 /// -doesNotRecognizeSelector: raises NSInvalidArgumentException, as Apple's does.
 extern "C" fn does_not_recognize(this: Id, _: Sel, selector: Sel) {
     let name = lock().sel_name(selector);
-    crate::fw::exception::throw(unrecognized_selector_exception(this, &name));
+    crate::fw::exception::raise(unrecognized_selector_exception(this, &name));
 }
 
 /// The NSInvalidArgumentException Apple raises for `selector` sent to `this`.
@@ -449,9 +449,10 @@ fn boxed_result(receiver: Id, sel: Sel) -> Id {
     }
 }
 
+/// Apple's order: get<Key>, <key>, is<Key>, _<key>.
 fn getter(receiver: Id, key: &str) -> Option<Sel> {
     let cap = capitalized(key);
-    [key.to_string(), format!("get{cap}"), format!("is{cap}"), format!("_{key}")]
+    [format!("get{cap}"), key.to_string(), format!("is{cap}"), format!("_{key}")]
         .into_iter()
         .find(|name| !name.is_empty() && runtime::responds(receiver, name))
         .map(|name| runtime::sel(&name))
@@ -459,10 +460,32 @@ fn getter(receiver: Id, key: &str) -> Option<Sel> {
 
 /// The instance variable key-value coding falls back to without accessor
 /// methods, as Apple's does: _key, _isKey, key, isKey. Its address and type.
-fn field_for(receiver: Id, key: &str) -> Option<(usize, String)> {
+/// A field of an object: where it is, its type, and whether it is in a
+/// 32-bit game's memory (4-byte long and pointers, 4-byte alignment).
+pub struct Field {
+    pub at: usize,
+    pub kind: String,
+    pub guest: bool,
+}
+
+/// Fields the host's class tables don't describe (a 32-bit game's objects,
+/// known to its bridge): the named field of an object, if it has one.
+type FieldsHook = fn(Id, &str) -> Option<Field>;
+
+static EXTRA_FIELDS: std::sync::RwLock<Option<FieldsHook>> = std::sync::RwLock::new(None);
+
+pub fn set_extra_fields(hook: FieldsHook) {
+    *EXTRA_FIELDS.write().unwrap() = Some(hook);
+}
+
+fn field_for(receiver: Id, key: &str) -> Option<Field> {
     let class = lock().class_of(receiver);
     let cap = capitalized(key);
+    let hook = *EXTRA_FIELDS.read().unwrap();
     for name in [format!("_{key}"), format!("_is{cap}"), key.to_string(), format!("is{cap}")] {
+        if let Some(field) = hook.and_then(|h| h(receiver, &name)) {
+            return Some(field);
+        }
         let Ok(name) = std::ffi::CString::new(name) else { continue };
         let ivar = crate::objc::reflect::get_instance_variable(class, name.as_ptr());
         if ivar == 0 {
@@ -474,27 +497,37 @@ fn field_for(receiver: Id, key: &str) -> Option<(usize, String)> {
             let offset = if offset_cell == 0 { 0 } else { *(offset_cell as *const i32) as isize };
             let types = *((ivar + 16) as *const *const libc::c_char);
             let kind = if types.is_null() { "@".to_string() } else { std::ffi::CStr::from_ptr(types).to_string_lossy().into_owned() };
-            return Some(((receiver as isize + offset) as usize, kind));
+            return Some(Field { at: (receiver as isize + offset) as usize, kind, guest: false });
         }
     }
     None
 }
 
-fn read_field(at: usize, kind: &str) -> Option<Id> {
+fn read_field(field: &Field) -> Option<Id> {
     use crate::fw::collections::{number_bool, number_float, number_int};
+    use std::ptr::read_unaligned as read;
+    let at = field.at;
+    let objects = field.guest.then(crate::fw::system::guest_memory).flatten();
     unsafe {
-        Some(match kind.as_bytes().first()? {
-            b'@' | b'#' => *(at as *const Id),
-            b'c' => number_int(*(at as *const i8) as i64),
-            b'C' => number_int(*(at as *const u8) as i64),
-            b'B' => number_bool(*(at as *const u8) != 0),
-            b's' => number_int(*(at as *const i16) as i64),
-            b'S' => number_int(*(at as *const u16) as i64),
-            b'i' => number_int(*(at as *const i32) as i64),
-            b'I' => number_int(*(at as *const u32) as i64),
-            b'l' | b'q' | b'L' | b'Q' => number_int(*(at as *const i64)),
-            b'f' => number_float(*(at as *const f32) as f64),
-            b'd' => number_float(*(at as *const f64)),
+        Some(match field.kind.as_bytes().first()? {
+            b'@' | b'#' => match objects {
+                Some(memory) => (memory.object_to_host)(read(at as *const u32)),
+                None if field.guest => return None,
+                None => read(at as *const Id),
+            },
+            b'c' => number_int(read(at as *const i8) as i64),
+            b'C' => number_int(read(at as *const u8) as i64),
+            b'B' => number_bool(read(at as *const u8) != 0),
+            b's' => number_int(read(at as *const i16) as i64),
+            b'S' => number_int(read(at as *const u16) as i64),
+            b'i' => number_int(read(at as *const i32) as i64),
+            b'I' => number_int(read(at as *const u32) as i64),
+            // A 32-bit game's long is 4 bytes.
+            b'l' if field.guest => number_int(read(at as *const i32) as i64),
+            b'L' if field.guest => number_int(read(at as *const u32) as i64),
+            b'l' | b'q' | b'L' | b'Q' => number_int(read(at as *const i64)),
+            b'f' => number_float(read(at as *const f32) as f64),
+            b'd' => number_float(read(at as *const f64)),
             _ => return None,
         })
     }
@@ -502,25 +535,41 @@ fn read_field(at: usize, kind: &str) -> Option<Id> {
 
 /// Stores `value` in a field: objects retained (the old one released),
 /// numbers unboxed. False for a type key-value coding can't fill.
-fn write_field(at: usize, kind: &str, value: Id) -> bool {
+fn write_field(field: &Field, value: Id) -> bool {
     use crate::fw::collections::{is_number, number_as_f64, number_as_i64};
+    use std::ptr::{read_unaligned as read, write_unaligned as write};
+    let at = field.at;
     let integer = || if is_number(value) { number_as_i64(value) } else { crate::fw::string::get(value).trim().parse().unwrap_or(0) };
     let real = || if is_number(value) { number_as_f64(value) } else { crate::fw::string::get(value).trim().parse().unwrap_or(0.0) };
+    let objects = field.guest.then(crate::fw::system::guest_memory).flatten();
     unsafe {
-        match kind.as_bytes().first() {
+        match field.kind.as_bytes().first() {
             Some(b'@') => {
-                let old = *(at as *const Id);
-                *(at as *mut Id) = if value == 0 { 0 } else { runtime::send(value, "retain", &[]) };
-                if old != 0 && old != value {
+                let new = if value == 0 { 0 } else { runtime::send(value, "retain", &[]) };
+                let old = match objects {
+                    Some(memory) => {
+                        let old = (memory.object_to_host)(read(at as *const u32));
+                        write(at as *mut u32, (memory.object_to_guest)(new));
+                        old
+                    }
+                    None if field.guest => return false,
+                    None => {
+                        let old = read(at as *const Id);
+                        write(at as *mut Id, new);
+                        old
+                    }
+                };
+                if old != 0 {
                     runtime::send(old, "release", &[]);
                 }
             }
-            Some(b'c' | b'C' | b'B') => *(at as *mut u8) = integer() as u8,
-            Some(b's' | b'S') => *(at as *mut u16) = integer() as u16,
-            Some(b'i' | b'I') => *(at as *mut u32) = integer() as u32,
-            Some(b'l' | b'q' | b'L' | b'Q') => *(at as *mut i64) = integer(),
-            Some(b'f') => *(at as *mut f32) = real() as f32,
-            Some(b'd') => *(at as *mut f64) = real(),
+            Some(b'c' | b'C' | b'B') => write(at as *mut u8, integer() as u8),
+            Some(b's' | b'S') => write(at as *mut u16, integer() as u16),
+            Some(b'i' | b'I') => write(at as *mut u32, integer() as u32),
+            Some(b'l' | b'L') if field.guest => write(at as *mut u32, integer() as u32),
+            Some(b'l' | b'q' | b'L' | b'Q') => write(at as *mut i64, integer()),
+            Some(b'f') => write(at as *mut f32, real() as f32),
+            Some(b'd') => write(at as *mut f64, real()),
             _ => return false,
         }
     }
@@ -532,21 +581,37 @@ extern "C" fn value_for_key(this: Id, _: Sel, key: Id) -> Id {
     if let Some(sel) = getter(this, &name) {
         return boxed_result(this, sel);
     }
-    match field_for(this, &name).and_then(|(at, kind)| read_field(at, &kind)) {
+    match field_for(this, &name).and_then(|field| read_field(&field)) {
         Some(value) => value,
         None => runtime::send(this, "valueForUndefinedKey:", &[key]),
     }
 }
 
-/// Apple raises NSUndefinedKeyException; here the miss is logged and nil
-/// given (a game that relies on the raise is broken on Apple too).
+/// Apple's NSUnknownKeyException for `key` of `this`, raised from `method`.
+fn raise_unknown_key(this: Id, method: &str, key: Id) {
+    let class = crate::fw::string::describe_class_of(this);
+    let key_text = crate::fw::string::get(key);
+    crate::log!("{method} {class} has no key {key_text}; raising NSUnknownKeyException");
+    let reason = format!("[<{class} {this:#x}> {method}]: this class is not key value coding-compliant for the key {key_text}.");
+    let info = crate::fw::collections::dictionary_from(&[
+        (crate::fw::string::make("NSTargetObjectUserInfoKey"), this),
+        (crate::fw::string::make("NSUnknownUserInfoKey"), key),
+    ]);
+    let exception = runtime::send(
+        runtime::class_named("NSException"),
+        "exceptionWithName:reason:userInfo:",
+        &[crate::fw::string::make("NSUnknownKeyException"), crate::fw::string::make(&reason), info],
+    );
+    crate::fw::exception::raise(exception);
+}
+
 extern "C" fn value_for_undefined_key(this: Id, _: Sel, key: Id) -> Id {
-    crate::log!("valueForKey: {} has no key {}; nil", crate::fw::string::describe_class_of(this), crate::fw::string::get(key));
+    raise_unknown_key(this, "valueForUndefinedKey:", key);
     0
 }
 
 extern "C" fn set_value_for_undefined_key(this: Id, _: Sel, _value: Id, key: Id) {
-    crate::log!("setValue:forKey: {} has no key {}; ignored", crate::fw::string::describe_class_of(this), crate::fw::string::get(key));
+    raise_unknown_key(this, "setValue:forUndefinedKey:", key);
 }
 
 extern "C" fn set_nil_value_for_key(this: Id, _: Sel, key: Id) {
@@ -590,10 +655,10 @@ extern "C" fn set_value_for_key(this: Id, _: Sel, value: Id, key: Id) {
     match [format!("set{cap}:"), format!("_set{cap}:")].into_iter().find(|n| runtime::responds(this, n)) {
         Some(setter) => call_setter(this, runtime::sel(&setter), value, key),
         None => match field_for(this, &name) {
-            Some((_, kind)) if value == 0 && !kind.starts_with('@') => {
+            Some(field) if value == 0 && !field.kind.starts_with('@') => {
                 runtime::send(this, "setNilValueForKey:", &[key]);
             }
-            Some((at, kind)) if write_field(at, &kind, value) => {}
+            Some(field) if write_field(&field, value) => {}
             _ => {
                 runtime::send(this, "setValue:forUndefinedKey:", &[value, key]);
             }
@@ -627,7 +692,8 @@ fn collection_operator(list: Vec<Id>, operator: &str, rest: Option<&str>) -> Id 
     let numbers = || -> Vec<f64> { values().into_iter().map(|v| if is_number(v) { number_as_f64(v) } else { crate::fw::string::get(v).trim().parse().unwrap_or(0.0) }).collect() };
     let whole = |total: f64| if total.fract() == 0.0 && total.abs() < 9.0e15 { number_int(total as i64) } else { number_float(total) };
     match operator {
-        "@count" => number_int(if rest.is_some() { values().len() } else { list.len() } as i64),
+        // Apple ignores a key path after @count.
+        "@count" => number_int(list.len() as i64),
         "@sum" => whole(numbers().iter().sum()),
         "@avg" => {
             let all = numbers();
@@ -777,6 +843,12 @@ mod tests {
     extern "C" fn thing_nothing(_this: Id, _: Sel) -> Id {
         0
     }
+    extern "C" fn thing_label(_this: Id, _: Sel) -> Id {
+        string::make("plain")
+    }
+    extern "C" fn thing_get_label(_this: Id, _: Sel) -> Id {
+        string::make("get")
+    }
 
     /// Types for the test class's methods, as a 32-bit game's would come.
     fn test_types(class: Class, sel: Sel) -> Option<String> {
@@ -808,6 +880,8 @@ mod tests {
                     ("setRatio:", thing_set_ratio as usize),
                     ("child", thing_child as usize),
                     ("nothing", thing_nothing as usize),
+                    ("label", thing_label as usize),
+                    ("getLabel", thing_get_label as usize),
                 ],
             );
             set_extra_method_types(test_types);
@@ -857,5 +931,44 @@ mod tests {
         assert_eq!(titles, ["a", "b", "c"]);
         let nested = collections::dictionary_from(&[(s("a"), collections::dictionary_from(&[(s("b"), s("deep"))]))]);
         assert_eq!(string::get(runtime::send(nested, "valueForKeyPath:", &[s("a.b")])), "deep");
+    }
+
+    /// Apple's search order (get<Key> first), @count ignoring the path after
+    /// it, and an unknown key raising NSUnknownKeyException for the game.
+    #[test]
+    fn key_value_coding_follows_apples_rules() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let s = string::make;
+        let one = thing("one", 1, 0);
+        assert_eq!(string::get(runtime::send(one, "valueForKey:", &[s("label")])), "get");
+        let list = collections::array_from(&[thing("a", 1, 0), thing("b", 2, 0)]);
+        assert_eq!(collections::number_as_i64(runtime::send(list, "valueForKeyPath:", &[s("@count.child")])), 2);
+        for (raised, what) in [
+            (crate::fw::exception::catching(|| runtime::send(one, "valueForKey:", &[s("nope")])).1, "get"),
+            (crate::fw::exception::catching(|| runtime::send(one, "setValue:forKey:", &[s("x"), s("nope")])).1, "set"),
+        ] {
+            let raised = raised.unwrap_or_else(|| panic!("{what} of an unknown key raised nothing"));
+            assert_eq!(string::get(runtime::send(raised, "name", &[])), "NSUnknownKeyException");
+            assert!(string::get(runtime::send(raised, "reason", &[])).contains("not key value coding-compliant for the key nope"));
+        }
+    }
+
+    /// Fields of a 32-bit game's object: long is 4 bytes, 8-byte values may
+    /// sit on 4-byte boundaries, and neighbours are left alone.
+    #[test]
+    fn fields_read_and_write_in_their_classes_layout() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let mut words = [0u32, 0xAAAA_AAAA, 0, 0, 0xBBBB_BBBB];
+        let at = |i: usize, words: &mut [u32; 5]| words.as_mut_ptr() as usize + 4 * i;
+        let long = Field { at: at(0, &mut words), kind: "l".into(), guest: true };
+        assert!(write_field(&long, collections::number_int(-7)));
+        assert_eq!(words[..2], [(-7i32) as u32, 0xAAAA_AAAA]);
+        assert_eq!(collections::number_as_i64(read_field(&long).unwrap()), -7);
+        let double = Field { at: at(2, &mut words), kind: "d".into(), guest: true };
+        assert!(write_field(&double, collections::number_float(2.5)));
+        assert_eq!(collections::number_as_f64(read_field(&double).unwrap()), 2.5);
+        assert_eq!(words[4], 0xBBBB_BBBB);
     }
 }

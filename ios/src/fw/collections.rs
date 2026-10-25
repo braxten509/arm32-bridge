@@ -1197,13 +1197,90 @@ extern "C" fn decimal_with_string(class: Class, s: Sel, text: Id) -> Id {
     decimal_from(double(number, 0))
 }
 
-// ----- NSIndexSet / NSMutableIndexSet: { isa, *mut BTreeSet<usize> } -----
+// ----- NSIndexSet / NSMutableIndexSet: { isa, *mut Ranges } -----
 
 const NOT_FOUND: usize = isize::MAX as usize;
 
-fn indexes(object: Id) -> &'static mut std::collections::BTreeSet<usize> {
+/// Indexes as separate, non-touching ranges (start -> end, end exclusive),
+/// as Apple keeps them: a range of any size costs one entry.
+#[derive(Clone, Default, PartialEq)]
+pub struct Ranges(std::collections::BTreeMap<usize, usize>);
+
+impl Ranges {
+    fn add(&mut self, mut start: usize, mut end: usize) {
+        if start >= end {
+            return;
+        }
+        // Join every range that overlaps or touches [start, end).
+        let touching: Vec<(usize, usize)> = self.0.range(..=end).rev().take_while(|&(_, &e)| e >= start).map(|(&s, &e)| (s, e)).collect();
+        for (s, e) in touching {
+            self.0.remove(&s);
+            start = start.min(s);
+            end = end.max(e);
+        }
+        self.0.insert(start, end);
+    }
+
+    fn remove(&mut self, start: usize, end: usize) {
+        if start >= end {
+            return;
+        }
+        let overlapping: Vec<(usize, usize)> = self.0.range(..end).rev().take_while(|&(_, &e)| e > start).map(|(&s, &e)| (s, e)).collect();
+        for (s, e) in overlapping {
+            self.0.remove(&s);
+            if s < start {
+                self.0.insert(s, start);
+            }
+            if e > end {
+                self.0.insert(end, e);
+            }
+        }
+    }
+
+    fn contains(&self, index: usize) -> bool {
+        self.0.range(..=index).next_back().is_some_and(|(_, &e)| index < e)
+    }
+
+    fn count(&self) -> usize {
+        self.0.iter().fold(0usize, |n, (s, e)| n.saturating_add(e - s))
+    }
+
+    fn first(&self) -> Option<usize> {
+        self.0.first_key_value().map(|(&s, _)| s)
+    }
+
+    fn last(&self) -> Option<usize> {
+        self.0.last_key_value().map(|(_, &e)| e - 1)
+    }
+
+    /// The smallest index above `index`.
+    fn after(&self, index: usize) -> Option<usize> {
+        let next = index.checked_add(1)?;
+        if self.contains(next) {
+            return Some(next);
+        }
+        self.0.range(next..).next().map(|(&s, _)| s)
+    }
+
+    /// The largest index below `index`.
+    fn before(&self, index: usize) -> Option<usize> {
+        let previous = index.checked_sub(1)?;
+        self.0.range(..=previous).next_back().map(|(_, &e)| (e - 1).min(previous))
+    }
+
+    /// Every index, in order (lazily: a huge set is walked, never stored).
+    pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.0.iter().flat_map(|(&s, &e)| s..e)
+    }
+
+    pub fn ranges(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.0.iter().map(|(&s, &e)| (s, e))
+    }
+}
+
+fn indexes(object: Id) -> &'static mut Ranges {
     unsafe {
-        let slot = (object + 8) as *mut *mut std::collections::BTreeSet<usize>;
+        let slot = (object + 8) as *mut *mut Ranges;
         if (*slot).is_null() {
             *slot = Box::into_raw(Box::default());
         }
@@ -1211,16 +1288,17 @@ fn indexes(object: Id) -> &'static mut std::collections::BTreeSet<usize> {
     }
 }
 
-/// The indexes in an index set, in order.
-pub fn index_set_items(object: Id) -> Vec<usize> {
+/// An index set's indexes (empty for nil).
+pub fn index_set(object: Id) -> Ranges {
     if object == 0 {
-        return Vec::new();
+        return Ranges::default();
     }
-    indexes(object).iter().copied().collect()
+    indexes(object).clone()
 }
 
-fn range_indexes(range: crate::fw::string::Range) -> std::ops::Range<usize> {
-    range.location..range.location.saturating_add(range.length)
+/// [start, end) of an NSRange, the end held at the largest index.
+fn range_ends(range: crate::fw::string::Range) -> (usize, usize) {
+    (range.location, range.location.saturating_add(range.length))
 }
 
 extern "C" fn index_set_empty(class: Class, _: Sel) -> Id {
@@ -1230,12 +1308,13 @@ extern "C" fn index_set_empty(class: Class, _: Sel) -> Id {
 }
 extern "C" fn index_set_with_index(class: Class, s: Sel, index: usize) -> Id {
     let object = index_set_empty(class, s);
-    indexes(object).insert(index);
+    indexes(object).add(index, index.saturating_add(1));
     object
 }
 extern "C" fn index_set_with_range(class: Class, s: Sel, range: crate::fw::string::Range) -> Id {
     let object = index_set_empty(class, s);
-    indexes(object).extend(range_indexes(range));
+    let (start, end) = range_ends(range);
+    indexes(object).add(start, end);
     object
 }
 extern "C" fn index_set_init(this: Id, _: Sel) -> Id {
@@ -1243,40 +1322,42 @@ extern "C" fn index_set_init(this: Id, _: Sel) -> Id {
     this
 }
 extern "C" fn index_set_init_with_index(this: Id, _: Sel, index: usize) -> Id {
-    indexes(this).insert(index);
+    indexes(this).add(index, index.saturating_add(1));
     this
 }
 extern "C" fn index_set_init_with_range(this: Id, _: Sel, range: crate::fw::string::Range) -> Id {
-    indexes(this).extend(range_indexes(range));
+    let (start, end) = range_ends(range);
+    indexes(this).add(start, end);
     this
 }
 extern "C" fn index_set_init_with_set(this: Id, _: Sel, other: Id) -> Id {
-    *indexes(this) = index_set_items(other).into_iter().collect();
+    *indexes(this) = index_set(other);
     this
 }
 extern "C" fn index_set_count(this: Id, _: Sel) -> usize {
-    indexes(this).len()
+    indexes(this).count()
 }
 extern "C" fn index_set_first(this: Id, _: Sel) -> usize {
-    indexes(this).first().copied().unwrap_or(NOT_FOUND)
+    indexes(this).first().unwrap_or(NOT_FOUND)
 }
 extern "C" fn index_set_last(this: Id, _: Sel) -> usize {
-    indexes(this).last().copied().unwrap_or(NOT_FOUND)
+    indexes(this).last().unwrap_or(NOT_FOUND)
 }
 extern "C" fn index_set_greater(this: Id, _: Sel, index: usize) -> usize {
-    indexes(this).range(index.saturating_add(1)..).next().copied().unwrap_or(NOT_FOUND)
+    indexes(this).after(index).unwrap_or(NOT_FOUND)
 }
 extern "C" fn index_set_less(this: Id, _: Sel, index: usize) -> usize {
-    indexes(this).range(..index).next_back().copied().unwrap_or(NOT_FOUND)
+    indexes(this).before(index).unwrap_or(NOT_FOUND)
 }
 extern "C" fn index_set_contains(this: Id, _: Sel, index: usize) -> bool {
-    indexes(this).contains(&index)
+    indexes(this).contains(index)
 }
 extern "C" fn index_set_contains_set(this: Id, _: Sel, other: Id) -> bool {
-    index_set_items(other).iter().all(|i| indexes(this).contains(i))
+    let mine = indexes(this);
+    index_set(other).ranges().all(|(s, e)| mine.0.range(..=s).next_back().is_some_and(|(_, &end)| end >= e))
 }
 extern "C" fn index_set_is_equal(this: Id, _: Sel, other: Id) -> bool {
-    other != 0 && index_set_items(this) == index_set_items(other)
+    other != 0 && *indexes(this) == index_set(other)
 }
 extern "C" fn index_set_copy(this: Id, _: Sel, _zone: usize) -> Id {
     let object = runtime::alloc_instance(runtime::class_named("NSIndexSet"));
@@ -1293,7 +1374,7 @@ extern "C" fn index_set_enumerate(this: Id, _: Sel, block: usize) {
     let header = block as *const crate::libsystem::mach::BlockHeader;
     let invoke: extern "C" fn(usize, usize, *mut u8) = unsafe { std::mem::transmute((*header).invoke) };
     let mut stop = 0u8;
-    for index in index_set_items(this) {
+    for index in index_set(this).iter() {
         invoke(block, index, &mut stop);
         if stop != 0 {
             break;
@@ -1301,32 +1382,36 @@ extern "C" fn index_set_enumerate(this: Id, _: Sel, block: usize) {
     }
 }
 extern "C" fn index_set_description(this: Id, _: Sel) -> Id {
-    let list: Vec<String> = index_set_items(this).iter().map(|i| i.to_string()).collect();
-    crate::fw::string::make(&format!("<NSIndexSet>[number of indexes: {} (in {} ranges), indexes: ({})]", list.len(), list.len(), list.join(" ")))
+    let set = index_set(this);
+    let parts: Vec<String> = set.ranges().map(|(s, e)| if e - s == 1 { s.to_string() } else { format!("{s}-{}", e - 1) }).collect();
+    crate::fw::string::make(&format!("<NSIndexSet>[number of indexes: {} (in {} ranges), indexes: ({})]", set.count(), parts.len(), parts.join(" ")))
 }
 extern "C" fn index_set_add(this: Id, _: Sel, index: usize) {
-    indexes(this).insert(index);
+    indexes(this).add(index, index.saturating_add(1));
 }
 extern "C" fn index_set_remove(this: Id, _: Sel, index: usize) {
-    indexes(this).remove(&index);
+    indexes(this).remove(index, index.saturating_add(1));
 }
 extern "C" fn index_set_add_range(this: Id, _: Sel, range: crate::fw::string::Range) {
-    indexes(this).extend(range_indexes(range));
+    let (start, end) = range_ends(range);
+    indexes(this).add(start, end);
 }
 extern "C" fn index_set_remove_range(this: Id, _: Sel, range: crate::fw::string::Range) {
-    let range = range_indexes(range);
-    indexes(this).retain(|i| !range.contains(i));
+    let (start, end) = range_ends(range);
+    indexes(this).remove(start, end);
 }
 extern "C" fn index_set_add_set(this: Id, _: Sel, other: Id) {
-    indexes(this).extend(index_set_items(other));
+    for (s, e) in index_set(other).ranges() {
+        indexes(this).add(s, e);
+    }
 }
 extern "C" fn index_set_remove_set(this: Id, _: Sel, other: Id) {
-    for index in index_set_items(other) {
-        indexes(this).remove(&index);
+    for (s, e) in index_set(other).ranges() {
+        indexes(this).remove(s, e);
     }
 }
 extern "C" fn index_set_remove_all(this: Id, _: Sel) {
-    indexes(this).clear();
+    *indexes(this) = Ranges::default();
 }
 
 // ----- more NSArray / NSDictionary -----
@@ -1367,24 +1452,19 @@ extern "C" fn array_index_passing(this: Id, _: Sel, block: usize) -> usize {
 extern "C" fn array_indexes_passing(this: Id, _: Sel, block: usize) -> Id {
     let set = runtime::alloc_instance(runtime::class_named("NSIndexSet"));
     passing_test(&array_items(this), block, |index| {
-        indexes(set).insert(index);
+        indexes(set).add(index, index + 1);
     });
     set
 }
 
 extern "C" fn array_objects_at_indexes(this: Id, _: Sel, set: Id) -> Id {
     let list = array_items(this);
-    let mut picked = Vec::new();
-    for index in index_set_items(set) {
-        match list.get(index) {
-            Some(&item) => picked.push(item),
-            None => {
-                crate::log!("STOP: objectsAtIndexes: index {index} is past the end ({} items)", list.len());
-                crate::report::finish(1);
-            }
-        }
+    let wanted = index_set(set);
+    if let Some(last) = wanted.last().filter(|&last| last >= list.len()) {
+        crate::log!("STOP: objectsAtIndexes: index {last} is past the end ({} items)", list.len());
+        crate::report::finish(1);
     }
-    array_from(&picked)
+    array_from(&wanted.iter().map(|index| list[index]).collect::<Vec<_>>())
 }
 
 extern "C" fn array_init_copy_items(this: Id, _: Sel, other: Id, copy_items: u8) -> Id {
@@ -1397,10 +1477,10 @@ extern "C" fn array_init_copy_items(this: Id, _: Sel, other: Id, copy_items: u8)
 }
 
 extern "C" fn array_remove_at_indexes(this: Id, _: Sel, set: Id) {
-    let remove = index_set_items(set);
+    let remove = index_set(set);
     let mut index = 0;
     items(this).retain(|_| {
-        let keep = remove.binary_search(&index).is_err();
+        let keep = !remove.contains(index);
         index += 1;
         keep
     });
@@ -2004,5 +2084,38 @@ mod tests {
         assert_eq!(order, ["low", "mid", "high"]);
         let text = crate::fw::string::get(runtime::send(dictionary_from(&[(s("k"), s("v \"q\""))]), "descriptionInStringsFileFormat", &[]));
         assert_eq!(text, "\"k\" = \"v \\\"q\\\"\";\n");
+    }
+
+    /// Index sets hold ranges: a huge range costs nothing, and range edits
+    /// split and join them.
+    #[test]
+    fn index_sets_hold_huge_ranges() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        use crate::fw::string::Range;
+        let class = runtime::class_named("NSMutableIndexSet");
+        let with_range: extern "C" fn(Class, Sel, Range) -> Id =
+            unsafe { std::mem::transmute(runtime::imp_for(class, runtime::sel("indexSetWithIndexesInRange:")).unwrap()) };
+        let huge = 1usize << 40;
+        let set = with_range(class, 0, Range { location: 5, length: huge });
+        assert_eq!(runtime::send(set, "count", &[]), huge);
+        assert_eq!(runtime::send(set, "lastIndex", &[]), 5 + huge - 1);
+        let edit = |name: &str, location: usize, length: usize| {
+            let f: extern "C" fn(Id, Sel, Range) = unsafe { std::mem::transmute(runtime::imp_for(set, runtime::sel(name)).unwrap()) };
+            f(set, 0, Range { location, length });
+        };
+        edit("removeIndexesInRange:", 10, 5);
+        assert_eq!(runtime::send(set, "count", &[]), huge - 5);
+        assert_eq!(runtime::send(set, "containsIndex:", &[12]) & 0xFF, 0);
+        assert_eq!(runtime::send(set, "indexGreaterThanIndex:", &[9]), 15);
+        assert_eq!(runtime::send(set, "indexLessThanIndex:", &[15]), 9);
+        edit("addIndexesInRange:", 12, 1);
+        runtime::send(set, "addIndex:", &[4]);
+        assert_eq!(runtime::send(set, "firstIndex", &[]), 4);
+        let text = crate::fw::string::get(runtime::send(set, "description", &[]));
+        assert!(text.contains("in 3 ranges") && text.contains("(4-9 12 15-"), "{text}");
+        edit("removeIndexesInRange:", 0, usize::MAX);
+        assert_eq!(runtime::send(set, "count", &[]), 0);
+        assert_eq!(runtime::send(set, "firstIndex", &[]), isize::MAX as usize);
     }
 }

@@ -67,7 +67,41 @@ extern "C" fn exception_copy(this: Id, _: Sel, _zone: usize) -> Id {
 
 /// Throws the exception the way the game's own `@throw` does.
 extern "C" fn exception_raise(this: Id, _: Sel) {
-    throw(this);
+    raise(this);
+}
+
+thread_local! {
+    /// How many 32-bit game messages this thread's host code is answering.
+    static GAME_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The exception host code raised for the innermost of them.
+    static RAISED: std::cell::Cell<Id> = const { std::cell::Cell::new(0) };
+}
+
+/// Runs host work, handing back an exception it raised (see [`raise`])
+/// instead of throwing it: the bridge throws it in the 32-bit game whose
+/// message the work answered, where the game's @catch can take it.
+pub fn catching<R>(work: impl FnOnce() -> R) -> (R, Option<Id>) {
+    let outer = RAISED.with(|r| r.replace(0));
+    GAME_CALLS.with(|c| c.set(c.get() + 1));
+    let result = work();
+    GAME_CALLS.with(|c| c.set(c.get() - 1));
+    let raised = RAISED.with(|r| r.replace(outer));
+    (result, (raised != 0).then_some(raised))
+}
+
+/// Raises `exception` from host code: for a 32-bit game's message it is kept
+/// (the first one) and the host method returns as it can; otherwise it is
+/// thrown at once.
+pub fn raise(exception: Id) {
+    if GAME_CALLS.with(|c| c.get()) > 0 {
+        RAISED.with(|r| {
+            if r.get() == 0 {
+                r.set(exception);
+            }
+        });
+        return;
+    }
+    throw(exception)
 }
 
 pub fn throw(exception: Id) -> ! {
@@ -95,11 +129,11 @@ extern "C" fn exception_raise_format_arguments(class: Class, _: Sel, name: Id, f
     raise_new(class, name, reason);
 }
 
-fn raise_new(class: Class, name: Id, reason: Id) -> ! {
+fn raise_new(class: Class, name: Id, reason: Id) {
     let exception = runtime::send(class, "exceptionWithName:reason:userInfo:", &[name, reason, 0]);
     runtime::send(exception, "raise", &[]);
     // A subclass's -raise that returns: Apple throws it anyway.
-    throw(exception)
+    raise(exception)
 }
 
 /// The text a STOP line gives for an exception: "Name: reason".

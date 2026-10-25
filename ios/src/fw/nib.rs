@@ -564,7 +564,15 @@ fn set_outlet(object: Id, key: &str, value: Id) {
         return;
     }
     if runtime::responds(object, "setValue:forKey:") {
-        runtime::send(object, "setValue:forKey:", &[value, string::make(key)]);
+        // Apple raises for an outlet the object doesn't have; it is skipped here.
+        let (_, raised) = crate::fw::exception::catching(|| runtime::send(object, "setValue:forKey:", &[value, string::make(key)]));
+        if raised.is_some() {
+            let class_name = {
+                let rt = runtime::lock();
+                rt.class_name(rt.class_of(object))
+            };
+            log_once(format!("UINib: outlet {key} of {class_name} has no setter or field; not set"));
+        }
         return;
     }
     let mut letters = key.chars();
