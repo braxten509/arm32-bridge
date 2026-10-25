@@ -128,11 +128,42 @@ pub fn position(layer: Id) -> Point {
     }
 }
 
-/// The frame of a layer of its own, from its position, size and anchor
-/// point (its transform aside).
+/// The frame of a layer of its own: its bounds turned and scaled by its
+/// transform around the anchor point, put at its position, and the
+/// smallest rectangle holding that (Core Animation's rule).
 fn own_frame(s: &LayerState) -> Rect {
-    let size = s.bounds.size;
-    Rect { origin: Point { x: s.position.x - size.width * s.anchor.x, y: s.position.y - size.height * s.anchor.y }, size }
+    let offset = transformed_box(s.bounds.size, s.anchor, affine_of(s.transform));
+    Rect { origin: Point { x: s.position.x + offset.origin.x, y: s.position.y + offset.origin.y }, size: offset.size }
+}
+
+/// Where a `size` box with its anchor at (0, 0) lands under `t`, as the
+/// smallest rectangle holding it.
+fn transformed_box(size: Size, anchor: Point, t: Transform) -> Rect {
+    let (left, top) = (-size.width * anchor.x, -size.height * anchor.y);
+    let corners = [(left, top), (left + size.width, top), (left, top + size.height), (left + size.width, top + size.height)];
+    let points = corners.map(|(x, y)| (t.a * x + t.c * y + t.tx, t.b * x + t.d * y + t.ty));
+    let (x0, x1) = points.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| (lo.min(p.0), hi.max(p.0)));
+    let (y0, y1) = points.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| (lo.min(p.1), hi.max(p.1)));
+    Rect::new(x0, y0, x1 - x0, y1 - y0)
+}
+
+/// setFrame: on a layer of its own: the bounds size whose transformed box
+/// is the frame's size (kept when the transform squashes it flat), and the
+/// position that puts that box at the frame.
+fn set_own_frame(s: &mut LayerState, rect: Rect) {
+    let t = affine_of(s.transform);
+    let (a, b, c, d) = (t.a.abs(), t.b.abs(), t.c.abs(), t.d.abs());
+    // width' = |a| w + |c| h, height' = |b| w + |d| h.
+    let det = a * d - b * c;
+    if det.abs() > 1e-12 {
+        let w = (d * rect.size.width - c * rect.size.height) / det;
+        let h = (a * rect.size.height - b * rect.size.width) / det;
+        if w >= 0.0 && h >= 0.0 {
+            s.bounds.size = Size { width: w, height: h };
+        }
+    }
+    let offset = transformed_box(s.bounds.size, s.anchor, t);
+    s.position = Point { x: rect.origin.x - offset.origin.x, y: rect.origin.y - offset.origin.y };
 }
 
 pub fn frame(layer: Id) -> Rect {
@@ -194,10 +225,7 @@ extern "C" fn layer_frame(this: Id, _: Sel) -> Rect {
 
 extern "C" fn layer_set_frame(this: Id, _: Sel, rect: Rect) {
     match view_of(this) {
-        0 => with(this, |s| {
-            s.bounds.size = rect.size;
-            s.position = Point { x: rect.origin.x + rect.size.width * s.anchor.x, y: rect.origin.y + rect.size.height * s.anchor.y };
-        }),
+        0 => with(this, |s| set_own_frame(s, rect)),
         view => crate::fw::uikit::send_rect(view, "setFrame:", rect),
     }
 }
@@ -575,7 +603,7 @@ extern "C" fn layer_speed(this: Id, _: Sel) -> f32 {
     read(this, |s| s.speed) as f32
 }
 
-extern "C" fn layer_set_speed(this: Id, _: Sel, value: f32) {
+pub(crate) extern "C" fn layer_set_speed(this: Id, _: Sel, value: f32) {
     with(this, |s| s.speed = value as f64);
     crate::fw::animation::reschedule();
 }
@@ -1105,6 +1133,17 @@ mod tests {
         assert_eq!(call_point(own, "position"), Point { x: 5.0, y: 5.0 });
         layer_set_anchor(own, 0, Point { x: 1.0, y: 1.0 });
         assert_eq!(frame(own), Rect::new(-5.0, -5.0, 10.0, 10.0));
+        // A transformed layer's frame holds its turned bounds; setting one
+        // sizes the bounds to fit it.
+        let turned = layer_class_layer(runtime::class_named("CALayer"), 0);
+        layer_set_frame(turned, 0, Rect::new(0.0, 0.0, 10.0, 20.0));
+        let quarter = std::f64::consts::FRAC_PI_2;
+        layer_set_affine_transform(turned, 0, Transform { a: quarter.cos(), b: quarter.sin(), c: -quarter.sin(), d: quarter.cos(), tx: 0.0, ty: 0.0 });
+        let near = |a: Rect, b: Rect| (a.origin.x - b.origin.x).abs() + (a.origin.y - b.origin.y).abs() + (a.size.width - b.size.width).abs() + (a.size.height - b.size.height).abs() < 1e-9;
+        assert!(near(frame(turned), Rect::new(-5.0, 5.0, 20.0, 10.0)), "{:?}", frame(turned));
+        layer_set_frame(turned, 0, Rect::new(0.0, 0.0, 40.0, 20.0));
+        assert!(near(bounds(turned), Rect::new(0.0, 0.0, 20.0, 40.0)), "{:?}", bounds(turned));
+        assert!(near(frame(turned), Rect::new(0.0, 0.0, 40.0, 20.0)), "{:?}", frame(turned));
         // A view's layer opacity is its alpha.
         layer_set_opacity(layer, 0, 0.25);
         assert_eq!(property_get(view, "alpha").map(f64::from_bits), Some(0.25));

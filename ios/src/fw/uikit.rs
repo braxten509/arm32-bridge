@@ -1218,18 +1218,44 @@ fn forwards_to_children(controller: Id) -> bool {
         .all(|name| !runtime::responds(controller, name) || runtime::send(controller, name, &[]) & 0xFF != 0)
 }
 
+/// The controller whose own view `view` is (0 if none).
+fn owner_of(view: Id) -> Id {
+    let controller = property_get(view, "viewController").unwrap_or(0) as Id;
+    if controller != 0 && property_get(controller, "view") == Some(view as u64) {
+        controller
+    } else {
+        0
+    }
+}
+
+/// Whether every container above `controller` (its parent controllers)
+/// passes appearance on.
+fn parents_forward(controller: Id) -> bool {
+    let mut parent = property_get(controller, "parentController").unwrap_or(0) as Id;
+    for _ in 0..64 {
+        if parent == 0 {
+            return true;
+        }
+        if !forwards_to_children(parent) {
+            return false;
+        }
+        parent = property_get(parent, "parentController").unwrap_or(0) as Id;
+    }
+    true
+}
+
 /// The controllers whose own views are in `view`'s tree, outer ones first,
-/// that UIKit tells about appearance: not those inside a container that
-/// passes nothing on.
+/// that UIKit tells about appearance: not those inside a container (by its
+/// views or as a parent controller) that passes nothing on.
 fn controllers_in(view: Id) -> Vec<Id> {
     fn walk(view: Id, forward: bool, out: &mut Vec<Id>, depth: usize) {
         if view == 0 || depth > 256 {
             return;
         }
         let mut forward_inside = forward;
-        let controller = property_get(view, "viewController").unwrap_or(0) as Id;
-        if controller != 0 && property_get(controller, "view") == Some(view as u64) {
-            if forward {
+        let controller = owner_of(view);
+        if controller != 0 {
+            if forward && parents_forward(controller) {
                 out.push(controller);
             }
             forward_inside = forward && forwards_to_children(controller);
@@ -1238,8 +1264,22 @@ fn controllers_in(view: Id) -> Vec<Id> {
             walk(child, forward_inside, out, depth + 1);
         }
     }
+    // A container that passes nothing on, around the view, keeps it all.
+    let mut above = if view == 0 { 0 } else { view_state(view).superview };
+    let mut forward = true;
+    for _ in 0..256 {
+        if above == 0 {
+            break;
+        }
+        let controller = owner_of(above);
+        if controller != 0 && !forwards_to_children(controller) {
+            forward = false;
+            break;
+        }
+        above = view_state(above).superview;
+    }
     let mut out = Vec::new();
-    walk(view, true, &mut out, 0);
+    walk(view, forward, &mut out, 0);
     out
 }
 
@@ -1555,10 +1595,11 @@ fn close_presented(owner: Id, animated: bool, restore: bool) {
         closed.push(shown);
         shown = property_get(shown, "presented").unwrap_or(0) as Id;
     }
-    // Their views leave the window top first, each putting back the view it
-    // covered; only `owner` comes back on screen for good.
+    // Their views leave the window top first; only the bottom one puts back
+    // the view it covered: `owner`'s comes back on screen, and the ones in
+    // between (never uncovered) hear nothing.
     for (index, &controller) in closed.iter().enumerate().rev() {
-        hide_presented(controller, if index == 0 { owner } else { 0 }, animated, restore);
+        hide_presented(controller, if index == 0 { owner } else { 0 }, animated, restore && index == 0);
     }
     for shown in closed {
         property_set(shown, "presenting", 0);
@@ -1667,12 +1708,21 @@ extern "C" fn controller_children(this: Id, _: Sel) -> Id {
 /// is hidden instead), the animations block runs, and after `duration` the
 /// old view leaves, the appearance calls finish and completion(YES) runs.
 #[allow(clippy::too_many_arguments)]
-extern "C" fn controller_transition(_this: Id, _: Sel, from: Id, to: Id, duration: f64, options: usize, animations: usize, completion: usize) {
+pub(crate) extern "C" fn controller_transition(_this: Id, _: Sel, from: Id, to: Id, duration: f64, options: usize, animations: usize, completion: usize) {
     let from_view = if from == 0 { 0 } else { runtime::send(from, "view", &[]) };
     let to_view = if to == 0 { 0 } else { runtime::send(to, "view", &[]) };
     let on_screen = from != 0 && property_get(from, "appeared") == Some(1);
-    let hiding = on_screen && will_disappear(from, true);
-    let showing = on_screen && will_appear(to, true);
+    // Each child and the controllers inside its view, animated, starting
+    // now and ending with the transition (the moves below then send nothing).
+    let with_inside = |controller: Id, view: Id| {
+        let mut list = if view == 0 { Vec::new() } else { controllers_in(view) };
+        if controller != 0 && !list.contains(&controller) {
+            list.insert(0, controller);
+        }
+        list
+    };
+    let hiding: Vec<Id> = if on_screen { with_inside(from, from_view).into_iter().filter(|&c| will_disappear(c, true)).collect() } else { Vec::new() };
+    let showing: Vec<Id> = if on_screen { with_inside(to, to_view).into_iter().filter(|&c| will_appear(c, true)).collect() } else { Vec::new() };
     let show_hide = options & SHOW_HIDE_TRANSITION_VIEWS != 0;
     if show_hide {
         property_set(to_view, "hidden", 0);
@@ -1693,11 +1743,11 @@ extern "C" fn controller_transition(_this: Id, _: Sel, from: Id, to: Id, duratio
             } else if from_view != 0 && from_view != to_view {
                 runtime::send(from_view, "removeFromSuperview", &[]);
             }
-            if hiding {
-                did_disappear(from, true);
+            for controller in hiding {
+                did_disappear(controller, true);
             }
-            if showing {
-                did_appear(to, true);
+            for controller in showing {
+                did_appear(controller, true);
             }
             if completion != 0 {
                 let header = completion as *const crate::libsystem::mach::BlockHeader;

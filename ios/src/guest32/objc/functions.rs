@@ -11,13 +11,13 @@
 //! __block variables: { isa, forwarding, flags, size, [keep, destroy], ... }.
 
 use super::bridge::{
-    call_host_function, send_from_guest, Bridge, GuestSide, SendKind, Special, BLOCK_HAS_COPY_DISPOSE, BLOCK_IS_GLOBAL, BLOCK_NEEDS_FREE,
+    call_host_function, framework_row, send_from_guest, Bridge, GuestSide, SendKind, Special, BLOCK_HAS_COPY_DISPOSE, BLOCK_IS_GLOBAL, BLOCK_NEEDS_FREE,
     BLOCK_REFCOUNT_MASK,
 };
 use super::classes::{Lookup, Super};
 use super::convert::{GuestRet, HostCallOptions};
 use super::encoding::Signature;
-use super::selectors::{FrameworkSelectors, Varargs};
+use super::selectors::Varargs;
 use crate::objc::runtime;
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
@@ -680,11 +680,13 @@ fn method(c: &Ctx, class: u32, sel: u32) -> Result<u64, String> {
     let found = if b.classes.class(class).is_some() {
         match b.classes.lookup(class, &name) {
             Lookup::Guest(m) => Some((m.imp, m.types.clone())),
-            Lookup::Framework { .. } => FrameworkSelectors::builtin().get(&name).map(|e| (super::bridge::message_stub(c.g, Some(e.encoding)), e.encoding.to_string())),
+            Lookup::Framework { class, .. } => framework_row(&class, &name).map(|e| (super::bridge::message_stub(c.g, Some(e.encoding)), e.encoding.to_string())),
             Lookup::Missing => None,
         }
     } else {
-        FrameworkSelectors::builtin().get(&name).map(|e| (super::bridge::message_stub(c.g, Some(e.encoding)), e.encoding.to_string()))
+        // A framework class: its own row, as its messages use.
+        let (class, _) = b.class_display(class);
+        framework_row(&class, &name).map(|e| (super::bridge::message_stub(c.g, Some(e.encoding)), e.encoding.to_string()))
     };
     let Some((imp, types)) = found else { return ok(0) };
     let mut cache = METHODS.lock().unwrap_or_else(|e| e.into_inner());

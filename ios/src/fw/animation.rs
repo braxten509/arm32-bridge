@@ -430,6 +430,21 @@ impl Timing {
         State { started: true, ended: false, progress: Some(self.progress_at(local.max(0.0))) }
     }
 
+    /// How many whole cycles (repeats) are behind it at the parent's time
+    /// `t`: 0 in the first; held at its end, the laps before the last.
+    pub fn lap(&self, t: f64) -> f64 {
+        let cycle = if self.autoreverses { 2.0 * self.duration } else { self.duration };
+        if t < self.begin || cycle <= 0.0 {
+            return 0.0;
+        }
+        let (local, active) = ((t - self.begin) * self.speed + self.offset, self.active());
+        if local >= active {
+            ((active / cycle).ceil() - 1.0).max(0.0)
+        } else {
+            (local.max(0.0) / cycle).floor()
+        }
+    }
+
     /// When it ends, in its parent's time (never at speed 0 or repeating forever).
     pub fn end(&self) -> f64 {
         if self.speed <= 0.0 {
@@ -496,6 +511,19 @@ impl Value {
             (Value::Point(p), Value::Point(q)) => Value::Point(Point { x: p.x - q.x, y: p.y - q.y }),
             _ => return None,
         })
+    }
+
+    /// `n` of a value added up (`n` whole, for cumulative laps).
+    fn times(v: Value, n: f64) -> Value {
+        match v {
+            Value::Number(x) => Value::Number(x * n),
+            Value::Point(p) => Value::Point(Point { x: p.x * n, y: p.y * n }),
+            Value::Transform(m) => {
+                let p = Parts::of(layers::affine_of(m));
+                let parts = Parts { tx: p.tx * n, ty: p.ty * n, sx: p.sx.powf(n), sy: p.sy.powf(n), angle: p.angle * n };
+                Value::Transform(layers::affine_to_3d(parts.transform()))
+            }
+        }
     }
 
     /// How far apart two values are (for paced key frames).
@@ -615,14 +643,22 @@ impl Shown {
     }
 }
 
-/// The animation's value at `progress` of its simple duration, for its key
-/// path, over what is shown without it (`under`).
-fn value_at(animation: Id, progress: f64, under: &Shown) -> Option<(String, Value)> {
+fn eased(animation: Id, progress: f64) -> f64 {
+    curve_of(object(animation, "timingFunction")).map_or(progress, |c| c.at(progress))
+}
+
+/// The animation's value at `progress` of its simple duration with `lap`
+/// cycles behind it, for its key path, over what is shown without it
+/// (`under`). A key frame animation's `path` (for a point) wins over its
+/// values; cumulative laps each start from the end of the ones before.
+fn value_at(animation: Id, progress: f64, lap: f64, under: &Shown) -> Option<(String, Value)> {
     let path = string::get(object(animation, "keyPath"));
     let model = under.get(&path)?;
-    let eased = curve_of(object(animation, "timingFunction")).map_or(progress, |c| c.at(progress));
-    let values = object(animation, "values");
-    let value = if values != 0 {
+    let eased = eased(animation, progress);
+    let (values, curve_path) = (object(animation, "values"), object(animation, "path"));
+    let (value, last) = if curve_path != 0 && matches!(model, Value::Point(_)) {
+        (Value::Point(path_sample(curve_path, eased)?.0), Value::Point(path_sample(curve_path, 1.0)?.0))
+    } else if values != 0 {
         keyframe_value(animation, values, eased)?
     } else {
         let (from, to, by) = (read_value(object(animation, "fromValue")), read_value(object(animation, "toValue")), read_value(object(animation, "byValue")));
@@ -635,29 +671,74 @@ fn value_at(animation: Id, progress: f64, under: &Shown) -> Option<(String, Valu
             (None, None, Some(b)) => (model, Value::add(model, b)?),
             (None, None, None) => (model, model),
         };
-        Value::lerp(start, end, eased)?
+        (Value::lerp(start, end, eased)?, end)
     };
+    let cumulative = lap > 0.0 && number(animation, "cumulative", 0.0) != 0.0;
+    let value = if cumulative { Value::add(Value::times(last, lap), value)? } else { value };
     let value = if number(animation, "additive", 0.0) != 0.0 { Value::add(model, value)? } else { value };
     Some((path, value))
 }
 
-fn keyframe_value(animation: Id, values: Id, progress: f64) -> Option<Value> {
+/// The point `f` (0 to 1) of the way along a CGPath at even speed, and the
+/// path's heading there (radians). Lines between figures take no time.
+fn path_sample(path: Id, f: f64) -> Option<(Point, f64)> {
+    let figures = crate::fw::graphics::path_points(path);
+    let first = *figures.iter().flatten().next()?;
+    let steps: Vec<(Point, Point)> = figures.iter().flat_map(|points| points.windows(2).map(|w| (w[0], w[1]))).collect();
+    let length = |(a, b): &(Point, Point)| (b.x - a.x).hypot(b.y - a.y);
+    let total: f64 = steps.iter().map(length).sum();
+    let mut left = f.clamp(0.0, 1.0) * total;
+    let mut found = (first, 0.0);
+    for step in steps.iter().filter(|s| length(s) > 0.0) {
+        let (a, b) = *step;
+        let (len, heading) = (length(step), (b.y - a.y).atan2(b.x - a.x));
+        let t = (left / len).min(1.0);
+        found = (Point { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t }, heading);
+        if left <= len {
+            break;
+        }
+        left -= len;
+    }
+    Some(found)
+}
+
+/// A path animation's turn along its path (rotationMode auto or
+/// autoReverse), at `progress` of its simple duration.
+fn path_turn(animation: Id, progress: f64) -> Option<f64> {
+    let path = object(animation, "path");
+    let mode = object(animation, "rotationMode");
+    if path == 0 || mode == 0 {
+        return None;
+    }
+    let heading = path_sample(path, eased(animation, progress))?.1;
+    match string::get(mode).as_str() {
+        "auto" => Some(heading),
+        "autoReverse" => Some(heading + std::f64::consts::PI),
+        _ => None,
+    }
+}
+
+/// The key frames' value at `progress`, and their last value.
+fn keyframe_value(animation: Id, values: Id, progress: f64) -> Option<(Value, Value)> {
     let values: Vec<Value> = collections::array_items(values).into_iter().map(read_value).collect::<Option<_>>()?;
     let n = values.len();
     match n {
         0 => return None,
-        1 => return Some(values[0]),
+        1 => return Some((values[0], values[0])),
         _ => {}
     }
+    let last = values[n - 1];
     let mode = string::get(anim_calculation_mode(animation, 0));
     let given = object(animation, "keyTimes");
     let given: Vec<f64> = if given == 0 { Vec::new() } else { collections::array_items(given).into_iter().map(layers::number_value).collect() };
     if mode == "discrete" {
         let times: Vec<f64> = if given.len() >= n { given } else { (0..n).map(|i| i as f64 / n as f64).collect() };
         let at = times.iter().take(n).rposition(|&t| t <= progress).unwrap_or(0);
-        return Some(values[at]);
+        return Some((values[at], last));
     }
-    let times: Vec<f64> = if mode.starts_with("paced") || mode == "cubicPaced" {
+    // Paced modes work out their own times and ignore keyTimes and timingFunctions.
+    let paced = mode == "paced" || mode == "cubicPaced";
+    let times: Vec<f64> = if paced {
         let steps: Vec<f64> = values.windows(2).map(|w| Value::distance(w[0], w[1])).collect();
         let total: f64 = steps.iter().sum();
         let mut sum = 0.0;
@@ -674,12 +755,12 @@ fn keyframe_value(animation: Id, values: Id, progress: f64) -> Option<Value> {
     let span = times[segment + 1] - times[segment];
     let mut f = if span > 0.0 { ((progress - times[segment]) / span).clamp(0.0, 1.0) } else { 1.0 };
     let curves = object(animation, "timingFunctions");
-    if curves != 0 {
+    if curves != 0 && !paced {
         if let Some(curve) = collections::array_items(curves).get(segment).and_then(|&c| curve_of(c)) {
             f = curve.at(f);
         }
     }
-    Value::lerp(values[segment], values[segment + 1], f)
+    Some((Value::lerp(values[segment], values[segment + 1], f)?, last))
 }
 
 fn is_group(animation: Id) -> bool {
@@ -694,13 +775,16 @@ fn apply(animation: Id, t: f64, fallback: f64, shown: &mut Shown) {
     let Some(progress) = timing.state(t).progress else { return };
     if is_group(animation) {
         // Its animations run on its own time (clipped to its duration).
-        let eased = curve_of(object(animation, "timingFunction")).map_or(progress, |c| c.at(progress));
+        let eased = eased(animation, progress);
         let children = object(animation, "animations");
         for child in if children == 0 { Vec::new() } else { collections::array_items(children) } {
             apply(child, eased * timing.duration, timing.duration, shown);
         }
-    } else if let Some((path, value)) = value_at(animation, progress, shown) {
+    } else if let Some((path, value)) = value_at(animation, progress, timing.lap(t), shown) {
         shown.set(&path, value);
+        if let Some(turn) = path_turn(animation, progress) {
+            shown.set("transform.rotation", Value::Number(turn));
+        }
     }
 }
 
@@ -781,8 +865,9 @@ fn tick_at(now: f64) {
             }
             if state.ended && !r.stopped {
                 r.stopped = true;
-                stopped.push(r.animation);
-                if number(r.animation, "removedOnCompletion", 1.0) != 0.0 {
+                let removed = number(r.animation, "removedOnCompletion", 1.0) != 0.0;
+                stopped.push((r.animation, removed));
+                if removed {
                     return false;
                 }
             }
@@ -798,12 +883,27 @@ fn tick_at(now: f64) {
     for animation in started {
         tell_started(animation);
     }
-    for animation in stopped {
+    for (animation, removed) in stopped {
         tell_stopped(animation, true);
+        crate::fw::smallclasses::animation_finished(animation);
+        if removed {
+            let_go(animation);
+        }
     }
     if next.is_finite() {
         wake_at(next);
     }
+}
+
+/// Whether an animation (a layer's copy) is on a layer and hasn't ended.
+pub fn in_progress(animation: Id) -> bool {
+    running().iter().any(|r| r.animation == animation && !r.stopped)
+}
+
+/// The layer let go of its copy: the copy lets go of its delegate, as its
+/// dealloc would on Apple (objects here are never freed).
+fn let_go(animation: Id) {
+    anim_set_delegate(animation, 0, 0);
 }
 
 /// When the clock next wakes (infinity: not set).
@@ -830,8 +930,9 @@ pub fn reschedule() {
 }
 
 /// -addAnimation:forKey:. As on Apple: the animation is copied, one with
-/// the same key is removed first, and it starts now unless it has a
-/// beginTime; its start is told on the next turn of the main run loop.
+/// the same key is removed first, a duration of 0 becomes the transaction's
+/// animationDuration, and it starts now unless it has a beginTime; its
+/// start is told on the next turn of the main run loop.
 pub fn add(layer: Id, animation: Id, key: Id) {
     if animation == 0 {
         return;
@@ -845,10 +946,10 @@ pub fn add(layer: Id, animation: Id, key: Id) {
     if number(copy, "beginTime", 0.0) == 0.0 {
         set_number(copy, "beginTime", layers::local_time(layer, now));
     }
-    let timing = timing_of(copy, DEFAULT_DURATION);
-    if let Some(end) = layers::global_time(layer, timing.end()).filter(|e| e.is_finite()) {
-        crate::fw::smallclasses::animation_added(end);
+    if number(copy, "duration", 0.0) <= 0.0 {
+        set_number(copy, "duration", crate::fw::smallclasses::animation_duration());
     }
+    crate::fw::smallclasses::animation_added(copy);
     running().push(Running { layer, key, animation: copy, started: false, stopped: false });
     wake_at(now);
 }
@@ -859,16 +960,20 @@ fn remove_where(matches: impl Fn(&Running) -> bool) {
     let mut gone = Vec::new();
     running().retain(|r| {
         if matches(r) {
-            if !r.stopped {
-                gone.push(r.animation);
-            }
+            gone.push((r.animation, r.stopped));
             false
         } else {
             true
         }
     });
-    for animation in gone {
-        runloop::post(runloop::Work::Native(Box::new(move || tell_stopped(animation, false))));
+    for (animation, stopped) in gone {
+        runloop::post(runloop::Work::Native(Box::new(move || {
+            if !stopped {
+                tell_stopped(animation, false);
+                crate::fw::smallclasses::animation_finished(animation);
+            }
+            let_go(animation);
+        })));
     }
 }
 
@@ -1228,10 +1333,17 @@ mod tests {
         assert_eq!(string::get(anim_value_for_key(copy, 0, string::make("name"))), "intro");
         let begin = number(copy, "beginTime", 0.0);
         assert!(close(presented_at(layer, model, begin + 0.5).opacity, 0.5));
-        tick_at(begin + 0.1);
-        assert_eq!(*HEARD.lock().unwrap(), [("start", copy, true)]);
-        tick_at(begin + 1.5);
-        assert_eq!(HEARD.lock().unwrap()[1..], [("stop", copy, true)]);
+        // (Another test running the main loop may send a call first: wait for it.)
+        let heard_after = |tick: f64, n: usize| {
+            tick_at(tick);
+            let end = std::time::Instant::now() + std::time::Duration::from_millis(300);
+            while HEARD.lock().unwrap().len() < n && std::time::Instant::now() < end {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            HEARD.lock().unwrap().clone()
+        };
+        assert_eq!(heard_after(begin + 0.1, 1), [("start", copy, true)]);
+        assert_eq!(heard_after(begin + 1.5, 2), [("start", copy, true), ("stop", copy, true)]);
         assert_eq!(layer_animation_for_key(layer, 0, string::make("fade")), 0, "removed on completion");
         assert_eq!(presented_at(layer, model, begin + 1.5).opacity, 0.2, "back to the model value");
 
@@ -1275,11 +1387,11 @@ mod tests {
         let numbers = |list: &[f64]| collections::array_from(&list.iter().map(|&v| collections::number_float(v)).collect::<Vec<_>>());
         anim_set_values(hop, 0, numbers(&[1.0, 2.0, 1.0]));
         let model = Shown { opacity: 1.0, position: Point::default(), transform: IDENTITY };
-        assert!(close(value_at(hop, 0.25, &model).map(|(_, v)| match v { Value::Number(n) => n, _ => 0.0 }).unwrap(), 1.5));
+        assert!(close(value_at(hop, 0.25, 0.0, &model).map(|(_, v)| match v { Value::Number(n) => n, _ => 0.0 }).unwrap(), 1.5));
         anim_set_key_times(hop, 0, numbers(&[0.0, 0.8, 1.0]));
-        assert!(close(match value_at(hop, 0.4, &model).unwrap().1 { Value::Number(n) => n, _ => 0.0 }, 1.5));
+        assert!(close(match value_at(hop, 0.4, 0.0, &model).unwrap().1 { Value::Number(n) => n, _ => 0.0 }, 1.5));
         anim_set_calculation_mode(hop, 0, string::make("discrete"));
-        assert_eq!(value_at(hop, 0.9, &model).unwrap().1, Value::Number(2.0));
+        assert_eq!(value_at(hop, 0.9, 0.0, &model).unwrap().1, Value::Number(2.0));
         let mut shown = model;
         shown.set("transform.scale", Value::Number(2.0));
         shown.set("transform.rotation.z", Value::Number(std::f64::consts::FRAC_PI_2));
@@ -1289,5 +1401,124 @@ mod tests {
         let half = Value::lerp(Value::Transform(layers::affine_to_3d(IDENTITY)), Value::Transform(layers::affine_to_3d(Parts { tx: 0.0, ty: 0.0, sx: 1.0, sy: 1.0, angle: 3.0 }.transform())), 0.5).unwrap();
         let Value::Transform(m) = half else { panic!() };
         assert!(close(Parts::of(layers::affine_of(m)).sx, 1.0) && close(Parts::of(layers::affine_of(m)).angle, 1.5));
+    }
+
+    fn number_of(found: Option<(String, Value)>) -> f64 {
+        match found {
+            Some((_, Value::Number(n))) => n,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A cumulative animation adds each lap's end to the next; paced key
+    /// frames ignore the per-segment curves; a path moves a position along
+    /// it at even speed (turning with it when asked).
+    #[test]
+    fn cumulative_paced_and_path_animations() {
+        setup();
+        let layer = runtime::send(runtime::send(runtime::class_named("CALayer"), "alloc", &[]), "init", &[]);
+        let model = Shown { opacity: 1.0, position: Point::default(), transform: IDENTITY };
+        let step = basic("position.x", collections::number_float(0.0), collections::number_float(10.0));
+        anim_set_duration(step, 0, 100.0); // long: other tests running the main loop end nothing early
+        anim_set_repeat_count(step, 0, 2.0);
+        anim_set_cumulative(step, 0, 1);
+        anim_set_fill_mode(step, 0, string::make("forwards"));
+        add(layer, step, string::make("step"));
+        let begin = number(layer_animation_for_key(layer, 0, string::make("step")), "beginTime", 0.0);
+        assert!(close(presented_at(layer, model, begin + 50.0).position.x, 5.0));
+        assert!(close(presented_at(layer, model, begin + 150.0).position.x, 15.0), "second lap starts at the first's end");
+        assert!(close(presented_at(layer, model, begin + 900.0).position.x, 20.0), "held at the end of both laps");
+        layer_remove_all_animations(layer, 0);
+
+        let class = runtime::class_named("CAKeyframeAnimation");
+        let paced = anim_with_key_path(class, 0, string::make("position.x"));
+        let numbers = |list: &[f64]| collections::array_from(&list.iter().map(|&v| collections::number_float(v)).collect::<Vec<_>>());
+        anim_set_values(paced, 0, numbers(&[0.0, 10.0, 40.0]));
+        anim_set_calculation_mode(paced, 0, string::make("paced"));
+        let ease_in = function_with_name(runtime::class_named("CAMediaTimingFunction"), 0, string::make("easeIn"));
+        anim_set_timings(paced, 0, collections::array_from(&[ease_in, ease_in]));
+        assert!(close(number_of(value_at(paced, 0.125, 0.0, &model)), 5.0));
+        assert!(close(number_of(value_at(paced, 0.5, 0.0, &model)), 20.0));
+
+        let path = crate::fw::graphics::new_path();
+        crate::fw::graphics::path_move(path, Point { x: 0.0, y: 0.0 });
+        crate::fw::graphics::path_line(path, Point { x: 100.0, y: 0.0 });
+        crate::fw::graphics::path_line(path, Point { x: 100.0, y: 100.0 });
+        let along = anim_with_key_path(class, 0, string::make("position"));
+        anim_set_path(along, 0, path);
+        anim_set_duration(along, 0, 100.0);
+        anim_set_rotation_mode(along, 0, string::make("auto"));
+        add(layer, along, string::make("along"));
+        let begin = number(layer_animation_for_key(layer, 0, string::make("along")), "beginTime", 0.0);
+        let quarter = presented_at(layer, model, begin + 25.0);
+        assert!(close(quarter.position.x, 50.0) && close(quarter.position.y, 0.0), "{quarter:?}");
+        let late = presented_at(layer, model, begin + 75.0);
+        assert!(close(late.position.x, 100.0) && close(late.position.y, 50.0), "{late:?}");
+        assert!(close(Parts::of(late.transform).angle, std::f64::consts::FRAC_PI_2), "turned down the path");
+        layer_remove_all_animations(layer, 0);
+    }
+
+    static RELEASED: Mutex<Vec<Id>> = Mutex::new(Vec::new());
+    static COMPLETED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    extern "C" fn counted_release(this: Id, _: Sel) {
+        RELEASED.lock().unwrap().push(this);
+    }
+
+    extern "C" fn completed(_block: usize) {
+        COMPLETED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Runs the main run loop a little (at most 0.3 s) until `done`.
+    fn run_until(done: impl Fn() -> bool) -> bool {
+        let end = runloop::media_time() + 0.3;
+        while !done() && runloop::media_time() < end {
+            runloop::run_main_loop_briefly();
+        }
+        done()
+    }
+
+    /// A duration of 0 takes the transaction's animationDuration; the
+    /// transaction's completion runs once its animations have really ended
+    /// or been removed (not on a clock: a paused or endless one holds it);
+    /// a layer letting go of its copy lets go of the delegate.
+    #[test]
+    fn transactions_give_duration_and_wait_for_their_animations() {
+        setup();
+        let transaction = runtime::class_named("CATransaction");
+        let layer = runtime::send(runtime::send(runtime::class_named("CALayer"), "alloc", &[]), "init", &[]);
+        let delegate_class = define_class("CAAnimTestCountedDelegate", "NSObject", 8);
+        methods(delegate_class, &[("release", counted_release as usize)]);
+        let delegate = runtime::send(runtime::send(delegate_class, "alloc", &[]), "init", &[]);
+        let descriptor: [usize; 4] = [0, std::mem::size_of::<crate::libsystem::mach::BlockHeader>(), 0, 0];
+        let block = crate::libsystem::mach::BlockHeader { isa: 0, flags: 1 << 28, reserved: 0, invoke: completed as usize, descriptor: &descriptor };
+        let done = |n: usize| move || COMPLETED.load(std::sync::atomic::Ordering::SeqCst) >= n;
+
+        runtime::send(transaction, "begin", &[]);
+        runtime::send(transaction, "setValue:forKey:", &[collections::number_float(2.0), string::make("animationDuration")]);
+        runtime::send(transaction, "setCompletionBlock:", &[&block as *const _ as usize]);
+        let fade = basic("opacity", collections::number_float(0.0), collections::number_float(1.0));
+        anim_set_delegate(fade, 0, delegate);
+        add(layer, fade, string::make("fade"));
+        let copy = layer_animation_for_key(layer, 0, string::make("fade"));
+        assert_eq!(number(copy, "duration", 0.0), 2.0, "the transaction's duration");
+        runtime::send(transaction, "commit", &[]);
+        layers::layer_set_speed(layer, 0, 0.0);
+        assert!(!run_until(done(1)), "a paused animation holds the completion");
+        RELEASED.lock().unwrap().clear();
+        layer_remove_all_animations(layer, 0);
+        assert!(run_until(done(1)), "removed: the completion runs");
+        assert!(run_until(|| RELEASED.lock().unwrap().contains(&delegate)), "the copy lets go of its delegate");
+        layers::layer_set_speed(layer, 0, 1.0);
+
+        runtime::send(transaction, "begin", &[]);
+        runtime::send(transaction, "setCompletionBlock:", &[&block as *const _ as usize]);
+        let forever = basic("opacity", collections::number_float(0.0), collections::number_float(1.0));
+        anim_set_repeat_count(forever, 0, f32::INFINITY);
+        add(layer, forever, 0);
+        runtime::send(transaction, "commit", &[]);
+        assert!(!run_until(done(2)), "an endless animation holds the completion");
+        layer_remove_all_animations(layer, 0);
+        assert!(run_until(done(2)));
     }
 }

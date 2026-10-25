@@ -975,9 +975,64 @@ fn controllers_appear_and_disappear_with_their_views() {
     runtime::send(parent, "addChildViewController:", &[quiet]);
     runtime::send(parent_view, "addSubview:", &[quiet_view]);
     assert_eq!(events_of(&[quiet, inner]), [event(quiet, "viewWillAppear: NO"), event(quiet, "viewDidAppear: NO")]);
+    // Its child's view put in while it is on screen: still nothing.
+    let late = make("StoryboardTestController");
+    runtime::send(quiet, "addChildViewController:", &[late]);
+    runtime::send(quiet_view, "addSubview:", &[runtime::send(late, "view", &[])]);
+    assert!(events_of(&[late]).is_empty(), "the container tells its children itself");
     runtime::send(quiet_view, "removeFromSuperview", &[]);
-    assert_eq!(events_of(&[quiet, inner]), [event(quiet, "viewWillDisappear: NO"), event(quiet, "viewDidDisappear: NO")]);
+    assert_eq!(events_of(&[quiet, inner, late]), [event(quiet, "viewWillDisappear: NO"), event(quiet, "viewDidDisappear: NO")]);
     assert!(events_of(&[parent]).is_empty(), "the root heard nothing more");
+}
+
+/// transitionFromViewController: the arriving child and the controllers
+/// inside its view hear viewWillAppear:YES at the start and viewDidAppear:YES
+/// when it is over (the leaving one alike). Dismissing A→B→C from A: only A
+/// comes back; B, never uncovered, hears nothing.
+#[test]
+fn transitions_and_stacked_dismissals_tell_the_right_controllers() {
+    setup();
+    let make = |class: &str| runtime::send(runtime::send(runtime::class_named(class), "alloc", &[]), "init", &[]);
+    let event = |id: Id, what: &str| (id, what.to_string());
+    let window = new_window();
+    let parent = make("StoryboardTestController");
+    runtime::send(window, "setRootViewController:", &[parent]);
+    runtime::send(window, "makeKeyAndVisible", &[]);
+    let parent_view = runtime::send(parent, "view", &[]);
+    let (from, to, inside) = (make("StoryboardTestController"), make("StoryboardTestController"), make("StoryboardTestController"));
+    runtime::send(parent, "addChildViewController:", &[from]);
+    runtime::send(parent_view, "addSubview:", &[runtime::send(from, "view", &[])]);
+    runtime::send(parent, "addChildViewController:", &[to]);
+    runtime::send(to, "addChildViewController:", &[inside]);
+    runtime::send(runtime::send(to, "view", &[]), "addSubview:", &[runtime::send(inside, "view", &[])]);
+    let _ = events_of(&[parent, from, to, inside]);
+    crate::fw::uikit::controller_transition(parent, 0, from, to, 0.0, 0, 0, 0);
+    assert_eq!(
+        events_of(&[from, to, inside]),
+        [event(from, "viewWillDisappear: YES"), event(to, "viewWillAppear: YES"), event(inside, "viewWillAppear: YES")],
+        "only the starts"
+    );
+    let end = crate::fw::runloop::media_time() + 0.3;
+    let mut rest = Vec::new();
+    while !rest.contains(&event(inside, "viewDidAppear: YES")) && crate::fw::runloop::media_time() < end {
+        crate::fw::runloop::run_main_loop_briefly();
+        rest.extend(events_of(&[from, to, inside]));
+    }
+    assert_eq!(rest, [event(from, "viewDidDisappear: YES"), event(to, "viewDidAppear: YES"), event(inside, "viewDidAppear: YES")]);
+
+    // A shows B shows C; dismissing from A.
+    let (a, b, c) = (make("StoryboardTestController"), make("StoryboardTestController"), make("StoryboardTestController"));
+    let other = new_window();
+    runtime::send(other, "setRootViewController:", &[a]);
+    runtime::send(other, "makeKeyAndVisible", &[]);
+    runtime::send(a, "presentViewController:animated:completion:", &[b, 0, 0]);
+    runtime::send(b, "presentViewController:animated:completion:", &[c, 0, 0]);
+    let _ = events_of(&[a, b, c]);
+    runtime::send(a, "dismissViewControllerAnimated:completion:", &[0, 0]);
+    let heard = events_of(&[a, b, c]);
+    assert!(heard.iter().all(|e| e.0 != b), "B is never uncovered: {heard:?}");
+    assert_eq!(heard.iter().filter(|e| e.0 == a).cloned().collect::<Vec<_>>(), [event(a, "viewWillAppear: NO"), event(a, "viewDidAppear: NO")]);
+    assert_eq!(heard.iter().filter(|e| e.0 == c).cloned().collect::<Vec<_>>(), [event(c, "viewWillDisappear: NO"), event(c, "viewDidDisappear: NO")]);
 }
 
 /// A shown window given a new root controller: the controller's view is

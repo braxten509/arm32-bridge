@@ -357,7 +357,9 @@ extern "C" fn ignore_touches(_this: Id, _: Sel, _touches: Id, _event: Id) {}
 extern "C" fn picker_init_with_frame(this: Id, _: Sel, frame: Rect) -> Id {
     let s = runtime::sel("initWithFrame:");
     let view = runtime::class_named("UIView"); // before taking the lock: it locks too
-    if let Some(imp) = runtime::lock().lookup(view, s) {
+    // Its own statement: the lock must be let go before the initializer runs.
+    let imp = runtime::lock().lookup(view, s);
+    if let Some(imp) = imp {
         let f: extern "C" fn(Id, Sel, Rect) -> Id = unsafe { std::mem::transmute(imp) };
         f(this, s, frame);
     }
@@ -467,5 +469,21 @@ mod tests {
         assert_eq!(tap(200.0, middle - 10.0), None, "above row 0");
         assert_eq!(tap(200.0, middle + 33.0), Some((1, 1)));
         assert_eq!(tap(2.0, middle + 40.0), None, "between components");
+    }
+
+    /// Making a picker runs UIView's initializer without holding the
+    /// runtime lock (it takes the lock again).
+    #[test]
+    fn pickers_can_be_made() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let picker = runtime::send(runtime::class_named("UIPickerView"), "alloc", &[]);
+            crate::fw::uikit::send_rect(picker, "initWithFrame:", Rect::new(0.0, 0.0, 320.0, 216.0));
+            let _ = tx.send(property_get(picker, "userInteraction"));
+        });
+        let touches = rx.recv_timeout(std::time::Duration::from_millis(500)).expect("the picker is made");
+        assert_eq!(touches, Some(1));
     }
 }

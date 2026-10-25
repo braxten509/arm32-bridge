@@ -948,6 +948,24 @@ pub fn path_bounds(path: Id) -> Rect {
     Rect::new(x0, y0, x1 - x0, y1 - y0)
 }
 
+/// The path's points, one list per figure (curves already in short lines;
+/// a closed figure ends back at its start).
+pub fn path_points(path: Id) -> Vec<Vec<Point>> {
+    let Some(p) = path_state(path) else { return Vec::new() };
+    let outline = p.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    outline
+        .figures
+        .iter()
+        .map(|f| {
+            let mut points: Vec<Point> = f.points.iter().map(|&(x, y)| Point { x, y }).collect();
+            if let (true, Some(&first)) = (f.closed, points.first()) {
+                points.push(first);
+            }
+            points
+        })
+        .collect()
+}
+
 pub fn path_copy(path: Id) -> Id {
     let copy = new_path();
     if let Some(p) = path_state(path) {

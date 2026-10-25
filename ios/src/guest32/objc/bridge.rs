@@ -23,7 +23,7 @@ use super::classes::{GuestClasses, Lookup};
 use super::convert::{self, Boundary, GuestRet, HostCallOptions, HostFrame};
 use super::encoding::Signature;
 use super::mirror;
-use super::selectors::FrameworkSelectors;
+use super::selectors::{FrameworkSelector, FrameworkSelectors};
 use crate::objc::runtime;
 use guest32_image::ObjcMetadata32;
 use std::collections::{HashMap, HashSet};
@@ -669,7 +669,7 @@ impl Bridge {
 
     /// The name of the class the guest sees for a receiver's isa, and whether
     /// that isa is a metaclass (the receiver is the class itself).
-    fn class_display(&self, isa: u32) -> (String, bool) {
+    pub(super) fn class_display(&self, isa: u32) -> (String, bool) {
         if let Some(c) = self.classes.class(isa) {
             return (c.name.clone(), c.meta);
         }
@@ -962,15 +962,21 @@ pub fn set_block_owner(g: &'static dyn GuestSide) {
 /// run that keeps going can skip just that message (`functions::skip_missing`).
 pub const MISSING_METHOD: &str = "missing method ";
 
-/// Type encoding for a message the host answers: the framework table, else
-/// the game's own method of the same name (an override has the same types).
-fn host_signature(b: &Bridge, class: &str, meta: bool, sel: &str) -> Result<(Signature, HostCallOptions), String> {
+/// The framework table's row for a message to an instance of the host class
+/// `class`: that class's own row (`class:Name`), else the general one.
+pub fn framework_row(class: &str, sel: &str) -> Option<&'static FrameworkSelector> {
     let is_kind = |name: &str| {
         let (receiver, named) = (runtime::class_named(class), runtime::class_named(name));
         let rt = runtime::lock();
         receiver != 0 && named != 0 && rt.is_subclass(receiver, named)
     };
-    if let Some(entry) = FrameworkSelectors::builtin().get_for(sel, is_kind) {
+    FrameworkSelectors::builtin().get_for(sel, is_kind)
+}
+
+/// Type encoding for a message the host answers: the framework table, else
+/// the game's own method of the same name (an override has the same types).
+fn host_signature(b: &Bridge, class: &str, meta: bool, sel: &str) -> Result<(Signature, HostCallOptions), String> {
+    if let Some(entry) = framework_row(class, sel) {
         let options =
             HostCallOptions { real_float: entry.real_float, varargs: entry.varargs, arrays: entry.arrays, host_bytes: entry.host_bytes };
         return Ok((entry.signature.clone(), options));
@@ -1066,7 +1072,8 @@ pub fn send_from_guest(
                 let asked = b.selector_name(g, get(first + 2));
                 let imp = match b.classes.lookup(owner, &asked) {
                     Lookup::Guest(m) => m.imp,
-                    Lookup::Framework { .. } | Lookup::Missing => message_stub(g, FrameworkSelectors::builtin().get(&asked).map(|e| e.encoding)),
+                    Lookup::Framework { class, .. } => message_stub(g, framework_row(&class, &asked).map(|e| e.encoding)),
+                    Lookup::Missing => message_stub(g, FrameworkSelectors::builtin().get(&asked).map(|e| e.encoding)),
                 };
                 return Ok(GuestRet { r0: imp, r1: 0 });
             }
