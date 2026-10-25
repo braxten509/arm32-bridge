@@ -50,11 +50,23 @@ impl GuestSide for Translator {
     fn function_address(&self, name: &str) -> u32 {
         runtime::stub_for(name)
     }
+    /// A game exception escaping the call stops at it (see
+    /// exceptions::Barrier) and goes on as a raise of the host code that
+    /// made the call: the bridge throws it again in the game code that
+    /// called the host (64-bit games' exceptions unwind host frames as they are).
     fn call(&self, imp: u32, words: &[u32]) -> Result<u64, String> {
         let _gil = runtime::hold_gil();
         let current = CURRENT_UC.with(|c| c.get());
         let uc = if current.is_null() { runtime::engine() } else { unsafe { &mut *current } };
-        runtime::call_guest(uc, imp, words)
+        let barrier = exceptions::Barrier::push(uc);
+        let result = runtime::call_guest(uc, imp, words);
+        let Some(escaped) = barrier.pop() else { return result };
+        let bridge = bridge().ok_or("a game exception escaped before the Objective-C bridge was set up")?;
+        let c = Ctx { bridge, g: &Translator };
+        let object = exceptions::take_escaped(uc, &c, escaped, crate::fw::exception::answering_game())?;
+        let host = bridge.lock().unwrap_or_else(|e| e.into_inner()).host_object_for(&Translator, object)?;
+        crate::fw::exception::raise(host);
+        Ok(0)
     }
     fn without_guest_lock(&self, wait: &mut dyn FnMut()) {
         runtime::without_gil(wait)
@@ -95,8 +107,19 @@ fn objc_handler(uc: &mut Uc, args: &mut Args) -> Ret {
         }
         state.1[i as usize]
     };
-    let result = with_engine(uc, || call_function(&Ctx { bridge, g: &Translator }, name, &words));
-    if let Some(exception) = super::bridge::take_pending_throw() {
+    // An exception raised meanwhile (by host code, or a game exception that
+    // escaped a nested game call) is thrown here, in the game code that called.
+    let (result, raised) =
+        crate::fw::exception::catching(|| with_engine(uc, || call_function(&Ctx { bridge, g: &Translator }, name, &words)));
+    let raised = match raised.map(|host| bridge.lock().unwrap_or_else(|e| e.into_inner()).guest_object(&Translator, host)) {
+        Some(Err(error)) => {
+            runtime::stop_with_fault(uc, format!("{name}: an exception for the game: {error}"));
+            return Ret::Void;
+        }
+        Some(Ok(exception)) => Some(exception),
+        None => None,
+    };
+    if let Some(exception) = super::bridge::take_pending_throw().or(raised) {
         return with_context(uc, |uc, c| exceptions::throw(uc, c, exception));
     }
     match result {
@@ -176,6 +199,10 @@ pub fn register() {
     super::super::function(exceptions::ANSWER_FALSE, |_, _| Ret::U32(0));
     super::super::function(exceptions::DO_CATCH, exception_do_catch);
     super::super::function(exceptions::TERMINATE, exception_terminate);
+    super::super::function(exceptions::BARRIER, |_, args| {
+        let (_version, actions, _class_low, _class_high, exception, context) = (args.u32(), args.u32(), args.u32(), args.u32(), args.u32(), args.u32());
+        Ret::U32(exceptions::barrier_personality(actions, exception, context))
+    });
     super::super::data("objc_ehtype_vtable", exceptions::vtable);
     super::super::data("OBJC_EHTYPE_id", exceptions::id_type);
     super::super::data("OBJC_EHTYPE_$_NSException", || {

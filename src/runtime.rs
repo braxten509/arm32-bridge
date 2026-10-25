@@ -1562,6 +1562,13 @@ fn trap_address(depth: u32) -> u32 {
     mem::stub_base() + depth * 8
 }
 
+/// The return trap of the next guest call made on this engine: guest code
+/// jumping there ends that call as its return does (the caller's registers
+/// are put back either way).
+pub fn next_return_trap(uc: &Uc) -> u32 {
+    trap_address(uc.get_data().depth)
+}
+
 /// The guest address of the stand-in for `name`, creating it on first use.
 pub fn stub_for(name: &str) -> u32 {
     make_stub(&mut shared(), name)

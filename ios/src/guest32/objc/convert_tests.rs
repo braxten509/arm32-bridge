@@ -160,28 +160,30 @@ fn struct_returns_and_float_returns_convert_back() {
 }
 
 /// NSNotFound is NSIntegerMax: 0x7fffffff for a 32-bit game, not the low
-/// half of the host's 64-bit one, in a plain result and inside an NSRange.
+/// half of the host's 64-bit one. Only where it means "not found": results
+/// of rows marked `not-found` (indexOfObject: and the like) and NSRange
+/// locations; other numbers and range lengths convert as they are.
 #[test]
 fn not_found_reaches_32_bit_games_as_their_own() {
     let mut b = Fake::new();
     let not_found = isize::MAX as u64;
+    let index = HostCallOptions { not_found: true, ..plain() };
     let sig = Signature::parse("I@:@").unwrap();
+    let call = prepare_host_call(&sig, index, &words(&[1, 2, 3]), &mut b).unwrap();
+    let r = finish_host_call(call, &HostRet { x: [not_found, 0], d: [0; 4] }, &mut b).unwrap();
+    assert_eq!(r.r0, 0x7fff_ffff, "an index result");
     let call = prepare_host_call(&sig, plain(), &words(&[1, 2, 3]), &mut b).unwrap();
     let r = finish_host_call(call, &HostRet { x: [not_found, 0], d: [0; 4] }, &mut b).unwrap();
-    assert_eq!(r.r0, 0x7fff_ffff);
+    assert_eq!(r.r0, u32::MAX, "an ordinary number is cut to its low half, as on Apple");
     let sig = Signature::parse("{_NSRange=II}@:@").unwrap();
     let out = b.alloc(8);
     let call = prepare_host_call(&sig, plain(), &words(&[out, 1, 2, 3]), &mut b).unwrap();
-    finish_host_call(call, &HostRet { x: [not_found, 0], d: [0; 4] }, &mut b).unwrap();
-    assert_eq!(b.get(out, 8), [0xff, 0xff, 0xff, 0x7f, 0, 0, 0, 0].to_vec());
-    // And the game's NSNotFound passed in is the host's.
+    finish_host_call(call, &HostRet { x: [not_found, not_found], d: [0; 4] }, &mut b).unwrap();
+    assert_eq!(b.get(out, 8), [0xff, 0xff, 0xff, 0x7f, 0xff, 0xff, 0xff, 0xff].to_vec(), "the location only");
+    // The game's NSNotFound as a range location is the host's; other numbers stay.
     let sig = Signature::parse("v@:{_NSRange=II}i").unwrap();
-    let call = prepare_host_call(&sig, plain(), &words(&[1, 2, 0x7fff_ffff, 0, 0x7fff_ffff]), &mut b).unwrap();
-    assert_eq!(&call.args.x[2..5], &[not_found, 0, not_found]);
-    // NSUIntegerMax stays all ones.
-    let sig = Signature::parse("I@:").unwrap();
-    let call = prepare_host_call(&sig, plain(), &words(&[1, 2]), &mut b).unwrap();
-    assert_eq!(finish_host_call(call, &HostRet { x: [u64::MAX, 0], d: [0; 4] }, &mut b).unwrap().r0, u32::MAX);
+    let call = prepare_host_call(&sig, plain(), &words(&[1, 2, 0x7fff_ffff, 0x7fff_ffff, 0x7fff_ffff]), &mut b).unwrap();
+    assert_eq!(&call.args.x[2..5], &[not_found, 0x7fff_ffff, 0x7fff_ffff]);
 }
 
 #[test]

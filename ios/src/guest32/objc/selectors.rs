@@ -33,6 +33,8 @@ pub struct FrameworkSelector {
     /// The result points to host bytes, as many as the integer
     /// out-parameter says (`host-bytes`).
     pub host_bytes: bool,
+    /// The integer result is an index that may be NSNotFound (`not-found`).
+    pub not_found: bool,
 }
 
 pub struct FrameworkSelectors {
@@ -82,7 +84,8 @@ impl FrameworkSelectors {
                 IdArrays::None
             };
             let (real_float, host_bytes) = (notes.contains(&"float"), notes.contains(&"host-bytes"));
-            let entry = FrameworkSelector { encoding, signature, varargs, real_float, arrays, host_bytes };
+            let not_found = notes.contains(&"not-found");
+            let entry = FrameworkSelector { encoding, signature, varargs, real_float, arrays, host_bytes, not_found };
             if let Some(class) = notes.iter().find_map(|n| n.strip_prefix("class:")) {
                 let rows = by_class.entry(selector).or_default();
                 if rows.iter().any(|(c, _)| *c == class) {

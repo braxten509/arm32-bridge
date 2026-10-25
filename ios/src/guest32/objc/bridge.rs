@@ -972,7 +972,13 @@ fn host_signature(b: &Bridge, class: &str, meta: bool, sel: &str) -> Result<(Sig
     };
     if let Some(entry) = FrameworkSelectors::builtin().get_for(sel, is_kind) {
         let options =
-            HostCallOptions { real_float: entry.real_float, varargs: entry.varargs, arrays: entry.arrays, host_bytes: entry.host_bytes };
+            HostCallOptions {
+                real_float: entry.real_float,
+                varargs: entry.varargs,
+                arrays: entry.arrays,
+                host_bytes: entry.host_bytes,
+                not_found: entry.not_found,
+            };
         return Ok((entry.signature.clone(), options));
     }
     if let Some(types) = b.classes.types_for_selector(sel) {

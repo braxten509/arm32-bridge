@@ -188,11 +188,24 @@ fn host_u64(bytes: &[u8]) -> u64 {
     u64::from_le_bytes(bytes[..8].try_into().unwrap())
 }
 
+/// NSNotFound is NSIntegerMax, 0x7fffffff in a 32-bit game. It is only
+/// turned into the host's where it means "not found": NSRange locations and
+/// index results (`not-found` rows); other numbers convert as they are.
+fn not_found_to_host(host: &mut [u8]) {
+    if host_u64(host) == i32::MAX as u64 {
+        put(host, i64::MAX as u64)
+    }
+}
+
+fn not_found_to_guest(host: &[u8], guest: &mut [u8]) {
+    if host_u64(host) == i64::MAX as u64 {
+        guest[..4].copy_from_slice(&(i32::MAX as u32).to_le_bytes())
+    }
+}
+
 /// Guest bytes of `ty` -> host bytes of `hty`.
 fn to_host(ty: &Ty, hty: &HostTy, guest: &[u8], out: &mut [u8], b: &mut dyn Boundary) -> Result<(), String> {
     match (ty, hty) {
-        // The game's NSNotFound (32-bit NSIntegerMax) is the host's.
-        (Ty::Int { .. }, HostTy::Int { size: 8, .. }) if guest_u32(guest) == i32::MAX as u32 => put(out, i64::MAX as u64),
         (Ty::Char { .. } | Ty::Short { .. } | Ty::Int { .. } | Ty::LongLong { .. } | Ty::Bool, HostTy::Int { size, .. }) => {
             let signed = matches!(ty, Ty::Char { signed: true } | Ty::Short { signed: true } | Ty::Int { signed: true } | Ty::LongLong { signed: true });
             let value = read_int(guest, ty.guest_size() as usize, signed);
@@ -218,13 +231,16 @@ fn to_host(ty: &Ty, hty: &HostTy, guest: &[u8], out: &mut [u8], b: &mut dyn Boun
             };
             put(out, host as u64)
         }
-        (Ty::Struct { fields, .. }, HostTy::Struct { fields: host_fields, .. }) => {
+        (Ty::Struct { name, fields }, HostTy::Struct { fields: host_fields, .. }) => {
             let mut offset = 0;
-            for (f, (host_offset, hf)) in fields.iter().zip(host_fields) {
+            for (i, (f, (host_offset, hf))) in fields.iter().zip(host_fields).enumerate() {
                 offset = align_up(offset, f.guest_align());
                 let size = f.guest_size() as usize;
                 let o = *host_offset as usize;
                 to_host(f, hf, &guest[offset as usize..offset as usize + size], &mut out[o..o + hf.size() as usize], b)?;
+                if i == 0 && name == "_NSRange" {
+                    not_found_to_host(&mut out[o..o + 8]);
+                }
                 offset += size as u32;
             }
         }
@@ -243,11 +259,6 @@ fn to_host(ty: &Ty, hty: &HostTy, guest: &[u8], out: &mut [u8], b: &mut dyn Boun
 /// Host bytes of `hty` -> guest bytes of `ty`.
 fn to_guest(ty: &Ty, hty: &HostTy, host: &[u8], out: &mut [u8], b: &mut dyn Boundary) -> Result<(), String> {
     match (ty, hty) {
-        // NSNotFound (NSIntegerMax) becomes the 32-bit NSIntegerMax, so every
-        // result, NSRange field and out value says "not found" alike.
-        (Ty::Int { .. }, HostTy::Int { size: 8, .. }) if host_u64(host) == i64::MAX as u64 => {
-            out.copy_from_slice(&(i32::MAX as u32).to_le_bytes()[..out.len()])
-        }
         (Ty::Char { .. } | Ty::Short { .. } | Ty::Int { .. } | Ty::LongLong { .. } | Ty::Bool, HostTy::Int { .. }) => {
             out.copy_from_slice(&host[..out.len()])
         }
@@ -286,13 +297,17 @@ fn to_guest(ty: &Ty, hty: &HostTy, host: &[u8], out: &mut [u8], b: &mut dyn Boun
             };
             out.copy_from_slice(&g.to_le_bytes())
         }
-        (Ty::Struct { fields, .. }, HostTy::Struct { fields: host_fields, .. }) => {
+        (Ty::Struct { name, fields }, HostTy::Struct { fields: host_fields, .. }) => {
             let mut offset = 0;
-            for (f, (host_offset, hf)) in fields.iter().zip(host_fields) {
+            for (i, (f, (host_offset, hf))) in fields.iter().zip(host_fields).enumerate() {
                 offset = align_up(offset, f.guest_align());
                 let size = f.guest_size() as usize;
                 let o = *host_offset as usize;
-                to_guest(f, hf, &host[o..o + hf.size() as usize], &mut out[offset as usize..offset as usize + size], b)?;
+                let guest = &mut out[offset as usize..offset as usize + size];
+                to_guest(f, hf, &host[o..o + hf.size() as usize], guest, b)?;
+                if i == 0 && name == "_NSRange" {
+                    not_found_to_guest(&host[o..o + 8], guest);
+                }
                 offset += size as u32;
             }
         }
@@ -698,6 +713,7 @@ pub struct PreparedHostCall {
     indirect: Option<Box<[u64]>>,
     stret: Option<u32>,
     outs: Vec<OutParam>,
+    not_found: bool,
 }
 
 /// What the framework selector table says about a message beyond its types.
@@ -710,6 +726,8 @@ pub struct HostCallOptions {
     /// The result points to host bytes, as many as the integer out-parameter
     /// says (the bridge copies them into guest memory).
     pub host_bytes: bool,
+    /// The integer result is an index that may be NSNotFound (`not-found`).
+    pub not_found: bool,
 }
 
 /// The most ids one counted array may hold (a bad count fails, not the heap).
@@ -815,7 +833,7 @@ pub fn prepare_host_call(
         args.x[8] = buffer.as_ptr() as u64;
     }
     let stret = sig.ret.guest_returns_in_memory().then(|| words(0));
-    Ok(PreparedHostCall { args, ret: sig.ret.clone(), ret_hty, indirect, stret, outs })
+    Ok(PreparedHostCall { args, ret: sig.ret.clone(), ret_hty, indirect, stret, outs, not_found: options.not_found })
 }
 
 impl PreparedHostCall {
@@ -848,6 +866,9 @@ pub fn finish_host_call(call: PreparedHostCall, ret: &HostRet, b: &mut dyn Bound
     let hty = if is_float_scalar(&call.ret) { HostTy::F64 } else { call.ret_hty.clone() };
     let mut guest = vec![0u8; call.ret.guest_size() as usize];
     to_guest(&call.ret, &hty, &host, &mut guest, b)?;
+    if call.not_found && matches!(call.ret, Ty::Int { .. }) {
+        not_found_to_guest(&host, &mut guest);
+    }
     match call.stret {
         Some(address) => {
             b.write(address, &guest);

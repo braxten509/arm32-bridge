@@ -37,6 +37,8 @@
 #                out-parameter says: the guest gets its own copy, kept until
 #                the receiver is announced as finished
 #                (runtime::object_finished).
+#   not-found    the integer result is an index that may be NSNotFound
+#                (the host's NSIntegerMax reaches the game as its own).
 # Several notes are separated by commas.
 #
 # A selector missing here stops the game with its name when a framework
@@ -355,6 +357,7 @@ fill	v@:
 filteredArrayUsingPredicate:	@@:@
 finishEncoding	v@:
 finishTransaction:	v@:@
+firstIndex	I@:	not-found
 firstMatchInString:options:range:	@@:@I{_NSRange=II}
 firstOtherButtonIndex	i@:
 floatValue	f@:
@@ -392,9 +395,11 @@ imageWithCGImage:	@@:^{CGImage=}
 imageWithContentsOfFile:	@@:@
 imageWithData:	@@:@
 increaseLengthBy:	v@:I
-indexOfObject:	I@:@
-indexOfObjectIdenticalTo:	I@:@
-indexOfObjectPassingTest:	I@:@?
+indexGreaterThanIndex:	I@:I	not-found
+indexLessThanIndex:	I@:I	not-found
+indexOfObject:	I@:@	not-found
+indexOfObjectIdenticalTo:	I@:@	not-found
+indexOfObjectPassingTest:	I@:@?	not-found
 indexPathForCell:	@@:@
 indexPathForRow:inSection:	@@:ii
 indexPathForSelectedRow	@@:
@@ -521,6 +526,7 @@ keyEnumerator	@@:
 keysSortedByValueUsingComparator:	@@:@?
 keysSortedByValueUsingSelector:	@@::
 keyWindow	@@:
+lastIndex	I@:	not-found
 lastObject	@@:
 lastPathComponent	@@:
 lastTurnDate	@@:

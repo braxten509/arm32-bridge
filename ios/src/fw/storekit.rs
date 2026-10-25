@@ -8,13 +8,24 @@
 //! product requests fail, so games carry on without the store.
 
 use crate::fw::object::{class_methods, define_class, methods};
-use crate::fw::runloop::{post, Work};
+use crate::fw::runloop::Work;
 use crate::fw::uikit::{property_get, property_set};
 use crate::fw::{collections, string};
 use crate::objc::runtime::{self, lock, Class, Id, Sel};
 use crate::symbols::Registry;
 use std::collections::HashMap;
 use std::sync::Mutex;
+
+/// StoreKit's answers go to the main run loop. A test takes them on its own
+/// thread's loop instead: other tests run the main loop at the same time,
+/// and two threads running answers at once would mix their order.
+fn post(work: Work) {
+    #[cfg(test)]
+    if let Some(run_loop) = tests::OWN_LOOP.with(|l| l.get()) {
+        return crate::fw::runloop::post_to(run_loop, work);
+    }
+    crate::fw::runloop::post(work)
+}
 
 /// SKErrorUnknown: what StoreKit reports when it can't reach the store.
 const SK_ERROR_UNKNOWN: isize = 0;
@@ -596,8 +607,13 @@ mod tests {
 
     /// What the test observer and delegate heard: (who, message, argument).
     static HEARD: Mutex<Vec<(Id, &'static str, Id)>> = Mutex::new(Vec::new());
-    /// The tests share the main run loop and the owned list: one at a time.
+    /// The tests share the owned list: one at a time.
     static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+    thread_local! {
+        /// The run loop this test thread takes StoreKit's answers on (see `post`).
+        pub(super) static OWN_LOOP: std::cell::Cell<Option<&'static crate::fw::runloop::Loop>> = const { std::cell::Cell::new(None) };
+    }
 
     extern "C" fn heard_updated(this: Id, _: Sel, _queue: Id, transactions: Id) {
         HEARD.lock().unwrap().push((this, "updated", transactions));
@@ -657,15 +673,14 @@ mod tests {
                 ],
             );
         });
+        OWN_LOOP.with(|l| l.set(Some(crate::fw::runloop::this_threads_loop())));
         set_owned(parse_owned("# bought on the old iPad\ncom.game.dlc1\n\n  com.game.dlc2  # map pack\n"));
         (guard, runtime::alloc_instance(runtime::class_named("StoreTestListener")))
     }
 
-    /// Runs what is waiting on the main run loop, then what `who` heard.
-    /// For a moment, not one turn: other tests run the same main loop at the
-    /// same time and may be the ones to pick up an answer.
+    /// Runs the answers waiting on this thread's loop, then what `who` heard.
     fn heard_by(who: Id) -> Vec<(&'static str, Id)> {
-        crate::fw::runloop::run_main_loop(Some(crate::fw::runloop::media_time() + 0.1));
+        crate::fw::runloop::run_this_threads_loop_briefly();
         HEARD.lock().unwrap().iter().filter(|h| h.0 == who).map(|h| (h.1, h.2)).collect()
     }
 
@@ -752,7 +767,7 @@ mod tests {
         // A restore nobody heard goes to the first observer that comes.
         let queue = runtime::alloc_instance(runtime::class_named("SKPaymentQueue"));
         runtime::send(queue, "restoreCompletedTransactions", &[]);
-        crate::fw::runloop::run_main_loop(Some(0.0));
+        crate::fw::runloop::run_this_threads_loop_briefly();
         let late = runtime::alloc_instance(runtime::class_named("StoreTestListener"));
         runtime::send(queue, "addTransactionObserver:", &[late]);
         let heard = heard_by(late);
