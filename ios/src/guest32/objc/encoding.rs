@@ -164,6 +164,14 @@ impl Signature {
     }
 }
 
+/// The first type of `text` and the bytes it takes, its offset digits included.
+pub fn parse_one(text: &str) -> Result<(Ty, usize), String> {
+    let mut p = Parser { s: text.as_bytes(), i: 0 };
+    let ty = p.ty()?;
+    p.skip_offset();
+    Ok((ty, p.i))
+}
+
 struct Parser<'a> {
     s: &'a [u8],
     i: usize,

@@ -366,6 +366,154 @@ fn game_retains_autoreleases_and_releases_reach_the_eagl_context_count() {
     assert!(!gles::context_tracked(egl), "its EGL context went with it");
 }
 
+// ----- Core Foundation, CommonCrypto -----
+
+const CF_UTF8: u32 = 0x0800_0100;
+const CF_ASCII: u32 = 0x0600;
+const CF_UNICODE: u32 = 0x0100;
+
+fn host_of(guest: u32) -> usize {
+    super::object_to_host(guest)
+}
+
+fn guest_of(host: usize) -> u32 {
+    super::object_to_guest(host)
+}
+
+#[test]
+fn cf_data_bytes_live_in_guest_memory_and_follow_the_length() {
+    let source = alloc(5);
+    mem().write_bytes(source, b"hello");
+    let one = |name: &str, data: u32| call(name, [data, 0, 0, 0], &[]).0;
+    let data = call("CFDataCreate", [0, source, 5, 0], &[]).0;
+    assert_eq!(one("CFDataGetLength", data), 5);
+    let bytes = one("CFDataGetBytePtr", data);
+    assert_ne!(bytes, source, "CFDataCreate copies");
+    assert_eq!(mem().bytes(bytes, 5), b"hello");
+
+    // A capacity keeps the pointer; the game's writes through it are the data's bytes.
+    let fixed = call("CFDataCreateMutable", [0, 16, 0, 0], &[]).0;
+    let start = one("CFDataGetMutableBytePtr", fixed);
+    assert_ne!(start, 0);
+    call("CFDataSetLength", [fixed, 8, 0, 0], &[]);
+    assert_eq!(one("CFDataGetMutableBytePtr", fixed), start, "the pointer stays within the capacity");
+    assert_eq!(mem().bytes(start, 8), [0; 8], "new length reads as zeros");
+    mem().write_bytes(start, b"12345678");
+    assert_eq!(one("CFDataGetBytePtr", fixed), start);
+    assert_eq!(crate::fw::data::bytes(host_of(fixed)), b"12345678", "the host object holds what the game wrote");
+    let message = crate::objc::runtime::send(host_of(fixed), "bytes", &[]);
+    assert_eq!(mem().guest(message as *const u8), start, "-bytes is the same memory");
+
+    // Growing past the capacity moves the bytes and keeps them.
+    let growing = call("CFDataCreateMutable", [0, 0, 0, 0], &[]).0;
+    call("CFDataSetLength", [growing, 4, 0, 0], &[]);
+    mem().write_bytes(one("CFDataGetMutableBytePtr", growing), b"abcd");
+    call("CFDataSetLength", [growing, 5000, 0, 0], &[]);
+    let moved = one("CFDataGetBytePtr", growing);
+    assert_eq!(mem().bytes(moved, 4), b"abcd");
+    assert!(mem().bytes(moved + 4, 4996).iter().all(|&b| b == 0));
+    assert_eq!(one("CFDataGetLength", growing), 5000);
+
+    // No copy: the data reads the caller's own bytes.
+    let borrowed = call("CFDataCreateWithBytesNoCopy", [0, source, 5, 0], &[]).0;
+    assert_eq!(one("CFDataGetBytePtr", borrowed), source);
+    assert_eq!(one("CFDataGetLength", borrowed), 5);
+}
+
+#[test]
+fn cf_collections_and_numbers_use_32_bit_words() {
+    setup();
+    use crate::fw::{collections, string};
+    let (a, b) = (string::make("a"), string::make("b"));
+    let array = guest_of(collections::array_from(&[a, b, a]));
+    assert_eq!(call("CFArrayGetCount", [array, 0, 0, 0], &[]).0, 3);
+    // CFArrayGetValues(array, CFRange {1, 2}, values): two 4-byte words, nothing past them.
+    let values = alloc(12);
+    mem().write_u32(values + 8, 0xDEAD_BEEF);
+    call("CFArrayGetValues", [array, 1, 2, values], &[]);
+    assert_eq!([mem().read_u32(values), mem().read_u32(values + 4), mem().read_u32(values + 8)], [guest_of(b), guest_of(a), 0xDEAD_BEEF]);
+
+    let dictionary = guest_of(collections::dictionary_from(&[(a, b)]));
+    assert_eq!(call("CFDictionaryGetCount", [dictionary, 0, 0, 0], &[]).0, 1);
+    let (keys, objects) = (alloc(8), alloc(8));
+    mem().write_u32(keys + 4, 0xDEAD_BEEF);
+    call("CFDictionaryGetKeysAndValues", [dictionary, keys, objects, 0], &[]);
+    assert_eq!([mem().read_u32(keys), mem().read_u32(objects), mem().read_u32(keys + 4)], [guest_of(a), guest_of(b), 0xDEAD_BEEF]);
+    call("CFDictionaryGetKeysAndValues", [dictionary, keys, 0, 0], &[]);
+
+    // kCFNumberLongType (10) is 4 bytes here and kCFNumberCGFloatType (16) a float.
+    let value = alloc(8);
+    mem().write_u32(value, -7i32 as u32);
+    mem().write_u32(value + 4, 0x7FFF_FFFF);
+    let long = call("CFNumberCreate", [0, 10, value, 0], &[]).0;
+    assert_eq!(collections::number_as_i64(host_of(long)), -7);
+    mem().write_u32(value, 2.5f32.to_bits());
+    let float = call("CFNumberCreate", [0, 16, value, 0], &[]).0;
+    assert_eq!(collections::number_as_f64(host_of(float)), 2.5);
+
+    let other_a = guest_of(string::make("a"));
+    assert_eq!(call("CFEqual", [guest_of(a), other_a, 0, 0], &[]).0, 1);
+    assert_eq!(call("CFEqual", [guest_of(a), guest_of(b), 0, 0], &[]).0, 0);
+    assert_eq!(call("CFHash", [guest_of(a), 0, 0, 0], &[]).0, call("CFHash", [other_a, 0, 0, 0], &[]).0);
+}
+
+#[test]
+fn cf_string_bytes_use_32_bit_ranges_and_counts() {
+    setup();
+    let text = guest_of(crate::fw::string::make("h\u{e9}llo"));
+    assert_eq!(call("CFStringGetLength", [text, 0, 0, 0], &[]).0, 5);
+    let (buffer, used) = (alloc(16), alloc(8));
+    mem().write_u32(used + 4, 0xDEAD_BEEF);
+    // CFStringGetBytes(string, CFRange {1, 3}, UTF-8, loss byte, external, buffer, room, &used)
+    let converted = call("CFStringGetBytes", [text, 1, 3, CF_UTF8], &[0, 0, buffer, 16, used]).0;
+    assert_eq!((converted, mem().read_u32(used)), (3, 4));
+    assert_eq!(mem().bytes(buffer, 4), "\u{e9}ll".as_bytes());
+    assert_eq!(mem().read_u32(used + 4), 0xDEAD_BEEF, "a 4-byte CFIndex was written");
+    let converted = call("CFStringGetBytes", [text, 0, 5, CF_ASCII], &[b'?' as u32, 0, buffer, 16, used]).0;
+    assert_eq!((converted, mem().bytes(buffer, 5)), (5, &b"h?llo"[..]));
+    // CFStringCreateWithBytes(allocator, bytes, count, encoding, external representation)
+    mem().write_bytes(buffer, &[0xFF, 0xFE, b'h', 0, b'i', 0]);
+    let made = call("CFStringCreateWithBytes", [0, buffer, 6, CF_UNICODE], &[1]).0;
+    assert_eq!(crate::fw::string::get(host_of(made)), "hi");
+    assert_eq!(call("CFStringGetMaximumSizeForEncoding", [5, CF_UTF8, 0, 0], &[]).0, 15);
+}
+
+#[test]
+fn digest_contexts_stay_inside_apples_sizes() {
+    use crate::fw::crypto::{md5, sha1, sha256};
+    let data = alloc(3);
+    mem().write_bytes(data, b"abc");
+    let kinds: [(&str, u32, Vec<u8>); 3] =
+        [("CC_MD5", 92, md5(b"abc").to_vec()), ("CC_SHA1", 96, sha1(b"abc").to_vec()), ("CC_SHA256", 104, sha256(b"abc").to_vec())];
+    for (prefix, size, expected) in kinds {
+        let context = alloc(size + 4);
+        mem().write_u32(context + size, 0xDEAD_BEEF);
+        assert_eq!(call(&format!("{prefix}_Init"), [context, 0, 0, 0], &[]).0, 1);
+        call(&format!("{prefix}_Update"), [context, data, 1, 0], &[]);
+        call(&format!("{prefix}_Update"), [context, data + 1, 2, 0], &[]);
+        let out = alloc(32);
+        assert_eq!(call(&format!("{prefix}_Final"), [out, context, 0, 0], &[]).0, 1);
+        assert_eq!(mem().bytes(out, expected.len()), &expected[..], "{prefix}");
+        assert_eq!(mem().read_u32(context + size), 0xDEAD_BEEF, "{prefix} wrote past its {size}-byte context");
+    }
+}
+
+#[test]
+fn foundation_constants_have_32_bit_forms() {
+    setup();
+    let word = |name: &str| mem().read_u32(crate::guest32::data_address(name).unwrap_or_else(|| panic!("{name}")));
+    assert_eq!(word("vm_page_size"), 4096);
+    assert_eq!(word("OBJC_IVAR_$_NSObject.isa"), 0);
+    let ndr = crate::guest32::data_address("NDR_record").unwrap();
+    assert_eq!(mem().bytes(ndr, 8), [0, 0, 0, 0, 1, 0, 0, 0]);
+    assert_eq!(f32::from_bits(word("UIWindowLevelStatusBar")), 1000.0);
+    let object = |name: &str| host_of(word(name));
+    assert_eq!(crate::fw::string::get(object("kCAMediaTimingFunctionEaseInEaseOut")), "easeInEaseOut");
+    assert_eq!(crate::fw::string::get(object("kSecClassKey")), "keys");
+    assert!(crate::fw::collections::number_as_f64(object("kCFNumberNaN")).is_nan());
+    assert_eq!(object("kCFNull"), crate::objc::runtime::send(crate::objc::runtime::class_named("NSNull"), "null", &[]));
+}
+
 #[test]
 fn indexed_gl_queries_reach_the_guest_registry() {
     setup();

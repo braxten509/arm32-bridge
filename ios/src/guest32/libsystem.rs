@@ -1337,4 +1337,11 @@ fn data() {
         super::data_bytes(name, vec![0; 32], 4);
     }
     super::data_words("mach_task_self_", vec![0x103]);
+    // 32-bit iPhones had 4 KiB pages.
+    super::data_words("vm_page_size", vec![4096]);
+    // Mach's NDR record: { mig_vers, if_vers, reserved1, mig_encoding, int_rep
+    // (1: little-endian), char_rep, float_rep, reserved2 }.
+    super::data_bytes("NDR_record", vec![0, 0, 0, 0, 1, 0, 0, 0], 4);
+    // The offset of NSObject's one ivar, isa.
+    super::data_words("OBJC_IVAR_$_NSObject.isa", vec![0]);
 }

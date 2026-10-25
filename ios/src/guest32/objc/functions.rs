@@ -200,6 +200,24 @@ pub fn functions() -> &'static [(&'static str, ObjcFn)] {
         ("method_getTypeEncoding", |c, w| ok(c.word(w(0) + 4))),
         ("method_getName", |c, w| ok(c.word(w(0)))),
         ("protocol_getMethodDescription", method_description),
+        ("NSAllocateObject", |c, w| {
+            if w(0) == 0 {
+                return ok(0);
+            }
+            let object = c.lock().allocate(c.g, w(0), w(1))?;
+            super::bridge::construct_pending(c.bridge, c.g)?;
+            ok(object)
+        }),
+        // Zones are only names (every allocation uses the one heap): a fixed block.
+        ("NSDefaultMallocZone", |c, _| {
+            static ZONE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+            ok(*ZONE.get_or_init(|| {
+                let zone = c.g.alloc_permanent(16);
+                c.g.write(zone, &[0; 16]);
+                zone
+            }))
+        }),
+        ("NSGetSizeAndAlignment", get_size_and_alignment),
         ("_Block_copy", |c, w| ok(block_copy(c, w(0))?)),
         ("_Block_release", |c, w| block_release(c, w(0)).map(|_| 0)),
         ("_Block_object_assign", block_object_assign),
@@ -215,7 +233,32 @@ pub fn functions() -> &'static [(&'static str, ObjcFn)] {
 /// framework_selectors.tsv, without self/_cmd), variadic arguments.
 pub const HOST_FUNCTIONS: &[(&str, &str, Varargs)] = &[
     ("NSLog", "v@", Varargs::Format),
+    // CFStringAppendFormat(string, format options, format, ...)
+    ("CFStringAppendFormat", "v@@@", Varargs::Format),
+    // The keychain: CFTypeRef results come back through `id *`.
+    ("SecItemAdd", "i@^@", Varargs::None),
+    ("SecItemCopyMatching", "i@^@", Varargs::None),
+    ("SecItemUpdate", "i@@", Varargs::None),
+    ("SecItemDelete", "i@", Varargs::None),
 ];
+
+/// NSGetSizeAndAlignment(type, &size, &alignment): armv7 sizes; returns
+/// the type after it, past its offset digits.
+fn get_size_and_alignment(c: &Ctx, w: Words) -> Result<u64, String> {
+    let (types, size, align) = (w(0), w(1), w(2));
+    if types == 0 {
+        return ok(0);
+    }
+    let text = c.cstr(types);
+    let (ty, used) = super::encoding::parse_one(&text)?;
+    if size != 0 {
+        c.set_word(size, ty.guest_size());
+    }
+    if align != 0 {
+        c.set_word(align, ty.guest_align());
+    }
+    ok(types + used as u32)
+}
 
 pub fn call_function(ctx: &Ctx, name: &str, words: Words) -> Result<u64, String> {
     static TABLE: std::sync::OnceLock<HashMap<&'static str, ObjcFn>> = std::sync::OnceLock::new();

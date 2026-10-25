@@ -44,6 +44,7 @@ pub mod pvrtc;
 pub mod regex;
 pub mod scanner;
 pub mod runloop;
+pub mod seckey;
 pub mod smallclasses;
 pub mod sqlite;
 pub mod storekit;
@@ -84,6 +85,7 @@ pub fn register(r: &mut Registry) {
     runloop::register(r);
     media::register(r);
     keychain::register(r);
+    seckey::register(r);
     gl::register(r);
     eagl::register(r);
     files::register(r);
