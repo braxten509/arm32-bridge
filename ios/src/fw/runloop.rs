@@ -524,6 +524,46 @@ fn fire_due_timers(run_loop: &'static Loop) -> (usize, Option<f64>) {
     (fired, next)
 }
 
+/// Runs `f` as the main thread would: in tests, where several test threads
+/// run the main loop, one piece of its work at a time (a nested loop on the
+/// same thread goes on); elsewhere only the main thread runs it anyway.
+fn main_work<R>(main: bool, f: impl FnOnce() -> R) -> R {
+    #[cfg(test)]
+    if main {
+        static TURN: Mutex<(u64, usize)> = Mutex::new((0, 0));
+        static FREE: std::sync::Condvar = std::sync::Condvar::new();
+        let me = unsafe { libc::pthread_self() } as u64;
+        {
+            let mut turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+            while turn.1 > 0 && turn.0 != me {
+                turn = FREE.wait(turn).unwrap_or_else(|e| e.into_inner());
+            }
+            *turn = (me, turn.1 + 1);
+        }
+        struct Leave;
+        impl Drop for Leave {
+            fn drop(&mut self) {
+                let mut turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+                turn.1 -= 1;
+                if turn.1 == 0 {
+                    FREE.notify_all();
+                }
+            }
+        }
+        let _leave = Leave;
+        return f();
+    }
+    let _ = main;
+    f()
+}
+
+/// For tests: runs `f` as main-loop work (taking turns with other test
+/// threads running the main loop), as the main thread would.
+#[cfg(test)]
+pub fn as_main<R>(f: impl FnOnce() -> R) -> R {
+    main_work(true, f)
+}
+
 /// Runs a loop's queued work and due timers until `until` (or forever), in
 /// run loop mode `mode`. With `once`, returns as soon as something was
 /// handled. Returns true if anything was.
@@ -532,28 +572,29 @@ fn run_loop_until(run_loop: &'static Loop, until: Option<f64>, once: bool, mode:
     let mut handled = false;
     // Each turn of the loop has its own autorelease pool, as on Apple.
     let pool = crate::fw::counted::pool_mark();
+    let main = std::ptr::eq(run_loop, &MAIN_LOOP);
     loop {
         loop {
-            let work = {
-                let mut queue = run_loop.queue.lock().unwrap();
-                queue.iter().position(|work| runs_in(work, mode)).and_then(|at| queue.remove(at))
-            };
-            match work {
-                Some(work) => {
-                    run_work(work);
-                    handled = true;
-                }
-                None => break,
+            let ran = main_work(main, || {
+                let work = {
+                    let mut queue = run_loop.queue.lock().unwrap();
+                    queue.iter().position(|work| runs_in(work, mode)).and_then(|at| queue.remove(at))
+                };
+                work.map(run_work).is_some()
+            });
+            if !ran {
+                break;
             }
+            handled = true;
         }
         // UIKit lays out marked views once a turn, before anything is drawn.
-        if std::ptr::eq(run_loop, &MAIN_LOOP) {
-            crate::fw::uikit::layout_pass();
+        if main {
+            main_work(main, crate::fw::uikit::layout_pass);
         }
-        let (fired, mut next_timer) = fire_due_timers(run_loop);
+        let (fired, mut next_timer) = main_work(main, || fire_due_timers(run_loop));
         handled |= fired > 0;
-        if std::ptr::eq(run_loop, &MAIN_LOOP) {
-            let (ran, next_later) = run_due_later();
+        if main {
+            let (ran, next_later) = main_work(main, run_due_later);
             handled |= ran;
             next_timer = match (next_timer, next_later) {
                 (Some(a), Some(b)) => Some(a.min(b)),

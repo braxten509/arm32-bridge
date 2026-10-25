@@ -34,7 +34,7 @@ mod text;
 pub use render::render_layer;
 pub use shapes::{
     clip_path_in, fill_path_in, new_path, path_append, path_apply, path_arc, path_bounds, path_close, path_contains, path_copy, path_curve, path_current,
-    path_is_empty, path_line, path_move, path_oval, path_quad, path_rect, path_rounded_rect, stroke_path_in,
+    path_is_empty, path_line, path_move, path_oval, path_points, path_quad, path_rect, path_rounded_rect, stroke_path_in,
 };
 
 /// The current UIKit context (UIGraphicsGetCurrentContext), 0 when none.

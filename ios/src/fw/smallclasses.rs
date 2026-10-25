@@ -6,6 +6,7 @@ use crate::libsystem::mach::{block_copy, call_block, BlockHeader};
 use crate::objc::runtime::{self, lock, Class, Id, Sel};
 use crate::symbols::{leak, Registry};
 use std::cell::RefCell;
+use std::sync::Mutex;
 
 // ----- NSIndexPath: { isa, *mut Vec<usize> } -----
 
@@ -274,7 +275,7 @@ extern "C" fn credential_identity(_this: Id, _: Sel) -> usize {
 // A transaction keeps its settings (nested, per thread, as on Apple) and
 // runs its completion block on the main run loop once the outermost
 // transaction commits and the animations added in it (fw/animation.rs)
-// have ended.
+// have all ended or been removed (a paused or endless one holds it).
 
 struct Transaction {
     /// Started by a setter outside begin/commit. Apple commits it at the end
@@ -288,28 +289,50 @@ struct Transaction {
     /// Completion blocks of nested transactions, run with this one's.
     pending: Vec<usize>,
     values: Id,
-    /// When the last animation added in it (or a nested one) ends (media time).
-    animations_end: f64,
+    /// The animations (the layers' copies) added in it or a nested one.
+    animations: Vec<Id>,
 }
 
 impl Transaction {
     fn new(implicit: bool) -> Self {
-        Transaction { implicit, disable_actions: None, duration: None, timing: None, completion: 0, pending: Vec::new(), values: 0, animations_end: 0.0 }
+        Transaction { implicit, disable_actions: None, duration: None, timing: None, completion: 0, pending: Vec::new(), values: 0, animations: Vec::new() }
     }
 
-    fn blocks(self) -> (Vec<usize>, f64) {
+    fn blocks(self) -> (Vec<usize>, Vec<Id>) {
         let mut blocks = self.pending;
         if self.completion != 0 {
             blocks.push(self.completion);
         }
-        (blocks, self.animations_end)
+        (blocks, self.animations)
     }
 }
 
-/// An animation that ends at media time `end` was added: the innermost
-/// transaction's completion waits for it (Core Animation's rule).
-pub fn animation_added(end: f64) {
-    with_top(|t| t.animations_end = t.animations_end.max(end));
+/// An animation was added to a layer: the innermost transaction's
+/// completion waits for it (Core Animation's rule).
+pub fn animation_added(animation: Id) {
+    with_top(|t| t.animations.push(animation));
+}
+
+/// Committed completion blocks still waiting for some of their animations.
+static WAITING: Mutex<Vec<(Vec<usize>, Vec<Id>)>> = Mutex::new(Vec::new());
+
+/// An animation ended or was removed: completions waiting only for it run.
+pub fn animation_finished(animation: Id) {
+    let ready: Vec<usize> = {
+        let mut waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
+        for (_, animations) in waiting.iter_mut() {
+            animations.retain(|&a| a != animation);
+        }
+        let (ready, still): (Vec<_>, Vec<_>) = waiting.drain(..).partition(|(_, animations)| animations.is_empty());
+        *waiting = still;
+        ready.into_iter().flat_map(|(blocks, _)| blocks).collect()
+    };
+    post_blocks(ready);
+}
+
+/// What a duration of 0 stands for in an animation added now.
+pub fn animation_duration() -> f64 {
+    ca_duration(0, 0)
 }
 
 thread_local! {
@@ -318,16 +341,23 @@ thread_local! {
 
 const DEFAULT_DURATION: f64 = 0.25;
 
-/// Runs completion blocks on the main run loop, after `animations_end`.
-fn run_completions((blocks, animations_end): (Vec<usize>, f64)) {
-    let wait = animations_end - runloop::media_time();
+/// Runs completion blocks on the main run loop once their animations are
+/// over (now, when none still runs).
+fn run_completions((blocks, animations): (Vec<usize>, Vec<Id>)) {
+    if blocks.is_empty() {
+        return;
+    }
+    let animations: Vec<Id> = animations.into_iter().filter(|&a| crate::fw::animation::in_progress(a)).collect();
+    if animations.is_empty() {
+        post_blocks(blocks);
+    } else {
+        WAITING.lock().unwrap_or_else(|e| e.into_inner()).push((blocks, animations));
+    }
+}
+
+fn post_blocks(blocks: Vec<usize>) {
     for block in blocks {
-        let work: Box<dyn FnOnce() + Send> = Box::new(move || unsafe { call_block(block) });
-        if wait > 0.0 {
-            runloop::post_after(wait, work);
-        } else {
-            runloop::post(runloop::Work::Native(work));
-        }
+        runloop::post(runloop::Work::Native(Box::new(move || unsafe { call_block(block) })));
     }
 }
 
@@ -372,18 +402,18 @@ extern "C" fn ca_commit(_: Class, _: Sel) {
         if list.last().map(|top| top.implicit).unwrap_or(true) {
             return None;
         }
-        let (finished, end) = list.pop().unwrap().blocks();
+        let (finished, animations) = list.pop().unwrap().blocks();
         match list.last_mut() {
             Some(parent) => {
                 parent.pending.extend(finished);
-                parent.animations_end = parent.animations_end.max(end);
+                parent.animations.extend(animations);
                 if list.len() == 1 && list[0].implicit {
                     // The implicit one waited for this transaction.
                     commit_implicit_later();
                 }
-                Some((Vec::new(), 0.0))
+                Some((Vec::new(), Vec::new()))
             }
-            None => Some((finished, end)),
+            None => Some((finished, animations)),
         }
     });
     match ready {

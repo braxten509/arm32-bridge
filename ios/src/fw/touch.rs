@@ -3,7 +3,7 @@
 //! The phone app hands touches over in window pixels; IOS_TAPS lets PC
 //! tests tap too ("seconds:x,y;seconds:x,y" in points).
 
-use crate::fw::geometry::Point;
+use crate::fw::geometry::{concat, Point, Transform, IDENTITY};
 use crate::fw::object::{define_class, methods};
 use crate::fw::uikit::{key_window, property_get, property_set, view_state};
 use crate::fw::{collections, misc};
@@ -25,9 +25,86 @@ struct Touch {
     view: Id,
     /// A gesture recognizer took this touch: the view heard touchesCancelled and hears no more.
     taken: bool,
+    /// The view heard touchesBegan (so a recognizer taking it cancels it).
+    began_sent: bool,
 }
 
 static TOUCHES: Mutex<Option<HashMap<i32, Touch>>> = Mutex::new(None);
+
+/// What recognizers hold back from a view (delaysTouchesBegan,
+/// delaysTouchesEnded) until they fail or recognize, per finger.
+struct Held {
+    view: Id,
+    object: Id,
+    began_sent: bool,
+    /// (selector, changed touches, event), in order.
+    items: Vec<(&'static str, Id, Id)>,
+}
+
+static HELD: Mutex<Option<HashMap<i32, Held>>> = Mutex::new(None);
+
+fn selector_for(phase: Phase) -> &'static str {
+    match phase {
+        Phase::Began => "touchesBegan:withEvent:",
+        Phase::Moved => "touchesMoved:withEvent:",
+        Phase::Ended => "touchesEnded:withEvent:",
+        Phase::Cancelled => "touchesCancelled:withEvent:",
+    }
+}
+
+fn mark_touch(finger: i32, f: impl FnOnce(&mut Touch)) {
+    if let Some(touch) = TOUCHES.lock().unwrap().as_mut().and_then(|t| t.get_mut(&finger)) {
+        f(touch);
+    }
+}
+
+/// The recognizers holding a finger's touches decided: without `cancel`
+/// the view hears all it was held back from, in order; with it (one
+/// recognized) the view hears touchesCancelled if it had heard the touch
+/// begin, else nothing at all, and nothing more of that touch.
+pub(crate) fn release(finger: i32, cancel: bool) {
+    let Some(held) = HELD.lock().unwrap().as_mut().and_then(|h| h.remove(&finger)) else { return };
+    if cancel {
+        mark_touch(finger, |t| t.taken = true);
+        if held.began_sent {
+            property_set(held.object, "phase", Phase::Cancelled as u64);
+            let event = held.items.last().map_or_else(|| make_event(&[held.object], now()), |i| i.2);
+            send_to_view(held.view, finger, "touchesCancelled:withEvent:", misc::set_from(&[held.object]), event);
+        }
+        return;
+    }
+    for (selector, changed, event) in held.items {
+        if selector == "touchesBegan:withEvent:" {
+            mark_touch(finger, |t| t.began_sent = true);
+        }
+        send_to_view(held.view, finger, selector, changed, event);
+    }
+}
+
+/// A recognizer took a finger's touch outside a touch change (a long press
+/// on its timer, one that waited for others to fail): the view's touch is
+/// cancelled, as when it is taken during a change.
+pub(crate) fn take_from_view(finger: i32) {
+    if HELD.lock().unwrap().as_ref().is_some_and(|h| h.contains_key(&finger)) {
+        release(finger, true);
+        return;
+    }
+    let touch = TOUCHES.lock().unwrap().as_mut().and_then(|t| t.get_mut(&finger)).filter(|t| !t.taken).map(|t| {
+        t.taken = true;
+        (t.object, t.view, t.began_sent)
+    });
+    if let Some((object, view, true)) = touch {
+        property_set(object, "phase", Phase::Cancelled as u64);
+        send_to_view(view, finger, "touchesCancelled:withEvent:", misc::set_from(&[object]), make_event(&[object], now()));
+    }
+}
+
+fn make_event(touches: &[Id], stamp: f64) -> Id {
+    let event = runtime::alloc_instance(runtime::class_named("UIEvent"));
+    property_set(event, "touches", misc::set_from(touches) as u64);
+    property_set(event, "timestamp", stamp.to_bits());
+    event
+}
 
 /// UITouchPhaseStationary.
 const STATIONARY: u64 = 2;
@@ -68,6 +145,31 @@ pub(crate) fn origin_in_window(view: Id) -> Point {
         current = state.superview;
     }
     point
+}
+
+/// How the view's own points map to window points: each view's bounds
+/// origin, its transform around its anchor point (its center unless the
+/// layer's anchor moved) and its place in its superview, up to the window.
+pub(crate) fn view_to_window(view: Id) -> Transform {
+    let mut t = IDENTITY;
+    let mut current = view;
+    for _ in 0..64 {
+        if current == 0 {
+            break;
+        }
+        let state = view_state(current);
+        if state.superview == 0 {
+            break;
+        }
+        let anchor = crate::fw::layers::view_anchor(current);
+        let size = state.frame.size;
+        let (ax, ay) = (size.width * anchor.x, size.height * anchor.y);
+        let to_anchor = Transform { tx: -(state.bounds_origin.x + ax), ty: -(state.bounds_origin.y + ay), ..IDENTITY };
+        let to_superview = Transform { tx: state.frame.origin.x + ax, ty: state.frame.origin.y + ay, ..IDENTITY };
+        t = concat(concat(concat(t, to_anchor), state.transform), to_superview);
+        current = state.superview;
+    }
+    t
 }
 
 /// What hit-testing needs to know about one view.
@@ -244,13 +346,13 @@ pub(crate) fn deliver_in(window: Id, finger: i32, phase: Phase, point: Point) {
             property_set(object, "view", view as u64);
             property_set(object, "tapCount", 1);
             set_point(object, "previousX", point);
-            touches.insert(finger, Touch { object, view, taken: false });
+            touches.insert(finger, Touch { object, view, taken: false, began_sent: false });
             touches.get(&finger).unwrap()
         }
         (_, Some(existing)) => existing,
         (_, None) => return,
     };
-    let (object, view, taken) = (touch.object, touch.view, touch.taken);
+    let (object, view, taken, began_sent) = (touch.object, touch.view, touch.taken, touch.began_sent);
     if phase != Phase::Began {
         let previous = point_of(object, "x", "y");
         set_point(object, "previousX", previous);
@@ -268,30 +370,40 @@ pub(crate) fn deliver_in(window: Id, finger: i32, phase: Phase, point: Point) {
     }
     drop(guard);
 
-    let event = runtime::alloc_instance(runtime::class_named("UIEvent"));
-    property_set(event, "touches", misc::set_from(&active) as u64);
-    property_set(event, "timestamp", stamp.to_bits());
+    let event = make_event(&active, stamp);
     let changed = misc::set_from(&[object]);
-    // Gesture recognizers on the view and the views it is in see the touch first.
-    let took = crate::fw::gestures::touch_changed(view, object, finger, phase, point);
+    // Gesture recognizers on the view and the views it is in see the touch
+    // first (and may take it, or hold it back from the view for now).
+    let verdict = crate::fw::gestures::touch_changed(view, object, finger, phase, point);
     if taken {
         return;
     }
-    let phase = if took {
-        if let Some(touch) = TOUCHES.lock().unwrap().as_mut().and_then(|t| t.get_mut(&finger)) {
-            touch.taken = true;
+    match verdict {
+        crate::fw::gestures::Verdict::Took => {
+            mark_touch(finger, |t| t.taken = true);
+            if began_sent {
+                property_set(object, "phase", Phase::Cancelled as u64);
+                send_to_view(view, finger, "touchesCancelled:withEvent:", changed, event);
+            }
         }
-        property_set(object, "phase", Phase::Cancelled as u64);
-        Phase::Cancelled
-    } else {
-        phase
-    };
-    let selector = match phase {
-        Phase::Began => "touchesBegan:withEvent:",
-        Phase::Moved => "touchesMoved:withEvent:",
-        Phase::Ended => "touchesEnded:withEvent:",
-        Phase::Cancelled => "touchesCancelled:withEvent:",
-    };
+        crate::fw::gestures::Verdict::Hold => {
+            let mut held = HELD.lock().unwrap();
+            let entry = held.get_or_insert_with(HashMap::new).entry(finger).or_insert(Held { view, object, began_sent, items: Vec::new() });
+            entry.items.push((selector_for(phase), changed, event));
+        }
+        crate::fw::gestures::Verdict::Pass => {
+            if phase == Phase::Began {
+                mark_touch(finger, |t| t.began_sent = true);
+            }
+            send_to_view(view, finger, selector_for(phase), changed, event);
+        }
+    }
+}
+
+/// Sends a touch message for the view a finger touched, logging the first few.
+fn send_to_view(view: Id, finger: i32, selector: &'static str, changed: Id, event: Id) {
+    let point = runtime::send(changed, "anyObject", &[]);
+    let point = if point == 0 { Point::default() } else { point_of(point, "x", "y") };
     // Like UIKit's responder chain: the touched view, else the nearest
     // view above it that handles touches.
     let mut handler = view;
@@ -556,6 +668,74 @@ mod tests {
 
     fn heard() -> Vec<String> {
         std::mem::take(&mut *HEARD.lock().unwrap())
+    }
+
+    /// What the gesture test's view heard, in order.
+    static GESTURE_HEARD: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    /// The view's touches around recognizers, as UIKit holds and cancels
+    /// them: a long press recognized on its timer cancels the view's touch;
+    /// with delaysTouchesBegan the view hears nothing until the recognizer
+    /// fails (then all of it, in order) and nothing at all if it recognizes;
+    /// with delaysTouchesEnded (the default) the end waits while a double tap
+    /// could still come.
+    #[test]
+    fn recognizers_hold_back_and_cancel_the_views_touches() {
+        use crate::fw::geometry::Rect;
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        extern "C" fn note(_this: Id, s: Sel, _: Id, _: Id) {
+            GESTURE_HEARD.lock().unwrap().push(lock().sel_name(s).trim_end_matches(":withEvent:").to_string());
+        }
+        let heard = || std::mem::take(&mut *GESTURE_HEARD.lock().unwrap());
+        let class = define_class("TouchTestGestureView", "UIView", 8);
+        let touches = ["touchesBegan:withEvent:", "touchesMoved:withEvent:", "touchesEnded:withEvent:", "touchesCancelled:withEvent:"];
+        methods(class, &touches.map(|name| (name, note as usize)));
+        let new_view = |class: &str, frame: Rect| {
+            let object = runtime::send(runtime::class_named(class), "alloc", &[]);
+            crate::fw::uikit::send_rect(object, "initWithFrame:", frame);
+            object
+        };
+        let window = new_view("UIWindow", Rect::new(0.0, 0.0, 568.0, 320.0));
+        let view = new_view("TouchTestGestureView", Rect::new(0.0, 0.0, 568.0, 320.0));
+        runtime::send(window, "addSubview:", &[view]);
+        let finger = 710; // not a finger other tests use
+        // As main-loop work: other tests' main loops may let held touches go too.
+        let touch = |phase: Phase, x: f64| crate::fw::runloop::as_main(|| deliver_in(window, finger, phase, Point { x, y: 100.0 }));
+        let recognizer = |class: &str| {
+            let object = runtime::send(runtime::send(runtime::class_named(class), "alloc", &[]), "init", &[]);
+            runtime::send(view, "addGestureRecognizer:", &[object]);
+            object
+        };
+
+        let press = recognizer("UILongPressGestureRecognizer");
+        touch(Phase::Began, 100.0);
+        crate::fw::runloop::as_main(|| crate::fw::gestures::held(press, finger));
+        touch(Phase::Ended, 100.0);
+        assert_eq!(heard(), ["touchesBegan", "touchesCancelled"], "the long press took the touch");
+        runtime::send(view, "removeGestureRecognizer:", &[press]);
+
+        let pan = recognizer("UIPanGestureRecognizer");
+        runtime::send(pan, "setDelaysTouchesBegan:", &[1]);
+        touch(Phase::Began, 100.0);
+        touch(Phase::Moved, 103.0);
+        assert!(heard().is_empty(), "held while the pan could still begin");
+        touch(Phase::Ended, 103.0);
+        assert_eq!(heard(), ["touchesBegan", "touchesMoved", "touchesEnded"], "the pan failed: all of it, in order");
+        touch(Phase::Began, 100.0);
+        touch(Phase::Moved, 150.0);
+        touch(Phase::Ended, 150.0);
+        assert!(heard().is_empty(), "the pan took it before the view heard anything");
+        runtime::send(view, "removeGestureRecognizer:", &[pan]);
+
+        let double = recognizer("UITapGestureRecognizer");
+        runtime::send(double, "setNumberOfTapsRequired:", &[2]);
+        touch(Phase::Began, 100.0);
+        touch(Phase::Ended, 100.0);
+        assert_eq!(heard(), ["touchesBegan"], "the end waits for a second tap");
+        crate::fw::runloop::as_main(|| crate::fw::gestures::tap_gap_passed(double));
+        assert_eq!(heard(), ["touchesEnded"], "no second tap: the end comes");
+        runtime::send(view, "removeGestureRecognizer:", &[double]);
     }
 
     /// Controls follow a finger as UIKit's do: pressed (highlighted) while

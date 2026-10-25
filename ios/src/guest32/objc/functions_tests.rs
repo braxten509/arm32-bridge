@@ -142,6 +142,31 @@ fn runtime_functions_retain_store_properties_classes_and_ivars() {
     assert_eq!(call("objc_getAssociatedObject", &[object, 0x78]), 0);
 }
 
+/// class_getInstanceMethod on a framework class reports the types its
+/// messages really use: a class's own row (CALayer's setTransform: takes a
+/// CATransform3D) before the general one (UIView's CGAffineTransform).
+#[test]
+fn framework_methods_report_their_classs_own_types() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(crate::run::setup);
+    let g = Fake::new();
+    let bridge: &'static Mutex<Bridge> = Box::leak(Box::new(Mutex::new(Bridge::new(&ObjcMetadata32::default()).unwrap())));
+    let ctx = Ctx { bridge, g };
+    let call = |name: &str, words: &[u32]| {
+        let w = |i: u32| words.get(i as usize).copied().unwrap_or(0);
+        call_function(&ctx, name, &w).unwrap() as u32
+    };
+    let sel = |name: &str| bridge.lock().unwrap().guest_selector(g, name);
+    let types = |class: &str| {
+        let class = call("objc_getClass", &[g.text(class)]);
+        let method = call("class_getInstanceMethod", &[class, sel("setTransform:")]);
+        let text = g.read(g.u32_at(method + 4), 64);
+        String::from_utf8_lossy(&text[..text.iter().position(|&b| b == 0).unwrap()]).into_owned()
+    };
+    assert_eq!(types("CALayer"), "v@:{CATransform3D=ffffffffffffffff}");
+    assert_eq!(types("UIView"), "v@:{CGAffineTransform=ffffff}");
+}
+
 #[test]
 fn blocks_copy_to_the_heap_and_run_when_the_host_calls_them() {
     let g = Fake::new();
