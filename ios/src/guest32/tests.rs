@@ -226,6 +226,27 @@ fn packed_byte_extends_translate() {
 }
 
 #[test]
+fn fmax_and_fmin_take_doubles_and_skip_nan() {
+    // Doubles in r0:r1 and r2:r3 (softfp), the result in r0:r1.
+    let both = |name: &str, x: f64, y: f64| {
+        let (x, y) = (x.to_bits(), y.to_bits());
+        let (low, high) = call(name, [x as u32, (x >> 32) as u32, y as u32, (y >> 32) as u32], &[]);
+        f64::from_bits(low as u64 | (high as u64) << 32)
+    };
+    assert_eq!(both("fmax", 1.5, -2.0), 1.5);
+    assert_eq!(both("fmin", 1.5, -2.0), -2.0);
+    assert_eq!(both("fmax", f64::NAN, 3.0), 3.0, "NaN loses");
+    assert_eq!(both("fmin", -4.0, f64::NAN), -4.0);
+}
+
+#[test]
+fn system_has_no_shell_as_in_the_ios_sandbox() {
+    assert_eq!(call("system", [0; 4], &[]).0, 0, "system(NULL): no command processor");
+    assert_eq!(call("system", [cstring("ls"), 0, 0, 0], &[]).0 as i32, -1);
+    assert_eq!(errno(), 1, "EPERM: apps may not start processes");
+}
+
+#[test]
 fn uname_fills_darwins_five_256_byte_fields() {
     let names = alloc(5 * 256);
     assert_eq!(call("uname", [names, 0, 0, 0], &[]).0, 0);

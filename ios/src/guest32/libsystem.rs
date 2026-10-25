@@ -51,7 +51,7 @@ const REUSED: &[&str] = &[
     "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh", "exp", "exp2", "log", "log10", "log2",
     "log1p", "expm1", "cbrt", "ceil", "floor", "sqrt", "rint", "atan2", "pow", "fmod", "hypot", "round", "trunc",
     "ldexp", "frexp", "modf", "sinf", "cosf", "tanf", "asinf", "acosf", "atanf", "exp2f", "expf", "logf", "log10f",
-    "log2f", "sqrtf", "floorf", "ceilf", "atan2f", "powf", "fmodf", "roundf", "truncf", "fmaxf", "fminf",
+    "log2f", "sqrtf", "floorf", "ceilf", "atan2f", "powf", "fmodf", "roundf", "truncf", "fmaxf", "fminf", "fmax", "fmin",
     "ldexpf", "modff", "lrint", "lrintf", "sinhf", "coshf", "tanhf", "cbrtf",
     // threads with the same objects
     "pthread_self", "pthread_equal", "pthread_join", "pthread_detach", "pthread_exit", "pthread_key_create",
@@ -1039,6 +1039,18 @@ fn process() {
                 mem().write_bytes(field, &bytes);
             }
             Ret::U32(0)
+        })
+        .unwrap(),
+    );
+    // The iOS sandbox lets no app start a process: no shell (system(NULL) is 0), every command EPERM.
+    function(
+        "system",
+        handler!(|uc, a| {
+            if a.u32() == 0 {
+                return Ret::U32(0);
+            }
+            mem().write_u32(uc.get_data().errno_slot, 1);
+            Ret::U32(u32::MAX)
         })
         .unwrap(),
     );
