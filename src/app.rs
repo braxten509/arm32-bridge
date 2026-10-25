@@ -317,10 +317,24 @@ fn gl_thread_view(env: *mut JNIEnv) -> Option<jobject> {
     (!view.is_null()).then_some(view)
 }
 
+/// A Java string's text (empty for null).
+fn java_text(env: *mut JNIEnv, text: jobject) -> String {
+    if text.is_null() {
+        return String::new();
+    }
+    let chars = jcall!(env, GetStringUTFChars, text as jni_sys::jstring, std::ptr::null_mut());
+    if chars.is_null() {
+        return String::new();
+    }
+    let owned = unsafe { std::ffi::CStr::from_ptr(chars) }.to_string_lossy().into_owned();
+    jcall!(env, ReleaseStringUTFChars, text as jni_sys::jstring, chars);
+    owned
+}
+
 /// The game's view for games that draw from their own thread (SDL and others): a
 /// SurfaceView kept in a field of the class (or object) whose native method was called.
-/// Static fields first, then the object's own fields.
-fn field_view(env: *mut JNIEnv, owner: jobject) -> Option<jobject> {
+/// Static fields first, then the object's own fields. Returns the view and the field's name.
+fn field_view(env: *mut JNIEnv, owner: jobject) -> Option<(jobject, String)> {
     if owner.is_null() {
         return None;
     }
@@ -332,7 +346,14 @@ fn field_view(env: *mut JNIEnv, owner: jobject) -> Option<jobject> {
     let field_class = jcall!(env, FindClass, c"java/lang/reflect/Field".as_ptr());
     let get_type = jcall!(env, GetMethodID, field_class, c"getType".as_ptr(), c"()Ljava/lang/Class;".as_ptr());
     let get_modifiers = jcall!(env, GetMethodID, field_class, c"getModifiers".as_ptr(), c"()I".as_ptr());
-    if class.is_null() || surface_view.is_null() || get_fields.is_null() || get_type.is_null() || get_modifiers.is_null() {
+    let get_name = jcall!(env, GetMethodID, field_class, c"getName".as_ptr(), c"()Ljava/lang/String;".as_ptr());
+    if class.is_null()
+        || surface_view.is_null()
+        || get_fields.is_null()
+        || get_type.is_null()
+        || get_modifiers.is_null()
+        || get_name.is_null()
+    {
         return None;
     }
     let fields = jcall!(env, CallObjectMethodA, class, get_fields, std::ptr::null());
@@ -348,6 +369,8 @@ fn field_view(env: *mut JNIEnv, owner: jobject) -> Option<jobject> {
         // nativeInit-style calls may never return to Java, so local references are let go here.
         let field = jcall!(env, GetObjectArrayElement, fields, i);
         let kind = jcall!(env, CallObjectMethodA, field, get_type, std::ptr::null());
+        // JNI IsAssignableFrom(A, B): "can an object of class A be cast to B", so this is
+        // true for SurfaceView and its subclasses (SDLSurface), false for Object or View.
         let is_view = !kind.is_null() && jcall!(env, IsAssignableFrom, kind as jclass, surface_view) != 0;
         jcall!(env, DeleteLocalRef, kind);
         if !is_view {
@@ -356,48 +379,110 @@ fn field_view(env: *mut JNIEnv, owner: jobject) -> Option<jobject> {
         }
         let is_static = jcall!(env, CallIntMethodA, field, get_modifiers, std::ptr::null()) & 8 != 0;
         let id = jcall!(env, FromReflectedField, field);
+        let name_object = jcall!(env, CallObjectMethodA, field, get_name, std::ptr::null());
+        let name = java_text(env, name_object);
+        jcall!(env, DeleteLocalRef, name_object);
         jcall!(env, DeleteLocalRef, field);
-        if is_static {
-            let view = jcall!(env, GetStaticObjectField, class, id);
-            found_static = (!view.is_null()).then_some(view);
+        let view = if is_static {
+            jcall!(env, GetStaticObjectField, class, id)
         } else if !is_class && found_in_object.is_none() {
-            let view = jcall!(env, GetObjectField, owner, id);
-            found_in_object = (!view.is_null()).then_some(view);
+            jcall!(env, GetObjectField, owner, id)
+        } else {
+            continue;
+        };
+        // The value itself must be a SurfaceView too.
+        if view.is_null() || jcall!(env, IsInstanceOf, view, surface_view) == 0 {
+            jcall!(env, DeleteLocalRef, view);
+            continue;
+        }
+        if is_static {
+            found_static = Some((view, name));
+        } else {
+            found_in_object = Some((view, name));
         }
     }
     jcall!(env, DeleteLocalRef, fields);
     found_static.or(found_in_object)
 }
 
+/// The 120 Hz request is still owed: the game's surface wasn't there (or not valid) yet.
+static REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
+/// Later tries: at most this many, this far apart, from any native call (cheap: one atomic load).
+const REFRESH_RETRIES: u32 = 20;
+const REFRESH_RETRY_GAP: Duration = Duration::from_millis(500);
+static REFRESH_RETRY: Mutex<(u32, Option<Instant>)> = Mutex::new((0, None));
+
+/// Asks for 120 Hz from a native call made after an earlier request failed.
+fn retry_refresh_rate(env: *mut JNIEnv, owner: jobject) {
+    {
+        let mut retry = REFRESH_RETRY.lock().unwrap_or_else(|e| e.into_inner());
+        if retry.1.is_some_and(|last| last.elapsed() < REFRESH_RETRY_GAP) {
+            return;
+        }
+        if retry.0 >= REFRESH_RETRIES {
+            REFRESH_PENDING.store(false, Ordering::Relaxed);
+            crate::log::line("[bridge] gave up asking for 120 Hz: the game's surface never became ready");
+            return;
+        }
+        retry.0 += 1;
+        retry.1 = Some(Instant::now());
+    }
+    request_refresh_rate(env, owner);
+}
+
+/// Looks up the game's surface and asks for 120 Hz; when it isn't reachable yet the request
+/// stays pending and later native calls try again (see `retry_refresh_rate`).
 fn request_refresh_rate(env: *mut JNIEnv, owner: jobject) {
+    // Test switch: debug.arm32bridge.refresh_test=late holds the first request back as if the
+    // surface weren't ready, so the retry path can be seen working.
+    static HELD_BACK: AtomicBool = AtomicBool::new(false);
+    if !HELD_BACK.swap(true, Ordering::Relaxed) && crate::dynarec::property("debug.arm32bridge.refresh_test").as_deref() == Some("late") {
+        crate::log::line("[bridge] test: first 120 Hz request held back (debug.arm32bridge.refresh_test=late)");
+        REFRESH_PENDING.store(true, Ordering::Relaxed);
+        return;
+    }
+    let asked = ask_refresh_rate(env, owner);
+    jcall!(env, ExceptionClear);
+    REFRESH_PENDING.store(!asked, Ordering::Relaxed);
+}
+
+fn ask_refresh_rate(env: *mut JNIEnv, owner: jobject) -> bool {
     // A failed lookup leaves a Java exception pending; clear it before the next try.
     let view = cocos_view(env)
+        .map(|view| (view, "cocos2d-x view".to_string()))
         .or_else(|| {
             jcall!(env, ExceptionClear);
-            gl_thread_view(env)
+            gl_thread_view(env).map(|view| (view, "GLSurfaceView thread".to_string()))
         })
         .or_else(|| {
             jcall!(env, ExceptionClear);
-            field_view(env, owner)
+            field_view(env, owner).map(|(view, name)| (view, format!("field {name}")))
         });
     jcall!(env, ExceptionClear);
-    let Some(view) = view else {
-        crate::log::line("[bridge] could not reach the game's surface to ask for 120 Hz");
-        return;
+    let Some((view, found_in)) = view else {
+        crate::log::line("[bridge] could not reach the game's surface to ask for 120 Hz (will try again)");
+        return false;
     };
     let surface_view = jcall!(env, FindClass, c"android/view/SurfaceView".as_ptr());
     let get_holder = jcall!(env, GetMethodID, surface_view, c"getHolder".as_ptr(), c"()Landroid/view/SurfaceHolder;".as_ptr());
-    let holder = if view.is_null() { std::ptr::null_mut() } else { jcall!(env, CallObjectMethodA, view, get_holder, std::ptr::null()) };
+    let holder = jcall!(env, CallObjectMethodA, view, get_holder, std::ptr::null());
     let holder_class = jcall!(env, FindClass, c"android/view/SurfaceHolder".as_ptr());
     let get_surface = jcall!(env, GetMethodID, holder_class, c"getSurface".as_ptr(), c"()Landroid/view/Surface;".as_ptr());
     let surface =
         if holder.is_null() { std::ptr::null_mut() } else { jcall!(env, CallObjectMethodA, holder, get_surface, std::ptr::null()) };
     let surface_class = jcall!(env, FindClass, c"android/view/Surface".as_ptr());
+    let is_valid = jcall!(env, GetMethodID, surface_class, c"isValid".as_ptr(), c"()Z".as_ptr());
     let set_frame_rate = jcall!(env, GetMethodID, surface_class, c"setFrameRate".as_ptr(), c"(FI)V".as_ptr());
-    if surface.is_null() || set_frame_rate.is_null() {
+    if set_frame_rate.is_null() {
+        // Android before 11: nothing to ask, and nothing to try again.
         jcall!(env, ExceptionClear);
-        crate::log::line("[bridge] could not reach the game's surface to ask for 120 Hz");
-        return;
+        crate::log::line("[bridge] this Android has no Surface.setFrameRate");
+        return true;
+    }
+    if surface.is_null() || is_valid.is_null() || jcall!(env, CallBooleanMethodA, surface, is_valid, std::ptr::null()) == 0 {
+        jcall!(env, ExceptionClear);
+        crate::log::line(&format!("[bridge] the game's surface ({found_in}) isn't ready for 120 Hz yet (will try again)"));
+        return false;
     }
     // FRAME_RATE_COMPATIBILITY_FIXED_SOURCE (1): the game really renders at this rate.
     let arguments = [jvalue { f: TARGET_REFRESH_RATE }, jvalue { i: 1 }];
@@ -405,10 +490,11 @@ fn request_refresh_rate(env: *mut JNIEnv, owner: jobject) {
     if jcall!(env, ExceptionCheck) != 0 {
         jcall!(env, ExceptionDescribe);
         jcall!(env, ExceptionClear);
-        crate::log::line("[bridge] Surface.setFrameRate failed");
-        return;
+        crate::log::line("[bridge] Surface.setFrameRate failed (will try again)");
+        return false;
     }
-    crate::log::line(&format!("[bridge] asked for {TARGET_REFRESH_RATE} Hz on the game surface"));
+    crate::log::line(&format!("[bridge] asked for {TARGET_REFRESH_RATE} Hz on the game surface ({found_in})"));
+    true
 }
 
 /// Calls the 32-bit `symbol` for a Java native method and converts the result.
@@ -426,12 +512,14 @@ pub fn forward(env: *mut JNIEnv, symbol: &str, address: &AtomicU32, args: &[Host
         return HostValue(0);
     }
     let is_frame = symbol.ends_with("_nativeRender");
+    let owner = match args.first() {
+        Some(HostArg::Object(owner)) => *owner,
+        _ => std::ptr::null_mut(),
+    };
     if symbol.ends_with("_nativeOnSurfaceChanged") || symbol.ends_with("_nativeInit") {
-        let owner = match args.first() {
-            Some(HostArg::Object(owner)) => *owner,
-            _ => std::ptr::null_mut(),
-        };
         request_refresh_rate(env, owner);
+    } else if REFRESH_PENDING.load(Ordering::Relaxed) {
+        retry_refresh_rate(env, owner);
     }
     if is_frame {
         crate::sound_preload::on_frame(env, library_directory());
