@@ -846,16 +846,21 @@ fn tell_stopped(animation: Id, finished: bool) {
 /// Sends the delegate calls that are due and drops the animations that
 /// ended; then waits for the next start or end. Runs on the main thread.
 pub fn tick() {
-    tick_at(runloop::media_time());
+    tick_at(None, runloop::media_time());
 }
 
-fn tick_at(now: f64) {
+/// `only`: tick just this layer's animations (a test's fake clock must not
+/// end other layers' ones).
+fn tick_at(only: Option<Id>, now: f64) {
     let mut started = Vec::new();
     let mut stopped = Vec::new();
     let mut next = f64::INFINITY;
     {
         let mut list = running();
         list.retain_mut(|r| {
+            if only.is_some_and(|layer| layer != r.layer) {
+                return true;
+            }
             let timing = timing_of(r.animation, DEFAULT_DURATION);
             let t = layers::local_time(r.layer, now);
             let state = timing.state(t);
@@ -1335,7 +1340,7 @@ mod tests {
         assert!(close(presented_at(layer, model, begin + 0.5).opacity, 0.5));
         // (Another test running the main loop may send a call first: wait for it.)
         let heard_after = |tick: f64, n: usize| {
-            tick_at(tick);
+            tick_at(Some(layer), tick);
             let end = std::time::Instant::now() + std::time::Duration::from_millis(300);
             while HEARD.lock().unwrap().len() < n && std::time::Instant::now() < end {
                 std::thread::sleep(std::time::Duration::from_millis(2));
@@ -1354,8 +1359,15 @@ mod tests {
         anim_set_fill_mode(slide, 0, string::make("forwards"));
         anim_set_removed(slide, 0, 0);
         add(layer, slide, 0);
+        // (A fake clock for one layer must leave other tests' layers alone.)
+        let other = runtime::send(runtime::send(runtime::class_named("CALayer"), "alloc", &[]), "init", &[]);
+        let wait = basic("opacity", collections::number_float(0.0), collections::number_float(1.0));
+        anim_set_duration(wait, 0, 2.0);
+        add(other, wait, 0);
         let begin = layers::local_time(layer, runloop::media_time());
-        tick_at(begin + 5.0);
+        tick_at(Some(layer), begin + 5.0);
+        assert!(animating(other), "another layer's animation still runs");
+        layer_remove_all_animations(other, 0);
         assert!(close(presented_at(layer, model, begin + 5.0).position.x, 100.0));
         assert!(animating(layer));
         layer_remove_all_animations(layer, 0);

@@ -1908,7 +1908,10 @@ mod tests {
     fn play_for(player: &Arc<Player>, seconds: f64) -> bool {
         let mut out = vec![0f32; 512 * 2];
         for _ in 0..(seconds * 44100.0 / 512.0).round() as usize {
-            for _ in 0..2000 {
+            // The decoder thread fills the queue; on a busy PC it can lag
+            // seconds behind, so only a stuck one runs out this deadline.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
                 let q = player.queue();
                 if q.ended || q.seek.is_none() && q.stream.frames() >= 1200 {
                     break;
