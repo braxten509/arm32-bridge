@@ -420,8 +420,8 @@ pub(crate) fn deliver_in(window: Id, finger: i32, phase: Phase, point: Point) {
 fn send_to_view(view: Id, finger: i32, selector: &'static str, changed: Id, event: Id) {
     let point = runtime::send(changed, "anyObject", &[]);
     let point = if point == 0 { Point::default() } else { point_of(point, "x", "y") };
-    // Like UIKit's responder chain: the touched view, else the nearest
-    // view above it that handles touches.
+    // UIKit sends the touch to the view it hit; a view that doesn't handle it
+    // passes it up the responder chain (UIResponder's default, see uikit).
     let mut handler = view;
     while handler != 0 && !runtime::responds(handler, selector) {
         handler = view_state(handler).superview;
@@ -1168,5 +1168,43 @@ mod tests {
         screen_settled_with(|_| true);
         assert_eq!(sent(), [7.0], "then for the box that opened meanwhile");
         TAPS_ARMED.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// A touch on a plain view bubbles up the responder chain, so the view
+    /// controller whose view it is in hears touches it didn't handle itself
+    /// (as UIKit's UIResponder default does).
+    #[test]
+    fn touches_reach_a_view_controllers_touches_began() {
+        use crate::fw::geometry::Rect;
+        use crate::fw::object::define_class;
+        use crate::objc::runtime::Class;
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        static HEARD: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        extern "C" fn note(_this: Id, s: Sel, _touches: Id, _event: Id) {
+            let name = lock().sel_name(s);
+            HEARD.lock().unwrap().push(name.trim_end_matches(":withEvent:").to_string());
+        }
+        let controller_class = define_class("TouchTestResponderController", "UIViewController", 8);
+        methods(
+            controller_class,
+            &[("touchesBegan:withEvent:", note as usize), ("touchesEnded:withEvent:", note as usize)],
+        );
+        let new_view = |class: Class, frame: Rect| {
+            let object = runtime::send(class, "alloc", &[]);
+            crate::fw::uikit::send_rect(object, "initWithFrame:", frame);
+            object
+        };
+        let controller = runtime::send(runtime::send(controller_class, "alloc", &[]), "init", &[]);
+        let view = runtime::send(controller, "view", &[]);
+        crate::fw::uikit::send_rect(view, "setFrame:", Rect::new(0.0, 0.0, 568.0, 320.0));
+        let window = new_view(runtime::class_named("UIWindow"), Rect::new(0.0, 0.0, 568.0, 320.0));
+        let child = new_view(runtime::class_named("UIView"), Rect::new(10.0, 10.0, 100.0, 50.0));
+        runtime::send(window, "addSubview:", &[view]);
+        runtime::send(view, "addSubview:", &[child]);
+        let finger = 720; // not a finger other tests use
+        deliver_in(window, finger, Phase::Began, Point { x: 20.0, y: 20.0 });
+        deliver_in(window, finger, Phase::Ended, Point { x: 20.0, y: 20.0 });
+        assert_eq!(std::mem::take(&mut *HEARD.lock().unwrap()), ["touchesBegan", "touchesEnded"], "once each, through the chain");
     }
 }

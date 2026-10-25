@@ -1475,6 +1475,89 @@ pub fn key_window() -> Id {
 
 // ----- view controllers: { isa, ... } with the view kept as a property -----
 
+/// Whether the object is (a subclass of) the named UIKit class.
+fn class_is(object: Id, name: &str) -> bool {
+    let class = runtime::class_named(name);
+    object != 0 && class != 0 && {
+        let rt = lock();
+        rt.is_subclass(rt.class_of(object), class)
+    }
+}
+
+/// The next responder, as UIKit links them: a controller's view → the
+/// controller → the view's superview; a window → the application → the
+/// application delegate.
+pub(crate) fn next_responder(object: Id) -> Id {
+    let app = runtime::send(runtime::class_named("UIApplication"), "sharedApplication", &[]);
+    if object == 0 {
+        return 0;
+    }
+    if object == app {
+        return runtime::send(app, "delegate", &[]);
+    }
+    if class_is(object, "UIView") {
+        if let Some(controller) = property_get(object, "viewController").filter(|&c| c != 0) {
+            return controller as Id;
+        }
+        let parent = view_state(object).superview;
+        return if parent != 0 { parent } else { app };
+    }
+    if class_is(object, "UIViewController") {
+        let view = property_get(object, "view").unwrap_or(0) as Id;
+        let parent = if view != 0 { view_state(view).superview } else { 0 };
+        if parent != 0 {
+            return parent;
+        }
+        let presenting = property_get(object, "presenting").unwrap_or(0) as Id;
+        return if presenting != 0 { presenting } else { app };
+    }
+    0
+}
+
+// A broken view hierarchy that points back at itself must not spin.
+thread_local! {
+    static TOUCH_FORWARDING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Lowers the forwarding depth again, even if a game's handler unwinds.
+struct ForwardingDepth;
+
+impl Drop for ForwardingDepth {
+    fn drop(&mut self) {
+        TOUCH_FORWARDING.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// UIResponder's default for the touch methods: pass the call to the next
+/// responder (nothing when there is none, or it doesn't handle touches).
+fn pass_touch(this: Id, name: &'static str, touches: Id, event: Id) {
+    if TOUCH_FORWARDING.with(std::cell::Cell::get) >= 256 {
+        return;
+    }
+    TOUCH_FORWARDING.with(|d| d.set(d.get() + 1));
+    let _depth = ForwardingDepth;
+    let next = next_responder(this);
+    if next != 0 && runtime::responds(next, name) {
+        runtime::send(next, name, &[touches, event]);
+    }
+}
+
+extern "C" fn responder_touches_began(this: Id, _: Sel, touches: Id, event: Id) {
+    pass_touch(this, "touchesBegan:withEvent:", touches, event);
+}
+
+extern "C" fn responder_touches_moved(this: Id, _: Sel, touches: Id, event: Id) {
+    pass_touch(this, "touchesMoved:withEvent:", touches, event);
+}
+
+extern "C" fn responder_touches_ended(this: Id, _: Sel, touches: Id, event: Id) {
+    pass_touch(this, "touchesEnded:withEvent:", touches, event);
+}
+
+extern "C" fn responder_touches_cancelled(this: Id, _: Sel, touches: Id, event: Id) {
+    pass_touch(this, "touchesCancelled:withEvent:", touches, event);
+}
+
 extern "C" fn controller_init(this: Id, _: Sel) -> Id {
     this
 }
@@ -2262,7 +2345,11 @@ pub fn register(r: &mut Registry) {
             ("resignFirstResponder", yes as usize),
             ("canBecomeFirstResponder", no as usize),
             ("isFirstResponder", no as usize),
-            ("nextResponder", zero as usize),
+            ("nextResponder", next_responder as usize),
+            ("touchesBegan:withEvent:", responder_touches_began as usize),
+            ("touchesMoved:withEvent:", responder_touches_moved as usize),
+            ("touchesEnded:withEvent:", responder_touches_ended as usize),
+            ("touchesCancelled:withEvent:", responder_touches_cancelled as usize),
         ],
     );
 
@@ -3365,5 +3452,69 @@ mod tests {
         runtime::send(presented, "setView:", &[presented_view]);
         show_presented(presenter, presented, false);
         assert_eq!(view_state(presented_view).frame, Rect::new(0.0, 0.0, 568.0, 320.0));
+    }
+
+    /// UIKit's responder chain: a controller's view's next responder is the
+    /// controller, the controller's is the view's superview, and a plain
+    /// subview's is its superview.
+    #[test]
+    fn responder_chain_links_views_controllers_and_superviews() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let new_view = |class: Class, frame: Rect| view_init_with_frame(runtime::send(class, "alloc", &[]), 0, frame);
+        let controller = runtime::send(runtime::send(runtime::class_named("UIViewController"), "alloc", &[]), "init", &[]);
+        let view = runtime::send(controller, "view", &[]);
+        let child = new_view(runtime::class_named("UIView"), Rect::new(10.0, 10.0, 50.0, 50.0));
+        let window = new_view(runtime::class_named("UIWindow"), Rect::new(0.0, 0.0, 568.0, 320.0));
+        runtime::send(window, "addSubview:", &[view]);
+        runtime::send(view, "addSubview:", &[child]);
+        assert_eq!(runtime::send(view, "nextResponder", &[]), controller, "a controller's view answers its controller");
+        assert_eq!(runtime::send(child, "nextResponder", &[]), view, "a plain subview answers its superview");
+        assert_eq!(runtime::send(controller, "nextResponder", &[]), window, "the controller answers its view's superview");
+    }
+
+    /// A plain view (UIScrollView included) without a touch method of its
+    /// own passes the touch to its next responder: the superview's handler,
+    /// not a missing-method failure.
+    #[test]
+    fn touches_on_a_plain_view_pass_to_its_superview() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        static HEARD: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        extern "C" fn note(_this: Id, s: Sel, _touches: Id, _event: Id) {
+            HEARD.lock().unwrap().push(lock().sel_name(s));
+        }
+        let parent_class = define_class("UIKitTestTouchParent", "UIView", 8);
+        methods(
+            parent_class,
+            &[
+                ("touchesBegan:withEvent:", note as usize),
+                ("touchesMoved:withEvent:", note as usize),
+                ("touchesEnded:withEvent:", note as usize),
+                ("touchesCancelled:withEvent:", note as usize),
+            ],
+        );
+        let new_view = |class: Class, frame: Rect| view_init_with_frame(runtime::send(class, "alloc", &[]), 0, frame);
+        let parent = new_view(parent_class, Rect::new(0.0, 0.0, 568.0, 320.0));
+        let scroll = new_view(runtime::class_named("UIScrollView"), Rect::new(10.0, 10.0, 100.0, 100.0));
+        let child = new_view(runtime::class_named("UIView"), Rect::new(0.0, 0.0, 50.0, 50.0));
+        runtime::send(parent, "addSubview:", &[scroll]);
+        runtime::send(scroll, "addSubview:", &[child]);
+        for name in ["touchesBegan:withEvent:", "touchesMoved:withEvent:", "touchesEnded:withEvent:", "touchesCancelled:withEvent:"] {
+            runtime::send(scroll, name, &[0, 0]);
+        }
+        assert_eq!(
+            std::mem::take(&mut *HEARD.lock().unwrap()),
+            ["touchesBegan:withEvent:", "touchesMoved:withEvent:", "touchesEnded:withEvent:", "touchesCancelled:withEvent:"],
+            "the scroll view passed each touch on"
+        );
+        for name in ["touchesBegan:withEvent:", "touchesMoved:withEvent:", "touchesEnded:withEvent:", "touchesCancelled:withEvent:"] {
+            runtime::send(child, name, &[0, 0]);
+        }
+        assert_eq!(
+            std::mem::take(&mut *HEARD.lock().unwrap()),
+            ["touchesBegan:withEvent:", "touchesMoved:withEvent:", "touchesEnded:withEvent:", "touchesCancelled:withEvent:"],
+            "a plain child passes through its scroll view (and parent) once each"
+        );
     }
 }
