@@ -8,7 +8,7 @@
 //! be saved as a WAV file (IOS_SOUND_FILE).
 
 use crate::fw::object::{define_class, methods};
-use crate::fw::uikit::{property_get, property_set};
+use crate::fw::uikit::{property_get, property_set, property_set_object};
 use crate::fw::string;
 use crate::objc::runtime::{self, Id, Sel};
 use crate::symbols::{leak, Registry};
@@ -796,13 +796,35 @@ enum Source {
     Bytes(Arc<Vec<u8>>),
 }
 
-struct Opened {
-    reader: Box<dyn FormatReader>,
-    decoder: Box<dyn Decoder>,
-    track: u32,
+enum Opened {
+    /// What Symphonia reads itself (MP3, WAV, MP4/M4A, ADTS).
+    Read { reader: Box<dyn FormatReader>, decoder: Box<dyn Decoder>, track: u32 },
+    /// Containers only AudioFile reads (CAF, AIFF), decoded as the audio
+    /// queue does: `next` packet, `skip` decoded frames still to drop
+    /// (an AAC file's priming).
+    Packets { file: crate::fw::audiofile::Parsed, decoder: crate::fw::audioqueue::Decoder, next: u64, skip: usize },
+}
+
+/// Sound files Symphonia doesn't read here: CAF and AIFF.
+fn audiofile_only(head: &[u8]) -> bool {
+    head.starts_with(b"caff") || (head.starts_with(b"FORM") && head.get(8..12).is_some_and(|kind| kind == b"AIFF" || kind == b"AIFC"))
 }
 
 fn open(source: &Source) -> Result<(Opened, f64), String> {
+    let mut head = [0u8; 12];
+    match source {
+        Source::File(path) => {
+            use std::io::Read;
+            let _ = std::fs::File::open(path).and_then(|mut file| file.read(&mut head));
+        }
+        Source::Bytes(bytes) => {
+            let n = bytes.len().min(12);
+            head[..n].copy_from_slice(&bytes[..n]);
+        }
+    }
+    if audiofile_only(&head) {
+        return open_packets(source, 0.0).map(|(opened, rate, _)| (opened, rate));
+    }
     let media: Box<dyn MediaSource> = match source {
         Source::File(path) => Box::new(std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?),
         Source::Bytes(bytes) => Box::new(std::io::Cursor::new(bytes.as_ref().clone())),
@@ -824,27 +846,109 @@ fn open(source: &Source) -> Result<(Opened, f64), String> {
         .make(&track.codec_params, &DecoderOptions::default())
         .map_err(|e| format!("can't decode it ({e})"))?;
     let track = track.id;
-    Ok((Opened { reader, decoder, track }, rate))
+    Ok((Opened::Read { reader, decoder, track }, rate))
 }
+
+/// A CAF or AIFF file through AudioFile, placed at `seconds` (at or just
+/// before it, on a packet's start): the opened file, the rate its sound
+/// decodes at, and the time it starts from.
+fn open_packets(source: &Source, seconds: f64) -> Result<(Opened, f64, f64), String> {
+    use crate::fw::audioqueue::Decoder as PacketDecoder;
+    let parsed = match source {
+        Source::File(path) => crate::fw::audiofile::parse_path(path),
+        Source::Bytes(bytes) => crate::fw::audiofile::parse(bytes),
+    };
+    let file = parsed.map_err(|status| format!("not a sound file this layer reads (AudioFile {})", four_cc(status as u32)))?;
+    let format = file.format;
+    if !PacketDecoder::supported(&format) {
+        return Err(format!("can't decode it (format {})", four_cc(format.format)));
+    }
+    // The rate sound comes out at (HE-AAC's core rate): seen on the first packet.
+    let mut first = PacketDecoder::new(&format, &file.cookie)?;
+    if let Some(packet) = file.packet(0) {
+        first.decode(file.data.get(packet.offset..packet.offset + packet.size as usize).unwrap_or(&[]), packet.frames, &mut Vec::new());
+    }
+    let rate = first.rate;
+    let decoder = PacketDecoder::new(&format, &file.cookie)?;
+    // File frames to skip: the priming, then the time asked for.
+    let wanted = file.priming as u64 + (seconds.max(0.0) * format.rate) as u64;
+    let (mut next, mut at) = (0u64, 0u64);
+    while let Some(packet) = file.packet(next) {
+        if at + packet.frames as u64 > wanted {
+            break;
+        }
+        at += packet.frames as u64;
+        next += 1;
+    }
+    let skip = (file.priming as u64).saturating_sub(at);
+    let actual = at.saturating_sub(file.priming as u64) as f64 / format.rate;
+    let skip = (skip as f64 * rate / format.rate) as usize;
+    Ok((Opened::Packets { file, decoder, next, skip }, rate, actual))
+}
+
+/// Frames decoded here at a time from a file of fixed-size packets.
+const JOINED_FRAMES: u64 = 4096;
 
 /// The next packet as stereo floats, or None at the end of the file.
 fn decode_packet(opened: &mut Opened) -> Option<Vec<f32>> {
-    loop {
-        let packet = opened.reader.next_packet().ok()?;
-        if packet.track_id() != opened.track {
-            continue;
+    match opened {
+        Opened::Read { reader, decoder, track } => loop {
+            let packet = reader.next_packet().ok()?;
+            if packet.track_id() != *track {
+                continue;
+            }
+            let Ok(decoded) = decoder.decode(&packet) else { continue };
+            let spec = *decoded.spec();
+            let mut samples = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
+            samples.copy_interleaved_ref(decoded);
+            return Some(stereo(samples.samples(), spec.channels.count()));
+        },
+        Opened::Packets { file, decoder, next, skip } => {
+            let first = file.packet(*next)?;
+            let mut count = 1;
+            if file.packets.is_empty() && decoder.joins_packets() {
+                count = (JOINED_FRAMES / first.frames.max(1) as u64).max(1).min(file.packet_count() - *next);
+            }
+            let size = first.size as usize * count as usize;
+            let bytes = file.data.get(first.offset..first.offset + size)?;
+            *next += count;
+            let mut samples = Vec::new();
+            decoder.decode(bytes, first.frames * count as u32, &mut samples);
+            let mut out = stereo(&samples, file.format.channels as usize);
+            let dropped = (*skip * 2).min(out.len());
+            out.drain(..dropped);
+            *skip -= dropped / 2;
+            Some(out)
         }
-        let Ok(decoded) = opened.decoder.decode(&packet) else { continue };
-        let spec = *decoded.spec();
-        let channels = spec.channels.count().max(1);
-        let mut samples = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
-        samples.copy_interleaved_ref(decoded);
-        let mut out = Vec::with_capacity(samples.samples().len() / channels * 2);
-        for frame in samples.samples().chunks_exact(channels) {
-            out.push(frame[0]);
-            out.push(if channels > 1 { frame[1] } else { frame[0] });
+    }
+}
+
+/// Interleaved samples of `channels` channels as stereo (mono doubled).
+fn stereo(samples: &[f32], channels: usize) -> Vec<f32> {
+    let channels = channels.max(1);
+    let mut out = Vec::with_capacity(samples.len() / channels * 2);
+    for frame in samples.chunks_exact(channels) {
+        out.push(frame[0]);
+        out.push(if channels > 1 { frame[1] } else { frame[0] });
+    }
+    out
+}
+
+/// `opened` moved to `seconds` (or just before it): the time it plays
+/// from, or None when it can't move (it is left as it was).
+fn seek_opened(opened: &mut Opened, source: &Source, seconds: f64, rate: f64) -> Option<f64> {
+    match opened {
+        Opened::Read { reader, decoder, track } => {
+            let to = SeekTo::Time { time: symphonia::core::units::Time::from(seconds), track_id: Some(*track) };
+            let seeked = reader.seek(SeekMode::Coarse, to).ok()?;
+            decoder.reset();
+            Some(seeked.actual_ts as f64 / rate)
         }
-        return Some(out);
+        Opened::Packets { .. } => {
+            let (fresh, _, actual) = open_packets(source, seconds).ok()?;
+            *opened = fresh;
+            Some(actual)
+        }
     }
 }
 
@@ -935,10 +1039,8 @@ impl Player {
                 let mut actual = 0.0;
                 if let Ok((mut fresh, rate)) = open(&self.source) {
                     if seconds > 0.0 {
-                        let to = SeekTo::Time { time: symphonia::core::units::Time::from(seconds), track_id: Some(fresh.track) };
-                        if let Ok(seeked) = fresh.reader.seek(SeekMode::Coarse, to) {
-                            fresh.decoder.reset();
-                            actual = seeked.actual_ts as f64 / rate;
+                        if let Some(at) = seek_opened(&mut fresh, &self.source, seconds, rate) {
+                            actual = at;
                             skip = ((seconds - actual).max(0.0) * rate) as usize;
                         }
                     }
@@ -1067,17 +1169,19 @@ impl Player {
         if let Some(seconds) = *known {
             return seconds;
         }
-        let mut total = 0u64;
-        let mut rate = 44100.0;
-        if let Ok((mut opened, r)) = open(&self.source) {
-            rate = r;
-            while let Ok(packet) = opened.reader.next_packet() {
-                if packet.track_id() == opened.track {
-                    total += packet.dur;
+        let seconds = match open(&self.source) {
+            Ok((Opened::Read { mut reader, track, .. }, rate)) => {
+                let mut total = 0u64;
+                while let Ok(packet) = reader.next_packet() {
+                    if packet.track_id() == track {
+                        total += packet.dur;
+                    }
                 }
+                total as f64 / rate
             }
-        }
-        let seconds = total as f64 / rate;
+            Ok((Opened::Packets { file, .. }, _)) => file.valid_frames() as f64 / file.format.rate,
+            Err(_) => 0.0,
+        };
         *known = Some(seconds);
         seconds
     }
@@ -1107,11 +1211,12 @@ fn add_player(player: Id, source: Source, error: *mut Id) -> Id {
 
 extern "C" fn player_init_with_url(this: Id, _: Sel, url: Id, error: *mut Id) -> Id {
     let path = string::get(runtime::send(url, "path", &[]));
-    property_set(this, "url", url as u64);
+    property_set_object(this, "url", url);
     add_player(this, Source::File(path), error)
 }
 
 extern "C" fn player_init_with_data(this: Id, _: Sel, data: Id, error: *mut Id) -> Id {
+    property_set_object(this, "data", data);
     add_player(this, Source::Bytes(Arc::new(crate::fw::data::bytes(data))), error)
 }
 
@@ -1215,7 +1320,13 @@ extern "C" fn player_url(this: Id, _: Sel) -> Id {
     property_get(this, "url").unwrap_or(0) as Id
 }
 
+extern "C" fn player_data(this: Id, _: Sel) -> Id {
+    property_get(this, "data").unwrap_or(0) as Id
+}
+
 extern "C" fn player_dealloc(this: Id, _: Sel) {
+    property_set_object(this, "url", 0);
+    property_set_object(this, "data", 0);
     let removed = PLAYERS.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|players| players.remove(&this));
     if let Some(player) = removed {
         player.queue().quit = true;
@@ -1662,6 +1773,7 @@ pub fn register(r: &mut Registry) {
             ("delegate", player_delegate as usize),
             ("setDelegate:", player_set_delegate as usize),
             ("url", player_url as usize),
+            ("data", player_data as usize),
             ("setMeteringEnabled:", player_ignore_bool as usize),
             ("setEnableRate:", player_ignore_bool as usize),
             ("dealloc", player_dealloc as usize),
@@ -1796,6 +1908,74 @@ mod tests {
         false
     }
 
+    /// A CAF file in memory (games keep music in their own packs): the same
+    /// tone as `wav`, 16-bit big-endian stereo.
+    fn caf(rate: u32, seconds: f64) -> Vec<u8> {
+        let pcm: Vec<u8> = wav(rate, seconds)[44..].chunks_exact(2).flat_map(|s| [s[1], s[0]]).collect();
+        let mut file = b"caff\0\x01\0\0desc".to_vec();
+        file.extend_from_slice(&32u64.to_be_bytes());
+        file.extend_from_slice(&(rate as f64).to_be_bytes());
+        file.extend_from_slice(b"lpcm");
+        // Flags (integer, big-endian), bytes and frames a packet, channels, bits.
+        for value in [0u32, 4, 1, 2, 16] {
+            file.extend_from_slice(&value.to_be_bytes());
+        }
+        file.extend_from_slice(b"data");
+        file.extend_from_slice(&(pcm.len() as u64 + 4).to_be_bytes());
+        file.extend_from_slice(&[0; 4]);
+        file.extend_from_slice(&pcm);
+        file
+    }
+
+    /// A player tells what it was made from: -data for one made from data
+    /// (nil from a file), -url for one made from a file (nil from data).
+    #[test]
+    fn a_player_keeps_the_data_or_url_it_was_made_from() {
+        crate::run::setup();
+        let make = |selector: &str, from: Id| {
+            let player = runtime::send(runtime::class_named("AVAudioPlayer"), "alloc", &[]);
+            runtime::send(player, selector, &[from, 0])
+        };
+        let data = crate::fw::data::make(&wav(22050, 0.1));
+        let from_data = make("initWithData:error:", data);
+        assert_ne!(from_data, 0);
+        assert_eq!(runtime::send(from_data, "data", &[]), data);
+        assert_eq!(runtime::send(from_data, "url", &[]), 0);
+        let path = std::env::temp_dir().join(format!("gamebridge-player-{}.wav", std::process::id()));
+        std::fs::write(&path, wav(22050, 0.1)).unwrap();
+        let url = runtime::send(runtime::class_named("NSURL"), "fileURLWithPath:", &[string::make(&path.to_string_lossy())]);
+        let from_file = make("initWithContentsOfURL:error:", url);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(runtime::send(from_file, "url", &[]), url);
+        assert_eq!(runtime::send(from_file, "data", &[]), 0);
+    }
+
+    /// AVAudioPlayer reads what AudioFile reads: a CAF file plays its sound,
+    /// knows its length and seeks.
+    #[test]
+    fn music_in_a_caf_file_plays_and_seeks() {
+        let source = Source::Bytes(Arc::new(caf(22050, 1.0)));
+        let (_, rate) = open(&source).expect("a CAF file opens");
+        assert_eq!(rate, 22050.0);
+        let player = Player::new(source, rate);
+        assert!((player.duration() - 1.0).abs() < 0.01, "{}", player.duration());
+        player.ensure_worker();
+        player.playing.store(true, Ordering::Relaxed);
+        assert!(!play_for(&player, 0.5));
+        let time = player.current_time();
+        assert!((time - 0.5).abs() < 0.03, "half way: {time}");
+        let mut out = vec![0f32; 64 * 2];
+        player.mix_into(&mut out, 64, 22050.0);
+        assert!(out.iter().any(|&v| v.abs() > 0.1), "the tone is heard");
+        player.seek(0.6);
+        assert!(!play_for(&player, 0.2));
+        let time = player.current_time();
+        assert!((time - 0.8).abs() < 0.03, "after a seek to 0.6 and 0.2 s: {time}");
+        assert!(play_for(&player, 0.5), "then it ends");
+        player.queue().quit = true;
+        player.wake.notify_all();
+    }
+
     #[test]
     fn music_player_keeps_time_loops_and_seeks() {
         let player = Player::new(Source::Bytes(Arc::new(wav(22050, 1.0))), 22050.0);
@@ -1849,9 +2029,11 @@ mod tests {
     #[test]
     fn mp3_music_decodes() {
         let Some(path) = std::env::var_os("IOS_TEST_MP3") else { return };
-        let (mut opened, rate) = open(&Source::File(path.to_string_lossy().into_owned())).unwrap();
+        let (Opened::Read { mut reader, mut decoder, .. }, rate) = open(&Source::File(path.to_string_lossy().into_owned())).unwrap() else {
+            panic!("an MP3 file is read by Symphonia")
+        };
         assert!(rate > 8000.0);
-        let packet = opened.reader.next_packet().unwrap();
-        assert!(opened.decoder.decode(&packet).is_ok());
+        let packet = reader.next_packet().unwrap();
+        assert!(decoder.decode(&packet).is_ok());
     }
 }

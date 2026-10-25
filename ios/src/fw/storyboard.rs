@@ -254,6 +254,20 @@ extern "C" fn view_init_with_coder(this: Id, _: Sel, coder: Id) -> Id {
     this
 }
 
+/// -[UIWindow initWithCoder:]: a window marked "Full Screen at Launch"
+/// (UIResizesToFullScreen) takes the screen's size, whatever iPhone the nib
+/// was drawn for.
+extern "C" fn window_init_with_coder(this: Id, _: Sel, coder: Id) -> Id {
+    let this = super_init_with_coder(this, "UIWindow", coder);
+    if this != 0 && bool_for(coder, "UIResizesToFullScreen") == Some(true) {
+        let (width, height, _) = crate::fw::uikit::screen_points();
+        if let Some((imp, sel)) = framework_imp(this, "setFrame:") {
+            unsafe { std::mem::transmute::<usize, extern "C" fn(Id, Sel, Rect)>(imp)(this, sel, Rect::new(0.0, 0.0, width, height)) }
+        }
+    }
+    this
+}
+
 /// -[UILabel initWithCoder:]
 extern "C" fn label_init_with_coder(this: Id, _: Sel, coder: Id) -> Id {
     let this = super_init_with_coder(this, "UILabel", coder);
@@ -1061,6 +1075,7 @@ const TEST_NIB_CLASS: &str = "StoryboardTestNib";
 pub fn register(_r: &mut Registry) {
     methods(runtime::class_named("NSObject"), &[("awakeFromNib", awake_from_nib as usize)]);
     methods(runtime::class_named("UIView"), &[("initWithCoder:", view_init_with_coder as usize)]);
+    methods(runtime::class_named("UIWindow"), &[("initWithCoder:", window_init_with_coder as usize)]);
     methods(runtime::class_named("UILabel"), &[("initWithCoder:", label_init_with_coder as usize)]);
     methods(runtime::class_named("UITableView"), &[("initWithCoder:", table_init_with_coder as usize)]);
     methods(runtime::class_named("UITableViewCell"), &[("initWithCoder:", cell_init_with_coder as usize)]);

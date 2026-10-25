@@ -445,10 +445,16 @@ extern "C" fn absolute_time_get_current() -> f64 {
 // ----- NSError: { isa, domain, code, userInfo } -----
 
 pub fn error(domain: &str, code: isize, description: &str) -> Id {
+    error_in(string::make(domain), code, description)
+}
+
+/// An NSError whose domain is the string object `domain` (a framework's
+/// exported constant, which games may compare by pointer).
+pub fn error_in(domain: Id, code: isize, description: &str) -> Id {
     let object = runtime::alloc_instance(runtime::class_named("NSError"));
     let info = collections::dictionary_from(&[(string::make("NSLocalizedDescription"), string::make(description))]);
     unsafe {
-        *((object + 8) as *mut Id) = string::make(domain);
+        *((object + 8) as *mut Id) = domain;
         *((object + 16) as *mut isize) = code;
         *((object + 24) as *mut Id) = info;
     }

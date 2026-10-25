@@ -346,6 +346,12 @@ impl Decoder {
         Ok(Decoder { kind, format: *f, rate: f.rate })
     }
 
+    /// Whether several fixed-size packets may be handed over as one (formats
+    /// decoded here; a codec takes one packet at a time).
+    pub fn joins_packets(&self) -> bool {
+        !matches!(self.kind, Kind::Other(_))
+    }
+
     /// Appends one packet's sound (`frames` is how many it should hold;
     /// a packet that won't decode becomes that much silence).
     pub fn decode(&mut self, packet: &[u8], frames: u32, out: &mut Vec<f32>) {

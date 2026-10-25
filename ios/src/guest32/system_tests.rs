@@ -133,6 +133,24 @@ fn mach_memory_calls_work_on_guest_memory() {
     assert!([runtime::MAIN_STACK_SIZE, runtime::THREAD_STACK_SIZE].contains(&size), "{size:#x}");
 }
 
+/// Threads the host makes (dispatch workers, timers) that run game code give
+/// their guest stack back when they end: a busy serial queue starts a new
+/// worker for each burst of work, more over a game's life than the guest
+/// has room for stacks.
+#[test]
+fn host_threads_give_their_guest_stack_back_when_they_end() {
+    setup();
+    let room = (arm32_bridge::mem::STACK_TOP - arm32_bridge::mem::STACK_BASE) / runtime::THREAD_STACK_SIZE;
+    for _ in 0..room + 8 {
+        std::thread::spawn(|| {
+            let _gil = runtime::hold_gil();
+            runtime::engine();
+        })
+        .join()
+        .expect("the thread got a guest stack");
+    }
+}
+
 #[test]
 fn backtrace_follows_apples_frame_chain() {
     // Apple armv7 frames: r7 points at { saved r7, return address }, callers higher up.

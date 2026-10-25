@@ -458,6 +458,22 @@ fn a_view_reads_its_place_look_and_subviews_from_a_coder() {
     assert!(!flag(plain, "isHidden"));
 }
 
+/// A nib's window marked "Full Screen at Launch" (UIResizesToFullScreen)
+/// takes the screen's size (nibs made for a 3.5-inch iPhone are 320x480);
+/// without the mark it keeps the nib's size.
+#[test]
+fn a_full_screen_nib_window_takes_the_screens_size() {
+    setup();
+    let nib_size = vec![("UIBounds", Held::Rect(Rect::new(0.0, 0.0, 320.0, 480.0))), ("UICenter", Held::Point(Point { x: 160.0, y: 240.0 }))];
+    let mut values = nib_size.clone();
+    values.push(("UIResizesToFullScreen", Held::Bool(true)));
+    let full = decoded("UIWindow", values);
+    let (width, height, _) = crate::fw::uikit::screen_points();
+    assert_eq!(call::<Rect>(full, "frame"), Rect::new(0.0, 0.0, width, height));
+    let kept = decoded("UIWindow", nib_size);
+    assert_eq!(call::<Rect>(kept, "frame"), Rect::new(0.0, 0.0, 320.0, 480.0));
+}
+
 /// A progress bar's progress, style and colours from a nib.
 #[test]
 fn a_progress_bar_reads_its_progress_from_a_coder() {

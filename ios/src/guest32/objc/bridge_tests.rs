@@ -211,6 +211,42 @@ fn class32(fake: &Fake, name: &str, superclass: ClassTarget, root: &str, methods
     }
 }
 
+/// A game class whose superclass grew after it was compiled (ivars in the
+/// superclass's @implementation) gets its ivars moved past the superclass,
+/// keeping their alignment, like Apple's runtime does when it realizes classes.
+#[test]
+fn subclass_ivars_slide_past_a_larger_game_superclass() {
+    host_class("G32HostSlideRoot");
+    let fake = Fake::new();
+    let ivar = |fake: &Fake, offset: u32, alignment: u32, size: u32| guest32_image::Ivar32 {
+        offset_address: fake.words(&[offset]),
+        offset,
+        name: format!("_at{offset}"),
+        type_encoding: "@".into(),
+        alignment,
+        size,
+    };
+    let mut base = class32(fake, "G32SlideBase", ClassTarget::External("G32HostSlideRoot".into()), "G32HostSlideRoot", vec![]);
+    base.instance = ClassRo32 { instance_start: 4, instance_size: 16, ivars: vec![ivar(fake, 4, 2, 4), ivar(fake, 8, 2, 4), ivar(fake, 12, 2, 4)], ..Default::default() };
+    // Compiled seeing only the root: one ivar at 4.
+    let mut sub = class32(fake, "G32SlideSub", ClassTarget::Local(base.address), "G32HostSlideRoot", vec![]);
+    sub.instance = ClassRo32 { instance_start: 4, instance_size: 8, ivars: vec![ivar(fake, 4, 2, 4)], ..Default::default() };
+    // Below it, a double (8-aligned) compiled at 8: the slide keeps 8-alignment.
+    let mut leaf = class32(fake, "G32SlideLeaf", ClassTarget::Local(sub.address), "G32HostSlideRoot", vec![]);
+    leaf.instance = ClassRo32 { instance_start: 8, instance_size: 16, ivars: vec![ivar(fake, 8, 3, 8)], ..Default::default() };
+    let (base_ivars, sub_ivar, leaf_ivar) = (base.instance.ivars.clone(), sub.instance.ivars[0].offset_address, leaf.instance.ivars[0].offset_address);
+    let (sub_class, leaf_class) = (sub.address, leaf.address);
+    let md = ObjcMetadata32 { classes: vec![leaf, sub, base], ..Default::default() };
+    let bridge = Mutex::new(Bridge::new(&md).unwrap());
+    install(&bridge, fake, &md).unwrap();
+    assert_eq!(base_ivars.iter().map(|i| fake.u32_at(i.offset_address)).collect::<Vec<_>>(), [4, 8, 12], "the superclass keeps its layout");
+    assert_eq!(fake.u32_at(sub_ivar), 16, "past the superclass's 16 bytes");
+    assert_eq!(fake.u32_at(leaf_ivar), 24, "20 rounded up to the double's 8");
+    let b = bridge.lock().unwrap();
+    assert_eq!(b.classes.class(sub_class).map(|c| (c.instance_start, c.instance_size)), Some((16, 20)));
+    assert_eq!(b.classes.class(leaf_class).map(|c| (c.instance_start, c.instance_size, c.ivars[0].offset)), Some((24, 32, 24)));
+}
+
 #[test]
 fn super_calls_pass_through_intermediate_game_classes() {
     host_class("G32HostPanel");
@@ -545,6 +581,55 @@ fn a_float_host_property_reaches_the_host_as_a_float() {
     let volume = bridge.lock().unwrap().guest_selector(fake, "setVolume:");
     send(&bridge, fake, &[proxy, volume, 1.0f32.to_bits()]).unwrap();
     assert_eq!(HOST_VOLUME.lock().unwrap().clone(), vec![(host, 1.0f32)]);
+}
+
+extern "C" fn host_picture_size(_this: Id, _: Sel) -> crate::fw::geometry::Size {
+    crate::fw::geometry::Size { width: 3.0, height: 4.0 }
+}
+
+#[test]
+fn a_host_pictures_size_is_a_cgsize_even_when_the_game_has_a_union_size() {
+    // SpellCraft's engine has its own -size returning a union (_AEVector2)
+    // and asks UIImage for its -size: the types come from the framework
+    // table (CGSize), not from the game's union, which can't be converted.
+    let picture = {
+        let mut rt = runtime::lock();
+        let class = rt.define_class("G32Picture", 0, 16);
+        let size = rt.sel("size");
+        rt.add_method(class, size, host_picture_size as usize);
+        class
+    };
+    let fake = Fake::new();
+    let (class, meta) = (fake.alloc_permanent(20), fake.alloc_permanent(20));
+    fake.write(class, &meta.to_le_bytes());
+    let md = ObjcMetadata32 {
+        classes: vec![ObjcClass32 {
+            address: class,
+            name: "G32Texture".into(),
+            superclass: ClassTarget::External("NSObject".into()),
+            meta_address: meta,
+            meta_isa: ClassTarget::External("NSObject".into()),
+            meta_superclass: ClassTarget::External("NSObject".into()),
+            instance: ClassRo32 {
+                instance_start: 8,
+                instance_size: 16,
+                methods: vec![method("size", "(_AEVector2={?=ff}[2f])8@0:4", 0x3001)],
+                ..Default::default()
+            },
+            meta: ClassRo32 { flags: 1, ..Default::default() },
+        }],
+        ..Default::default()
+    };
+    let bridge = Mutex::new(Bridge::new(&md).unwrap());
+    install(&bridge, fake, &md).unwrap();
+    let host = runtime::alloc_instance(picture);
+    let proxy = bridge.lock().unwrap().guest_object(fake, host).unwrap();
+    let size = bridge.lock().unwrap().guest_selector(fake, "size");
+    let out = fake.alloc_permanent(8);
+    let words = [out, proxy, size];
+    send_from_guest(&bridge, fake, SendKind::Stret, &|i| words[i as usize]).unwrap();
+    let floats: Vec<f32> = fake.read(out, 8).chunks(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+    assert_eq!(floats, [3.0, 4.0]);
 }
 
 extern "C" fn host_play(_this: Id, _: Sel) -> bool {

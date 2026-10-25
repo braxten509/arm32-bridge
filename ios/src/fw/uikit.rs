@@ -796,6 +796,18 @@ fn window_of(view: Id) -> Id {
     0
 }
 
+/// Tells `view` and every view in it about a move to another window
+/// (`window` for willMoveToWindow:, None for didMoveToWindow).
+fn tell_window_move(view: Id, window: Option<Id>) {
+    match window {
+        Some(window) => runtime::send(view, "willMoveToWindow:", &[window]),
+        None => runtime::send(view, "didMoveToWindow", &[]),
+    };
+    for child in view_state(view).subviews.clone() {
+        tell_window_move(child, window);
+    }
+}
+
 fn detach(view: Id) {
     let parent = view_state(view).superview;
     if parent != 0 {
@@ -830,6 +842,19 @@ fn attach_with_geometry(parent: Id, view: Id, index: Option<usize>, geometry: Ge
     let (was_shown, will_show) = (on_screen(view), on_screen(parent));
     let leaving = if was_shown && !will_show { disappearing(view) } else { Vec::new() };
     let arriving = if !was_shown && will_show { appearing(view) } else { Vec::new() };
+    // The move hooks (a view put back in its own superview only changes place).
+    let old_parent = view_state(view).superview;
+    let moving = old_parent != parent;
+    let (old_window, new_window) = (if old_parent != 0 { window_of(old_parent) } else { 0 }, window_of(parent));
+    if moving {
+        if old_parent != 0 {
+            runtime::send(old_parent, "willRemoveSubview:", &[view]);
+        }
+        runtime::send(view, "willMoveToSuperview:", &[parent]);
+        if old_window != new_window {
+            tell_window_move(view, Some(new_window));
+        }
+    }
     detach(view);
     let list = &mut view_state(parent).subviews;
     match index {
@@ -848,13 +873,12 @@ fn attach_with_geometry(parent: Id, view: Id, index: Option<usize>, geometry: Ge
     }
     set_needs_layout(view);
     set_needs_layout(parent);
-    for name in ["didMoveToSuperview"] {
-        if runtime::responds(view, name) {
-            runtime::send(view, name, &[]);
+    if moving {
+        if old_window != new_window {
+            tell_window_move(view, None);
         }
-    }
-    if window_of(parent) != 0 && runtime::responds(view, "didMoveToWindow") {
-        runtime::send(view, "didMoveToWindow", &[]);
+        runtime::send(view, "didMoveToSuperview", &[]);
+        runtime::send(parent, "didAddSubview:", &[view]);
     }
     disappeared(leaving);
     appeared(arriving);
@@ -1270,8 +1294,22 @@ fn disappeared(controllers: Vec<Id>) {
 /// Takes a view out of its superview, with the appearance calls for the
 /// controllers that leave the screen with it.
 fn take_out(view: Id) {
+    let parent = view_state(view).superview;
+    if parent == 0 {
+        return;
+    }
+    let window = window_of(parent);
+    runtime::send(parent, "willRemoveSubview:", &[view]);
+    runtime::send(view, "willMoveToSuperview:", &[0]);
+    if window != 0 {
+        tell_window_move(view, Some(0));
+    }
     let leaving = if on_screen(view) { disappearing(view) } else { Vec::new() };
     detach(view);
+    if window != 0 {
+        tell_window_move(view, None);
+    }
+    runtime::send(view, "didMoveToSuperview", &[]);
     disappeared(leaving);
 }
 
@@ -2167,6 +2205,13 @@ pub fn register(r: &mut Registry) {
         &[
             ("initWithFrame:", view_init_with_frame as usize),
             ("init", view_init as usize),
+            // The move hooks: UIView's own do nothing (see `attach`, `take_out`).
+            ("willMoveToSuperview:", ignore_id as usize),
+            ("didMoveToSuperview", nothing as usize),
+            ("willMoveToWindow:", ignore_id as usize),
+            ("didMoveToWindow", nothing as usize),
+            ("didAddSubview:", ignore_id as usize),
+            ("willRemoveSubview:", ignore_id as usize),
             ("frame", view_frame as usize),
             ("setFrame:", view_set_frame as usize),
             ("bounds", view_bounds as usize),
@@ -2732,6 +2777,101 @@ mod tests {
         commit_old_animation(|work| queued.push(work));
         commit_old_animation(|work| queued.push(work));
         assert!(queued.is_empty());
+    }
+
+    /// UIView's move hooks, in UIKit's order: the moving view (and the views
+    /// in it, for the window ones) hears will/didMoveToSuperview and
+    /// will/didMoveToWindow, the superview didAddSubview: / willRemoveSubview:.
+    /// UIView has them all (doing nothing), so a subclass may call super.
+    #[test]
+    fn views_hear_their_moves_in_uikits_order() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        static EVENTS: Mutex<Vec<(Id, String)>> = Mutex::new(Vec::new());
+        fn note(this: Id, what: &str, other: Id) {
+            EVENTS.lock().unwrap().push((this, format!("{what} {other:#x}")));
+        }
+        fn call_super(this: Id, name: &str, argument: Option<Id>) {
+            let (uiview, sel) = (runtime::class_named("UIView"), runtime::sel(name));
+            let found = lock().lookup(uiview, sel);
+            // UIView lacking it is noted (a panic can't leave this C function).
+            let Some(imp) = found else { return note(this, &format!("no super {name}"), 0) };
+            match argument {
+                Some(other) => unsafe { std::mem::transmute::<usize, extern "C" fn(Id, Sel, Id)>(imp)(this, sel, other) },
+                None => unsafe { std::mem::transmute::<usize, extern "C" fn(Id, Sel)>(imp)(this, sel) },
+            }
+        }
+        extern "C" fn will_superview(this: Id, _: Sel, other: Id) {
+            call_super(this, "willMoveToSuperview:", Some(other));
+            note(this, "willMoveToSuperview:", other);
+        }
+        extern "C" fn did_superview(this: Id, _: Sel) {
+            call_super(this, "didMoveToSuperview", None);
+            note(this, "didMoveToSuperview", view_state(this).superview);
+        }
+        extern "C" fn will_window(this: Id, _: Sel, other: Id) {
+            call_super(this, "willMoveToWindow:", Some(other));
+            note(this, "willMoveToWindow:", other);
+        }
+        extern "C" fn did_window(this: Id, _: Sel) {
+            call_super(this, "didMoveToWindow", None);
+            note(this, "didMoveToWindow", window_of(this));
+        }
+        extern "C" fn did_add(this: Id, _: Sel, other: Id) {
+            call_super(this, "didAddSubview:", Some(other));
+            note(this, "didAddSubview:", other);
+        }
+        extern "C" fn will_remove(this: Id, _: Sel, other: Id) {
+            call_super(this, "willRemoveSubview:", Some(other));
+            note(this, "willRemoveSubview:", other);
+        }
+        let class = define_class("UIKitTestMovingView", "UIView", 16);
+        methods(
+            class,
+            &[
+                ("willMoveToSuperview:", will_superview as usize),
+                ("didMoveToSuperview", did_superview as usize),
+                ("willMoveToWindow:", will_window as usize),
+                ("didMoveToWindow", did_window as usize),
+                ("didAddSubview:", did_add as usize),
+                ("willRemoveSubview:", will_remove as usize),
+            ],
+        );
+        let new_view = |class: Class| view_init_with_frame(runtime::send(class, "alloc", &[]), 0, Rect::new(0.0, 0.0, 10.0, 10.0));
+        let take = || std::mem::take(&mut *EVENTS.lock().unwrap());
+        let window = new_view(runtime::class_named("UIWindow"));
+        let parent = new_view(class);
+        runtime::send(window, "addSubview:", &[parent]);
+        let (view, inner) = (new_view(class), new_view(class));
+        runtime::send(view, "addSubview:", &[inner]);
+        take();
+        let e = |object: Id, what: &str, other: Id| (object, format!("{what} {other:#x}"));
+        runtime::send(parent, "addSubview:", &[view]);
+        assert_eq!(
+            take(),
+            [
+                e(view, "willMoveToSuperview:", parent),
+                e(view, "willMoveToWindow:", window),
+                e(inner, "willMoveToWindow:", window),
+                e(view, "didMoveToWindow", window),
+                e(inner, "didMoveToWindow", window),
+                e(view, "didMoveToSuperview", parent),
+                e(parent, "didAddSubview:", view),
+            ]
+        );
+        runtime::send(view, "removeFromSuperview", &[]);
+        assert_eq!(
+            take(),
+            [
+                e(parent, "willRemoveSubview:", view),
+                e(view, "willMoveToSuperview:", 0),
+                e(view, "willMoveToWindow:", 0),
+                e(inner, "willMoveToWindow:", 0),
+                e(view, "didMoveToWindow", 0),
+                e(inner, "didMoveToWindow", 0),
+                e(view, "didMoveToSuperview", 0),
+            ]
+        );
     }
 
     /// UIKit's layout pass: a view added to a shown window gets -layoutSubviews

@@ -295,7 +295,12 @@ pub fn call_function(ctx: &Ctx, name: &str, words: Words) -> Result<u64, String>
 
 fn send(c: &Ctx, w: Words, kind: SendKind) -> Result<u64, String> {
     let keep_going = crate::trap::KEEP_GOING.load(std::sync::atomic::Ordering::Relaxed);
-    let r = skip_missing(send_from_guest(c.bridge, c.g, kind, w), keep_going)?;
+    let r = skip_missing(send_from_guest(c.bridge, c.g, kind, w), keep_going).map_err(|error| {
+        // Which message failed, for the log.
+        let stret = matches!(kind, SendKind::Stret | SendKind::Super2Stret);
+        let name = c.lock().selector_name(c.g, w(u32::from(stret) + 1));
+        format!("{error} (message {name})")
+    })?;
     Ok(u64::from(r.r0) | u64::from(r.r1) << 32)
 }
 

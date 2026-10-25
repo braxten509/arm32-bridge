@@ -11,8 +11,14 @@ use crate::symbols::Registry;
 
 const COMMUNICATIONS_FAILURE: isize = 3;
 
+/// GKErrorDomain: the exported constant and every Game Center error's domain.
+fn error_domain() -> Id {
+    static DOMAIN: std::sync::OnceLock<Id> = std::sync::OnceLock::new();
+    *DOMAIN.get_or_init(|| crate::fw::string::make("GKErrorDomain"))
+}
+
 fn offline_error() -> Id {
-    crate::fw::misc::error("GKErrorDomain", COMMUNICATIONS_FAILURE, "The requested operation could not be completed because Game Center is not available.")
+    crate::fw::misc::error_in(error_domain(), COMMUNICATIONS_FAILURE, "The requested operation could not be completed because Game Center is not available.")
 }
 
 /// Calls a completion block later on the main run loop with the given
@@ -127,7 +133,7 @@ extern "C" fn ignore_u64(_this: Id, _: Sel, _value: u64) {}
 const NOT_AUTHENTICATED: isize = 6;
 
 fn not_signed_in_error() -> Id {
-    crate::fw::misc::error("GKErrorDomain", NOT_AUTHENTICATED, "The requested operation could not be completed because local player has not been authenticated.")
+    crate::fw::misc::error_in(error_domain(), NOT_AUTHENTICATED, "The requested operation could not be completed because local player has not been authenticated.")
 }
 
 macro_rules! object_property {
@@ -346,7 +352,8 @@ extern "C" fn placeholder_achievement_image(_: Class, _: Sel) -> Id {
     image
 }
 
-pub fn register(_r: &mut Registry) {
+pub fn register(r: &mut Registry) {
+    r.data("GKErrorDomain", crate::symbols::leak(error_domain()));
     define_class("GKPlayer", "NSObject", 8);
     let local = define_class("GKLocalPlayer", "GKPlayer", 8);
     class_methods(local, &[("localPlayer", local_player as usize)]);
@@ -685,4 +692,38 @@ extern "C" fn ignore_bool_id(_this: Id, _: Sel, _flag: u8, _player: Id) {}
 
 extern "C" fn voice_accept(_this: Id, _: Sel, _call: u64, error: *mut Id) -> bool {
     voice_start(0, 0, 0, error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A data symbol's object (games read the variable, often unchecked).
+    fn constant(name: &str) -> Id {
+        let (address, kind) = crate::symbols::lookup(&format!("_{name}")).unwrap_or_else(|| panic!("{name} is not exported"));
+        assert_eq!(kind, crate::symbols::Kind::Data, "{name}");
+        unsafe { *(address as *const Id) }
+    }
+
+    /// Games compare a sign-in error's domain with GKErrorDomain, and the
+    /// Accounts keys are read the same way: none may be left unexported.
+    #[test]
+    fn error_domain_and_account_keys_are_exported_strings() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let domain = constant("GKErrorDomain");
+        assert_eq!(crate::fw::string::get(domain), "GKErrorDomain");
+        assert_eq!(runtime::send(offline_error(), "domain", &[]), domain, "the error's domain is the constant itself");
+        assert_eq!(runtime::send(offline_error(), "code", &[]), COMMUNICATIONS_FAILURE as usize);
+        for (name, value) in [
+            ("ACFacebookAppIdKey", "ACFacebookAppIdKey"),
+            ("ACFacebookPermissionsKey", "ACFacebookPermissionsKey"),
+            ("ACFacebookAudienceKey", "ACFacebookAudienceKey"),
+            ("ACFacebookAudienceEveryone", "everyone"),
+            ("ACFacebookAudienceFriends", "friends"),
+            ("ACFacebookAudienceOnlyMe", "me"),
+        ] {
+            assert_eq!(crate::fw::string::get(constant(name)), value, "{name}");
+        }
+    }
 }

@@ -816,10 +816,15 @@ fn lock(bridge: &Mutex<Bridge>) -> std::sync::MutexGuard<'_, Bridge> {
     bridge.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Defines the host mirror of every game class (parents first) and makes
-/// every selector reference point at one string per selector name.
+/// Slides game ivars past grown superclasses, defines the host mirror of
+/// every game class (parents first) and makes every selector reference
+/// point at one string per selector name.
 pub fn install(bridge: &Mutex<Bridge>, g: &dyn GuestSide, md: &ObjcMetadata32) -> Result<(), String> {
     let mut b = lock(bridge);
+    // The game's code reads the offset variables: they move with the ivars.
+    for (variable, diff) in b.classes.slide_ivars() {
+        g.write(variable, &(u32_at(g, variable) + diff).to_le_bytes());
+    }
     let order: Vec<(u32, String, super::classes::Super, u32)> = b
         .classes
         .classes_parents_first()
