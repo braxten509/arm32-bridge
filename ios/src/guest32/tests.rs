@@ -112,6 +112,120 @@ fn stat_fills_darwins_layout() {
 }
 
 #[test]
+fn statfs_and_statvfs_fill_darwins_layouts() {
+    // Darwin armv7 (64-bit inodes): struct statfs is 2168 bytes with 64-bit
+    // block counts from 8; struct statvfs is 44 bytes with 32-bit ones.
+    let folder = std::env::temp_dir();
+    let host = {
+        let path = std::ffi::CString::new(folder.to_str().unwrap()).unwrap();
+        let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::statvfs(path.as_ptr(), &mut stats) }, 0);
+        stats
+    };
+    let host_total = host.f_blocks as u64 * host.f_frsize as u64;
+    let close = |bytes: u64| bytes.abs_diff(host_total) <= host_total / 100;
+    let out = alloc(2168 + 4);
+    mem().write_u32(out + 2168, 0xFEED_F00D);
+    assert_eq!(call("statfs", [cstring(folder.to_str().unwrap()), out, 0, 0], &[]).0, 0);
+    let block = mem().read_u32(out) as u64;
+    assert!(block > 0 && close(mem().read_u64(out + 8) * block), "f_bsize at 0 and f_blocks at 8 give the disk size");
+    assert!(mem().read_u64(out + 24) <= mem().read_u64(out + 8), "f_bavail at 24");
+    assert_eq!(mem().string(out + 72), "hfs", "f_fstypename at 72");
+    assert_eq!(mem().string(out + 88), "/private/var", "f_mntonname at 88");
+    assert_eq!(mem().read_u32(out + 2168), 0xFEED_F00D, "nothing past 2168 bytes");
+    let fd = unsafe { libc::open(std::ffi::CString::new(folder.to_str().unwrap()).unwrap().as_ptr(), libc::O_RDONLY) };
+    assert_eq!(call("fstatfs", [fd as u32, out, 0, 0], &[]).0, 0);
+    unsafe { libc::close(fd) };
+    assert_eq!(mem().string(out + 72), "hfs");
+
+    let out = alloc(44 + 4);
+    mem().write_u32(out + 44, 0xFEED_F00D);
+    assert_eq!(call("statvfs", [cstring(folder.to_str().unwrap()), out, 0, 0], &[]).0, 0);
+    let fragment = mem().read_u32(out + 4) as u64;
+    assert!(fragment > 0 && close(mem().read_u32(out + 8) as u64 * fragment), "f_frsize at 4 and f_blocks at 8");
+    assert!(mem().read_u32(out + 16) <= mem().read_u32(out + 8), "f_bavail at 16");
+    assert_eq!(mem().read_u32(out + 44), 0xFEED_F00D, "nothing past 44 bytes");
+    assert_eq!(call("statvfs", [cstring("/no/such/folder"), out, 0, 0], &[]).0 as i32, -1);
+    assert_eq!(errno(), 2, "ENOENT");
+}
+
+#[test]
+fn directories_list_with_darwins_dirent() {
+    // struct dirent (64-bit inodes): d_ino 0, d_seekoff 8, d_reclen 16,
+    // d_namlen 18, d_type 20, d_name 21 (1024 bytes).
+    let folder = std::env::temp_dir().join(format!("guest32-dir-{}", std::process::id()));
+    std::fs::create_dir_all(folder.join("sub")).unwrap();
+    std::fs::write(folder.join("a.txt"), b"x").unwrap();
+    let dir = call("opendir", [cstring(folder.to_str().unwrap()), 0, 0, 0], &[]).0;
+    assert_ne!(dir, 0);
+    let read_all = || {
+        let mut names = Vec::new();
+        loop {
+            let entry = call("readdir", [dir, 0, 0, 0], &[]).0;
+            if entry == 0 {
+                break;
+            }
+            let name = mem().string(entry + 21);
+            assert_eq!(mem().read_u16(entry + 18) as usize, name.len(), "d_namlen");
+            assert!(mem().read_u16(entry + 16) as usize >= 21 + name.len() + 1, "d_reclen");
+            assert_ne!(mem().read_u64(entry), 0, "d_ino");
+            names.push((name, mem().read_u8(entry + 20)));
+        }
+        names.sort();
+        names
+    };
+    let expected = vec![(".".to_string(), 4), ("..".to_string(), 4), ("a.txt".to_string(), 8), ("sub".to_string(), 4)];
+    assert_eq!(read_all(), expected, "DT_DIR 4, DT_REG 8");
+    call("rewinddir", [dir, 0, 0, 0], &[]);
+    let (entry, result) = (alloc(1048), alloc(4));
+    assert_eq!(call("readdir_r", [dir, entry, result, 0], &[]).0, 0);
+    assert_eq!(mem().read_u32(result), entry, "readdir_r fills the caller's entry");
+    assert_eq!(read_all().len(), 3, "the rest after rewinding");
+    assert_eq!(call("readdir_r", [dir, entry, result, 0], &[]).0, 0);
+    assert_eq!(mem().read_u32(result), 0, "NULL at the end");
+    assert_eq!(call("closedir", [dir, 0, 0, 0], &[]).0, 0);
+    std::fs::remove_dir_all(&folder).unwrap();
+    assert_eq!(call("opendir", [cstring("/no/such/folder"), 0, 0, 0], &[]).0, 0);
+    assert_eq!(errno(), 2, "ENOENT");
+}
+
+#[test]
+fn packed_byte_extends_translate() {
+    // UXTB16/SXTB16/UXTAB16/SXTAB16, Thumb-2 and ARM: bytes 0 and 2 of the
+    // (rotated) Rm become halfwords, added halfword by halfword to Rn.
+    setup();
+    let thumb = |instruction: [u16; 2]| {
+        let address = alloc(8);
+        for (i, half) in [instruction[0], instruction[1], 0x4770].iter().enumerate() {
+            mem().write_bytes(address + i as u32 * 2, &half.to_le_bytes()); // ...; bx lr
+        }
+        address | 1
+    };
+    let arm = |instruction: u32| {
+        let address = alloc(8);
+        mem().write_u32(address, instruction);
+        mem().write_u32(address + 4, 0xE12F_FF1E); // bx lr
+        address
+    };
+    let (x, n) = (0x80F1_7F82u32, 0x0001_FFFFu32);
+    let cases = [
+        ("uxtb16 r0, r0", [0xFA3F, 0xF080], 0xE6CF_0070, 0x00F1_0082u32),
+        ("sxtb16 r0, r0", [0xFA2F, 0xF080], 0xE68F_0070, 0xFFF1_FF82),
+        ("uxtab16 r0, r1, r0", [0xFA31, 0xF080], 0xE6C1_0070, 0x00F2_0081),
+        ("sxtab16 r0, r1, r0", [0xFA21, 0xF080], 0xE681_0070, 0xFFF2_FF81),
+        ("uxtb16 r0, r0, ror #8", [0xFA3F, 0xF090], 0xE6CF_0470, 0x0080_007F),
+    ];
+    let _gil = runtime::hold_gil();
+    let uc = runtime::engine();
+    for (name, thumb_form, arm_form, expected) in cases {
+        let got = runtime::call_guest(uc, thumb(thumb_form), &[x, n]).unwrap() as u32;
+        assert_eq!(got, expected, "Thumb {name}: {got:#010x}");
+        let got = runtime::call_guest(uc, arm(arm_form), &[x, n]).unwrap() as u32;
+        assert_eq!(got, expected, "ARM {name}: {got:#010x}");
+    }
+}
+
+#[test]
 fn uname_fills_darwins_five_256_byte_fields() {
     let names = alloc(5 * 256);
     assert_eq!(call("uname", [names, 0, 0, 0], &[]).0, 0);

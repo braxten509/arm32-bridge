@@ -30,7 +30,8 @@ extern "C" fn audio_session_get_property(id: u32, size: *mut u32, data: *mut u8)
             write(&0u32.to_le_bytes());
         } else if id == four(b"chsr") {
             write(&44100.0f64.to_le_bytes());
-        } else if id == four(b"cbuf") {
+        } else if id == four(b"cbuf") || id == four(b"chbd") {
+            // The preferred and current I/O buffer: 512 frames at 44100 Hz.
             write(&0.0116f32.to_le_bytes());
         } else if id == four(b"choc") {
             write(&2u32.to_le_bytes());

@@ -73,6 +73,7 @@ pub fn register() {
 
 fn register_darwin() {
     files();
+    directories();
     text();
     numbers();
     process();
@@ -193,6 +194,193 @@ fn stat_into(uc: &Uc, result: i32, st: &libc::stat, out: u32) -> Ret {
     checked(uc, result as i64)
 }
 
+// ---- directories: a guest DIR holds its entry buffer (Darwin's struct
+// dirent with 64-bit inodes: d_ino, d_seekoff, d_reclen, d_namlen, d_type,
+// d_name[1024]); the host stream stays here ----
+
+const DIRENT_SIZE: u32 = 1048;
+/// Where a guest DIR keeps the entry readdir hands back.
+const DIR_ENTRY: u32 = 8;
+
+fn open_directories() -> &'static Mutex<std::collections::HashMap<u32, usize>> {
+    static OPEN: OnceLock<Mutex<std::collections::HashMap<u32, usize>>> = OnceLock::new();
+    OPEN.get_or_init(Default::default)
+}
+
+fn host_directory(dir: u32) -> Option<*mut libc::DIR> {
+    open_directories().lock().unwrap_or_else(|e| e.into_inner()).get(&dir).map(|&d| d as *mut libc::DIR)
+}
+
+/// A guest DIR for a host stream (0 and errno when there is none).
+fn guest_directory(uc: &Uc, host: *mut libc::DIR) -> Ret {
+    if host.is_null() {
+        set_errno_from_host(uc);
+        return Ret::U32(0);
+    }
+    let dir = super::alloc(DIR_ENTRY + DIRENT_SIZE);
+    open_directories().lock().unwrap_or_else(|e| e.into_inner()).insert(dir, host as usize);
+    Ret::U32(dir)
+}
+
+fn write_dirent(out: u32, entry: &libc::dirent) {
+    let name = unsafe { std::ffi::CStr::from_ptr(entry.d_name.as_ptr()) }.to_bytes();
+    let name = &name[..name.len().min(1023)];
+    let m = mem();
+    m.write_u64(out, entry.d_ino);
+    m.write_u64(out + 8, entry.d_off as u64);
+    m.write_u16(out + 16, ((21 + name.len() + 1 + 3) & !3) as u16);
+    m.write_u16(out + 18, name.len() as u16);
+    // DT_* numbers are the same on Darwin.
+    m.write_u8(out + 20, entry.d_type);
+    m.write_bytes(out + 21, name);
+    m.write_u8(out + 21 + name.len() as u32, 0);
+}
+
+/// The next host entry (None at the end or on an error, errno telling which).
+fn next_entry(host: *mut libc::DIR) -> Option<libc::dirent> {
+    unsafe {
+        *libc::__errno_location() = 0;
+        libc::readdir(host).as_ref().copied()
+    }
+}
+
+fn directories() {
+    function("opendir", handler!(|uc, a| { let path = a.u32(); guest_directory(uc, unsafe { libc::opendir(host_c(path)) }) }).unwrap());
+    function("fdopendir", handler!(|uc, a| { let fd = a.i32(); guest_directory(uc, unsafe { libc::fdopendir(fd) }) }).unwrap());
+    function(
+        "readdir",
+        handler!(|uc, a| {
+            let dir = a.u32();
+            let Some(host) = host_directory(dir) else {
+                mem().write_u32(uc.get_data().errno_slot, 9); // EBADF
+                return Ret::U32(0);
+            };
+            match next_entry(host) {
+                Some(entry) => {
+                    write_dirent(dir + DIR_ENTRY, &entry);
+                    Ret::U32(dir + DIR_ENTRY)
+                }
+                None => {
+                    if host_errno() != 0 {
+                        set_errno_from_host(uc);
+                    }
+                    Ret::U32(0)
+                }
+            }
+        })
+        .unwrap(),
+    );
+    // readdir_r(dir, entry, &result): 0 with *result the entry, or NULL at the end.
+    function(
+        "readdir_r",
+        handler!(|uc, a| {
+            let (dir, out, result) = (a.u32(), a.u32(), a.u32());
+            let Some(host) = host_directory(dir) else { return Ret::U32(9) };
+            match next_entry(host) {
+                Some(entry) => {
+                    write_dirent(out, &entry);
+                    mem().write_u32(result, out);
+                    Ret::U32(0)
+                }
+                None => {
+                    mem().write_u32(result, 0);
+                    Ret::U32(darwin_errno(host_errno()) as u32)
+                }
+            }
+        })
+        .unwrap(),
+    );
+    function(
+        "closedir",
+        handler!(|uc, a| {
+            let dir = a.u32();
+            let host = open_directories().lock().unwrap_or_else(|e| e.into_inner()).remove(&dir);
+            let Some(host) = host else {
+                mem().write_u32(uc.get_data().errno_slot, 9);
+                return Ret::U32(u32::MAX);
+            };
+            super::free(dir);
+            checked(uc, unsafe { libc::closedir(host as *mut libc::DIR) } as i64)
+        })
+        .unwrap(),
+    );
+    function(
+        "rewinddir",
+        handler!(|uc, a| {
+            if let Some(host) = host_directory(a.u32()) {
+                unsafe { libc::rewinddir(host) };
+            }
+            Ret::U32(0)
+        })
+        .unwrap(),
+    );
+    function(
+        "dirfd",
+        handler!(|uc, a| match host_directory(a.u32()) {
+            Some(host) => checked(uc, unsafe { libc::dirfd(host) } as i64),
+            None => Ret::U32(u32::MAX),
+        })
+        .unwrap(),
+    );
+    // telldir(dir) -> long; seekdir(dir, long).
+    function("telldir", handler!(|uc, a| Ret::U32(host_directory(a.u32()).map_or(u32::MAX, |host| unsafe { libc::telldir(host) } as u32))).unwrap());
+    function(
+        "seekdir",
+        handler!(|uc, a| {
+            let (dir, position) = (a.u32(), a.i32());
+            if let Some(host) = host_directory(dir) {
+                unsafe { libc::seekdir(host, position as libc::c_long) };
+            }
+            Ret::U32(0)
+        })
+        .unwrap(),
+    );
+}
+
+/// A file system's sizes from the host, as Darwin's statfs/statvfs fill
+/// them for the iPhone's data partition (its name, type and mount point).
+fn file_system_into(uc: &Uc, result: i32, host: &libc::statvfs, out: u32, darwin_statvfs: bool) -> Ret {
+    if result != 0 {
+        return checked(uc, result as i64);
+    }
+    let m = mem();
+    if darwin_statvfs {
+        // 32-bit counts: Apple's scales the fragment size up until they fit.
+        let (mut fragment, mut counts) = (host.f_frsize as u64, [host.f_blocks as u64, host.f_bfree as u64, host.f_bavail as u64]);
+        while counts.iter().any(|&c| c > u32::MAX as u64) {
+            fragment *= 2;
+            counts = counts.map(|c| c / 2);
+        }
+        let words = [
+            host.f_bsize as u32, fragment as u32, counts[0] as u32, counts[1] as u32, counts[2] as u32,
+            host.f_files.min(u32::MAX as u64) as u32, host.f_ffree.min(u32::MAX as u64) as u32, host.f_favail.min(u32::MAX as u64) as u32,
+            host.f_fsid as u32, (host.f_flag & (libc::ST_RDONLY | libc::ST_NOSUID)) as u32, host.f_namemax as u32,
+        ];
+        for (i, word) in words.iter().enumerate() {
+            m.write_u32(out + i as u32 * 4, *word);
+        }
+        return Ret::U32(0);
+    }
+    // struct statfs: f_bsize, f_iosize, then 64-bit blocks/bfree/bavail/files/ffree.
+    m.write_bytes(out, &[0; 2168]);
+    m.write_u32(out, host.f_frsize as u32);
+    m.write_u32(out + 4, host.f_bsize as u32);
+    for (i, count) in [host.f_blocks, host.f_bfree, host.f_bavail, host.f_files, host.f_ffree].iter().enumerate() {
+        m.write_u64(out + 8 + i as u32 * 8, *count as u64);
+    }
+    m.write_u32(out + 48, host.f_fsid as u32);
+    m.write_u32(out + 52, (host.f_fsid >> 32) as u32);
+    m.write_u32(out + 60, 0x11); // f_type: HFS
+    // f_flags: MNT_LOCAL | MNT_JOURNALED, plus read-only / nosuid as the host has them.
+    let flags = 0x1000 | 0x80_0000 | if host.f_flag & libc::ST_RDONLY != 0 { 1 } else { 0 } | if host.f_flag & libc::ST_NOSUID != 0 { 8 } else { 0 };
+    m.write_u32(out + 64, flags as u32);
+    m.write_u32(out + 68, 1); // f_fssubtype: journaled HFS+
+    for (offset, text) in [(72, "hfs"), (88, "/private/var"), (1112, "/dev/disk0s1s2")] {
+        m.write_bytes(out + offset, text.as_bytes());
+    }
+    Ret::U32(0)
+}
+
 fn files() {
     function("__error", handler!(|uc, a| Ret::U32(uc.get_data().errno_slot)).unwrap());
     function(
@@ -225,6 +413,24 @@ fn files() {
         })
         .unwrap(),
     );
+    // statfs/statvfs(path, out), fstatfs/fstatvfs(fd, out).
+    for name in ["statfs", "statvfs", "fstatfs", "fstatvfs"] {
+        function(
+            name,
+            handler!(|uc, a| {
+                let name = uc.get_data().current_call;
+                let (target, out) = (a.u32(), a.u32());
+                let mut host: libc::statvfs = unsafe { std::mem::zeroed() };
+                let result = if name.starts_with('f') {
+                    unsafe { libc::fstatvfs(target as i32, &mut host) }
+                } else {
+                    unsafe { libc::statvfs(host_c(target), &mut host) }
+                };
+                file_system_into(uc, result, &host, out, name.ends_with("vfs"))
+            })
+            .unwrap(),
+        );
+    }
     function(
         "open",
         handler!(|uc, a| {

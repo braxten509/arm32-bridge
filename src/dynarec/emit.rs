@@ -594,6 +594,25 @@ impl Asm {
     pub fn sxth_w(&mut self, rd: Reg, rn: Reg) {
         self.sbfm_w(rd, rn, 0, 15);
     }
+    /// ARM's UXTB16/SXTB16 (`add` None) and UXTAB16/SXTAB16: bytes 0 and 2
+    /// of `x` zero- or sign-extended to halfwords, each added to `add`'s
+    /// halfword with no carry between the halves. `t1`/`t2` are scratch
+    /// (neither may be `x` or `add`).
+    pub fn extend_bytes16(&mut self, rd: Reg, add: Option<Reg>, x: Reg, signed: bool, t1: Reg, t2: Reg) {
+        for (out, lsb) in [(t1, 0), (t2, 16)] {
+            if signed {
+                self.sbfx_w(out, x, lsb, 8);
+            } else {
+                self.ubfx_w(out, x, lsb, 8);
+            }
+        }
+        if let Some(n) = add {
+            self.add_w(t1, t1, n, shift::LSL, 0);
+            self.add_w(t2, t2, n, shift::LSR, 16);
+        }
+        self.bfi_w(t1, t2, 16, 16);
+        self.mov_w(rd, t1);
+    }
     /// sxtw xd, wn
     pub fn sxtw_x(&mut self, rd: Reg, rn: Reg) {
         self.sbfm_x(rd, rn, 0, 31);

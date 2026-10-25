@@ -236,8 +236,28 @@ const NS_UTF16: usize = 10;
 const NS_UTF16_LE: usize = 0x9400_0100;
 const NS_UTF32_LE: usize = 0x9C00_0100;
 const NS_UTF32: usize = 0x8C00_0100;
+const NS_WINDOWS_LATIN1: usize = 12;
+/// NSMacOSRomanStringEncoding: iOS's +defaultCStringEncoding.
+const NS_MAC_ROMAN: usize = 30;
+
+/// The table for bytes 0x80-0xFF of a one-byte encoding.
+fn high_table(encoding: usize) -> Option<&'static [u16; 128]> {
+    match encoding {
+        NS_MAC_ROMAN => Some(&crate::fw::cfbridge::MAC_ROMAN_HIGH),
+        NS_WINDOWS_LATIN1 => Some(&crate::fw::cfbridge::WINDOWS_LATIN1_HIGH),
+        _ => None,
+    }
+}
+
+extern "C" fn default_c_string_encoding(_class: Class, _: Sel) -> usize {
+    NS_MAC_ROMAN
+}
 
 fn decode(bytes: &[u8], encoding: usize) -> Option<Vec<u16>> {
+    if let Some(high) = high_table(encoding) {
+        // cp1252's five unused bytes keep their own value, as Windows does.
+        return Some(bytes.iter().map(|&b| if b < 0x80 || high[b as usize - 0x80] == 0 { b as u16 } else { high[b as usize - 0x80] }).collect());
+    }
     Some(match encoding {
         NS_ASCII | NS_UTF8 => std::str::from_utf8(bytes).ok()?.encode_utf16().collect(),
         NS_ISO_LATIN1 => bytes.iter().map(|&b| b as u16).collect(),
@@ -264,6 +284,15 @@ fn decode(bytes: &[u8], encoding: usize) -> Option<Vec<u16>> {
 }
 
 pub fn encode(units: &[u16], encoding: usize) -> Vec<u8> {
+    if let Some(high) = high_table(encoding) {
+        return String::from_utf16_lossy(units)
+            .chars()
+            .map(|c| match c as u32 {
+                ascii @ 0..=0x7F => ascii as u8,
+                code => high.iter().position(|&h| h != 0 && h as u32 == code).map_or(b'?', |i| 0x80 + i as u8),
+            })
+            .collect();
+    }
     match encoding {
         NS_UTF16 | NS_UTF16_LE => units.iter().flat_map(|u| u.to_le_bytes()).collect(),
         NS_UTF32 | NS_UTF32_LE => String::from_utf16_lossy(units).chars().flat_map(|c| (c as u32).to_le_bytes()).collect(),
@@ -971,6 +1000,7 @@ pub fn register(r: &mut Registry) {
         string,
         &[
             ("string", empty_string as usize),
+            ("defaultCStringEncoding", default_c_string_encoding as usize),
             ("stringWithUTF8String:", string_with_utf8 as usize),
             ("stringWithString:", string_with_string as usize),
             ("pathWithComponents:", path_with_components as usize),
@@ -997,6 +1027,20 @@ pub fn register(r: &mut Registry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// iOS's C string encoding is Mac Roman (NSMacOSRomanStringEncoding, 30);
+    /// it and Windows Latin-1 (12) read and write one byte per character.
+    #[test]
+    fn mac_roman_is_the_default_c_string_encoding() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let class = crate::objc::runtime::class_named("NSString");
+        assert_eq!(crate::objc::runtime::send(class, "defaultCStringEncoding", &[]), 30);
+        assert_eq!(decode(&[b'c', 0x8E, 0xDB], 30), Some("cé€".encode_utf16().collect()));
+        assert_eq!(encode(&"cé€✓".encode_utf16().collect::<Vec<_>>(), 30), [b'c', 0x8E, 0xDB, b'?']);
+        assert_eq!(decode(&[0x80, 0xE9], 12), Some("€é".encode_utf16().collect()));
+        assert_eq!(encode(&"€é".encode_utf16().collect::<Vec<_>>(), 12), [0x80, 0xE9]);
+    }
 
     /// Each word (split by spaces, tabs or line ends) starts upper case, the rest lower case.
     #[test]
