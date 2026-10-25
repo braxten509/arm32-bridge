@@ -604,6 +604,12 @@ extern "C" fn dict_remove(this: Id, _: Sel, key: Id) {
     }
 }
 
+extern "C" fn dict_remove_keys(this: Id, s: Sel, keys: Id) {
+    for key in array_items(keys) {
+        dict_remove(this, s, key);
+    }
+}
+
 extern "C" fn dict_remove_all(this: Id, _: Sel) {
     pairs(this).clear();
 }
@@ -1166,6 +1172,7 @@ pub fn register(_: &mut Registry) {
             ("setObject:forKeyedSubscript:", dict_set as usize),
             ("setValue:forKey:", dict_set_value as usize),
             ("removeObjectForKey:", dict_remove as usize),
+            ("removeObjectsForKeys:", dict_remove_keys as usize),
             ("removeAllObjects", dict_remove_all as usize),
             ("addEntriesFromDictionary:", dict_add_entries as usize),
             ("setDictionary:", dict_set_dictionary as usize),
