@@ -76,6 +76,8 @@ pub struct Node {
     pub frame: Rect,
     pub bounds_origin: Point,
     pub transform: Option<Transform>,
+    /// Its layer's anchor point (unit square), what it turns around; None: the middle.
+    pub anchor: Option<Point>,
     pub hidden: bool,
     pub alpha: f64,
     /// Its pictures, back to front.
@@ -146,9 +148,11 @@ fn walk(node: &Node, parent: Option<Transform>, parent_alpha: f64, clip: Rect, o
     let own = match parent {
         None => moved(-node.bounds_origin.x, -node.bounds_origin.y),
         Some(parent) => {
-            let centre = (node.frame.origin.x + size.width / 2.0, node.frame.origin.y + size.height / 2.0);
+            // It turns and scales around its anchor point (the middle unless moved).
+            let anchor = node.anchor.unwrap_or(Point { x: 0.5, y: 0.5 });
+            let centre = (node.frame.origin.x + size.width * anchor.x, node.frame.origin.y + size.height * anchor.y);
             let turn = node.transform.unwrap_or(IDENTITY);
-            let to_middle = moved(-node.bounds_origin.x - size.width / 2.0, -node.bounds_origin.y - size.height / 2.0);
+            let to_middle = moved(-node.bounds_origin.x - size.width * anchor.x, -node.bounds_origin.y - size.height * anchor.y);
             then(then(then(to_middle, turn), moved(centre.0, centre.1)), parent)
         }
     };
@@ -374,20 +378,64 @@ fn snapshot(view: Id, classes: &Classes, depth: usize) -> Node {
     if Classes::is(view, classes.cell) {
         background = crate::fw::tables::cell_fill(view).or(background);
     }
+    if let Some(pieces) = crate::fw::pickers::pieces(view) {
+        pictures.extend(pieces.into_iter().map(piece_shown));
+    }
+    let alpha = property_get(view, "alpha").map(f64::from_bits).unwrap_or(1.0);
+    let (mut frame, mut transform, mut alpha) = (state.frame, state.transform, alpha);
+    let anchor = if state.layer == 0 { Point { x: 0.5, y: 0.5 } } else { crate::fw::layers::anchor(state.layer) };
+    // Core Animation animations on the view's layer show over its own values.
+    if state.layer != 0 && crate::fw::animation::animating(state.layer) {
+        let size = frame.size;
+        let position = Point { x: frame.origin.x + size.width * anchor.x, y: frame.origin.y + size.height * anchor.y };
+        let shown = crate::fw::animation::presented(state.layer, crate::fw::animation::Shown { opacity: alpha, position, transform });
+        frame.origin = Point { x: shown.position.x - size.width * anchor.x, y: shown.position.y - size.height * anchor.y };
+        (transform, alpha) = (shown.transform, shown.opacity);
+    }
+    let mut children: Vec<(f64, Node)> = if depth < 64 {
+        state.subviews.iter().map(|&child| (z_of(child), snapshot(child, classes, depth + 1))).collect()
+    } else {
+        Vec::new()
+    };
+    // Layers with a higher zPosition show in front of their siblings (a stable sort keeps the rest in order).
+    children.sort_by(|a, b| a.0.total_cmp(&b.0));
     Node {
-        frame: state.frame,
+        frame,
         bounds_origin: state.bounds_origin,
-        transform: Some(state.transform),
+        transform: Some(transform),
+        anchor: Some(anchor),
         hidden: property_get(view, "hidden").unwrap_or(0) != 0,
-        alpha: property_get(view, "alpha").map(f64::from_bits).unwrap_or(1.0),
+        alpha,
         pictures,
         video: crate::fw::media::shows_video(view),
         gl: state.layer != 0 && Classes::is(state.layer, classes.gl_layer),
         background,
         clips: property_get(view, "clips").unwrap_or(0) != 0,
-        children: if depth < 64 { state.subviews.iter().map(|&child| snapshot(child, classes, depth + 1)).collect() } else { Vec::new() },
+        children: children.into_iter().map(|(_, node)| node).collect(),
     }
 }
+
+/// A view's layer's zPosition (0 without a layer).
+fn z_of(view: Id) -> f64 {
+    match view_state(view).layer {
+        0 => 0.0,
+        layer => crate::fw::layers::z_position(layer),
+    }
+}
+
+/// A page control's or picker's piece as a picture.
+fn piece_shown(piece: crate::fw::pickers::Piece) -> Shown {
+    use crate::fw::pickers::Piece;
+    let plain = |path: String, rect: Rect| Shown { path, mode: 0, size: (1.0, 1.0), rect, caps: None, tile: false, text: None, alpha: 1.0 };
+    match piece {
+        Piece::Color(color, rect) => plain(color_path(color), rect),
+        Piece::Dot(color, rect) => plain(format!("{DOT_PREFIX}{},{},{},{}", color[0], color[1], color[2], color[3]), rect),
+        Piece::Text(look, rect) => Shown { path: String::new(), mode: 0, size: look.size, rect, caps: None, tile: false, text: Some(look), alpha: 1.0 },
+    }
+}
+
+/// Stands for a round dot of a colour in a picture path until `resolve`.
+const DOT_PREFIX: &str = "\u{1}dot:";
 
 /// Stands for a plain colour in a picture path until `resolve`.
 const COLOR_PREFIX: &str = "\u{1}color:";
@@ -430,6 +478,12 @@ fn resolve(pictures: Vec<Picture>) -> Vec<Picture> {
             if let Some(color) = p.path.strip_prefix(COLOR_PREFIX) {
                 let parts: Vec<f64> = color.split(',').filter_map(|part| part.parse().ok()).collect();
                 p.path = crate::fw::graphics::color_picture(parts.try_into().ok()?)?;
+                return Some(p);
+            }
+            if let Some(color) = p.path.strip_prefix(DOT_PREFIX) {
+                let parts: Vec<f64> = color.split(',').filter_map(|part| part.parse().ok()).collect();
+                p.path = crate::fw::graphics::dot_picture(parts.try_into().ok()?)?;
+                p.size = (crate::fw::graphics::DOT_PIXELS as f64, crate::fw::graphics::DOT_PIXELS as f64);
                 return Some(p);
             }
             let Some(id) = p.path.strip_prefix(IMAGE_PREFIX) else { return Some(p) };
@@ -1042,6 +1096,38 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(500));
         runtime::send(button, "setHighlighted:", &[1]);
         assert_eq!(drawn(), 1, "the darker background is ready at once");
+    }
+
+    /// A view's layer decides how it is drawn: it turns around its anchor
+    /// point, a higher zPosition puts it in front of its siblings, and a
+    /// running Core Animation animation shows over its own values.
+    #[test]
+    fn views_follow_their_layers_anchor_z_order_and_animations() {
+        setup();
+        let parent = new_view("UIView", rect(0.0, 0.0, 300.0, 300.0));
+        let (turned, plain) = (new_view("UIView", rect(100.0, 100.0, 40.0, 20.0)), new_view("UIView", rect(0.0, 0.0, 10.0, 10.0)));
+        let color = |name: &str| runtime::send(runtime::class_named("UIColor"), name, &[]);
+        runtime::send(turned, "setBackgroundColor:", &[color("redColor")]);
+        runtime::send(plain, "setBackgroundColor:", &[color("blueColor")]);
+        runtime::send(parent, "addSubview:", &[turned]);
+        runtime::send(parent, "addSubview:", &[plain]);
+        let layer = runtime::send(turned, "layer", &[]);
+        send_struct(layer, "setAnchorPoint:", Point { x: 0.0, y: 0.0 });
+        send_struct(turned, "setTransform:", Transform { a: 0.0, b: 1.0, c: -1.0, d: 0.0, tx: 0.0, ty: 0.0 });
+        send_struct(layer, "setZPosition:", 1.0f64);
+        let animation = runtime::send(runtime::class_named("CABasicAnimation"), "animationWithKeyPath:", &[crate::fw::string::make("opacity")]);
+        runtime::send(animation, "setFromValue:", &[crate::fw::collections::number_float(0.25)]);
+        runtime::send(animation, "setToValue:", &[crate::fw::collections::number_float(0.25)]);
+        send_struct(animation, "setDuration:", 100.0f64);
+        runtime::send(runtime::send(plain, "layer", &[]), "addAnimation:forKey:", &[animation, 0]);
+        let pictures = flatten(&window(vec![snapshot(parent, &Classes::find(), 0)]));
+        let paths: Vec<&str> = pictures.iter().map(|p| p.path.as_str()).collect();
+        assert_eq!(paths, [color_path([0.0, 0.0, 1.0, 1.0]), color_path([1.0, 0.0, 0.0, 1.0])], "the higher zPosition in front");
+        // Its top-left corner is the anchor: it stays where the position is.
+        assert_eq!(at(&pictures[1], 0.0, 0.0), (120.0, 110.0));
+        assert_eq!(at(&pictures[1], 40.0, 0.0), (120.0, 150.0));
+        assert!((pictures[0].alpha - 0.25).abs() < 1e-6, "animated opacity: {}", pictures[0].alpha);
+        runtime::send(runtime::send(plain, "layer", &[]), "removeAllAnimations", &[]);
     }
 
     #[test]

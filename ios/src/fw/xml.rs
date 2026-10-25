@@ -238,8 +238,8 @@ extern "C" fn parser_init_with_data(this: Id, _: Sel, data: Id) -> Id {
     if data == 0 {
         return 0;
     }
+    // The parser's own copy (+1, held for good: parsers are never freed).
     let copy = crate::fw::data::make(&crate::fw::data::bytes(data));
-    crate::fw::counted::retain(copy);
     property_set(this, "data", copy as u64);
     this
 }
@@ -247,7 +247,12 @@ extern "C" fn parser_init_with_data(this: Id, _: Sel, data: Id) -> Id {
 extern "C" fn parser_init_with_url(this: Id, s: Sel, url: Id) -> Id {
     let path = if url == 0 { 0 } else { runtime::send(url, "path", &[]) };
     match (path != 0).then(|| std::fs::read(string::get(path))).and_then(Result::ok) {
-        Some(bytes) => parser_init_with_data(this, s, crate::fw::data::make(&bytes)),
+        Some(bytes) => {
+            let data = crate::fw::data::make(&bytes);
+            let parser = parser_init_with_data(this, s, data);
+            crate::fw::counted::release(data);
+            parser
+        }
         None => 0,
     }
 }

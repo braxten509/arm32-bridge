@@ -21,6 +21,10 @@
 #   nil-list     variadic object arguments follow, ended by nil;
 #   ambiguous    classes disagree on the types; the encoding is for the
 #                class the games use (named after the colon);
+#   class        the row is for receivers of the class named after the
+#                colon (and its subclasses), tried before the selector's
+#                row without it (CALayer's setTransform: takes a
+#                CATransform3D, UIView's a CGAffineTransform);
 #   float        the row's scalar 'f' arguments are C float on the 64-bit
 #                side too (without it a scalar 'f' is CGFloat: double there).
 #                Struct fields of CGPoint/CGSize/CGRect/CGAffineTransform/
@@ -318,6 +322,7 @@ drawInRect:	v@:{CGRect={CGPoint=ff}{CGSize=ff}}
 drawInRect:withFont:	{CGSize=ff}@:{CGRect={CGPoint=ff}{CGSize=ff}}@
 drawInRect:withFont:lineBreakMode:	{CGSize=ff}@:{CGRect={CGPoint=ff}{CGSize=ff}}@i
 drawInRect:withFont:lineBreakMode:alignment:	{CGSize=ff}@:{CGRect={CGPoint=ff}{CGSize=ff}}@ii
+duration	d@:
 encodeBool:forKey:	v@:c@
 encodeDouble:forKey:	v@:d@
 encodeFloat:forKey:	v@:f@	float
@@ -655,6 +660,7 @@ playbackState	i@:
 playerID	@@:
 pointerValue	^v@:
 pointSize	f@:
+position	{CGPoint=ff}@:
 postNotification:	v@:@
 postNotificationName:object:	v@:@@
 postNotificationName:object:userInfo:	v@:@@@
@@ -741,6 +747,7 @@ retain	@@:
 retainArguments	v@:
 reverseObjectEnumerator	@@:
 rightExpression	@@:
+rotation	f@:
 row	i@:
 run	v@:
 runMode:beforeDate:	c@:@@
@@ -773,6 +780,7 @@ sender	@@:
 sendSubviewToBack:	v@:@
 sendSynchronousRequest:returningResponse:error:	@@:@^@^@
 set	@@:
+set	v@:	class:UIColor
 setAccelerometerUpdateInterval:	v@:d
 setAccessoryType:	v@:i
 setAccessoryView:	v@:@
@@ -861,9 +869,11 @@ setDictionary:	v@:@
 setDisableActions:	v@:c
 setDouble:forKey:	v@:d@
 setDrawableProperties:	v@:@
+setDuration:	v@:d
 setEnabled:	v@:c
 setEndPoint:	v@:{CGPoint=ff}
 setFill	v@:
+setFillColor:	v@:^{CGColor=}
 setFillMode:	v@:@
 setFireDate:	v@:@
 setFloat:forKey:	v@:f@	float
@@ -932,11 +942,13 @@ setObject:forKeyedSubscript:	v@:@@
 setOpacity:	v@:f	float
 setOpaque:	v@:c
 setPan:	v@:f	float
+setPath:	v@:^{CGPath=}
 setPercentComplete:	v@:d
 setPersistent:	v@:c
 setPlaceholder:	v@:@
 setPlayerGroup:	v@:I
 setPopoverContentSize:	v@:{CGSize=ff}
+setPosition:	v@:{CGPoint=ff}
 setPredicate:	v@:@
 setProgress:	v@:f	float
 setProgress:animated:	v@:fc	float
@@ -985,6 +997,7 @@ setStatusBarHidden:withAnimation:	v@:ci
 setStatusBarOrientation:animated:	v@:ic
 setString:	v@:@
 setStroke	v@:
+setStrokeColor:	v@:^{CGColor=}
 setSubject:	v@:@
 setTag:	v@:i
 setTarget:	v@:@
@@ -1004,7 +1017,9 @@ setToValue:	v@:@
 setTrackImage:	v@:@
 setTrackTintColor:	v@:@
 setTransform:	v@:{CGAffineTransform=ffffff}
+setTransform:	v@:{CATransform3D=ffffffffffffffff}	class:CALayer
 setTurnBasedMatchmakerDelegate:	v@:@
+setType:	v@:@
 setURL:	v@:@
 setUpdateInterval:	v@:d
 setUserInteractionEnabled:	v@:c
@@ -1057,6 +1072,7 @@ startAccelerometerUpdatesToQueue:withHandler:	v@:@@?
 startAnimating	v@:
 startDownloadingUbiquitousItemAtURL:error:	c@:@^@
 startQuery	c@:
+state	i@:
 statusBarOrientation	i@:
 statusBarOrientationAnimationDuration	d@:
 stopAccelerometerUpdates	v@:
@@ -1135,8 +1151,12 @@ transactionIdentifier	@@:
 transactionReceipt	@@:
 transactions	@@:
 transactionState	i@:
+transform	{CGAffineTransform=ffffff}@:
+transform	{CATransform3D=ffffffffffffffff}@:	class:CALayer
 transitionFromViewController:toViewController:duration:options:animations:completion:	v@:@@dI@?@?
 tryLock	c@:
+type	@@:
+type	i@:	class:UIEvent
 unarchiveObjectWithData:	@@:@
 unarchiveObjectWithFile:	@@:@
 unionSet:	v@:@
@@ -1297,7 +1317,6 @@ setCurrentMode:	v@:@
 setDataDetectorTypes:	v@:I
 setDataSource:	v@:@
 setDetectsPhoneNumbers:	v@:c
-setDuration:	v@:d	ambiguous:CAAnimation
 setEditable:	v@:c
 setExclusiveTouch:	v@:c
 setGyroUpdateInterval:	v@:d
@@ -1317,7 +1336,6 @@ setStatusBarHidden:animated:	v@:cc
 setStatusBarOrientation:	v@:i
 setSubtype:	v@:@
 setTimeZone:	v@:@
-setType:	v@:@	ambiguous:CATransition
 setUbiquitous:itemAtURL:destinationURL:error:	c@:c@@^@
 setUserInfo:	v@:@
 sharedURLCache	@@:
@@ -1332,7 +1350,6 @@ statusCode	i@:
 stop	v@:
 subscriberCellularProvider	@@:
 titleLabel	@@:
-transform	{CGAffineTransform=ffffff}@:	ambiguous:UIView
 URLByAppendingPathComponent:isDirectory:	@@:@c
 valueForProperty:	@@:@
 writeToFile:atomically:encoding:error:	c@:@cI^@

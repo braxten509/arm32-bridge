@@ -965,7 +965,12 @@ pub const MISSING_METHOD: &str = "missing method ";
 /// Type encoding for a message the host answers: the framework table, else
 /// the game's own method of the same name (an override has the same types).
 fn host_signature(b: &Bridge, class: &str, meta: bool, sel: &str) -> Result<(Signature, HostCallOptions), String> {
-    if let Some(entry) = FrameworkSelectors::builtin().get(sel) {
+    let is_kind = |name: &str| {
+        let (receiver, named) = (runtime::class_named(class), runtime::class_named(name));
+        let rt = runtime::lock();
+        receiver != 0 && named != 0 && rt.is_subclass(receiver, named)
+    };
+    if let Some(entry) = FrameworkSelectors::builtin().get_for(sel, is_kind) {
         let options =
             HostCallOptions { real_float: entry.real_float, varargs: entry.varargs, arrays: entry.arrays, host_bytes: entry.host_bytes };
         return Ok((entry.signature.clone(), options));
@@ -1091,6 +1096,17 @@ pub fn send_from_guest(
                 PENDING_THROW.with(|p| p.set(Some(exception)));
                 return Ok(GuestRet { r0: 0, r1: 0 });
             }
+            // -doesNotRecognizeSelector: from game code: Apple's exception,
+            // thrown in the guest like -raise.
+            if name == "doesNotRecognizeSelector:" && !meta {
+                let asked = b.selector_name(g, get(first + 2));
+                let host = b.host_object_for(g, receiver)?;
+                drop(b);
+                let exception = crate::fw::object::unrecognized_selector_exception(host, &asked);
+                let exception = lock(bridge).guest_object(g, exception)?;
+                PENDING_THROW.with(|p| p.set(Some(exception)));
+                return Ok(GuestRet { r0: 0, r1: 0 });
+            }
             // The framework's -dealloc of a game object: its C++ ivars go first.
             let game_dealloc = name == "dealloc" && b.classes.class(u32_at(g, receiver)).is_some_and(|c| !c.meta);
             if game_dealloc {
@@ -1134,7 +1150,8 @@ pub fn send_from_guest(
                 runtime::imp_for(host_receiver, host_sel)
             };
             let imp = imp.ok_or_else(|| format!("{}[{class} {name}] is not implemented by the host layer", if meta { "+" } else { "-" }))?;
-            let mut ret = mirror::call_host(imp, &call.args);
+            // An exception the host method raises is thrown in the game once it returns.
+            let (mut ret, raised) = crate::fw::exception::catching(|| mirror::call_host(imp, &call.args));
             // -bytes / -mutableBytes: data bytes live in guest memory (fw::data)
             // and pass as they are; bytes in host memory get a guest copy
             // (writes through a mutableBytes copy would not reach the host object).
@@ -1162,6 +1179,10 @@ pub fn send_from_guest(
             let result = convert::finish_host_call(call, &ret, &mut Session { bridge: &mut b, g })?;
             if game_dealloc {
                 b.forget(g, receiver);
+            }
+            if let Some(exception) = raised {
+                let exception = b.guest_object(g, exception)?;
+                PENDING_THROW.with(|p| p.set(Some(exception)));
             }
             drop(b);
             construct_pending(bridge, g)?;

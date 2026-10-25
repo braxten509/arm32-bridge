@@ -42,7 +42,7 @@ pub fn register() {
         // Data bytes live in guest memory (fw::data), so their pointers cross as they are.
         "CFDataCreate" => fn(allocator: Ptr, bytes: Ptr, length: Long) -> Obj;
         "CFDataCreateMutable" => fn(allocator: Ptr, capacity: Long) -> Obj;
-        "CFDataCreateWithBytesNoCopy" => fn(allocator: Ptr, bytes: Ptr, length: Long, deallocator: Ptr) -> Obj;
+        "CFDataCreateWithBytesNoCopy" => fn(allocator: Ptr, bytes: Ptr, length: Long, deallocator: Obj) -> Obj;
         "CFDataGetBytePtr" => fn(data: Obj) -> Ptr;
         "CFDataGetMutableBytePtr" => fn(data: Obj) -> Ptr;
         "CFDataGetLength" => fn(data: Obj) -> Long;
@@ -54,7 +54,7 @@ pub fn register() {
         "CFStringGetFastestEncoding" => fn(text: Obj) -> U32;
         "CFStringGetMaximumSizeForEncoding" => fn(length: Long, encoding: U32) -> Long;
         "CFStringCreateWithBytes" => fn(allocator: Ptr, bytes: Ptr, length: Long, encoding: U32, external: Bool) -> Obj;
-        "CFStringCreateWithBytesNoCopy" => fn(allocator: Ptr, bytes: Ptr, length: Long, encoding: U32, external: Bool, deallocator: Ptr) -> Obj;
+        "CFStringCreateWithBytesNoCopy" => fn(allocator: Ptr, bytes: Ptr, length: Long, encoding: U32, external: Bool, deallocator: Obj) -> Obj;
         "NSTemporaryDirectory" => fn() -> Obj;
         "CFGetTypeID" => fn(object: Obj) -> Word;
         "CFRunLoopGetCurrent" => fn() -> Obj;
@@ -209,7 +209,7 @@ pub fn register() {
             super::word_constant(name);
         }
     }
-    for name in OBJECT_CONSTANTS {
+    for name in OBJECT_CONSTANTS.iter().chain(crate::fw::animation::CONSTANT_NAMES) {
         if super::host_data(name).is_some() {
             super::object_constant(name);
         }
@@ -228,7 +228,7 @@ const OBJECT_CONSTANTS: &[&str] = &[
     // Core Foundation
     "kCFRunLoopDefaultMode", "kCFRunLoopCommonModes", "kCFBooleanTrue", "kCFBooleanFalse", "kCFBundleIdentifierKey",
     "kCFBundleVersionKey", "kCFLocaleCurrencySymbol", "kCFNull", "kCFNumberNaN", "kCFNumberNegativeInfinity",
-    "kCFNumberPositiveInfinity",
+    "kCFNumberPositiveInfinity", "kCFAllocatorNull", "kCFAllocatorMalloc", "kCFAllocatorSystemDefault",
     // Security (the keychain)
     "kSecClass", "kSecClassGenericPassword", "kSecClassInternetPassword", "kSecClassKey", "kSecAttrService",
     "kSecAttrAccount", "kSecAttrAccessGroup", "kSecAttrAccessible", "kSecAttrAccessibleWhenUnlocked",
@@ -241,12 +241,8 @@ const OBJECT_CONSTANTS: &[&str] = &[
     "SKErrorDomain", "MPMovieDurationAvailableNotification", "MPMoviePlayerContentPreloadDidFinishNotification",
     "MPMoviePlayerLoadStateDidChangeNotification", "MPMoviePlayerPlaybackDidFinishNotification",
     "MPMoviePlayerPlaybackDidFinishReasonUserInfoKey", "MPMoviePlayerPlaybackStateDidChangeNotification",
-    "MPMoviePlayerNowPlayingMovieDidChangeNotification", "kCAFillModeForwards", "kCAFillModeBackwards",
-    "kCAFillModeBoth", "kCAFillModeRemoved", "kCAMediaTimingFunctionLinear", "kCAMediaTimingFunctionEaseIn",
-    "kCAMediaTimingFunctionEaseOut", "kCAMediaTimingFunctionEaseInEaseOut", "kCAMediaTimingFunctionDefault",
-    "kCATransitionFade", "kCATransitionMoveIn", "kCATransitionPush", "kCATransitionReveal", "kCATransitionFromRight",
-    "kCATransitionFromLeft", "kCATransitionFromTop", "kCATransitionFromBottom", "kCAAnimationLinear",
-    "kCAAnimationDiscrete", "kCAAnimationPaced", "kCAAnimationCubic", "kCAAnimationCubicPaced",
+    "MPMoviePlayerNowPlayingMovieDidChangeNotification",
+    // (Core Animation's are fw::animation::CONSTANT_NAMES, below.)
     // Foundation
     "NSDefaultRunLoopMode", "NSRunLoopCommonModes", "NSInternalInconsistencyException", "NSInvalidArgumentException",
     "NSLocalizedDescriptionKey", "NSLocalizedFailureReasonErrorKey", "NSUnderlyingErrorKey", "NSPOSIXErrorDomain",

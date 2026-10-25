@@ -207,11 +207,13 @@ extern "C" fn string_with_capacity(class: Class, s: Sel, _capacity: usize) -> Id
     empty_string(class, s)
 }
 
-/// Takes the bytes over: copies them, then frees them if asked (as Apple would when done).
+/// Takes the bytes over: copies them, then frees them with the game's free
+/// if asked (as Apple would when done); not when the string can't be made,
+/// as Apple documents.
 extern "C" fn init_with_bytes_no_copy(this: Id, s: Sel, bytes: *mut u8, length: usize, encoding: usize, free_when_done: u8) -> Id {
     let result = init_with_bytes(this, s, bytes, length, encoding);
-    if free_when_done != 0 && !bytes.is_null() {
-        crate::libsystem::heap::free(bytes as *mut _);
+    if result != 0 && free_when_done != 0 && !bytes.is_null() {
+        crate::fw::data::game_free()(bytes);
     }
     result
 }
@@ -417,7 +419,7 @@ extern "C" fn get_c_string(this: Id, _: Sel, buffer: *mut u8, size: usize, encod
 }
 
 extern "C" fn data_using_encoding(this: Id, _: Sel, encoding: usize) -> Id {
-    crate::fw::data::make(&encode(&units(this), encoding))
+    crate::fw::counted::autorelease(crate::fw::data::make(&encode(&units(this), encoding)))
 }
 
 extern "C" fn data_using_encoding_lossy(this: Id, s: Sel, encoding: usize, _lossy: u8) -> Id {
@@ -591,6 +593,69 @@ extern "C" fn substring_with_range(this: Id, _: Sel, range: Range) -> Id {
     let object = make("");
     set(object, value[start..end].to_vec());
     object
+}
+
+/// Cut to `length`, or filled up with `pad` repeated from `start` in it.
+extern "C" fn padding(this: Id, _: Sel, length: usize, pad: Id, start: usize) -> Id {
+    let mut value = units(this);
+    let pad = units(pad);
+    if value.len() >= length || pad.is_empty() {
+        value.truncate(length);
+    } else {
+        let mut at = start % pad.len();
+        while value.len() < length {
+            value.push(pad[at]);
+            at = (at + 1) % pad.len();
+        }
+    }
+    let object = make("");
+    set(object, value);
+    object
+}
+
+extern "C" fn replacing_range(this: Id, _: Sel, range: Range, with: Id) -> Id {
+    let mut value = units(this);
+    let start = range.location.min(value.len());
+    let end = range.location.saturating_add(range.length).min(value.len());
+    value.splice(start..end, units(with));
+    let object = make("");
+    set(object, value);
+    object
+}
+
+/// block(line, &stop) for each line; \n, \r, \r\n, U+0085, U+2028 and
+/// U+2029 end lines, and an ending at the very end starts no empty line.
+extern "C" fn enumerate_lines(this: Id, _: Sel, block: usize) {
+    let value = units(this);
+    let header = block as *const crate::libsystem::mach::BlockHeader;
+    let invoke: extern "C" fn(usize, Id, *mut u8) = unsafe { std::mem::transmute((*header).invoke) };
+    let mut stop = 0u8;
+    let mut start = 0;
+    let mut i = 0;
+    while i < value.len() {
+        let ending = match value[i] {
+            0x0D if value.get(i + 1) == Some(&0x0A) => 2,
+            0x0A | 0x0D | 0x85 | 0x2028 | 0x2029 => 1,
+            _ => 0,
+        };
+        if ending == 0 {
+            i += 1;
+            continue;
+        }
+        let line = make("");
+        set(line, value[start..i].to_vec());
+        invoke(block, line, &mut stop);
+        if stop != 0 {
+            return;
+        }
+        i += ending;
+        start = i;
+    }
+    if start < value.len() {
+        let line = make("");
+        set(line, value[start..].to_vec());
+        invoke(block, line, &mut stop);
+    }
 }
 
 extern "C" fn range_of_string(this: Id, s: Sel, other: Id) -> Range {
@@ -878,6 +943,9 @@ pub fn register(r: &mut Registry) {
             ("rangeOfString:", range_of_string as usize),
             ("rangeOfString:options:", range_of_string_options as usize),
             ("rangeOfString:options:range:", range_of_string_in as usize),
+            ("stringByPaddingToLength:withString:startingAtIndex:", padding as usize),
+            ("stringByReplacingCharactersInRange:withString:", replacing_range as usize),
+            ("enumerateLinesUsingBlock:", enumerate_lines as usize),
             ("intValue", int_value as usize),
             ("integerValue", integer_value as usize),
             ("longLongValue", integer_value as usize),
@@ -992,5 +1060,34 @@ mod tests {
         assert_eq!(join(&["/"]), "/");
         let split = crate::objc::runtime::send(make("/x/y.png"), "pathComponents", &[]);
         assert_eq!(get(crate::objc::runtime::send(class, "pathWithComponents:", &[split])), "/x/y.png");
+    }
+
+    /// Padding (repeating the pad from an index), replacing a range, and
+    /// one call per line whatever ends it (\n, \r\n, \r).
+    #[test]
+    fn padding_replacing_and_lines() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let send = crate::objc::runtime::send;
+        assert_eq!(get(send(make("ab"), "stringByPaddingToLength:withString:startingAtIndex:", &[7, make("123"), 1])), "ab23123");
+        assert_eq!(get(send(make("abcdef"), "stringByPaddingToLength:withString:startingAtIndex:", &[3, make("."), 0])), "abc");
+        let imp = crate::objc::runtime::imp_for(make("x"), crate::objc::runtime::sel("stringByReplacingCharactersInRange:withString:")).expect("replacing is missing");
+        let replace: extern "C" fn(Id, Sel, Range, Id) -> Id = unsafe { std::mem::transmute(imp) };
+        assert_eq!(get(replace(make("Spellcraft"), 0, Range { location: 5, length: 5 }, make("book"))), "Spellbook");
+        extern "C" fn note(block: usize, line: Id, _stop: *mut u8) {
+            unsafe { (*((block + 32) as *const Mutex<Vec<String>>)).lock().unwrap().push(get(line)) };
+        }
+        #[repr(C)]
+        struct Block {
+            header: crate::libsystem::mach::BlockHeader,
+            lines: Mutex<Vec<String>>,
+        }
+        let descriptor: [usize; 4] = [0, std::mem::size_of::<Block>(), 0, 0];
+        let block = Block {
+            header: crate::libsystem::mach::BlockHeader { isa: 0, flags: 1 << 28, reserved: 0, invoke: note as usize, descriptor: &descriptor },
+            lines: Mutex::new(Vec::new()),
+        };
+        send(make("one\r\ntwo\n\nthree\rfour\n"), "enumerateLinesUsingBlock:", &[&block as *const Block as usize]);
+        assert_eq!(*block.lines.lock().unwrap(), ["one", "two", "", "three", "four"]);
     }
 }

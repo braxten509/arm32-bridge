@@ -215,6 +215,10 @@ extern "C" fn noted_should_perform(this: Id, _: Sel, _identifier: Id, _sender: I
     property_get(this, "testRefuseSegues") != Some(1)
 }
 
+extern "C" fn no_forwarding(_this: Id, _: Sel) -> bool {
+    false
+}
+
 /// A delegate that keeps the window it is given, like a real app delegate.
 extern "C" fn delegate_set_window(this: Id, _: Sel, window: Id) {
     property_set(this, "testWindow", window as u64);
@@ -270,6 +274,9 @@ fn setup() {
         // The same, also noting when its view is loaded.
         let loading = define_class("StoryboardTestLoadingController", "StoryboardTestController", 8);
         methods(loading, &[("viewDidLoad", noted_did_load as usize)]);
+        // A container that tells its children itself (iOS 5's automatic forwarding off).
+        let quiet = define_class("StoryboardTestQuietController", "StoryboardTestController", 8);
+        methods(quiet, &[("automaticallyForwardAppearanceAndRotationMethodsToChildViewControllers", no_forwarding as usize)]);
         let delegate = define_class("StoryboardTestDelegate", "NSObject", 8);
         methods(delegate, &[("setWindow:", delegate_set_window as usize), ("window", delegate_window as usize)]);
         // A view class of the game's own (as if loaded from its program).
@@ -908,6 +915,69 @@ fn the_main_storyboard_makes_and_shows_the_window() {
 
     // No main storyboard: nothing is made.
     assert_eq!(load_main_interface_from(&Value::Dict(vec![]), bundle, delegate), 0);
+}
+
+/// UIKit's rule for every controller, not just the window's root: a
+/// controller hears viewWillAppear: / viewDidAppear: (once each) when its
+/// view comes into a shown window, and viewWillDisappear: /
+/// viewDidDisappear: when it leaves — a child added with
+/// addChildViewController: whose view the parent puts in its own, views
+/// that come along inside a view put on screen, a window being shown. A
+/// container whose automaticallyForwardAppearanceAndRotationMethodsToChildViewControllers
+/// says NO tells its children itself.
+#[test]
+fn controllers_appear_and_disappear_with_their_views() {
+    setup();
+    let make = |class: &str| runtime::send(runtime::send(runtime::class_named(class), "alloc", &[]), "init", &[]);
+    let event = |id: Id, what: &str| (id, what.to_string());
+    let window = new_window();
+    let (parent, child, grandchild) = (make("StoryboardTestController"), make("StoryboardTestController"), make("StoryboardTestController"));
+    runtime::send(window, "setRootViewController:", &[parent]);
+    let parent_view = runtime::send(parent, "view", &[]);
+    // A child already inside the root's view before the window is shown comes on screen with it.
+    runtime::send(parent, "addChildViewController:", &[grandchild]);
+    runtime::send(parent_view, "addSubview:", &[runtime::send(grandchild, "view", &[])]);
+    assert!(events_of(&[parent, grandchild]).is_empty(), "nothing is on screen yet");
+    runtime::send(window, "makeKeyAndVisible", &[]);
+    let shown = events_of(&[parent, grandchild]);
+    assert_eq!(shown.iter().filter(|e| e.0 == parent).cloned().collect::<Vec<_>>(), [event(parent, "viewWillAppear: NO"), event(parent, "viewDidAppear: NO")], "the root, once");
+    assert_eq!(
+        shown.iter().filter(|e| e.0 == grandchild).cloned().collect::<Vec<_>>(),
+        [event(grandchild, "viewWillAppear: NO"), event(grandchild, "viewDidAppear: NO")]
+    );
+
+    // A child's view put in the shown parent's view.
+    runtime::send(parent, "addChildViewController:", &[child]);
+    let child_view = runtime::send(child, "view", &[]);
+    runtime::send(parent_view, "addSubview:", &[child_view]);
+    assert_eq!(events_of(&[parent, child]), [event(child, "viewWillAppear: NO"), event(child, "viewDidAppear: NO")]);
+    runtime::send(parent_view, "insertSubview:atIndex:", &[child_view, 0]);
+    assert!(events_of(&[parent, child]).is_empty(), "moving inside the window changes nothing");
+    runtime::send(child_view, "removeFromSuperview", &[]);
+    assert_eq!(events_of(&[parent, child]), [event(child, "viewWillDisappear: NO"), event(child, "viewDidDisappear: NO")]);
+    runtime::send(child_view, "removeFromSuperview", &[]);
+    assert!(events_of(&[child]).is_empty(), "gone once");
+
+    // A view holding a controller's view, put on screen, brings it along.
+    let holder = plain_view(50.0, 50.0);
+    runtime::send(holder, "addSubview:", &[child_view]);
+    assert!(events_of(&[child]).is_empty(), "the holder is off screen");
+    runtime::send(parent_view, "addSubview:", &[holder]);
+    assert_eq!(events_of(&[child]), [event(child, "viewWillAppear: NO"), event(child, "viewDidAppear: NO")]);
+    runtime::send(holder, "removeFromSuperview", &[]);
+    assert_eq!(events_of(&[child]), [event(child, "viewWillDisappear: NO"), event(child, "viewDidDisappear: NO")]);
+
+    // A container that doesn't forward: it hears its own, its children nothing.
+    let (quiet, inner) = (make("StoryboardTestQuietController"), make("StoryboardTestController"));
+    runtime::send(quiet, "addChildViewController:", &[inner]);
+    let quiet_view = runtime::send(quiet, "view", &[]);
+    runtime::send(quiet_view, "addSubview:", &[runtime::send(inner, "view", &[])]);
+    runtime::send(parent, "addChildViewController:", &[quiet]);
+    runtime::send(parent_view, "addSubview:", &[quiet_view]);
+    assert_eq!(events_of(&[quiet, inner]), [event(quiet, "viewWillAppear: NO"), event(quiet, "viewDidAppear: NO")]);
+    runtime::send(quiet_view, "removeFromSuperview", &[]);
+    assert_eq!(events_of(&[quiet, inner]), [event(quiet, "viewWillDisappear: NO"), event(quiet, "viewDidDisappear: NO")]);
+    assert!(events_of(&[parent]).is_empty(), "the root heard nothing more");
 }
 
 /// A shown window given a new root controller: the controller's view is

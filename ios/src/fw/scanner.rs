@@ -274,7 +274,7 @@ extern "C" fn cs_bitmap(this: Id, _: Sel) -> Id {
             bytes[(code / 8) as usize] |= 1 << (code % 8);
         }
     }
-    data::make(&bytes)
+    crate::fw::counted::autorelease(data::make(&bytes))
 }
 
 extern "C" fn cs_copy(this: Id, _: Sel, _zone: usize) -> Id {

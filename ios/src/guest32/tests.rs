@@ -15,8 +15,17 @@ pub(crate) fn setup() {
         let _ = runtime::set_platform(&ios32::APPLE32);
         super::register_all();
         runtime::init(false);
-        super::fw::keep_data_bytes_in_guest_memory();
     });
+}
+
+/// Data bytes come from the guest heap while the first part is held, as
+/// in a 32-bit game's run; the second keeps the tests that need it apart
+/// (it goes last).
+pub(crate) fn guest_data_bytes() -> (crate::fw::data::HeapHeld, std::sync::MutexGuard<'static, ()>) {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    setup();
+    let serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    (super::fw::keep_data_bytes_in_guest_memory(), serial)
 }
 
 pub(crate) fn alloc(size: u32) -> u32 {
@@ -742,6 +751,27 @@ fn raise_and_raise_format_from_game_code_throw_through_the_guest_runtime() {
     uc.get_data_mut().fault = None;
     let error = result.expect_err("an uncaught exception stops the program");
     assert!(error.contains("uncaught Objective-C exception: FormatException: value 42 of ten"), "{error}");
+}
+
+/// An exception host code raises while answering a game's message (here
+/// key-value coding's NSUnknownKeyException) is thrown in the game, where
+/// its @catch could take it; uncaught, it ends at the terminate handler.
+#[test]
+fn host_raises_reach_game_code_as_game_throws() {
+    use super::objc::wire::{test_bridge, Translator};
+    use crate::fw::string::make;
+    cxx();
+    let (object, value_for_key, key) = {
+        let mut b = test_bridge().lock().unwrap();
+        let host = crate::objc::runtime::send(crate::objc::runtime::send(crate::objc::runtime::class_named("NSObject"), "alloc", &[]), "init", &[]);
+        (b.guest_object(&Translator, host).unwrap(), b.guest_selector(&Translator, "valueForKey:"), b.guest_object(&Translator, make("nope")).unwrap())
+    };
+    let _gil = runtime::hold_gil();
+    let uc = runtime::engine();
+    let result = runtime::call_guest(uc, runtime::stub_for("objc_msgSend"), &[object, value_for_key, key]);
+    uc.get_data_mut().fault = None;
+    let error = result.expect_err("the raise reaches the game");
+    assert!(error.contains("uncaught Objective-C exception: NSUnknownKeyException"), "{error}");
 }
 
 #[test]

@@ -211,6 +211,65 @@ extern "C" fn preferred_localizations(_this: Id, _: Sel) -> Id {
     collections::array_from(&[string::make("en")])
 }
 
+/// The bundle's languages: its "<name>.lproj" folders.
+extern "C" fn localizations(this: Id, _: Sel) -> Id {
+    let mut names: Vec<String> = std::fs::read_dir(bundle_path_of(this))
+        .map(|entries| entries.filter_map(|e| e.ok()?.file_name().to_str()?.strip_suffix(".lproj").map(String::from)).collect())
+        .unwrap_or_default();
+    names.sort();
+    collections::array_from(&names.iter().map(|n| string::make(n)).collect::<Vec<_>>())
+}
+
+/// Which of `offered` to use for the phone's languages (English here):
+/// the first match, else the development language's, else the first one.
+pub fn pick_localization(offered: &[String]) -> Option<String> {
+    let wanted = ["en", "English", "en_US", "en-US", "Base"];
+    wanted
+        .iter()
+        .find_map(|w| offered.iter().find(|o| o.as_str() == *w))
+        .or_else(|| offered.iter().find(|o| o.starts_with("en")))
+        .or_else(|| offered.first())
+        .cloned()
+}
+
+extern "C" fn preferred_localizations_from(_: Class, _: Sel, offered: Id) -> Id {
+    let offered: Vec<String> = collections::array_items(offered).into_iter().map(string::get).collect();
+    let picked: Vec<Id> = pick_localization(&offered).into_iter().map(|p| string::make(&p)).collect();
+    collections::array_from(&picked)
+}
+
+extern "C" fn preferred_localizations_for(class: Class, s: Sel, offered: Id, _preferences: Id) -> Id {
+    preferred_localizations_from(class, s, offered)
+}
+
+/// Every file of a type ("png", or all for nil/"") in a folder of the bundle
+/// and in its language folder, full paths, the folder's own first.
+extern "C" fn paths_for_resources(this: Id, _: Sel, kind: Id, folder: Id) -> Id {
+    let base = bundle_path_of(this);
+    let folder = string::get(folder);
+    let kind = string::get(kind);
+    let kind = kind.trim_start_matches('.');
+    let place = |root: String| if folder.is_empty() { root } else { format!("{root}/{folder}") };
+    let mut places = vec![place(base.clone())];
+    let languages: Vec<String> = collections::array_items(localizations(this, 0)).into_iter().map(string::get).collect();
+    if let Some(language) = pick_localization(&languages) {
+        places.push(place(format!("{base}/{language}.lproj")));
+    }
+    let mut found = Vec::new();
+    for place in places {
+        let Ok(entries) = std::fs::read_dir(&place) else { continue };
+        let mut names: Vec<String> = entries.filter_map(|e| e.ok()?.file_name().to_str().map(String::from)).collect();
+        names.sort();
+        for name in names {
+            let matches = kind.is_empty() || name.rsplit_once('.').is_some_and(|(_, ext)| ext == kind);
+            if matches && !name.ends_with(".lproj") {
+                found.push(string::make(&format!("{place}/{name}")));
+            }
+        }
+    }
+    collections::array_from(&found)
+}
+
 // ----- NSUserDefaults: values kept in memory and saved as a property list -----
 
 struct Defaults {
@@ -552,7 +611,15 @@ pub fn register(r: &mut Registry) {
     r.function("NSGetUncaughtExceptionHandler", get_uncaught_exception_handler as usize);
 
     let bundle = define_class("NSBundle", "NSObject", 16);
-    class_methods(bundle, &[("mainBundle", main_bundle as usize), ("bundleWithPath:", bundle_with_path as usize)]);
+    class_methods(
+        bundle,
+        &[
+            ("mainBundle", main_bundle as usize),
+            ("bundleWithPath:", bundle_with_path as usize),
+            ("preferredLocalizationsFromArray:", preferred_localizations_from as usize),
+            ("preferredLocalizationsFromArray:forPreferences:", preferred_localizations_for as usize),
+        ],
+    );
     methods(
         bundle,
         &[
@@ -568,6 +635,8 @@ pub fn register(r: &mut Registry) {
             ("pathForResource:ofType:inDirectory:", path_for_resource_in as usize),
             ("localizedStringForKey:value:table:", localized_string as usize),
             ("preferredLocalizations", preferred_localizations as usize),
+            ("localizations", localizations as usize),
+            ("pathsForResourcesOfType:inDirectory:", paths_for_resources as usize),
         ],
     );
 

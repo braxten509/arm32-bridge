@@ -153,7 +153,7 @@ extern "C" fn create_file(_this: Id, _: Sel, path: Id, contents: Id, _attributes
 
 extern "C" fn contents_at_path(_this: Id, _: Sel, path: Id) -> Id {
     match std::fs::read(path_of(path)) {
-        Ok(bytes) => crate::fw::data::make(&bytes),
+        Ok(bytes) => crate::fw::counted::autorelease(crate::fw::data::make(&bytes)),
         Err(_) => 0,
     }
 }
@@ -210,25 +210,94 @@ extern "C" fn preferred_languages(_: Class, _: Sel) -> Id {
     collections::array_from(&[string::make("en")])
 }
 
-extern "C" fn locale_identifier(_this: Id, _: Sel) -> Id {
-    string::make("en_US")
+/// The phone's locale is en_US; one made with an identifier keeps it.
+fn identifier_of(locale: Id) -> String {
+    match crate::fw::uikit::property_get(locale, "localeIdentifier") {
+        Some(text) => string::get(text as Id),
+        None => "en_US".into(),
+    }
 }
 
-extern "C" fn locale_object_for_key(_this: Id, _: Sel, key: Id) -> Id {
+extern "C" fn locale_identifier(this: Id, _: Sel) -> Id {
+    string::make(&identifier_of(this))
+}
+
+/// "de_DE", "en-GB", "pt_BR@currency=EUR": language, then the country
+/// (a script such as zh_Hans_CN sits between them).
+fn locale_parts(identifier: &str) -> (String, Option<String>, Option<String>) {
+    let base = identifier.split('@').next().unwrap_or("");
+    let mut parts = base.split(['_', '-']).filter(|p| !p.is_empty());
+    let language = parts.next().unwrap_or("").to_lowercase();
+    let mut country = None;
+    let mut script = None;
+    for part in parts {
+        if part.len() == 4 && part.chars().all(|c| c.is_ascii_alphabetic()) && script.is_none() && country.is_none() {
+            script = Some(part.to_string());
+        } else if country.is_none() {
+            country = Some(part.to_uppercase());
+        }
+    }
+    (language, script, country)
+}
+
+/// The usual currency of a country (enough for prices; others USD).
+fn currency_of(country: Option<&str>) -> (&'static str, &'static str) {
+    match country.unwrap_or("US") {
+        "GB" => ("GBP", "£"),
+        "JP" => ("JPY", "¥"),
+        "CN" => ("CNY", "¥"),
+        "KR" => ("KRW", "₩"),
+        "IN" => ("INR", "₹"),
+        "RU" => ("RUB", "₽"),
+        "BR" => ("BRL", "R$"),
+        "CA" => ("CAD", "$"),
+        "AU" => ("AUD", "$"),
+        "MX" => ("MXN", "$"),
+        "CH" => ("CHF", "CHF"),
+        "SE" => ("SEK", "kr"),
+        "NO" => ("NOK", "kr"),
+        "DK" => ("DKK", "kr."),
+        "DE" | "FR" | "ES" | "IT" | "NL" | "BE" | "AT" | "PT" | "FI" | "IE" | "GR" | "SK" | "SI" | "EE" | "LV" | "LT" | "LU" | "MT" | "CY" => ("EUR", "€"),
+        _ => ("USD", "$"),
+    }
+}
+
+extern "C" fn locale_object_for_key(this: Id, _: Sel, key: Id) -> Id {
     let key = string::get(key);
+    let identifier = identifier_of(this);
+    let (language, script, country) = locale_parts(&identifier);
     let value = match key.as_str() {
-        "kCFLocaleCountryCodeKey" => "US",
-        "kCFLocaleLanguageCodeKey" => "en",
-        "currency" => "USD",
-        "kCFLocaleCurrencySymbolKey" => "$",
-        "kCFLocaleIdentifierKey" => "en_US",
+        "kCFLocaleCountryCodeKey" => match country {
+            Some(country) => country,
+            None => return 0,
+        },
+        "kCFLocaleLanguageCodeKey" => language,
+        "kCFLocaleScriptCodeKey" => match script {
+            Some(script) => script,
+            None => return 0,
+        },
+        "currency" | "kCFLocaleCurrencyCodeKey" => currency_of(country.as_deref()).0.to_string(),
+        "kCFLocaleCurrencySymbolKey" => currency_of(country.as_deref()).1.to_string(),
+        "kCFLocaleIdentifierKey" => identifier,
+        "kCFLocaleUsesMetricSystemKey" => return collections::number_bool(!matches!(country.as_deref(), Some("US" | "LR" | "MM"))),
+        "kCFLocaleDecimalSeparatorKey" => if matches!(language.as_str(), "de" | "fr" | "es" | "it" | "pt" | "ru" | "nl" | "sv" | "da" | "fi" | "nb" | "pl" | "tr") { ",".into() } else { ".".into() },
         "kCFLocaleVariantCodeKey" => return 0,
         _ => {
             crate::log!("NSLocale objectForKey {key}: not known");
             return 0;
         }
     };
-    string::make(value)
+    string::make(&value)
+}
+
+extern "C" fn locale_init_with_identifier(this: Id, _: Sel, identifier: Id) -> Id {
+    let identifier = if identifier == 0 { string::make("") } else { runtime::send(identifier, "copy", &[]) };
+    crate::fw::uikit::property_set_object(this, "localeIdentifier", identifier);
+    this
+}
+
+extern "C" fn locale_with_identifier(class: Class, s: Sel, identifier: Id) -> Id {
+    locale_init_with_identifier(runtime::alloc_instance(class), s, identifier)
 }
 
 /// A path's bytes (UTF-8 here, as on iPhone) to a string.
@@ -279,10 +348,15 @@ pub fn register(_: &mut Registry) {
             ("autoupdatingCurrentLocale", current_locale as usize),
             ("systemLocale", current_locale as usize),
             ("preferredLanguages", preferred_languages as usize),
+            ("localeWithLocaleIdentifier:", locale_with_identifier as usize),
         ],
     );
     methods(
         locale,
-        &[("localeIdentifier", locale_identifier as usize), ("objectForKey:", locale_object_for_key as usize)],
+        &[
+            ("localeIdentifier", locale_identifier as usize),
+            ("objectForKey:", locale_object_for_key as usize),
+            ("initWithLocaleIdentifier:", locale_init_with_identifier as usize),
+        ],
     );
 }

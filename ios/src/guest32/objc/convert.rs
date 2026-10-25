@@ -191,6 +191,8 @@ fn host_u64(bytes: &[u8]) -> u64 {
 /// Guest bytes of `ty` -> host bytes of `hty`.
 fn to_host(ty: &Ty, hty: &HostTy, guest: &[u8], out: &mut [u8], b: &mut dyn Boundary) -> Result<(), String> {
     match (ty, hty) {
+        // The game's NSNotFound (32-bit NSIntegerMax) is the host's.
+        (Ty::Int { .. }, HostTy::Int { size: 8, .. }) if guest_u32(guest) == i32::MAX as u32 => put(out, i64::MAX as u64),
         (Ty::Char { .. } | Ty::Short { .. } | Ty::Int { .. } | Ty::LongLong { .. } | Ty::Bool, HostTy::Int { size, .. }) => {
             let signed = matches!(ty, Ty::Char { signed: true } | Ty::Short { signed: true } | Ty::Int { signed: true } | Ty::LongLong { signed: true });
             let value = read_int(guest, ty.guest_size() as usize, signed);
@@ -241,6 +243,11 @@ fn to_host(ty: &Ty, hty: &HostTy, guest: &[u8], out: &mut [u8], b: &mut dyn Boun
 /// Host bytes of `hty` -> guest bytes of `ty`.
 fn to_guest(ty: &Ty, hty: &HostTy, host: &[u8], out: &mut [u8], b: &mut dyn Boundary) -> Result<(), String> {
     match (ty, hty) {
+        // NSNotFound (NSIntegerMax) becomes the 32-bit NSIntegerMax, so every
+        // result, NSRange field and out value says "not found" alike.
+        (Ty::Int { .. }, HostTy::Int { size: 8, .. }) if host_u64(host) == i64::MAX as u64 => {
+            out.copy_from_slice(&(i32::MAX as u32).to_le_bytes()[..out.len()])
+        }
         (Ty::Char { .. } | Ty::Short { .. } | Ty::Int { .. } | Ty::LongLong { .. } | Ty::Bool, HostTy::Int { .. }) => {
             out.copy_from_slice(&host[..out.len()])
         }
@@ -904,7 +911,8 @@ fn format_kinds(format: &str) -> Vec<FormatArg> {
         let Some(&conversion) = f.get(i) else { break };
         i += 1;
         out.push(match conversion {
-            b'@' => FormatArg::Object,
+            // %K: a key path name in a predicate format.
+            b'@' | b'K' => FormatArg::Object,
             b's' | b'S' | b'p' => FormatArg::Pointer,
             b'f' | b'F' | b'e' | b'E' | b'g' | b'G' | b'a' | b'A' => FormatArg::Long,
             _ if longs >= 2 => FormatArg::Long,

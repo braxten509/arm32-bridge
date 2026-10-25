@@ -232,7 +232,8 @@ pub fn run(app_dir: &str, program_path: &str) -> Result<(), String> {
     ios32::set_keep_going(env_on("IOS_KEEP_GOING") || crate::trap::KEEP_GOING.load(std::sync::atomic::Ordering::Relaxed));
     // IOS_TRACE_CALLS=1 (test switch): logs every stand-in call (very slow).
     runtime::init(env_on("IOS_TRACE_CALLS"));
-    fw::keep_data_bytes_in_guest_memory();
+    // Until the run ends: data bytes from the guest heap.
+    let _data_bytes = fw::keep_data_bytes_in_guest_memory();
     let _gil = runtime::hold_gil();
     let uc = runtime::engine();
     zlib::open(uc)?;

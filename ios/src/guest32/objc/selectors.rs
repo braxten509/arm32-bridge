@@ -37,6 +37,9 @@ pub struct FrameworkSelector {
 
 pub struct FrameworkSelectors {
     map: HashMap<&'static str, FrameworkSelector>,
+    /// Rows for receivers of one class and its subclasses (`class:Name`),
+    /// tried before the selector's general row.
+    by_class: HashMap<&'static str, Vec<(&'static str, FrameworkSelector)>>,
 }
 
 impl FrameworkSelectors {
@@ -49,6 +52,7 @@ impl FrameworkSelectors {
 
     pub fn parse(text: &'static str) -> Result<FrameworkSelectors, String> {
         let mut map = HashMap::new();
+        let mut by_class: HashMap<&'static str, Vec<(&'static str, FrameworkSelector)>> = HashMap::new();
         for (number, line) in text.lines().enumerate() {
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -79,11 +83,23 @@ impl FrameworkSelectors {
             };
             let (real_float, host_bytes) = (notes.contains(&"float"), notes.contains(&"host-bytes"));
             let entry = FrameworkSelector { encoding, signature, varargs, real_float, arrays, host_bytes };
-            if map.insert(selector, entry).is_some() {
+            if let Some(class) = notes.iter().find_map(|n| n.strip_prefix("class:")) {
+                let rows = by_class.entry(selector).or_default();
+                if rows.iter().any(|(c, _)| *c == class) {
+                    return Err(format!("line {}: {selector} is listed twice for {class}", number + 1));
+                }
+                rows.push((class, entry));
+            } else if map.insert(selector, entry).is_some() {
                 return Err(format!("line {}: {selector} is listed twice", number + 1));
             }
         }
-        Ok(FrameworkSelectors { map })
+        Ok(FrameworkSelectors { map, by_class })
+    }
+
+    /// The row for a message to a receiver: its class's own row (`is_kind`
+    /// tells whether the receiver is of a named class), else the general one.
+    pub fn get_for(&self, selector: &str, is_kind: impl Fn(&str) -> bool) -> Option<&FrameworkSelector> {
+        self.by_class.get(selector).and_then(|rows| rows.iter().find(|(class, _)| is_kind(class)).map(|(_, entry)| entry)).or_else(|| self.get(selector))
     }
 
     pub fn len(&self) -> usize {
@@ -92,5 +108,26 @@ impl FrameworkSelectors {
 
     pub fn get(&self, selector: &str) -> Option<&FrameworkSelector> {
         self.map.get(selector)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A selector whose types differ by class (CALayer's setTransform: takes
+    /// a CATransform3D, UIView's a CGAffineTransform) gets the row of the
+    /// receiver's class, else the general one; a class listed twice is a mistake.
+    #[test]
+    fn rows_for_one_class_win_for_its_receivers() {
+        let table = FrameworkSelectors::parse(
+            "setTransform:\tv@:{CGAffineTransform=ffffff}\nsetTransform:\tv@:{CATransform3D=ffffffffffffffff}\tclass:CALayer\n",
+        )
+        .unwrap();
+        let layer = |name: &str| name == "CALayer";
+        assert_eq!(table.get_for("setTransform:", layer).unwrap().encoding, "v@:{CATransform3D=ffffffffffffffff}");
+        assert_eq!(table.get_for("setTransform:", |_| false).unwrap().encoding, "v@:{CGAffineTransform=ffffff}");
+        assert!(table.get_for("frame", layer).is_none());
+        assert!(FrameworkSelectors::parse("a:\tv@:@\tclass:X\na:\tv@:i\tclass:X\n").is_err());
     }
 }

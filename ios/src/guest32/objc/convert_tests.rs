@@ -159,6 +159,31 @@ fn struct_returns_and_float_returns_convert_back() {
     assert_eq!(r.r0, 0x4444);
 }
 
+/// NSNotFound is NSIntegerMax: 0x7fffffff for a 32-bit game, not the low
+/// half of the host's 64-bit one, in a plain result and inside an NSRange.
+#[test]
+fn not_found_reaches_32_bit_games_as_their_own() {
+    let mut b = Fake::new();
+    let not_found = isize::MAX as u64;
+    let sig = Signature::parse("I@:@").unwrap();
+    let call = prepare_host_call(&sig, plain(), &words(&[1, 2, 3]), &mut b).unwrap();
+    let r = finish_host_call(call, &HostRet { x: [not_found, 0], d: [0; 4] }, &mut b).unwrap();
+    assert_eq!(r.r0, 0x7fff_ffff);
+    let sig = Signature::parse("{_NSRange=II}@:@").unwrap();
+    let out = b.alloc(8);
+    let call = prepare_host_call(&sig, plain(), &words(&[out, 1, 2, 3]), &mut b).unwrap();
+    finish_host_call(call, &HostRet { x: [not_found, 0], d: [0; 4] }, &mut b).unwrap();
+    assert_eq!(b.get(out, 8), [0xff, 0xff, 0xff, 0x7f, 0, 0, 0, 0].to_vec());
+    // And the game's NSNotFound passed in is the host's.
+    let sig = Signature::parse("v@:{_NSRange=II}i").unwrap();
+    let call = prepare_host_call(&sig, plain(), &words(&[1, 2, 0x7fff_ffff, 0, 0x7fff_ffff]), &mut b).unwrap();
+    assert_eq!(&call.args.x[2..5], &[not_found, 0, not_found]);
+    // NSUIntegerMax stays all ones.
+    let sig = Signature::parse("I@:").unwrap();
+    let call = prepare_host_call(&sig, plain(), &words(&[1, 2]), &mut b).unwrap();
+    assert_eq!(finish_host_call(call, &HostRet { x: [u64::MAX, 0], d: [0; 4] }, &mut b).unwrap().r0, u32::MAX);
+}
+
 #[test]
 fn c_strings_and_out_parameters_cross_into_guest_memory() {
     let mut b = Fake::new();
@@ -265,6 +290,12 @@ fn variadic_arguments_go_to_stack_slots() {
     assert_eq!(f64::from_bits(call.args.stack[2]), 1.25);
     assert_eq!(call.args.stack[3], 9);
     assert_eq!(call.args.stack[4] as usize, b.host_address(BASE + 0x10));
+    // A predicate format's %K is a key path object, like %@ (not an int).
+    b.texts.insert(0x310, "%K == %@ AND %K > %d".into());
+    let w = [1, 2, 0x310, 0x500, 0x510, 0x520, (-1i32) as u32];
+    let call = prepare_host_call(&sig, HostCallOptions { varargs: Varargs::Format, ..plain() }, &words(&w), &mut b).unwrap();
+    assert_eq!(call.args.stack[..3], [(HOST_ID + 0x500) as u64, (HOST_ID + 0x510) as u64, (HOST_ID + 0x520) as u64]);
+    assert_eq!(call.args.stack[3] as i32, -1);
     // nil-ended object lists end with a 0 slot.
     let call = prepare_host_call(&sig, HostCallOptions { varargs: Varargs::NilList, ..plain() }, &words(&[1, 2, 0x10, 0x20, 0x30, 0]), &mut b).unwrap();
     assert_eq!(call.args.stack, [(HOST_ID + 0x20) as u64, (HOST_ID + 0x30) as u64, 0]);

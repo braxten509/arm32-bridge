@@ -499,14 +499,16 @@ fn put<T>(out: *mut T, value: T) {
     }
 }
 
-/// A list as data in the format asked for (XML or binary; OpenStep can't be written).
+/// A list as data (autoreleased) in the format asked for (XML or binary;
+/// OpenStep can't be written).
 fn to_data(list: Id, format: usize) -> Option<Id> {
     let value = from_object(list)?;
-    match format {
-        XML_FORMAT => Some(crate::fw::data::make(to_xml(&value).as_bytes())),
-        BINARY_FORMAT => Some(crate::fw::data::make(&to_binary(&value))),
-        _ => None,
-    }
+    let bytes = match format {
+        XML_FORMAT => to_xml(&value).into_bytes(),
+        BINARY_FORMAT => to_binary(&value),
+        _ => return None,
+    };
+    Some(crate::fw::counted::autorelease(crate::fw::data::make(&bytes)))
 }
 
 fn from_data(data: Id, format: *mut usize) -> Option<Id> {

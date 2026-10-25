@@ -662,8 +662,10 @@ mod tests {
     }
 
     /// Runs what is waiting on the main run loop, then what `who` heard.
+    /// For a moment, not one turn: other tests run the same main loop at the
+    /// same time and may be the ones to pick up an answer.
     fn heard_by(who: Id) -> Vec<(&'static str, Id)> {
-        crate::fw::runloop::run_main_loop(Some(0.0));
+        crate::fw::runloop::run_main_loop(Some(crate::fw::runloop::media_time() + 0.1));
         HEARD.lock().unwrap().iter().filter(|h| h.0 == who).map(|h| (h.1, h.2)).collect()
     }
 
