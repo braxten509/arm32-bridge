@@ -218,7 +218,7 @@ extern "C" fn unarchive_object_with_file(_: Class, _: Sel, path: Id) -> Id {
 
 extern "C" fn archived_data_with_root_object(_: Class, _: Sel, object: Id) -> Id {
     match archive(object) {
-        Some(value) => crate::fw::data::make(plist::to_xml(&value).as_bytes()),
+        Some(value) => crate::fw::counted::autorelease(crate::fw::data::make(plist::to_xml(&value).as_bytes())),
         None => 0,
     }
 }

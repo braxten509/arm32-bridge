@@ -310,10 +310,21 @@ extern "C" fn cf_data_create_mutable(_allocator: usize, capacity: isize) -> Id {
     crate::fw::data::make_mutable(capacity.max(0) as usize)
 }
 
-/// Reads the caller's bytes in place. They would be freed with the given
-/// deallocator when the data goes; ours never go, so they never are.
-extern "C" fn cf_data_create_with_bytes_no_copy(_allocator: usize, bytes: *const u8, length: isize, _deallocator: usize) -> Id {
-    crate::fw::data::make_borrowed(bytes, length.max(0) as usize)
+/// The allocators a game can name besides kCFAllocatorDefault (NULL):
+/// kCFAllocatorNull, kCFAllocatorMalloc, kCFAllocatorSystemDefault.
+static ALLOCATORS: std::sync::OnceLock<[Id; 3]> = std::sync::OnceLock::new();
+
+/// Reads the caller's bytes in place; the data frees them with
+/// `deallocator` when it goes. kCFAllocatorNull leaves them the caller's;
+/// CFAllocatorCreate isn't offered, so no allocator of the game's can
+/// exist and any other value is left alone too.
+extern "C" fn cf_data_create_with_bytes_no_copy(_allocator: usize, bytes: *const u8, length: isize, deallocator: Id) -> Id {
+    let [null, malloc, system] = *ALLOCATORS.get().unwrap();
+    let frees = deallocator == 0 || deallocator == malloc || deallocator == system;
+    if deallocator != 0 && deallocator != null && !frees {
+        crate::log!("CFDataCreateWithBytesNoCopy: deallocator {deallocator:#x} isn't an allocator; the bytes stay the caller's");
+    }
+    crate::fw::data::make_over(bytes, length.max(0) as usize, frees.then(crate::fw::data::game_free))
 }
 
 /// The word a message with no arguments answers (0 for nil).
@@ -702,6 +713,11 @@ extern "C" fn cf_bit_vector_set_bit_at_index(vector: Id, index: isize, value: u3
 pub fn register(r: &mut Registry) {
     let class = crate::fw::object::define_class("__CFBitVector", "NSObject", 16);
     let _ = BIT_VECTOR.set(class);
+    let allocator = crate::fw::object::define_class("__NSCFAllocator", "NSObject", 8);
+    let allocators = *ALLOCATORS.get_or_init(|| [(); 3].map(|_| crate::objc::runtime::alloc_instance(allocator)));
+    for (name, object) in ["kCFAllocatorNull", "kCFAllocatorMalloc", "kCFAllocatorSystemDefault"].into_iter().zip(allocators) {
+        r.data(name, leak(object));
+    }
     r.function("CFStringCompare", cf_string_compare as usize);
     r.function("CFURLCopyPathExtension", cf_url_copy_path_extension as usize);
     r.function("CFStringAppendCharacters", cf_string_append_characters as usize);

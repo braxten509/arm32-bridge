@@ -321,7 +321,7 @@ extern "C" fn json_object_with_data(_: Class, _: Sel, bytes: Id, options: usize,
 extern "C" fn data_with_json_object(_: Class, _: Sel, object: Id, options: usize, error: *mut Id) -> Id {
     let mut out = String::new();
     match write(object, options & PRETTY_PRINTED != 0, 0, &mut out) {
-        Ok(()) => data::make(out.as_bytes()),
+        Ok(()) => crate::fw::counted::autorelease(data::make(out.as_bytes())),
         Err(reason) => {
             set_error(error, &format!("JSON text not written: {reason}"));
             0

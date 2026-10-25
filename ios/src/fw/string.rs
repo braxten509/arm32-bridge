@@ -417,7 +417,7 @@ extern "C" fn get_c_string(this: Id, _: Sel, buffer: *mut u8, size: usize, encod
 }
 
 extern "C" fn data_using_encoding(this: Id, _: Sel, encoding: usize) -> Id {
-    crate::fw::data::make(&encode(&units(this), encoding))
+    crate::fw::counted::autorelease(crate::fw::data::make(&encode(&units(this), encoding)))
 }
 
 extern "C" fn data_using_encoding_lossy(this: Id, s: Sel, encoding: usize, _lossy: u8) -> Id {

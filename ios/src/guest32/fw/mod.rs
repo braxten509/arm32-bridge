@@ -623,6 +623,21 @@ pub fn keep_data_bytes_in_guest_memory() {
             Err(_) => std::ptr::null_mut(),
         },
         free: |pointer| runtime::heap().free(mem().guest(pointer)),
+        // Bytes a game handed over: a block of its malloc, else left alone.
+        free_malloced: |pointer| {
+            let guest = (pointer as usize).wrapping_sub(mem().host(0) as usize);
+            let why = match u32::try_from(guest) {
+                Ok(guest) => {
+                    let mut heap = runtime::heap();
+                    match heap.not_owned(guest) {
+                        None => return heap.free(guest),
+                        Some(why) => why,
+                    }
+                }
+                Err(_) => "not in guest memory",
+            };
+            crate::log!("data: bytes {pointer:p} handed over to be freed are not a block of the game's malloc ({why}); left alone");
+        },
     });
 }
 

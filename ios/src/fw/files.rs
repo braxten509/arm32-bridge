@@ -153,7 +153,7 @@ extern "C" fn create_file(_this: Id, _: Sel, path: Id, contents: Id, _attributes
 
 extern "C" fn contents_at_path(_this: Id, _: Sel, path: Id) -> Id {
     match std::fs::read(path_of(path)) {
-        Ok(bytes) => crate::fw::data::make(&bytes),
+        Ok(bytes) => crate::fw::counted::autorelease(crate::fw::data::make(&bytes)),
         Err(_) => 0,
     }
 }

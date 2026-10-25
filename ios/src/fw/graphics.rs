@@ -1765,7 +1765,7 @@ extern "C" fn ui_image_png_representation(picture: Id) -> Id {
     let Some(bitmap) = image(image_cg(picture)) else { return 0 };
     let Some(layout) = bitmap.layout() else { return 0 };
     match bitmap.straight_rgba().and_then(|rgba| encode_png(bitmap.width, bitmap.height, &rgba, layout.has_alpha())) {
-        Some(bytes) => data::make(&bytes),
+        Some(bytes) => counted::autorelease(data::make(&bytes)),
         None => 0,
     }
 }
@@ -1778,7 +1778,7 @@ extern "C" fn ui_image_jpeg_representation(picture: Id, quality: f64) -> Id {
     let quality = (quality.clamp(0.0, 1.0) * 100.0).round().max(1.0) as u8;
     let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality);
     match encoder.encode(&rgb, width as u32, height as u32, image::ExtendedColorType::Rgb8) {
-        Ok(()) => data::make(&out),
+        Ok(()) => counted::autorelease(data::make(&out)),
         Err(e) => {
             crate::log!("UIImageJPEGRepresentation: {e}");
             0

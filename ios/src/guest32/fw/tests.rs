@@ -625,6 +625,54 @@ fn cf_data_bytes_live_in_guest_memory_and_follow_the_length() {
 }
 
 #[test]
+fn released_data_gives_its_guest_heap_bytes_back() {
+    use crate::fw::counted;
+    use crate::objc::runtime::{class_named, send};
+    setup();
+    const SIZE: u32 = 4 << 20;
+    let arena = || runtime::heap().arena_size();
+    let malloc = || runtime::heap().malloc(SIZE);
+    let live = |guest: u32| runtime::heap().not_owned(guest).is_none();
+    let (data, mutable) = (class_named("NSData"), class_named("NSMutableData"));
+    let before = arena();
+    // 12 rounds of 7 data of 4 MiB each: 336 MiB if nothing came back.
+    for _ in 0..12 {
+        // Core Foundation from game code: Create is +1, CFRelease the last.
+        let cf = call("CFDataCreateMutable", [0, SIZE, 0, 0], &[]).0;
+        call("CFRelease", [cf, 0, 0, 0], &[]);
+        // No copy with the default deallocator: the data frees the game's bytes.
+        let given = call("CFDataCreateWithBytesNoCopy", [0, malloc(), SIZE, 0], &[]).0;
+        call("CFRelease", [given, 0, 0, 0], &[]);
+        // Convenience constructors are autoreleased: gone when their pool drains.
+        let pool = counted::pool_push();
+        let made = send(mutable, "dataWithCapacity:", &[SIZE as usize]);
+        let handed = send(data, "dataWithBytesNoCopy:length:", &[mem().host(malloc()) as usize, SIZE as usize]);
+        // alloc/init, copy and mutableCopy are +1: they outlive the pool.
+        let owned = send(send(mutable, "alloc", &[]), "initWithLength:", &[SIZE as usize]);
+        let (copy, mutable_copy) = (send(owned, "copy", &[]), send(owned, "mutableCopy", &[]));
+        counted::pool_pop(pool);
+        assert_eq!((counted::count(made), counted::count(handed)), (None, None), "drained with the pool");
+        assert_eq!([owned, copy, mutable_copy].map(counted::count), [Some(1); 3], "+1 results survive the pool");
+        for object in [owned, copy, mutable_copy] {
+            send(object, "release", &[]);
+        }
+    }
+    let grown = arena() - before;
+    assert!(grown < 64 << 20, "the heap grew {} MiB: released data kept their bytes", grown >> 20);
+
+    // Bytes the caller keeps are never freed: kCFAllocatorNull, freeWhenDone:NO.
+    let null_allocator = mem().read_u32(crate::guest32::data_address("kCFAllocatorNull").expect("kCFAllocatorNull"));
+    let kept = malloc();
+    let borrowed = call("CFDataCreateWithBytesNoCopy", [0, kept, SIZE, null_allocator], &[]).0;
+    call("CFRelease", [borrowed, 0, 0, 0], &[]);
+    let pool = counted::pool_push();
+    send(data, "dataWithBytesNoCopy:length:freeWhenDone:", &[mem().host(kept) as usize, 16, 0]);
+    counted::pool_pop(pool);
+    assert!(live(kept), "the caller's bytes are still the caller's");
+    runtime::heap().free(kept);
+}
+
+#[test]
 fn cf_collections_and_numbers_use_32_bit_words() {
     setup();
     use crate::fw::{collections, string};

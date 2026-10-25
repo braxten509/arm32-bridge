@@ -154,7 +154,10 @@ extern "C" fn copy_matching(query: Id, result: *mut Id) -> i32 {
     if !result.is_null() {
         let value = if all {
             let list: Vec<Id> = found.iter().map(|item| result_for(item, &query)).collect();
-            collections::array_from(&list)
+            let array = collections::array_from(&list);
+            // The array holds them now: the results' own references go.
+            list.iter().for_each(|&item| crate::fw::counted::release(item));
+            array
         } else {
             result_for(&found[0], &query)
         };
