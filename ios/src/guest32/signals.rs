@@ -194,7 +194,11 @@ fn run_handler(uc: &mut Uc, signal: u32, handler: u32, action: Action) {
     BLOCKED.set(blocked);
     if let Err(error) = result {
         stop_with_fault(uc, format!("handler for signal {signal}: {error}"));
+        return;
     }
+    // Raised during the handler while blocked (the same signal, or one in
+    // its mask): due now that the old mask is back.
+    deliver_unblocked(uc);
 }
 
 /// Runs the signals waiting for an unblock, lowest first.

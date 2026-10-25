@@ -17,6 +17,9 @@ struct Group {
 #[derive(Default)]
 struct GroupState {
     count: i64,
+    /// How many times the count reached zero: a wait ends once this moves,
+    /// even if new work entered before the waiter woke (as libdispatch's).
+    emptied: u64,
     /// (queue, copied block) to send once the count is zero.
     notify: Vec<(usize, usize)>,
 }
@@ -46,6 +49,7 @@ extern "C" fn dispatch_group_leave(handle: usize) {
         if state.count > 0 {
             return;
         }
+        state.emptied += 1;
         std::mem::take(&mut state.notify)
     };
     group.empty.notify_all();
@@ -54,12 +58,16 @@ extern "C" fn dispatch_group_leave(handle: usize) {
     }
 }
 
-/// 0 once the group is empty, non-zero if `timeout` passed first.
+/// 0 once the group is (or has been, since the call) empty, non-zero if `timeout` passed first.
 extern "C" fn dispatch_group_wait(handle: usize, timeout: u64) -> isize {
     let group = group(handle);
     let deadline = mach::deadline_nanos(timeout);
     let mut state = group.state.lock().unwrap();
-    while state.count > 0 {
+    if state.count == 0 {
+        return 0;
+    }
+    let started = state.emptied;
+    while state.emptied == started {
         match deadline {
             None => state = group.empty.wait(state).unwrap(),
             Some(at) => {
@@ -111,6 +119,27 @@ extern "C" fn dispatch_group_async(handle: usize, queue: usize, block: usize) {
         work: mach::block_copy(block as *mut BlockHeader) as usize,
     });
     mach::dispatch_async(queue, Box::into_raw(runner) as usize);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn a_wait_ends_when_its_work_finished_even_if_new_work_entered_since() {
+        let group = dispatch_group_create();
+        dispatch_group_enter(group);
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || done.send(dispatch_group_wait(group, !0)).unwrap());
+        std::thread::sleep(Duration::from_millis(50)); // the waiter sleeps at count 1
+        // The group empties, then new work enters before the waiter wakes up.
+        dispatch_group_leave(group);
+        dispatch_group_enter(group);
+        let answer = finished.recv_timeout(Duration::from_millis(500));
+        dispatch_group_leave(group);
+        assert_eq!(answer, Ok(0), "the wait ends: the group was empty after it began");
+    }
 }
 
 pub fn register(r: &mut Registry) {
