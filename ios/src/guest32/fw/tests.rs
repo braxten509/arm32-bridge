@@ -783,6 +783,7 @@ fn guest_of(host: usize) -> u32 {
 
 #[test]
 fn cf_data_bytes_live_in_guest_memory_and_follow_the_length() {
+    let _guest_bytes = crate::guest32::tests::guest_data_bytes();
     let source = alloc(5);
     mem().write_bytes(source, b"hello");
     let one = |name: &str, data: u32| call(name, [data, 0, 0, 0], &[]).0;
@@ -819,6 +820,71 @@ fn cf_data_bytes_live_in_guest_memory_and_follow_the_length() {
     let borrowed = call("CFDataCreateWithBytesNoCopy", [0, source, 5, 0], &[]).0;
     assert_eq!(one("CFDataGetBytePtr", borrowed), source);
     assert_eq!(one("CFDataGetLength", borrowed), 5);
+}
+
+#[test]
+fn released_data_gives_its_guest_heap_bytes_back() {
+    use crate::fw::counted;
+    use crate::objc::runtime::{class_named, send};
+    let (guest_bytes, _serial) = crate::guest32::tests::guest_data_bytes();
+    const SIZE: u32 = 4 << 20;
+    let arena = || runtime::heap().arena_size();
+    let malloc = || runtime::heap().malloc(SIZE);
+    let text = || {
+        let block = malloc();
+        mem().write_bytes(block, b"hi");
+        block
+    };
+    let live = |guest: u32| runtime::heap().not_owned(guest).is_none();
+    let (data, mutable) = (class_named("NSData"), class_named("NSMutableData"));
+    let before = arena();
+    // 12 rounds of 9 blocks of 4 MiB each: 432 MiB if nothing came back.
+    for _ in 0..12 {
+        // Strings over handed-over bytes take them over (default deallocator, freeWhenDone).
+        call("CFStringCreateWithBytesNoCopy", [0, text(), 2, CF_UTF8], &[0, 0]);
+        let string = send(class_named("NSString"), "alloc", &[]);
+        send(string, "initWithBytesNoCopy:length:encoding:freeWhenDone:", &[mem().host(text()) as usize, 2, 4, 1]);
+        // Core Foundation from game code: Create is +1, CFRelease the last.
+        let cf = call("CFDataCreateMutable", [0, SIZE, 0, 0], &[]).0;
+        call("CFRelease", [cf, 0, 0, 0], &[]);
+        // No copy with the default deallocator: the data frees the game's bytes.
+        let given = call("CFDataCreateWithBytesNoCopy", [0, malloc(), SIZE, 0], &[]).0;
+        call("CFRelease", [given, 0, 0, 0], &[]);
+        // Convenience constructors are autoreleased: gone when their pool drains.
+        let pool = counted::pool_push();
+        let made = send(mutable, "dataWithCapacity:", &[SIZE as usize]);
+        let handed = send(data, "dataWithBytesNoCopy:length:", &[mem().host(malloc()) as usize, SIZE as usize]);
+        // alloc/init, copy and mutableCopy are +1: they outlive the pool.
+        let owned = send(send(mutable, "alloc", &[]), "initWithLength:", &[SIZE as usize]);
+        let (copy, mutable_copy) = (send(owned, "copy", &[]), send(owned, "mutableCopy", &[]));
+        counted::pool_pop(pool);
+        assert_eq!((counted::count(made), counted::count(handed)), (None, None), "drained with the pool");
+        assert_eq!([owned, copy, mutable_copy].map(counted::count), [Some(1); 3], "+1 results survive the pool");
+        for object in [owned, copy, mutable_copy] {
+            send(object, "release", &[]);
+        }
+    }
+    let grown = arena() - before;
+    assert!(grown < 64 << 20, "the heap grew {} MiB: released data kept their bytes", grown >> 20);
+
+    // Bytes the caller keeps are never freed: kCFAllocatorNull, freeWhenDone:NO.
+    let null_allocator = mem().read_u32(crate::guest32::data_address("kCFAllocatorNull").expect("kCFAllocatorNull"));
+    let kept = text();
+    let borrowed = call("CFDataCreateWithBytesNoCopy", [0, kept, SIZE, null_allocator], &[]).0;
+    call("CFRelease", [borrowed, 0, 0, 0], &[]);
+    let pool = counted::pool_push();
+    send(data, "dataWithBytesNoCopy:length:freeWhenDone:", &[mem().host(kept) as usize, 16, 0]);
+    counted::pool_pop(pool);
+    let string = call("CFStringCreateWithBytesNoCopy", [0, kept, 2, CF_UTF8], &[0, null_allocator]).0;
+    assert_eq!(crate::fw::string::get(host_of(string)), "hi");
+    assert!(live(kept), "the caller's bytes are still the caller's");
+    runtime::heap().free(kept);
+
+    // Once the 32-bit session lets go, new bytes come from the host's heap again.
+    drop(guest_bytes);
+    let after = crate::fw::data::make(b"x");
+    let at = send(after, "bytes", &[]).wrapping_sub(mem().host(0) as usize);
+    assert!(at >> 32 != 0, "data bytes still made in guest memory");
 }
 
 #[test]

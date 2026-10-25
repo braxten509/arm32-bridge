@@ -207,11 +207,13 @@ extern "C" fn string_with_capacity(class: Class, s: Sel, _capacity: usize) -> Id
     empty_string(class, s)
 }
 
-/// Takes the bytes over: copies them, then frees them if asked (as Apple would when done).
+/// Takes the bytes over: copies them, then frees them with the game's free
+/// if asked (as Apple would when done); not when the string can't be made,
+/// as Apple documents.
 extern "C" fn init_with_bytes_no_copy(this: Id, s: Sel, bytes: *mut u8, length: usize, encoding: usize, free_when_done: u8) -> Id {
     let result = init_with_bytes(this, s, bytes, length, encoding);
-    if free_when_done != 0 && !bytes.is_null() {
-        crate::libsystem::heap::free(bytes as *mut _);
+    if result != 0 && free_when_done != 0 && !bytes.is_null() {
+        crate::fw::data::game_free()(bytes);
     }
     result
 }
@@ -417,7 +419,7 @@ extern "C" fn get_c_string(this: Id, _: Sel, buffer: *mut u8, size: usize, encod
 }
 
 extern "C" fn data_using_encoding(this: Id, _: Sel, encoding: usize) -> Id {
-    crate::fw::data::make(&encode(&units(this), encoding))
+    crate::fw::counted::autorelease(crate::fw::data::make(&encode(&units(this), encoding)))
 }
 
 extern "C" fn data_using_encoding_lossy(this: Id, s: Sel, encoding: usize, _lossy: u8) -> Id {

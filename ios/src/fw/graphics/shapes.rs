@@ -740,7 +740,7 @@ pub(super) fn picture_provider(bitmap: Arc<Bitmap>) -> Id {
     make_provider(holding(Held::Picture(bitmap)))
 }
 
-/// A new CFData of the provider's bytes.
+/// A new CFData of the provider's bytes (+1: its bytes go at the game's CFRelease).
 extern "C" fn data_provider_copy_data(provider: Id) -> Id {
     match provider_state(provider) {
         Some(p) => p.with_bytes(data::make),

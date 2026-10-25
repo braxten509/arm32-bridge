@@ -705,7 +705,7 @@ extern "C" fn archive_root_object(_: Class, _: Sel, object: Id, path: Id) -> boo
 
 extern "C" fn archived_data_with_root_object(_: Class, _: Sel, object: Id) -> Id {
     match archive(object) {
-        Some(value) => crate::fw::data::make(&plist::to_binary(&value)),
+        Some(value) => crate::fw::counted::autorelease(crate::fw::data::make(&plist::to_binary(&value))),
         None => 0,
     }
 }
