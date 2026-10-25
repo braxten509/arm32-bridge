@@ -317,12 +317,69 @@ fn gl_thread_view(env: *mut JNIEnv) -> Option<jobject> {
     (!view.is_null()).then_some(view)
 }
 
-fn request_refresh_rate(env: *mut JNIEnv) {
+/// The game's view for games that draw from their own thread (SDL and others): a
+/// SurfaceView kept in a field of the class (or object) whose native method was called.
+/// Static fields first, then the object's own fields.
+fn field_view(env: *mut JNIEnv, owner: jobject) -> Option<jobject> {
+    if owner.is_null() {
+        return None;
+    }
+    let class_class = jcall!(env, FindClass, c"java/lang/Class".as_ptr());
+    let is_class = jcall!(env, IsInstanceOf, owner, class_class) != 0;
+    let class = if is_class { owner as jclass } else { jcall!(env, GetObjectClass, owner) };
+    let surface_view = jcall!(env, FindClass, c"android/view/SurfaceView".as_ptr());
+    let get_fields = jcall!(env, GetMethodID, class_class, c"getDeclaredFields".as_ptr(), c"()[Ljava/lang/reflect/Field;".as_ptr());
+    let field_class = jcall!(env, FindClass, c"java/lang/reflect/Field".as_ptr());
+    let get_type = jcall!(env, GetMethodID, field_class, c"getType".as_ptr(), c"()Ljava/lang/Class;".as_ptr());
+    let get_modifiers = jcall!(env, GetMethodID, field_class, c"getModifiers".as_ptr(), c"()I".as_ptr());
+    if class.is_null() || surface_view.is_null() || get_fields.is_null() || get_type.is_null() || get_modifiers.is_null() {
+        return None;
+    }
+    let fields = jcall!(env, CallObjectMethodA, class, get_fields, std::ptr::null());
+    if fields.is_null() || jcall!(env, ExceptionCheck) != 0 {
+        return None;
+    }
+    let mut found_static = None;
+    let mut found_in_object = None;
+    for i in 0..jcall!(env, GetArrayLength, fields) {
+        if found_static.is_some() {
+            break;
+        }
+        // nativeInit-style calls may never return to Java, so local references are let go here.
+        let field = jcall!(env, GetObjectArrayElement, fields, i);
+        let kind = jcall!(env, CallObjectMethodA, field, get_type, std::ptr::null());
+        let is_view = !kind.is_null() && jcall!(env, IsAssignableFrom, kind as jclass, surface_view) != 0;
+        jcall!(env, DeleteLocalRef, kind);
+        if !is_view {
+            jcall!(env, DeleteLocalRef, field);
+            continue;
+        }
+        let is_static = jcall!(env, CallIntMethodA, field, get_modifiers, std::ptr::null()) & 8 != 0;
+        let id = jcall!(env, FromReflectedField, field);
+        jcall!(env, DeleteLocalRef, field);
+        if is_static {
+            let view = jcall!(env, GetStaticObjectField, class, id);
+            found_static = (!view.is_null()).then_some(view);
+        } else if !is_class && found_in_object.is_none() {
+            let view = jcall!(env, GetObjectField, owner, id);
+            found_in_object = (!view.is_null()).then_some(view);
+        }
+    }
+    jcall!(env, DeleteLocalRef, fields);
+    found_static.or(found_in_object)
+}
+
+fn request_refresh_rate(env: *mut JNIEnv, owner: jobject) {
     // A failed lookup leaves a Java exception pending; clear it before the next try.
-    let view = cocos_view(env).or_else(|| {
-        jcall!(env, ExceptionClear);
-        gl_thread_view(env)
-    });
+    let view = cocos_view(env)
+        .or_else(|| {
+            jcall!(env, ExceptionClear);
+            gl_thread_view(env)
+        })
+        .or_else(|| {
+            jcall!(env, ExceptionClear);
+            field_view(env, owner)
+        });
     jcall!(env, ExceptionClear);
     let Some(view) = view else {
         crate::log::line("[bridge] could not reach the game's surface to ask for 120 Hz");
@@ -370,7 +427,11 @@ pub fn forward(env: *mut JNIEnv, symbol: &str, address: &AtomicU32, args: &[Host
     }
     let is_frame = symbol.ends_with("_nativeRender");
     if symbol.ends_with("_nativeOnSurfaceChanged") || symbol.ends_with("_nativeInit") {
-        request_refresh_rate(env);
+        let owner = match args.first() {
+            Some(HostArg::Object(owner)) => *owner,
+            _ => std::ptr::null_mut(),
+        };
+        request_refresh_rate(env, owner);
     }
     if is_frame {
         crate::sound_preload::on_frame(env, library_directory());
