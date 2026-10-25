@@ -843,3 +843,20 @@ fn progress_bars_get_their_float_progress_from_32_bit_games() {
     let back = send(&bridge, fake, &[proxy, sel("progress")]).unwrap() as u32;
     assert_eq!(f32::from_bits(back), 0.25, "read back as a float");
 }
+
+/// Data that only looks like a pointer (Mach's NDR_record reads as
+/// 0x1_0000_0000; nothing is mapped there) is not an object, and checking
+/// it must not read that memory.
+#[test]
+fn values_pointing_at_unmapped_memory_are_not_host_objects() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(crate::run::setup);
+    assert!(!is_host_object(0x1_0000_0000));
+    let page = unsafe {
+        libc::mmap(std::ptr::null_mut(), 4096, libc::PROT_NONE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+    };
+    assert_ne!(page, libc::MAP_FAILED);
+    assert!(!is_host_object(page as usize), "a page that can't be read");
+    let object = runtime::send(runtime::class_named("NSObject"), "new", &[]);
+    assert!(is_host_object(object), "a real object still counts");
+}

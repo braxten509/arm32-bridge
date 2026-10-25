@@ -319,6 +319,35 @@ fn read_memory(address: usize, out: &mut [u8]) -> bool {
     }
 }
 
+/// Reads the word at an address that may be bad (None if it can't be read),
+/// for code outside a crash. When process_vm_readv is refused (qemu has no
+/// such call) the kernel copies it through a pipe of its own instead.
+pub fn read_word(address: usize) -> Option<usize> {
+    let mut word = [0u8; 8];
+    if read_memory(address, &mut word) {
+        return Some(usize::from_ne_bytes(word));
+    }
+    if std::io::Error::last_os_error().raw_os_error() == Some(libc::EFAULT) {
+        return None;
+    }
+    static PIPE: std::sync::Mutex<Option<[libc::c_int; 2]>> = std::sync::Mutex::new(None);
+    let mut pipe = PIPE.lock().unwrap_or_else(|e| e.into_inner());
+    if pipe.is_none() {
+        let mut fds = [-1; 2];
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+            return None;
+        }
+        *pipe = Some(fds);
+    }
+    let [read_end, write_end] = pipe.unwrap();
+    unsafe {
+        if libc::write(write_end, address as *const _, 8) != 8 {
+            return None;
+        }
+        (libc::read(read_end, word.as_mut_ptr() as *mut _, 8) == 8).then(|| usize::from_ne_bytes(word))
+    }
+}
+
 /// For each register that points at readable memory: which mapping it is in
 /// and the 64 bytes around it (16 before, 48 after), to see what overwrote
 /// an object.

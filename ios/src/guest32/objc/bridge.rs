@@ -735,8 +735,10 @@ pub fn is_host_object(value: usize) -> bool {
     if value < 0x10000 || value >= 1 << 48 || value % 8 != 0 {
         return false;
     }
-    let rt = runtime::lock();
-    rt.classes.contains_key(&rt.class_of(value))
+    // Data that only looks like a pointer (NDR_record, handles) may point at
+    // nothing, so the class word is read without faulting.
+    let Some(isa) = crate::report::read_word(value) else { return false };
+    runtime::lock().classes.contains_key(&isa)
 }
 
 fn lock(bridge: &Mutex<Bridge>) -> std::sync::MutexGuard<'_, Bridge> {
