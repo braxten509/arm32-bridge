@@ -283,7 +283,8 @@ pub(crate) fn deliver_in(window: Id, finger: i32, phase: Phase, point: Point) {
         handler = view_state(handler).superview;
     }
     static SHOWN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    if SHOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
+    // Tests see every touch; otherwise only the first few are logged.
+    if SHOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 || TAPS_ARMED.load(std::sync::atomic::Ordering::Relaxed) {
         crate::log!(
             "touch {finger} {selector} at {:.0},{:.0}: view {}, handled by {}",
             point.x,
