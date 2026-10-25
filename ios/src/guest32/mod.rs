@@ -69,6 +69,9 @@ pub mod fw;
 mod libsystem;
 mod locale;
 mod mach;
+mod net;
+#[cfg(test)]
+mod net_tests;
 pub mod objc;
 mod regex;
 mod signals;
@@ -170,6 +173,7 @@ pub fn call(uc: &mut Uc, address: u32, args: &[u32]) -> Result<u64, String> {
 /// Every name the 32-bit layer provides, registered before loading.
 pub fn register_all() {
     libsystem::register();
+    net::register();
     signals::register();
     regex::register();
     mach::register();
