@@ -107,6 +107,8 @@ pub struct Ivar32 {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Property32 {
+    /// The property_t { name, attributes } in the image (its identity).
+    pub address: u32,
     pub name: String,
     pub attributes: String,
 }
@@ -355,6 +357,7 @@ impl<'a, M: Memory32 + ?Sized> Reader<'a, M> {
             .map(|i| {
                 let at = list + 8 + i * entry_size;
                 Ok(Property32 {
+                    address: at,
                     name: self.string(self.word(at, what)?, what)?,
                     attributes: self.string(self.word(at + 4, what)?, what)?,
                 })

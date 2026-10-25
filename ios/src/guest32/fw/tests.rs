@@ -303,11 +303,30 @@ fn image_masks_hide_where_their_samples_are_one() {
     let decode = alloc(8);
     mem().write_u32(decode, f(1.0));
     mem().write_u32(decode + 4, f(0.0));
-    let (bits, _) = call("CGImageMaskCreate", [2, 1, 1, 1], &[1, provider_with(&[0b0100_0000]), decode, 0]);
+    let bits_provider = provider_with(&[0b0100_0000]);
+    let (bits, _) = call("CGImageMaskCreate", [2, 1, 1, 1], &[1, bits_provider, decode, 0]);
     let (context, pixels) = row_context(2);
     call("CGContextSetRGBFillColor", [context, f(0.0), f(0.0), f(1.0)], &[f(1.0)]);
     draw(context, 2, bits);
     assert_eq!(mem().bytes(pixels, 8), [0, 0, 0, 0, 0, 0, 255, 255]);
+    // The mask keeps what it was made from: its provider and packed bytes,
+    // its format, its decode array, and no colour space.
+    let (provider, _) = call("CGImageGetDataProvider", [bits, 0, 0, 0], &[]);
+    assert_eq!(provider, bits_provider);
+    let (bytes, _) = call("CGDataProviderCopyData", [provider, 0, 0, 0], &[]);
+    assert_eq!(crate::fw::data::bytes(super::object_to_host(bytes)), [0b0100_0000]);
+    let format: Vec<u32> = ["CGImageGetBitsPerComponent", "CGImageGetBitsPerPixel", "CGImageGetBytesPerRow", "CGImageGetColorSpace", "CGImageIsMask"]
+        .iter()
+        .map(|name| call(name, [bits, 0, 0, 0], &[]).0)
+        .collect();
+    assert_eq!(format, [1, 1, 1, 0, 1]);
+    let (kept, _) = call("CGImageGetDecode", [bits, 0, 0, 0], &[]);
+    assert_eq!(floats(kept, 2), [1.0, 0.0]);
+    // A picture used as the mask must be DeviceGray: an RGB one gives NULL.
+    let (rgb, _) = call("CGColorSpaceCreateDeviceRGB", [0; 4], &[]);
+    let (rgb_image, _) = call("CGImageCreate", [2, 1, 8, 32], &[8, rgb, 5, provider_with(&[0; 8]), 0, 0, 0]);
+    assert_ne!(rgb_image, 0);
+    assert_eq!(call("CGImageCreateWithMask", [image, rgb_image, 0, 0], &[]).0, 0);
 }
 
 #[test]

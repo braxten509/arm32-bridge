@@ -471,7 +471,15 @@ fn property_lists_come_from_the_games_metadata() {
     let (bare, bare_meta) = (g.alloc_permanent(20), g.alloc_permanent(20));
     g.put_words(class, &[meta]);
     g.put_words(bare, &[bare_meta]);
-    let property = |name: &str, attributes: &str| Property32 { name: name.into(), attributes: attributes.into() };
+    // Each declaration is a property_t { name, attributes } in the image.
+    let property = |name: &str, attributes: &str| Property32 {
+        address: g.words(&[g.text(name), g.text(attributes)]),
+        name: name.into(),
+        attributes: attributes.into(),
+    };
+    let level = property("level", "Ti,R,N");
+    // The category redeclares "volume" read-only.
+    let volume_again = property("volume", "Tf,R,N");
     let class_record = |address: u32, meta_address: u32, name: &str, properties: Vec<Property32>| ObjcClass32 {
         address,
         name: name.into(),
@@ -494,7 +502,7 @@ fn property_lists_come_from_the_games_metadata() {
             instance_methods: Vec::new(),
             class_methods: Vec::new(),
             protocols: Vec::new(),
-            instance_properties: vec![property("level", "Ti,R,N")],
+            instance_properties: vec![level.clone(), volume_again.clone()],
         }],
         ..Default::default()
     };
@@ -508,16 +516,19 @@ fn property_lists_come_from_the_games_metadata() {
     let text = |address: u32| unsafe { runtime::cstr(g.host_address(address)) };
     let count = g.words(&[99]);
     let list = call("class_copyPropertyList", &[class, count]);
-    assert_eq!(g.u32_at(count), 3);
-    let entries: Vec<(String, String)> = (0..3)
-        .map(|i| g.u32_at(list + 4 * i))
-        .map(|p| (text(call("property_getName", &[p])), text(call("property_getAttributes", &[p]))))
-        .collect();
+    assert_eq!(g.u32_at(count), 4);
+    let pointers: Vec<u32> = (0..4).map(|i| g.u32_at(list + 4 * i)).collect();
+    let entries: Vec<(String, String)> =
+        pointers.iter().map(|&p| (text(call("property_getName", &[p])), text(call("property_getAttributes", &[p])))).collect();
     assert_eq!(
         entries,
-        [("level", "Ti,R,N"), ("volume", "Tf,N,V_volume"), ("name", "T@\"NSString\",C,N,V_name")].map(|(n, a)| (n.to_string(), a.to_string()))
+        [("level", "Ti,R,N"), ("volume", "Tf,R,N"), ("volume", "Tf,N,V_volume"), ("name", "T@\"NSString\",C,N,V_name")]
+            .map(|(n, a)| (n.to_string(), a.to_string()))
     );
-    assert_eq!(g.u32_at(list + 12), 0, "the list ends with NULL");
+    // Each declaration is its own entry: the image's.
+    assert_eq!((pointers[0], pointers[1]), (level.address, volume_again.address));
+    assert_ne!(pointers[1], pointers[2], "a redeclared property keeps both declarations");
+    assert_eq!(g.u32_at(list + 16), 0, "the list ends with NULL");
     // The same property is the same entry every time; the list itself is new.
     let again = call("class_copyPropertyList", &[class, 0]);
     assert_ne!(again, list);
