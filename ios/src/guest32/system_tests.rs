@@ -6,6 +6,7 @@
 use super::tests::{alloc, call, cstring, setup};
 use arm32_bridge::ios32;
 use arm32_bridge::runtime::{self, mem, ArgSource, Args, GuestCpu, Ret, Uc};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
 /// A guest copy of `values`.
@@ -197,9 +198,9 @@ fn sqlite_round_trip_with_guest_callbacks() {
     assert_eq!(call("sqlite3_bind_double", [insert, 2, quarter as u32, (quarter >> 32) as u32], &[]).0, 0);
     let seven = cstring("seven");
     assert_eq!(call("sqlite3_bind_text", [insert, 3, seven, u32::MAX], &[runtime::stub_for("test_sqlite_destructor")]).0, 0);
-    assert_eq!(*FREED.lock().unwrap(), [seven], "SQLite keeps its own copy; the game's destructor gets its text back");
     assert_eq!(call("sqlite3_step", [insert, 0, 0, 0], &[]).0, 101, "SQLITE_DONE");
     assert_eq!(call("sqlite3_finalize", [insert, 0, 0, 0], &[]).0, 0);
+    assert_eq!(*FREED.lock().unwrap(), [seven], "the game's destructor gets its text back once SQLite is done");
 
     // exec's game callback sees each row; a non-zero answer stops it (SQLITE_ABORT 4).
     let select = cstring("select a, b, c from t order by a");
@@ -298,4 +299,140 @@ fn dispatch_groups_timers_and_after_run_guest_blocks() {
     let fired = count(6);
     std::thread::sleep(std::time::Duration::from_millis(50));
     assert_eq!(count(6), fired, "suspended, it stops");
+}
+
+#[test]
+fn a_signal_raised_in_its_own_handler_runs_when_the_handler_returns() {
+    // How many times the handler ran, and how many while the first run was still going.
+    static RUNS: AtomicU32 = AtomicU32::new(0);
+    static DURING: AtomicU32 = AtomicU32::new(0);
+    fn handler(uc: &mut Uc, a: &mut Args) -> Ret {
+        let signal = a.u32();
+        if RUNS.fetch_add(1, Ordering::SeqCst) == 0 {
+            // Blocked while its handler runs (no SA_NODEFER): held until it returns.
+            let raise = ios32::function("raise").unwrap();
+            raise(uc, &mut Args::new([signal, 0, 0, 0], 0));
+            DURING.store(RUNS.load(Ordering::SeqCst), Ordering::SeqCst);
+        }
+        Ret::Void
+    }
+    setup();
+    ios32::register_function("test_reraising_signal_handler", handler);
+    const SIGUSR2: u32 = 31;
+    let action = words(&[runtime::stub_for("test_reraising_signal_handler"), 0, 0]);
+    assert_eq!(call("sigaction", [SIGUSR2, action, 0, 0], &[]).0, 0);
+    assert_eq!(call("raise", [SIGUSR2, 0, 0, 0], &[]).0, 0);
+    assert_eq!(DURING.load(Ordering::SeqCst), 1, "not run inside its own handler");
+    assert_eq!(RUNS.load(Ordering::SeqCst), 2, "run as soon as the first handler returned");
+}
+
+#[test]
+fn vm_allocate_at_a_taken_address_answers_no_space() {
+    const TASK: u32 = 0x103;
+    let address = alloc(4);
+    assert_eq!(call("vm_allocate", [TASK, address, 8192, 1], &[]).0, 0);
+    let block = mem().read_u32(address);
+    mem().write_bytes(block + 16, b"still here");
+    // VM_FLAGS_FIXED (0) over memory already handed out: KERN_NO_SPACE (3), nothing replaced.
+    mem().write_u32(address, block);
+    assert_eq!(call("vm_allocate", [TASK, address, 4096, 0], &[]).0, 3);
+    assert_eq!(mem().bytes(block + 16, 10), b"still here");
+    assert_eq!(mem().read_u32(address), block, "the address is left as it was");
+    // Over the program's own heap (malloc's blocks) too.
+    let heap_block = alloc(4096);
+    mem().write_u32(heap_block, 0x1234_5678);
+    mem().write_u32(address, heap_block & !0xFFF);
+    assert_eq!(call("vm_allocate", [TASK, address, 4096, 0], &[]).0, 3);
+    assert_eq!(mem().read_u32(heap_block), 0x1234_5678);
+    call("vm_deallocate", [TASK, block, 8192, 0], &[]);
+}
+
+#[test]
+fn sqlite_bind_text_destructors_follow_sqlites_contract() {
+    static FREED: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+    fn destructor(_uc: &mut Uc, a: &mut Args) -> Ret {
+        FREED.lock().unwrap().push(a.u32());
+        Ret::Void
+    }
+    let freed = || FREED.lock().unwrap().clone();
+    setup();
+    ios32::register_function("test_sqlite_contract_destructor", destructor);
+    let game_destructor = runtime::stub_for("test_sqlite_contract_destructor");
+    let out = alloc(4);
+    assert_eq!(call("sqlite3_open", [cstring(":memory:"), out, 0, 0], &[]).0, 0);
+    let db = mem().read_u32(out);
+    assert_eq!(call("sqlite3_exec", [db, cstring("create table t(x text)"), 0, 0], &[0]).0, 0);
+    assert_eq!(call("sqlite3_prepare_v2", [db, cstring("insert into t values(?)"), u32::MAX, out], &[0]).0, 0);
+    let insert = mem().read_u32(out);
+    // Length -1 (up to the end mark): SQLite uses the game's text until it is done with it.
+    let (first, second, third) = (cstring("first"), cstring("second"), cstring("third"));
+    assert_eq!(call("sqlite3_bind_text", [insert, 1, first, u32::MAX], &[game_destructor]).0, 0);
+    assert_eq!(freed(), [], "not while SQLite still uses it");
+    // Binding the parameter again: SQLite is done with the first text.
+    assert_eq!(call("sqlite3_bind_text", [insert, 1, second, u32::MAX], &[u32::MAX]).0, 0, "SQLITE_TRANSIENT");
+    assert_eq!(freed(), [first]);
+    // A failed bind (SQLITE_RANGE 25) still disposes of the text; a NULL text never reaches the destructor.
+    assert_eq!(call("sqlite3_bind_text", [insert, 9, third, 5], &[game_destructor]).0, 25);
+    assert_eq!(freed(), [first, third]);
+    assert_eq!(call("sqlite3_bind_text", [insert, 1, 0, u32::MAX], &[game_destructor]).0, 0);
+    assert_eq!(freed(), [first, third]);
+    // SQLITE_STATIC: SQLite never disposes of it.
+    let fourth = cstring("fourth");
+    assert_eq!(call("sqlite3_bind_text", [insert, 1, fourth, 6], &[0]).0, 0);
+    assert_eq!(call("sqlite3_step", [insert, 0, 0, 0], &[]).0, 101);
+    let last = cstring("last");
+    assert_eq!(call("sqlite3_reset", [insert, 0, 0, 0], &[]).0, 0);
+    assert_eq!(call("sqlite3_bind_text", [insert, 1, last, u32::MAX], &[game_destructor]).0, 0);
+    assert_eq!(call("sqlite3_step", [insert, 0, 0, 0], &[]).0, 101);
+    assert_eq!(freed(), [first, third]);
+    assert_eq!(call("sqlite3_finalize", [insert, 0, 0, 0], &[]).0, 0);
+    assert_eq!(freed(), [first, third, last], "finalizing is when SQLite is done with the last one");
+    assert_eq!(call("sqlite3_close", [db, 0, 0, 0], &[]).0, 0);
+}
+
+/// GIL mode: a game callback inside sqlite3_exec may let go of the guest
+/// lock; another thread then calling into the same connection must not wait
+/// for SQLite's lock while holding the guest lock (the callback could never
+/// get it back).
+#[test]
+#[ignore = "GIL mode: test-pc.sh runs it with ARM32_PARALLEL=0"]
+fn gil_mode_sqlite_callbacks_let_other_threads_wait_for_the_connection() {
+    static DB: AtomicU32 = AtomicU32::new(0);
+    static OTHER: Mutex<Option<std::sync::mpsc::Receiver<u32>>> = Mutex::new(None);
+    // The row callback: starts a thread that prepares on the same connection,
+    // and lets go of the guest lock until that thread is in SQLite.
+    fn row(_uc: &mut Uc, _a: &mut Args) -> Ret {
+        let (entering, entered) = std::sync::mpsc::channel();
+        let (finished, result) = std::sync::mpsc::channel();
+        *OTHER.lock().unwrap() = Some(result);
+        std::thread::spawn(move || {
+            let _gil = runtime::hold_gil();
+            let out = alloc(4);
+            let sql = cstring("select 2");
+            entering.send(()).unwrap();
+            let answer = call("sqlite3_prepare_v2", [DB.load(Ordering::SeqCst), sql, u32::MAX, out], &[0]).0;
+            finished.send(answer).unwrap();
+        });
+        runtime::without_gil(|| {
+            entered.recv().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        });
+        Ret::U32(0)
+    }
+    setup();
+    assert!(!runtime::parallel(), "run with ARM32_PARALLEL=0 (test-pc.sh does)");
+    ios32::register_function("test_sqlite_row_letting_go", row);
+    let out = alloc(4);
+    assert_eq!(call("sqlite3_open", [cstring(":memory:"), out, 0, 0], &[]).0, 0);
+    DB.store(mem().read_u32(out), Ordering::SeqCst);
+    let (sql, callback) = (cstring("select 1"), runtime::stub_for("test_sqlite_row_letting_go"));
+    let (done, exec) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let answer = call("sqlite3_exec", [DB.load(Ordering::SeqCst), sql, callback, 0], &[0]).0;
+        done.send(answer).unwrap();
+    });
+    let wait = std::time::Duration::from_millis(500);
+    assert_eq!(exec.recv_timeout(wait), Ok(0), "deadlock: the callback couldn't get the guest lock back");
+    let other = OTHER.lock().unwrap().take().expect("the callback ran");
+    assert_eq!(other.recv_timeout(wait), Ok(0), "the other thread's prepare went through after exec");
 }

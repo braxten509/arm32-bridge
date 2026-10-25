@@ -68,18 +68,21 @@ fn stack(uc: &Uc, thread: u32) -> (u32, u32) {
 
 pub fn register() {
     function("mach_thread_self", handler!(|uc, a| Ret::U32(this_thread_port())).unwrap());
-    // vm_allocate(task, vm_address_t *address, size, flags)
+    // vm_allocate(task, vm_address_t *address, size, flags). Without
+    // VM_FLAGS_ANYWHERE the range must be vacant (Mach never replaces what is
+    // there), and no guest range ever is: every mapped one already belongs to
+    // the program, the heap, a stack or the runtime, and the gaps between
+    // them can't be mapped. So a fixed request answers KERN_NO_SPACE.
     function(
         "vm_allocate",
         handler!(|uc, a| {
             let (_task, address, size, flags) = (a.u32(), a.u32(), a.u32(), a.u32());
-            let (want, map_flags) = if flags & VM_FLAGS_ANYWHERE != 0 {
-                (0, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS)
-            } else {
-                (mem().read_u32(address), libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED)
-            };
+            if flags & VM_FLAGS_ANYWHERE == 0 {
+                return Ret::U32(KERN_NO_SPACE);
+            }
             let protection = (libc::PROT_READ | libc::PROT_WRITE) as u32;
-            match android(uc, "mmap", &[want, size, protection, map_flags as u32, u32::MAX, 0]) {
+            let map_flags = (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS) as u32;
+            match android(uc, "mmap", &[0, size, protection, map_flags, u32::MAX, 0]) {
                 Ret::U32(block) if block != u32::MAX => {
                     mem().write_u32(address, block);
                     Ret::U32(KERN_SUCCESS)

@@ -5,14 +5,21 @@
 //! call) and error messages (the game frees them with sqlite3_free, which
 //! frees guest memory), and column_text, which stays the same guest text
 //! until the statement's next step, reset or finalize, as SQLite promises.
-//! bind_text always lets SQLite take its own copy (SQLITE_TRANSIENT), so a
-//! game destructor can be given its text back right away.
+//!
+//! Every SQLite call runs with the guest lock let go: a connection's own lock
+//! may be held by another thread inside sqlite3_exec, whose game callback
+//! needs the guest lock to finish. The game's code (exec's callback, bind
+//! destructors) runs with the guest lock taken again, inside SQLite.
+//!
+//! bind_text hands the game's text and destructor to SQLite as they are
+//! (the destructor through a host function that calls it), so SQLite itself
+//! decides when it is done with the text, as its contract says.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
 use arm32_bridge::handler;
-use arm32_bridge::runtime::{call_guest, mem, stop_with_fault, ArgSource, Ret, Uc};
+use arm32_bridge::runtime::{self, call_guest, mem, stop_with_fault, ArgSource, Ret, Uc};
 use libsqlite3_sys as sql;
 
 use super::{forget_handle, handle_to_guest, handle_to_host};
@@ -32,6 +39,11 @@ fn forget_texts(statement: u32) {
     for (_, text) in with_texts(|texts| texts.remove(&statement)).unwrap_or_default() {
         crate::guest32::free(text);
     }
+}
+
+/// Runs a SQLite call with the guest lock let go (see the notes above).
+fn unlocked<R>(call: impl FnOnce() -> R) -> R {
+    runtime::without_gil(call)
 }
 
 fn database(guest: u32) -> *mut sql::sqlite3 {
@@ -66,6 +78,7 @@ struct RowCallback {
 /// arrays and their texts in one guest block, for the call.
 unsafe extern "C" fn row(context: *mut libc::c_void, count: libc::c_int, values: *mut *mut libc::c_char, names: *mut *mut libc::c_char) -> libc::c_int {
     let callback = &mut *(context as *mut RowCallback);
+    let _gil = runtime::hold_gil();
     let count = count.max(0) as u32;
     let lists = crate::guest32::alloc(count.max(1) * 8);
     let mut copies = Vec::new();
@@ -90,6 +103,34 @@ unsafe extern "C" fn row(context: *mut libc::c_void, count: libc::c_int, values:
     }
 }
 
+/// The game's bind_text destructors SQLite still owes a call, by the host
+/// address of their text (oldest first when one text is bound twice).
+static DESTRUCTORS: Mutex<Option<HashMap<usize, VecDeque<u32>>>> = Mutex::new(None);
+
+fn with_destructors<R>(work: impl FnOnce(&mut HashMap<usize, VecDeque<u32>>) -> R) -> R {
+    work(DESTRUCTORS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new))
+}
+
+/// The destructor SQLite is given for a game destructor: calls it with the
+/// guest address of the text, on the thread SQLite is done on (a game
+/// thread inside a SQLite call), with the guest lock taken again.
+unsafe extern "C" fn run_game_destructor(text: *mut libc::c_void) {
+    let taken = with_destructors(|table| {
+        let waiting = table.get_mut(&(text as usize))?;
+        let destructor = waiting.pop_front();
+        if waiting.is_empty() {
+            table.remove(&(text as usize));
+        }
+        destructor
+    });
+    let Some(destructor) = taken else { return };
+    let _gil = runtime::hold_gil();
+    let uc = runtime::engine();
+    if let Err(error) = call_guest(uc, destructor, &[mem().guest(text as *const u8)]) {
+        stop_with_fault(uc, format!("sqlite3_bind_text's destructor: {error}"));
+    }
+}
+
 pub fn register() {
     // sqlite3_open(filename, sqlite3 **): a handle even on failure (for sqlite3_errmsg).
     super::super::function(
@@ -97,7 +138,7 @@ pub fn register() {
         handler!(|uc, a| {
             let (filename, out) = (a.u32(), a.u32());
             let mut db = std::ptr::null_mut();
-            let result = unsafe { sql::sqlite3_open(host_text(filename), &mut db) };
+            let result = unlocked(|| unsafe { sql::sqlite3_open(host_text(filename), &mut db) });
             mem().write_u32(out, handle_to_guest(db as usize));
             Ret::U32(result as u32)
         })
@@ -107,7 +148,8 @@ pub fn register() {
         "sqlite3_close",
         handler!(|uc, a| {
             let db = a.u32();
-            let result = unsafe { sql::sqlite3_close(database(db)) };
+            let host = database(db);
+            let result = unlocked(|| unsafe { sql::sqlite3_close(host) });
             if result == sql::SQLITE_OK {
                 forget_handle(db);
             }
@@ -122,15 +164,11 @@ pub fn register() {
             let (db, text, function, argument, error_out) = (a.u32(), a.u32(), a.u32(), a.u32(), a.u32());
             let mut callback = RowCallback { uc: uc as *mut Uc, function, argument, error: None };
             let mut error = std::ptr::null_mut();
-            let result = unsafe {
-                sql::sqlite3_exec(
-                    database(db),
-                    host_text(text),
-                    if function != 0 { Some(row) } else { None },
-                    &mut callback as *mut RowCallback as *mut libc::c_void,
-                    &mut error,
-                )
-            };
+            let host = database(db);
+            let context = &mut callback as *mut RowCallback as *mut libc::c_void;
+            let result = unlocked(|| unsafe {
+                sql::sqlite3_exec(host, host_text(text), if function != 0 { Some(row) } else { None }, context, &mut error)
+            });
             if error_out != 0 {
                 mem().write_u32(error_out, guest_copy(error));
             }
@@ -161,7 +199,8 @@ pub fn register() {
         handler!(|uc, a| {
             let (db, text, length, out, tail_out) = (a.u32(), a.u32(), a.i32(), a.u32(), a.u32());
             let (mut prepared, mut tail) = (std::ptr::null_mut(), std::ptr::null());
-            let result = unsafe { sql::sqlite3_prepare_v2(database(db), host_text(text), length, &mut prepared, &mut tail) };
+            let host = database(db);
+            let result = unlocked(|| unsafe { sql::sqlite3_prepare_v2(host, host_text(text), length, &mut prepared, &mut tail) });
             if out != 0 {
                 mem().write_u32(out, handle_to_guest(prepared as usize));
             }
@@ -177,7 +216,8 @@ pub fn register() {
         handler!(|uc, a| {
             let stmt = a.u32();
             forget_texts(stmt);
-            Ret::U32(unsafe { sql::sqlite3_step(statement(stmt)) } as u32)
+            let host = statement(stmt);
+            Ret::U32(unlocked(|| unsafe { sql::sqlite3_step(host) }) as u32)
         })
         .unwrap(),
     );
@@ -186,7 +226,8 @@ pub fn register() {
         handler!(|uc, a| {
             let stmt = a.u32();
             forget_texts(stmt);
-            Ret::U32(unsafe { sql::sqlite3_reset(statement(stmt)) } as u32)
+            let host = statement(stmt);
+            Ret::U32(unlocked(|| unsafe { sql::sqlite3_reset(host) }) as u32)
         })
         .unwrap(),
     );
@@ -195,7 +236,8 @@ pub fn register() {
         handler!(|uc, a| {
             let stmt = a.u32();
             forget_texts(stmt);
-            let result = unsafe { sql::sqlite3_finalize(statement(stmt)) };
+            let host = statement(stmt);
+            let result = unlocked(|| unsafe { sql::sqlite3_finalize(host) });
             forget_handle(stmt);
             Ret::U32(result as u32)
         })
@@ -205,7 +247,8 @@ pub fn register() {
         "sqlite3_bind_int",
         handler!(|uc, a| {
             let (stmt, index, value) = (a.u32(), a.i32(), a.i32());
-            Ret::U32(unsafe { sql::sqlite3_bind_int(statement(stmt), index, value) } as u32)
+            let host = statement(stmt);
+            Ret::U32(unlocked(|| unsafe { sql::sqlite3_bind_int(host, index, value) }) as u32)
         })
         .unwrap(),
     );
@@ -213,22 +256,32 @@ pub fn register() {
         "sqlite3_bind_double",
         handler!(|uc, a| {
             let (stmt, index, value) = (a.u32(), a.i32(), a.f64());
-            Ret::U32(unsafe { sql::sqlite3_bind_double(statement(stmt), index, value) } as u32)
+            let host = statement(stmt);
+            Ret::U32(unlocked(|| unsafe { sql::sqlite3_bind_double(host, index, value) }) as u32)
         })
         .unwrap(),
     );
-    // sqlite3_bind_text(stmt, index, text, length, destructor)
+    // sqlite3_bind_text(stmt, index, text, length, destructor): SQLITE_STATIC
+    // and SQLITE_TRANSIENT as they are; a game destructor is called whenever
+    // SQLite calls the one it is given (when done with the text, or when the
+    // bind fails; never for a NULL text).
     super::super::function(
         "sqlite3_bind_text",
         handler!(|uc, a| {
             let (stmt, index, text, length, destructor) = (a.u32(), a.i32(), a.u32(), a.i32(), a.u32());
-            let result = unsafe { sql::sqlite3_bind_text(statement(stmt), index, host_text(text), length, sql::SQLITE_TRANSIENT()) };
-            if text != 0 && destructor != SQLITE_STATIC && destructor != SQLITE_TRANSIENT {
-                if let Err(error) = call_guest(uc, destructor, &[text]) {
-                    stop_with_fault(uc, format!("sqlite3_bind_text's destructor: {error}"));
-                    return Ret::Void;
+            let host_destructor = match destructor {
+                SQLITE_STATIC => sql::SQLITE_STATIC(),
+                SQLITE_TRANSIENT => sql::SQLITE_TRANSIENT(),
+                game => {
+                    if text != 0 {
+                        let host = host_text(text) as usize;
+                        with_destructors(|table| table.entry(host).or_default().push_back(game));
+                    }
+                    Some(run_game_destructor as unsafe extern "C" fn(*mut libc::c_void))
                 }
-            }
+            };
+            let host = statement(stmt);
+            let result = unlocked(|| unsafe { sql::sqlite3_bind_text(host, index, host_text(text), length, host_destructor) });
             Ret::U32(result as u32)
         })
         .unwrap(),
@@ -237,7 +290,8 @@ pub fn register() {
         "sqlite3_column_int",
         handler!(|uc, a| {
             let (stmt, column) = (a.u32(), a.i32());
-            Ret::U32(unsafe { sql::sqlite3_column_int(statement(stmt), column) } as u32)
+            let host = statement(stmt);
+            Ret::U32(unlocked(|| unsafe { sql::sqlite3_column_int(host, column) }) as u32)
         })
         .unwrap(),
     );
@@ -245,7 +299,8 @@ pub fn register() {
         "sqlite3_column_double",
         handler!(|uc, a| {
             let (stmt, column) = (a.u32(), a.i32());
-            Ret::F64(unsafe { sql::sqlite3_column_double(statement(stmt), column) })
+            let host = statement(stmt);
+            Ret::F64(unlocked(|| unsafe { sql::sqlite3_column_double(host, column) }))
         })
         .unwrap(),
     );
@@ -257,11 +312,13 @@ pub fn register() {
                 return Ret::U32(text);
             }
             let host = statement(stmt);
-            let text = unsafe { sql::sqlite3_column_text(host, column) };
+            let (text, length) = unlocked(|| unsafe {
+                let text = sql::sqlite3_column_text(host, column);
+                (text, sql::sqlite3_column_bytes(host, column).max(0) as usize)
+            });
             if text.is_null() {
                 return Ret::U32(0);
             }
-            let length = unsafe { sql::sqlite3_column_bytes(host, column) }.max(0) as usize;
             let copy = crate::guest32::alloc(length as u32 + 1);
             mem().write_bytes(copy, unsafe { std::slice::from_raw_parts(text, length) });
             mem().write_u8(copy + length as u32, 0);
