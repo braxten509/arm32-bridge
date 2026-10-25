@@ -643,21 +643,41 @@ fn send_test_tap(tap: TestTap) {
             crate::fw::pictures::on_next_draw(format!("screen drawn after tap at {:.0},{:.0}", to.x, to.y));
         })));
     };
-    send(Phase::Began, from);
+    // The GL frame count when the finger went down (usize::MAX: not yet).
+    let pressed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+    let pressed_at = pressed.clone();
+    crate::fw::runloop::post(crate::fw::runloop::Work::Native(Box::new(move || {
+        deliver_now(finger, Phase::Began, from);
+        pressed_at.store(crate::fw::eagl::frames_shown(), std::sync::atomic::Ordering::SeqCst);
+    })));
     std::thread::spawn(move || {
-        if !swipe {
-            std::thread::sleep(std::time::Duration::from_millis(80));
-            ended();
-            return;
-        }
-        for step in 1..=6 {
+        if swipe {
+            for step in 1..=6 {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                let f = step as f64 / 6.0;
+                send(Phase::Moved, Point { x: from.x + (to.x - from.x) * f, y: from.y + (to.y - from.y) * f });
+            }
             std::thread::sleep(std::time::Duration::from_millis(25));
-            let f = step as f64 / 6.0;
-            send(Phase::Moved, Point { x: from.x + (to.x - from.x) * f, y: from.y + (to.y - from.y) * f });
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(80));
         }
-        std::thread::sleep(std::time::Duration::from_millis(25));
+        // A frame takes seconds on a slow PC run: a game that reads touches
+        // once a frame must see the finger down (up to 30 s).
+        for _ in 0..1500 {
+            let at = pressed.load(std::sync::atomic::Ordering::SeqCst);
+            if at != usize::MAX && tap_can_lift(at, crate::fw::eagl::frames_shown()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         ended();
     });
+}
+
+/// Whether a test finger pressed at GL frame `pressed` may lift now: once a
+/// frame has been drawn since (games that don't draw with GL: at once).
+fn tap_can_lift(pressed: usize, now: usize) -> bool {
+    now == 0 || now > pressed
 }
 
 pub fn register(_: &mut Registry) {
@@ -1020,6 +1040,15 @@ mod tests {
         assert_eq!(sent(), [(10.0, 20.0)], "the tap went out inside the log call, nothing waited");
         crate::log!("tap test: screen two");
         assert_eq!(sent(), [(10.0, 20.0), (30.0, 40.0)]);
+    }
+
+    #[test]
+    fn a_test_tap_stays_down_for_a_drawn_frame() {
+        // A game that reads touches once a frame (a frame takes seconds on a
+        // PC run) must see the finger down; games not drawing with GL don't wait.
+        assert!(!tap_can_lift(41, 41), "no frame drawn since the press");
+        assert!(tap_can_lift(41, 42));
+        assert!(tap_can_lift(0, 0), "no GL frames at all");
     }
 
     #[test]
