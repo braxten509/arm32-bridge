@@ -37,12 +37,18 @@ pub fn set_guest_memory(memory: GuestMemory) {
     *GUEST_MEMORY.write().unwrap_or_else(|e| e.into_inner()) = Some(memory);
 }
 
+/// The 32-bit game's memory rules, when a 32-bit game runs.
+pub fn guest_memory() -> Option<GuestMemory> {
+    *GUEST_MEMORY.read().unwrap_or_else(|e| e.into_inner())
+}
+
 fn guest_memory_at(address: usize) -> Option<GuestMemory> {
     GUEST_MEMORY.read().unwrap_or_else(|e| e.into_inner()).filter(|m| (m.owns)(address))
 }
 
-/// Nested coding deeper than this is taken as runaway.
-const MAX_DEPTH: usize = 512;
+/// Objects nested deeper than this (containers or objects coding
+/// themselves) are taken as runaway.
+const MAX_DEPTH: usize = 256;
 
 #[derive(Default)]
 struct Frame {
@@ -60,6 +66,8 @@ struct Writer {
     frames: Vec<Frame>,
     data: Id,
     failed: bool,
+    /// How many objects are being written inside one another.
+    depth: usize,
 }
 
 struct ReadFrame {
@@ -73,6 +81,11 @@ struct Reader {
     top: Value,
     made: HashMap<u64, Id>,
     frames: Vec<ReadFrame>,
+    /// How many objects are being read inside one another.
+    depth: usize,
+    /// Plain containers being filled, and whether a member pointed back at one.
+    open: HashMap<u64, bool>,
+    failed: bool,
 }
 
 fn guard<T>(state: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -113,6 +126,7 @@ impl Writer {
             frames: vec![Frame::default()],
             data,
             failed: false,
+            depth: 0,
         }
     }
 
@@ -182,12 +196,6 @@ fn encode_object(coder: Id, object: Id) -> u64 {
         if let Some(&number) = w.numbers.get(&object) {
             return number;
         }
-        if w.frames.len() > MAX_DEPTH {
-            drop(w);
-            guard(state).failed = true;
-            crate::log!("NSKeyedArchiver: objects nested too deep; not written");
-            return 0;
-        }
     }
     let plain = if string::is_string(object) && !is_kind(object, "NSMutableString") {
         Some(Value::String(string::get(object)))
@@ -210,6 +218,13 @@ fn encode_object(coder: Id, object: Id) -> u64 {
     // Numbered before its parts, so a part pointing back finds it.
     let at = {
         let mut w = guard(state);
+        if w.depth >= MAX_DEPTH {
+            w.failed = true;
+            drop(w);
+            crate::log!("NSKeyedArchiver: objects nested too deep; not written");
+            return 0;
+        }
+        w.depth += 1;
         let at = w.add(Value::String(String::new()));
         w.numbers.insert(object, at);
         at
@@ -245,6 +260,7 @@ fn encode_object(coder: Id, object: Id) -> u64 {
         None
     };
     let mut w = guard(state);
+    w.depth -= 1;
     match written {
         Some((mut entries, names)) => {
             let class = w.class(&names);
@@ -292,7 +308,15 @@ fn reader_for(value: Value) -> Option<Reader> {
         return None;
     };
     let top = value.get("$top")?.clone();
-    Some(Reader { objects: objects.clone(), top, made: HashMap::new(), frames: vec![ReadFrame { object: None, unkeyed: 0 }] })
+    Some(Reader {
+        objects: objects.clone(),
+        top,
+        made: HashMap::new(),
+        frames: vec![ReadFrame { object: None, unkeyed: 0 }],
+        depth: 0,
+        open: HashMap::new(),
+        failed: false,
+    })
 }
 
 /// The root object of a keyed archive, or None if it isn't one or holds a
@@ -306,10 +330,9 @@ fn unarchive(value: &Value) -> Option<Id> {
     let root = root.as_uid()?;
     let coder = new_coder("NSKeyedUnarchiver");
     set_state(coder, reader);
-    match decode_object(coder, root) {
-        0 if root != 0 => None,
-        object => Some(object),
-    }
+    let object = decode_object(coder, root);
+    let failed = reader_of(coder).is_some_and(|state| guard(state).failed);
+    (!failed && (object != 0 || root == 0)).then_some(object)
 }
 
 /// Classes made from their own archive layout rather than -initWithCoder:.
@@ -323,11 +346,16 @@ const PLAIN_CLASSES: [&str; 13] = [
 fn decode_object(coder: Id, number: u64) -> Id {
     let Some(state) = reader_of(coder) else { return 0 };
     let (value, class) = {
-        let r = guard(state);
+        let mut r = guard(state);
         if let Some(&made) = r.made.get(&number) {
+            if let Some(looped) = r.open.get_mut(&number) {
+                *looped = true;
+            }
             return made;
         }
-        if r.frames.len() > MAX_DEPTH {
+        if r.depth >= MAX_DEPTH {
+            r.failed = true;
+            drop(r);
             crate::log!("NSKeyedUnarchiver: objects nested too deep; nil");
             return 0;
         }
@@ -338,12 +366,6 @@ fn decode_object(coder: Id, number: u64) -> Id {
     let remember = |object: Id| {
         guard(state).made.insert(number, object);
         object
-    };
-    let list = |key: &str| -> Vec<Id> {
-        match value.get(key) {
-            Some(Value::Array(items)) => items.iter().map(|item| item.as_uid().map_or(0, |n| decode_object(coder, n))).collect(),
-            _ => Vec::new(),
-        }
     };
     let made = match &value {
         Value::String(text) if number == 0 && text == "$null" => 0,
@@ -357,12 +379,7 @@ fn decode_object(coder: Id, number: u64) -> Id {
             let Some(Value::String(name)) = class.get("$classname") else { return 0 };
             let mutable = name.starts_with("NSMutable");
             let made = match name.trim_start_matches("NSMutable").trim_start_matches("NS") {
-                "Dictionary" => {
-                    let (keys, values) = (list("NS.keys"), list("NS.objects"));
-                    collections::dictionary_from(&keys.into_iter().zip(values).collect::<Vec<_>>())
-                }
-                "Array" => collections::array_from(&list("NS.objects")),
-                "Set" => crate::fw::misc::set_from(&list("NS.objects")),
+                kind @ ("Dictionary" | "Array" | "Set") => return decode_container(coder, state, number, &value, kind, mutable),
                 "String" => match value.get("NS.string") {
                     Some(Value::String(text)) => string::make(text),
                     _ => string::make(""),
@@ -384,6 +401,53 @@ fn decode_object(coder: Id, number: u64) -> Id {
         _ => return 0,
     };
     remember(made)
+}
+
+/// A dictionary, array or set: made (empty) and remembered before its
+/// members are read, so a member holding the container gets the container.
+fn decode_container(coder: Id, state: &Mutex<Reader>, number: u64, value: &Value, kind: &str, mutable: bool) -> Id {
+    let class = match kind {
+        "Dictionary" => "NSMutableDictionary",
+        "Array" => "NSMutableArray",
+        _ => "NSMutableSet",
+    };
+    let made = runtime::send(runtime::send(runtime::class_named(class), "alloc", &[]), "init", &[]);
+    {
+        let mut r = guard(state);
+        r.made.insert(number, made);
+        r.open.insert(number, false);
+        r.depth += 1;
+    }
+    let list = |key: &str| -> Vec<Id> {
+        match value.get(key) {
+            Some(Value::Array(items)) => items.iter().map(|item| item.as_uid().map_or(0, |n| decode_object(coder, n))).collect(),
+            _ => Vec::new(),
+        }
+    };
+    if kind == "Dictionary" {
+        for (key, item) in list("NS.keys").into_iter().zip(list("NS.objects")) {
+            if key != 0 && item != 0 {
+                runtime::send(made, "setObject:forKey:", &[item, key]);
+            }
+        }
+    } else {
+        for item in list("NS.objects").into_iter().filter(|&item| item != 0) {
+            runtime::send(made, "addObject:", &[item]);
+        }
+    }
+    let looped = {
+        let mut r = guard(state);
+        r.depth -= 1;
+        r.open.remove(&number).unwrap_or(false)
+    };
+    // An immutable one comes back immutable, unless a member holds it (the
+    // member has this very object).
+    if mutable || looped {
+        return made;
+    }
+    let copy = runtime::send(made, "copy", &[]);
+    guard(state).made.insert(number, copy);
+    copy
 }
 
 /// An object that saved itself: made with -initWithCoder: from the first
@@ -408,9 +472,14 @@ fn decode_custom(coder: Id, state: &Mutex<Reader>, number: u64, class: &Value, n
         let mut r = guard(state);
         r.made.insert(number, object);
         r.frames.push(ReadFrame { object: Some(number), unkeyed: 0 });
+        r.depth += 1;
     }
     let mut made = runtime::send(object, "initWithCoder:", &[coder]);
-    guard(state).frames.pop();
+    {
+        let mut r = guard(state);
+        r.frames.pop();
+        r.depth -= 1;
+    }
     if made != 0 && runtime::responds(made, "awakeAfterUsingCoder:") {
         made = runtime::send(made, "awakeAfterUsingCoder:", &[coder]);
     }
@@ -1238,6 +1307,44 @@ mod tests {
         ready();
         let value = plist::Value::Dict(vec![("score".into(), plist::Value::Integer(1))]);
         assert!(unarchive(&value).is_none());
+    }
+
+    /// A container holding itself comes back holding itself; plain
+    /// containers nested past the limit fail cleanly both ways.
+    #[test]
+    fn keyed_archives_with_container_loops_and_deep_nesting() {
+        ready();
+        let list = runtime::send(runtime::send(runtime::class_named("NSMutableArray"), "alloc", &[]), "init", &[]);
+        runtime::send(list, "addObject:", &[string::make("x")]);
+        runtime::send(list, "addObject:", &[list]);
+        let back = unarchive(&archive(list).expect("a looped array is written")).expect("and read");
+        let items = collections::array_items(back);
+        assert_eq!(string::get(items[0]), "x");
+        assert_eq!(items[1], back, "the array holds itself again");
+
+        let mut deep = string::make("bottom");
+        for _ in 0..MAX_DEPTH + 10 {
+            deep = collections::array_from(&[deep]);
+        }
+        assert!(archive(deep).is_none(), "nesting past the limit isn't written");
+        // The same depth written by hand: read as nothing, not a crash.
+        let class = Value::Dict(vec![
+            ("$classes".into(), Value::Array(vec![Value::String("NSArray".into()), Value::String("NSObject".into())])),
+            ("$classname".into(), Value::String("NSArray".into())),
+        ]);
+        let mut objects = vec![Value::String("$null".into()), class, Value::String("bottom".into())];
+        for _ in 0..MAX_DEPTH + 10 {
+            let inner = objects.len() as u64 - 1;
+            objects.push(Value::Dict(vec![("NS.objects".into(), Value::Array(vec![Value::Uid(inner)])), ("$class".into(), Value::Uid(1))]));
+        }
+        let root = objects.len() as u64 - 1;
+        let archive = Value::Dict(vec![
+            ("$archiver".into(), Value::String("NSKeyedArchiver".into())),
+            ("$objects".into(), Value::Array(objects)),
+            ("$top".into(), Value::Dict(vec![("root".into(), Value::Uid(root))])),
+            ("$version".into(), Value::Integer(100000)),
+        ]);
+        assert!(unarchive(&archive).is_none());
     }
 
     // A game class that saves itself (NSCoding), as games write them.

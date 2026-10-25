@@ -462,7 +462,8 @@ extern "C" fn place_distance(this: Id, _: Sel, other: Id) -> f64 {
     let (la1, la2) = (a.latitude.to_radians(), b.latitude.to_radians());
     let (dla, dlo) = (la2 - la1, (b.longitude - a.longitude).to_radians());
     let h = (dla / 2.0).sin().powi(2) + la1.cos() * la2.cos() * (dlo / 2.0).sin().powi(2);
-    2.0 * 6_371_000.0 * h.sqrt().asin()
+    // Core Location's Earth radius.
+    2.0 * 6_372_797.560856 * h.sqrt().asin()
 }
 
 extern "C" fn place_description(this: Id, _: Sel) -> Id {

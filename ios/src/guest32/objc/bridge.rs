@@ -1145,7 +1145,8 @@ pub fn send_from_guest(
                 runtime::imp_for(host_receiver, host_sel)
             };
             let imp = imp.ok_or_else(|| format!("{}[{class} {name}] is not implemented by the host layer", if meta { "+" } else { "-" }))?;
-            let mut ret = mirror::call_host(imp, &call.args);
+            // An exception the host method raises is thrown in the game once it returns.
+            let (mut ret, raised) = crate::fw::exception::catching(|| mirror::call_host(imp, &call.args));
             // -bytes / -mutableBytes: data bytes live in guest memory (fw::data)
             // and pass as they are; bytes in host memory get a guest copy
             // (writes through a mutableBytes copy would not reach the host object).
@@ -1173,6 +1174,10 @@ pub fn send_from_guest(
             let result = convert::finish_host_call(call, &ret, &mut Session { bridge: &mut b, g })?;
             if game_dealloc {
                 b.forget(g, receiver);
+            }
+            if let Some(exception) = raised {
+                let exception = b.guest_object(g, exception)?;
+                PENDING_THROW.with(|p| p.set(Some(exception)));
             }
             drop(b);
             construct_pending(bridge, g)?;

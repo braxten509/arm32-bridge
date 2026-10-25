@@ -474,7 +474,12 @@ extern "C" fn data_get_bytes_range(this: Id, _: Sel, buffer: *mut u8, range: cra
 
 extern "C" fn data_increase_length(this: Id, _: Sel, extra: usize) {
     let all = store(this);
-    all.resize(all.len() + extra);
+    let Some(length) = all.len().checked_add(extra) else {
+        // Apple raises: no data can be that long.
+        crate::log!("STOP: increaseLengthBy: {extra} more bytes than {} overflows the length", all.len());
+        crate::report::finish(1);
+    };
+    all.resize(length);
 }
 
 /// The range's bytes become `length` new ones (the data grows or shrinks to fit).

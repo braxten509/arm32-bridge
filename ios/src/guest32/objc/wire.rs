@@ -319,6 +319,33 @@ fn game_method_types(class: crate::objc::runtime::Class, sel: crate::objc::runti
     }
 }
 
+/// The field `name` of a game object, in the game's memory (its class's
+/// 32-bit layout), for key-value coding.
+fn game_field(object: crate::objc::runtime::Id, name: &str) -> Option<crate::fw::object::Field> {
+    let class_name = {
+        let rt = crate::objc::runtime::lock();
+        rt.class_name(rt.class_of(object))
+    };
+    let mut b = bridge()?.lock().unwrap_or_else(|e| e.into_inner());
+    b.classes.class_named(&class_name)?;
+    let guest = b.guest_object(&Translator, object).ok()?;
+    let word = |at: u32| u32::from_le_bytes(Translator.read(at, 4).try_into().unwrap());
+    let mut class = word(guest);
+    for _ in 0..256 {
+        let k = b.classes.class(class)?;
+        if let Some(ivar) = k.ivars.iter().find(|i| i.name == name) {
+            // The offset variable holds the offset the game's code uses.
+            let offset = if ivar.offset_address != 0 { word(ivar.offset_address) } else { ivar.offset };
+            return Some(crate::fw::object::Field { at: Translator.host_address(guest + offset), kind: ivar.type_encoding.clone(), guest: true });
+        }
+        match k.superclass {
+            super::classes::Super::Game(parent) => class = parent,
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// Defines the host mirrors of the game's classes and makes selector
 /// references unique. Runs after `load`.
 pub fn install_program() -> Result<(), String> {
@@ -326,6 +353,7 @@ pub fn install_program() -> Result<(), String> {
     install(bridge, &Translator, md)?;
     super::bridge::set_block_owner(&Translator);
     crate::fw::object::set_extra_method_types(game_method_types);
+    crate::fw::object::set_extra_fields(game_field);
     crate::fw::system::set_guest_memory(crate::fw::system::GuestMemory {
         owns: |host| Translator.guest_address(host).is_some(),
         object_to_host: |guest| with_bridge(|b| b.host_object_for(&Translator, guest)).unwrap_or(0),

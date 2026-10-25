@@ -696,7 +696,21 @@ fn evaluate(p: Id, object: Id, variables: Id) -> bool {
                 _ => compare_one(l, r, *op, *options),
             }
         }
-        None => runtime::send(p, "evaluateWithObject:substitutionVariables:", &[object, variables]) & 0xFF != 0,
+        // A subclass answering for itself (the game's own predicate class).
+        None if runtime::imp_for(p, runtime::sel("evaluateWithObject:substitutionVariables:")) != Some(evaluate_with_variables as usize) => {
+            runtime::send(p, "evaluateWithObject:substitutionVariables:", &[object, variables]) & 0xFF != 0
+        }
+        // NSPredicate itself, never initialised: Apple's abstract class raises.
+        None => {
+            let reason = "*** -evaluateWithObject:substitutionVariables: only defined for abstract class.  Define -[NSPredicate evaluateWithObject:substitutionVariables:]!";
+            let exception = runtime::send(
+                runtime::class_named("NSException"),
+                "exceptionWithName:reason:userInfo:",
+                &[string::make("NSInvalidArgumentException"), string::make(reason), 0],
+            );
+            crate::fw::exception::raise(exception);
+            false
+        }
     }
 }
 
@@ -1241,5 +1255,17 @@ mod tests {
         let mutable = runtime::send(list, "mutableCopy", &[]);
         runtime::send(mutable, "sortUsingDescriptors:", &[collections::array_from(&[by_name])]);
         assert_eq!(string::get(collections::dictionary_get(collections::array_items(mutable)[0], s("name"))), "a");
+    }
+
+    /// A predicate made with alloc alone answers NO and raises, as Apple's
+    /// abstract NSPredicate does, instead of asking itself again forever.
+    #[test]
+    fn an_uninitialised_predicate_raises() {
+        ready();
+        let bare = runtime::send(runtime::class_named("NSPredicate"), "alloc", &[]);
+        let (answer, raised) = crate::fw::exception::catching(|| runtime::send(bare, "evaluateWithObject:", &[s("x")]));
+        assert_eq!(answer & 0xFF, 0);
+        let raised = raised.expect("evaluating it raised nothing");
+        assert_eq!(string::get(runtime::send(raised, "name", &[])), "NSInvalidArgumentException");
     }
 }
