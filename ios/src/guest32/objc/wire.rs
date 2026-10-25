@@ -325,6 +325,7 @@ pub fn install_program() -> Result<(), String> {
     let (bridge, md) = (bridge().ok_or("no Objective-C bridge")?, METADATA.get().ok_or("no metadata")?);
     install(bridge, &Translator, md)?;
     super::bridge::set_block_owner(&Translator);
+    super::forward::set_invocation_hooks(bridge, &Translator);
     crate::fw::object::set_extra_method_types(game_method_types);
     crate::fw::system::set_guest_memory(crate::fw::system::GuestMemory {
         owns: |host| Translator.guest_address(host).is_some(),

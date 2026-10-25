@@ -361,8 +361,11 @@ floatValue	f@:
 font	@@:
 fontWithName:size:	@@:@f
 formUnionWithCharacterSet:	v@:@
+forwardingTargetForSelector:	@@::
+forwardInvocation:	v@:@
 fragment	@@:
 frame	{CGRect={CGPoint=ff}{CGSize=ff}}@:
+frameLength	I@:
 functionWithName:	@@:@
 getArgument:atIndex:	v@:^vi
 getArgumentTypeAtIndex:	r*@:I
@@ -507,9 +510,11 @@ isKindOfClass:	c@:#
 isLoading	c@:
 isMainThread	c@:
 isMultitaskingSupported	c@:
+isOneway	c@:
 isOpaque	c@:
 isPlaying	c@:
 isPopoverVisible	c@:
+isProxy	c@:
 isSecureTextEntry	c@:
 isSelected	c@:
 isSubclassOfClass:	c@:#
@@ -573,6 +578,7 @@ matchOutcome	i@:
 message	@@:
 methodForSelector:	^?@::
 methodReturnLength	I@:
+methodReturnType	r*@:
 methodSignature	@@:
 methodSignatureForSelector:	@@::
 MIMEType	@@:
@@ -739,6 +745,8 @@ resetAchievementsWithCompletionHandler:	v@:@?
 resignFirstResponder	c@:
 resizableImageWithCapInsets:	@@:{UIEdgeInsets=ffff}
 resizableImageWithCapInsets:resizingMode:	@@:{UIEdgeInsets=ffff}i
+resolveClassMethod:	c@::
+resolveInstanceMethod:	c@::
 resourceSpecifier	@@:
 respondsToSelector:	c@::
 restoreCompletedTransactions	v@:
@@ -773,6 +781,7 @@ segueWithIdentifier:source:destination:performHandler:	@@:@@@@?
 selectedRowInComponent:	i@:i
 selectRow:inComponent:animated:	v@:iic
 selectRowAtIndexPath:animated:scrollPosition:	v@:@ci
+selector	:@:
 self	@@:
 sendAction:to:forEvent:	v@::@@
 sendActionsForControlEvents:	v@:I
@@ -1050,6 +1059,7 @@ sharedTurnBasedEventHandler	@@:
 sharegroup	@@:
 shouldPerformSegueWithIdentifier:sender:	c@:@@
 signal	v@:
+signatureWithObjCTypes:	@@:r*
 sizeThatFits:	{CGSize=ff}@:{CGSize=ff}
 sizeToFit	v@:
 sizeWithFont:	{CGSize=ff}@:@
@@ -1123,6 +1133,7 @@ systemTimeZone	@@:
 systemVersion	@@:
 tag	i@:
 tapCount	I@:
+target	@@:
 text	@@:
 textAlignment	i@:
 textColor	@@:

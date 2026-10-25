@@ -71,6 +71,7 @@ use crate::symbols::Registry;
 
 pub fn register(r: &mut Registry) {
     object::define(r);
+    object::define_proxy();
     string::register(r);
     attributed::register(r);
     collections::register(r);

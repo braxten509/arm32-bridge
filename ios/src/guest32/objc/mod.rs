@@ -17,6 +17,9 @@ pub mod dispatch;
 mod convert_tests;
 pub mod encoding;
 pub mod exceptions;
+pub mod forward;
+#[cfg(test)]
+mod forward_tests;
 pub mod functions;
 #[cfg(test)]
 mod functions_tests;

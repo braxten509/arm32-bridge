@@ -116,6 +116,11 @@ impl Runtime {
         sel
     }
 
+    /// The selector named `name`, if any code registered it.
+    pub fn selector(&self, name: &str) -> Option<Sel> {
+        self.selectors.get(name).copied()
+    }
+
     pub fn sel_name(&self, sel: Sel) -> String {
         self.selector_names
             .get(&sel)
@@ -402,6 +407,8 @@ std::arch::global_asm!(
     "stp q4, q5, [sp, #160]",
     "stp q6, q7, [sp, #192]",
     "mov x2, x30",
+    // The saved receiver: forwarding may replace it (see forward.rs).
+    "add x3, sp, #16",
     "bl ios_objc_lookup",
     "mov x16, x0",
     "ldp q6, q7, [sp, #192]",
@@ -446,6 +453,8 @@ std::arch::global_asm!(
     "stp q6, q7, [sp, #192]",
     "mov x2, x9",
     "mov x3, x30",
+    // The saved x0 (the pair) becomes the receiver the method gets.
+    "add x4, sp, #16",
     "bl ios_objc_lookup_super",
     "mov x16, x0",
     "ldp q6, q7, [sp, #192]",
@@ -458,7 +467,6 @@ std::arch::global_asm!(
     "ldp x2, x3, [sp, #32]",
     "ldp x0, x1, [sp, #16]",
     "ldp x29, x30, [sp], #224",
-    "ldr x0, [x0]",
     "br x16",
 );
 
@@ -574,7 +582,27 @@ fn ensure_initialized(class: Class) {
 }
 
 #[no_mangle]
-extern "C" fn ios_objc_lookup(receiver: Id, sel: Sel, caller: usize) -> Imp {
+extern "C" fn ios_objc_lookup(receiver: Id, sel: Sel, caller: usize, saved_receiver: *mut Id) -> Imp {
+    let mut receiver = receiver;
+    let imp = find_method(&mut receiver, sel, caller);
+    unsafe { *saved_receiver = receiver };
+    imp
+}
+
+/// objc_msgSend's search: the method `*receiver` runs for `sel`, forwarded
+/// when there is none (which may name another receiver; see forward.rs).
+pub(crate) fn find_method(receiver: &mut Id, sel: Sel, caller: usize) -> Imp {
+    let receiver_now = *receiver;
+    let (isa, is_class) = class_for_message(receiver_now, sel, caller);
+    let found = lock().lookup(isa, sel);
+    match found {
+        Some(imp) => imp,
+        None => super::forward::after_miss(receiver, isa, sel, caller).unwrap_or_else(|| missing_method(isa, is_class, sel, caller)),
+    }
+}
+
+/// The receiver's class (initialized) and whether the receiver is a class.
+fn class_for_message(receiver: Id, sel: Sel, caller: usize) -> (Class, bool) {
     let (isa, is_class, known) = {
         let rt = lock();
         let isa = rt.class_of(receiver);
@@ -590,11 +618,7 @@ extern "C" fn ios_objc_lookup(receiver: Id, sel: Sel, caller: usize) -> Imp {
     if let Some(pattern) = message_trace() {
         trace_message(pattern, isa, is_class, sel, caller);
     }
-    let found = lock().lookup(isa, sel);
-    match found {
-        Some(imp) => imp,
-        None => missing_method(isa, is_class, sel, caller),
-    }
+    (isa, is_class)
 }
 
 /// Test switch IOS_TRACE_MESSAGES=<pattern>: logs the game's messages whose
@@ -673,8 +697,8 @@ mod trace_tests {
 }
 
 #[no_mangle]
-extern "C" fn ios_objc_lookup_super(pair: *const [usize; 2], sel: Sel, second_form: usize, caller: usize) -> Imp {
-    let [receiver, current] = unsafe { *pair };
+extern "C" fn ios_objc_lookup_super(pair: *const [usize; 2], sel: Sel, second_form: usize, caller: usize, saved_x0: *mut Id) -> Imp {
+    let [mut receiver, current] = unsafe { *pair };
     let start = if second_form != 0 {
         lock().classes.get(&current).map(|r| r.superclass).unwrap_or(0)
     } else {
@@ -682,10 +706,12 @@ extern "C" fn ios_objc_lookup_super(pair: *const [usize; 2], sel: Sel, second_fo
     };
     let is_class = lock().is_class_object(receiver);
     let found = lock().lookup(start, sel);
-    match found {
+    let imp = match found {
         Some(imp) => imp,
-        None => missing_method(start, is_class, sel, caller),
-    }
+        None => super::forward::after_miss(&mut receiver, start, sel, caller).unwrap_or_else(|| missing_method(start, is_class, sel, caller)),
+    };
+    unsafe { *saved_x0 = receiver };
+    imp
 }
 
 /// Finds the code for a message, for calls from our own Rust code.
@@ -711,6 +737,7 @@ pub fn send(receiver: Id, sel_name: &str, args: &[usize]) -> usize {
     if receiver == 0 {
         return 0;
     }
+    let mut receiver = receiver;
     let imp = match imp_for(receiver, s) {
         Some(imp) => imp,
         None => {
@@ -718,7 +745,8 @@ pub fn send(receiver: Id, sel_name: &str, args: &[usize]) -> usize {
                 let rt = lock();
                 (rt.class_of(receiver), rt.is_class_object(receiver))
             };
-            missing_method(isa, is_class, s, 0)
+            // Forwarded like objc_msgSend's (the arguments are in registers alike).
+            super::forward::after_miss(&mut receiver, isa, s, 0).unwrap_or_else(|| missing_method(isa, is_class, s, 0))
         }
     };
     unsafe {
