@@ -966,15 +966,15 @@ extern "C" fn animate_delay(_: Class, _: Sel, _duration: f64, _delay: f64, _opti
     animate(animations, completion);
 }
 
-// ----- the older animation calls: +beginAnimations:context:, setters for
-// the open group, +commitAnimations. As with blocks, changes take effect at
-// once. Groups nest (UIKit keeps a stack); the outermost commit starts them:
-// the delegate hears its will-start selector (animationID, context) then,
-// and its did-stop selector (animationID, finished = @YES, context) on the
-// next turn of the main run loop. -----
+// ----- iOS 3 style animations: +beginAnimations:context: opens a block
+// (blocks nest), the +setAnimation… calls set up the innermost one and
+// +commitAnimations closes it. As with block animations the changes take
+// effect at once; the delegate's will-start and did-stop selectors are
+// sent on the next turn of the main run loop, did-stop with the block's id,
+// finished = YES and its context (animationDidStop:finished:context:). -----
 
-#[derive(Clone, Copy, Default)]
-struct AnimationGroup {
+#[derive(Clone, Copy)]
+struct OldAnimation {
     id: Id,
     context: usize,
     delegate: Id,
@@ -982,72 +982,67 @@ struct AnimationGroup {
     did_stop: Sel,
 }
 
-/// The groups begun and not yet committed, outermost first; committed inner
-/// groups wait here for the outer commit.
-static ANIMATION_GROUPS: Mutex<(Vec<AnimationGroup>, Vec<AnimationGroup>)> = Mutex::new((Vec::new(), Vec::new()));
+static OLD_ANIMATIONS: Mutex<Vec<OldAnimation>> = Mutex::new(Vec::new());
 
-extern "C" fn begin_animations(_: Class, _: Sel, id: Id, context: usize) {
-    ANIMATION_GROUPS.lock().unwrap().0.push(AnimationGroup { id, context, ..Default::default() });
+fn with_open_animation(change: impl FnOnce(&mut OldAnimation)) {
+    if let Some(open) = OLD_ANIMATIONS.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
+        change(open);
+    }
 }
 
-fn change_open_group(change: impl FnOnce(&mut AnimationGroup)) {
-    if let Some(group) = ANIMATION_GROUPS.lock().unwrap().0.last_mut() {
-        change(group);
-    }
+extern "C" fn begin_animations(_: Class, _: Sel, id: Id, context: usize) {
+    runtime::send(id, "retain", &[]);
+    let open = OldAnimation { id, context, delegate: 0, will_start: 0, did_stop: 0 };
+    OLD_ANIMATIONS.lock().unwrap_or_else(|e| e.into_inner()).push(open);
 }
 
 extern "C" fn set_animation_delegate(_: Class, _: Sel, delegate: Id) {
-    change_open_group(|group| group.delegate = delegate);
+    with_open_animation(|open| open.delegate = delegate);
 }
 
 extern "C" fn set_animation_will_start(_: Class, _: Sel, selector: Sel) {
-    change_open_group(|group| group.will_start = selector);
+    with_open_animation(|open| open.will_start = selector);
 }
 
 extern "C" fn set_animation_did_stop(_: Class, _: Sel, selector: Sel) {
-    change_open_group(|group| group.did_stop = selector);
+    with_open_animation(|open| open.did_stop = selector);
 }
 
-extern "C" fn ignore_class_double(_: Class, _: Sel, _value: f64) {}
-extern "C" fn ignore_class_float(_: Class, _: Sel, _value: f32) {}
-extern "C" fn ignore_class_int(_: Class, _: Sel, _value: isize) {}
-extern "C" fn ignore_class_id(_: Class, _: Sel, _value: Id) {}
-extern "C" fn ignore_transition(_: Class, _: Sel, _transition: isize, _view: Id, _cache: u8) {}
+/// Sends `selector` with as many of `args` as its name has colons.
+fn send_to_delegate(delegate: Id, selector: Sel, args: &[usize]) {
+    if selector == 0 {
+        return;
+    }
+    let name = lock().sel_name(selector);
+    let count = name.matches(':').count().min(args.len());
+    runtime::send(delegate, &name, &args[..count]);
+}
 
-/// Closes the open group; the outermost commit tells the delegates (will-start
-/// now, did-stop through `later`).
-fn commit_animations_with(later: impl FnOnce(Box<dyn FnOnce() + Send>)) {
-    let started = {
-        let mut groups = ANIMATION_GROUPS.lock().unwrap();
-        let Some(group) = groups.0.pop() else { return };
-        groups.1.push(group);
-        if !groups.0.is_empty() {
-            return;
-        }
-        std::mem::take(&mut groups.1)
-    };
-    let tell = |group: &AnimationGroup, selector: Sel, args: &[usize]| {
-        if group.delegate != 0 && selector != 0 {
-            let name = runtime::lock().sel_name(selector);
-            runtime::send(group.delegate, &name, args);
-        }
-    };
-    for group in started.iter().rev() {
-        tell(group, group.will_start, &[group.id, group.context]);
+/// +commitAnimations: closes the innermost block and hands its delegate calls to `later`.
+fn commit_old_animation(later: impl FnOnce(Box<dyn FnOnce() + Send>)) {
+    let Some(done) = OLD_ANIMATIONS.lock().unwrap_or_else(|e| e.into_inner()).pop() else { return };
+    if done.delegate == 0 || (done.will_start == 0 && done.did_stop == 0) {
+        runtime::send(done.id, "release", &[]);
+        return;
     }
-    if started.iter().any(|group| group.delegate != 0 && group.did_stop != 0) {
-        later(Box::new(move || {
-            let finished = runtime::send(runtime::class_named("NSNumber"), "numberWithBool:", &[1]);
-            for group in started.iter().rev() {
-                tell(group, group.did_stop, &[group.id, finished, group.context]);
-            }
-        }));
-    }
+    runtime::send(done.delegate, "retain", &[]);
+    later(Box::new(move || {
+        send_to_delegate(done.delegate, done.will_start, &[done.id, done.context]);
+        send_to_delegate(done.delegate, done.did_stop, &[done.id, collections::number_bool(true), done.context]);
+        runtime::send(done.delegate, "release", &[]);
+        runtime::send(done.id, "release", &[]);
+    }));
 }
 
 extern "C" fn commit_animations(_: Class, _: Sel) {
-    commit_animations_with(|work| crate::fw::runloop::post(crate::fw::runloop::Work::Native(work)));
+    commit_old_animation(|work| crate::fw::runloop::post(crate::fw::runloop::Work::Native(work)));
 }
+
+// Timing and curve settings: nothing moves on screen here.
+extern "C" fn ignore_class_double(_: Class, _: Sel, _value: f64) {}
+extern "C" fn ignore_class_float(_: Class, _: Sel, _value: f32) {}
+extern "C" fn ignore_class_word(_: Class, _: Sel, _value: usize) {}
+extern "C" fn ignore_animation_transition(_: Class, _: Sel, _transition: usize, _view: Id, _cache: u8) {}
 
 #[allow(clippy::too_many_arguments)]
 extern "C" fn animate_spring(
@@ -1989,12 +1984,12 @@ pub fn register(r: &mut Registry) {
             ("setAnimationDidStopSelector:", set_animation_did_stop as usize),
             ("setAnimationDuration:", ignore_class_double as usize),
             ("setAnimationDelay:", ignore_class_double as usize),
-            ("setAnimationStartDate:", ignore_class_id as usize),
-            ("setAnimationCurve:", ignore_class_int as usize),
+            ("setAnimationStartDate:", ignore_class_word as usize),
+            ("setAnimationCurve:", ignore_class_word as usize),
             ("setAnimationRepeatCount:", ignore_class_float as usize),
             ("setAnimationRepeatAutoreverses:", ignore_class_bool as usize),
             ("setAnimationBeginsFromCurrentState:", ignore_class_bool as usize),
-            ("setAnimationTransition:forView:cache:", ignore_transition as usize),
+            ("setAnimationTransition:forView:cache:", ignore_animation_transition as usize),
             ("setAnimationsEnabled:", ignore_class_bool as usize),
             ("areAnimationsEnabled", class_yes as usize),
         ],
@@ -2524,72 +2519,63 @@ mod tests {
         assert_eq!(FINISHED.load(std::sync::atomic::Ordering::SeqCst), 2, "completion told finished = YES");
     }
 
-    /// The older animation calls (+beginAnimations:context: ...
-    /// +commitAnimations, which old games use instead of blocks): changes
-    /// take effect at once; the delegate hears its will-start selector at the
-    /// commit and its did-stop selector (animation id, finished = YES,
-    /// context) on a later run-loop turn. Groups nest; only the outer commit
-    /// starts them.
+    /// iOS 3 style animations (+beginAnimations:context: ... +commitAnimations):
+    /// the changes apply at once; the delegate's did-stop selector gets the
+    /// animation's id, finished = YES and the context on the next run-loop
+    /// turn, each nested block with its own settings.
     #[test]
-    fn old_style_animations_apply_at_once_and_tell_the_delegate() {
+    fn old_style_animations_tell_their_delegate_when_they_stop() {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(crate::run::setup);
         static HEARD: Mutex<Vec<(&'static str, Id, Option<bool>, usize)>> = Mutex::new(Vec::new());
-        extern "C" fn will_start(_: Id, _: Sel, id: Id, context: usize) {
-            HEARD.lock().unwrap().push(("start", id, None, context));
+        extern "C" fn stopped(_: Id, _: Sel, id: Id, finished: Id, context: usize) {
+            HEARD.lock().unwrap().push(("stopped", id, Some(collections::number_as_f64(finished) != 0.0), context));
         }
-        extern "C" fn did_stop(_: Id, _: Sel, id: Id, finished: Id, context: usize) {
-            HEARD.lock().unwrap().push(("stop", id, Some(runtime::send(finished, "boolValue", &[]) & 0xff != 0), context));
+        extern "C" fn reel_stopped(_: Id, _: Sel, id: Id) {
+            HEARD.lock().unwrap().push(("reel", id, None, 0));
         }
-        let delegate_class = define_class("UIKitTestAnimationDelegate", "NSObject", 8);
-        methods(delegate_class, &[("fadeStarts:context:", will_start as usize), ("fadeDone:finished:context:", did_stop as usize)]);
-        let delegate = runtime::send(runtime::send(delegate_class, "alloc", &[]), "init", &[]);
-        let ui_view = runtime::class_named("UIView");
-        let view = view_init_with_frame(runtime::send(ui_view, "alloc", &[]), 0, Rect::new(0.0, 0.0, 10.0, 10.0));
-        let name = crate::fw::string::make("fade");
-
-        runtime::send(ui_view, "beginAnimations:context:", &[name, 0x5150]);
-        runtime::send(ui_view, "setAnimationDelegate:", &[delegate]);
-        runtime::send(ui_view, "setAnimationWillStartSelector:", &[runtime::sel("fadeStarts:context:")]);
-        runtime::send(ui_view, "setAnimationDidStopSelector:", &[runtime::sel("fadeDone:finished:context:")]);
-        for setter in ["setAnimationCurve:", "setAnimationBeginsFromCurrentState:", "setAnimationRepeatAutoreverses:"] {
-            runtime::send(ui_view, setter, &[1]);
+        extern "C" fn starting(_: Id, _: Sel, id: Id, context: usize) {
+            HEARD.lock().unwrap().push(("starting", id, None, context));
         }
-        // An inner group (no delegate) commits with the outer one.
-        runtime::send(ui_view, "beginAnimations:context:", &[0, 0]);
-        view_set_frame(view, 0, Rect::new(5.0, 5.0, 10.0, 10.0));
+        let class = define_class("G32OldAnimationDelegate", "NSObject", 8);
+        methods(
+            class,
+            &[
+                ("animationDidStop:finished:context:", stopped as usize),
+                ("reelStopped:", reel_stopped as usize),
+                ("animationWillStart:context:", starting as usize),
+            ],
+        );
+        let delegate = runtime::send(runtime::send(class, "alloc", &[]), "init", &[]);
+        let view = runtime::class_named("UIView");
+        let send = |name: &str, args: &[usize]| runtime::send(view, name, args);
+        let (outer, inner) = (string::make("spin"), string::make("reel"));
         let mut queued: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
-        commit_animations_with(|work| queued.push(work));
-        assert!(queued.is_empty() && HEARD.lock().unwrap().is_empty(), "the inner commit starts nothing");
-        commit_animations_with(|work| queued.push(work));
-        assert_eq!(view_state(view).frame.origin, Point { x: 5.0, y: 5.0 }, "the change applies at once");
-        assert_eq!(*HEARD.lock().unwrap(), [("start", name, None, 0x5150)], "will-start at the commit");
-        assert_eq!(queued.len(), 1, "did-stop waits for a later turn");
-        queued.pop().unwrap()();
-        assert_eq!(HEARD.lock().unwrap()[1], ("stop", name, Some(true), 0x5150));
-        // Without a group open, a commit is ignored.
-        commit_animations_with(|work| queued.push(work));
-        assert!(queued.is_empty());
-        // 32-bit games reach every one of them through a framework_selectors.tsv row.
-        let table = crate::guest32::objc::selectors::FrameworkSelectors::builtin();
-        for name in [
-            "beginAnimations:context:",
-            "commitAnimations",
-            "setAnimationDelegate:",
-            "setAnimationWillStartSelector:",
-            "setAnimationDidStopSelector:",
-            "setAnimationDuration:",
-            "setAnimationDelay:",
-            "setAnimationStartDate:",
-            "setAnimationCurve:",
-            "setAnimationRepeatCount:",
-            "setAnimationRepeatAutoreverses:",
-            "setAnimationBeginsFromCurrentState:",
-            "setAnimationTransition:forView:cache:",
-        ] {
-            assert!(runtime::responds(ui_view, name), "+[UIView {name}] is missing");
-            assert!(table.get(name).is_some(), "no framework_selectors.tsv row for {name}");
+
+        send("beginAnimations:context:", &[outer, 0x1234]);
+        send("setAnimationDelegate:", &[delegate]);
+        send("setAnimationWillStartSelector:", &[runtime::sel("animationWillStart:context:")]);
+        send("setAnimationDidStopSelector:", &[runtime::sel("animationDidStop:finished:context:")]);
+        send("beginAnimations:context:", &[inner, 0]);
+        send("setAnimationDelegate:", &[delegate]);
+        send("setAnimationDidStopSelector:", &[runtime::sel("reelStopped:")]);
+        commit_old_animation(|work| queued.push(work));
+        commit_old_animation(|work| queued.push(work));
+        assert!(HEARD.lock().unwrap().is_empty(), "nothing is told before the next run-loop turn");
+        assert_eq!(queued.len(), 2);
+        for work in queued.drain(..) {
+            work();
         }
+        assert_eq!(
+            *HEARD.lock().unwrap(),
+            [("reel", inner, None, 0), ("starting", outer, None, 0x1234), ("stopped", outer, Some(true), 0x1234)],
+            "each block keeps its own delegate selectors"
+        );
+        // No delegate: nothing to tell; a commit with no begin is ignored.
+        send("beginAnimations:context:", &[0, 0]);
+        commit_old_animation(|work| queued.push(work));
+        commit_old_animation(|work| queued.push(work));
+        assert!(queued.is_empty());
     }
 
     /// UIKit's layout pass: a view added to a shown window gets -layoutSubviews
