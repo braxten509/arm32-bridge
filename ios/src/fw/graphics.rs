@@ -294,6 +294,38 @@ fn premultiply(c: [f64; 4]) -> [f32; 4] {
     [(c[0] * c[3]) as f32, (c[1] * c[3]) as f32, (c[2] * c[3]) as f32, c[3] as f32]
 }
 
+/// Fixed-point scale for the fast blend: a byte value is kept as itself times
+/// 128, so the premultiply and bilinear roundings stay under 1/128 of a byte
+/// and only the final write rounds to a whole byte.
+const FIX: u32 = 128;
+
+/// `255 * FIX * FIX`: the blend's shared denominator (a byte and the source
+/// alpha both at `FIX` scale, times the 255 of alpha).
+const DENOM: u32 = 255 * FIX * FIX;
+const HALF: u32 = DENOM / 2;
+
+/// One pixel read from bytes as premultiplied red, green, blue, alpha at
+/// `FIX` scale. Straight-alpha pixels are premultiplied when `premul`; a
+/// no-alpha layout gives alpha 255.
+#[inline(always)]
+fn premul_fix(data: &[u8], f: Fast, premul: bool, at: usize) -> (u32, u32, u32, u32) {
+    let r = data[at + f.red] as u32;
+    let g = data[at + f.green] as u32;
+    let b = data[at + f.blue] as u32;
+    let a = if f.alpha { data[at + f.fourth] as u32 } else { 255 };
+    if premul {
+        ((r * a * FIX + 127) / 255, (g * a * FIX + 127) / 255, (b * a * FIX + 127) / 255, a * FIX)
+    } else {
+        (r * FIX, g * FIX, b * FIX, a * FIX)
+    }
+}
+
+/// `a` mixed toward `b` by `w`/`FIX` (both at `FIX` scale, rounded).
+#[inline(always)]
+fn mix_fix(a: u32, b: u32, w: u32) -> u32 {
+    (a * (FIX - w) + b * w + (FIX >> 1)) >> 7
+}
+
 // ----- pictures in memory (CGImage) -----
 
 pub struct Bitmap {
@@ -1202,12 +1234,171 @@ impl Canvas {
         if rect.size.width <= 0.0 || rect.size.height <= 0.0 {
             return;
         }
+        if !self.draw_bitmap_fast(rect, bitmap, &source, map) {
+            self.draw_bitmap_paint(rect, bitmap, &source, map);
+        }
+    }
+
+    /// The slow, general path: a per-pixel bilinear sample through `paint`.
+    fn draw_bitmap_paint(&mut self, rect: Rect, bitmap: &Bitmap, source: &Layout, map: &dyn Fn(f64, f64) -> (f64, f64)) {
         self.paint(rect, Blend::Over, &|ux, uy| {
             let u = (ux - rect.origin.x) / rect.size.width;
             let v = (rect.origin.y + rect.size.height - uy) / rect.size.height;
             let (s, t) = map(u, v);
-            bitmap.sample(&source, s, t)
+            bitmap.sample(source, s, t)
         });
+    }
+
+    /// The common fast path: an axis-aligned (not turned) transform, a map
+    /// where s depends on u alone and t on v alone, and 4-byte pixel layouts
+    /// on both sides. Each column's source x index and weight and each row's
+    /// source y index and weight are worked out once, source pixels are read
+    /// straight from their bytes, and the blend is fixed-point integer math
+    /// rounded once — no per-pixel closures or array maps. False falls back
+    /// to the general path (turned transforms, odd layouts and maps).
+    fn draw_bitmap_fast(&mut self, rect: Rect, bitmap: &Bitmap, source: &Layout, map: &dyn Fn(f64, f64) -> (f64, f64)) -> bool {
+        let ctm = self.state.ctm;
+        // Axis-aligned only: no rotation, no 90-degree swap, so source x is a
+        // function of device x alone and source y of device y alone.
+        if ctm.b != 0.0 || ctm.c != 0.0 || ctm.a == 0.0 || ctm.d == 0.0 {
+            return false;
+        }
+        let (Some(sf), Some(df)) = (source.fast, self.layout.fast) else {
+            return false;
+        };
+        // A separable map: s(u, v) == s(u, 0) and t(u, v) == t(0, v), checked
+        // at the corners (exact for the affine maps used here, and it also
+        // turns away any u*v cross terms).
+        let (s00, t00) = map(0.0, 0.0);
+        let (s10, t10) = map(1.0, 0.0);
+        let (s01, t01) = map(0.0, 1.0);
+        let (s11, t11) = map(1.0, 1.0);
+        if (s01 - s00).abs() > 1e-12 || (s11 - s10).abs() > 1e-12 || (t10 - t00).abs() > 1e-12 || (t11 - t01).abs() > 1e-12 {
+            return false;
+        }
+        let Some(inverse) = geometry::invert(ctm) else {
+            return false;
+        };
+
+        // The device area the rectangle covers, as paint works it out.
+        let corners = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)]
+            .map(|(fx, fy)| geometry::apply(ctm, rect.origin.x + fx * rect.size.width, rect.origin.y + fy * rect.size.height));
+        let x0 = corners.iter().map(|c| c.0).fold(f64::INFINITY, f64::min).max(0.0);
+        let x1 = corners.iter().map(|c| c.0).fold(f64::NEG_INFINITY, f64::max).min(self.width as f64);
+        let y0 = corners.iter().map(|c| c.1).fold(f64::INFINITY, f64::min).max(0.0);
+        let y1 = corners.iter().map(|c| c.1).fold(f64::NEG_INFINITY, f64::max).min(self.height as f64);
+        if !(x0 < x1 && y0 < y1) {
+            return true; // nothing to draw
+        }
+        let (min_x, max_x) = (rect.origin.x, rect.origin.x + rect.size.width);
+        let (min_y, max_y) = (rect.origin.y, rect.origin.y + rect.size.height);
+
+        let (x_start, x_end) = (x0.floor() as usize, x1.ceil() as usize);
+        let (y_start, y_end) = (y0.floor() as usize, y1.ceil() as usize);
+
+        let source_bytes = source.bytes;
+        let mut columns: Vec<(f32, usize, usize, u32)> = Vec::with_capacity(x_end - x_start);
+        for x in x_start..x_end {
+            let fx = x as f64;
+            let coverage_x = (((fx + 1.0).min(x1) - fx.max(x0)).max(0.0)) as f32;
+            let ux = geometry::apply(inverse, fx + 0.5, 0.0).0;
+            let u = (ux.clamp(min_x, max_x) - min_x) / rect.size.width;
+            let s = map(u, 0.0).0;
+            let sx = (s * bitmap.width as f64 - 0.5).clamp(0.0, (bitmap.width - 1) as f64);
+            let x0i = sx.floor() as usize;
+            let x1i = (x0i + 1).min(bitmap.width - 1);
+            let wfx = ((sx - x0i as f64) as f32 * FIX as f32).round() as u32;
+            columns.push((coverage_x, x0i * source_bytes, x1i * source_bytes, wfx));
+        }
+        let mut rows: Vec<(f32, usize, usize, u32)> = Vec::with_capacity(y_end - y_start);
+        for y in y_start..y_end {
+            let fy = y as f64;
+            let coverage_y = (((fy + 1.0).min(y1) - fy.max(y0)).max(0.0)) as f32;
+            let uy = geometry::apply(inverse, 0.0, fy + 0.5).1;
+            let v = (max_y - uy.clamp(min_y, max_y)) / rect.size.height;
+            let t = map(0.0, v).1;
+            let sy = (t * bitmap.height as f64 - 0.5).clamp(0.0, (bitmap.height - 1) as f64);
+            let y0i = sy.floor() as usize;
+            let y1i = (y0i + 1).min(bitmap.height - 1);
+            let wfy = ((sy - y0i as f64) as f32 * FIX as f32).round() as u32;
+            rows.push((coverage_y, y0i * bitmap.bytes_per_row, y1i * bitmap.bytes_per_row, wfy));
+        }
+
+        let alpha = self.state.alpha as f32;
+        let clear = self.state.blend_mode == shapes::BLEND_CLEAR;
+        let clip = self.state.clip.clone();
+        let premul = sf.alpha && !source.premultiplied;
+        let data = bitmap.data.as_slice();
+        let (width, height) = (self.width, self.height);
+        let (bytes_per_row, dest_bytes) = (self.bytes_per_row, self.layout.bytes);
+        let memory = self.memory();
+
+        for (yi, &(coverage_y, y0_base, y1_base, wfy)) in rows.iter().enumerate() {
+            if coverage_y <= 0.0 {
+                continue;
+            }
+            let dev_y = yi + y_start;
+            let dst_row = (height - 1 - dev_y) * bytes_per_row;
+            for (xi, &(coverage_x, x0_off, x1_off, wfx)) in columns.iter().enumerate() {
+                let cov = coverage_x * coverage_y;
+                if cov <= 0.0 {
+                    continue;
+                }
+                let dev_x = xi + x_start;
+                let mut k = cov * alpha;
+                if let Some(c) = &clip {
+                    k *= c[dev_y * width + dev_x];
+                }
+                let k_fix = (k * FIX as f32).round().clamp(0.0, FIX as f32) as u32;
+                if k_fix == 0 {
+                    // Fully transparent: nothing blends, but a no-alpha
+                    // destination's skipped fourth byte is still written 255,
+                    // as the general path's blend does.
+                    if !df.alpha {
+                        memory[dst_row + dev_x * dest_bytes + df.fourth] = 255;
+                    }
+                    continue;
+                }
+                let (addr00, addr10) = (y0_base + x0_off, y0_base + x1_off);
+                let (addr01, addr11) = (y1_base + x0_off, y1_base + x1_off);
+                let (r00, g00, b00, al00) = premul_fix(data, sf, premul, addr00);
+                let (r10, g10, b10, al10) = premul_fix(data, sf, premul, addr10);
+                let (r01, g01, b01, al01) = premul_fix(data, sf, premul, addr01);
+                let (r11, g11, b11, al11) = premul_fix(data, sf, premul, addr11);
+                let r = mix_fix(mix_fix(r00, r10, wfx), mix_fix(r01, r11, wfx), wfy);
+                let g = mix_fix(mix_fix(g00, g10, wfx), mix_fix(g01, g11, wfx), wfy);
+                let b = mix_fix(mix_fix(b00, b10, wfx), mix_fix(b01, b11, wfx), wfy);
+                let a = mix_fix(mix_fix(al00, al10, wfx), mix_fix(al01, al11, wfx), wfy);
+                // out = src*k + dst*(1 - alpha*k), premultiplied; a clear
+                // blend drops the src term.
+                let base = dst_row + dev_x * dest_bytes;
+                let dr = memory[base + df.red] as u32;
+                let dg = memory[base + df.green] as u32;
+                let db = memory[base + df.blue] as u32;
+                let da = if df.alpha { memory[base + df.fourth] as u32 } else { 255 };
+                let keep = DENOM - a * k_fix;
+                let (out_r, out_g, out_b, out_a) = if clear {
+                    (
+                        (dr * keep + HALF) / DENOM,
+                        (dg * keep + HALF) / DENOM,
+                        (db * keep + HALF) / DENOM,
+                        (da * keep + HALF) / DENOM,
+                    )
+                } else {
+                    (
+                        (r * k_fix * 255 + dr * keep + HALF) / DENOM,
+                        (g * k_fix * 255 + dg * keep + HALF) / DENOM,
+                        (b * k_fix * 255 + db * keep + HALF) / DENOM,
+                        (a * k_fix * 255 + da * keep + HALF) / DENOM,
+                    )
+                };
+                memory[base + df.red] = out_r as u8;
+                memory[base + df.green] = out_g as u8;
+                memory[base + df.blue] = out_b as u8;
+                memory[base + df.fourth] = if df.alpha { out_a as u8 } else { 255 };
+            }
+        }
+        true
     }
 
     /// CGContextDrawImage: a picture landing pixel for pixel (one picture
@@ -2325,6 +2516,106 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn fast_bitmap_path_matches_the_general_path() {
+        // A scaled, alpha-faded, clipped draw of a picture: the integer fast
+        // path and the float general path give the same pixels (at most one
+        // step per channel, 1/255), whatever the source and destination
+        // layouts.
+        let source_infos = [PREMULTIPLIED_LAST, ALPHA_LAST, NONE_SKIP_LAST];
+        let dst_infos = [PREMULTIPLIED_LAST, PREMULTIPLIED_FIRST | ORDER_32_LITTLE, NONE_SKIP_LAST];
+        for &src_info in &source_infos {
+            let src_layout = layout(Space::Rgb, 8, 32, src_info).unwrap();
+            // A 5x3 picture with varied straight colours and alphas, stored
+            // the way the source layout stores them.
+            let mut data = vec![0u8; 5 * 3 * 4];
+            for i in 0..15u32 {
+                let a = [255u8, 0, 128, 37, 200][i as usize % 5] as f32 / 255.0;
+                let color = [
+                    ((i * 53) % 256) as f32 / 255.0 * a,
+                    ((i * 31) % 256) as f32 / 255.0 * a,
+                    ((i * 17) % 256) as f32 / 255.0 * a,
+                    a,
+                ];
+                src_layout.write(&mut data[i as usize * 4..i as usize * 4 + 4], color);
+            }
+            let picture = Bitmap { width: 5, height: 3, bits_per_pixel: 32, bytes_per_row: 20, info: src_info, space: Space::Rgb, data };
+            let source = picture.layout().unwrap();
+            for flip in [false, true] {
+                for &dst_info in &dst_infos {
+                    let (mut fast, mut general) = (canvas(9, 7, dst_info), canvas(9, 7, dst_info));
+                    let setup = |c: &mut Canvas| {
+                        if flip {
+                            c.state.ctm = Transform { a: 1.0, b: 0.0, c: 0.0, d: -1.0, tx: 0.0, ty: 7.0 };
+                        }
+                        c.state.alpha = 0.7;
+                        let mut outline = shapes::Outline::default();
+                        outline.rect(Rect::new(1.0, 1.0, 6.0, 4.0), &c.to_device());
+                        c.clip_to(&outline, false);
+                    };
+                    setup(&mut fast);
+                    setup(&mut general);
+                    fast.draw_bitmap(Rect::new(0.0, 0.0, 9.0, 7.0), &picture, &|u, v| (u, 1.0 - v));
+                    general.draw_bitmap_paint(Rect::new(0.0, 0.0, 9.0, 7.0), &picture, &source, &|u, v| (u, 1.0 - v));
+                    let (f, g) = (fast.memory().to_vec(), general.memory().to_vec());
+                    assert!(f.iter().zip(&g).all(|(a, b)| a.abs_diff(*b) <= 1), "fast vs general src={src_info:#x} dst={dst_info:#x} flip={flip}:\n{f:?}\n{g:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn timing_scaled_bitmap_with_rectangle_clip() {
+        // A 512x512 RGBA picture scaled into a 710x300 canvas under a
+        // rectangle clip, 14 times: the SpellCraft picture-draw shape.
+        let (w, h) = (512usize, 512usize);
+        let data: Vec<u8> = (0..(w * h) as u32).flat_map(|i| {
+            let (x, y) = ((i as usize % w) as u8, (i as usize / w) as u8);
+            [x, y, x ^ y, 255]
+        }).collect();
+        let bitmap = Bitmap { width: w, height: h, bits_per_pixel: 32, bytes_per_row: w * 4, info: PREMULTIPLIED_LAST, space: Space::Rgb, data };
+        let source = bitmap.layout().unwrap();
+        let map = |u: f64, v: f64| (u, 1.0 - v);
+
+        // The whole scenario (fast clip + fast draw).
+        let start = std::time::Instant::now();
+        for _ in 0..14 {
+            let mut c = canvas(710, 300, PREMULTIPLIED_LAST);
+            let mut outline = shapes::Outline::default();
+            outline.rect(Rect::new(10.0, 10.0, 690.0, 280.0), &|p| p);
+            c.clip_to(&outline, false);
+            c.draw_bitmap(Rect::new(0.0, 0.0, 710.0, 300.0), &bitmap, &map);
+        }
+        eprintln!("TIMING whole scenario (fast clip + fast draw) 14x: {:?}", start.elapsed());
+
+        // Clip alone.
+        let start = std::time::Instant::now();
+        for _ in 0..14 {
+            let mut c = canvas(710, 300, PREMULTIPLIED_LAST);
+            let mut outline = shapes::Outline::default();
+            outline.rect(Rect::new(10.0, 10.0, 690.0, 280.0), &|p| p);
+            c.clip_to(&outline, false);
+        }
+        eprintln!("TIMING clip_to alone 14x: {:?}", start.elapsed());
+
+        // Fast draw alone.
+        let start = std::time::Instant::now();
+        for _ in 0..14 {
+            let mut c = canvas(710, 300, PREMULTIPLIED_LAST);
+            c.draw_bitmap(Rect::new(0.0, 0.0, 710.0, 300.0), &bitmap, &map);
+        }
+        eprintln!("TIMING draw_bitmap (fast) alone 14x: {:?}", start.elapsed());
+
+        // General draw alone.
+        let start = std::time::Instant::now();
+        for _ in 0..14 {
+            let mut c = canvas(710, 300, PREMULTIPLIED_LAST);
+            c.draw_bitmap_paint(Rect::new(0.0, 0.0, 710.0, 300.0), &bitmap, &source, &map);
+        }
+        eprintln!("TIMING draw_bitmap_paint (general) alone 14x: {:?}", start.elapsed());
     }
 
     #[test]

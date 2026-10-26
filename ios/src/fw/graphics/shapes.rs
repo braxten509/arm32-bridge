@@ -177,12 +177,74 @@ impl Outline {
     }
 }
 
+/// The edges of a plain axis-aligned rectangle (two vertical, two horizontal
+/// lines), as its bounds in device space; None for any other shape.
+fn axis_aligned_rect(edges: &[((f64, f64), (f64, f64))]) -> Option<(f64, f64, f64, f64)> {
+    if edges.len() != 4 {
+        return None;
+    }
+    let (mut xs, mut ys) = ([f64::NAN; 2], [f64::NAN; 2]);
+    let (mut nx, mut ny) = (0usize, 0usize);
+    for &((x0, y0), (x1, y1)) in edges {
+        if x0 == x1 && y0 != y1 {
+            if nx == 2 {
+                return None;
+            }
+            xs[nx] = x0;
+            nx += 1;
+        } else if y0 == y1 && x0 != x1 {
+            if ny == 2 {
+                return None;
+            }
+            ys[ny] = y0;
+            ny += 1;
+        } else {
+            return None;
+        }
+    }
+    if nx != 2 || ny != 2 || xs[0] == xs[1] || ys[0] == ys[1] {
+        return None;
+    }
+    Some((xs[0].min(xs[1]), ys[0].min(ys[1]), xs[0].max(xs[1]), ys[0].max(ys[1])))
+}
+
+/// Coverage of an axis-aligned rectangle: whole pixels inside are 1, outside
+/// 0, and an edge pixel the fraction of it the rectangle covers. This is the
+/// exact area (not the 4x4 sample count), so the two may differ by fractions
+/// at an edge; that is fine, only the interior and outside must be exact.
+fn rect_coverage(x0: f64, y0: f64, x1: f64, y1: f64, width: usize, height: usize) -> Vec<f32> {
+    let mut mask = vec![0f32; width * height];
+    let (min_x, max_x) = (x0.max(0.0).min(width as f64), x1.max(0.0).min(width as f64));
+    let (min_y, max_y) = (y0.max(0.0).min(height as f64), y1.max(0.0).min(height as f64));
+    if !(min_x < max_x && min_y < max_y) {
+        return mask;
+    }
+    let (x_start, x_end) = (min_x.floor() as usize, (max_x.ceil() as usize).min(width));
+    let (y_start, y_end) = (min_y.floor() as usize, (max_y.ceil() as usize).min(height));
+    // A column's share of the rectangle, worked out once (only the first and
+    // last columns can be a fraction; the rest are 1).
+    let column: Vec<f32> = (x_start..x_end)
+        .map(|x| (((x as f64 + 1.0).min(max_x) - (x as f64).max(min_x)).clamp(0.0, 1.0)) as f32)
+        .collect();
+    for y in y_start..y_end {
+        let cov_y = (((y as f64 + 1.0).min(max_y) - (y as f64).max(min_y)).clamp(0.0, 1.0)) as f32;
+        let row = &mut mask[y * width..(y + 1) * width];
+        for (i, &cov_x) in column.iter().enumerate() {
+            row[x_start + i] = cov_x * cov_y;
+        }
+    }
+    mask
+}
+
 /// Coverage (0..1) of each device pixel (rows from the bottom) by the shape
 /// with these edges, 4x4 samples per pixel.
 fn coverage(edges: &[((f64, f64), (f64, f64))], even_odd: bool, width: usize, height: usize) -> Vec<f32> {
     let mut mask = vec![0f32; width * height];
     if edges.is_empty() || width == 0 || height == 0 {
         return mask;
+    }
+    if let Some((x0, y0, x1, y1)) = axis_aligned_rect(edges) {
+        return rect_coverage(x0, y0, x1, y1, width, height);
     }
     let min_y = edges.iter().map(|e| e.0 .1.min(e.1 .1)).fold(f64::INFINITY, f64::min).max(0.0);
     let max_y = edges.iter().map(|e| e.0 .1.max(e.1 .1)).fold(f64::NEG_INFINITY, f64::max).min(height as f64);
@@ -1164,6 +1226,25 @@ mod tests {
         arc.arc((0.0, 0.0), 1.0, 0.0, -std::f64::consts::FRAC_PI_2, true, &|p| p);
         let end = arc.current().unwrap();
         assert!(end.0.abs() < 1e-9 && (end.1 + 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_rectangle_clip_covers_interior_edge_and_outside() {
+        // A clip rectangle from (2, 2) to (6, 5) on an 8x8 canvas: whole
+        // pixels inside are 1, outside 0.
+        let mut outline = Outline::default();
+        outline.rect(Rect::new(2.0, 2.0, 4.0, 3.0), &|p| p);
+        let mask = outline.cover(false, 8, 8);
+        assert_eq!(mask[3 * 8 + 3], 1.0, "an inside pixel");
+        assert_eq!(mask[8 + 1], 0.0, "an outside pixel");
+        assert_eq!(mask.iter().sum::<f32>(), 12.0, "4 by 3 fully-covered pixels");
+        // A rectangle whose left edge lands mid-pixel: that pixel is a
+        // fraction of 1 (partly in), never 0 or 1.
+        let mut fractional = Outline::default();
+        fractional.rect(Rect::new(2.5, 2.0, 3.5, 3.0), &|p| p);
+        let mask = fractional.cover(false, 8, 8);
+        let edge = mask[2 * 8 + 2];
+        assert!(edge > 0.0 && edge < 1.0, "edge pixel is a fraction, got {edge}");
     }
 
     #[test]
