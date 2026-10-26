@@ -25,6 +25,15 @@ pub struct CachedSend {
     pub words: u32,
 }
 
+/// A message the host answered: its selector there and the call's shape
+/// (types and options), so a repeat skips the lookups by name.
+#[derive(Clone, Debug)]
+pub struct HostSend {
+    pub sel: usize,
+    pub signature: std::sync::Arc<super::encoding::Signature>,
+    pub options: super::convert::HostCallOptions,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Lookup<'a> {
     Guest(&'a GuestMethod),
@@ -72,6 +81,8 @@ pub struct GuestClasses {
     /// Messages a game method answered, by (receiver's class, selector
     /// address); forgotten whenever a method is added.
     sends: HashMap<(u32, u32), CachedSend>,
+    /// Messages the host answered, kept and forgotten like `sends`.
+    host_sends: HashMap<(u32, u32), HostSend>,
 }
 
 fn method_map(list: &[Method32]) -> HashMap<String, GuestMethod> {
@@ -190,6 +201,16 @@ impl GuestClasses {
         self.sends.insert((class, sel), send);
     }
 
+    /// The host method an earlier message to `class` with the selector at
+    /// `sel` reached, while no method has been added since.
+    pub fn cached_host_send(&self, class: u32, sel: u32) -> Option<HostSend> {
+        self.host_sends.get(&(class, sel)).cloned()
+    }
+
+    pub fn remember_host_send(&mut self, class: u32, sel: u32, send: HostSend) {
+        self.host_sends.insert((class, sel), send);
+    }
+
     pub fn class_named(&self, name: &str) -> Option<&GuestClass> {
         self.classes.get(self.by_name.get(name)?)
     }
@@ -292,6 +313,7 @@ impl GuestClasses {
         methods.insert(sel.to_string(), GuestMethod { imp, types: types.to_string() });
         self.refused_resolutions.clear();
         self.sends.clear();
+        self.host_sends.clear();
         true
     }
 
@@ -304,6 +326,7 @@ impl GuestClasses {
         c.methods.insert(sel.to_string(), GuestMethod { imp, types: types.to_string() });
         self.refused_resolutions.retain(|(owner, _)| *owner != class);
         self.sends.clear();
+        self.host_sends.clear();
         true
     }
 }

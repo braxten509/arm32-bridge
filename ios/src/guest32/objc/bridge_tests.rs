@@ -1291,3 +1291,44 @@ fn a_tutorial_waiting_for_a_skipped_story_box_goes_on() {
     close();
     assert_eq!(BEGUN.load(SeqCst), 2);
 }
+
+#[test]
+fn a_repeated_framework_message_is_remembered_and_still_reaches_the_host() {
+    // SpellCraft's HUD sends ~700 messages twice a second, most to the
+    // framework: each repeat looked its target and types up by name again.
+    // The answer is remembered per (class, selector), and forgotten when
+    // the game adds a method.
+    host_class("G32HostRememberPanel");
+    let fake = Fake::new();
+    let leaf = class32(fake, "G32RememberLeaf", ClassTarget::External("G32HostRememberPanel".into()), "G32HostRememberPanel", vec![]);
+    let class = leaf.address;
+    let md = ObjcMetadata32 { classes: vec![leaf], ..Default::default() };
+    let bridge = Mutex::new(Bridge::new(&md).unwrap());
+    install(&bridge, fake, &md).unwrap();
+    let sel = |name: &str| bridge.lock().unwrap().guest_selector(fake, name);
+    let object = send(&bridge, fake, &[class, sel("alloc")]).unwrap() as u32;
+    let host = bridge.lock().unwrap().host_object(object).unwrap();
+    let alpha = sel("setAlpha:");
+    let seen = || HOST_ALPHA.lock().unwrap().iter().filter(|e| e.0 == host).map(|e| e.1).collect::<Vec<_>>();
+    send(&bridge, fake, &[object, alpha, 0.25f32.to_bits()]).unwrap();
+    assert!(bridge.lock().unwrap().classes.cached_host_send(class, alpha).is_some(), "the answer is remembered");
+    send(&bridge, fake, &[object, alpha, 0.5f32.to_bits()]).unwrap();
+    assert_eq!(seen(), [0.25, 0.5], "the repeat reaches the host with its own argument");
+    // A struct result (stret) and an id result answer from memory alike.
+    let (out, frame) = (fake.alloc_permanent(16), sel("frame"));
+    for _ in 0..2 {
+        fake.write(out, &[0; 16]);
+        send_from_guest(&bridge, fake, SendKind::Stret, &|i| [out, object, frame][i as usize]).unwrap();
+        let floats: Vec<f32> = fake.read(out, 16).chunks(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+        assert_eq!(floats, [1.0, 2.0, 30.0, 40.0]);
+    }
+    let at = sel("objectAtIndex:");
+    for _ in 0..2 {
+        assert_eq!(send(&bridge, fake, &[object, at, 0]).unwrap() as u32, object);
+    }
+    // class_addMethod: the game's own -setAlpha: answers from now on.
+    fake.code(0x2301, |_| 0);
+    assert!(bridge.lock().unwrap().classes.add_method(class, "setAlpha:", 0x2301, "v12@0:4f8"));
+    send(&bridge, fake, &[object, alpha, 0.75f32.to_bits()]).unwrap();
+    assert_eq!(seen(), [0.25, 0.5], "the game's method, not the host's");
+}

@@ -1167,9 +1167,18 @@ fn send_unobserved(
     if matches!(kind, SendKind::Normal | SendKind::Stret) && !runtime::message_trace_on() {
         let receiver = words(first);
         if receiver != 0 {
-            if let Some(send) = b.classes.cached_send(u32_at(g, receiver), sel) {
+            let isa = u32_at(g, receiver);
+            if let Some(send) = b.classes.cached_send(isa, sel) {
                 drop(b);
                 return call_game_method(g, send, words);
+            }
+            if let Some(host) = b.classes.cached_host_send(isa, sel) {
+                let host_receiver = b.host_object_for(g, receiver)?;
+                drop(b);
+                if let Some(imp) = runtime::imp_for(host_receiver, host.sel) {
+                    return call_remembered_host(bridge, g, words, &host, imp);
+                }
+                b = lock(bridge);
             }
         }
     }
@@ -1375,6 +1384,20 @@ fn send_unobserved(
             }
             let mark = wrapper_mark();
             let (sig, options) = host_signature(&b, &class, meta, &name)?;
+            // A plain message (no block to move, no bytes to copy, not a
+            // dealloc or super call): remembered for `call_remembered_host`.
+            let plain = !via_super
+                && !game_dealloc
+                && !options.host_bytes
+                && !matches!(name.as_str(), "bytes" | "mutableBytes")
+                && !sig.args.contains(&super::encoding::Ty::Block);
+            if plain && matches!(kind, SendKind::Normal | SendKind::Stret) {
+                let isa = u32_at(g, receiver);
+                if class_to_initialize(&b, isa).is_none() {
+                    let send = super::classes::HostSend { sel: host_sel, signature: std::sync::Arc::new(sig.clone()), options };
+                    b.classes.remember_host_send(isa, sel, send);
+                }
+            }
             // The host may keep a block argument: stack blocks move to the heap first.
             let mut replaced: Vec<(u32, u32)> = Vec::new();
             let block_words: Vec<u32> = sig
@@ -1445,6 +1468,32 @@ fn send_unobserved(
             Ok(result)
         }
     }
+}
+
+/// A message `remember_host_send` kept, to the host method `imp`: the
+/// plain part of the host call in `send_unobserved`.
+fn call_remembered_host(
+    bridge: &Mutex<Bridge>,
+    g: &dyn GuestSide,
+    words: &dyn Fn(u32) -> u32,
+    host: &super::classes::HostSend,
+    imp: usize,
+) -> Result<GuestRet, String> {
+    let mark = wrapper_mark();
+    let mut b = lock(bridge);
+    let call = convert::prepare_host_call(&host.signature, host.options, words, &mut Session { bridge: &mut b, g })?;
+    drop(b);
+    let (ret, raised) = crate::fw::exception::catching(|| mirror::call_host(imp, &call.args));
+    let mut b = lock(bridge);
+    let result = convert::finish_host_call(call, &ret, &mut Session { bridge: &mut b, g })?;
+    if let Some(exception) = raised {
+        let exception = b.guest_object(g, exception)?;
+        PENDING_THROW.with(|p| p.set(Some(exception)));
+    }
+    drop(b);
+    construct_pending(bridge, g)?;
+    end_wrapper_scope(g, mark)?;
+    Ok(result)
 }
 
 /// Runs a game method with the message's argument words.
