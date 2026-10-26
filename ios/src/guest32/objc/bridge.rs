@@ -26,7 +26,10 @@ use super::mirror;
 use super::selectors::{FrameworkSelector, FrameworkSelectors};
 use crate::objc::runtime;
 use guest32_image::ObjcMetadata32;
-use std::collections::{HashMap, HashSet};
+// FxHash: the bridge's tables are keyed by addresses and short names
+// looked up on every message; the default (DoS-proof) hash cost several
+// times more there.
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::sync::Mutex;
 
 /// Guest memory and guest code, as the bridge needs them.
@@ -197,7 +200,7 @@ fn destruct(bridge: &Mutex<Bridge>, g: &dyn GuestSide, object: u32) -> Result<()
 }
 
 fn live_wrappers<R>(f: impl FnOnce(&mut HashSet<usize>) -> R) -> R {
-    f(LIVE_WRAPPERS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashSet::new))
+    f(LIVE_WRAPPERS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashSet::default))
 }
 
 /// The guest block a host block runs, if it is one of the bridge's.
@@ -302,19 +305,19 @@ impl Bridge {
         Ok(Bridge {
             framework_initializers,
             classes,
-            to_host: HashMap::new(),
-            to_guest: HashMap::new(),
-            game_instances: HashMap::new(),
-            framework: HashMap::new(),
-            framework_by_guest: HashMap::new(),
-            mirrors: HashMap::new(),
-            protocols: HashMap::new(),
-            sel_names: HashMap::new(),
-            sel_guest: HashMap::new(),
-            specials: HashMap::new(),
-            buffers: HashMap::new(),
-            kept_copies: HashMap::new(),
-            init_state: HashMap::new(),
+            to_host: HashMap::default(),
+            to_guest: HashMap::default(),
+            game_instances: HashMap::default(),
+            framework: HashMap::default(),
+            framework_by_guest: HashMap::default(),
+            mirrors: HashMap::default(),
+            protocols: HashMap::default(),
+            sel_names: HashMap::default(),
+            sel_guest: HashMap::default(),
+            specials: HashMap::default(),
+            buffers: HashMap::default(),
+            kept_copies: HashMap::default(),
+            init_state: HashMap::default(),
             extra_bytes: 0,
         })
     }
@@ -932,7 +935,7 @@ pub fn run_loads(bridge: &Mutex<Bridge>, g: &dyn GuestSide, md: &ObjcMetadata32)
         }
     }
     let by_address: HashMap<u32, &guest32_image::ObjcClass32> = md.classes.iter().map(|c| (c.address, c)).collect();
-    let (mut done, mut order) = (HashSet::new(), Vec::new());
+    let (mut done, mut order) = (HashSet::default(), Vec::new());
     for class in &md.classes {
         visit(class, &by_address, &mut done, &mut order);
     }

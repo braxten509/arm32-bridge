@@ -3,7 +3,10 @@
 
 use crate::loader::Loaded;
 use crate::symbols::{leak, leak_cstr};
-use std::collections::{HashMap, HashSet};
+// FxHash: the bridge's tables are keyed by addresses and short names
+// looked up on every message; the default (DoS-proof) hash cost several
+// times more there.
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::ffi::CStr;
 use std::sync::atomic::Ordering;
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -322,7 +325,7 @@ impl Runtime {
                 superclass,
                 meta: false,
                 partner: meta,
-                methods: HashMap::new(),
+                methods: HashMap::default(),
                 instance_size: size,
                 protocols: Vec::new(),
                 from_game: false,
@@ -337,7 +340,7 @@ impl Runtime {
                 superclass: meta_super,
                 meta: true,
                 partner: class,
-                methods: HashMap::new(),
+                methods: HashMap::default(),
                 instance_size: meta_size,
                 protocols: Vec::new(),
                 from_game: false,
@@ -740,7 +743,7 @@ fn trace_wants(pattern: &regex::Regex, limit: u32, text: &str) -> bool {
         return false;
     }
     let mut counts = COUNTS.lock().unwrap_or_else(|e| e.into_inner());
-    let count = counts.get_or_insert_with(HashMap::new).entry(text.to_string()).or_default();
+    let count = counts.get_or_insert_with(HashMap::default).entry(text.to_string()).or_default();
     *count += 1;
     *count <= limit
 }
@@ -956,7 +959,7 @@ fn realize(rt: &mut Runtime, class: Class, game_classes: &HashSet<Class>) -> Res
         let class_methods = method_list(rt, read::<usize>(meta_ro + 32));
         let load = rt.sel("load");
         if let Some(&(_, imp)) = class_methods.iter().find(|(s, _)| *s == load) {
-            BASE_LOAD.lock().unwrap().get_or_insert_with(HashMap::new).insert(class, imp);
+            BASE_LOAD.lock().unwrap().get_or_insert_with(HashMap::default).insert(class, imp);
         }
         let protocols = protocol_list(read::<usize>(ro + 40));
         let meta_super = (*(meta as *const ClassObject)).superclass;
@@ -1020,7 +1023,7 @@ pub fn read_class_pair(class: Class) -> Class {
         crate::log!("objc_readClassPair: class at {class:#x} has an unknown parent {superclass:#x}");
         return 0;
     }
-    match realize(&mut rt, class, &HashSet::new()) {
+    match realize(&mut rt, class, &HashSet::default()) {
         Ok(()) => class,
         Err(error) => {
             crate::log!("objc_readClassPair: {error}");

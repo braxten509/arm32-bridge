@@ -5,7 +5,10 @@
 //! method is found or the chain reaches a framework (host) class.
 
 use guest32_image::{ClassTarget, Ivar32, Method32, ObjcMetadata32, Property32};
-use std::collections::{HashMap, HashSet};
+// FxHash: the bridge's tables are keyed by addresses and short names
+// looked up on every message; the default (DoS-proof) hash cost several
+// times more there.
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GuestMethod {
@@ -145,7 +148,7 @@ impl GuestClasses {
             }
         }
         let all = table.classes.values().map(|c| &c.methods).chain(table.framework_categories.values());
-        let mut types = HashMap::new();
+        let mut types = HashMap::default();
         for methods in all {
             for (name, m) in methods {
                 types.entry(name.clone()).or_insert_with(|| m.types.clone());
