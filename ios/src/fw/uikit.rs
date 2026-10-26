@@ -1562,6 +1562,15 @@ fn did_appear(controller: Id, animated: bool) {
         return;
     }
     property_set(controller, "appeared", 1);
+    // As UIKit, the view is laid out before viewDidAppear: (SpellCraft adds
+    // its drawer in -viewDidLayoutSubviews and opens a tutorial box in
+    // -viewDidAppear:; laid out later, the drawer covered the box).
+    if runtime::send(controller, "isViewLoaded", &[]) & 0xFF != 0 {
+        let window = window_of(runtime::send(controller, "view", &[]));
+        if window != 0 {
+            lay_out_tree(window, 0);
+        }
+    }
     tell_appearance(controller, "viewDidAppear:", animated);
     // Tests tap on this line (IOS_TAPS "on=screen shown: <class>"), once it is drawn.
     crate::fw::pictures::on_next_draw(format!("screen shown: {}", crate::fw::string::describe_class_of(controller)));
@@ -2202,6 +2211,13 @@ pub(crate) extern "C" fn controller_transition(_this: Id, _: Sel, from: Id, to: 
         }
         list
     };
+    // The arriving view is laid out before its controller hears
+    // viewWillAppear: (SpellCraft opens a tutorial box there and adds its
+    // drawer in -viewDidLayoutSubviews: laid out later, the drawer covered it).
+    if on_screen && to_view != 0 {
+        set_needs_layout(to_view);
+        lay_out_tree(to_view, 0);
+    }
     let hiding: Vec<Id> = if on_screen { with_inside(from, from_view).into_iter().filter(|&c| will_disappear(c, true)).collect() } else { Vec::new() };
     let showing: Vec<Id> = if on_screen { with_inside(to, to_view).into_iter().filter(|&c| will_appear(c, true)).collect() } else { Vec::new() };
     let show_hide = options & SHOW_HIDE_TRANSITION_VIEWS != 0;
@@ -3770,6 +3786,11 @@ mod tests {
         let window = new_view(runtime::class_named("UIWindow"), screen_bounds());
         window_set_root_controller(window, 0, controller);
         window_make_key_and_visible(window, 0);
+        assert_eq!(
+            take(),
+            [(controller, "viewWillLayoutSubviews"), (root, "layoutSubviews"), (controller, "viewDidLayoutSubviews")],
+            "the root is laid out before it appears, as on UIKit"
+        );
         let child = new_view(view_class, Rect::new(0.0, 0.0, 10.0, 10.0));
         runtime::send(root, "addSubview:", &[child]);
         assert!(take().is_empty(), "nothing is laid out before the run loop's pass");

@@ -206,6 +206,9 @@ extern "C" fn noted_will_disappear(this: Id, _: Sel, animated: bool) {
 extern "C" fn noted_did_disappear(this: Id, _: Sel, animated: bool) {
     note(this, &format!("viewDidDisappear: {}", yes_no(animated)));
 }
+extern "C" fn noted_did_layout(this: Id, _: Sel) {
+    note(this, "viewDidLayoutSubviews");
+}
 extern "C" fn noted_did_load(this: Id, _: Sel) {
     note(this, "viewDidLoad");
 }
@@ -278,6 +281,9 @@ fn setup() {
         // The same, also noting when its view is loaded.
         let loading = define_class("StoryboardTestLoadingController", "StoryboardTestController", 8);
         methods(loading, &[("viewDidLoad", noted_did_load as usize)]);
+        // The same, also noting its layouts.
+        let laying = define_class("StoryboardTestLayoutController", "StoryboardTestController", 8);
+        methods(laying, &[("viewDidLayoutSubviews", noted_did_layout as usize)]);
         // A container that tells its children itself (iOS 5's automatic forwarding off).
         let quiet = define_class("StoryboardTestQuietController", "StoryboardTestController", 8);
         methods(quiet, &[("automaticallyForwardAppearanceAndRotationMethodsToChildViewControllers", no_forwarding as usize)]);
@@ -1000,6 +1006,55 @@ fn the_main_storyboard_makes_and_shows_the_window() {
 
     // No main storyboard: nothing is made.
     assert_eq!(load_main_interface_from(&Value::Dict(vec![]), bundle, delegate), 0);
+}
+
+/// As on UIKit, a controller's view is laid out between viewWillAppear: and
+/// viewDidAppear:: SpellCraft opens a tutorial box in -viewDidAppear: and
+/// adds its drawer in -viewDidLayoutSubviews, so the drawer covered the box
+/// when the layout came after.
+#[test]
+fn a_controller_is_laid_out_before_it_appears() {
+    setup();
+    let make = |class: &str| runtime::send(runtime::send(runtime::class_named(class), "alloc", &[]), "init", &[]);
+    let window = new_window();
+    let parent = make("StoryboardTestController");
+    runtime::send(window, "setRootViewController:", &[parent]);
+    runtime::send(window, "makeKeyAndVisible", &[]);
+    let child = make("StoryboardTestLayoutController");
+    runtime::send(parent, "addChildViewController:", &[child]);
+    let child_view = runtime::send(child, "view", &[]);
+    let _ = events_of(&[child]);
+    runtime::send(runtime::send(parent, "view", &[]), "addSubview:", &[child_view]);
+    let told: Vec<String> = events_of(&[child]).into_iter().map(|e| e.1).collect();
+    assert_eq!(told, ["viewWillAppear: NO", "viewDidLayoutSubviews", "viewDidAppear: NO"]);
+}
+
+/// transitionFromViewController: lays the arriving view out before its
+/// controller hears viewWillAppear:: SpellCraft opens a tutorial box in
+/// -viewWillAppear: and adds its drawer in -viewDidLayoutSubviews; laid out
+/// later, the drawer covered the box.
+#[test]
+fn a_transition_lays_out_the_arriving_view_before_it_appears() {
+    setup();
+    let make = |class: &str| runtime::send(runtime::send(runtime::class_named(class), "alloc", &[]), "init", &[]);
+    let window = new_window();
+    let parent = make("StoryboardTestController");
+    runtime::send(window, "setRootViewController:", &[parent]);
+    runtime::send(window, "makeKeyAndVisible", &[]);
+    let parent_view = runtime::send(parent, "view", &[]);
+    let (from, to) = (make("StoryboardTestController"), make("StoryboardTestLayoutController"));
+    runtime::send(parent, "addChildViewController:", &[from]);
+    runtime::send(parent_view, "addSubview:", &[runtime::send(from, "view", &[])]);
+    runtime::send(parent, "addChildViewController:", &[to]);
+    let _ = runtime::send(to, "view", &[]);
+    let _ = events_of(&[parent, from, to]);
+    crate::fw::uikit::controller_transition(parent, 0, from, to, 0.0, 0, 0, 0);
+    let told: Vec<String> = events_of(&[to]).into_iter().map(|e| e.1).collect();
+    assert_eq!(told, ["viewDidLayoutSubviews", "viewWillAppear: YES"]);
+    let end = crate::fw::runloop::media_time() + 0.3;
+    while !events_of(&[to]).iter().any(|e| e.1 == "viewDidAppear: YES") && crate::fw::runloop::media_time() < end {
+        crate::fw::runloop::run_main_loop_briefly();
+    }
 }
 
 /// UIKit's rule for every controller, not just the window's root: a
