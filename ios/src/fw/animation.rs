@@ -974,6 +974,12 @@ pub fn commit() {
     commit_at(None, runloop::media_time());
 }
 
+/// Whether this thread added animations that haven't begun yet (`commit`).
+pub fn uncommitted() -> bool {
+    let me = std::thread::current().id();
+    running().iter().any(|r| r.begun_on_add.is_some_and(|(_, thread)| thread == me))
+}
+
 pub(crate) fn commit_at(only: Option<Id>, now: f64) {
     let mut late = 0.0f64;
     let me = std::thread::current().id();

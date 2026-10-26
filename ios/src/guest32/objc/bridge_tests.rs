@@ -831,6 +831,28 @@ fn a_va_list_of_format_arguments_reaches_the_host() {
     assert_eq!(crate::fw::string::get(host), format!("7 wizards {}", 5u64 | 1 << 32));
 }
 
+#[test]
+fn a_format_argument_that_is_no_object_shows_as_null() {
+    // SpellCraft's shop tutorial formatted a %@ whose word was no object
+    // every frame: the message failed, the game's code stopped there, and
+    // the screen's buttons did nothing. The text still gets made.
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(crate::run::setup);
+    let fake = Fake::new();
+    let bridge = Mutex::new(Bridge::new(&ObjcMetadata32::default()).unwrap());
+    let proxy = |host: Id| bridge.lock().unwrap().guest_object(fake, host).unwrap();
+    let string = proxy(runtime::send(runtime::class_named("NSString"), "alloc", &[]));
+    let (format, name) = (proxy(crate::fw::string::make("%@ and %@")), proxy(crate::fw::string::make("wizards")));
+    let junk = fake.alloc_permanent(16);
+    fake.write(junk, &0xe7f0_00f0u32.to_le_bytes());
+    let va = fake.alloc_permanent(8);
+    fake.write(va, &[name.to_le_bytes(), junk.to_le_bytes()].concat());
+    let sel = bridge.lock().unwrap().guest_selector(fake, "initWithFormat:arguments:");
+    let made = send(&bridge, fake, &[string, sel, format, va]).expect("the text is made") as u32;
+    let host = bridge.lock().unwrap().host_object(made).unwrap();
+    assert_eq!(crate::fw::string::get(host), "wizards and (null)");
+}
+
 extern "C" fn host_picture_size(_this: Id, _: Sel) -> crate::fw::geometry::Size {
     crate::fw::geometry::Size { width: 3.0, height: 4.0 }
 }

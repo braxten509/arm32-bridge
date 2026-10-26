@@ -616,12 +616,13 @@ fn run_loop_until(run_loop: &'static Loop, until: Option<f64>, once: bool, mode:
         if once && handled {
             return true;
         }
-        // The turn is done: what it animated begins now (Apple's commit).
-        if main {
-            main_work(main, crate::fw::animation::commit);
-        }
         // The game's UIKit pictures go to the phone screen from the main thread.
         let pictures = std::ptr::eq(run_loop, &MAIN_LOOP) && crate::fw::pictures::active();
+        // The turn is done: what it animated begins now (Apple's commit;
+        // with pictures, once their new pictures are made, in their tick).
+        if main && !pictures {
+            main_work(main, crate::fw::animation::commit);
+        }
         if pictures {
             crate::fw::pictures::tick();
         }
@@ -899,6 +900,15 @@ extern "C" fn perform_after_delay(this: Id, _: Sel, selector: Sel, argument: Id,
         delayed.push(object);
     }
     schedule(object, current_loop());
+}
+
+/// Whether a -performSelector:withObject:afterDelay: of `selector` to
+/// `target` is still waiting to run.
+pub fn perform_pending(target: Id, selector: Sel) -> bool {
+    DELAYED.lock().unwrap().iter().any(|&t| {
+        let state = timer(t);
+        state.valid && state.target == target && state.selector == selector
+    })
 }
 
 extern "C" fn perform_after_delay_modes(this: Id, s: Sel, selector: Sel, argument: Id, delay: f64, _modes: Id) {
@@ -1327,6 +1337,26 @@ mod perform_tests {
         .join()
         .unwrap();
         assert_eq!(*MODE_SEEN.lock().unwrap(), ["nil", "kCFRunLoopDefaultMode", "nil"]);
+    }
+
+    /// Whether a delayed perform is still waiting: yes once asked, no after a
+    /// cancel (a game fix checks it for SpellCraft's tutorial lock).
+    #[test]
+    fn a_delayed_perform_is_known_to_be_waiting_until_cancelled() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let class = define_class("PendingTestTarget", "NSObject", 8);
+        methods(class, &[("noteMode:", record_current_mode as usize)]);
+        let target = runtime::send(runtime::send(class, "alloc", &[]), "init", &[]);
+        let note = runtime::sel("noteMode:");
+        assert!(!perform_pending(target, note));
+        let s = runtime::sel("performSelector:withObject:afterDelay:");
+        let f: extern "C" fn(Id, Sel, Sel, Id, f64) = unsafe { std::mem::transmute(runtime::imp_for(target, s).unwrap()) };
+        f(target, s, note, 0, 30.0);
+        assert!(perform_pending(target, note), "waiting");
+        assert!(!perform_pending(target, runtime::sel("other:")), "only that selector");
+        runtime::send(runtime::class_named("NSObject"), "cancelPreviousPerformRequestsWithTarget:", &[target]);
+        assert!(!perform_pending(target, note), "cancelled");
     }
 
     /// A loop mode answers with the same object every time it is asked for,

@@ -62,7 +62,7 @@ pub fn message_stub(g: &dyn GuestSide, types: Option<&str>) -> u32 {
     g.function_address(if in_memory { "objc_msgSend_stret" } else { "objc_msgSend" })
 }
 
-fn u32_at(g: &dyn GuestSide, addr: u32) -> u32 {
+pub(super) fn u32_at(g: &dyn GuestSide, addr: u32) -> u32 {
     u32::from_le_bytes(g.read(addr, 4).try_into().unwrap())
 }
 

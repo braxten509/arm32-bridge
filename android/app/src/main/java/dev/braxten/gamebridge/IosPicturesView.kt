@@ -63,8 +63,13 @@ class IosPicturesView(context: Context) : View(context) {
             use(number, parsed)
             return
         }
+        val asked = System.nanoTime()
         decoder.execute {
             val decoded = missing.associateWith { decode(it) }
+            // TEMP timing: new pictures held a list back this long (and how late its frames start).
+            val now = System.nanoTime()
+            android.util.Log.i("IosPictures", "TEMP ${missing.size} new pictures took ${(now - asked) / 1_000_000} ms; " +
+                "${parsed.frames.size} frames, first ${(now - parsed.frames.first().time) / 1_000_000} ms ago, last in ${(parsed.frames.last().time - now) / 1_000_000} ms")
             post {
                 bitmaps.putAll(decoded)
                 // A newer list may have gone up meanwhile: only its pictures are kept.

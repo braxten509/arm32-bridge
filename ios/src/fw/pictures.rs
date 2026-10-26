@@ -1189,7 +1189,11 @@ fn screen_frames(nodes: &[Node], sampling: Sampling) -> Vec<(f64, Vec<Picture>)>
         let composed = if k == 0 { Some(compose_groups(resolved)) } else { crate::fw::graphics::only_made(|| compose_groups(resolved)) };
         match composed {
             Some(pictures) => out.push((time, pictures)),
-            None => break,
+            None => {
+                // TEMP: coming frames cut short (their groups not made yet).
+                crate::log!("TEMP pictures: {} of {} coming frames (groups not made)", k, sampling.count);
+                break;
+            }
         }
     }
     out
@@ -1214,11 +1218,22 @@ pub fn tick() {
     let soon = DRAW_SOON.load(std::sync::atomic::Ordering::Relaxed);
     // A little under the gap, so a loop woken on time isn't turned away.
     if !soon && last.as_ref().is_some_and(|(at, _)| at.elapsed().as_secs_f64() < gap() * 0.9) {
+        crate::fw::animation::commit();
         return;
     }
     DRAW_SOON.store(false, std::sync::atomic::Ordering::Relaxed);
     let classes = Classes::find();
     let windows = crate::fw::uikit::windows();
+    // As Apple's commit draws new layers' contents before their animations
+    // begin, the new pictures are made first: making them (SpellCraft's spell
+    // panel cards, ~200 ms on the phone) used up a 0.2 s slide before its
+    // first frame was sent.
+    if crate::fw::animation::uncommitted() {
+        let nodes: Vec<Node> = windows.iter().map(|&w| snapshot(w, &classes, 0)).collect();
+        compose_groups(resolve(frames(&nodes, 1).remove(0)));
+        crate::fw::animation::commit();
+    }
+    let made = std::time::Instant::now();
     let (wide, high, _) = crate::fw::uikit::screen_points();
     let now = crate::fw::runloop::media_time();
     let mut sent = SENT.lock().unwrap_or_else(|e| e.into_inner());
@@ -1275,6 +1290,13 @@ pub fn tick() {
             crate::log!("pictures: {} shown:\n{}", pictures.len(), encode((wide, high), &pictures).trim_end());
         } else {
             crate::log!("pictures: {} shown", pictures.len());
+        }
+        if sampling.is_some() {
+            static TOLD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            if TOLD.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40 {
+                // TEMP: how long a moving list took to make after the commit.
+                crate::log!("TEMP pictures: moving list made in {:.0} ms", made.elapsed().as_secs_f64() * 1000.0);
+            }
         }
         (screen.show)(&text);
     }

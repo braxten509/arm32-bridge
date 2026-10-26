@@ -10,7 +10,42 @@ use std::sync::Mutex;
 /// Whether `-[class name]` is followed by a fix (the class name only made
 /// for a selector a fix follows).
 pub(super) fn follows(name: &str, class: impl FnOnce() -> String) -> bool {
-    name == "dialogViewDidClose:" && class() == "SCAlertController"
+    match name {
+        "dialogViewDidClose:" => class() == "SCAlertController",
+        "beginStageInteraction" => class() == "SCTutorialController",
+        _ => false,
+    }
+}
+
+/// After the game method a fix follows (`follows`): `receiver` got it, with
+/// `first` its first argument.
+pub(super) fn after_message(bridge: &Mutex<Bridge>, g: &dyn GuestSide, receiver: u32, first: u32) -> Result<(), String> {
+    let name = {
+        let b = bridge.lock().unwrap_or_else(|e| e.into_inner());
+        b.class_display(super::bridge::u32_at(g, receiver)).0
+    };
+    match name.as_str() {
+        "SCAlertController" => after_dialog_closed(bridge, g, receiver, first),
+        "SCTutorialController" => after_stage_interaction(bridge, g, receiver),
+        _ => Ok(()),
+    }
+}
+
+/// SpellCraft (owner asked): a tutorial step that waits for an event (the
+/// store tab, opened by the game itself) locks the screen to its one control
+/// only 2 s later (-[SCTutorialController beginStageInteraction] performs
+/// -lockControlsAndPlacePointer after a delay), and opening the tab turned
+/// the other tabs back on: a tap on one in those seconds left the step
+/// waiting for a hat that was no longer on screen. While that lock waits,
+/// every control is off, as -lockOutControlsForTransition: does between
+/// steps; the waiting lock turns the step's control on as before.
+fn after_stage_interaction(bridge: &Mutex<Bridge>, g: &dyn GuestSide, tutorial: u32) -> Result<(), String> {
+    let c = Ctx { bridge, g };
+    let host = bridge.lock().unwrap_or_else(|e| e.into_inner()).host_object_for(g, tutorial)?;
+    if crate::fw::runloop::perform_pending(host, crate::objc::runtime::sel("lockControlsAndPlacePointer")) {
+        c.send(tutorial, "lockOutControlsForTransition:", &[1])?;
+    }
+    Ok(())
 }
 
 /// SpellCraft: a story box can line up a next box that shows only once. When
@@ -20,7 +55,7 @@ pub(super) fn follows(name: &str, class: impl FnOnce() -> String) -> bool {
 /// (-[SCTutorialController dialogViewDidClose:]), kept the map locked. A box
 /// with a next box closed and none is showing or lined up: the tutorial goes
 /// on, as it would have when the skipped box closed.
-pub(super) fn after_message(bridge: &Mutex<Bridge>, g: &dyn GuestSide, alert: u32, dialog: u32) -> Result<(), String> {
+fn after_dialog_closed(bridge: &Mutex<Bridge>, g: &dyn GuestSide, alert: u32, dialog: u32) -> Result<(), String> {
     let c = Ctx { bridge, g };
     let key = {
         let host = crate::fw::string::make("nextDialogName");

@@ -919,7 +919,21 @@ fn format_slots(text: &str, mut next: impl FnMut() -> u32, b: &mut dyn Boundary)
                 let low = next();
                 u64::from(low) | u64::from(next()) << 32
             }
-            FormatArg::Object => b.id_to_host(next())? as u64,
+            // A word that is no object shows as (null), as nil does: failing
+            // the message would stop the game's code there (SpellCraft's shop
+            // tutorial did that every frame and its buttons went dead).
+            FormatArg::Object => match b.id_to_host(next()) {
+                Ok(host) => host as u64,
+                Err(error) => {
+                    static TOLD: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+                    let mut told = TOLD.lock().unwrap_or_else(|e| e.into_inner());
+                    if told.len() < 20 && !told.iter().any(|t| t == text) {
+                        told.push(text.to_string());
+                        crate::log!("format \"{text}\": a %@ argument is no object ({error}); shown as (null)");
+                    }
+                    0
+                }
+            },
             FormatArg::Pointer => match next() {
                 0 => 0,
                 g => b.host_address(g) as u64,
