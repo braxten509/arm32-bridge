@@ -410,7 +410,7 @@ extern "C" fn timer_fire(this: Id, _: Sel) {
 // CADisplayLink: a timer at the screen's top refresh rate (IOS_SCREEN_HZ,
 // 120 on the Pixel; 60 when unknown), so no game is held to the 60 Hz of the
 // iPhones it was made for. IOS_REFRESH_HZ=<n> tries another rate.
-fn refresh_seconds() -> f64 {
+pub(crate) fn refresh_seconds() -> f64 {
     static SECONDS: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *SECONDS.get_or_init(|| {
         let hz = refresh_hz(std::env::var("IOS_REFRESH_HZ").ok().as_deref(), std::env::var("IOS_SCREEN_HZ").ok().as_deref());
@@ -629,7 +629,7 @@ fn run_loop_until(run_loop: &'static Loop, until: Option<f64>, once: bool, mode:
         }
         let mut wait_until = next_timer.unwrap_or(current + 0.25);
         if pictures {
-            wait_until = wait_until.min(current + 0.05);
+            wait_until = wait_until.min(current + crate::fw::pictures::gap());
         }
         if let Some(end) = until {
             wait_until = wait_until.min(end);

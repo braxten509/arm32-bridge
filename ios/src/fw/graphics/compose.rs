@@ -44,12 +44,32 @@ struct Made {
 /// What was made, by what it shows.
 static MADE: Mutex<Option<HashMap<String, Made>>> = Mutex::new(None);
 
+thread_local! {
+    /// Coming frames (fw/pictures.rs Sampling) only use what was made: a
+    /// new composite each frame would cost too much. `MISSED` notes a miss.
+    static ONLY_MADE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static MISSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `compose` using only pictures made already: None if it needed a new one.
+pub fn only_made<T>(compose: impl FnOnce() -> T) -> Option<T> {
+    ONLY_MADE.with(|o| o.set(true));
+    MISSED.with(|m| m.set(false));
+    let out = compose();
+    ONLY_MADE.with(|o| o.set(false));
+    (!MISSED.with(|m| m.get())).then_some(out)
+}
+
 /// The file made for `key`: made by `make` the first time it is asked for.
 fn made(key: String, make: impl FnOnce() -> Option<String>) -> Option<String> {
     let check = CHECKS.load(std::sync::atomic::Ordering::Relaxed);
     if let Some(found) = MADE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).get_mut(&key) {
         found.used = check;
         return found.file.clone();
+    }
+    if ONLY_MADE.with(|o| o.get()) {
+        MISSED.with(|m| m.set(true));
+        return None;
     }
     let file = make();
     let mut all = MADE.lock().unwrap_or_else(|e| e.into_inner());

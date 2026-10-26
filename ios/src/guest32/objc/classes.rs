@@ -318,6 +318,15 @@ impl GuestClasses {
         true
     }
 
+    /// A game method's code replaced (game_fixes.rs): answers the old code.
+    pub fn replace_method(&mut self, class: u32, sel: &str, imp: u32) -> Option<u32> {
+        let method = self.classes.get_mut(&class)?.methods.get_mut(sel)?;
+        let old = std::mem::replace(&mut method.imp, imp);
+        self.sends.clear();
+        self.host_sends.clear();
+        Some(old)
+    }
+
     /// class_addMethod: adds unless the class itself already has the selector.
     pub fn add_method(&mut self, class: u32, sel: &str, imp: u32, types: &str) -> bool {
         let Some(c) = self.classes.get_mut(&class) else { return false };

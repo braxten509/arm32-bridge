@@ -851,7 +851,7 @@ pub fn tick() {
 
 /// `only`: tick just this layer's animations (a test's fake clock must not
 /// end other layers' ones).
-fn tick_at(only: Option<Id>, now: f64) {
+pub(crate) fn tick_at(only: Option<Id>, now: f64) {
     let mut started = Vec::new();
     let mut stopped = Vec::new();
     let mut next = f64::INFINITY;
@@ -891,6 +891,7 @@ fn tick_at(only: Option<Id>, now: f64) {
     for (animation, removed) in stopped {
         tell_stopped(animation, true);
         crate::fw::smallclasses::animation_finished(animation);
+        stopped_now(animation, true);
         if removed {
             let_go(animation);
         }
@@ -938,9 +939,9 @@ pub fn reschedule() {
 /// the same key is removed first, a duration of 0 becomes the transaction's
 /// animationDuration, and it starts now unless it has a beginTime; its
 /// start is told on the next turn of the main run loop.
-pub fn add(layer: Id, animation: Id, key: Id) {
+pub fn add(layer: Id, animation: Id, key: Id) -> Id {
     if animation == 0 {
-        return;
+        return 0;
     }
     let key = if key == 0 { None } else { Some(string::get(key)) };
     if key.is_some() {
@@ -957,6 +958,70 @@ pub fn add(layer: Id, animation: Id, key: Id) {
     crate::fw::smallclasses::animation_added(copy);
     running().push(Running { layer, key, animation: copy, started: false, stopped: false });
     wake_at(now);
+    crate::fw::pictures::draw_soon();
+    copy
+}
+
+/// When the last running animation ends (media time; infinity for one that
+/// repeats forever); None when none runs.
+pub fn latest_end() -> Option<f64> {
+    let list: Vec<(Id, Id)> = running().iter().filter(|r| !r.stopped).map(|r| (r.layer, r.animation)).collect();
+    list.into_iter()
+        .map(|(layer, animation)| {
+            let end = timing_of(animation, DEFAULT_DURATION).end();
+            if end.is_finite() { layers::global_time(layer, end).unwrap_or(f64::INFINITY) } else { f64::INFINITY }
+        })
+        .reduce(f64::max)
+}
+
+/// What a UIView animation block asks for (fw/uikit.rs).
+#[derive(Clone, Copy, Debug)]
+pub struct ViewTiming {
+    pub duration: f64,
+    pub delay: f64,
+    pub curve: Curve,
+    pub repeat_count: f64,
+    pub autoreverses: bool,
+}
+
+/// Animates a change UIKit made to a view's layer, as a UIView animation
+/// does: from what showed before (`from`) to the layer's own new value,
+/// keyed by its key path (so it replaces an earlier one), the old value
+/// showing during a delay. Answers the copy running on the layer.
+pub fn animate_view_change(layer: Id, key: &str, from: Value, timing: ViewTiming) -> Id {
+    let animation = runtime::send(runtime::send(runtime::class_named("CABasicAnimation"), "alloc", &[]), "init", &[]);
+    let key = string::make(key);
+    hold(animation, "keyPath", key);
+    hold(animation, "fromValue", boxed_value(from));
+    set_number(animation, "duration", timing.duration);
+    if timing.delay > 0.0 {
+        set_number(animation, "beginTime", layers::local_time(layer, runloop::media_time()) + timing.delay);
+        hold(animation, "fillMode", string::make("backwards"));
+    }
+    set_number(animation, "repeatCount", timing.repeat_count);
+    set_number(animation, "autoreverses", timing.autoreverses as u8 as f64);
+    hold(animation, "timingFunction", make_curve(runtime::class_named("CAMediaTimingFunction"), timing.curve));
+    add(layer, animation, key)
+}
+
+/// What to do once an animation (a layer's copy) stops: finished or
+/// removed before its end (false). Runs on the main thread.
+static WHEN_STOPPED: Mutex<Vec<(Id, Box<dyn FnOnce(bool) + Send>)>> = Mutex::new(Vec::new());
+
+pub fn when_stopped(animation: Id, then: Box<dyn FnOnce(bool) + Send>) {
+    WHEN_STOPPED.lock().unwrap_or_else(|e| e.into_inner()).push((animation, then));
+}
+
+fn stopped_now(animation: Id, finished: bool) {
+    let due: Vec<_> = {
+        let mut waiting = WHEN_STOPPED.lock().unwrap_or_else(|e| e.into_inner());
+        let (due, rest) = std::mem::take(&mut *waiting).into_iter().partition(|(a, _)| *a == animation);
+        *waiting = rest;
+        due
+    };
+    for (_, then) in due {
+        then(finished);
+    }
 }
 
 /// Removes animations; those that hadn't ended tell their delegate
@@ -976,6 +1041,7 @@ fn remove_where(matches: impl Fn(&Running) -> bool) {
             if !stopped {
                 tell_stopped(animation, false);
                 crate::fw::smallclasses::animation_finished(animation);
+                stopped_now(animation, false);
             }
             let_go(animation);
         })));

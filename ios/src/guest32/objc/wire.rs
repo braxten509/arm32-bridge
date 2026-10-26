@@ -139,6 +139,7 @@ fn ui_application_main(uc: &mut Uc, args: &mut Args) -> Ret {
         runtime::stop_with_fault(uc, "UIApplicationMain before the Objective-C bridge was set up".into());
         return Ret::Void;
     };
+    super::game_fixes::install(uc, bridge);
     let host_strings = |guest: u32| -> Result<usize, String> {
         bridge.lock().unwrap_or_else(|e| e.into_inner()).host_object_for(&Translator, guest)
     };
@@ -199,6 +200,22 @@ pub fn register() {
     super::super::function(exceptions::ANSWER_FALSE, |_, _| Ret::U32(0));
     super::super::function(exceptions::DO_CATCH, exception_do_catch);
     super::super::function(exceptions::TERMINATE, exception_terminate);
+    super::super::function(super::game_fixes::RENDER_LOOP, |uc, args| {
+        let renderer = args.u32();
+        with_context(uc, |uc, c| {
+            if let Err(error) = super::game_fixes::render_loop(c, renderer) {
+                runtime::stop_with_fault(uc, format!("SpellCraft render loop: {error}"));
+            }
+            Ret::Void
+        })
+    });
+    super::super::function(super::game_fixes::NODE_TRANSFORM, |uc, args| {
+        let (animation, node, frame, out) = (args.u32(), args.u32(), args.u32(), args.u32());
+        if let Err(error) = super::game_fixes::node_transform(uc, animation, node, frame, out) {
+            runtime::stop_with_fault(uc, format!("SpellCraft nodeTransform: {error}"));
+        }
+        Ret::Void
+    });
     super::super::function(exceptions::BARRIER, |_, args| {
         let (_version, actions, _class_low, _class_high, exception, context) = (args.u32(), args.u32(), args.u32(), args.u32(), args.u32(), args.u32());
         Ret::U32(exceptions::barrier_personality(actions, exception, context))

@@ -530,7 +530,14 @@ pub fn view_state(view: Id) -> &'static mut ViewState {
 }
 
 property!(view_hidden, view_set_hidden, "hidden", bool, false);
-property!(view_alpha, view_set_alpha, "alpha", f64, 1.0);
+extern "C" fn view_alpha(this: Id, _: Sel) -> f64 {
+    property_get(this, "alpha").map(f64::from_bits).unwrap_or(1.0)
+}
+
+extern "C" fn view_set_alpha(this: Id, _: Sel, value: f64) {
+    will_change(this, "opacity");
+    property_set(this, "alpha", value.to_bits());
+}
 property!(view_user_interaction, view_set_user_interaction, "userInteraction", bool, true);
 
 extern "C" fn image_view_user_interaction(this: Id, _: Sel) -> bool {
@@ -589,6 +596,7 @@ extern "C" fn view_frame(this: Id, _: Sel) -> Rect {
 }
 
 extern "C" fn view_set_frame(this: Id, _: Sel, frame: Rect) {
+    will_change(this, "position");
     let state = view_state(this);
     let old = state.frame.size;
     state.frame = frame;
@@ -641,6 +649,7 @@ extern "C" fn window_set_frame(this: Id, selector: Sel, frame: Rect) {
 /// New bounds keep the view's center (its layer's position, at the layer's
 /// anchor point) where it is.
 extern "C" fn view_set_bounds(this: Id, _: Sel, bounds: Rect) {
+    will_change(this, "position");
     let center = view_center(this, 0);
     let anchor = crate::fw::layers::view_anchor(this);
     let state = view_state(this);
@@ -662,6 +671,7 @@ extern "C" fn view_center(this: Id, _: Sel) -> Point {
 }
 
 extern "C" fn view_set_center(this: Id, _: Sel, center: Point) {
+    will_change(this, "position");
     let anchor = crate::fw::layers::view_anchor(this);
     let state = view_state(this);
     state.frame.origin = Point { x: center.x - state.frame.size.width * anchor.x, y: center.y - state.frame.size.height * anchor.y };
@@ -672,6 +682,7 @@ extern "C" fn view_transform(this: Id, _: Sel) -> Transform {
 }
 
 extern "C" fn view_set_transform(this: Id, _: Sel, transform: Transform) {
+    will_change(this, "transform");
     view_state(this).transform = transform;
 }
 
@@ -1063,48 +1074,206 @@ extern "C" fn view_convert_rect_to(this: Id, _: Sel, rect: Rect, other: Id) -> R
     convert_rect(conversion(this, other, this), rect)
 }
 
-// ----- block animations: nothing moves on screen here, so the changes the
-// animations block makes take effect at once and the completion block is
-// told the animation finished (YES) on the next turn of the main run loop,
-// as UIKit calls it after the animation. -----
+// ----- UIView animations: as in UIKit, what an animations block (or an
+// iOS 3 style +beginAnimations:context: ... +commitAnimations block)
+// changes on a view (its center or frame's place, transform, alpha) takes
+// the new value at once, and the view's layer gets a Core Animation
+// animation from what showed before (fw/animation.rs), so it moves on
+// screen over the block's duration, after its delay, along its curve.
+// The completion block hears finished = YES when they all end (NO when one
+// was removed or replaced first); a block that animates nothing hears YES
+// on the next turn of the main run loop. Sizes change at once. -----
 
-/// Runs `animations` now and hands the completion call to `later`.
-fn animate_with(animations: usize, completion: usize, later: impl FnOnce(Box<dyn FnOnce() + Send>)) {
+/// One open animation block: its settings, what it changed (view, key
+/// path, the value shown before) and the sizes of the views it moved.
+struct OpenBlock {
+    timing: crate::fw::animation::ViewTiming,
+    changes: Vec<(Id, &'static str, crate::fw::animation::Value)>,
+    sizes: Vec<(Id, Size)>,
+}
+
+thread_local! {
+    /// Each thread's open blocks, as Core Animation keeps a transaction per thread.
+    static OPEN_BLOCKS: std::cell::RefCell<Vec<OpenBlock>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// +setAnimationsEnabled: (and performWithoutAnimation:).
+static ANIMATIONS_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+fn with_open_blocks<R>(f: impl FnOnce(&mut Vec<OpenBlock>) -> R) -> R {
+    OPEN_BLOCKS.with(|blocks| f(&mut blocks.borrow_mut()))
+}
+
+/// What the view's layer shows of `key` now (its animations included).
+fn shown_value(view: Id, key: &str) -> crate::fw::animation::Value {
+    use crate::fw::animation::{presented, Shown, Value};
+    let model = Shown { opacity: view_alpha(view, 0), position: view_center(view, 0), transform: view_state(view).transform };
+    let layer = view_state(view).layer;
+    let shown = if layer == 0 { model } else { presented(layer, model) };
+    match key {
+        "opacity" => Value::Number(shown.opacity),
+        "transform" => Value::Transform(crate::fw::layers::affine_to_3d(shown.transform)),
+        _ => Value::Point(shown.position),
+    }
+}
+
+/// A setter is about to change `key` of the view: an open animation block
+/// notes what showed before (once per view and key).
+fn will_change(view: Id, key: &'static str) {
+    if !ANIMATIONS_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let noted = with_open_blocks(|blocks| blocks.last().map(|block| block.changes.iter().any(|&(v, k, _)| v == view && k == key)));
+    match noted {
+        None | Some(true) => {}
+        Some(false) => {
+            let before = shown_value(view, key);
+            let size = view_state(view).frame.size;
+            with_open_blocks(|blocks| {
+                if let Some(block) = blocks.last_mut() {
+                    block.changes.push((view, key, before));
+                    if key == "position" {
+                        block.sizes.push((view, size));
+                    }
+                }
+            });
+        }
+    }
+}
+
+/// UIViewAnimationOptions / UIViewAnimationCurve as a timing curve.
+fn view_curve(curve: usize) -> crate::fw::animation::Curve {
+    use crate::fw::animation::Curve;
+    Curve::named(match curve & 3 {
+        1 => "easeIn",
+        2 => "easeOut",
+        3 => "linear",
+        _ => "easeInEaseOut",
+    })
+    .unwrap_or(Curve::LINEAR)
+}
+
+fn view_timing(duration: f64, delay: f64, options: usize) -> crate::fw::animation::ViewTiming {
+    const REPEAT: usize = 1 << 3;
+    const AUTOREVERSE: usize = 1 << 4;
+    crate::fw::animation::ViewTiming {
+        duration,
+        delay: delay.max(0.0),
+        curve: view_curve(options >> 16),
+        repeat_count: if options & REPEAT != 0 { f64::INFINITY } else { 0.0 },
+        autoreverses: options & AUTOREVERSE != 0,
+    }
+}
+
+fn open_block(timing: crate::fw::animation::ViewTiming) {
+    with_open_blocks(|blocks| blocks.push(OpenBlock { timing, changes: Vec::new(), sizes: Vec::new() }));
+}
+
+/// Closes the innermost block: each change that left a different value
+/// gets its animation. A view whose size changed too moves at once (its
+/// size isn't animated here, and its middle sliding while the size jumps
+/// looks worse). Answers the animations started.
+fn close_block() -> Vec<Id> {
+    let Some(block) = with_open_blocks(|blocks| blocks.pop()) else { return Vec::new() };
+    if block.timing.duration <= 0.0 {
+        return Vec::new();
+    }
+    let mut started = Vec::new();
+    for (view, key, before) in block.changes {
+        if key == "position" && block.sizes.iter().any(|&(v, size)| v == view && size != view_state(view).frame.size) {
+            continue;
+        }
+        let model = {
+            use crate::fw::animation::Value;
+            match key {
+                "opacity" => Value::Number(view_alpha(view, 0)),
+                "transform" => Value::Transform(crate::fw::layers::affine_to_3d(view_state(view).transform)),
+                _ => Value::Point(view_center(view, 0)),
+            }
+        };
+        if model == before {
+            continue;
+        }
+        if view_state(view).layer == 0 {
+            make_layer_for(view);
+        }
+        let copy = crate::fw::animation::animate_view_change(view_state(view).layer, key, before, block.timing);
+        if copy != 0 {
+            started.push(copy);
+        }
+    }
+    started
+}
+
+/// Runs `done` (finished = all ended on their own) once every animation in
+/// `started` stops, or through `later` when none started.
+fn when_all_stopped(started: Vec<Id>, done: Box<dyn FnOnce(bool) + Send>, later: impl FnOnce(Box<dyn FnOnce() + Send>)) {
+    if started.is_empty() {
+        later(Box::new(move || done(true)));
+        return;
+    }
+    let left = std::sync::Arc::new(Mutex::new((started.len(), true, Some(done))));
+    for animation in started {
+        let left = left.clone();
+        crate::fw::animation::when_stopped(
+            animation,
+            Box::new(move |finished| {
+                let done = {
+                    let mut left = left.lock().unwrap_or_else(|e| e.into_inner());
+                    left.0 -= 1;
+                    left.1 &= finished;
+                    if left.0 == 0 { left.2.take().map(|done| (done, left.1)) } else { None }
+                };
+                if let Some((done, finished)) = done {
+                    done(finished);
+                }
+            }),
+        );
+    }
+}
+
+/// Runs `animations` as an animation block and hands the completion call
+/// to `later` when nothing was animated.
+fn animate_with(timing: crate::fw::animation::ViewTiming, animations: usize, completion: usize, later: impl FnOnce(Box<dyn FnOnce() + Send>)) {
+    open_block(timing);
     if animations != 0 {
         unsafe { crate::libsystem::mach::call_block(animations) };
     }
+    let started = close_block();
     if completion != 0 {
         let block = crate::libsystem::mach::block_copy(completion as *mut _) as usize;
-        later(Box::new(move || {
+        let done = Box::new(move |finished: bool| {
             let header = block as *const crate::libsystem::mach::BlockHeader;
             let invoke: extern "C" fn(usize, u8) = unsafe { std::mem::transmute((*header).invoke) };
-            invoke(block, 1);
-        }));
+            invoke(block, finished as u8);
+        });
+        when_all_stopped(started, done, later);
     }
 }
 
-fn animate(animations: usize, completion: usize) {
-    animate_with(animations, completion, |work| crate::fw::runloop::post(crate::fw::runloop::Work::Native(work)));
+fn animate(timing: crate::fw::animation::ViewTiming, animations: usize, completion: usize) {
+    animate_with(timing, animations, completion, |work| crate::fw::runloop::post(crate::fw::runloop::Work::Native(work)));
 }
 
-extern "C" fn animate_simple(_: Class, _: Sel, _duration: f64, animations: usize) {
-    animate(animations, 0);
+extern "C" fn animate_simple(_: Class, _: Sel, duration: f64, animations: usize) {
+    animate(view_timing(duration, 0.0, 0), animations, 0);
 }
 
-extern "C" fn animate_completion(_: Class, _: Sel, _duration: f64, animations: usize, completion: usize) {
-    animate(animations, completion);
+extern "C" fn animate_completion(_: Class, _: Sel, duration: f64, animations: usize, completion: usize) {
+    animate(view_timing(duration, 0.0, 0), animations, completion);
 }
 
-extern "C" fn animate_delay(_: Class, _: Sel, _duration: f64, _delay: f64, _options: usize, animations: usize, completion: usize) {
-    animate(animations, completion);
+extern "C" fn animate_delay(_: Class, _: Sel, duration: f64, delay: f64, options: usize, animations: usize, completion: usize) {
+    animate(view_timing(duration, delay, options), animations, completion);
 }
 
 // ----- iOS 3 style animations: +beginAnimations:context: opens a block
 // (blocks nest), the +setAnimation… calls set up the innermost one and
-// +commitAnimations closes it. As with block animations the changes take
-// effect at once; the delegate's will-start and did-stop selectors are
-// sent on the next turn of the main run loop, did-stop with the block's id,
-// finished = YES and its context (animationDidStop:finished:context:). -----
+// +commitAnimations closes it, animating as above (0.2 s, ease in-out
+// unless set). The delegate's will-start selector is sent on the next turn
+// of the main run loop, its did-stop selector when the animations end (on
+// the next turn when none started), with the block's id, finished and its
+// context (animationDidStop:finished:context:). -----
 
 #[derive(Clone, Copy)]
 struct OldAnimation {
@@ -1123,10 +1292,19 @@ fn with_open_animation(change: impl FnOnce(&mut OldAnimation)) {
     }
 }
 
+fn with_open_timing(change: impl FnOnce(&mut crate::fw::animation::ViewTiming)) {
+    with_open_blocks(|blocks| {
+        if let Some(block) = blocks.last_mut() {
+            change(&mut block.timing);
+        }
+    });
+}
+
 extern "C" fn begin_animations(_: Class, _: Sel, id: Id, context: usize) {
     runtime::send(id, "retain", &[]);
     let open = OldAnimation { id, context, delegate: 0, will_start: 0, did_stop: 0 };
     OLD_ANIMATIONS.lock().unwrap_or_else(|e| e.into_inner()).push(open);
+    open_block(view_timing(0.2, 0.0, 0));
 }
 
 extern "C" fn set_animation_delegate(_: Class, _: Sel, delegate: Id) {
@@ -1141,6 +1319,34 @@ extern "C" fn set_animation_did_stop(_: Class, _: Sel, selector: Sel) {
     with_open_animation(|open| open.did_stop = selector);
 }
 
+extern "C" fn set_animation_duration(_: Class, _: Sel, value: f64) {
+    with_open_timing(|timing| timing.duration = value);
+}
+
+extern "C" fn set_animation_delay(_: Class, _: Sel, value: f64) {
+    with_open_timing(|timing| timing.delay = value.max(0.0));
+}
+
+extern "C" fn set_animation_curve(_: Class, _: Sel, curve: usize) {
+    with_open_timing(|timing| timing.curve = view_curve(curve));
+}
+
+extern "C" fn set_animation_repeat_count(_: Class, _: Sel, value: f32) {
+    with_open_timing(|timing| timing.repeat_count = value as f64);
+}
+
+extern "C" fn set_animation_repeat_autoreverses(_: Class, _: Sel, value: u8) {
+    with_open_timing(|timing| timing.autoreverses = value != 0);
+}
+
+extern "C" fn set_animations_enabled(_: Class, _: Sel, value: u8) {
+    ANIMATIONS_ENABLED.store(value != 0, std::sync::atomic::Ordering::Relaxed);
+}
+
+extern "C" fn animations_enabled(_: Class, _: Sel) -> bool {
+    ANIMATIONS_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Sends `selector` with as many of `args` as its name has colons.
 fn send_to_delegate(delegate: Id, selector: Sel, args: &[usize]) {
     if selector == 0 {
@@ -1151,29 +1357,39 @@ fn send_to_delegate(delegate: Id, selector: Sel, args: &[usize]) {
     runtime::send(delegate, &name, &args[..count]);
 }
 
-/// +commitAnimations: closes the innermost block and hands its delegate calls to `later`.
-fn commit_old_animation(later: impl FnOnce(Box<dyn FnOnce() + Send>)) {
+/// +commitAnimations: closes the innermost block; delegate calls that come
+/// on the next run-loop turn go to `later`.
+fn commit_old_animation(mut later: impl FnMut(Box<dyn FnOnce() + Send>)) {
     let Some(done) = OLD_ANIMATIONS.lock().unwrap_or_else(|e| e.into_inner()).pop() else { return };
+    let started = close_block();
     if done.delegate == 0 || (done.will_start == 0 && done.did_stop == 0) {
         runtime::send(done.id, "release", &[]);
         return;
     }
     runtime::send(done.delegate, "retain", &[]);
-    later(Box::new(move || {
-        send_to_delegate(done.delegate, done.will_start, &[done.id, done.context]);
-        send_to_delegate(done.delegate, done.did_stop, &[done.id, collections::number_bool(true), done.context]);
+    if started.is_empty() {
+        later(Box::new(move || {
+            send_to_delegate(done.delegate, done.will_start, &[done.id, done.context]);
+            send_to_delegate(done.delegate, done.did_stop, &[done.id, collections::number_bool(true), done.context]);
+            runtime::send(done.delegate, "release", &[]);
+            runtime::send(done.id, "release", &[]);
+        }));
+        return;
+    }
+    later(Box::new(move || send_to_delegate(done.delegate, done.will_start, &[done.id, done.context])));
+    let stop = Box::new(move |finished: bool| {
+        send_to_delegate(done.delegate, done.did_stop, &[done.id, collections::number_bool(finished), done.context]);
         runtime::send(done.delegate, "release", &[]);
         runtime::send(done.id, "release", &[]);
-    }));
+    });
+    when_all_stopped(started, stop, |_| {});
 }
 
 extern "C" fn commit_animations(_: Class, _: Sel) {
     commit_old_animation(|work| crate::fw::runloop::post(crate::fw::runloop::Work::Native(work)));
 }
 
-// Timing and curve settings: nothing moves on screen here.
-extern "C" fn ignore_class_double(_: Class, _: Sel, _value: f64) {}
-extern "C" fn ignore_class_float(_: Class, _: Sel, _value: f32) {}
+// Settings with nothing to show here.
 extern "C" fn ignore_class_word(_: Class, _: Sel, _value: usize) {}
 extern "C" fn ignore_animation_transition(_: Class, _: Sel, _transition: usize, _view: Id, _cache: u8) {}
 
@@ -1181,19 +1397,35 @@ extern "C" fn ignore_animation_transition(_: Class, _: Sel, _transition: usize, 
 extern "C" fn animate_spring(
     _: Class,
     _: Sel,
-    _duration: f64,
-    _delay: f64,
+    duration: f64,
+    delay: f64,
     _damping: f64,
     _velocity: f64,
-    _options: usize,
+    options: usize,
     animations: usize,
     completion: usize,
 ) {
-    animate(animations, completion);
+    // A spring settles fast and slows into place: ease-out, unless the options pick a curve.
+    let options = if options >> 16 & 3 == 0 { options | 2 << 16 } else { options };
+    animate(view_timing(duration, delay, options), animations, completion);
 }
 
-extern "C" fn transition_with_view(_: Class, _: Sel, _view: Id, _duration: f64, _options: usize, animations: usize, completion: usize) {
-    animate(animations, completion);
+/// As UIKit: the animations block's changes aren't animated one by one
+/// (the view's contents cross-fade or flip as a whole, which isn't drawn
+/// here, so they show at once); the completion comes after the duration.
+extern "C" fn transition_with_view(_: Class, _: Sel, _view: Id, duration: f64, options: usize, animations: usize, completion: usize) {
+    if let Some(seconds) = transition_fade(duration, options) {
+        crate::fw::pictures::cross_fade(seconds);
+    }
+    animate_with(view_timing(0.0, 0.0, 0), animations, completion, |work| crate::fw::runloop::post_after(duration.max(0.0), work));
+}
+
+/// How long the screen fades for a view or controller transition with
+/// these options (UIViewAnimationOptionTransition*, bits 20-22): the
+/// cross-dissolve as asked; flips and curls cross-dissolve too (not drawn
+/// here). None for no transition or no time.
+pub(crate) fn transition_fade(duration: f64, options: usize) -> Option<f64> {
+    (duration > 0.0 && (options >> 20) & 7 != 0).then_some(duration)
 }
 
 /// UIViewAnimationOptionShowHideTransitionViews: hide/show instead of
@@ -1202,7 +1434,10 @@ const SHOW_HIDE_TRANSITION_VIEWS: usize = 1 << 8;
 
 /// transitionFromView:toView:: toView takes fromView's place in its
 /// superview (or, with ShowHideTransitionViews, one is hidden and the other shown).
-extern "C" fn transition_from_view(_: Class, _: Sel, from: Id, to: Id, _duration: f64, options: usize, completion: usize) {
+extern "C" fn transition_from_view(_: Class, _: Sel, from: Id, to: Id, duration: f64, options: usize, completion: usize) {
+    if let Some(seconds) = transition_fade(duration, options) {
+        crate::fw::pictures::cross_fade(seconds);
+    }
     if options & SHOW_HIDE_TRANSITION_VIEWS != 0 {
         property_set(from, "hidden", 1);
         property_set(to, "hidden", 0);
@@ -1214,16 +1449,53 @@ extern "C" fn transition_from_view(_: Class, _: Sel, from: Id, to: Id, _duration
         }
         runtime::send(from, "removeFromSuperview", &[]);
     }
-    animate(0, completion);
+    animate(view_timing(0.0, 0.0, 0), 0, completion);
 }
 
 extern "C" fn perform_without_animation(_: Class, _: Sel, actions: usize) {
-    animate(actions, 0);
+    let was = ANIMATIONS_ENABLED.swap(false, std::sync::atomic::Ordering::Relaxed);
+    animate(view_timing(0.0, 0.0, 0), actions, 0);
+    ANIMATIONS_ENABLED.store(was, std::sync::atomic::Ordering::Relaxed);
 }
 
 extern "C" fn ignore_class_bool(_: Class, _: Sel, _value: u8) {}
-extern "C" fn class_yes(_: Class, _: Sel) -> bool {
-    true
+
+// ----- -beginIgnoringInteractionEvents / -endIgnoringInteractionEvents:
+// while they nest above zero, new touches go nowhere (games wrap screen
+// changes and closing boxes in them). A game that never ends them would
+// lock the screen for good: after 3 s touches come back (and the log says
+// so). -----
+
+static IGNORING: Mutex<(usize, Option<std::time::Instant>)> = Mutex::new((0, None));
+
+extern "C" fn begin_ignoring_interaction(_this: Id, _: Sel) {
+    let mut ignoring = IGNORING.lock().unwrap_or_else(|e| e.into_inner());
+    if ignoring.0 == 0 {
+        ignoring.1 = Some(std::time::Instant::now());
+    }
+    ignoring.0 += 1;
+}
+
+extern "C" fn end_ignoring_interaction(_this: Id, _: Sel) {
+    let mut ignoring = IGNORING.lock().unwrap_or_else(|e| e.into_inner());
+    ignoring.0 = ignoring.0.saturating_sub(1);
+}
+
+extern "C" fn is_ignoring_interaction(_this: Id, _: Sel) -> bool {
+    ignoring_touches()
+}
+
+/// Whether new touches are ignored now.
+pub fn ignoring_touches() -> bool {
+    let mut ignoring = IGNORING.lock().unwrap_or_else(|e| e.into_inner());
+    match ignoring.1 {
+        Some(since) if ignoring.0 > 0 && since.elapsed().as_secs_f64() > 3.0 => {
+            crate::log!("touches were ignored for 3 s (beginIgnoringInteractionEvents without its end): taking them again");
+            *ignoring = (0, None);
+            false
+        }
+        _ => ignoring.0 > 0,
+    }
 }
 
 // ----- windows -----
@@ -1939,8 +2211,11 @@ pub(crate) extern "C" fn controller_transition(_this: Id, _: Sel, from: Id, to: 
             attach(parent, to_view, index.map(|i| i + 1));
         }
     }
+    if let Some(seconds) = transition_fade(duration, options) {
+        crate::fw::pictures::cross_fade(seconds);
+    }
     let completion = if completion == 0 { 0 } else { crate::libsystem::mach::block_copy(completion as *mut _) as usize };
-    animate_with(animations, 0, |_| {});
+    animate_with(view_timing(duration, 0.0, options), animations, 0, |_| {});
     crate::fw::runloop::post_after(
         duration.max(0.0),
         Box::new(move || {
@@ -2499,16 +2774,16 @@ pub fn register(r: &mut Registry) {
             ("setAnimationDelegate:", set_animation_delegate as usize),
             ("setAnimationWillStartSelector:", set_animation_will_start as usize),
             ("setAnimationDidStopSelector:", set_animation_did_stop as usize),
-            ("setAnimationDuration:", ignore_class_double as usize),
-            ("setAnimationDelay:", ignore_class_double as usize),
+            ("setAnimationDuration:", set_animation_duration as usize),
+            ("setAnimationDelay:", set_animation_delay as usize),
             ("setAnimationStartDate:", ignore_class_word as usize),
-            ("setAnimationCurve:", ignore_class_word as usize),
-            ("setAnimationRepeatCount:", ignore_class_float as usize),
-            ("setAnimationRepeatAutoreverses:", ignore_class_bool as usize),
+            ("setAnimationCurve:", set_animation_curve as usize),
+            ("setAnimationRepeatCount:", set_animation_repeat_count as usize),
+            ("setAnimationRepeatAutoreverses:", set_animation_repeat_autoreverses as usize),
             ("setAnimationBeginsFromCurrentState:", ignore_class_bool as usize),
             ("setAnimationTransition:forView:cache:", ignore_animation_transition as usize),
-            ("setAnimationsEnabled:", ignore_class_bool as usize),
-            ("areAnimationsEnabled", class_yes as usize),
+            ("setAnimationsEnabled:", set_animations_enabled as usize),
+            ("areAnimationsEnabled", animations_enabled as usize),
         ],
     );
     methods(
@@ -2791,8 +3066,9 @@ pub fn register(r: &mut Registry) {
             ("presentLocalNotificationNow:", ignore_id as usize),
             ("beginReceivingRemoteControlEvents", nothing as usize),
             ("endReceivingRemoteControlEvents", nothing as usize),
-            ("beginIgnoringInteractionEvents", nothing as usize),
-            ("endIgnoringInteractionEvents", nothing as usize),
+            ("beginIgnoringInteractionEvents", begin_ignoring_interaction as usize),
+            ("endIgnoringInteractionEvents", end_ignoring_interaction as usize),
+            ("isIgnoringInteractionEvents", is_ignoring_interaction as usize),
         ],
     );
     r.data("UIWindowLevelNormal", leak(0.0f64));
@@ -3109,7 +3385,7 @@ mod tests {
             descriptor: DESCRIPTOR.as_ptr() as usize,
         });
         let mut queued: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
-        animate_with(animations, completion, |work| queued.push(work));
+        animate_with(view_timing(0.3, 0.0, 0), animations, completion, |work| queued.push(work));
         assert_eq!(RAN.load(std::sync::atomic::Ordering::SeqCst), 5, "animations block runs at once");
         assert_eq!((FINISHED.load(std::sync::atomic::Ordering::SeqCst), queued.len()), (0, 1), "completion waits");
         queued.pop().unwrap()();
@@ -3173,6 +3449,102 @@ mod tests {
         commit_old_animation(|work| queued.push(work));
         commit_old_animation(|work| queued.push(work));
         assert!(queued.is_empty());
+    }
+
+    /// UIView animations move views on screen as on iOS: the view takes its
+    /// new values at once, its layer shows the way there from the old ones
+    /// over the duration (after the delay, along the options' curve), and
+    /// the completion block (or an iOS 3 style block's delegate) hears
+    /// finished = YES when the animations end, not before.
+    #[test]
+    fn view_animations_show_the_way_and_finish_at_the_end() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        static FINISHED: AtomicUsize = AtomicUsize::new(0);
+        static STOPPED: AtomicUsize = AtomicUsize::new(0);
+        let view = runtime::send(runtime::class_named("UIView"), "alloc", &[]);
+        send_rect(view, "initWithFrame:", Rect::new(0.0, 0.0, 100.0, 100.0));
+        let layer = view_state(view).layer;
+        let shown = |t: f64| {
+            let model = crate::fw::animation::Shown { opacity: view_alpha(view, 0), position: view_center(view, 0), transform: view_state(view).transform };
+            crate::fw::animation::presented_at(layer, model, t)
+        };
+        #[repr(C)]
+        struct Completion {
+            isa: usize,
+            flags: i32,
+            reserved: i32,
+            invoke: usize,
+            descriptor: usize,
+        }
+        extern "C" fn completion_invoke(_block: usize, finished: u8) {
+            FINISHED.store(1 + finished as usize, SeqCst);
+        }
+        static DESCRIPTOR: [usize; 2] = [0, std::mem::size_of::<Completion>()];
+        let completion = leak(Completion { isa: 0, flags: 1 << 28, reserved: 0, invoke: completion_invoke as usize, descriptor: DESCRIPTOR.as_ptr() as usize });
+        let animations = crate::fw::media::make_callback(view, |v| {
+            view_set_center(v, 0, Point { x: 250.0, y: 50.0 });
+            view_set_alpha(v, 0, 0.0);
+        });
+        const LINEAR: usize = 3 << 16;
+        let start = crate::fw::runloop::media_time();
+        animate_delay(0, 0, 0.4, 0.1, LINEAR, animations, completion);
+        assert_eq!((view_center(view, 0), view_alpha(view, 0)), (Point { x: 250.0, y: 50.0 }, 0.0), "the view takes its new values at once");
+        let waiting = shown(start + 0.05);
+        assert!((waiting.position.x - 50.0).abs() < 1.0 && waiting.opacity > 0.99, "the old values show during the delay: {waiting:?}");
+        let half = shown(start + 0.3);
+        assert!((half.position.x - 150.0).abs() < 2.0 && (half.opacity - 0.5).abs() < 0.02, "halfway along a straight curve: {half:?}");
+        crate::fw::animation::tick_at(Some(layer), start + 0.3);
+        assert_eq!(FINISHED.load(SeqCst), 0, "not finished halfway");
+        crate::fw::animation::tick_at(Some(layer), start + 0.55);
+        assert_eq!(FINISHED.load(SeqCst), 2, "finished = YES once they end");
+        assert_eq!(shown(start + 0.6).position.x, 250.0, "the new values show after the end");
+
+        // iOS 3 style: the block's own duration and curve; its delegate hears did-stop at the end.
+        extern "C" fn stopped(_: Id, _: Sel, _id: Id, finished: Id, _context: usize) {
+            STOPPED.store(1 + (collections::number_as_f64(finished) != 0.0) as usize, SeqCst);
+        }
+        let class = define_class("G32MovingViewDelegate", "NSObject", 8);
+        methods(class, &[("animationDidStop:finished:context:", stopped as usize)]);
+        let delegate = runtime::send(runtime::send(class, "alloc", &[]), "init", &[]);
+        let uiview = runtime::class_named("UIView");
+        let send_f64 = |name: &str, value: f64| {
+            let sel = runtime::sel(name);
+            let imp = runtime::imp_for(uiview, sel).expect(name);
+            let f: extern "C" fn(Class, Sel, f64) = unsafe { std::mem::transmute(imp) };
+            f(uiview, sel, value)
+        };
+        runtime::send(uiview, "beginAnimations:context:", &[0, 0]);
+        send_f64("setAnimationDuration:", 0.3);
+        runtime::send(uiview, "setAnimationCurve:", &[3]);
+        runtime::send(uiview, "setAnimationDelegate:", &[delegate]);
+        runtime::send(uiview, "setAnimationDidStopSelector:", &[runtime::sel("animationDidStop:finished:context:")]);
+        view_set_center(view, 0, Point { x: 50.0, y: 50.0 });
+        let start = crate::fw::runloop::media_time();
+        runtime::send(uiview, "commitAnimations", &[]);
+        let half = shown(start + 0.15);
+        assert!((half.position.x - 150.0).abs() < 2.0, "halfway back: {half:?}");
+        crate::fw::animation::tick_at(Some(layer), start + 0.1);
+        assert_eq!(STOPPED.load(SeqCst), 0, "the delegate waits for the end");
+        crate::fw::animation::tick_at(Some(layer), start + 0.35);
+        assert_eq!(STOPPED.load(SeqCst), 2, "did-stop with finished = YES at the end");
+
+        // A view resized as it moves goes there at once: its size isn't
+        // animated, and its middle sliding while the size jumps looks worse.
+        let resize = crate::fw::media::make_callback(view, |v| send_rect(v, "setFrame:", Rect::new(300.0, 0.0, 40.0, 100.0)));
+        let start = crate::fw::runloop::media_time();
+        animate_delay(0, 0, 0.4, 0.0, LINEAR, resize, 0);
+        assert_eq!(shown(start + 0.2).position, Point { x: 320.0, y: 50.0 }, "resized: no slide");
+
+        // While the app ignores interaction events, new touches go nowhere.
+        // (UIApplication's methods; no shared application in a test.)
+        begin_ignoring_interaction(0, 0);
+        begin_ignoring_interaction(0, 0);
+        end_ignoring_interaction(0, 0);
+        assert!(ignoring_touches(), "the calls nest");
+        end_ignoring_interaction(0, 0);
+        assert!(!ignoring_touches());
     }
 
     /// UIView's move hooks, in UIKit's order: the moving view (and the views

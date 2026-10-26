@@ -356,3 +356,145 @@ Longer notes and raw numbers: `~/.cache/ios-debug/spellcraft/DEBUGGING-clunky.md
   adds a new nib-loaded SCPlayerView each pass, so the loop re-ran every frame
   and stacked portraits; each fight HUD tick then walked the bloated tree.
   Committed locally on ios/spellcraft (not pushed).
+
+## Continuation 2026-10-26 (later): 120 Hz and smoother screens
+
+Owner, after the fight fix: "Fights are much much better! However, the
+screen transition is still a little clunky. Also, I need you to update the
+game to 120hz ... you have permission to alter the game to make it run more
+like a modern one. A lot of clunkiness could just be the game, so please
+update anything like that. The phone won't be available." Away mode: no
+questions, no phone; decisions logged here.
+
+Findings:
+- Our UIView animations never moved: animateWithDuration and begin/commit
+  applied changes at once (completion next turn). Every dialog, panel, card
+  drag and popup in SpellCraft jumped. (uikit.rs "block animations".)
+- UIKit pictures go to the phone at most 20 times a second (pictures::tick
+  50 ms gate); Core Animation values are sampled only then.
+- IosPicturesView decodes new pictures on the phone's UI thread inside
+  show(), and drops every bitmap not in the current list.
+- Opus t56 RE (notes and scripts: ~/.cache/ios-debug/spellcraft/re-120hz/):
+  the real game loop is -[SCRenderer renderLoop] (0x34f10), AEPeriodicTimer
+  1/60 (1/30 while UITrackingRunLoopMode), whole 1/60 frames, stall cap 4,
+  draw then updateContent. AEGameWorldView is unused (earlier "120 Hz"
+  note was about the wrong class). AEAnimationPlayer tick:/render:
+  (0xbe528/0xbe5b4) use integer frames; aecAnimation::nodeTransform
+  (0xca12c) interpolates keyframes linearly, so sampling at frame+0.5 is
+  real 120 Hz motion. Main screen switches are 0.0 s cross-dissolve cuts
+  (-[AERootViewController setChildViewController:] 0xda8da), also on iPhone.
+  Dialogs/panels: UIView animations 0.2-0.5 s. SCAnimatedImageView
+  flipbooks: 30 Hz NSTimer, imageWithContentsOfFile: every frame.
+
+Plan (each step: failing test first, then code; all PC checks must pass):
+- P1 UIView animations animate (center/frame place, transform, alpha) via
+  Core Animation copies; completion/did-stop at the end. Sizes still jump.
+  Check: view_animations_show_the_way_and_finish_at_the_end. DONE, 480/480.
+- P2 While animations run, each list also carries the coming frames (one
+  screen refresh apart, until the animations end, capped), with
+  CLOCK_MONOTONIC times; the phone draws the frame for each refresh
+  (Choreographer) so motion is screen-rate even when the game thread is
+  busy. Check: moving_views_send_their_coming_frames + a JVM test of the
+  phone-side parser/selector if feasible; PC run lists show the sections.
+- P3 Phone decodes new pictures off the UI thread and swaps the list when
+  ready; recently used bitmaps kept (bounded). Check: Gradle build; JVM test.
+- P4A Replace -[SCRenderer renderLoop]: screen-rate tick, fixed 1/60 steps
+  from an accumulator, stall cap kept, never updateContent with 0 frames.
+  Check: test of the step accumulator; PC run counts updateContent steps per
+  second (~60) while ticks run at the screen rate.
+- P4B Half-frame drawing: sample aecAnimation::nodeTransform at frame+frac
+  for players that moved. Needs a guest-function replacement hook. Check:
+  unit test of the hook + PC run.
+- P5 Modernize (owner permission): screen switches get a short cross-fade
+  (0.2 s) instead of the 0.0 s cut. Switch IOS_SPELLCRAFT_FADE=0 to undo.
+- P6 Flipbook frames: imageWithContentsOfFile: reads from a bounded cache.
+Off limits: the fight/layout fix (6309128), owner save, the phone.
+
+Work log and decisions (away mode):
+- Sol review out (Codex usage limit until 6:25 AM): Opus t58 reviewed the
+  plan instead. Its 12 findings: fixed #1 (resizes slid), #3 (ignoring
+  touches), #4 (blocks per thread), #5 (settle), #6 (transitionWithView),
+  #9 (faster ticks while a finger is down or a change is new); #2 limited
+  with only_made (groups not re-drawn per sample); #7/#8 cost accepted with
+  frame reuse (Sent::holds); #10/#11 (P4 risk) answered by the checks
+  below; #12 done phone-side.
+- P2: lists carry `@\t<ns>` frames for 0.3 s ahead on the refresh grid;
+  the phone draws the frame for each Choreographer refresh. P3: phone
+  decodes on its own thread, keeps 96 MB of unused bitmaps (LRU). P5: the
+  Rust side marks instant screen cuts (`!\tfade\t250\tover|under`), the
+  phone cross-fades 0.25 s (under the new screen when GL shows, else over).
+  JVM check android/tools/check-picture-list.sh passes.
+- P4A: -[SCRenderer renderLoop] replaced (game_fixes.rs render_loop):
+  ticks at the screen rate, 1/60 s steps from carried time (stall cap 4.2
+  steps: one step, no catch-up, as the game). Steps run, then the draw.
+  IOS_SPELLCRAFT_HZ=60 keeps the game's own loop.
+- P4B: the iPhone stand-ins sit at 0xD0000000, out of Thumb BL reach, so
+  the nodeTransform call in -[AEAnimationPlayer render:] (+0x26a) now goes
+  to a 12-byte jump (ldr.w ip,[pc,#4]; bx ip; nop; stand-in) written into
+  the zero padding after the program's load commands (checked zero, before
+  the first __TEXT section; the call's bytes and target are checked first;
+  nothing changes if any check fails). The stand-in calls the real
+  nodeTransform at the frame and, for an animation whose frame moved with
+  the last steps, at frame+1 too, and moves the 6 numbers (x, y, scale x/y,
+  turn in degrees, opacity: pushTransform) that fraction of a step on. Jumps
+  over 64 points / 1 scale / 90 degrees (cuts, loop restarts) are not drawn
+  between. Ticks with no step draw again (renderView; frameCount stays >= 1,
+  since renderView runs updateContent itself at 0). Draw methods only refresh
+  caches (xrefs: no tick/update in render paths), so extra draws do not move
+  the game. Switch IOS_SPELLCRAFT_HALF=0.
+- P6 decision: not done. File pictures go to the phone by path and the
+  phone's bitmap cache (P3) already covers decoding; the Rust side only
+  reads sizes. Revisit only if a PC profile shows imageWithContentsOfFile:.
+- CORRECTION (PC trace, IOS_TRACE_MESSAGES=ransition + a log in
+  controller_transition): screen switches are NOT 0 s cuts. The game sets
+  -[AEApplication setViewTransitionDuration:] at start, and
+  setChildViewController: calls transitionFromViewController with
+  duration 0.5 and options 0x500000 (UIViewAnimationOptionTransition-
+  CrossDissolve). Our layer ignored the transition kind, so the switch
+  jumped: that was the clunky screen change. Fix (all games, iPhone-
+  faithful): uikit::transition_fade(duration, options) -> cross_fade(s);
+  the next list carries `!\tfade\t500\t...` and the phone dissolves.
+  Also for transitionWithView: and transitionFromView:toView:. Flips and
+  curls dissolve too (not drawn). The SpellCraft-only 0.25 s "cut fade"
+  (P5, IOS_SPELLCRAFT_FADE) was based on the wrong reading and is removed.
+  Test: transitions_fade_for_the_time_the_game_asks (failed first).
+- Emulator (ios_bridge_test, x86_64 + ARM translation, 60 Hz): menus,
+  the welcome box fade-out and the tutorial pointer work; the game world
+  crashes in the emulator's own GLES1 driver (SIGSEGV in
+  GLEncoder::s_glIsEnabled via libndk_translation) on the first GL frame,
+  ALSO with IOS_SPELLCRAFT_HZ=60 (game's own loop, no half draws), so
+  not caused by this work. Game-world checks stay on the PC (qemu,
+  Mesa) and the owner's phone.
+- Test flakes seen only while an APK build loaded the CPU:
+  moving_views_send_their_coming_frames (fixed: the animation now begins
+  at a set time) and fw::sound music_player_keeps_time_loops_and_seeks
+  (unchanged file; passed on the rerun).
+- Opus review t59 (Sol still out of usage): nothing serious in the patch
+  core (BL/BLX fields, jump bytes, slide, Steps checked by hand). Fixed:
+  #3 a fade left waiting by a transition that changed nothing shown now
+  expires with the transition (Instant); #4 draw-ahead state is set right
+  before renderView, after updateContent (draw()); #5 IosPicturesView
+  drops lists after its decoder shut down. Shown not to apply: #1
+  nodeTransform is void (r0 overwritten by `movs r0,#9` right after the
+  call); #2 nodeTransform clamps to its first/last keyframe (ca152/ca172),
+  so frame+1 past the end is safe. Accepted: paused players sharing
+  animation data may twitch half a frame once; ticks stay at the screen
+  rate while scrolling.
+- Also fixed after the first PC runs: AEGLAnimationView draws animation
+  players on its own timer, outside the render loop; HalfSteps now draws
+  ahead only during the render loop's own draw (test extended first).
+- PC fight check (FROM_HOME=cap-copy-map-final; taps: menu 499,53;
+  `every=screen shown: SCExplorationViewController=>settled 367,77`;
+  `every=screen drawn after tap at 367,77=>settled 281,127`): reaches
+  SCCombatViewController; "first animation placed through the in-between
+  drawing"; 4849-4887 of the first 5000 animation places drawn part of a
+  step ahead (monsters' idle loops). Note the screen is 568 points wide,
+  not 480 (phone x = 241 + 3.375 * points).
+- A 266 s main-thread stall in the first fight run was the PC-only frame
+  save (IOS_FRAMES_DIR, frame 300: glReadPixels + our PNG encoder under
+  qemu): runs with in-between drawing off stalled at frame ~297-299 too,
+  and with FRAME_EVERY=100000 (everything on) the fight ran 867 frames,
+  no stall, exit 0. Not a phone issue. Use FRAME_EVERY=100000 for fights.
+- Emulator splash -> menu still cut after review fix #3: the fade expired
+  after its own 0.5 s while the slow emulator made the menu's pictures.
+  Now a waiting fade is kept up to 2 s and always plays its full length.

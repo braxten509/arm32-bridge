@@ -52,6 +52,11 @@ fn selector_for(phase: Phase) -> &'static str {
     }
 }
 
+/// Whether a finger is on the screen.
+pub fn fingers_down() -> bool {
+    TOUCHES.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|t| !t.is_empty())
+}
+
 fn mark_touch(finger: i32, f: impl FnOnce(&mut Touch)) {
     if let Some(touch) = TOUCHES.lock().unwrap().as_mut().and_then(|t| t.get_mut(&finger)) {
         f(touch);
@@ -356,6 +361,8 @@ pub(crate) fn deliver_in(window: Id, finger: i32, phase: Phase, point: Point) {
     let touches = guard.get_or_insert_with(HashMap::new);
     let stamp = now();
     let touch = match (phase, touches.get(&finger)) {
+        // Ignored while the app ignores interaction events: the finger goes nowhere.
+        (Phase::Began, _) if crate::fw::uikit::ignoring_touches() => return,
         (Phase::Began, _) => {
             let object = runtime::alloc_instance(runtime::class_named("UITouch"));
             let view = hit_test(window, point);

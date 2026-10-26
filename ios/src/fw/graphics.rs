@@ -32,7 +32,7 @@ mod render;
 mod shapes;
 mod text;
 
-pub use compose::{box_picture, cg_picture, cg_size, gradient_picture, group_pictures, new_screen_check, shape_picture};
+pub use compose::{box_picture, cg_picture, cg_size, gradient_picture, group_pictures, new_screen_check, only_made, shape_picture};
 pub use render::render_layer;
 pub use shapes::{
     clip_path_in, fill_path_in, new_path, path_append, path_apply, path_arc, path_bounds, path_close, path_contains, path_copy, path_curve, path_current,
