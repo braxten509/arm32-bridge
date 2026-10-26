@@ -301,10 +301,16 @@ pub fn group_pictures(start: &Picture, content: &[Picture], mask: &[Picture], sc
     let Some(area) = region(group, start.clip, content, mask) else { return fallback };
     let k = capped(scale, area.size.width, area.size.height);
     let key = format!("group {k} {area:?} {group:?} {content:?} {mask:?}");
-    let Some(file) = made(key, || composite(group, area, k, content, mask, only_shadow)) else { return fallback };
+    let Some(file) = made(key, || {
+        // TEMP: which groups are composited, and what they cost.
+        let t = std::time::Instant::now();
+        let out = composite(group, area, k, content, mask, only_shadow);
+        crate::log!("TEMP group {:.0}x{:.0} at ({:.0},{:.0}) k {k}: {} pictures, clips {} radius {} masked {} shadow {:?}: {} ms", area.size.width, area.size.height, area.origin.x, area.origin.y, content.len(), group.clips, group.radius, group.masked, group.shadow.as_ref().map(|s| (s.radius, s.offset, s.path.is_some())), t.elapsed().as_millis());
+        out
+    }) else { return fallback };
     let size = (pixels(area.size.width, k) as f64 / k, pixels(area.size.height, k) as f64 / k);
     let place = Transform { tx: area.origin.x, ty: area.origin.y, ..IDENTITY };
-    let picture = Picture { path: file, place, area: size, alpha: 1.0, mode: 0, size, text: None, clip: start.clip, group: None };
+    let picture = Picture { path: file, place, area: size, alpha: 1.0, mode: 0, size, text: None, clip: start.clip, group: None, corner: start.corner };
     if only_shadow {
         std::iter::once(picture).chain(content.iter().cloned()).collect()
     } else {
@@ -324,6 +330,13 @@ fn draw_pictures(c: &mut Canvas, pictures: &[Picture], screen: Transform) {
         if meet(clip, whole) != whole {
             let mut outline = shapes::Outline::default();
             outline.rect(clip, &|p| p);
+            c.clip_to(&outline, false);
+        }
+        // Round corners of a layer inside the group (fw/pictures.rs `Corner`).
+        if let Some(corner) = p.corner {
+            let ((rx, ry), k) = (corner.radius, screen.a.abs());
+            let mut outline = shapes::Outline::default();
+            outline.rounded_rect(screen_box(screen, corner.rect), rx.min(ry) * k, &|p| p);
             c.clip_to(&outline, false);
         }
         c.state.ctm = geometry::concat(p.place, screen);

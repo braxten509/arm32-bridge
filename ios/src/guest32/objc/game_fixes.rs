@@ -37,14 +37,36 @@ pub(super) fn after_message(bridge: &Mutex<Bridge>, g: &dyn GuestSide, receiver:
 /// -lockControlsAndPlacePointer after a delay), and opening the tab turned
 /// the other tabs back on: a tap on one in those seconds left the step
 /// waiting for a hat that was no longer on screen. While that lock waits,
-/// every control is off, as -lockOutControlsForTransition: does between
-/// steps; the waiting lock turns the step's control on as before.
+/// every control but the step's own is off (as -applyControlFocus turns
+/// them: all on, then all off but the focus control), so a tap on the hat
+/// right away works; the waiting lock still places the pointer as before.
 fn after_stage_interaction(bridge: &Mutex<Bridge>, g: &dyn GuestSide, tutorial: u32) -> Result<(), String> {
     let c = Ctx { bridge, g };
     let host = bridge.lock().unwrap_or_else(|e| e.into_inner()).host_object_for(g, tutorial)?;
-    if crate::fw::runloop::perform_pending(host, crate::objc::runtime::sel("lockControlsAndPlacePointer")) {
-        c.send(tutorial, "lockOutControlsForTransition:", &[1])?;
+    if !crate::fw::runloop::perform_pending(host, crate::objc::runtime::sel("lockControlsAndPlacePointer")) {
+        return Ok(());
     }
+    c.send(tutorial, "lockOutControlsForTransition:", &[1])?;
+    // The step's control: -[SCTutorialController applyControlFocus]'s key path from the current screen.
+    let key = {
+        let host = crate::fw::string::make("focusControl");
+        bridge.lock().unwrap_or_else(|e| e.into_inner()).guest_object(g, host)?
+    };
+    let path = c.send(c.send(tutorial, "currentStage", &[])?, "stringValueForKey:", &[key])?;
+    if path == 0 || c.send(path, "length", &[])? == 0 {
+        return Ok(());
+    }
+    let Some(app) = bridge.lock().unwrap_or_else(|e| e.into_inner()).classes.class_named("SCAppController").map(|c| c.address) else {
+        return Ok(());
+    };
+    let screen = c.send(c.send(app, "appController", &[])?, "currentBaseViewController", &[])?;
+    let control = c.send(screen, "valueForKeyPath:", &[path])?;
+    if control == 0 {
+        return Ok(());
+    }
+    let root = c.send(tutorial, "rootView", &[])?;
+    c.send(tutorial, "setEnabled:allControlsExcept:inHierarchy:", &[1, 0, root])?;
+    c.send(tutorial, "setEnabled:allControlsExcept:inHierarchy:", &[0, control, root])?;
     Ok(())
 }
 

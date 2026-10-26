@@ -6,6 +6,7 @@ import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Matrix
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.Rect
 import android.graphics.RectF
 import android.view.View
@@ -31,6 +32,8 @@ class IosPicturesView(context: Context) : View(context) {
         val area: RectF, val alpha: Float, val mode: Int, val width: Float, val height: Float,
         /** The screen area (points) it may draw in: its clipping views' bounds. */
         val clip: RectF,
+        /** A rounded rectangle (points) it is also cut to: a layer's round corners (masksToBounds). */
+        val corner: Path?,
         val path: String,
     )
 
@@ -109,7 +112,10 @@ class IosPicturesView(context: Context) : View(context) {
         // a, b, c, d, tx, ty as Apple writes them: x' = a x + c y + tx, y' = b x + d y + ty.
         val place = Matrix().apply { setValues(floatArrayOf(n[0], n[2], n[4], n[1], n[3], n[5], 0f, 0f, 1f)) }
         val clip = RectF(n[12], n[13], n[12] + n[14], n[13] + n[15])
-        return Picture(place, RectF(0f, 0f, n[6], n[7]), n[8], n[9].toInt(), n[10], n[11], clip, line.path)
+        val corner = if (n.size >= 22) {
+            Path().apply { addRoundRect(RectF(n[16], n[17], n[16] + n[18], n[17] + n[19]), n[20], n[21], Path.Direction.CW) }
+        } else null
+        return Picture(place, RectF(0f, 0f, n[6], n[7]), n[8], n[9].toInt(), n[10], n[11], clip, corner, line.path)
     }
 
     /** Lets go of the least recently used pictures not in use beyond KEPT_BYTES. */
@@ -159,6 +165,7 @@ class IosPicturesView(context: Context) : View(context) {
             canvas.translate(left, top)
             canvas.scale(scale, scale)
             canvas.clipRect(picture.clip)
+            picture.corner?.let { canvas.clipPath(it) }
             canvas.concat(picture.place)
             // Fit inside, or fill and crop, keep the picture's shape (by its pixels); the rest place it by its points.
             val (w, h) = if (picture.mode == 1 || picture.mode == 2) bitmap.width.toFloat() to bitmap.height.toFloat() else picture.width to picture.height

@@ -55,6 +55,41 @@ pub struct Picture {
     pub clip: Rect,
     /// On a GROUP_MARK: how the pictures up to its END_MARK are drawn together.
     pub group: Option<Box<Group>>,
+    /// A rounded rectangle it is also cut to: the round corners of a layer
+    /// around it that clips (masksToBounds), cut where it is shown (the
+    /// phone, compose.rs) as Core Animation cuts them on the GPU.
+    pub corner: Option<Corner>,
+}
+
+/// A rounded rectangle in screen points: its corners' radii across and down.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Corner {
+    pub rect: Rect,
+    pub radius: (f64, f64),
+}
+
+impl Corner {
+    pub fn contains(&self, x: f64, y: f64) -> bool {
+        let r = self.rect;
+        let (rx, ry) = (self.radius.0.min(r.size.width / 2.0), self.radius.1.min(r.size.height / 2.0));
+        if !(r.origin.x..r.origin.x + r.size.width).contains(&x) || !(r.origin.y..r.origin.y + r.size.height).contains(&y) {
+            return false;
+        }
+        // Inside the nearest corner's ellipse when in a corner square.
+        let dx = (r.origin.x + rx - x).max(x - (r.origin.x + r.size.width - rx)).max(0.0);
+        let dy = (r.origin.y + ry - y).max(y - (r.origin.y + r.size.height - ry)).max(0.0);
+        rx <= 0.0 || ry <= 0.0 || (dx / rx).powi(2) + (dy / ry).powi(2) <= 1.0
+    }
+}
+
+impl Picture {
+    /// Whether the screen point (points) is inside what it may draw in.
+    pub fn shows_at(&self, x: f64, y: f64) -> bool {
+        let c = self.clip;
+        (c.origin.x..c.origin.x + c.size.width).contains(&x)
+            && (c.origin.y..c.origin.y + c.size.height).contains(&y)
+            && self.corner.is_none_or(|corner| corner.contains(x, y))
+    }
 }
 
 /// A layer whose pictures are drawn together (fw/graphics/compose.rs):
@@ -242,7 +277,7 @@ pub fn flatten(node: &Node) -> Vec<Picture> {
     // area reaches over the window too; past the screen the phone cuts it.
     let (wide, high, _) = crate::fw::uikit::screen_points();
     let area = Rect::new(0.0, 0.0, wide.max(node.frame.size.width), high.max(node.frame.size.height));
-    walk(node, 0, None, 1.0, area, &mut out);
+    walk(node, 0, None, 1.0, area, None, &mut out);
     out
 }
 
@@ -251,7 +286,7 @@ fn flatten_at(node: &Node, k: usize) -> Vec<Picture> {
     let (wide, high, _) = crate::fw::uikit::screen_points();
     let area = Rect::new(0.0, 0.0, wide.max(node.frame.size.width), high.max(node.frame.size.height));
     let mut out = Vec::new();
-    walk(node, k, None, 1.0, area, &mut out);
+    walk(node, k, None, 1.0, area, None, &mut out);
     out
 }
 
@@ -275,7 +310,7 @@ pub(crate) fn meet(a: Rect, b: Rect) -> Rect {
 
 /// `parent`: the parent's own points to screen points (None for the window);
 /// `clip`: the screen area the node may draw in.
-fn walk(node: &Node, k: usize, parent: Option<Transform>, parent_alpha: f64, clip: Rect, out: &mut Vec<Picture>) {
+fn walk(node: &Node, k: usize, parent: Option<Transform>, parent_alpha: f64, clip: Rect, corner: Option<Corner>, out: &mut Vec<Picture>) {
     let (origin, transform, own_alpha) = node.pose(k);
     let alpha = parent_alpha * own_alpha;
     if node.hidden || alpha <= 0.01 {
@@ -298,10 +333,12 @@ fn walk(node: &Node, k: usize, parent: Option<Transform>, parent_alpha: f64, cli
         out.clear();
     }
     let visible = Rect { origin: node.bounds_origin, size };
-    // Drawn together (after resolve, by fw/graphics/compose.rs) when cut to
-    // round or turned bounds, masked, or shadowed.
+    // Round corners alone are cut where the pictures are shown (`Corner`);
+    // drawn together (after resolve, by fw/graphics/compose.rs) when cut to
+    // turned bounds or round ones inside round ones, masked, or shadowed.
     let turned = own.b.abs() > 1e-9 || own.c.abs() > 1e-9;
-    let group = (node.clips && (node.radius > 0.0 || turned) || node.mask.is_some() || node.shadow.is_some()).then(|| Group {
+    let rounded = node.clips && node.radius > 0.0 && !turned && node.mask.is_none() && node.shadow.is_none() && corner.is_none();
+    let group = (node.clips && (node.radius > 0.0 && !rounded || turned) || node.mask.is_some() || node.shadow.is_some()).then(|| Group {
         place: own,
         bounds: visible,
         clips: node.clips,
@@ -319,12 +356,14 @@ fn walk(node: &Node, k: usize, parent: Option<Transform>, parent_alpha: f64, cli
         text: None,
         clip,
         group: group.map(Box::new),
+        corner,
     };
     let grouped = group.is_some();
     if let Some(group) = group {
         out.push(mark(GROUP_MARK, Some(group)));
     }
     let clip = if node.clips { meet(clip, screen_box(own, visible)) } else { clip };
+    let corner = if rounded { Some(Corner { rect: screen_box(own, visible), radius: (node.radius * own.a.abs(), node.radius * own.d.abs()) }) } else { corner };
     let over_bounds = |path: String| Shown { path, mode: 0, size: (1.0, 1.0), rect: Rect { origin: Point::default(), size }, caps: None, tile: false, text: None, alpha: 1.0 };
     // The background colour first, under what the view shows (the GL picture covers a GL view's).
     let background = node.background.filter(|color| color[3] > 0.0 && !node.gl).map(|color| {
@@ -350,7 +389,7 @@ fn walk(node: &Node, k: usize, parent: Option<Transform>, parent_alpha: f64, cli
                 }
                 let text = shown.text.clone();
                 let alpha = alpha * shown.alpha;
-                out.push(Picture { path, place, area: (rect.size.width, rect.size.height), alpha, mode: shown.mode, size: picture_size, text, clip, group: None });
+                out.push(Picture { path, place, area: (rect.size.width, rect.size.height), alpha, mode: shown.mode, size: picture_size, text, clip, group: None, corner });
             }
         }
     };
@@ -359,7 +398,7 @@ fn walk(node: &Node, k: usize, parent: Option<Transform>, parent_alpha: f64, cli
         draw(shown, out);
     }
     for child in &node.children {
-        walk(child, k, Some(own), alpha, clip, out);
+        walk(child, k, Some(own), alpha, clip, corner, out);
     }
     if let Some(border) = &border {
         draw(border, out);
@@ -368,7 +407,7 @@ fn walk(node: &Node, k: usize, parent: Option<Transform>, parent_alpha: f64, cli
         if let Some(mask) = &node.mask {
             out.push(mark(MASK_MARK, None));
             // The mask counts by its own opacity alone, wherever the layer's clip is.
-            walk(mask, k, Some(own), 1.0, Rect::new(-1e9, -1e9, 2e9, 2e9), out);
+            walk(mask, k, Some(own), 1.0, Rect::new(-1e9, -1e9, 2e9, 2e9), None, out);
         }
         out.push(mark(END_MARK, None));
     }
@@ -1007,9 +1046,14 @@ fn encode_lines(text: &mut String, pictures: &[Picture]) {
     for p in pictures {
         let (t, c) = (p.place, p.clip);
         *text += &format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}{}\n",
             t.a, t.b, t.c, t.d, t.tx, t.ty, p.area.0, p.area.1, p.alpha, p.mode, p.size.0, p.size.1,
-            c.origin.x, c.origin.y, c.size.width, c.size.height, p.path
+            c.origin.x, c.origin.y, c.size.width, c.size.height,
+            match p.corner {
+                Some(Corner { rect: r, radius }) => format!("{}\t{}\t{}\t{}\t{}\t{}\t", r.origin.x, r.origin.y, r.size.width, r.size.height, radius.0, radius.1),
+                None => String::new(),
+            },
+            p.path
         );
     }
 }
@@ -2080,14 +2124,31 @@ mod tests {
         send_struct(shadowed, "setShadowOpacity:", 1.0f32);
         send_struct(shadowed, "setShadowRadius:", 0.0f64);
         send_struct(shadowed, "setShadowOffset:", Size { width: 10.0, height: 10.0 });
-        for layer in [round, masked, shadowed] {
+        // A shadow over a round layer: the round layer's corners still cut.
+        let shadowed_round = new_layer("CALayer", rect(100.0, 100.0, 40.0, 40.0));
+        send_struct(shadowed_round, "setShadowOpacity:", 1.0f32);
+        send_struct(shadowed_round, "setShadowRadius:", 0.0f64);
+        send_struct(shadowed_round, "setShadowOffset:", Size { width: 50.0, height: 50.0 });
+        let round_inside = new_layer("CALayer", rect(0.0, 0.0, 40.0, 40.0));
+        runtime::send(round_inside, "setBackgroundColor:", &[rgba(blue)]);
+        send_struct(round_inside, "setCornerRadius:", 20.0f64);
+        runtime::send(round_inside, "setMasksToBounds:", &[1]);
+        runtime::send(shadowed_round, "addSublayer:", &[round_inside]);
+        for layer in [round, masked, shadowed, shadowed_round] {
             runtime::send(host, "addSublayer:", &[layer]);
         }
         let pictures = screen_pictures(&[window], &Classes::find());
         assert!(pictures.iter().all(|p| !p.path.starts_with('\u{1}')), "every picture has its file: {pictures:?}");
+        // Round corners alone are cut where the pictures are shown (as Core
+        // Animation does on the GPU), not drawn into one new picture: the
+        // sublayer inside the round layer is still its own picture.
+        assert!(pictures.iter().any(|p| p.area == (60.0, 60.0)), "the round layer's sublayer is shown as it is: {pictures:?}");
         // The colour of the topmost picture not clear at a screen point.
         let seen = |x: f64, y: f64| -> [u8; 4] {
             for p in pictures.iter().rev() {
+                if !p.shows_at(x, y) {
+                    continue;
+                }
                 let Some(back) = crate::fw::geometry::invert(p.place) else { continue };
                 let (u, v) = crate::fw::geometry::apply(back, x, y);
                 if !(0.0..p.area.0).contains(&u) || !(0.0..p.area.1).contains(&v) {
@@ -2111,5 +2172,7 @@ mod tests {
         assert_eq!(seen(30.0, 120.0), [255, 0, 0, 255]);
         assert_eq!(seen(55.0, 145.0), [0, 0, 0, 255], "the shadow, 10 points right and down");
         assert_eq!(seen(15.0, 145.0), [0; 4], "no shadow where it was moved away from");
+        assert_eq!(seen(120.0, 120.0), [0, 0, 255, 255], "the round layer under a shadow");
+        assert_eq!(seen(103.0, 103.0), [0; 4], "its corner cut, in the shadowed layer's picture too");
     }
 }

@@ -19,7 +19,8 @@ class IosPictureList(val screenWidth: Float, val screenHeight: Float, val frames
     class Fade(val millis: Long, val over: Boolean)
 
     /** One picture line: its 16 numbers (place a, b, c, d, tx, ty; area width, height; alpha; mode;
-     * picture width, height; clip x, y, width, height) and its file. */
+     * picture width, height; clip x, y, width, height), or 22 when it is also cut to a rounded
+     * rectangle (x, y, width, height, corner width and height radii, in screen points), and its file. */
     class Line(val numbers: FloatArray, val path: String)
 
     /** What shows from `time` on (0: the list's only frame, always). */
@@ -56,11 +57,11 @@ class IosPictureList(val screenWidth: Float, val screenHeight: Float, val frames
                     current = ArrayList()
                     continue
                 }
-                val f = line.split('\t', limit = 17)
-                if (f.size < 17) continue
-                val numbers = FloatArray(16)
+                val f = line.split('\t')
+                if (f.size != 17 && f.size != 23) continue
+                val numbers = FloatArray(f.size - 1)
                 var ok = true
-                for (i in 0 until 16) {
+                for (i in numbers.indices) {
                     val n = f[i].toFloatOrNull()
                     if (n == null) {
                         ok = false
@@ -68,7 +69,7 @@ class IosPictureList(val screenWidth: Float, val screenHeight: Float, val frames
                     }
                     numbers[i] = n
                 }
-                if (ok) current.add(Line(numbers, f[16]))
+                if (ok) current.add(Line(numbers, f.last()))
             }
             frames.add(Frame(time, current))
             return IosPictureList(width, height, frames, fade?.takeIf { it.millis > 0 })
