@@ -1990,6 +1990,9 @@ extern "C" fn color_cg(this: Id, _: Sel) -> Id {
 pub struct ImageInfo {
     /// The picture's file ("" for pictures made in memory).
     pub path: String,
+    /// The file's bytes, kept from making the picture until its CGImage is
+    /// first read from them (then dropped, so the pixels aren't held twice).
+    pub bytes: Mutex<Option<Vec<u8>>>,
     pub pixels: (u32, u32),
     pub scale: f64,
     /// UIImageOrientation (0 = up).
@@ -2010,8 +2013,7 @@ pub struct ImageInfo {
     pub parts_started: std::sync::atomic::AtomicBool,
 }
 
-fn png_size(path: &str) -> Option<(u32, u32)> {
-    let bytes = std::fs::read(path).ok()?;
+fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
     if bytes.len() < 24 || &bytes[1..4] != b"PNG" {
         return None;
     }
@@ -2022,8 +2024,22 @@ fn png_size(path: &str) -> Option<(u32, u32)> {
     Some((width, height))
 }
 
+/// A picture file's width and height from its bytes, as `image::image_dimensions`
+/// reads a file: the format is the file's extension, not its contents.
+fn image_dimensions_bytes(path: &str, bytes: &[u8]) -> Option<(u32, u32)> {
+    let ext = std::path::Path::new(path).extension()?.to_str()?;
+    let format = image::ImageFormat::from_extension(ext)?;
+    image::ImageReader::with_format(std::io::Cursor::new(bytes), format).into_dimensions().ok()
+}
+
 fn image_from_path(path: &str) -> Id {
-    let Some(pixels) = png_size(path).or_else(|| image::image_dimensions(path).ok()) else {
+    // The file is read once: its size, orientation and pixels all come from
+    // these bytes (the CGImage is read from them too, the first time).
+    let Some(bytes) = std::fs::read(path).ok() else {
+        crate::log!("image {path}: can't read its size");
+        return 0;
+    };
+    let Some(pixels) = png_size(&bytes).or_else(|| image_dimensions_bytes(path, &bytes)) else {
         crate::log!("image {path}: can't read its size");
         return 0;
     };
@@ -2035,8 +2051,8 @@ fn image_from_path(path: &str) -> Id {
         1.0
     };
     // A photo's EXIF tag turns it, as UIImage reads it (the size is then swapped).
-    let orientation = crate::fw::graphics::file_orientation(path);
-    make_image(ImageInfo { path: path.into(), pixels, scale, orientation, ..Default::default() })
+    let orientation = crate::fw::graphics::file_orientation(&bytes);
+    make_image(ImageInfo { path: path.into(), bytes: Mutex::new(Some(bytes)), pixels, scale, orientation, ..Default::default() })
 }
 
 /// A new UIImage with one reference (the caller's); it counts references (fw/counted.rs).
@@ -2069,6 +2085,59 @@ pub fn image_info(image: Id) -> Option<&'static ImageInfo> {
     unsafe { (*((image + 8) as *const *const ImageInfo)).as_ref() }
 }
 
+/// Every file under a folder, as its path; listed once (an app's files don't change).
+fn list_files(folder: &str) -> std::collections::HashSet<String> {
+    let mut files = std::collections::HashSet::new();
+    let mut pending = vec![folder.to_string()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let path = path.to_string_lossy().into_owned();
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => pending.push(path),
+                Ok(kind) if kind.is_file() => {
+                    files.insert(path);
+                }
+                // A link counts only if it leads to a file (linked folders
+                // aren't walked: a miss looks at the disk anyway).
+                Ok(kind) if kind.is_symlink() && std::path::Path::new(&path).is_file() => {
+                    files.insert(path);
+                }
+                _ => {}
+            }
+        }
+    }
+    files
+}
+
+/// The app folder's files, listed once per folder (an app's files don't change).
+static APP_FILES: Mutex<Option<HashMap<String, std::collections::HashSet<String>>>> = Mutex::new(None);
+
+/// Whether a candidate file is there: a file in the app folder's listing
+/// (made once, like NSBundle caches its contents) costs no stat on the
+/// phone's slow shared storage; anything else (a file added later, a path
+/// with ./ or .., one outside the folder) is a plain stat.
+fn app_has_file(dir: &str, candidate: &str) -> bool {
+    let listed = candidate.starts_with(dir)
+        && APP_FILES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(HashMap::new)
+            .entry(dir.to_string())
+            .or_insert_with(|| list_files(dir))
+            .contains(candidate);
+    listed || std::path::Path::new(candidate).is_file()
+}
+
+/// For tests: forget the folders' listings (tests add and remove files).
+#[cfg(test)]
+pub fn clear_app_files() {
+    if let Some(folders) = APP_FILES.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        folders.clear();
+    }
+}
+
 extern "C" fn image_named(_: Class, _: Sel, name: Id) -> Id {
     let name = string::get(name);
     let dir = crate::loader::app_dir();
@@ -2089,7 +2158,7 @@ extern "C" fn image_named(_: Class, _: Sel, name: Id) -> Id {
     };
     let candidates = [format!("{dir}/{stem}@2x.{ext}"), format!("{dir}/{stem}.{ext}"), format!("{dir}/{name}")];
     // A file only: an empty name would otherwise find the app's folder.
-    let image = match candidates.iter().find(|candidate| std::path::Path::new(candidate).is_file()) {
+    let image = match candidates.iter().find(|candidate| app_has_file(dir, candidate)) {
         Some(path) => {
             let mut by_file = BY_FILE.lock().unwrap_or_else(|e| e.into_inner());
             let by_file = by_file.get_or_insert_with(HashMap::new);

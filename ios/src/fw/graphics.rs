@@ -474,11 +474,12 @@ pub fn decode(bytes: &[u8]) -> Option<(Bitmap, i64)> {
     Some((Bitmap { width, height, bits_per_pixel: 32, bytes_per_row: width * 4, info, space: Space::Rgb, data }, orientation))
 }
 
-/// A picture file's orientation (UIImageOrientation) from its EXIF tag, reading only its header.
-pub fn file_orientation(path: &str) -> i64 {
-    image::ImageReader::open(path)
+/// A picture's orientation (UIImageOrientation) from its EXIF tag, read from
+/// its bytes (which were read once to make the picture).
+pub fn file_orientation(bytes: &[u8]) -> i64 {
+    image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
         .ok()
-        .and_then(|r| r.with_guessed_format().ok())
         .and_then(|r| r.into_decoder().ok())
         .and_then(|mut d| d.orientation().ok())
         .map_or(0, |o| orientation_from_exif(o.to_exif()))
@@ -1052,25 +1053,58 @@ impl Canvas {
         let straight = (ctm.b == 0.0 && ctm.c == 0.0) || (ctm.a == 0.0 && ctm.d == 0.0);
         let (min_x, max_x) = (rect.origin.x, rect.origin.x + rect.size.width);
         let (min_y, max_y) = (rect.origin.y, rect.origin.y + rect.size.height);
+        let alpha = self.state.alpha as f32;
+        if straight {
+            // A straight transform keeps x and y apart: each column's and
+            // row's coverage and user coordinate are worked out once, not
+            // once per pixel.
+            let (x_start, x_end) = (x0.floor() as usize, x1.ceil() as usize);
+            let (y_start, y_end) = (y0.floor() as usize, y1.ceil() as usize);
+            let swapped = ctm.a == 0.0 && ctm.d == 0.0;
+            let columns: Vec<(f64, (f64, f64))> = (x_start..x_end)
+                .map(|x| {
+                    let fx = x as f64;
+                    let coverage = ((fx + 1.0).min(x1) - fx.max(x0)).max(0.0);
+                    (coverage, geometry::apply(inverse, fx + 0.5, 0.0))
+                })
+                .collect();
+            let rows: Vec<(f64, (f64, f64))> = (y_start..y_end)
+                .map(|y| {
+                    let fy = y as f64;
+                    let coverage = ((fy + 1.0).min(y1) - fy.max(y0)).max(0.0);
+                    (coverage, geometry::apply(inverse, 0.0, fy + 0.5))
+                })
+                .collect();
+            for (y, &(coverage_y, row)) in rows.iter().enumerate() {
+                for (x, &(coverage_x, column)) in columns.iter().enumerate() {
+                    let coverage = coverage_x * coverage_y;
+                    if coverage <= 0.0 {
+                        continue;
+                    }
+                    let (ux, uy) = if swapped { (row.0, column.1) } else { (column.0, row.1) };
+                    let color = shade(ux.clamp(min_x, max_x), uy.clamp(min_y, max_y));
+                    match blend {
+                        Blend::Copy => self.copy(x + x_start, y + y_start, scaled(color, alpha), coverage as f32),
+                        _ => self.blend(x + x_start, y + y_start, scaled(color, coverage as f32 * alpha), &blend),
+                    }
+                }
+            }
+            return;
+        }
         let inside = |dx: f64, dy: f64| {
             let (ux, uy) = geometry::apply(inverse, dx, dy);
             ux >= min_x && ux <= max_x && uy >= min_y && uy <= max_y
         };
-        let alpha = self.state.alpha as f32;
         for y in y0.floor() as usize..y1.ceil() as usize {
             for x in x0.floor() as usize..x1.ceil() as usize {
                 let (fx, fy) = (x as f64, y as f64);
-                let coverage = if straight {
-                    ((fx + 1.0).min(x1) - fx.max(x0)).max(0.0) * ((fy + 1.0).min(y1) - fy.max(y0)).max(0.0)
-                } else {
-                    let mut hits = 0;
-                    for sy in 0..4 {
-                        for sx in 0..4 {
-                            hits += inside(fx + (sx as f64 + 0.5) / 4.0, fy + (sy as f64 + 0.5) / 4.0) as u32;
-                        }
+                let mut hits = 0;
+                for sy in 0..4 {
+                    for sx in 0..4 {
+                        hits += inside(fx + (sx as f64 + 0.5) / 4.0, fy + (sy as f64 + 0.5) / 4.0) as u32;
                     }
-                    hits as f64 / 16.0
-                };
+                }
+                let coverage = hits as f64 / 16.0;
                 if coverage <= 0.0 {
                     continue;
                 }
@@ -1192,21 +1226,57 @@ impl Canvas {
         if bitmap.width == 0 || (x1 - x0) as usize != bitmap.width || (y1 - y0) as usize != bitmap.height {
             return false;
         }
+        // Clear and opaque pixels are left or copied byte for byte (the
+        // float blend handles the in-between ones) when nothing clips or
+        // fades, the blend is normal and both layouts have fixed byte places.
+        let straight = self.state.clip.is_none()
+            && self.state.blend_mode != shapes::BLEND_CLEAR
+            && self.state.alpha == 1.0
+            && source.fast.is_some()
+            && self.layout.fast.is_some();
+        self.draw_whole_pixels_loop(x0, x1, y0, y1, bitmap, &source, straight)
+    }
+
+    /// The whole-pixel loop, with or without the byte fast path (`straight`).
+    fn draw_whole_pixels_loop(&mut self, x0: i64, x1: i64, y0: i64, y1: i64, bitmap: &Bitmap, source: &Layout, straight: bool) -> bool {
         // The picture's first row is the rectangle's top (user max y): the
         // device top when y goes up, the device bottom when flipped.
         let (mirrored, upright) = (self.state.ctm.a < 0.0, self.state.ctm.d > 0.0);
         let alpha = self.state.alpha as f32;
-        let (xs, ys) = self.cut(area);
+        let (xs, ys) = self.cut((x0, x1, y0, y1));
         for y in ys {
             let row = (if upright { y1 - 1 - y as i64 } else { y as i64 - y0 }) as usize;
             for x in xs.clone() {
                 let column = (if mirrored { x1 - 1 - x as i64 } else { x as i64 - x0 }) as usize;
                 let at = row * bitmap.bytes_per_row + column * source.bytes;
-                let color = source.read(&bitmap.data[at..at + source.bytes]);
-                self.blend(x, y, scaled(color, alpha), &Blend::Over);
+                let pixel = &bitmap.data[at..at + source.bytes];
+                if straight {
+                    self.blend_straight(x, y, pixel, source);
+                } else {
+                    self.blend(x, y, scaled(source.read(pixel), alpha), &Blend::Over);
+                }
             }
         }
         true
+    }
+
+    /// A whole-pixel source straight into (x, y): an opaque one is copied
+    /// byte for byte (into this layout's byte places); any other goes through
+    /// the float blend (even a clear one writes bytes, e.g. a no-alpha
+    /// destination's fourth byte).
+    fn blend_straight(&mut self, x: usize, y: usize, pixel: &[u8], source: &Layout) {
+        let (Some(sf), Some(df)) = (source.fast, self.layout.fast) else { return };
+        let alpha = if sf.alpha { pixel[sf.fourth] } else { 255 };
+        let at = (self.height - 1 - y) * self.bytes_per_row + x * self.layout.bytes;
+        if alpha == 255 {
+            let memory = self.memory();
+            memory[at + df.red] = pixel[sf.red];
+            memory[at + df.green] = pixel[sf.green];
+            memory[at + df.blue] = pixel[sf.blue];
+            memory[at + df.fourth] = 255;
+        } else {
+            self.blend(x, y, source.read(pixel), &Blend::Over);
+        }
     }
 
     fn draw_linear_gradient(&mut self, gradient: &Gradient, start: Point, end: Point, options: u32) {
@@ -1538,6 +1608,8 @@ pub fn ui_image_clean_up(picture: Id) {
     // get_or_init waits for a CGImage being read right now, and stops later
     // reads (the UIImage is then empty), so nothing is left behind.
     counted::release(*info.cg.get_or_init(|| 0));
+    // The file's bytes, if it was never decoded.
+    drop(info.bytes.lock().unwrap_or_else(|e| e.into_inner()).take());
     if let Some(file) = info.picture_file.get_or_init(|| None) {
         let _ = std::fs::remove_file(file);
     }
@@ -1653,11 +1725,19 @@ pub fn darker_image(picture: Id) -> Id {
 /// The UIImage's CGImage (pictures from files are read the first time it's asked for).
 pub fn image_cg(picture: Id) -> Id {
     let Some(info) = uikit::image_info(picture) else { return 0 };
-    *info.cg.get_or_init(|| match std::fs::read(&info.path).ok().and_then(|bytes| decode(&bytes)) {
-        Some((bitmap, _)) => make_image(bitmap),
-        None => {
-            crate::log!("UIImage {}: can't read its pixels", info.path);
-            0
+    *info.cg.get_or_init(|| {
+        // The bytes kept from making the picture are used once, then dropped
+        // so the decoded pixels aren't held alongside them; a picture made
+        // before this change (or a copy, like a stretchable one) reads its
+        // file again.
+        let bytes = info.bytes.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let bytes = bytes.or_else(|| std::fs::read(&info.path).ok());
+        match bytes.and_then(|bytes| decode(&bytes)) {
+            Some((bitmap, _)) => make_image(bitmap),
+            None => {
+                crate::log!("UIImage {}: can't read its pixels", info.path);
+                0
+            }
         }
     })
 }
@@ -2207,6 +2287,44 @@ mod tests {
                 general.paint(Rect::new(2.0, 1.0, 3.0, 2.0), Blend::Clear, &|_, _| [0.0, 0.0, 0.0, 1.0]);
                 let (q, g) = (quick.memory().to_vec(), general.memory().to_vec());
                 assert!(q.iter().zip(&g).all(|(a, b)| a.abs_diff(*b) <= 1), "clear flip={flip} info={info:#x}");
+            }
+        }
+    }
+
+    /// The whole-pixel byte fast path (clear pixels skipped, opaque pixels
+    /// copied) gives the same bytes as the float blend for every source and
+    /// destination layout with fixed byte places.
+    #[test]
+    fn whole_pixel_byte_path_matches_the_float_path() {
+        let source_infos = [PREMULTIPLIED_LAST, ALPHA_LAST, NONE_SKIP_LAST, PREMULTIPLIED_FIRST | ORDER_32_LITTLE];
+        let dst_infos = [PREMULTIPLIED_LAST, PREMULTIPLIED_FIRST | ORDER_32_LITTLE, NONE_SKIP_LAST, NONE_SKIP_FIRST | ORDER_32_LITTLE];
+        for src_info in source_infos {
+            for &dst_info in &dst_infos {
+                let source = layout(Space::Rgb, 8, 32, src_info).unwrap();
+                // One 5x1 picture with clear, opaque and in-between pixels.
+                let mut data = vec![0u8; 5 * 4];
+                for (i, &a) in [0u8, 255, 128, 37, 255].iter().enumerate() {
+                    let (r, g, b) = ((i * 53 % 256) as u8, (i * 31 % 256) as u8, (i * 7 % 256) as u8);
+                    let af = a as f32 / 255.0;
+                    let color = [r as f32 / 255.0 * af, g as f32 / 255.0 * af, b as f32 / 255.0 * af, af];
+                    source.write(&mut data[i * 4..i * 4 + 4], color);
+                }
+                let picture = Bitmap { width: 5, height: 1, bits_per_pixel: 32, bytes_per_row: 20, info: src_info, space: Space::Rgb, data };
+                let background = |c: &mut Canvas| {
+                    c.state.fill = [0.2, 0.6, 0.9, 0.7];
+                    c.fill_rect(Rect::new(0.0, 0.0, 5.0, 1.0));
+                };
+                // Over a painted background, and over a fresh all-zero one.
+                for painted in [true, false] {
+                    let (mut fast, mut float) = (canvas(5, 1, dst_info), canvas(5, 1, dst_info));
+                    if painted {
+                        background(&mut fast);
+                        background(&mut float);
+                    }
+                    fast.draw_whole_pixels(Rect::new(0.0, 0.0, 5.0, 1.0), &picture);
+                    float.draw_whole_pixels_loop(0, 5, 0, 1, &picture, &source, false);
+                    assert_eq!(fast.memory().to_vec(), float.memory().to_vec(), "source {src_info:#x} destination {dst_info:#x} painted {painted}");
+                }
             }
         }
     }

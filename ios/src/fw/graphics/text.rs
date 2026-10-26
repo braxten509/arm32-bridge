@@ -603,6 +603,63 @@ impl TextFiles {
                 file
             })
             .collect();
+        self.trim(keep, scale, looks);
+        files
+    }
+
+    /// The files for one screen's looks with the not-yet-made ones drawn by
+    /// `draw` (in parallel, a few at a time); beyond `keep` files the least
+    /// recently used ones not on this screen are deleted.
+    fn files_parallel(&mut self, looks: &[&TextLook], scale: f64, keep: usize, draw: &(dyn Fn(&TextLook, f64) -> Option<String> + Sync)) -> Vec<Option<String>> {
+        // One slot per look: an already-made file, or the new look's index.
+        enum Slot {
+            Have(Option<String>),
+            New(usize),
+        }
+        let mut slots: Vec<Slot> = Vec::with_capacity(looks.len());
+        let mut new: Vec<TextLook> = Vec::new();
+        for &look in looks {
+            // A look shown twice on the screen shares the one being drawn.
+            if let Some(at) = new.iter().position(|pending| pending == look) {
+                slots.push(Slot::New(at));
+                continue;
+            }
+            match self.made.iter().position(|(seen, seen_scale, _)| seen == look && *seen_scale == scale.to_bits()) {
+                Some(at) => {
+                    let entry = self.made.remove(at);
+                    let file = entry.2.clone();
+                    self.made.push(entry);
+                    slots.push(Slot::Have(file));
+                }
+                None => {
+                    let at = new.len();
+                    new.push(look.clone());
+                    self.made.push((look.clone(), scale.to_bits(), None));
+                    slots.push(Slot::New(at));
+                }
+            }
+        }
+        let drawn = draw_in_parallel(&new, scale, draw);
+        // The new looks keep the picture they drew.
+        for (look, file) in new.iter().zip(&drawn) {
+            if let Some(entry) = self.made.iter_mut().find(|(seen, seen_scale, _)| seen == look && *seen_scale == scale.to_bits()) {
+                entry.2 = file.clone();
+            }
+        }
+        let files = slots
+            .into_iter()
+            .map(|slot| match slot {
+                Slot::Have(file) => file,
+                Slot::New(at) => drawn[at].clone(),
+            })
+            .collect();
+        self.trim(keep, scale, looks);
+        files
+    }
+
+    /// Deletes the least recently used files beyond `keep` that are not on
+    /// this screen (the entries at the front of `made`).
+    fn trim(&mut self, keep: usize, scale: f64, looks: &[&TextLook]) {
         // The screen's own entries were all moved to the end.
         let unused = self
             .made
@@ -615,8 +672,26 @@ impl TextFiles {
                 let _ = std::fs::remove_file(old);
             }
         }
-        files
     }
+}
+
+/// Every look drawn, a few at a time on worker threads, in order.
+fn draw_in_parallel(looks: &[TextLook], scale: f64, draw: &(dyn Fn(&TextLook, f64) -> Option<String> + Sync)) -> Vec<Option<String>> {
+    if looks.is_empty() {
+        return Vec::new();
+    }
+    let workers = looks.len().min(4);
+    let chunk = looks.len().div_ceil(workers);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|worker| {
+                let start = (worker * chunk).min(looks.len());
+                let end = ((worker + 1) * chunk).min(looks.len());
+                scope.spawn(move || looks[start..end].iter().map(|look| draw(look, scale)).collect::<Vec<_>>())
+            })
+            .collect();
+        handles.into_iter().flat_map(|handle| handle.join().unwrap()).collect()
+    })
 }
 
 /// PNG files showing one screen's `looks` at `scale` pixels per point
@@ -625,11 +700,12 @@ impl TextFiles {
 pub fn text_pictures(looks: &[&TextLook], scale: f64) -> Vec<Option<String>> {
     static MADE: Mutex<TextFiles> = Mutex::new(TextFiles { made: Vec::new() });
     let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
-    made.files(looks, scale, 256, |look, scale| {
+    let draw = |look: &TextLook, scale: f64| {
         draw_look(look, scale)
             .and_then(|(width, height, rgba)| encode_png(width, height, &rgba, true))
             .and_then(|bytes| write_png_file(&format!("text \"{}\"", look.text), &bytes))
-    })
+    };
+    made.files_parallel(looks, scale, 256, &draw)
 }
 
 /// The NSString methods this file adds (32-bit games reach them through
@@ -842,6 +918,34 @@ mod tests {
         let kept: Vec<bool> = first.iter().map(|f| std::path::Path::new(f.as_ref().unwrap()).exists()).collect();
         assert_eq!(kept, [false, false, true, true, true]);
         let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// The PNG file a label draws (the serial and parallel paths both use it).
+    fn label_png(look: &TextLook, scale: f64) -> Option<String> {
+        draw_look(look, scale)
+            .and_then(|(width, height, rgba)| encode_png(width, height, &rgba, true))
+            .and_then(|bytes| write_png_file(&format!("text \"{}\"", look.text), &bytes))
+    }
+
+    /// A label drawn once in the serial order and once by the parallel
+    /// worker threads comes out byte for byte the same.
+    #[test]
+    fn parallel_and_serial_text_pictures_match() {
+        setup();
+        let looks: Vec<TextLook> = (0..5).map(|n| look(&format!("label {n}"), (48.0, 24.0))).collect();
+        // The first label is on the screen twice.
+        let shown: Vec<&TextLook> = looks.iter().chain(&looks[..1]).collect();
+        let mut serial = TextFiles::default();
+        let serial_files = serial.files(&shown, 2.0, 256, label_png);
+        let mut parallel = TextFiles::default();
+        let parallel_files = parallel.files_parallel(&shown, 2.0, 256, &label_png);
+        assert_eq!(serial_files.len(), parallel_files.len());
+        for (serial, parallel) in serial_files.iter().zip(&parallel_files) {
+            match (serial, parallel) {
+                (Some(a), Some(b)) => assert_eq!(std::fs::read(a).unwrap(), std::fs::read(b).unwrap(), "the same label drew different pictures"),
+                _ => assert_eq!(serial, parallel, "serial and parallel presence differ"),
+            }
+        }
     }
 
     /// 32-bit games reach these methods only through a framework_selectors.tsv row.

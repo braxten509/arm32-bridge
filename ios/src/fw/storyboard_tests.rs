@@ -13,6 +13,10 @@ use crate::objc::runtime::{self, lock, Class, Sel};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+/// The image tests share the app folder and its once-made listing, so they
+/// run one at a time and forget the listing between them.
+static IMAGE_TESTS: Mutex<()> = Mutex::new(());
+
 // ----- a coder that answers from a map -----
 
 #[derive(Clone, Copy)]
@@ -577,6 +581,8 @@ fn a_label_reads_its_text_font_and_colours_from_a_coder() {
 #[test]
 fn image_named_answers_a_name_it_has_seen_from_its_cache() {
     setup();
+    let _image_tests = IMAGE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    crate::fw::uikit::clear_app_files();
     let named = |name: &str| runtime::send(runtime::class_named("UIImage"), "imageNamed:", &[string::make(name)]);
     let pid = std::process::id();
     let (found, missing) = (format!("cache_test_found_{pid}.png"), format!("cache_test_missing_{pid}.png"));
@@ -601,11 +607,44 @@ fn image_named_answers_a_name_it_has_seen_from_its_cache() {
     panic!("the app folder kept changing");
 }
 
+/// A picture made from a file keeps its bytes, so its CGImage still decodes
+/// (at the right size) after the file is gone: the file is read once, not
+/// again when the CGImage is first asked for.
+#[test]
+fn a_picture_keeps_its_bytes_until_it_is_decoded() {
+    setup();
+    let _image_tests = IMAGE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    crate::fw::uikit::clear_app_files();
+    let named = |name: &str| runtime::send(runtime::class_named("UIImage"), "imageNamed:", &[string::make(name)]);
+    let name = format!("keeps_bytes_{}.png", std::process::id());
+    let (width, height) = (6usize, 4usize);
+    for _ in 0..3 {
+        let folder = image_folder();
+        let path = format!("{folder}/{name}");
+        std::fs::write(&path, crate::fw::png::encode(width as u32, height as u32, &vec![0x80u8; width * height * 4], false)).unwrap();
+        let image = named(&name);
+        std::fs::remove_file(&path).unwrap();
+        if image_folder() != folder {
+            continue;
+        }
+        assert_ne!(image, 0, "the picture is found");
+        assert_eq!(call::<Size>(image, "size"), Size { width: width as f64, height: height as f64 });
+        // The file is gone: the CGImage still decodes from the kept bytes.
+        let cg = crate::fw::graphics::image_cg(image);
+        assert_ne!(cg, 0, "the CGImage decodes without the file");
+        assert_eq!(crate::fw::graphics::straight_pixels(cg).map(|pixels| pixels.len()), Some(width * height * 4), "the decoded size");
+        return;
+    }
+    panic!("the app folder kept changing");
+}
+
 /// A picture is kept in a nib as its name (UIImageNibPlaceholder), which
 /// becomes the app's picture of that name; image views show it.
 #[test]
 fn an_image_view_reads_its_picture_from_a_coder() {
     setup();
+    let _image_tests = IMAGE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+    crate::fw::uikit::clear_app_files();
     // The app folder is the process's (another test may load a game and
     // change it), so the picture is there only while it is read.
     let pixels = vec![0x80u8; 8 * 4 * 4];
