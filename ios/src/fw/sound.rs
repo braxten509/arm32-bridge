@@ -1909,8 +1909,17 @@ mod tests {
         let mut out = vec![0f32; 512 * 2];
         for _ in 0..(seconds * 44100.0 / 512.0).round() as usize {
             wait_for_decoded(player);
-            if player.mix_into(&mut out, 512, 44100.0) {
-                return true;
+            // A turn finding the decoder holding the queue plays nothing (a
+            // real sound card's does too): this test's turns all play.
+            for _ in 0..1000 {
+                let before = player.queue().played;
+                if player.mix_into(&mut out, 512, 44100.0) {
+                    return true;
+                }
+                if player.queue().played != before {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_micros(200));
             }
         }
         false

@@ -498,3 +498,29 @@ Work log and decisions (away mode):
 - Emulator splash -> menu still cut after review fix #3: the fade expired
   after its own 0.5 s while the slow emulator made the menu's pictures.
   Now a waiting fade is kept up to 2 s and always plays its full length.
+
+## 2026-10-26: heart, spell card, spell panel slide
+
+- Monster heart stayed full: its spec observes
+  `parent.combatController.monsterHealth`, and our KVO only told observers
+  about the first key of a path. Now (fw/object.rs) each observer keeps the
+  objects along its path; a change of any key on that chain is told as a
+  change of the whole path, and the chain is followed again afterwards
+  (Apple's behaviour). PC fight log: "KVO: a change of monsterHealth along an
+  observed key path (parent.combatController.monsterHealth)". All games.
+- Spell card on the monster: the game's own design.
+  `buildCardTexturesWithEncounterView:andSpellView:` places the spell card at
+  the encounter card's spot, half size. `spellWasCast` keeps it while the
+  spell has uses left, and plays `playSpellCardDeathAnimation` when it is
+  used up.
+- Spell panel slide (`SCTabbedPanelView animateIn/animateOut`, a 0.2 s
+  UIView animation of center) felt clunky: our animations began when they
+  were added, so the rest of a busy turn used up part of the slide before
+  its first frame. Now, as on Apple, animations without their own begin
+  time begin at the end of the main loop's turn (`animation::commit`, from
+  run_loop_until before pictures::tick). One UIView block's animations
+  share one start (ViewTiming.asked). The log line "animations begin at the
+  end of their turn, N ms after they were added" shows the gap (84 ms in a
+  PC fight).
+- Music test flake fixed: the test's pretend sound card retries a turn the
+  decoder held the queue for.

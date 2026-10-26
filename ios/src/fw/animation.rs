@@ -797,6 +797,9 @@ struct Running {
     animation: Id,
     started: bool,
     stopped: bool,
+    /// Begun "now" when added (media time, on this thread): moved to when
+    /// that thread's main-loop turn is done (`commit_at`).
+    begun_on_add: Option<(f64, std::thread::ThreadId)>,
 }
 
 static RUNNING: Mutex<Vec<Running>> = Mutex::new(Vec::new());
@@ -949,17 +952,45 @@ pub fn add(layer: Id, animation: Id, key: Id) -> Id {
     }
     let copy = runtime::send(animation, "copy", &[]);
     let now = runloop::media_time();
-    if number(copy, "beginTime", 0.0) == 0.0 {
+    let begun_on_add = (number(copy, "beginTime", 0.0) == 0.0).then_some((now, std::thread::current().id()));
+    if begun_on_add.is_some() {
         set_number(copy, "beginTime", layers::local_time(layer, now));
     }
     if number(copy, "duration", 0.0) <= 0.0 {
         set_number(copy, "duration", crate::fw::smallclasses::animation_duration());
     }
     crate::fw::smallclasses::animation_added(copy);
-    running().push(Running { layer, key, animation: copy, started: false, stopped: false });
+    running().push(Running { layer, key, animation: copy, started: false, stopped: false, begun_on_add });
     wake_at(now);
     crate::fw::pictures::draw_soon();
     copy
+}
+
+/// The main loop's turn is done (Apple's transaction commit): animations
+/// added during it without a begin time begin now, as on Apple, so the work
+/// the game did after adding them doesn't use up their first part before a
+/// frame of them is drawn (SpellCraft's 0.2 s spell panel slide).
+pub fn commit() {
+    commit_at(None, runloop::media_time());
+}
+
+pub(crate) fn commit_at(only: Option<Id>, now: f64) {
+    let mut late = 0.0f64;
+    let me = std::thread::current().id();
+    for r in running().iter_mut().filter(|r| only.is_none_or(|layer| layer == r.layer)) {
+        let Some((added, _)) = r.begun_on_add.take_if(|(_, thread)| *thread == me) else { continue };
+        let shift = layers::local_time(r.layer, now) - layers::local_time(r.layer, added);
+        if shift > 0.0 {
+            set_number(r.animation, "beginTime", number(r.animation, "beginTime", 0.0) + shift);
+            late = late.max(now - added);
+        }
+    }
+    if late > 0.03 {
+        static LOGGED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
+            crate::log!("animations begin at the end of their turn, {:.0} ms after they were added", late * 1000.0);
+        }
+    }
 }
 
 /// When the last running animation ends (media time; infinity for one that
@@ -982,6 +1013,9 @@ pub struct ViewTiming {
     pub curve: Curve,
     pub repeat_count: f64,
     pub autoreverses: bool,
+    /// When the block was made (media time): its animations all begin then
+    /// (plus the delay), moved together to the end of the turn.
+    pub asked: f64,
 }
 
 /// Animates a change UIKit made to a view's layer, as a UIView animation
@@ -994,14 +1028,18 @@ pub fn animate_view_change(layer: Id, key: &str, from: Value, timing: ViewTiming
     hold(animation, "keyPath", key);
     hold(animation, "fromValue", boxed_value(from));
     set_number(animation, "duration", timing.duration);
+    set_number(animation, "beginTime", layers::local_time(layer, timing.asked) + timing.delay);
     if timing.delay > 0.0 {
-        set_number(animation, "beginTime", layers::local_time(layer, runloop::media_time()) + timing.delay);
         hold(animation, "fillMode", string::make("backwards"));
     }
     set_number(animation, "repeatCount", timing.repeat_count);
     set_number(animation, "autoreverses", timing.autoreverses as u8 as f64);
     hold(animation, "timingFunction", make_curve(runtime::class_named("CAMediaTimingFunction"), timing.curve));
-    add(layer, animation, key)
+    let copy = add(layer, animation, key);
+    if let Some(r) = running().iter_mut().find(|r| r.animation == copy) {
+        r.begun_on_add = Some((timing.asked, std::thread::current().id()));
+    }
+    copy
 }
 
 /// What to do once an animation (a layer's copy) stops: finished or
@@ -1380,6 +1418,35 @@ mod tests {
 
     extern "C" fn did_stop(_: Id, _: Sel, animation: Id, finished: u8) {
         HEARD.lock().unwrap().push(("stop", animation, finished != 0));
+    }
+
+    /// As on Apple, an animation added without a begin time starts when its
+    /// turn of the main loop is done (the transaction commits), not when it
+    /// was added: work the game does after asking for a 0.2 s slide must not
+    /// use up the slide before its first frame is drawn. One given its own
+    /// begin time keeps it.
+    #[test]
+    fn animations_start_when_their_turn_is_done() {
+        setup();
+        runloop::as_main(|| {
+            let layer = runtime::send(runtime::send(runtime::class_named("CALayer"), "alloc", &[]), "init", &[]);
+            let slide = basic("position.x", collections::number_float(0.0), collections::number_float(100.0));
+            anim_set_duration(slide, 0, 0.2);
+            add(layer, slide, string::make("slide"));
+            let copy = layer_animation_for_key(layer, 0, string::make("slide"));
+            let asked = number(copy, "beginTime", 0.0);
+            let fixed = basic("opacity", 0, collections::number_float(1.0));
+            anim_set_begin(fixed, 0, asked + 1.0);
+            add(layer, fixed, string::make("fixed"));
+            let fixed = layer_animation_for_key(layer, 0, string::make("fixed"));
+            // The game is busy for 150 ms more in the same turn.
+            commit_at(Some(layer), layers::global_time(layer, asked + 0.15).unwrap());
+            assert!(close(number(copy, "beginTime", 0.0), asked + 0.15), "begins at the commit");
+            assert!(close(number(fixed, "beginTime", 0.0), asked + 1.0), "its own begin time stays");
+            commit_at(Some(layer), layers::global_time(layer, asked + 0.3).unwrap());
+            assert!(close(number(copy, "beginTime", 0.0), asked + 0.15), "only the first commit counts");
+            layer_remove_all_animations(layer, 0);
+        });
     }
 
     /// On a layer: a copy runs (with the game's keyed values), its delegate

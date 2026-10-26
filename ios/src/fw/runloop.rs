@@ -616,6 +616,10 @@ fn run_loop_until(run_loop: &'static Loop, until: Option<f64>, once: bool, mode:
         if once && handled {
             return true;
         }
+        // The turn is done: what it animated begins now (Apple's commit).
+        if main {
+            main_work(main, crate::fw::animation::commit);
+        }
         // The game's UIKit pictures go to the phone screen from the main thread.
         let pictures = std::ptr::eq(run_loop, &MAIN_LOOP) && crate::fw::pictures::active();
         if pictures {

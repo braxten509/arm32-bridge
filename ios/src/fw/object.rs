@@ -154,16 +154,53 @@ const OPTION_PRIOR: usize = 8;
 
 #[derive(Clone)]
 struct KeyObserver {
+    /// Tells this registration apart from a same-looking one.
+    serial: u64,
     object: Id,
     path: String,
     observer: Id,
     options: usize,
     context: usize,
+    /// The object each key of the path is read from: `object`, then the
+    /// value of the first key, and so on (shorter when one is nil). As
+    /// Apple's, a change of any of these keys is a change of the path.
+    chain: Vec<Id>,
 }
 
 impl KeyObserver {
-    fn first_key(&self) -> &str {
-        self.path.split('.').next().unwrap_or("")
+    fn keys(&self) -> impl Iterator<Item = &str> {
+        self.path.split('.')
+    }
+
+    /// Whether `key` of `object` is a link of this path.
+    fn watches(&self, object: Id, key: &str) -> bool {
+        self.chain.iter().zip(self.keys()).any(|(o, k)| *o == object && k == key)
+    }
+}
+
+/// The objects along `path` from `object` (see `KeyObserver::chain`).
+fn chain_of(object: Id, path: &str) -> Vec<Id> {
+    let keys: Vec<&str> = path.split('.').collect();
+    let mut chain = vec![object];
+    for key in &keys[..keys.len() - 1] {
+        let next = runtime::send(*chain.last().unwrap(), "valueForKey:", &[crate::fw::string::make(key)]);
+        if next == 0 {
+            break;
+        }
+        chain.push(next);
+    }
+    chain
+}
+
+/// Follows the path again after a link changed, so the observer watches the
+/// new objects and no longer the old ones.
+fn refollow(watchers: &[KeyObserver]) {
+    for watcher in watchers.iter().filter(|w| w.path.contains('.')) {
+        let chain = chain_of(watcher.object, &watcher.path);
+        let mut o = observing();
+        if let Some(w) = o.observers.iter_mut().find(|w| w.serial == watcher.serial) {
+            w.chain = chain;
+        }
     }
 }
 
@@ -174,12 +211,13 @@ struct Observing {
     setters: std::collections::BTreeSet<String>,
     setter_sels: std::collections::BTreeSet<Sel>,
     /// Changes announced by -willChangeValueForKey: and not yet done: the
-    /// object, key, and each observer's path with its old value.
-    pending: Vec<(Id, String, Vec<(String, Id)>)>,
+    /// object, key, and each observer's serial with its old value.
+    pending: Vec<(Id, String, Vec<(u64, Id)>)>,
+    next_serial: u64,
 }
 
 static OBSERVING: std::sync::Mutex<Observing> =
-    std::sync::Mutex::new(Observing { observers: Vec::new(), setters: std::collections::BTreeSet::new(), setter_sels: std::collections::BTreeSet::new(), pending: Vec::new() });
+    std::sync::Mutex::new(Observing { observers: Vec::new(), setters: std::collections::BTreeSet::new(), setter_sels: std::collections::BTreeSet::new(), pending: Vec::new(), next_serial: 0 });
 /// How many observers there are: message senders skip all of this at 0.
 static OBSERVER_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -194,7 +232,7 @@ fn setter_names(key: &str) -> [String; 2] {
 }
 
 fn refresh_setters(o: &mut Observing) {
-    o.setters = o.observers.iter().flat_map(|w| setter_names(w.first_key())).collect();
+    o.setters = o.observers.iter().flat_map(|w| w.keys().flat_map(setter_names).collect::<Vec<_>>()).collect();
     o.setter_sels = o.setters.iter().map(|name| runtime::sel(name)).collect();
     OBSERVER_COUNT.store(o.observers.len(), std::sync::atomic::Ordering::SeqCst);
 }
@@ -220,7 +258,13 @@ pub fn observed_setter_key(object: Id, selector: &str) -> Option<String> {
         if !o.setters.contains(selector) {
             return None;
         }
-        o.observers.iter().filter(|w| w.object == object).map(|w| w.first_key().to_string()).find(|key| setter_names(key).iter().any(|s| s == selector))?
+        let found = o
+            .observers
+            .iter()
+            .flat_map(|w| w.chain.iter().zip(w.keys()))
+            .find(|(o, key)| **o == object && setter_names(key).iter().any(|s| s == selector))
+            .map(|(_, key)| key.to_string());
+        found?
     };
     let class = lock().class_of(object);
     let automatic = runtime::send(class, "automaticallyNotifiesObserversForKey:", &[crate::fw::string::make(&key)]) & 0xFF != 0;
@@ -228,7 +272,7 @@ pub fn observed_setter_key(object: Id, selector: &str) -> Option<String> {
 }
 
 fn observers_of(object: Id, key: &str) -> Vec<KeyObserver> {
-    observing().observers.iter().filter(|w| w.object == object && w.first_key() == key).cloned().collect()
+    observing().observers.iter().filter(|w| w.watches(object, key)).cloned().collect()
 }
 
 /// A change entry's value: nil is NSNull, as Apple's.
@@ -240,7 +284,9 @@ fn change_value(value: Id) -> Id {
     }
 }
 
-fn tell(watcher: &KeyObserver, object: Id, new: Option<Id>, old: Option<Id>, prior: bool) {
+/// The change is told as one of the observed object's path, wherever along
+/// it the change was.
+fn tell(watcher: &KeyObserver, new: Option<Id>, old: Option<Id>, prior: bool) {
     let s = crate::fw::string::make;
     let mut entries = vec![(s("kind"), crate::fw::collections::number_int(1))];
     if let Some(new) = new.filter(|_| watcher.options & OPTION_NEW != 0) {
@@ -253,7 +299,7 @@ fn tell(watcher: &KeyObserver, object: Id, new: Option<Id>, old: Option<Id>, pri
         entries.push((s("notificationIsPrior"), crate::fw::collections::number_bool(true)));
     }
     let change = crate::fw::collections::dictionary_from(&entries);
-    runtime::send(watcher.observer, "observeValueForKeyPath:ofObject:change:context:", &[s(&watcher.path), object, change, watcher.context]);
+    runtime::send(watcher.observer, "observeValueForKeyPath:ofObject:change:context:", &[s(&watcher.path), watcher.object, change, watcher.context]);
 }
 
 fn value_at(object: Id, path: &str) -> Id {
@@ -267,11 +313,11 @@ pub fn will_change(object: Id, key: &str) {
     if watchers.is_empty() {
         return;
     }
-    let olds: Vec<(String, Id)> = watchers.iter().map(|w| (w.path.clone(), if w.options & OPTION_OLD != 0 { value_at(object, &w.path) } else { 0 })).collect();
+    let olds: Vec<(u64, Id)> = watchers.iter().map(|w| (w.serial, if w.options & OPTION_OLD != 0 { value_at(w.object, &w.path) } else { 0 })).collect();
     observing().pending.push((object, key.to_string(), olds.clone()));
     for (watcher, (_, old)) in watchers.iter().zip(&olds) {
         if watcher.options & OPTION_PRIOR != 0 {
-            tell(watcher, object, None, Some(*old), true);
+            tell(watcher, None, Some(*old), true);
         }
     }
 }
@@ -286,23 +332,35 @@ pub fn did_change(object: Id, key: &str) {
             None => Vec::new(),
         }
     };
-    for watcher in observers_of(object, key) {
-        let old = olds.iter().find(|(path, _)| *path == watcher.path).map(|(_, old)| *old).unwrap_or(0);
-        let new = if watcher.options & OPTION_NEW != 0 { value_at(object, &watcher.path) } else { 0 };
-        tell(&watcher, object, Some(new), Some(old), false);
+    let watchers = observers_of(object, key);
+    refollow(&watchers);
+    if let Some(w) = watchers.iter().find(|w| w.object != object) {
+        static LOGGED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
+            crate::log!("KVO: a change of {key} along an observed key path ({})", w.path);
+        }
+    }
+    for watcher in &watchers {
+        let old = olds.iter().find(|(serial, _)| *serial == watcher.serial).map(|(_, old)| *old).unwrap_or(0);
+        let new = if watcher.options & OPTION_NEW != 0 { value_at(watcher.object, &watcher.path) } else { 0 };
+        tell(watcher, Some(new), Some(old), false);
     }
 }
 
 extern "C" fn add_key_observer(this: Id, _: Sel, observer: Id, path: Id, options: usize, context: usize) {
-    let watcher = KeyObserver { object: this, path: crate::fw::string::get(path), observer, options, context };
-    {
+    let path = crate::fw::string::get(path);
+    let chain = chain_of(this, &path);
+    let watcher = {
         let mut o = observing();
+        o.next_serial += 1;
+        let watcher = KeyObserver { serial: o.next_serial, object: this, path, observer, options, context, chain };
         o.observers.push(watcher.clone());
         refresh_setters(&mut o);
-    }
+        watcher
+    };
     if options & OPTION_INITIAL != 0 {
         let new = if options & OPTION_NEW != 0 { value_at(this, &watcher.path) } else { 0 };
-        tell(&watcher, this, Some(new), None, false);
+        tell(&watcher, Some(new), None, false);
     }
 }
 
@@ -339,8 +397,11 @@ extern "C" fn automatically_notifies(_class: Class, _: Sel, _key: Id) -> bool {
 
 /// Tells observers of `key` on `object` that the framework changed it to `value`.
 pub fn kvo_notify(object: Id, key: &str, value: Id) {
-    for watcher in observers_of(object, key).into_iter().filter(|w| w.path == key) {
-        tell(&watcher, object, Some(value), None, false);
+    let watchers = observers_of(object, key);
+    refollow(&watchers);
+    for watcher in &watchers {
+        let new = if watcher.object == object && watcher.path == key { value } else { value_at(watcher.object, &watcher.path) };
+        tell(watcher, Some(new), None, false);
     }
 }
 
@@ -1116,6 +1177,9 @@ mod tests {
     extern "C" fn thing_child(this: Id, _: Sel) -> Id {
         crate::fw::uikit::property_get(this, "child").unwrap_or(0) as Id
     }
+    extern "C" fn thing_set_child(this: Id, _: Sel, child: Id) {
+        crate::fw::uikit::property_set(this, "child", child as u64);
+    }
     extern "C" fn thing_nothing(_this: Id, _: Sel) -> Id {
         0
     }
@@ -1155,6 +1219,7 @@ mod tests {
                     ("ratio", thing_ratio as usize),
                     ("setRatio:", thing_set_ratio as usize),
                     ("child", thing_child as usize),
+                    ("setChild:", thing_set_child as usize),
                     ("nothing", thing_nothing as usize),
                     ("label", thing_label as usize),
                     ("getLabel", thing_get_label as usize),
@@ -1286,6 +1351,46 @@ mod tests {
         msg_send(object, runtime::sel("setTitle:"), s("gone"));
         assert_eq!(take(), [], "removed");
         assert_eq!(string::get(thing_title(object, 0)), "gone");
+    }
+
+    static PATH_HEARD: std::sync::Mutex<Vec<(String, Id, Option<String>)>> = std::sync::Mutex::new(Vec::new());
+
+    extern "C" fn path_watcher(_this: Id, _: Sel, path: Id, object: Id, change: Id, _context: usize) {
+        let new = collections::dictionary_get(change, string::make("new"));
+        PATH_HEARD.lock().unwrap().push((string::get(path), object, (new != 0).then(|| string::get(new))));
+    }
+
+    /// An observer of a key path hears a change anywhere along it, as
+    /// Apple's: the last object's key, or a middle object's (then it
+    /// follows the new middle object, not the old one). SpellCraft's
+    /// monster heart watches parent.combatController.monsterHealth.
+    #[test]
+    fn observers_of_a_key_path_hear_changes_along_it() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let s = string::make;
+        let watcher_class = define_class("KvoPathWatcher", "NSObject", 8);
+        methods(watcher_class, &[("observeValueForKeyPath:ofObject:change:context:", path_watcher as usize)]);
+        let watcher = runtime::alloc_instance(watcher_class);
+        let leaf = thing("full", 0, 0);
+        let middle = thing("middle", 0, leaf);
+        let root = thing("root", 0, middle);
+        let path = "child.child.title".to_string();
+        let take = || std::mem::take(&mut *PATH_HEARD.lock().unwrap());
+        runtime::send(root, "addObserver:forKeyPath:options:context:", &[watcher, s(&path), 1, 0]);
+        let msg_send: extern "C" fn(Id, Sel, Id) = unsafe { std::mem::transmute(runtime::ios_objc_msgSend as usize) };
+        msg_send(leaf, runtime::sel("setTitle:"), s("hit"));
+        assert_eq!(take(), [(path.clone(), root, Some("hit".to_string()))], "the last object's key, told as a change of the root's path");
+        let other = thing("other", 0, 0);
+        msg_send(middle, runtime::sel("setChild:"), other);
+        assert_eq!(take(), [(path.clone(), root, Some("other".to_string()))], "a middle object's key");
+        msg_send(leaf, runtime::sel("setTitle:"), s("left behind"));
+        assert_eq!(take(), [], "the old last object is no longer on the path");
+        msg_send(other, runtime::sel("setTitle:"), s("new"));
+        assert_eq!(take(), [(path.clone(), root, Some("new".to_string()))], "the new one is");
+        runtime::send(root, "removeObserver:forKeyPath:", &[watcher, s(&path)]);
+        msg_send(other, runtime::sel("setTitle:"), s("gone"));
+        assert_eq!(take(), [], "removed");
     }
 
     static SET_VALUE_HEARD: std::sync::Mutex<Vec<(String, Option<String>, Option<String>)>> = std::sync::Mutex::new(Vec::new());

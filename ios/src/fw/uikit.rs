@@ -1162,6 +1162,7 @@ fn view_timing(duration: f64, delay: f64, options: usize) -> crate::fw::animatio
         curve: view_curve(options >> 16),
         repeat_count: if options & REPEAT != 0 { f64::INFINITY } else { 0.0 },
         autoreverses: options & AUTOREVERSE != 0,
+        asked: crate::fw::runloop::media_time(),
     }
 }
 
@@ -1361,6 +1362,8 @@ fn send_to_delegate(delegate: Id, selector: Sel, args: &[usize]) {
 /// on the next run-loop turn go to `later`.
 fn commit_old_animation(mut later: impl FnMut(Box<dyn FnOnce() + Send>)) {
     let Some(done) = OLD_ANIMATIONS.lock().unwrap_or_else(|e| e.into_inner()).pop() else { return };
+    // An iOS 3 block's animations begin at its commit, not its begin.
+    with_open_timing(|timing| timing.asked = crate::fw::runloop::media_time());
     let started = close_block();
     if done.delegate == 0 || (done.will_start == 0 && done.did_stop == 0) {
         runtime::send(done.id, "release", &[]);
