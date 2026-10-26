@@ -115,6 +115,19 @@ pub struct Layout {
     slots: [Slot; 4],
     pub bytes: usize,
     premultiplied: bool,
+    /// Four-byte RGB pixels: the byte places of red, green, blue and the
+    /// fourth component, read and written without going slot by slot.
+    fast: Option<Fast>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Fast {
+    red: usize,
+    green: usize,
+    blue: usize,
+    fourth: usize,
+    /// The fourth byte is alpha (else skipped: read as opaque, written 255).
+    alpha: bool,
 }
 
 /// The memory layout of an 8-bit-per-component format, or None when it is
@@ -150,7 +163,12 @@ pub fn layout(space: Space, bits_per_component: usize, bits_per_pixel: usize, in
         ORDER_32_LITTLE if list.len() == 4 => slots.reverse(),
         _ => return None,
     }
-    Some(Layout { slots, bytes: list.len(), premultiplied: matches!(alpha, PREMULTIPLIED_LAST | PREMULTIPLIED_FIRST) })
+    let at = |slot: Slot| slots.iter().position(|&s| s == slot);
+    let fast = match (list.len(), at(Red), at(Green), at(Blue), at(Alpha).or(at(Skip))) {
+        (4, Some(red), Some(green), Some(blue), Some(fourth)) => Some(Fast { red, green, blue, fourth, alpha: slots[fourth] == Alpha }),
+        _ => None,
+    };
+    Some(Layout { slots, bytes: list.len(), premultiplied: matches!(alpha, PREMULTIPLIED_LAST | PREMULTIPLIED_FIRST), fast })
 }
 
 /// The formats a bitmap context can draw into (Apple's list for 8 bits per
@@ -176,6 +194,16 @@ impl Layout {
 
     /// The pixel as stored: red, green, blue, alpha (0..1), premultiplied or not as the format is.
     fn unpack(&self, pixel: &[u8]) -> [f32; 4] {
+        match self.fast {
+            Some(f) => {
+                let v = |at: usize| pixel[at] as f32 / 255.0;
+                [v(f.red), v(f.green), v(f.blue), if f.alpha { v(f.fourth) } else { 1.0 }]
+            }
+            None => self.unpack_slots(pixel),
+        }
+    }
+
+    fn unpack_slots(&self, pixel: &[u8]) -> [f32; 4] {
         let mut out = [0.0, 0.0, 0.0, 1.0];
         for (slot, &byte) in self.slots[..self.bytes].iter().zip(pixel) {
             let v = byte as f32 / 255.0;
@@ -217,6 +245,21 @@ impl Layout {
 
     /// Stores a premultiplied colour.
     pub fn write(&self, pixel: &mut [u8], c: [f32; 4]) {
+        let Some(f) = self.fast else { return self.write_slots(pixel, c) };
+        let mut c = c;
+        let a = c[3];
+        if !self.premultiplied && f.alpha {
+            for v in &mut c[..3] {
+                *v = if a > 0.0 { *v / a } else { 0.0 };
+            }
+        }
+        pixel[f.red] = to_byte(c[0]);
+        pixel[f.green] = to_byte(c[1]);
+        pixel[f.blue] = to_byte(c[2]);
+        pixel[f.fourth] = if f.alpha { to_byte(a) } else { 255 };
+    }
+
+    fn write_slots(&self, pixel: &mut [u8], c: [f32; 4]) {
         let mut c = c;
         let a = c[3];
         if !self.premultiplied && self.has_alpha() {
@@ -964,6 +1007,10 @@ impl Canvas {
         let (layout, at) = (self.layout, (self.height - 1 - y) * self.bytes_per_row + x * self.layout.bytes);
         let clear = self.state.blend_mode == shapes::BLEND_CLEAR;
         let pixel = &mut self.memory()[at..at + layout.bytes];
+        // An opaque source over what is there is the source (dst * 0 = 0).
+        if matches!(blend, Blend::Over) && !clear && src[3] == 1.0 {
+            return layout.write(pixel, src);
+        }
         let dst = layout.read(pixel);
         let out = match blend {
             Blend::Over if clear => scaled(dst, 1.0 - src[3]),
@@ -2038,6 +2085,31 @@ mod tests {
 
     fn canvas(width: usize, height: usize, info: u32) -> Canvas {
         Canvas::new(std::ptr::null_mut(), width, height, 8, 0, Space::Rgb, info).unwrap()
+    }
+
+    #[test]
+    fn four_byte_pixels_read_and_write_like_the_slot_by_slot_way() {
+        // SpellCraft froze 80-120 ms per cast drawing a card pixel by pixel;
+        // RGB pixels are read and written at fixed byte places, which must
+        // give the same bytes and colours as going slot by slot.
+        let infos = [PREMULTIPLIED_LAST, PREMULTIPLIED_FIRST, ALPHA_LAST, ALPHA_FIRST, NONE_SKIP_LAST, NONE_SKIP_FIRST];
+        let orders = [0, ORDER_32_BIG, ORDER_32_LITTLE];
+        let values = [0u8, 1, 37, 128, 200, 254, 255];
+        for info in infos.into_iter().flat_map(|alpha| orders.map(|order| alpha | order)) {
+            let layout = layout(Space::Rgb, 8, 32, info).unwrap();
+            assert!(layout.fast.is_some(), "{info:#x} has fixed byte places");
+            for (i, &a) in values.iter().enumerate() {
+                for &b in &values {
+                    let pixel = [b, a, values[(i + 3) % values.len()], b ^ a];
+                    assert_eq!(layout.unpack(&pixel), layout.unpack_slots(&pixel), "{info:#x} {pixel:?}");
+                    let color = layout.read(&pixel);
+                    let (mut fast, mut slots) = ([9u8; 4], [9u8; 4]);
+                    layout.write(&mut fast, color);
+                    layout.write_slots(&mut slots, color);
+                    assert_eq!(fast, slots, "{info:#x} {color:?}");
+                }
+            }
+        }
     }
 
     fn bytes_at(c: &mut Canvas, x: usize, row: usize) -> Vec<u8> {
