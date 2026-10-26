@@ -17,6 +17,12 @@ pub fn render_layer(context: Id, layer: Id) {
     if layer == 0 || canvas("-[CALayer renderInContext:]", context).is_none() {
         return;
     }
+    // Core Animation lays the tree out first: a view never shown (a card
+    // made just for its picture) adds its parts in -layoutSubviews.
+    let view = layers::view_of(layer);
+    if view != 0 {
+        runtime::send(view, "layoutIfNeeded", &[]);
+    }
     let bounds = layers::bounds(layer);
     context_save_gstate(context);
     context_translate_ctm(context, -bounds.origin.x, -bounds.origin.y);

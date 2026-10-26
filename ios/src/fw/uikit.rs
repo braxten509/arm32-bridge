@@ -3178,6 +3178,31 @@ mod tests {
         assert_eq!(take(), [(controller, "viewWillLayoutSubviews"), (root, "layoutSubviews"), (controller, "viewDidLayoutSubviews")]);
     }
 
+    /// -renderInContext: lays the layer tree out first, as Core Animation
+    /// does: a view never shown that adds its parts in -layoutSubviews (as
+    /// SpellCraft's cards do) is drawn with them.
+    #[test]
+    fn a_picture_of_a_view_lays_it_out_first() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        extern "C" fn layout(this: Id, _: Sel) {
+            if view_state(this).subviews.is_empty() {
+                let part = view_init_with_frame(runtime::send(runtime::class_named("UIView"), "alloc", &[]), 0, Rect::new(0.0, 0.0, 4.0, 4.0));
+                runtime::send(part, "setBackgroundColor:", &[crate::fw::graphics::make_color([1.0, 0.0, 0.0, 1.0])]);
+                runtime::send(this, "addSubview:", &[part]);
+            }
+        }
+        let class = define_class("G32LaidOutWhenDrawnView", "UIView", 16);
+        methods(class, &[("layoutSubviews", layout as usize)]);
+        // Made the way the game's +[UIView(AENibView) view] makes it: no size, then sized.
+        let card = view_init_with_frame(runtime::send(class, "alloc", &[]), 0, Rect::default());
+        send_rect(card, "setFrame:", Rect::new(0.0, 0.0, 4.0, 4.0));
+        let context = crate::fw::graphics::test_begin_context(4.0, 4.0);
+        runtime::send(runtime::send(card, "layer", &[]), "renderInContext:", &[context]);
+        let pixels = crate::fw::graphics::test_end_context();
+        assert_eq!(pixels.get(..4), Some(&[255, 0, 0, 255][..]), "the part added during layout is drawn");
+    }
+
     /// UIKit's autoresizing: a view's new size moves and sizes its subviews
     /// by their masks at once (the flexible parts share the change by their
     /// sizes), down the tree, unless it doesn't autoresize subviews. A nib
