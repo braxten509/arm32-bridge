@@ -284,6 +284,32 @@ fn super_calls_pass_through_intermediate_game_classes() {
 }
 
 #[test]
+fn a_repeated_game_message_uses_the_remembered_method_until_the_game_adds_one() {
+    // SpellCraft's fights stalled ~70 ms twice a second: every message
+    // looked its method up again by name. The answer is now remembered per
+    // (class, selector), and forgotten when the game adds a method.
+    host_class("G32HostCachePanel");
+    let fake = Fake::new();
+    let base = class32(fake, "G32CacheBase", ClassTarget::External("G32HostCachePanel".into()), "G32HostCachePanel", vec![method("spin", "i8@0:4", 0x2201)]);
+    let leaf = class32(fake, "G32CacheLeaf", ClassTarget::Local(base.address), "G32HostCachePanel", vec![]);
+    let leaf_class = leaf.address;
+    let md = ObjcMetadata32 { classes: vec![base, leaf], ..Default::default() };
+    let bridge = Mutex::new(Bridge::new(&md).unwrap());
+    install(&bridge, fake, &md).unwrap();
+    fake.code(0x2201, |_| 1);
+    fake.code(0x2211, |_| 2);
+    let sel = |name: &str| bridge.lock().unwrap().guest_selector(fake, name);
+    let object = send(&bridge, fake, &[leaf_class, sel("alloc")]).unwrap() as u32;
+    let spin = sel("spin");
+    assert_eq!(send(&bridge, fake, &[object, spin]).unwrap(), 1);
+    assert!(bridge.lock().unwrap().classes.cached_send(leaf_class, spin).is_some(), "the answer is remembered");
+    assert_eq!(send(&bridge, fake, &[object, spin]).unwrap(), 1);
+    // class_addMethod: the leaf's own -spin answers from now on.
+    assert!(bridge.lock().unwrap().classes.add_method(leaf_class, "spin", 0x2211, "i8@0:4"));
+    assert_eq!(send(&bridge, fake, &[object, spin]).unwrap(), 2);
+}
+
+#[test]
 fn bytes_asks_a_game_override_of_length_without_holding_the_bridge() {
     host_class("G32HostBlobBase");
     let fake = Fake::new();

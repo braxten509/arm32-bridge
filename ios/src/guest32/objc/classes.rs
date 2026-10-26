@@ -14,6 +14,14 @@ pub struct GuestMethod {
     pub types: String,
 }
 
+/// A message a game method answered: that method and how many argument
+/// words it takes (receiver and selector included).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CachedSend {
+    pub imp: u32,
+    pub words: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Lookup<'a> {
     Guest(&'a GuestMethod),
@@ -58,6 +66,9 @@ pub struct GuestClasses {
     /// (class, selector) whose resolver was asked and added nothing: it is
     /// not asked again until the class's method table changes.
     refused_resolutions: HashSet<(u32, String)>,
+    /// Messages a game method answered, by (receiver's class, selector
+    /// address); forgotten whenever a method is added.
+    sends: HashMap<(u32, u32), CachedSend>,
 }
 
 fn method_map(list: &[Method32]) -> HashMap<String, GuestMethod> {
@@ -165,6 +176,17 @@ impl GuestClasses {
         Lookup::Missing
     }
 
+    /// The game method an earlier message to `class` with the selector at
+    /// `sel` reached, while no method has been added since.
+    pub fn cached_send(&self, class: u32, sel: u32) -> Option<CachedSend> {
+        self.sends.get(&(class, sel)).copied()
+    }
+
+    /// Remembers the game method a message reached (see `cached_send`).
+    pub fn remember_send(&mut self, class: u32, sel: u32, send: CachedSend) {
+        self.sends.insert((class, sel), send);
+    }
+
     pub fn class_named(&self, name: &str) -> Option<&GuestClass> {
         self.classes.get(self.by_name.get(name)?)
     }
@@ -266,6 +288,7 @@ impl GuestClasses {
         }
         methods.insert(sel.to_string(), GuestMethod { imp, types: types.to_string() });
         self.refused_resolutions.clear();
+        self.sends.clear();
         true
     }
 
@@ -277,6 +300,7 @@ impl GuestClasses {
         }
         c.methods.insert(sel.to_string(), GuestMethod { imp, types: types.to_string() });
         self.refused_resolutions.retain(|(owner, _)| *owner != class);
+        self.sends.clear();
         true
     }
 }

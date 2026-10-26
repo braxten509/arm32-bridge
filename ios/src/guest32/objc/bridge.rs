@@ -19,7 +19,7 @@
 //! Locking: the bridge state is behind a mutex that is never held while
 //! guest or host code runs (both may send messages back).
 
-use super::classes::{GuestClasses, Lookup};
+use super::classes::{CachedSend, GuestClasses, Lookup};
 use super::convert::{self, Boundary, GuestRet, HostCallOptions, HostFrame};
 use super::encoding::Signature;
 use super::mirror;
@@ -390,13 +390,17 @@ impl Bridge {
     }
 
     pub fn selector_name(&mut self, g: &dyn GuestSide, sel: u32) -> String {
-        if let Some(name) = self.sel_names.get(&sel) {
-            return name.clone();
+        self.selector_str(g, sel).to_string()
+    }
+
+    /// The selector's name without a copy.
+    pub fn selector_str(&mut self, g: &dyn GuestSide, sel: u32) -> &str {
+        if !self.sel_names.contains_key(&sel) {
+            let name = guest_cstr(g, sel);
+            self.sel_guest.entry(name.clone()).or_insert(sel);
+            self.sel_names.insert(sel, name);
         }
-        let name = guest_cstr(g, sel);
-        self.sel_names.insert(sel, name.clone());
-        self.sel_guest.entry(name.clone()).or_insert(sel);
-        name
+        &self.sel_names[&sel]
     }
 
     /// The one guest selector for `name` (the game's own string if it has one).
@@ -1134,10 +1138,11 @@ fn observed_setter(bridge: &Mutex<Bridge>, g: &dyn GuestSide, words: &dyn Fn(u32
         if receiver == 0 {
             return None;
         }
-        let name = b.selector_name(g, words(1));
+        let name = b.selector_str(g, words(1));
         if !(name.starts_with("set") || name.starts_with("_set")) {
             return None;
         }
+        let name = name.to_string();
         (b.host_object(receiver)?, name)
     };
     let key = crate::fw::object::observed_setter_key(object, &name)?;
@@ -1154,9 +1159,23 @@ fn send_unobserved(
     let first = u32::from(stret);
     let mut b = lock(bridge);
     let sel = words(first + 1);
+    // A message a game method answered before: straight to it, without the
+    // lookups by name below (most of a busy game's message time).
+    if matches!(kind, SendKind::Normal | SendKind::Stret) && !runtime::message_trace_on() {
+        let receiver = words(first);
+        if receiver != 0 {
+            if let Some(send) = b.classes.cached_send(u32_at(g, receiver), sel) {
+                drop(b);
+                return call_game_method(g, send, words);
+            }
+        }
+    }
     let name = b.selector_name(g, sel);
     // The class the lookup starts at (a super call's starting superclass).
     let start;
+    // (class, selector) when the answer may be remembered: a game method
+    // found in the game's own class chain, for a class whose +initialize is done.
+    let mut cacheable = None;
     let (receiver, target) = match kind {
         SendKind::Normal | SendKind::Stret => {
             let receiver = words(first);
@@ -1184,7 +1203,11 @@ fn send_unobserved(
                 initialize(bridge, g, class)?;
                 b = lock(bridge);
             }
-            (receiver, b.resolve(isa, &name)?)
+            let target = b.resolve(isa, &name)?;
+            if matches!(target, Target::Guest { .. }) && matches!(b.classes.lookup(isa, &name), Lookup::Guest(_)) && class_to_initialize(&b, isa).is_none() {
+                cacheable = Some(isa);
+            }
+            (receiver, target)
         }
         SendKind::Super2 | SendKind::Super2Stret => {
             let pair = words(first);
@@ -1223,11 +1246,12 @@ fn send_unobserved(
             super::forward::forward_message(bridge, g, kind, words, receiver, start, &error)
         }
         Target::Guest { imp, types } => {
+            let send = CachedSend { imp, words: Signature::parse_method(&types)?.guest_total_words() };
+            if let Some(isa) = cacheable {
+                b.classes.remember_send(isa, sel, send);
+            }
             drop(b);
-            let sig = Signature::parse_method(&types)?;
-            let call_words: Vec<u32> = (0..sig.guest_total_words()).map(get).collect();
-            let r = g.call(imp, &call_words)?;
-            Ok(GuestRet { r0: r as u32, r1: (r >> 32) as u32 })
+            call_game_method(g, send, &get)
         }
         Target::Host { class, meta, via_super } => {
             // +instanceMethodForSelector: / -methodForSelector:: the game calls
@@ -1411,6 +1435,13 @@ fn send_unobserved(
             Ok(result)
         }
     }
+}
+
+/// Runs a game method with the message's argument words.
+fn call_game_method(g: &dyn GuestSide, send: CachedSend, words: &dyn Fn(u32) -> u32) -> Result<GuestRet, String> {
+    let call_words: Vec<u32> = (0..send.words).map(words).collect();
+    let r = g.call(send.imp, &call_words)?;
+    Ok(GuestRet { r0: r as u32, r1: (r >> 32) as u32 })
 }
 
 /// -sortUsingFunction:context: and -sortedArrayUsingFunction:context: on a
