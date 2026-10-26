@@ -1908,22 +1908,26 @@ mod tests {
     fn play_for(player: &Arc<Player>, seconds: f64) -> bool {
         let mut out = vec![0f32; 512 * 2];
         for _ in 0..(seconds * 44100.0 / 512.0).round() as usize {
-            // The decoder thread fills the queue; on a busy PC it can lag
-            // seconds behind, so only a stuck one runs out this deadline.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            while std::time::Instant::now() < deadline {
-                let q = player.queue();
-                if q.ended || q.seek.is_none() && q.stream.frames() >= 1200 {
-                    break;
-                }
-                drop(q);
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
+            wait_for_decoded(player);
             if player.mix_into(&mut out, 512, 44100.0) {
                 return true;
             }
         }
         false
+    }
+
+    /// The decoder thread fills the queue; on a busy PC it can lag seconds
+    /// behind, so only a stuck one runs out this deadline.
+    fn wait_for_decoded(player: &Arc<Player>) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            let q = player.queue();
+            if q.ended || q.seek.is_none() && q.stream.frames() >= 1200 {
+                break;
+            }
+            drop(q);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     /// A CAF file in memory (games keep music in their own packs): the same
@@ -1983,7 +1987,14 @@ mod tests {
         let time = player.current_time();
         assert!((time - 0.5).abs() < 0.03, "half way: {time}");
         let mut out = vec![0f32; 64 * 2];
-        player.mix_into(&mut out, 64, 22050.0);
+        // As play_for: decoded sound first, and a turn the decoder held the
+        // queue through (try_lock missed) mixes nothing, so it goes again.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !out.iter().any(|&v| v.abs() > 0.1) && std::time::Instant::now() < deadline {
+            wait_for_decoded(&player);
+            out.fill(0.0);
+            player.mix_into(&mut out, 64, 22050.0);
+        }
         assert!(out.iter().any(|&v| v.abs() > 0.1), "the tone is heard");
         player.seek(0.6);
         assert!(!play_for(&player, 0.2));

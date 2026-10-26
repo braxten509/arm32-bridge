@@ -519,13 +519,82 @@ fn enqueue(queue: usize, state: &'static SerialQueue, job: Job) {
 }
 
 /// Starts the queue's worker unless one runs, the queue is suspended or empty.
+/// Threads kept for background jobs, as Apple's GCD keeps its workers: a job
+/// goes to an idle one, and a new thread starts only when all are busy.
+/// One idle for `WORKER_IDLE` ends.
+pub(crate) struct Workers {
+    state: Mutex<WorkerState>,
+    wake: Condvar,
+    started: AtomicUsize,
+}
+
+struct WorkerState {
+    jobs: std::collections::VecDeque<Box<dyn FnOnce() + Send>>,
+    /// Threads waiting for a job.
+    idle: usize,
+}
+
+/// How long a pool thread waits for another job before it ends.
+const WORKER_IDLE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The pool GCD's queues run their jobs on.
+static WORKERS: Workers = Workers::new();
+
+impl Workers {
+    pub(crate) const fn new() -> Self {
+        Workers {
+            state: Mutex::new(WorkerState { jobs: std::collections::VecDeque::new(), idle: 0 }),
+            wake: Condvar::new(),
+            started: AtomicUsize::new(0),
+        }
+    }
+
+    /// Runs `job` on one of the pool's threads.
+    pub(crate) fn run(&'static self, job: Box<dyn FnOnce() + Send>) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.jobs.push_back(job);
+        if state.jobs.len() <= state.idle {
+            self.wake.notify_one();
+            return;
+        }
+        drop(state);
+        self.started.fetch_add(1, Ordering::SeqCst);
+        std::thread::Builder::new().name("dispatch".into()).spawn(move || self.serve()).expect("a dispatch thread");
+    }
+
+    fn serve(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(job) = state.jobs.pop_front() {
+                drop(state);
+                job();
+                state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                continue;
+            }
+            state.idle += 1;
+            let (back, waited) = self.wake.wait_timeout(state, WORKER_IDLE).unwrap_or_else(|e| e.into_inner());
+            state = back;
+            state.idle -= 1;
+            if waited.timed_out() && state.jobs.is_empty() {
+                return;
+            }
+        }
+    }
+
+    /// How many threads the pool has started so far.
+    #[cfg(test)]
+    pub(crate) fn started(&self) -> usize {
+        self.started.load(Ordering::SeqCst)
+    }
+}
+
 fn start_worker(queue: usize, state: &'static SerialQueue, mut jobs: std::sync::MutexGuard<'_, Jobs>) {
     if jobs.running || jobs.suspended > 0 || jobs.waiting.is_empty() {
         return;
     }
     jobs.running = true;
     drop(jobs);
-    std::thread::spawn(move || {
+    WORKERS.run(Box::new(move || {
         CURRENT_RUNNER.with(|c| c.set(queue));
         loop {
             let job = {
@@ -535,7 +604,7 @@ fn start_worker(queue: usize, state: &'static SerialQueue, mut jobs: std::sync::
                     Some(job) => job,
                     None => {
                         jobs.running = false;
-                        return;
+                        break;
                     }
                 }
             };
@@ -543,7 +612,9 @@ fn start_worker(queue: usize, state: &'static SerialQueue, mut jobs: std::sync::
                 run(job);
             }
         }
-    });
+        // The pool thread may serve another queue next.
+        CURRENT_RUNNER.with(|c| c.set(0));
+    }));
 }
 
 fn is_suspended(suspensions: &Suspensions, queue: usize) -> bool {
@@ -670,17 +741,18 @@ fn submit_with(locked: Option<&mut Suspensions>, job: Job) {
     } else if let Some(state) = serial_queue(runner) {
         enqueue(runner, state, job);
     } else {
-        std::thread::spawn(move || {
+        WORKERS.run(Box::new(move || {
             if let Some(job) = try_hold(job, runner) {
                 CURRENT_QUEUE.with(|c| c.set(queue));
                 let pool = crate::fw::counted::pool_mark();
                 unsafe { call_block(job.block) };
                 crate::fw::counted::pool_drain(pool);
+                CURRENT_QUEUE.with(|c| c.set(0));
                 if let Some(done) = job.done {
                     mark_done(&done);
                 }
             }
-        });
+        }));
     }
 }
 
@@ -970,6 +1042,27 @@ mod tests {
     fn block(id: usize, queue: usize) -> usize {
         let header = BlockHeader { isa: 0, flags: BLOCK_IS_GLOBAL, reserved: 0, invoke: record as usize, descriptor: std::ptr::null() };
         Box::leak(Box::new(TestBlock { header, id, queue })) as *mut TestBlock as usize
+    }
+
+    #[test]
+    fn background_jobs_reuse_an_idle_thread() {
+        // SpellCraft froze ~1 s on each screen change: every queued job
+        // started a new thread (~113 in that second).
+        static POOL: Workers = Workers::new();
+        let threads: &'static Mutex<Vec<std::thread::ThreadId>> = Box::leak(Box::new(Mutex::new(Vec::new())));
+        for round in 1..=6 {
+            POOL.run(Box::new(move || threads.lock().unwrap().push(std::thread::current().id())));
+            let started = std::time::Instant::now();
+            while threads.lock().unwrap().len() < round && started.elapsed() < std::time::Duration::from_secs(5) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            // Let the thread finish its job and wait for the next one.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let mut ids = threads.lock().unwrap().clone();
+        assert_eq!(ids.len(), 6);
+        ids.dedup();
+        assert_eq!((ids.len(), POOL.started()), (1, 1), "jobs one after another share one thread");
     }
 
     #[test]
