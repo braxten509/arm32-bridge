@@ -1235,3 +1235,59 @@ fn framework_arrays_sort_with_a_game_function() {
     let contexts = contexts.lock().unwrap();
     assert!(!contexts.is_empty() && contexts.iter().all(|&c| c == 77), "{contexts:?}");
 }
+
+#[test]
+fn a_tutorial_waiting_for_a_skipped_story_box_goes_on() {
+    // SpellCraft: a story box can line up a next box that shows only once.
+    // After a quit mid-tutorial that next box was seen already, so the game
+    // skips it, and the tutorial (which waits for that box to close) kept
+    // the map locked. Nothing showing or lined up after a box with a next
+    // box closes: the tutorial is told to go on.
+    use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(crate::run::setup);
+    host_class("G32HostStoryBase");
+    let fake = Fake::new();
+    let base = || ClassTarget::External("G32HostStoryBase".into());
+    let class = |name: &str, methods| class32(fake, name, base(), "G32HostStoryBase", methods);
+    let alert = class("SCAlertController", vec![method("dialogViewDidClose:", "v12@0:4@8", 0x2301), method("currentAlert", "@8@0:4", 0x2311), method("alertQueue", "@8@0:4", 0x2321)]);
+    let mut tutorial = class("SCTutorialController", vec![method("tutorialUnderway", "c8@0:4", 0x2341), method("beginStageInteraction", "v8@0:4", 0x2351)]);
+    tutorial.meta.methods = vec![method("tutorialController", "@8@0:4", 0x2331)];
+    let dialog = class("G32StoryDialog", vec![method("spec", "@8@0:4", 0x2361)]);
+    let spec = class("G32StorySpec", vec![method("stringValueForKey:", "@12@0:4@8", 0x2371)]);
+    let text = class("G32StoryText", vec![method("length", "I8@0:4", 0x2381)]);
+    let queue = class("G32StoryQueue", vec![method("count", "I8@0:4", 0x2391)]);
+    let classes = [&alert, &tutorial, &dialog, &spec, &text, &queue].map(|c| c.address);
+    let md = ObjcMetadata32 { classes: vec![alert, tutorial, dialog, spec, text, queue], ..Default::default() };
+    let bridge: &'static Mutex<Bridge> = Box::leak(Box::new(Mutex::new(Bridge::new(&md).unwrap())));
+    install(bridge, fake, &md).unwrap();
+    let sel = |name: &str| bridge.lock().unwrap().guest_selector(fake, name);
+    let [alert, tutorial, dialog, spec, text, queue] = classes.map(|c| send(bridge, fake, &[c, sel("alloc")]).unwrap() as u32);
+    static SHOWING: AtomicU32 = AtomicU32::new(0);
+    static NEXT_NAME: AtomicU32 = AtomicU32::new(0);
+    static BEGUN: AtomicU32 = AtomicU32::new(0);
+    fake.code(0x2301, |_| 0);
+    fake.code(0x2311, |_| u64::from(SHOWING.load(SeqCst)));
+    fake.code(0x2321, move |_| u64::from(queue));
+    fake.code(0x2391, |_| 0);
+    fake.code(0x2331, move |_| u64::from(tutorial));
+    fake.code(0x2341, |_| 1);
+    fake.code(0x2351, |_| u64::from(BEGUN.fetch_add(1, SeqCst)));
+    fake.code(0x2361, move |_| u64::from(spec));
+    fake.code(0x2371, move |_| u64::from(text));
+    fake.code(0x2381, |_| u64::from(NEXT_NAME.load(SeqCst)));
+    let close = || send(bridge, fake, &[alert, sel("dialogViewDidClose:"), dialog]).unwrap();
+    // No next box: the tutorial's own -dialogViewDidClose: goes on.
+    close();
+    assert_eq!(BEGUN.load(SeqCst), 0);
+    // A next box that is showing: the tutorial waits for it.
+    NEXT_NAME.store(9, SeqCst);
+    SHOWING.store(dialog, SeqCst);
+    close();
+    assert_eq!(BEGUN.load(SeqCst), 0);
+    // A next box that was skipped: told to go on (each time, not only the first).
+    SHOWING.store(0, SeqCst);
+    close();
+    close();
+    assert_eq!(BEGUN.load(SeqCst), 2);
+}

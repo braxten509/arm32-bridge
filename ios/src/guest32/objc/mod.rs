@@ -21,6 +21,7 @@ pub mod forward;
 #[cfg(test)]
 mod forward_tests;
 pub mod functions;
+mod game_fixes;
 #[cfg(test)]
 mod functions_tests;
 pub mod mirror;

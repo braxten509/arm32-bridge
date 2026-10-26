@@ -1247,11 +1247,18 @@ fn send_unobserved(
         }
         Target::Guest { imp, types } => {
             let send = CachedSend { imp, words: Signature::parse_method(&types)?.guest_total_words() };
-            if let Some(isa) = cacheable {
+            // A game method a fix follows (game_fixes.rs) is not remembered,
+            // so each call comes back here.
+            let fixed = super::game_fixes::follows(&name, || b.class_display(u32_at(g, receiver)).0);
+            if let Some(isa) = cacheable.filter(|_| !fixed) {
                 b.classes.remember_send(isa, sel, send);
             }
             drop(b);
-            call_game_method(g, send, &get)
+            let result = call_game_method(g, send, &get)?;
+            if fixed {
+                super::game_fixes::after_message(bridge, g, receiver, get(first + 2))?;
+            }
+            Ok(result)
         }
         Target::Host { class, meta, via_super } => {
             // +instanceMethodForSelector: / -methodForSelector:: the game calls

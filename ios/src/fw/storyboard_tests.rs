@@ -571,6 +571,36 @@ fn a_label_reads_its_text_font_and_colours_from_a_coder() {
     assert_eq!(call::<f64>(system, "pointSize"), 15.0);
 }
 
+/// +[UIImage imageNamed:] answers a name it has seen from its cache (an
+/// app's pictures don't change), so a game asking every frame doesn't reach
+/// the phone's slow shared storage each time.
+#[test]
+fn image_named_answers_a_name_it_has_seen_from_its_cache() {
+    setup();
+    let named = |name: &str| runtime::send(runtime::class_named("UIImage"), "imageNamed:", &[string::make(name)]);
+    let pid = std::process::id();
+    let (found, missing) = (format!("cache_test_found_{pid}.png"), format!("cache_test_missing_{pid}.png"));
+    for _ in 0..3 {
+        let folder = image_folder();
+        let path = |name: &str| format!("{folder}/{name}");
+        std::fs::write(path(&found), crate::fw::png::encode(2, 2, &[0x80u8; 16], false)).unwrap();
+        let image = named(&found);
+        assert_eq!(named(&missing), 0);
+        std::fs::remove_file(path(&found)).unwrap();
+        std::fs::write(path(&missing), crate::fw::png::encode(2, 2, &[0x80u8; 16], false)).unwrap();
+        let (again, still_missing) = (named(&found), named(&missing));
+        std::fs::remove_file(path(&missing)).unwrap();
+        if image_folder() != folder {
+            continue;
+        }
+        assert_ne!(image, 0);
+        assert_eq!(again, image, "a found picture comes from the cache");
+        assert_eq!(still_missing, 0, "a missing one is remembered too");
+        return;
+    }
+    panic!("the app folder kept changing");
+}
+
 /// A picture is kept in a nib as its name (UIImageNibPlaceholder), which
 /// becomes the app's picture of that name; image views show it.
 #[test]

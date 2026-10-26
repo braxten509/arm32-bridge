@@ -2072,29 +2072,45 @@ pub fn image_info(image: Id) -> Option<&'static ImageInfo> {
 extern "C" fn image_named(_: Class, _: Sel, name: Id) -> Id {
     let name = string::get(name);
     let dir = crate::loader::app_dir();
+    // UIKit keeps named images in its cache (which holds its own reference),
+    // and an app's pictures don't change: a name seen before (found or not)
+    // is answered without looking at the files again.
+    static CACHE: Mutex<Option<HashMap<(String, String), Id>>> = Mutex::new(None);
+    // One picture per file, whichever name found it.
+    static BY_FILE: Mutex<Option<HashMap<String, Id>>> = Mutex::new(None);
+    let key = (dir, name);
+    if let Some(&image) = CACHE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).get(&key) {
+        return image;
+    }
+    let (dir, name) = &key;
     let (stem, ext) = match name.rsplit_once('.') {
         Some((s, e)) if !s.is_empty() => (s.to_string(), e.to_string()),
         _ => (name.clone(), "png".to_string()),
     };
-    for candidate in [format!("{dir}/{stem}@2x.{ext}"), format!("{dir}/{stem}.{ext}"), format!("{dir}/{name}")] {
-        // A file only: an empty name would otherwise find the app's folder.
-        if std::path::Path::new(&candidate).is_file() {
-            // UIKit keeps named images in its cache (which holds its own reference).
-            static CACHE: Mutex<Option<HashMap<String, Id>>> = Mutex::new(None);
-            let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-            let cache = cache.get_or_insert_with(HashMap::new);
-            if let Some(&image) = cache.get(&candidate) {
-                return image;
+    let candidates = [format!("{dir}/{stem}@2x.{ext}"), format!("{dir}/{stem}.{ext}"), format!("{dir}/{name}")];
+    // A file only: an empty name would otherwise find the app's folder.
+    let image = match candidates.iter().find(|candidate| std::path::Path::new(candidate).is_file()) {
+        Some(path) => {
+            let mut by_file = BY_FILE.lock().unwrap_or_else(|e| e.into_inner());
+            let by_file = by_file.get_or_insert_with(HashMap::new);
+            match by_file.get(path) {
+                Some(&image) => image,
+                None => {
+                    let image = image_from_path(path);
+                    if image != 0 {
+                        by_file.insert(path.clone(), image);
+                    }
+                    image
+                }
             }
-            let image = image_from_path(&candidate);
-            if image != 0 {
-                cache.insert(candidate, image);
-            }
-            return image;
         }
-    }
-    crate::log!("imageNamed {name}: not in the app");
-    0
+        None => {
+            crate::log!("imageNamed {name}: not in the app");
+            0
+        }
+    };
+    CACHE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(key, image);
+    image
 }
 
 extern "C" fn image_with_contents_of_file(_: Class, _: Sel, path: Id) -> Id {
