@@ -375,3 +375,44 @@ fn host_pointer_arguments_reach_guest_methods_as_typed_temporaries() {
     finish_guest_call(call, 0, 0, &mut frame, &mut b).unwrap();
     assert_eq!(flags, [1, 0xaa]);
 }
+
+/// A remembered message's plan (worked out once) converts each later call
+/// as a fresh look at its signature does: structs of CGFloats, C floats,
+/// selectors, id out-parameters, NSRange both ways.
+#[test]
+fn a_call_plan_made_once_converts_each_call_like_a_fresh_one() {
+    let mut b = Fake::new();
+    let (slot, range_out) = (b.alloc(8), b.alloc(8));
+    b.put(slot, &0x55u32.to_le_bytes());
+    // (types, real float, argument words of two calls, x register holding a temporary, result)
+    let cases: [(&str, bool, [Vec<u32>; 2], Option<usize>, HostRet); 5] = [
+        ("v@:{CGRect={CGPoint=ff}{CGSize=ff}}", false, [vec![1, 2, f(1.0), f(2.0), f(3.0), f(4.0)], vec![5, 6, f(-1.5), f(0.0), f(9.0), f(0.25)]], None, HostRet::default()),
+        ("f@:f", true, [vec![1, 2, f(0.5)], vec![3, 4, f(7.0)]], None, HostRet { x: [0; 2], d: [u64::from(f(2.5)), 0, 0, 0] }),
+        (":@::", false, [vec![1, 2, 0x30], vec![1, 2, 0]], None, HostRet { x: [HOST_SEL as u64 + 0x40, 0], d: [0; 4] }),
+        ("c@:@^@", false, [vec![1, 2, 3, slot], vec![1, 2, 0, slot]], Some(3), HostRet { x: [1, 0], d: [0; 4] }),
+        ("{_NSRange=II}@:{_NSRange=II}", false, [vec![range_out, 1, 2, 3, 4], vec![range_out, 5, 6, 7, 8]], None, HostRet { x: [9, 10], d: [0; 4] }),
+    ];
+    for (types, real_float, calls, temp_at, ret) in cases {
+        let sig = Signature::parse(types).unwrap();
+        let options = HostCallOptions { real_float, ..plain() };
+        let plan = std::sync::Arc::new(CallPlan::new(&sig, options).unwrap());
+        for w in calls {
+            let mut shapes = Vec::new();
+            for planned in [true, false] {
+                let call = if planned {
+                    prepare_planned(&sig, &plan, options, &words(&w), &mut b).unwrap()
+                } else {
+                    prepare_host_call(&sig, options, &words(&w), &mut b).unwrap()
+                };
+                let mut x = call.args.x;
+                if let Some(at) = temp_at {
+                    x[at] = 0;
+                }
+                let (d, stack, out) = (call.args.d, call.args.stack.clone(), call.first_out_value());
+                let r = finish_host_call(call, &ret, &mut b).unwrap();
+                shapes.push((x, d, stack, out, r, b.get(slot, 4), b.get(range_out, 8)));
+            }
+            assert_eq!(shapes[0], shapes[1], "{types} with {w:?}");
+        }
+    }
+}

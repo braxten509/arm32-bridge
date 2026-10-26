@@ -270,12 +270,16 @@ pub struct Bridge {
     game_instances: HashMap<u32, ()>,
     framework: HashMap<String, (u32, u32)>,
     framework_by_guest: HashMap<u32, (String, bool)>,
+    /// Host framework class -> its guest class (from `framework`, by name).
+    framework_isa: HashMap<usize, u32>,
     /// Game class (not metaclass) -> host mirror class.
     mirrors: HashMap<u32, usize>,
     /// Host protocol -> the game's protocol_t (see protocols.rs).
     protocols: HashMap<usize, u32>,
     sel_names: HashMap<u32, String>,
     sel_guest: HashMap<String, u32>,
+    /// Guest selector -> host selector.
+    host_sels: HashMap<u32, usize>,
     specials: HashMap<u32, Special>,
     /// Host object -> guest copy of its -bytes (address, capacity).
     buffers: HashMap<usize, (u32, u32)>,
@@ -310,10 +314,12 @@ impl Bridge {
             game_instances: HashMap::default(),
             framework: HashMap::default(),
             framework_by_guest: HashMap::default(),
+            framework_isa: HashMap::default(),
             mirrors: HashMap::default(),
             protocols: HashMap::default(),
             sel_names: HashMap::default(),
             sel_guest: HashMap::default(),
+            host_sels: HashMap::default(),
             specials: HashMap::default(),
             buffers: HashMap::default(),
             kept_copies: HashMap::default(),
@@ -398,12 +404,24 @@ impl Bridge {
 
     /// The selector's name without a copy.
     pub fn selector_str(&mut self, g: &dyn GuestSide, sel: u32) -> &str {
-        if !self.sel_names.contains_key(&sel) {
-            let name = guest_cstr(g, sel);
-            self.sel_guest.entry(name.clone()).or_insert(sel);
-            self.sel_names.insert(sel, name);
+        match self.sel_names.entry(sel) {
+            std::collections::hash_map::Entry::Occupied(known) => known.into_mut(),
+            std::collections::hash_map::Entry::Vacant(new) => {
+                let name = guest_cstr(g, sel);
+                self.sel_guest.entry(name.clone()).or_insert(sel);
+                new.insert(name)
+            }
         }
-        &self.sel_names[&sel]
+    }
+
+    /// The host selector for a guest one (found by name once).
+    pub fn host_sel(&mut self, g: &dyn GuestSide, sel: u32) -> usize {
+        if let Some(&host) = self.host_sels.get(&sel) {
+            return host;
+        }
+        let host = runtime::sel(self.selector_str(g, sel));
+        self.host_sels.insert(sel, host);
+        host
     }
 
     /// The one guest selector for `name` (the game's own string if it has one).
@@ -507,12 +525,12 @@ impl Bridge {
         if let Some(&protocol) = self.protocols.get(&host) {
             return Ok(protocol);
         }
-        let (class, is_class, name, meta, partner) = {
+        let (class, is_class, meta, partner) = {
             let rt = runtime::lock();
             let is_class = rt.classes.contains_key(&host);
             let class = if is_class { host } else { rt.class_of(host) };
             let rec = rt.classes.get(&class).ok_or_else(|| format!("host object {host:#x} has unknown class {class:#x}"))?;
-            (class, is_class, rec.name.clone(), rec.meta, rec.partner)
+            (class, is_class, rec.meta, rec.partner)
         };
         if let Some(&guest) = self.to_guest.get(&host) {
             // A host address can be reused after its object is freed: keep the
@@ -523,6 +541,7 @@ impl Bridge {
             self.to_guest.remove(&host);
             self.to_host.remove(&guest);
         }
+        let name = runtime::lock().class_name(class);
         if is_class {
             let mirror_of = mirror::mirror_guest_class(if meta { partner } else { class });
             return Ok(match mirror_of {
@@ -566,8 +585,15 @@ impl Bridge {
         match mirror::mirror_guest_class(host_class) {
             Some(guest_class) => isa == guest_class,
             None => {
+                if let Some(&known) = self.framework_isa.get(&host_class) {
+                    return isa == known;
+                }
                 let name = runtime::lock().class_name(host_class);
-                self.framework.get(&name).map(|p| p.0) == Some(isa)
+                let known = self.framework.get(&name).map(|p| p.0);
+                if let Some(known) = known {
+                    self.framework_isa.insert(host_class, known);
+                }
+                known == Some(isa)
             }
         }
     }
@@ -800,8 +826,7 @@ impl Boundary for Session<'_> {
         self.bridge.guest_object(self.g, host)
     }
     fn sel_to_host(&mut self, guest: u32) -> Result<usize, String> {
-        let name = self.bridge.selector_name(self.g, guest);
-        Ok(runtime::sel(&name))
+        Ok(self.bridge.host_sel(self.g, guest))
     }
     fn sel_to_guest(&mut self, host: usize) -> Result<u32, String> {
         let name = unsafe { runtime::cstr(host) };
@@ -905,6 +930,7 @@ pub fn install(bridge: &Mutex<Bridge>, g: &dyn GuestSide, md: &ObjcMetadata32) -
         let current = u32_at(g, r.slot);
         let canonical = *b.sel_guest.entry(r.name.clone()).or_insert(current);
         b.sel_names.insert(canonical, r.name.clone());
+        b.host_sels.remove(&canonical);
         if canonical != current {
             g.write(r.slot, &canonical.to_le_bytes());
         }
@@ -1361,7 +1387,7 @@ fn send_unobserved(
             }
             // No host method: Apple's forwarding (forward.rs).
             let host_receiver = b.host_object_for(g, receiver)?;
-            let host_sel = runtime::sel(&name);
+            let host_sel = b.host_sel(g, sel);
             drop(b);
             let imp = if via_super {
                 let host_class = Bridge::host_class_named(&class, meta);
@@ -1393,8 +1419,9 @@ fn send_unobserved(
                 && !sig.args.contains(&super::encoding::Ty::Block);
             if plain && matches!(kind, SendKind::Normal | SendKind::Stret) {
                 let isa = u32_at(g, receiver);
-                if class_to_initialize(&b, isa).is_none() {
-                    let send = super::classes::HostSend { sel: host_sel, signature: std::sync::Arc::new(sig.clone()), options };
+                if let (None, Ok(plan)) = (class_to_initialize(&b, isa), convert::CallPlan::new(&sig, options)) {
+                    let plan = std::sync::Arc::new(plan);
+                    let send = super::classes::HostSend { sel: host_sel, signature: std::sync::Arc::new(sig.clone()), options, plan };
                     b.classes.remember_host_send(isa, sel, send);
                 }
             }
@@ -1481,7 +1508,7 @@ fn call_remembered_host(
 ) -> Result<GuestRet, String> {
     let mark = wrapper_mark();
     let mut b = lock(bridge);
-    let call = convert::prepare_host_call(&host.signature, host.options, words, &mut Session { bridge: &mut b, g })?;
+    let call = convert::prepare_planned(&host.signature, &host.plan, host.options, words, &mut Session { bridge: &mut b, g })?;
     drop(b);
     let (ret, raised) = crate::fw::exception::catching(|| mirror::call_host(imp, &call.args));
     let mut b = lock(bridge);

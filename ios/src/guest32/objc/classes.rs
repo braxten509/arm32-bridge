@@ -32,6 +32,7 @@ pub struct HostSend {
     pub sel: usize,
     pub signature: std::sync::Arc<super::encoding::Signature>,
     pub options: super::convert::HostCallOptions,
+    pub plan: std::sync::Arc<super::convert::CallPlan>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

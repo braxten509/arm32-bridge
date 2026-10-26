@@ -772,12 +772,31 @@ extern "C" fn dispatch_sync(queue: usize, block: usize) {
         }
         submit(job(block, queue, Some(done.clone())));
         wait_for(&done);
-    } else if serial_queue(runner).is_some() {
+    } else if let Some(state) = serial_queue(runner) {
         if CURRENT_RUNNER.with(|c| c.get()) == runner {
             // On Apple this waits forever; running it here keeps the game going.
             crate::log!("dispatch_sync onto the queue already running; ran it directly");
             return inline();
         }
+        // An idle queue runs it on the caller's thread, as Apple's GCD does,
+        // holding the queue meanwhile so later blocks wait their turn. Checked
+        // under SUSPENSIONS, so no queue on the way gets suspended in between.
+        let suspensions = SUSPENSIONS.lock().unwrap();
+        if ANY_SUSPENDED.load(Ordering::SeqCst) == 0 {
+            let mut jobs = state.jobs.lock().unwrap();
+            if !jobs.running && jobs.suspended == 0 && jobs.waiting.is_empty() {
+                jobs.running = true;
+                drop(jobs);
+                drop(suspensions);
+                let before = CURRENT_RUNNER.with(|c| c.replace(runner));
+                inline();
+                CURRENT_RUNNER.with(|c| c.set(before));
+                let mut jobs = state.jobs.lock().unwrap();
+                jobs.running = false;
+                return start_worker(runner, state, jobs);
+            }
+        }
+        drop(suspensions);
         submit(job(block, queue, Some(done.clone())));
         wait_for(&done);
     } else {
@@ -1042,6 +1061,42 @@ mod tests {
     fn block(id: usize, queue: usize) -> usize {
         let header = BlockHeader { isa: 0, flags: BLOCK_IS_GLOBAL, reserved: 0, invoke: record as usize, descriptor: std::ptr::null() };
         Box::leak(Box::new(TestBlock { header, id, queue })) as *mut TestBlock as usize
+    }
+
+    static SYNC_RUNS: Mutex<Vec<(usize, std::thread::ThreadId, bool)>> = Mutex::new(Vec::new());
+    static SYNC_GATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    extern "C" fn note_sync_run(block: usize) {
+        let block = unsafe { &*(block as *const TestBlock) };
+        // Block 1 holds the queue until the test lets it go.
+        while block.id == 1 && !SYNC_GATE.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let right_queue = dispatch_get_current_queue() == block.queue;
+        SYNC_RUNS.lock().unwrap().push((block.id, std::thread::current().id(), right_queue));
+    }
+
+    /// dispatch_sync onto an idle serial queue runs the block on the caller's
+    /// thread, as Apple's GCD does (SpellCraft's screen changes waited ~40 ms
+    /// for worker threads to wake); onto a busy one it still waits its turn.
+    #[test]
+    fn sync_onto_an_idle_serial_queue_runs_on_the_callers_thread() {
+        let queue = dispatch_queue_create(0, 0);
+        let noting = |id: usize| {
+            let header = BlockHeader { isa: 0, flags: BLOCK_IS_GLOBAL, reserved: 0, invoke: note_sync_run as usize, descriptor: std::ptr::null() };
+            Box::leak(Box::new(TestBlock { header, id, queue })) as *mut TestBlock as usize
+        };
+        let me = std::thread::current().id();
+        dispatch_sync(queue, noting(0));
+        assert_eq!(SYNC_RUNS.lock().unwrap().clone(), [(0, me, true)], "ran here, as the queue");
+        dispatch_async(queue, noting(1));
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            SYNC_GATE.store(true, Ordering::SeqCst);
+        });
+        dispatch_sync(queue, noting(2));
+        let runs = SYNC_RUNS.lock().unwrap().clone();
+        assert_eq!(runs.iter().map(|r| (r.0, r.2)).collect::<Vec<_>>(), [(0, true), (1, true), (2, true)], "the busy queue's block went first");
     }
 
     #[test]

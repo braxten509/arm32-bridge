@@ -143,6 +143,24 @@ fn set(object: Id, value: Vec<u16>) {
     }
 }
 
+/// A string's text read in place, when the string is ours and answers
+/// -isEqual: with ours (comparing text); None for anything else, including
+/// a subclass with its own -isEqual:, which must be asked.
+pub fn plain_units(object: Id) -> Option<*const [u16]> {
+    if object == 0 || CLASSES.get().is_none() {
+        return None;
+    }
+    static IS_EQUAL: OnceLock<Sel> = OnceLock::new();
+    let sel = *IS_EQUAL.get_or_init(|| runtime::sel("isEqual:"));
+    let string = {
+        let rt = lock();
+        rt.is_subclass(rt.class_of(object), string_class())
+    };
+    // Through imp_for, so a subclass's +initialize has run (it may add its own -isEqual:).
+    let plain = string && runtime::imp_for(object, sel) == Some(is_equal as usize);
+    plain.then(|| unsafe { (*text(object)).units.as_slice() as *const [u16] })
+}
+
 fn units(object: Id) -> Vec<u16> {
     if object == 0 {
         return Vec::new();

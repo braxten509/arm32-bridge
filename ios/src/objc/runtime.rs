@@ -812,8 +812,22 @@ pub fn imp_for(receiver: Id, sel: Sel) -> Option<Imp> {
         return None;
     }
     let (isa, is_class) = {
-        let rt = lock();
-        (rt.class_of(receiver), rt.is_class_object(receiver))
+        let mut rt = lock();
+        let (isa, is_class) = (rt.class_of(receiver), rt.is_class_object(receiver));
+        // A parent's +initialize may finish its child first, so every class
+        // up the chain must be Done.
+        let mut at = if is_class { receiver } else { isa };
+        let all_done = loop {
+            match rt.classes.get(&at) {
+                Some(rec) if rec.init == Init::Done => at = rec.superclass,
+                Some(_) => break false,
+                None => break at == 0,
+            }
+        };
+        if all_done {
+            return rt.lookup(isa, sel);
+        }
+        (isa, is_class)
     };
     ensure_initialized(if is_class { receiver } else { isa });
     lock().lookup(isa, sel)

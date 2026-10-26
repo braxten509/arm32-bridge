@@ -715,8 +715,7 @@ fn contains_pointer(hty: &HostTy) -> bool {
 /// A guest message turned into a host call, ready to run.
 pub struct PreparedHostCall {
     pub args: HostArgs,
-    ret: Ty,
-    ret_hty: HostTy,
+    plan: std::sync::Arc<CallPlan>,
     indirect: Option<Box<[u64]>>,
     stret: Option<u32>,
     outs: Vec<OutParam>,
@@ -744,8 +743,48 @@ const MAX_ID_ARRAY: u32 = 1 << 20;
 
 /// Converts a guest message (`words`: r0-r3 then the guest stack, by word
 /// index) into host registers.
+/// What a signature's host call needs that its argument values don't
+/// change: each argument's guest word and host type, the result's types.
+/// Worked out once for a remembered message (classes::HostSend).
+#[derive(Debug)]
+pub struct CallPlan {
+    words: Vec<u32>,
+    total: u32,
+    /// Each argument's host type (None: worked out per call, as for the
+    /// pointer an out-parameter gets).
+    htys: Vec<Option<HostTy>>,
+    /// Each pointer argument's out-parameter type.
+    outs: Vec<Option<HostTy>>,
+    ret: Ty,
+    ret_hty: HostTy,
+}
+
+impl CallPlan {
+    pub fn new(sig: &Signature, options: HostCallOptions) -> Result<CallPlan, String> {
+        Ok(CallPlan {
+            words: sig.guest_arg_words(),
+            total: sig.guest_total_words(),
+            htys: sig.args.iter().map(|ty| host_ty(ty, options.real_float).ok()).collect(),
+            outs: sig.args.iter().map(|ty| if let Ty::Pointer(pointee) = ty { out_param_type(pointee) } else { None }).collect(),
+            ret: sig.ret.clone(),
+            ret_hty: host_ty(&sig.ret, false)?,
+        })
+    }
+}
+
 pub fn prepare_host_call(
     sig: &Signature,
+    options: HostCallOptions,
+    words: &dyn Fn(u32) -> u32,
+    b: &mut dyn Boundary,
+) -> Result<PreparedHostCall, String> {
+    prepare_planned(sig, &std::sync::Arc::new(CallPlan::new(sig, options)?), options, words, b)
+}
+
+/// prepare_host_call with `plan` (made from `sig` and `options`).
+pub fn prepare_planned(
+    sig: &Signature,
+    plan: &std::sync::Arc<CallPlan>,
     options: HostCallOptions,
     words: &dyn Fn(u32) -> u32,
     b: &mut dyn Boundary,
@@ -754,15 +793,15 @@ pub fn prepare_host_call(
     let mut outs = Vec::new();
     let array_count = match options.arrays {
         IdArrays::None => None,
-        _ => sig.args.iter().zip(sig.guest_arg_words()).filter(|(t, _)| matches!(t, Ty::Int { .. })).last().map(|(_, at)| words(at)),
+        _ => sig.args.iter().zip(plan.words.iter().copied()).filter(|(t, _)| matches!(t, Ty::Int { .. })).last().map(|(_, at)| words(at)),
     };
     let mut kept = Vec::new();
-    let last_word = sig.guest_arg_words().last().copied();
-    for (index, (ty, at)) in sig.args.iter().zip(sig.guest_arg_words()).enumerate() {
+    let last_word = plan.words.last().copied();
+    for (index, (ty, at)) in sig.args.iter().zip(plan.words.iter().copied()).enumerate() {
         if options.varargs == Varargs::VaList && Some(at) == last_word && index >= 1 {
             // The guest's va_list: the format's arguments, one word after
             // another; the host gets an arm64 va_list (8-byte slots) of them.
-            let format_at = sig.guest_arg_words()[index - 1];
+            let format_at = plan.words[index - 1];
             let text = format_text(&sig.args[index - 1], words(format_at), b)?;
             let needed: u32 = format_kinds(&text).iter().map(|kind| if matches!(kind, FormatArg::Long) { 2 } else { 1 }).sum();
             let place = words(at);
@@ -776,7 +815,7 @@ pub fn prepare_host_call(
         let guest = guest_bytes(words, at, ty.guest_size());
         if let Ty::Pointer(pointee) = ty {
             let address = guest_u32(&guest);
-            if let (Some(hty), true) = (out_param_type(pointee), address != 0) {
+            if let (Some(hty), true) = (plan.outs[index].clone(), address != 0) {
                 let (count, read, write_back) = match (array_count, **pointee == Ty::Object) {
                     (Some(n), true) if n > MAX_ID_ARRAY => return Err(format!("an id array of {n} elements")),
                     (Some(n), true) => (n.max(1), options.arrays == IdArrays::In, options.arrays == IdArrays::Out),
@@ -803,12 +842,26 @@ pub fn prepare_host_call(
                 continue;
             }
         }
-        let hty = host_ty(ty, options.real_float)?;
-        let mut host = vec![0u8; (hty.size() as usize).max(8)];
-        to_host(ty, &hty, &guest, &mut host[..hty.size() as usize], b)?;
-        args.push(&hty, &host);
+        let worked_out;
+        let hty = match &plan.htys[index] {
+            Some(hty) => hty,
+            None => {
+                worked_out = host_ty(ty, options.real_float)?;
+                &worked_out
+            }
+        };
+        let size = hty.size() as usize;
+        let (mut small, mut large) = ([0u8; 64], Vec::new());
+        let host: &mut [u8] = if size <= 64 {
+            &mut small[..size.max(8)]
+        } else {
+            large.resize(size, 0);
+            &mut large
+        };
+        to_host(ty, hty, &guest, &mut host[..size], b)?;
+        args.push(hty, host);
     }
-    let next = sig.guest_total_words();
+    let next = plan.total;
     match options.varargs {
         Varargs::None | Varargs::VaList => {}
         Varargs::NilList => {
@@ -821,7 +874,7 @@ pub fn prepare_host_call(
             }
         }
         Varargs::Format => {
-            let at = *sig.guest_arg_words().last().unwrap();
+            let at = *plan.words.last().unwrap();
             let text = format_text(sig.args.last().unwrap(), words(at), b)?;
             let mut word = next;
             let slots = format_slots(
@@ -835,13 +888,12 @@ pub fn prepare_host_call(
             args.stack.extend(slots);
         }
     }
-    let ret_hty = host_ty(&sig.ret, false)?;
-    let indirect = needs_indirect_result(&ret_hty).then(|| vec![0u64; (ret_hty.size() as usize).div_ceil(8)].into_boxed_slice());
+    let indirect = needs_indirect_result(&plan.ret_hty).then(|| vec![0u64; (plan.ret_hty.size() as usize).div_ceil(8)].into_boxed_slice());
     if let Some(buffer) = &indirect {
         args.x[8] = buffer.as_ptr() as u64;
     }
     let stret = sig.ret.guest_returns_in_memory().then(|| words(0));
-    Ok(PreparedHostCall { args, ret: sig.ret.clone(), ret_hty, indirect, stret, outs, not_found: options.not_found, _kept: kept })
+    Ok(PreparedHostCall { args, plan: plan.clone(), indirect, stret, outs, not_found: options.not_found, _kept: kept })
 }
 
 /// The text of a printf-style format argument (a C string or a string object).
@@ -904,15 +956,15 @@ pub fn finish_host_call(call: PreparedHostCall, ret: &HostRet, b: &mut dyn Bound
         mapped.write(out.guest, &guest);
     }
     let b = mapped.b;
-    if call.ret == Ty::Void {
+    if call.plan.ret == Ty::Void {
         return Ok(GuestRet { r0: 0, r1: 0 });
     }
-    let host = host_result_bytes(&call.ret_hty, ret, is_float_scalar(&call.ret), call.indirect.as_deref());
+    let host = host_result_bytes(&call.plan.ret_hty, ret, is_float_scalar(&call.plan.ret), call.indirect.as_deref());
     // A scalar float came back as f64 bits (see float_register_as_double).
-    let hty = if is_float_scalar(&call.ret) { HostTy::F64 } else { call.ret_hty.clone() };
-    let mut guest = vec![0u8; call.ret.guest_size() as usize];
-    to_guest(&call.ret, &hty, &host, &mut guest, b)?;
-    if call.not_found && matches!(call.ret, Ty::Int { .. }) {
+    let hty = if is_float_scalar(&call.plan.ret) { &HostTy::F64 } else { &call.plan.ret_hty };
+    let mut guest = vec![0u8; call.plan.ret.guest_size() as usize];
+    to_guest(&call.plan.ret, hty, &host, &mut guest, b)?;
+    if call.not_found && matches!(call.plan.ret, Ty::Int { .. }) {
         not_found_to_guest(&host, &mut guest);
     }
     match call.stret {
@@ -920,7 +972,7 @@ pub fn finish_host_call(call: PreparedHostCall, ret: &HostRet, b: &mut dyn Bound
             b.write(address, &guest);
             Ok(GuestRet { r0: address, r1: 0 })
         }
-        None => Ok(guest_ret_from_bytes(&call.ret, &guest)),
+        None => Ok(guest_ret_from_bytes(&call.plan.ret, &guest)),
     }
 }
 

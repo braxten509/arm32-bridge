@@ -124,7 +124,18 @@ fn find_key(object: Id, key: Id) -> Option<Id> {
     if let Some(&same) = keys.iter().find(|&&k| k == key) {
         return Some(same);
     }
-    keys.into_iter().find(|&k| keys_equal(k, key))
+    // Our own strings (most keys) are compared by their text in place;
+    // anything else is asked -isEqual:, as NSDictionary asks.
+    // A key's own isEqual: may change the looked-up string: its text is read again after one.
+    let mut key_text = crate::fw::string::plain_units(key);
+    keys.into_iter().find(|&k| match key_text.zip(crate::fw::string::plain_units(k)) {
+        Some((a, b)) => unsafe { *a == *b },
+        None => {
+            let same = keys_equal(k, key);
+            key_text = crate::fw::string::plain_units(key);
+            same
+        }
+    })
 }
 
 pub fn dictionary_get(object: Id, key: Id) -> Id {
@@ -2050,6 +2061,41 @@ mod tests {
         assert_eq!(counted::count(data), Some(1), "the copies' entries are alive");
         assert_eq!(runtime::send(list_copy, "objectAtIndex:", &[0]), data);
         assert_eq!(runtime::send(words_copy, "objectForKey:", &[key]), data);
+    }
+
+    static PICKY_ASKED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    extern "C" fn picky_is_equal(_this: Id, _: Sel, _other: Id) -> bool {
+        PICKY_ASKED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        true
+    }
+
+    /// Our own string keys are compared by their text in place (SpellCraft's
+    /// screen changes spent ~30 ms sending -isEqual: for every key); a key
+    /// class with its own -isEqual: is still asked, as NSDictionary asks it.
+    #[test]
+    fn string_keys_compare_their_text_and_a_keys_own_is_equal_is_still_asked() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let key = |name: &str| crate::fw::string::make(name);
+        let picky = {
+            let mut rt = runtime::lock();
+            let string = rt.by_name["NSString"];
+            let class = rt.define_class("PickyKeyString", string, 16);
+            let is_equal = rt.sel("isEqual:");
+            rt.add_method(class, is_equal, picky_is_equal as usize);
+            class
+        };
+        let odd = runtime::alloc_instance(picky);
+        assert!(crate::fw::string::plain_units(key("wand")).is_some());
+        assert!(crate::fw::string::plain_units(odd).is_none(), "its own -isEqual: answers");
+        let (one, two, three) = (number_int(1), number_int(2), number_int(3));
+        let words = dictionary_from(&[(key("hat"), one), (key("wand"), two)]);
+        assert_eq!(dictionary_get(words, key("wand")), two, "an equal text, another object");
+        assert_eq!(dictionary_get(words, key("staff")), 0);
+        let picky_words = dictionary_from(&[(odd, three)]);
+        assert_eq!(dictionary_get(picky_words, key("anything")), three);
+        assert!(PICKY_ASKED.load(std::sync::atomic::Ordering::SeqCst) > 0, "the key's own -isEqual: was asked");
     }
 
     static FOREIGN: std::sync::Mutex<Vec<(Id, Id)>> = std::sync::Mutex::new(Vec::new());
