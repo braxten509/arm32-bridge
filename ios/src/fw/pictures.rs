@@ -2134,7 +2134,17 @@ mod tests {
         send_struct(round_inside, "setCornerRadius:", 20.0f64);
         runtime::send(round_inside, "setMasksToBounds:", &[1]);
         runtime::send(shadowed_round, "addSublayer:", &[round_inside]);
-        for layer in [round, masked, shadowed, shadowed_round] {
+        // A shadowed layer inside a round one: its shadow comes from all of it (the round corner cuts afterwards).
+        let round_parent = new_layer("CALayer", rect(150.0, 100.0, 40.0, 40.0));
+        send_struct(round_parent, "setCornerRadius:", 20.0f64);
+        runtime::send(round_parent, "setMasksToBounds:", &[1]);
+        let corner_child = new_layer("CALayer", rect(0.0, 0.0, 4.0, 4.0));
+        runtime::send(corner_child, "setBackgroundColor:", &[rgba(red)]);
+        send_struct(corner_child, "setShadowOpacity:", 1.0f32);
+        send_struct(corner_child, "setShadowRadius:", 0.0f64);
+        send_struct(corner_child, "setShadowOffset:", Size { width: 18.0, height: 18.0 });
+        runtime::send(round_parent, "addSublayer:", &[corner_child]);
+        for layer in [round, masked, shadowed, shadowed_round, round_parent] {
             runtime::send(host, "addSublayer:", &[layer]);
         }
         let pictures = screen_pictures(&[window], &Classes::find());
@@ -2174,5 +2184,6 @@ mod tests {
         assert_eq!(seen(15.0, 145.0), [0; 4], "no shadow where it was moved away from");
         assert_eq!(seen(120.0, 120.0), [0, 0, 255, 255], "the round layer under a shadow");
         assert_eq!(seen(103.0, 103.0), [0; 4], "its corner cut, in the shadowed layer's picture too");
+        assert_eq!(seen(170.0, 120.0), [0, 0, 0, 255], "the shadow of a layer in a round layer's corner");
     }
 }

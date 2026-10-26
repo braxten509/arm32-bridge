@@ -7,7 +7,7 @@
 //! it is used.
 
 use super::*;
-use crate::fw::pictures::{meet, screen_box, Group, Picture};
+use crate::fw::pictures::{meet, screen_box, Corner, Group, Picture};
 use std::collections::HashMap;
 
 /// Most pixels a made picture has (it is made coarser past this), so a
@@ -304,7 +304,7 @@ pub fn group_pictures(start: &Picture, content: &[Picture], mask: &[Picture], sc
     let Some(file) = made(key, || {
         // TEMP: which groups are composited, and what they cost.
         let t = std::time::Instant::now();
-        let out = composite(group, area, k, content, mask, only_shadow);
+        let out = composite(group, area, k, content, mask, only_shadow, start.corner);
         crate::log!("TEMP group {:.0}x{:.0} at ({:.0},{:.0}) k {k}: {} pictures, clips {} radius {} masked {} shadow {:?}: {} ms", area.size.width, area.size.height, area.origin.x, area.origin.y, content.len(), group.clips, group.radius, group.masked, group.shadow.as_ref().map(|s| (s.radius, s.offset, s.path.is_some())), t.elapsed().as_millis());
         out
     }) else { return fallback };
@@ -320,8 +320,9 @@ pub fn group_pictures(start: &Picture, content: &[Picture], mask: &[Picture], sc
 
 /// Draws resolved pictures as the phone app does: each over its area by its
 /// content mode, with its alpha, inside the screen area it may draw in.
-/// `screen`: screen points to the canvas's pixels.
-fn draw_pictures(c: &mut Canvas, pictures: &[Picture], screen: Transform) {
+/// `screen`: screen points to the canvas's pixels. `outer`: the group's own
+/// round corners, which cut its finished picture (after its shadow is made).
+fn draw_pictures(c: &mut Canvas, pictures: &[Picture], screen: Transform, outer: Option<Corner>) {
     let whole = Rect::new(0.0, 0.0, c.width as f64, c.height as f64);
     for p in pictures {
         let Some(bitmap) = decoded(&p.path) else { continue };
@@ -333,10 +334,13 @@ fn draw_pictures(c: &mut Canvas, pictures: &[Picture], screen: Transform) {
             c.clip_to(&outline, false);
         }
         // Round corners of a layer inside the group (fw/pictures.rs `Corner`).
-        if let Some(corner) = p.corner {
-            let ((rx, ry), k) = (corner.radius, screen.a.abs());
+        if let Some(corner) = p.corner.filter(|&corner| Some(corner) != outer) {
+            let b = screen_box(screen, corner.rect);
+            let (rx, ry) = (corner.radius.0 * screen.a.abs(), corner.radius.1 * screen.d.abs());
+            // Corners wider than tall: drawn round with x squeezed by ry / rx, then stretched back.
+            let s = if rx > 0.0 && ry > 0.0 { ry / rx } else { 1.0 };
             let mut outline = shapes::Outline::default();
-            outline.rounded_rect(screen_box(screen, corner.rect), rx.min(ry) * k, &|p| p);
+            outline.rounded_rect(Rect::new(b.origin.x * s, b.origin.y, b.size.width * s, b.size.height), ry, &|(x, y)| (x / s, y));
             c.clip_to(&outline, false);
         }
         c.state.ctm = geometry::concat(p.place, screen);
@@ -417,12 +421,12 @@ fn box_blur(from: &[f32], to: &mut [f32], length: usize, count: usize, reach: us
 }
 
 /// The group's picture over `area` (screen points) at `k` pixels per point.
-fn composite(group: &Group, area: Rect, k: f64, content: &[Picture], mask: &[Picture], only_shadow: bool) -> Option<String> {
+fn composite(group: &Group, area: Rect, k: f64, content: &[Picture], mask: &[Picture], only_shadow: bool, outer: Option<Corner>) -> Option<String> {
     let (width, height) = (pixels(area.size.width, k), pixels(area.size.height, k));
     let mut c = canvas_at(area.origin, width, height, k)?;
     let screen = c.state.ctm;
     let layer = geometry::concat(group.place, screen);
-    draw_pictures(&mut c, content, screen);
+    draw_pictures(&mut c, content, screen, outer);
     let mut out = premultiplied(&mut c);
     if let Some(shadow) = &group.shadow {
         let alpha = match &shadow.path {
@@ -451,7 +455,7 @@ fn composite(group: &Group, area: Rect, k: f64, content: &[Picture], mask: &[Pic
     }
     if group.masked {
         let mut m = canvas_at(area.origin, width, height, k)?;
-        draw_pictures(&mut m, mask, screen);
+        draw_pictures(&mut m, mask, screen, outer);
         let alpha: Vec<f32> = premultiplied(&mut m).iter().map(|p| p[3]).collect();
         keep(&alpha);
     }
