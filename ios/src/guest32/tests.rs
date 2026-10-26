@@ -965,6 +965,48 @@ fn host_raises_reach_game_code_as_game_throws() {
     assert!(error.contains("uncaught Objective-C exception: NSUnknownKeyException"), "{error}");
 }
 
+/// Warm barriers reuse their constant personality without locking the
+/// stub table, while each nested call keeps its own return trap and link.
+#[test]
+fn warm_exception_barriers_do_not_relock_the_stub_table() {
+    use super::objc::exceptions::{Barrier, BARRIER};
+    setup();
+    let _gil = runtime::hold_gil();
+    let uc = runtime::engine();
+    let personality = runtime::stub_for(BARRIER);
+    let top = uc.get_data().tls_block + 18 * 4;
+    let original_top = mem().read_u32(top);
+    let original_depth = uc.get_data().depth;
+    // Warm both reusable contexts before holding the shared stub table.
+    let outer = Barrier::push(uc);
+    let inner = Barrier::push(uc);
+    assert_eq!(inner.pop(), None);
+    assert_eq!(outer.pop(), None);
+    // shared() rejects a second acquisition by this thread. Repeated
+    // barriers must use the resolved personality without any table lookup.
+    let shared = runtime::shared();
+    for depth in 0..3 {
+        uc.get_data_mut().depth = depth;
+        let outer = Barrier::push(uc);
+        let outer_at = mem().read_u32(top);
+        assert_eq!(mem().read_u32(outer_at + 24), personality);
+        assert_eq!(mem().read_u32(outer_at + 36), runtime::next_return_trap(uc));
+        uc.get_data_mut().depth = depth + 1;
+        let inner = Barrier::push(uc);
+        let inner_at = mem().read_u32(top);
+        assert_ne!(inner_at, outer_at);
+        assert_eq!(mem().read_u32(inner_at), outer_at);
+        assert_eq!(mem().read_u32(inner_at + 24), personality);
+        assert_eq!(mem().read_u32(inner_at + 36), runtime::next_return_trap(uc));
+        assert_eq!(inner.pop(), None);
+        assert_eq!(mem().read_u32(top), outer_at);
+        assert_eq!(outer.pop(), None);
+        assert_eq!(mem().read_u32(top), original_top);
+    }
+    drop(shared);
+    uc.get_data_mut().depth = original_depth;
+}
+
 /// A game exception escaping game code that host code called (game → host
 /// → game) stops at that call instead of unwinding past the host's frames
 /// into an outer game frame: the host gets it as a raise, which the bridge

@@ -1727,12 +1727,10 @@ pub fn image_cg(picture: Id) -> Id {
     let Some(info) = uikit::image_info(picture) else { return 0 };
     *info.cg.get_or_init(|| {
         // The bytes kept from making the picture are used once, then dropped
-        // so the decoded pixels aren't held alongside them; a picture made
-        // before this change (or a copy, like a stretchable one) reads its
-        // file again.
+        // so the decoded pixels aren't held alongside them.
         let bytes = info.bytes.lock().unwrap_or_else(|e| e.into_inner()).take();
-        let bytes = bytes.or_else(|| std::fs::read(&info.path).ok());
-        match bytes.and_then(|bytes| decode(&bytes)) {
+        let bytes = bytes.or_else(|| std::fs::read(&info.path).ok().map(std::sync::Arc::new));
+        match bytes.and_then(|bytes| decode(bytes.as_slice())) {
             Some((bitmap, _)) => make_image(bitmap),
             None => {
                 crate::log!("UIImage {}: can't read its pixels", info.path);

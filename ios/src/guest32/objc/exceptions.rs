@@ -200,7 +200,10 @@ impl Barrier {
         let prev = memory.read_u32(top);
         unsafe { std::ptr::write_bytes(memory.host(at), 0, CONTEXT_SIZE as usize) };
         memory.write_u32(at, prev);
-        memory.write_u32(at + PERSONALITY, runtime::stub_for(BARRIER));
+        // Stub addresses live for the process. Only the context and its
+        // return trap change between calls, not the barrier's personality.
+        static PERSONALITY_STUB: OnceLock<u32> = OnceLock::new();
+        memory.write_u32(at + PERSONALITY, *PERSONALITY_STUB.get_or_init(|| runtime::stub_for(BARRIER)));
         memory.write_u32(at + JUMP_BUFFER + 4, runtime::next_return_trap(uc));
         memory.write_u32(at + JUMP_BUFFER + 8, uc.get_data().stack_top - 64);
         memory.write_u32(top, at);

@@ -505,6 +505,8 @@ pub struct ViewState {
     pub window: Id,
     /// Marked for -layoutSubviews in the run loop's next layout pass.
     pub needs_layout: bool,
+    /// Own layout has started and its subtree is still being laid out.
+    layout_active: bool,
 }
 
 pub fn view_state(view: Id) -> &'static mut ViewState {
@@ -520,6 +522,7 @@ pub fn view_state(view: Id) -> &'static mut ViewState {
                 transform: IDENTITY,
                 window: 0,
                 needs_layout: false,
+                layout_active: false,
             }));
         }
         &mut **slot
@@ -695,11 +698,27 @@ fn set_needs_layout(view: Id) {
     }
 }
 
+/// Hierarchy and size changes made by layout are part of that layout, not
+/// a request to repeat it. Explicit -setNeedsLayout remains unconditional.
+fn request_layout_for_change(view: Id) {
+    if view != 0 && !view_state(view).layout_active {
+        set_needs_layout(view);
+    }
+}
+
+struct ActiveLayout(Id);
+
+impl Drop for ActiveLayout {
+    fn drop(&mut self) {
+        view_state(self.0).layout_active = false;
+    }
+}
+
 /// A new size lays out the view and its superview, and (as UIKit does at
 /// once) moves and sizes its subviews by their autoresizing masks.
 fn resized_view(view: Id, old: Size) {
-    set_needs_layout(view);
-    set_needs_layout(view_state(view).superview);
+    request_layout_for_change(view);
+    request_layout_for_change(view_state(view).superview);
     if property_get(view, "autoresizes").is_none_or(|v| v != 0) {
         let new = view_state(view).frame.size;
         for child in view_state(view).subviews.clone() {
@@ -751,12 +770,19 @@ fn lay_out(view: Id) {
 /// Lays out the marked views of a tree, each before its subviews (the
 /// list is read after a view's own layout, which may change it).
 fn lay_out_tree(view: Id, depth: usize) {
-    if view == 0 || depth > 256 {
+    if view == 0 || depth > 256 || view_state(view).layout_active {
         return;
     }
-    if std::mem::take(&mut view_state(view).needs_layout) {
+    // Keep the guard through child layout, since child sizing can invalidate
+    // its parent. Clean parents stay inactive and still accept those changes.
+    let _active = if std::mem::take(&mut view_state(view).needs_layout) {
+        view_state(view).layout_active = true;
+        let active = ActiveLayout(view);
         lay_out(view);
-    }
+        Some(active)
+    } else {
+        None
+    };
     for child in view_state(view).subviews.clone() {
         lay_out_tree(child, depth + 1);
     }
@@ -813,7 +839,7 @@ fn detach(view: Id) {
     if parent != 0 {
         view_state(parent).subviews.retain(|&v| v != view);
         view_state(view).superview = 0;
-        set_needs_layout(parent);
+        request_layout_for_change(parent);
     }
 }
 
@@ -833,8 +859,27 @@ fn attach(parent: Id, view: Id, index: Option<usize>) {
     attach_with_geometry(parent, view, index, current_geometry());
 }
 
+fn correct_controller_child_frame(parent: Id, view: Id, geometry: Geometry) {
+    let parent_size = view_state(parent).frame.size;
+    let child_frame = view_state(view).frame;
+    let child_transform = view_state(view).transform;
+    if let Some(frame) = controller_child_frame(geometry, parent_size, child_frame, child_transform, true) {
+        let parent_controller = property_get(parent, "viewController").unwrap_or(0) as Id;
+        if linked_controller_view(parent_controller, parent, view) {
+            send_rect(view, "setFrame:", frame);
+        }
+    }
+}
+
 fn attach_with_geometry(parent: Id, view: Id, index: Option<usize>, geometry: Geometry) {
     if view == 0 || parent == 0 {
+        return;
+    }
+    // Layout code may add its content view again. If it is already on top,
+    // nothing moved: invalidating layout here would make that layout repeat.
+    if index.is_none() && view_state(view).superview == parent && view_state(parent).subviews.last() == Some(&view) {
+        // Controller links can be established after the first attachment.
+        correct_controller_child_frame(parent, view, geometry);
         return;
     }
     // Controllers whose views come on screen or leave it with this one hear
@@ -862,17 +907,9 @@ fn attach_with_geometry(parent: Id, view: Id, index: Option<usize>, geometry: Ge
         None => list.push(view),
     }
     view_state(view).superview = parent;
-    let parent_size = view_state(parent).frame.size;
-    let child_frame = view_state(view).frame;
-    let child_transform = view_state(view).transform;
-    if let Some(frame) = controller_child_frame(geometry, parent_size, child_frame, child_transform, true) {
-        let parent_controller = property_get(parent, "viewController").unwrap_or(0) as Id;
-        if linked_controller_view(parent_controller, parent, view) {
-            send_rect(view, "setFrame:", frame);
-        }
-    }
-    set_needs_layout(view);
-    set_needs_layout(parent);
+    correct_controller_child_frame(parent, view, geometry);
+    request_layout_for_change(view);
+    request_layout_for_change(parent);
     if moving {
         if old_window != new_window {
             tell_window_move(view, None);
@@ -1992,7 +2029,7 @@ pub struct ImageInfo {
     pub path: String,
     /// The file's bytes, kept from making the picture until its CGImage is
     /// first read from them (then dropped, so the pixels aren't held twice).
-    pub bytes: Mutex<Option<Vec<u8>>>,
+    pub bytes: Mutex<Option<std::sync::Arc<Vec<u8>>>>,
     pub pixels: (u32, u32),
     pub scale: f64,
     /// UIImageOrientation (0 = up).
@@ -2052,7 +2089,7 @@ fn image_from_path(path: &str) -> Id {
     };
     // A photo's EXIF tag turns it, as UIImage reads it (the size is then swapped).
     let orientation = crate::fw::graphics::file_orientation(&bytes);
-    make_image(ImageInfo { path: path.into(), bytes: Mutex::new(Some(bytes)), pixels, scale, orientation, ..Default::default() })
+    make_image(ImageInfo { path: path.into(), bytes: Mutex::new(Some(std::sync::Arc::new(bytes))), pixels, scale, orientation, ..Default::default() })
 }
 
 /// A new UIImage with one reference (the caller's); it counts references (fw/counted.rs).
@@ -2195,14 +2232,17 @@ extern "C" fn image_init_with_contents_of_file(_this: Id, _: Sel, path: Id) -> I
 /// and the middle stretches (fw/pictures.rs).
 fn image_with_caps(image: Id, caps: [f64; 4], tile: bool) -> Id {
     let Some(info) = image_info(image) else { return 0 };
-    // Pictures made in memory have no file: the copy holds the same CGImage.
+    let bytes = info.bytes.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let cg = OnceLock::new();
-    if info.path.is_empty() {
+    if let Some(&picture) = info.cg.get() {
+        crate::fw::counted::retain(picture);
+        let _ = cg.set(picture);
+    } else if bytes.is_none() {
         let picture = crate::fw::graphics::image_cg(image);
         crate::fw::counted::retain(picture);
         let _ = cg.set(picture);
     }
-    let copy = ImageInfo { path: info.path.clone(), pixels: info.pixels, scale: info.scale, orientation: info.orientation, caps: Some(caps), tile, cg, ..Default::default() };
+    let copy = ImageInfo { path: info.path.clone(), bytes: Mutex::new(bytes), pixels: info.pixels, scale: info.scale, orientation: info.orientation, caps: Some(caps), tile, cg, ..Default::default() };
     crate::fw::counted::autorelease(make_image(copy))
 }
 
@@ -2933,6 +2973,36 @@ mod tests {
         std::fs::remove_dir_all(&folder).unwrap();
     }
 
+    #[test]
+    fn resizable_copies_reuse_the_sources_file_bytes_and_pixels() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let folder = std::env::temp_dir().join(format!("gamebridge-cap-reuse-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let sel = runtime::sel("resizableImageWithCapInsets:");
+        for source_decoded in [false, true] {
+            let path = folder.join(format!("{source_decoded}.png"));
+            let pixels: Vec<u8> = (0..6 * 4).flat_map(|i| [(i % 6) as u8 * 40, 0, 0, 255]).collect();
+            std::fs::write(&path, crate::fw::png::encode(6, 4, &pixels, false)).unwrap();
+            let source = image_from_path(&path.to_string_lossy());
+            assert_ne!(source, 0);
+            let source_cg = if source_decoded { crate::fw::graphics::image_cg(source) } else { 0 };
+            std::fs::remove_file(&path).unwrap();
+            let imp = runtime::imp_for(source, sel).expect("-[UIImage resizableImageWithCapInsets:] is missing");
+            let resizable: extern "C" fn(Id, Sel, f64, f64, f64, f64) -> Id = unsafe { std::mem::transmute(imp) };
+            let copy = resizable(source, sel, 1.0, 2.0, 1.0, 2.0);
+            assert_ne!(copy, 0);
+            crate::fw::counted::release(source);
+            let copy_cg = crate::fw::graphics::image_cg(copy);
+            assert_ne!(copy_cg, 0, "source_decoded={source_decoded}");
+            assert_eq!(crate::fw::graphics::straight_pixels(copy_cg).map(|pixels| pixels.len()), Some(6 * 4 * 4));
+            if source_decoded {
+                assert_eq!(copy_cg, source_cg);
+            }
+        }
+        std::fs::remove_dir_all(&folder).unwrap();
+    }
+
     /// A stretchable copy is an image of its own (+0, autoreleased, as
     /// UIKit gives it): kept, it lives on after the image it was made from
     /// is gone, whether that came from a file or was made in memory.
@@ -3198,6 +3268,100 @@ mod tests {
                 e(view, "didMoveToSuperview", 0),
             ]
         );
+    }
+
+    #[test]
+    fn readding_the_top_subview_during_layout_does_not_schedule_another_layout() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        extern "C" fn layout(this: Id, _: Sel) {
+            CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let child = view_state(this).subviews[0];
+            runtime::send(this, "addSubview:", &[child]);
+        }
+        let class = define_class("ReaddingContentLayoutView", "UIView", 16);
+        methods(class, &[("layoutSubviews", layout as usize)]);
+        let parent = runtime::send(runtime::alloc_instance(class), "init", &[]);
+        let child = runtime::send(runtime::alloc_instance(runtime::class_named("UIView")), "init", &[]);
+        runtime::send(parent, "addSubview:", &[child]);
+        CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+        runtime::send(parent, "layoutIfNeeded", &[]);
+        runtime::send(parent, "layoutIfNeeded", &[]);
+        assert_eq!(CALLS.load(std::sync::atomic::Ordering::SeqCst), 1, "adding the child already on top must not keep layout running");
+        assert_eq!(view_state(parent).subviews, [child]);
+        runtime::send(parent, "setNeedsLayout", &[]);
+        runtime::send(parent, "layoutIfNeeded", &[]);
+        assert_eq!(CALLS.load(std::sync::atomic::Ordering::SeqCst), 2, "an explicit request still lays out again");
+        runtime::send(child, "setNeedsLayout", &[]);
+        runtime::send(parent, "addSubview:", &[child]);
+        assert!(view_state(child).needs_layout, "a child's existing layout request is preserved");
+        let sibling = runtime::send(runtime::alloc_instance(runtime::class_named("UIView")), "init", &[]);
+        runtime::send(parent, "addSubview:", &[sibling]);
+        runtime::send(parent, "addSubview:", &[child]);
+        assert_eq!(view_state(parent).subviews, [sibling, child], "a lower child still moves to the front");
+    }
+
+    #[test]
+    fn children_added_during_controller_layout_do_not_restart_the_parent_layout() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        extern "C" fn child_layout(this: Id, _: Sel) {
+            property_set(this, "layoutCount", property_get(this, "layoutCount").unwrap_or(0) + 1);
+            // Child sizing during layout must not requeue the active parent.
+            view_set_frame(this, 0, Rect::new(0.0, 0.0, 10.0, 10.0));
+            if property_get(this, "resizeParent") == Some(1) {
+                property_set(this, "resizeParent", 0);
+                view_set_frame(view_state(this).superview, 0, Rect::new(0.0, 0.0, 100.0, 50.0));
+            }
+        }
+        extern "C" fn did_layout(this: Id, _: Sel) {
+            let root = runtime::send(this, "view", &[]);
+            let child = runtime::send(runtime::alloc_instance(runtime::class_named("AddedDuringLayoutChild")), "init", &[]);
+            runtime::send(root, "addSubview:", &[child]);
+            if property_get(this, "requestAgain") == Some(1) {
+                property_set(this, "requestAgain", 0);
+                runtime::send(root, "setNeedsLayout", &[]);
+                runtime::send(root, "layoutIfNeeded", &[]);
+            }
+        }
+        let child_class = define_class("AddedDuringLayoutChild", "UIView", 16);
+        methods(child_class, &[("layoutSubviews", child_layout as usize)]);
+        let controller_class = define_class("AddingDuringLayoutController", "UIViewController", 8);
+        methods(controller_class, &[("viewDidLayoutSubviews", did_layout as usize)]);
+        let controller = runtime::send(runtime::alloc_instance(controller_class), "init", &[]);
+        let root = runtime::send(runtime::alloc_instance(runtime::class_named("UIView")), "init", &[]);
+        runtime::send(controller, "setView:", &[root]);
+        runtime::send(root, "setNeedsLayout", &[]);
+        runtime::send(root, "layoutIfNeeded", &[]);
+        runtime::send(root, "layoutIfNeeded", &[]);
+        assert_eq!(view_state(root).subviews.len(), 1, "adding a child during layout must not keep creating children");
+        let child = view_state(root).subviews[0];
+        assert_eq!(property_get(child, "layoutCount"), Some(1), "the added child is laid out in this pass, without resizing restarting it");
+        property_set(controller, "requestAgain", 1);
+        runtime::send(root, "setNeedsLayout", &[]);
+        runtime::send(root, "layoutIfNeeded", &[]);
+        assert!(view_state(root).needs_layout, "an explicit request from inside the callback survives");
+        runtime::send(root, "layoutIfNeeded", &[]);
+        runtime::send(root, "layoutIfNeeded", &[]);
+        assert_eq!(view_state(root).subviews.len(), 3, "the explicit request runs exactly once more");
+        let external = runtime::send(runtime::alloc_instance(runtime::class_named("UIView")), "init", &[]);
+        runtime::send(root, "addSubview:", &[external]);
+        runtime::send(root, "layoutIfNeeded", &[]);
+        assert_eq!(view_state(root).subviews.len(), 5, "outside attachment still schedules parent layout");
+        view_set_frame(child, 0, Rect::new(0.0, 0.0, 20.0, 20.0));
+        assert!(view_state(root).needs_layout, "outside resizing still schedules parent layout");
+        let clean_parent = runtime::send(runtime::alloc_instance(runtime::class_named("UIView")), "init", &[]);
+        let dirty_child = runtime::send(runtime::alloc_instance(child_class), "init", &[]);
+        runtime::send(clean_parent, "addSubview:", &[dirty_child]);
+        runtime::send(clean_parent, "layoutIfNeeded", &[]);
+        assert!(!view_state(clean_parent).needs_layout);
+        property_set(dirty_child, "resizeParent", 1);
+        runtime::send(dirty_child, "setNeedsLayout", &[]);
+        runtime::send(clean_parent, "layoutIfNeeded", &[]);
+        assert!(view_state(clean_parent).needs_layout, "a clean parent traversed for a dirty child still accepts size changes");
+        runtime::send(clean_parent, "layoutIfNeeded", &[]);
+        assert!(!view_state(clean_parent).needs_layout);
     }
 
     /// UIKit's layout pass: a view added to a shown window gets -layoutSubviews
@@ -3488,6 +3652,15 @@ mod tests {
         let other = new_view(portrait);
         attach_with_geometry(parent_view, other, None, geometry);
         assert_eq!(view_state(other).frame, portrait);
+
+        let late_controller = new_controller(runtime::class_named("UIViewController"));
+        let late_view = new_view(portrait);
+        controller_set_view(late_controller, 0, late_view);
+        attach_with_geometry(parent_view, late_view, None, geometry);
+        assert_eq!(view_state(late_view).frame, portrait, "not linked to the parent yet");
+        controller_add_child(parent, 0, late_controller);
+        attach_with_geometry(parent_view, late_view, None, geometry);
+        assert_eq!(view_state(late_view).frame, landscape, "re-adding an unchanged top child still corrects a late controller link");
     }
 
     #[test]
