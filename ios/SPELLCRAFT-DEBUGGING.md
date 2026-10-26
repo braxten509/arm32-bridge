@@ -524,3 +524,64 @@ Work log and decisions (away mode):
   PC fight).
 - Music test flake fixed: the test's pretend sound card retries a turn the
   decoder held the queue for.
+- Spell panel, second fix: the phone showed lists arriving ~250 ms late
+  because pictures were made after the commit. Now pictures::tick makes the
+  pictures for uncommitted animations first, then commits.
+
+## 2026-10-26 (later): tutorial gap, drawer, tab-switch lag
+
+- Tutorial gap: -beginStageInteraction performs -lockControlsAndPlacePointer
+  2 s later; until then the store tab's other tabs were tappable. Fix
+  (game_fixes.rs after_stage_interaction): while that perform waits, every
+  control is off except the step's own (the focus control, found as
+  -applyControlFocus finds it: currentStage focusControl key path on the
+  current screen). Owner then had to tap the hat 3 times (all controls were
+  off in the first version) - fixed by leaving the focus control on.
+- Drawer in front of the tutorial box: the box opens in viewWillAppear, the
+  drawer was added in viewDidLayoutSubviews afterwards. Now a screen is laid
+  out before viewWillAppear (uikit.rs controller_transition, did_appear).
+- Tab-switch lag (owner: "switching drawer tabs is a bit laggy"). simpleperf
+  on the phone (25 s, 2000 Hz, symbols from target/aarch64-linux-android
+  release lib via --symfs) showed ~0.5 s game-thread stalls per switch:
+  (1) compose_groups ~300 ms: the drawer content panel is masksToBounds +
+  cornerRadius 8, so every content change redrew the whole panel on the CPU
+  (PC: 355x150 pt group, 14 pictures, 645 ms); (2) the game's own
+  CGContextDrawImage calls ~200 ms (draw_bitmap per-pixel closure, clip
+  masks with 4x4 supersampling).
+  Fix (1): round corners alone are no longer composited. Each picture
+  carries a `Corner` (rounded rect, screen points); the list line gets 22
+  numbers; the phone clips with Path.addRoundRect (Core Animation's way).
+  Groups still made for masks, shadows, turned bounds and round-in-round;
+  inside them compose.rs honours corners (both radii) and leaves the
+  group's own corner for its finished picture (after the shadow).
+  Fix (2) (sc-draw worktree, DeepSeek): draw_bitmap fast path for straight
+  transforms (precomputed bilinear rows/columns, fixed-point blend) and an
+  analytic rectangle clip: ~6x faster in a qemu bench.
+  Review (GPT-6.1 Sol) found the min-radius and shadow-cut bugs (fixed, test
+  added); fixed point can differ by 2/255 from the general path at partial
+  alpha (left).
+- Garden flicker (going to the garden, picking a plant): the owner's 180 s
+  phone recording (~/.cache/ios-debug/spellcraft/garden/sc-garden.mp4,
+  scanned frame by frame for 1-3 frame bursts) shows none: the garden fades
+  in smoothly at 3.0 s (one 50 ms pause). Ask for a new recording if seen again.
+- The bad %@ ("buy_%@"/"use_%@" get 0xd0000048, a return-trap slot) only
+  feeds Flurry event names (offline); left. Likely the same cause as below.
+
+## 2026-10-26 (evening): stuck at the plant step (bridge, all 32-bit games)
+
+- Owner: can't tap the plant the tutorial asks for. PC replay (phone save
+  phone-save4) ended in a stop: `addObject:` on a stale return-trap word
+  (0xd0000020). Cause: -[SCAlertController queueAlertWithFormatNamed:
+  withTarget:andAction:] takes nil-terminated extra arguments; the bridge
+  ran every game method as a nested call copying only the words the
+  method's types name, so the extras (on the caller's stack) were lost
+  and the method read stack garbage until it hit a trap address.
+- Fix (owner picked "jump straight in, like Apple"): objc_msgSend and its
+  _stret/Super2 forms no longer call a plain game method; they set r0-r3
+  and jump into it (runtime Thread.jump_to, honoured by the translator and
+  Unicorn after a stand-in returns Ret::Jumped), lr and sp left as the
+  caller's: a tail call, as Apple's objc_msgSend. Still nested: KVO-
+  observed setters (will/did change around the call), game_fixes methods
+  (after_message runs after), forwarding, host methods, and every message
+  host code sends. Test: guest32 tests game_methods_get_the_variable_
+  arguments_their_caller_passed (failed with 1 instead of 4321 before).

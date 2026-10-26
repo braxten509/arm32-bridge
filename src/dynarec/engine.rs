@@ -963,7 +963,7 @@ pub fn run(uc: &mut Uc, pc: u32, stop_at: u32) -> Result<(), String> {
             if let Some(code) = thread.exit_code {
                 return Err(format!("guest called exit({code})"));
             }
-            pc = uc.reg(LR);
+            pc = uc.get_data_mut().jump_to.take().unwrap_or_else(|| uc.reg(LR));
             continue;
         }
         if uc.get_data().native.as_ref().unwrap().state.fpscr & FPSCR_VECTOR != 0 {

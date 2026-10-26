@@ -150,6 +150,26 @@ thread_local! {
     /// An exception game code raised (-raise, +raise:format:) for the
     /// runtime function handler to throw in the guest (it has the engine).
     static PENDING_THROW: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    /// Set by the objc_msgSend stand-ins (wire.rs) for the message they send;
+    /// the first send on this thread takes it, so nested sends never see it.
+    static MAY_JUMP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The game method that message goes to, and its r0-r3, for the stand-in
+    /// to jump into (see allow_jump).
+    static JUMP: std::cell::Cell<Option<(u32, [u32; 4])>> = const { std::cell::Cell::new(None) };
+}
+
+/// Lets the next message sent on this thread (or not) leave a plain game
+/// method to the caller instead of calling it: the objc_msgSend stand-in
+/// then jumps into it with the caller's stack as it is, as Apple's
+/// objc_msgSend does, so arguments past the method's own types (a variable
+/// argument list) reach it too.
+pub fn allow_jump(on: bool) {
+    MAY_JUMP.with(|m| m.set(on));
+}
+
+/// The game method to jump into (imp, r0-r3), when the message left one.
+pub fn take_jump() -> Option<(u32, [u32; 4])> {
+    JUMP.with(|j| j.take())
 }
 
 /// The exception a message just raised on this thread, to be thrown.
@@ -1144,18 +1164,19 @@ pub fn send_from_guest(
     kind: SendKind,
     words: &dyn Fn(u32) -> u32,
 ) -> Result<GuestRet, String> {
+    let may_jump = MAY_JUMP.with(|m| m.take());
     // A setter of a key something observes on the receiver: announced
     // around the call, as Apple's KVO does (fw/object.rs). Not for super
     // calls: the setter the game sent already announces it.
     if kind == SendKind::Normal && crate::fw::object::kvo_active() {
         if let Some((object, key)) = observed_setter(bridge, g, words) {
             crate::fw::object::will_change(object, &key);
-            let result = send_unobserved(bridge, g, kind, words);
+            let result = send_unobserved(bridge, g, kind, words, false);
             crate::fw::object::did_change(object, &key);
             return result;
         }
     }
-    send_unobserved(bridge, g, kind, words)
+    send_unobserved(bridge, g, kind, words, may_jump)
 }
 
 /// The receiver (as the host knows it) and key, when this message is the
@@ -1183,6 +1204,7 @@ fn send_unobserved(
     g: &dyn GuestSide,
     kind: SendKind,
     words: &dyn Fn(u32) -> u32,
+    may_jump: bool,
 ) -> Result<GuestRet, String> {
     let stret = matches!(kind, SendKind::Stret | SendKind::Super2Stret);
     let first = u32::from(stret);
@@ -1196,7 +1218,7 @@ fn send_unobserved(
             let isa = u32_at(g, receiver);
             if let Some(send) = b.classes.cached_send(isa, sel) {
                 drop(b);
-                return call_game_method(g, send, words);
+                return call_game_method(g, send, words, may_jump);
             }
             if let Some(host) = b.classes.cached_host_send(isa, sel) {
                 let host_receiver = b.host_object_for(g, receiver)?;
@@ -1292,7 +1314,7 @@ fn send_unobserved(
                 b.classes.remember_send(isa, sel, send);
             }
             drop(b);
-            let result = call_game_method(g, send, &get)?;
+            let result = call_game_method(g, send, &get, may_jump && !fixed)?;
             if fixed {
                 super::game_fixes::after_message(bridge, g, receiver, get(first + 2))?;
             }
@@ -1523,8 +1545,13 @@ fn call_remembered_host(
     Ok(result)
 }
 
-/// Runs a game method with the message's argument words.
-fn call_game_method(g: &dyn GuestSide, send: CachedSend, words: &dyn Fn(u32) -> u32) -> Result<GuestRet, String> {
+/// Runs a game method with the message's argument words, or leaves it to
+/// the caller to jump into when it may (see allow_jump).
+fn call_game_method(g: &dyn GuestSide, send: CachedSend, words: &dyn Fn(u32) -> u32, may_jump: bool) -> Result<GuestRet, String> {
+    if may_jump {
+        JUMP.with(|j| j.set(Some((send.imp, [0, 1, 2, 3].map(words)))));
+        return Ok(GuestRet { r0: 0, r1: 0 });
+    }
     let call_words: Vec<u32> = (0..send.words).map(words).collect();
     let r = g.call(send.imp, &call_words)?;
     Ok(GuestRet { r0: r as u32, r1: (r >> 32) as u32 })

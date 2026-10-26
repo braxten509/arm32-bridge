@@ -7,7 +7,7 @@ use super::bridge::{dispatch_from_host, install, is_host_object, run_loads as ru
 use super::functions::{call_function, functions, Ctx, HOST_FUNCTIONS};
 use super::{exceptions, mirror};
 use arm32_bridge::ios32::Program;
-use arm32_bridge::runtime::{self, ArgSource, Args, Ret, Uc};
+use arm32_bridge::runtime::{self, ArgSource, Args, GuestCpu, Ret, Uc};
 use guest32_image::{read_objc, ImageMemory, ObjcMetadata32, ObjcSections};
 use std::cell::{Cell, RefCell};
 use std::sync::{Mutex, OnceLock};
@@ -91,6 +91,9 @@ fn with_engine<R>(uc: &mut Uc, f: impl FnOnce() -> R) -> R {
     result
 }
 
+/// The stand-ins that send a message.
+const SENDS: [&str; 4] = ["objc_msgSend", "objc_msgSend_stret", "objc_msgSendSuper2", "objc_msgSendSuper2_stret"];
+
 /// The handler behind every Objective-C runtime function.
 fn objc_handler(uc: &mut Uc, args: &mut Args) -> Ret {
     let name = uc.get_data().current_call;
@@ -107,10 +110,15 @@ fn objc_handler(uc: &mut Uc, args: &mut Args) -> Ret {
         }
         state.1[i as usize]
     };
+    // A message to a plain game method jumps into it from here (see
+    // allow_jump): no nested call, so it gets the caller's stack words too.
+    super::bridge::allow_jump(SENDS.contains(&name));
     // An exception raised meanwhile (by host code, or a game exception that
     // escaped a nested game call) is thrown here, in the game code that called.
     let (result, raised) =
         crate::fw::exception::catching(|| with_engine(uc, || call_function(&Ctx { bridge, g: &Translator }, name, &words)));
+    super::bridge::allow_jump(false);
+    let jump = super::bridge::take_jump();
     let raised = match raised.map(|host| bridge.lock().unwrap_or_else(|e| e.into_inner()).guest_object(&Translator, host)) {
         Some(Err(error)) => {
             runtime::stop_with_fault(uc, format!("{name}: an exception for the game: {error}"));
@@ -123,6 +131,15 @@ fn objc_handler(uc: &mut Uc, args: &mut Args) -> Ret {
         return with_context(uc, |uc, c| exceptions::throw(uc, c, exception));
     }
     match result {
+        Ok(_) if jump.is_some() => {
+            let (imp, registers) = jump.unwrap();
+            for (i, word) in registers.into_iter().enumerate() {
+                uc.set_reg(i, word);
+            }
+            // lr and sp stay the caller's: the method returns straight to it.
+            uc.get_data_mut().jump_to = Some(imp);
+            Ret::Jumped
+        }
         Ok(value) => Ret::U64(value),
         Err(error) => {
             runtime::stop_with_fault(uc, format!("{name}: {error}"));

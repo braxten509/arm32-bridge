@@ -1233,11 +1233,7 @@ fn screen_frames(nodes: &[Node], sampling: Sampling) -> Vec<(f64, Vec<Picture>)>
         let composed = if k == 0 { Some(compose_groups(resolved)) } else { crate::fw::graphics::only_made(|| compose_groups(resolved)) };
         match composed {
             Some(pictures) => out.push((time, pictures)),
-            None => {
-                // TEMP: coming frames cut short (their groups not made yet).
-                crate::log!("TEMP pictures: {} of {} coming frames (groups not made)", k, sampling.count);
-                break;
-            }
+            None => break,
         }
     }
     out
@@ -1277,7 +1273,6 @@ pub fn tick() {
         compose_groups(resolve(frames(&nodes, 1).remove(0)));
         crate::fw::animation::commit();
     }
-    let made = std::time::Instant::now();
     let (wide, high, _) = crate::fw::uikit::screen_points();
     let now = crate::fw::runloop::media_time();
     let mut sent = SENT.lock().unwrap_or_else(|e| e.into_inner());
@@ -1334,13 +1329,6 @@ pub fn tick() {
             crate::log!("pictures: {} shown:\n{}", pictures.len(), encode((wide, high), &pictures).trim_end());
         } else {
             crate::log!("pictures: {} shown", pictures.len());
-        }
-        if sampling.is_some() {
-            static TOLD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            if TOLD.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40 {
-                // TEMP: how long a moving list took to make after the commit.
-                crate::log!("TEMP pictures: moving list made in {:.0} ms", made.elapsed().as_secs_f64() * 1000.0);
-            }
         }
         (screen.show)(&text);
     }

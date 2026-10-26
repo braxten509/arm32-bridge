@@ -494,6 +494,10 @@ pub struct Thread {
     /// time spent in outermost ones, in `ticks`.
     pub phone_depth: u32,
     pub phone_ticks: u64,
+    /// Where game code goes on after a phone function that returned
+    /// `Ret::Jumped`, instead of its return address (lr stays the caller's:
+    /// a tail call, as iOS's objc_msgSend jumps into the method).
+    pub jump_to: Option<u32>,
 }
 
 static SHARED: Mutex<Option<Shared>> = Mutex::new(None);
@@ -1539,6 +1543,7 @@ fn idle_thread(code_generation: u64, clean: Option<unicorn_engine::Context>) -> 
         resume_at: None,
         phone_depth: 0,
         phone_ticks: 0,
+        jump_to: None,
     }
 }
 
@@ -1617,6 +1622,7 @@ fn adopt_engine(uc: &mut Uc) {
         resume_at: None,
         phone_depth: 0,
         phone_ticks: 0,
+        jump_to: None,
     };
     // A helper's engine is made while it stands in for a thread: that
     // thread keeps its own runner.
@@ -1774,6 +1780,10 @@ fn on_interrupt(uc: &mut Unicorn<'_, Thread>, interrupt: u32) {
     }
     let index = mem().read_u32(svc_address) & 0x00FF_FFFF;
     call_stub(uc, index);
+    if let Some(target) = uc.get_data_mut().jump_to.take() {
+        // Bit 0 picks Thumb, as for a `bx`.
+        uc.reg_write(RegisterARM::PC, u64::from(target)).unwrap();
+    }
     if uc.get_data().fault.is_some() || uc.get_data().exit_code.is_some() {
         uc.stop();
     }

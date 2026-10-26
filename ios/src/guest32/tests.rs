@@ -1212,3 +1212,35 @@ fn the_bridges_own_memory_comes_from_the_fast_allocator() {
     let block = Box::new([7u8; 24]);
     assert!(unsafe { libmimalloc_sys::mi_is_in_heap_region(block.as_ptr().cast()) }, "Rust memory still comes from the system's malloc");
 }
+
+/// A game method with a variable argument list (nil-terminated extras, as
+/// -[SCAlertController queueAlertWithFormatNamed:withTarget:andAction:])
+/// gets every word its caller passed, in registers and on the stack, as on
+/// an iPhone where objc_msgSend jumps straight into the method. Its types
+/// name only the fixed arguments.
+#[test]
+fn game_methods_get_the_variable_arguments_their_caller_passed() {
+    use super::objc::wire::{test_bridge, Translator};
+    cxx();
+    setup();
+    // int sum(id self, SEL _cmd, int first, ...): first + r3 + two stack words.
+    let code = alloc(16);
+    for (i, half) in [0x9800u16, 0x9901, 0x4408, 0x4410, 0x4418, 0x4770].iter().enumerate() {
+        // ldr r0, [sp]; ldr r1, [sp, #4]; add r0, r1; add r0, r2; add r0, r3; bx lr
+        mem().write_bytes(code + i as u32 * 2, &half.to_le_bytes());
+    }
+    let (object, sum) = {
+        let mut b = test_bridge().lock().unwrap();
+        let host = crate::objc::runtime::send(crate::objc::runtime::send(crate::objc::runtime::class_named("NSObject"), "alloc", &[]), "init", &[]);
+        (b.guest_object(&Translator, host).unwrap(), b.guest_selector(&Translator, "g32VariadicSum:"))
+    };
+    let class = call_stub("object_getClass", [object, 0, 0, 0], &[]).0;
+    assert_eq!(call_stub("class_addMethod", [class, sum, code | 1, cstring("i12@0:4i8")], &[]).0, 1);
+    let _gil = runtime::hold_gil();
+    let uc = runtime::engine();
+    let send = runtime::stub_for("objc_msgSend");
+    for round in 0..2 {
+        let got = runtime::call_guest(uc, send, &[object, sum, 1, 20, 300, 4000]).unwrap() as u32;
+        assert_eq!(got, 4321, "round {round}: r2, r3 and both stack words reach the method");
+    }
+}
