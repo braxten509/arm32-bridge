@@ -2188,8 +2188,9 @@ fn alert_draw(this: Id, sheet: bool) -> bool {
     for child in view_state(this).subviews.clone() {
         runtime::send(child, "removeFromSuperview", &[]);
     }
-    let area = frame_of(window).size;
-    set_frame(this, Rect::new(0.0, 0.0, area.width, area.height));
+    // Over the whole screen, upright (turned in an old app's window).
+    crate::fw::uikit::place_upright(window, this);
+    let area = view_state(this).frame.size;
     runtime::send(this, "setBackgroundColor:", &[colored([0.0, 0.0, 0.0, 0.4])]);
     let width = if sheet { (area.width - 16.0).min(400.0) } else { ALERT_WIDTH };
     let inner = width - 2.0 * ALERT_MARGIN;

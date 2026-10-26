@@ -260,7 +260,7 @@ extern "C" fn view_init_with_coder(this: Id, _: Sel, coder: Id) -> Id {
 extern "C" fn window_init_with_coder(this: Id, _: Sel, coder: Id) -> Id {
     let this = super_init_with_coder(this, "UIWindow", coder);
     if this != 0 && bool_for(coder, "UIResizesToFullScreen") == Some(true) {
-        let (width, height, _) = crate::fw::uikit::screen_points();
+        let (width, height, _) = crate::fw::uikit::reported_screen_points();
         if let Some((imp, sel)) = framework_imp(this, "setFrame:") {
             unsafe { std::mem::transmute::<usize, extern "C" fn(Id, Sel, Rect)>(imp)(this, sel, Rect::new(0.0, 0.0, width, height)) }
         }
@@ -1017,7 +1017,7 @@ pub fn load_main_interface_from(info: &Value, bundle: Id, delegate: Id) -> Id {
         crate::log!("main storyboard {name}: can't be opened");
         return 0;
     }
-    let (width, height, _) = crate::fw::uikit::screen_points();
+    let (width, height, _) = crate::fw::uikit::reported_screen_points();
     let window = runtime::send(runtime::class_named("UIWindow"), "alloc", &[]);
     let window = match framework_imp(window, "initWithFrame:") {
         Some((imp, sel)) => unsafe {

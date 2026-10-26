@@ -17,7 +17,7 @@
 //! and delaysTouchesEnded hold the view's touches back (fw/touch.rs) until
 //! the recognizers decide.
 
-use crate::fw::geometry::{apply, invert, Point, IDENTITY};
+use crate::fw::geometry::{apply, invert, Point, Transform, IDENTITY};
 use crate::fw::object::{define_class, methods};
 use crate::fw::touch::Phase;
 use crate::fw::uikit::{property, property_get, property_set, view_state};
@@ -597,7 +597,7 @@ fn step(r: &mut Recognizer, settings: &Settings, finger: i32, phase: Phase, poin
                     }
                 }
                 Kind::Swipe => {
-                    let (dx, dy) = (c.x - r.origin.x, c.y - r.origin.y);
+                    let (dx, dy) = apply(settings.view_from_window, c.x - r.origin.x, c.y - r.origin.y);
                     let along = match settings.direction {
                         d if d & 1 != 0 && dx >= SWIPE_DISTANCE && dx.abs() > 2.0 * dy.abs() => true,
                         d if d & 2 != 0 && -dx >= SWIPE_DISTANCE && dx.abs() > 2.0 * dy.abs() => true,
@@ -702,6 +702,9 @@ struct Settings {
     direction: isize,
     press: f64,
     movement: f64,
+    /// Window points to the recognizer's view's (only the turn and scale
+    /// count): which way a swipe went, as the view sees it.
+    view_from_window: Transform,
 }
 
 fn settings_of(recognizer: Id) -> Settings {
@@ -713,6 +716,10 @@ fn settings_of(recognizer: Id) -> Settings {
         direction: setting(recognizer, "direction", 1),
         press: press_duration(recognizer, 0),
         movement: allowed_movement(recognizer, 0),
+        view_from_window: match with(recognizer, |r| r.view).unwrap_or(0) {
+            0 => IDENTITY,
+            view => invert(Transform { tx: 0.0, ty: 0.0, ..crate::fw::touch::view_to_window(view) }).unwrap_or(IDENTITY),
+        },
     }
 }
 
@@ -1298,11 +1305,27 @@ mod tests {
         take();
     }
 
+    /// A swipe's way is judged in its view's own points: in an old app's
+    /// turned screen a swipe to the right on screen goes down the upright
+    /// window, and is still a swipe to the right for a view upright on screen.
+    #[test]
+    fn swipes_go_the_way_their_view_sees() {
+        // LandscapeRight: window points to the upright controller view's.
+        let turned = Transform { a: 0.0, b: -1.0, c: 1.0, d: 0.0, tx: 0.0, ty: 0.0 };
+        let settings = |direction| Settings { taps: 1, touches: 1, min_touches: 1, max_touches: isize::MAX, direction, press: 0.5, movement: 10.0, view_from_window: turned };
+        let mut right = Recognizer::new(Kind::Swipe);
+        step(&mut right, &settings(1), 1, Phase::Began, p(100.0, 100.0), 0.0);
+        assert!(step(&mut right, &settings(1), 1, Phase::Moved, p(100.0, 160.0), 0.1).recognized, "right on screen");
+        let mut down = Recognizer::new(Kind::Swipe);
+        step(&mut down, &settings(8), 1, Phase::Began, p(100.0, 100.0), 0.0);
+        assert!(!step(&mut down, &settings(8), 1, Phase::Moved, p(100.0, 160.0), 0.1).recognized, "not down on screen");
+    }
+
     /// A double tap needs both taps within the gap (between them it waits
     /// for the next); swipes and pinches follow their fingers.
     #[test]
     fn multi_taps_count_their_taps() {
-        let settings = |taps| Settings { taps, touches: 1, min_touches: 1, max_touches: isize::MAX, direction: 1, press: 0.5, movement: 10.0 };
+        let settings = |taps| Settings { taps, touches: 1, min_touches: 1, max_touches: isize::MAX, direction: 1, press: 0.5, movement: 10.0, view_from_window: IDENTITY };
         let mut double = Recognizer::new(Kind::Tap);
         let at = p(5.0, 5.0);
         step(&mut double, &settings(2), 1, Phase::Began, at, 0.0);
@@ -1334,7 +1357,7 @@ mod tests {
     /// stop before lifting. Rotation works the same way.
     #[test]
     fn pinch_and_rotation_count_from_a_scale_the_game_set() {
-        let settings = Settings { taps: 1, touches: 1, min_touches: 1, max_touches: isize::MAX, direction: 1, press: 0.5, movement: 10.0 };
+        let settings = Settings { taps: 1, touches: 1, min_touches: 1, max_touches: isize::MAX, direction: 1, press: 0.5, movement: 10.0, view_from_window: IDENTITY };
         let mut pinch = Recognizer::new(Kind::Pinch);
         step(&mut pinch, &settings, 1, Phase::Began, p(0.0, 0.0), 0.0);
         step(&mut pinch, &settings, 2, Phase::Began, p(20.0, 0.0), 0.0);

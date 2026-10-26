@@ -110,6 +110,12 @@ pub fn screen_points() -> (f64, f64, f64) {
     geometry_for(raw_screen_points(), app_info()).oriented
 }
 
+/// UIScreen's bounds as the game reads them (portrait for an iOS 6 era
+/// app): the size a full-screen window has.
+pub fn reported_screen_points() -> (f64, f64, f64) {
+    geometry_for(raw_screen_points(), app_info()).reported
+}
+
 /// The screen the app would get in landscape, before the old-iPhone rule
 /// turns it to the interface's orientation.
 fn raw_screen_points() -> (f64, f64, f64) {
@@ -277,22 +283,48 @@ fn current_geometry() -> Geometry {
     *GEOMETRY.get_or_init(|| geometry_for(raw_screen_points(), app_info()))
 }
 
-/// A window's bounds in the interface's orientation. A full-screen window
-/// made from UIScreen.bounds (portrait in an old app) becomes landscape for
-/// a landscape interface, so reading the bounds and setting them back is
-/// harmless; any other size stays as the game set it.
-fn window_frame(geometry: Geometry, rect: Rect) -> Rect {
-    if !geometry.legacy {
-        return rect;
-    }
+/// iOS 6 and older keep a landscape app's window upright (portrait, the
+/// size UIScreen reports) and show it turned to the interface's
+/// orientation: window points to screen points, or None when the window
+/// is shown as it is (newer apps, portrait apps).
+fn screen_turn(geometry: Geometry) -> Option<Transform> {
     let (wide, high, _) = geometry.oriented;
-    let (long, short, _) = geometry.reported;
-    let (width, height) = (rect.size.width, rect.size.height);
-    if (width == wide && height == high) || (width == long && height == short) {
-        Rect { origin: rect.origin, size: Size { width: wide, height: high } }
-    } else {
-        rect
+    if !geometry.legacy || wide <= high {
+        return None;
     }
+    Some(match geometry.interface.orientation {
+        // Home button on the left: the window's top edge is the screen's right.
+        4 => Transform { a: 0.0, b: 1.0, c: -1.0, d: 0.0, tx: wide, ty: 0.0 },
+        // On the right: its top edge is the screen's left.
+        _ => Transform { a: 0.0, b: -1.0, c: 1.0, d: 0.0, tx: 0.0, ty: high },
+    })
+}
+
+/// This app's `screen_turn`.
+pub(crate) fn window_turn() -> Option<Transform> {
+    screen_turn(current_geometry())
+}
+
+/// Places a controller's view (a root or presented one) or one of our
+/// alerts straight in `window`, as UIKit does: filling the screen in the
+/// interface's orientation. In a turned window (iOS 6 and older) that is
+/// iOS 6's way: landscape bounds, centred in the window and turned back
+/// against the screen's turn, so on screen it is upright.
+pub(crate) fn place_upright(window: Id, view: Id) {
+    place_upright_in(current_geometry(), window, view);
+}
+
+fn place_upright_in(geometry: Geometry, window: Id, view: Id) {
+    let (wide, high, _) = geometry.oriented;
+    let Some(turn) = screen_turn(geometry) else {
+        send_rect(view, "setFrame:", Rect::new(0.0, 0.0, wide, high));
+        return;
+    };
+    let upright = crate::fw::geometry::invert(Transform { tx: 0.0, ty: 0.0, ..turn }).unwrap_or(IDENTITY);
+    let window_size = view_state(window).frame.size;
+    send_transform(view, "setTransform:", upright);
+    send_rect(view, "setBounds:", Rect::new(0.0, 0.0, wide, high));
+    send_point(view, "setCenter:", Point { x: window_size.width / 2.0, y: window_size.height / 2.0 });
 }
 
 fn has_storyboard(info: Option<&crate::fw::plist::Value>) -> bool {
@@ -605,6 +637,24 @@ extern "C" fn view_set_frame(this: Id, _: Sel, frame: Rect) {
     }
 }
 
+/// Sends a method taking a CGPoint (setCenter:), so the game's own version runs.
+fn send_point(view: Id, name: &str, point: Point) {
+    let s = runtime::sel(name);
+    if let Some(imp) = runtime::imp_for(view, s) {
+        let f: extern "C" fn(Id, Sel, Point) = unsafe { std::mem::transmute(imp) };
+        f(view, s, point);
+    }
+}
+
+/// Sends a method taking a CGAffineTransform (setTransform:), so the game's own version runs.
+fn send_transform(view: Id, name: &str, transform: Transform) {
+    let s = runtime::sel(name);
+    if let Some(imp) = runtime::imp_for(view, s) {
+        let f: extern "C" fn(Id, Sel, Transform) = unsafe { std::mem::transmute(imp) };
+        f(view, s, transform);
+    }
+}
+
 /// Sends a method taking a CGRect (setFrame:, setBounds:), so the game's
 /// own versions run.
 pub(crate) fn send_rect(view: Id, name: &str, rect: Rect) {
@@ -618,32 +668,6 @@ pub(crate) fn send_rect(view: Id, name: &str, rect: Rect) {
 extern "C" fn view_bounds(this: Id, _: Sel) -> Rect {
     let state = view_state(this);
     Rect { origin: state.bounds_origin, size: state.frame.size }
-}
-
-extern "C" fn window_bounds(this: Id, selector: Sel) -> Rect {
-    window_reported_bounds(current_geometry(), view_bounds(this, selector))
-}
-
-fn window_reported_bounds(geometry: Geometry, bounds: Rect) -> Rect {
-    let (wide, high, _) = geometry.oriented;
-    let (short, long, _) = geometry.reported;
-    if geometry.legacy && bounds.size.width == wide && bounds.size.height == high {
-        Rect { origin: bounds.origin, size: Size { width: short, height: long } }
-    } else {
-        bounds
-    }
-}
-
-extern "C" fn window_set_bounds(this: Id, selector: Sel, bounds: Rect) {
-    view_set_bounds(this, selector, window_frame(current_geometry(), bounds));
-}
-
-extern "C" fn window_init_with_frame(this: Id, selector: Sel, frame: Rect) -> Id {
-    view_init_with_frame(this, selector, window_frame(current_geometry(), frame))
-}
-
-extern "C" fn window_set_frame(this: Id, selector: Sel, frame: Rect) {
-    view_set_frame(this, selector, window_frame(current_geometry(), frame));
 }
 
 /// New bounds keep the view's center (its layer's position, at the layer's
@@ -1034,7 +1058,7 @@ fn to_screen(view: Id, beside: Id) -> Transform {
     if top == 0 {
         IDENTITY
     } else {
-        crate::fw::touch::view_step(top)
+        crate::fw::touch::window_to_screen(top)
     }
 }
 
@@ -1766,7 +1790,7 @@ extern "C" fn window_set_root_controller(this: Id, _: Sel, controller: Id) {
         let view = runtime::send(controller, "view", &[]);
         let showing = shown && will_appear(controller, false);
         if view != 0 {
-            send_rect(view, "setFrame:", oriented_bounds());
+            place_upright(this, view);
             attach(this, view, None);
         }
         put_on_screen(controller);
@@ -1982,14 +2006,9 @@ fn show_presented(presenter: Id, controller: Id, animated: bool) {
     }
     let showing = will_appear(controller, animated);
     let hiding = covered != 0 && will_disappear(presenter, animated);
-    // The game draws in the interface's orientation: a window that still
-    // holds portrait bounds (an old app made it from UIScreen.bounds) must
-    // not squeeze the presented view.
-    let s = runtime::sel("setFrame:");
-    if let Some(imp) = runtime::imp_for(view, s) {
-        let f: extern "C" fn(Id, Sel, Rect) = unsafe { std::mem::transmute(imp) };
-        f(view, s, oriented_bounds());
-    }
+    // It fills the screen as the root's view does (turned in an old app's
+    // upright window).
+    place_upright(window, view);
     attach(window, view, None);
     property_set(controller, "presentedInWindow", window as u64);
     if covered != 0 {
@@ -2893,10 +2912,6 @@ pub fn register(r: &mut Registry) {
             ("windowLevel", window_level as usize),
             ("setWindowLevel:", window_set_level as usize),
             ("isKeyWindow", yes as usize),
-            ("initWithFrame:", window_init_with_frame as usize),
-            ("setFrame:", window_set_frame as usize),
-            ("bounds", window_bounds as usize),
-            ("setBounds:", window_set_bounds as usize),
         ],
     );
 
@@ -3106,6 +3121,7 @@ extern "C" fn screen_scale_one(_this: Id, _: Sel) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fw::geometry::{apply, concat};
     use crate::fw::plist::Value;
 
     /// convertPoint:/convertRect: go through frames, bounds origins and
@@ -3969,35 +3985,120 @@ mod tests {
         assert!(!legacy_screen(None));
     }
 
-    /// An old landscape game's window is landscape, whichever full-screen
-    /// size it was made with; anything else keeps its size. Reading the
-    /// bounds and setting them back changes nothing.
-    #[test]
-    fn old_landscape_windows_keep_landscape_bounds() {
-        let info = screen_info("iphoneos6.1", &["UIInterfaceOrientationLandscapeRight", "UIInterfaceOrientationLandscapeLeft"]);
-        let geometry = geometry_for((568.0, 320.0, 2.0), Some(&info));
-        let landscape = Rect::new(0.0, 0.0, 568.0, 320.0);
-        assert_eq!(window_frame(geometry, Rect::new(0.0, 0.0, 320.0, 568.0)), landscape, "a window made from UIScreen.bounds");
-        assert_eq!(window_frame(geometry, landscape), landscape);
-        assert_eq!(window_frame(geometry, Rect::new(0.0, 0.0, 200.0, 100.0)), Rect::new(0.0, 0.0, 200.0, 100.0));
-        let current = geometry_for((568.0, 320.0, 2.0), None);
-        assert_eq!(window_frame(current, Rect::new(0.0, 0.0, 320.0, 568.0)), Rect::new(0.0, 0.0, 320.0, 568.0));
+    fn old_landscape(orientation: &str) -> Geometry {
+        geometry_for((568.0, 320.0, 2.0), Some(&screen_info("iphoneos6.1", &[orientation])))
     }
 
+    fn near(a: (f64, f64), b: (f64, f64)) -> bool {
+        (a.0 - b.0).abs() < 1e-6 && (a.1 - b.1).abs() < 1e-6
+    }
+
+    /// iOS 6 and older: the window stays upright (portrait) and the screen
+    /// shows it turned to the interface's orientation. Newer apps' windows,
+    /// and old portrait apps', are not turned.
     #[test]
-    fn old_fullscreen_window_bounds_are_reported_portrait() {
-        let old_info = screen_info("iphoneos7.0", &["UIInterfaceOrientationLandscapeRight"]);
-        let new_info = screen_info("iphoneos8.0", &["UIInterfaceOrientationLandscapeRight"]);
-        let old = geometry_for((568.0, 320.0, 2.0), Some(&old_info));
-        let newer = geometry_for((568.0, 320.0, 2.0), Some(&new_info));
-        let landscape = Rect::new(0.0, 0.0, 568.0, 320.0);
-        let portrait = Rect::new(0.0, 0.0, 320.0, 568.0);
-        assert_eq!(window_reported_bounds(old, landscape), portrait);
-        assert_eq!(window_frame(old, portrait), landscape);
-        assert_eq!(window_reported_bounds(old, window_frame(old, portrait)), portrait);
-        assert_eq!(window_reported_bounds(newer, landscape), landscape);
-        let custom = Rect::new(5.0, 6.0, 200.0, 100.0);
-        assert_eq!(window_reported_bounds(old, custom), custom);
+    fn old_landscape_windows_stay_upright_and_the_screen_turns_them() {
+        let right = old_landscape("UIInterfaceOrientationLandscapeRight");
+        let turn = screen_turn(right).expect("an old landscape app's window is turned");
+        // Home button on the right: the window's top edge is the screen's left.
+        assert!(near(apply(turn, 0.0, 0.0), (0.0, 320.0)));
+        assert!(near(apply(turn, 320.0, 568.0), (568.0, 0.0)));
+        assert!(near(apply(turn, 160.0, 284.0), (284.0, 160.0)));
+        let left = screen_turn(old_landscape("UIInterfaceOrientationLandscapeLeft")).unwrap();
+        assert!(near(apply(left, 0.0, 0.0), (568.0, 0.0)));
+        assert!(near(apply(left, 320.0, 568.0), (0.0, 320.0)));
+        let newer = geometry_for((568.0, 320.0, 2.0), Some(&screen_info("iphoneos8.0", &["UIInterfaceOrientationLandscapeRight"])));
+        assert_eq!(screen_turn(newer), None);
+        let portrait = geometry_for((568.0, 320.0, 2.0), Some(&screen_info("iphoneos6.1", &["UIInterfaceOrientationPortrait"])));
+        assert_eq!(screen_turn(portrait), None);
+        assert_eq!(screen_turn(geometry_for((568.0, 320.0, 2.0), None)), None);
+    }
+
+    fn new_test_view(class: &str, frame: Rect) -> Id {
+        view_init_with_frame(runtime::send(runtime::class_named(class), "alloc", &[]), 0, frame)
+    }
+
+    /// A controller's view straight in an old app's window is placed as
+    /// iOS 6 placed it: landscape bounds, centred in the window, turned
+    /// against the screen's turn, so on screen it is upright and fills it.
+    #[test]
+    fn old_apps_controller_views_are_turned_upright() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        for name in ["UIInterfaceOrientationLandscapeRight", "UIInterfaceOrientationLandscapeLeft"] {
+            let geometry = old_landscape(name);
+            let window = new_test_view("UIWindow", Rect::new(0.0, 0.0, 320.0, 568.0));
+            let view = new_test_view("UIView", Rect::new(0.0, 0.0, 320.0, 568.0));
+            attach(window, view, None);
+            place_upright_in(geometry, window, view);
+            assert_eq!(view_bounds(view, 0).size, Size { width: 568.0, height: 320.0 }, "{name}");
+            assert_eq!(view_center(view, 0), Point { x: 160.0, y: 284.0 }, "{name}");
+            let to_screen = concat(crate::fw::touch::view_to_window(view), screen_turn(geometry).unwrap());
+            assert!(near(apply(to_screen, 0.0, 0.0), (0.0, 0.0)), "{name}: {to_screen:?}");
+            assert!(near(apply(to_screen, 568.0, 320.0), (568.0, 320.0)), "{name}: {to_screen:?}");
+        }
+        // Newer apps: the view just fills the window, unturned.
+        let newer = geometry_for((568.0, 320.0, 2.0), Some(&screen_info("iphoneos8.0", &["UIInterfaceOrientationLandscapeRight"])));
+        let window = new_test_view("UIWindow", Rect::new(0.0, 0.0, 568.0, 320.0));
+        let view = new_test_view("UIView", Rect::new(0.0, 0.0, 10.0, 10.0));
+        attach(window, view, None);
+        place_upright_in(newer, window, view);
+        assert_eq!(view_state(view).frame, Rect::new(0.0, 0.0, 568.0, 320.0));
+        assert_eq!(view_state(view).transform, IDENTITY);
+    }
+
+    /// A view an old game puts straight on its window and turns itself for
+    /// the interface's orientation (SpellCraft's AECustomAlertView: a dim
+    /// view the window's size, the box at its centre turned a quarter)
+    /// comes out upright and centred on screen.
+    #[test]
+    fn hand_turned_views_on_an_old_window_come_out_upright() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let geometry = old_landscape("UIInterfaceOrientationLandscapeRight");
+        let window = new_test_view("UIWindow", Rect::new(0.0, 0.0, 320.0, 568.0));
+        let back = new_test_view("UIView", view_state(window).frame);
+        let alert = new_test_view("UIView", Rect::new(0.0, 0.0, 200.0, 100.0));
+        attach(window, back, None);
+        attach(back, alert, None);
+        view_set_center(alert, 0, Point { x: 160.0, y: 284.0 });
+        view_set_transform(alert, 0, Transform { a: 0.0, b: 1.0, c: -1.0, d: 0.0, tx: 0.0, ty: 0.0 });
+        let to_screen = concat(crate::fw::touch::view_to_window(alert), screen_turn(geometry).unwrap());
+        assert!(near((to_screen.a, to_screen.d), (1.0, 1.0)) && near((to_screen.b, to_screen.c), (0.0, 0.0)), "upright: {to_screen:?}");
+        assert!(near(apply(to_screen, 0.0, 0.0), (184.0, 110.0)), "centred: {to_screen:?}");
+    }
+
+    /// Touches follow each view's transform, as UIKit's hit-testing and
+    /// locationInView: do: inside an old app's turned controller view, and
+    /// on a scaled view in any app.
+    #[test]
+    fn touches_follow_turned_and_scaled_views() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let geometry = old_landscape("UIInterfaceOrientationLandscapeRight");
+        let window = new_test_view("UIWindow", Rect::new(0.0, 0.0, 320.0, 568.0));
+        let root = new_test_view("UIView", Rect::new(0.0, 0.0, 320.0, 568.0));
+        attach(window, root, None);
+        place_upright_in(geometry, window, root);
+        let button = new_test_view("UIView", Rect::new(10.0, 10.0, 50.0, 50.0));
+        attach(root, button, None);
+        // A tap at screen point (30, 30) is in the button, 20 points in.
+        let at = crate::fw::touch::screen_to_window_with(screen_turn(geometry), Point { x: 30.0, y: 30.0 });
+        assert!(near((at.x, at.y), (290.0, 30.0)), "{at:?}");
+        assert_eq!(crate::fw::touch::hit_test(window, at), button);
+        let inside = crate::fw::touch::point_in_view(button, at);
+        assert!(near((inside.x, inside.y), (20.0, 20.0)), "{inside:?}");
+
+        let plain = new_test_view("UIWindow", Rect::new(0.0, 0.0, 568.0, 320.0));
+        let scaled = new_test_view("UIView", Rect::new(100.0, 100.0, 100.0, 100.0));
+        attach(plain, scaled, None);
+        view_set_transform(scaled, 0, Transform { a: 2.0, b: 0.0, c: 0.0, d: 2.0, tx: 0.0, ty: 0.0 });
+        // Scaled about its centre (150, 150): it covers 50..250.
+        let at = Point { x: 60.0, y: 60.0 };
+        assert_eq!(crate::fw::touch::hit_test(plain, at), scaled);
+        let inside = crate::fw::touch::point_in_view(scaled, at);
+        assert!(near((inside.x, inside.y), (5.0, 5.0)), "{inside:?}");
+        assert_eq!(crate::fw::touch::hit_test(plain, Point { x: 260.0, y: 60.0 }), plain);
     }
 
     extern "C" fn overriding_controller_view(this: Id, _: Sel) -> Id {

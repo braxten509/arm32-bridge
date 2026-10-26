@@ -269,7 +269,8 @@ pub fn encode_frames(screen: (f64, f64), frames: &[(f64, Vec<Picture>)]) -> Stri
     text
 }
 
-/// The pictures under `node` (a window, at the screen's top-left), back to front.
+/// The pictures under `node` (a window, at the screen's top-left, turned
+/// as an old app's window is: uikit::window_turn), back to front.
 pub fn flatten(node: &Node) -> Vec<Picture> {
     let mut out = Vec::new();
     // A window clips nothing (its own clipsToBounds aside), the screen does:
@@ -277,7 +278,7 @@ pub fn flatten(node: &Node) -> Vec<Picture> {
     // area reaches over the window too; past the screen the phone cuts it.
     let (wide, high, _) = crate::fw::uikit::screen_points();
     let area = Rect::new(0.0, 0.0, wide.max(node.frame.size.width), high.max(node.frame.size.height));
-    walk(node, 0, None, 1.0, area, None, &mut out);
+    walk(node, 0, crate::fw::uikit::window_turn(), 1.0, area, None, &mut out);
     out
 }
 
@@ -286,7 +287,7 @@ fn flatten_at(node: &Node, k: usize) -> Vec<Picture> {
     let (wide, high, _) = crate::fw::uikit::screen_points();
     let area = Rect::new(0.0, 0.0, wide.max(node.frame.size.width), high.max(node.frame.size.height));
     let mut out = Vec::new();
-    walk(node, k, None, 1.0, area, None, &mut out);
+    walk(node, k, crate::fw::uikit::window_turn(), 1.0, area, None, &mut out);
     out
 }
 

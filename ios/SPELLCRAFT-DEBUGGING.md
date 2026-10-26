@@ -585,3 +585,26 @@ Work log and decisions (away mode):
   (after_message runs after), forwarding, host methods, and every message
   host code sends. Test: guest32 tests game_methods_get_the_variable_
   arguments_their_caller_passed (failed with 1 instead of 4321 before).
+
+## 2026-10-26 (evening): sideways "Not Ready to Harvest" box (old-game window)
+
+- Cause: SpellCraft (iOS 6 SDK) shows AECustomAlertView by adding a dim
+  view the window's size to the window and turning the box itself by
+  statusBarOrientation (CGAffineTransformMakeRotation(M_PI_2) for
+  LandscapeRight), as iOS 6 needed: the window stayed portrait there. Our
+  layer forced old games' windows to landscape, so the box was turned twice.
+- Fix (owner picked "full iOS 6 window model"): for apps built with the
+  iOS 7 SDK or older, the window stays upright (portrait, as UIScreen
+  reports) and the screen turns it (uikit::screen_turn / window_turn);
+  root and presented controller views and our host alerts get iOS 6's
+  placement (landscape bounds, centred, turned back: place_upright);
+  pictures start from the window turn; touches come in screen points and
+  go into window points. Hit-testing, locationInView: and swipe
+  directions now follow each view's whole transform (all games).
+- PC checks: 494 tests pass; Dungeon Plunder menu picture lists identical
+  before/after; TownCraft Select Avatar identical; Monster Life unchanged.
+  Not done on the PC: the box itself showing upright (the replay didn't
+  reach it before its time limit); owner tests on the phone.
+- Known gap (not in this change): the GL picture of a GL view placed
+  straight in an upright window is not turned (Monster Life draws into a
+  640x1136 buffer and looks sideways, before and after this change).

@@ -3,7 +3,7 @@
 //! The phone app hands touches over in window pixels; IOS_TAPS lets PC
 //! tests tap too ("seconds:x,y;seconds:x,y" in points).
 
-use crate::fw::geometry::{concat, Point, Transform, IDENTITY};
+use crate::fw::geometry::{concat, invert, Point, Transform, IDENTITY};
 use crate::fw::object::{define_class, methods};
 use crate::fw::uikit::{key_window, property_get, property_set, view_state};
 use crate::fw::{collections, misc};
@@ -134,6 +134,7 @@ fn point_of(object: Id, x: &'static str, y: &'static str) -> Point {
 }
 
 /// The view's top-left corner in window points.
+#[cfg(test)]
 pub(crate) fn origin_in_window(view: Id) -> Point {
     let mut point = Point::default();
     let mut current = view;
@@ -160,9 +161,43 @@ pub(crate) fn view_to_window(view: Id) -> Transform {
 }
 
 /// The same up to the screen: the top view's own place too (a window's
-/// frame is in screen points).
+/// frame is in screen points), and an old app's window's turn (see
+/// uikit::window_turn).
 pub(crate) fn view_to_screen(view: Id) -> Transform {
     view_chain(view, true)
+}
+
+/// A window's (or other top view's) points to screen points.
+pub(crate) fn window_to_screen(window: Id) -> Transform {
+    let step = view_step(window);
+    match crate::fw::uikit::window_turn() {
+        Some(turn) if is_window(window) => concat(step, turn),
+        _ => step,
+    }
+}
+
+fn is_window(view: Id) -> bool {
+    let class = runtime::class_named("UIWindow");
+    class != 0 && runtime::send(view, "isKindOfClass:", &[class as Id]) & 0xFF != 0
+}
+
+/// A screen point to window points, through the window's turn if it has one.
+pub(crate) fn screen_to_window_with(turn: Option<Transform>, point: Point) -> Point {
+    match turn.and_then(invert) {
+        Some(back) => {
+            let (x, y) = crate::fw::geometry::apply(back, point.x, point.y);
+            Point { x, y }
+        }
+        None => point,
+    }
+}
+
+/// A window point in a view's own points (its bounds), through every
+/// transform on the way (UIKit's convertPoint:fromView:nil).
+pub(crate) fn point_in_view(view: Id, point: Point) -> Point {
+    let back = invert(view_to_window(view)).unwrap_or(IDENTITY);
+    let (x, y) = crate::fw::geometry::apply(back, point.x, point.y);
+    Point { x, y }
 }
 
 /// One view's points to its superview's.
@@ -187,7 +222,7 @@ fn view_chain(view: Id, with_top: bool) -> Transform {
         if superview == 0 && !with_top {
             break;
         }
-        t = concat(t, view_step(current));
+        t = concat(t, if superview == 0 { window_to_screen(current) } else { view_step(current) });
         current = superview;
     }
     t
@@ -202,9 +237,10 @@ struct HitView {
     /// be touched, but it never catches a touch itself, so taps go on to
     /// the drawn views under it.
     see_through: bool,
-    /// Top-left corner in window points.
-    origin: Point,
-    size: crate::fw::geometry::Size,
+    /// Window points to its own points.
+    to_local: Transform,
+    /// Its bounds (own points).
+    bounds: crate::fw::geometry::Rect,
     is_window: bool,
     /// Back to front.
     subviews: Vec<Id>,
@@ -231,8 +267,8 @@ fn hit_view(view: Id) -> HitView {
     HitView {
         blocks: hidden || invisible || !interaction,
         see_through: property_get(view, "notDrawn").is_some(),
-        origin: origin_in_window(view),
-        size: state.frame.size,
+        to_local: invert(view_to_window(view)).unwrap_or(IDENTITY),
+        bounds: crate::fw::geometry::Rect { origin: state.bounds_origin, size: state.frame.size },
         is_window: state.superview == 0,
         subviews: state.subviews.clone(),
     }
@@ -256,15 +292,18 @@ fn holds_gl_picture(view: Id) -> bool {
 }
 
 /// UIKit's hitTest:withEvent: from `view` down: the front-most, deepest view
-/// under the point (window points), skipping views that block and views
-/// outside their parent's bounds, as pointInside:withEvent: does.
+/// under the point (window points, taken into each view's own points
+/// through its transform), skipping views that block and views outside
+/// their parent's bounds, as pointInside:withEvent: does.
 fn hit_search(view: Id, point: Point, info: &dyn Fn(Id) -> HitView) -> Option<Id> {
     let node = info(view);
     if node.blocks {
         return None;
     }
-    let local = Point { x: point.x - node.origin.x, y: point.y - node.origin.y };
-    if !node.is_window && (local.x < 0.0 || local.y < 0.0 || local.x >= node.size.width || local.y >= node.size.height) {
+    let (x, y) = crate::fw::geometry::apply(node.to_local, point.x, point.y);
+    let local = Point { x, y };
+    let b = node.bounds;
+    if !node.is_window && (local.x < b.origin.x || local.y < b.origin.y || local.x >= b.origin.x + b.size.width || local.y >= b.origin.y + b.size.height) {
         return None;
     }
     for &child in node.subviews.iter().rev() {
@@ -279,7 +318,7 @@ fn hit_search(view: Id, point: Point, info: &dyn Fn(Id) -> HitView) -> Option<Id
     }
 }
 
-fn hit_test(window: Id, point: Point) -> Id {
+pub(crate) fn hit_test(window: Id, point: Point) -> Id {
     hit_search(window, point, &hit_view).unwrap_or(window)
 }
 
@@ -293,8 +332,7 @@ extern "C" fn touch_location_in_view(this: Id, _: Sel, view: Id) -> Point {
     if view == 0 {
         return at;
     }
-    let origin = origin_in_window(view);
-    Point { x: at.x - origin.x, y: at.y - origin.y }
+    point_in_view(view, at)
 }
 
 extern "C" fn touch_previous_location_in_view(this: Id, _: Sel, view: Id) -> Point {
@@ -302,8 +340,7 @@ extern "C" fn touch_previous_location_in_view(this: Id, _: Sel, view: Id) -> Poi
     if view == 0 {
         return at;
     }
-    let origin = origin_in_window(view);
-    Point { x: at.x - origin.x, y: at.y - origin.y }
+    point_in_view(view, at)
 }
 
 extern "C" fn touch_phase(this: Id, _: Sel) -> isize {
@@ -347,9 +384,10 @@ extern "C" fn event_type(_this: Id, _: Sel) -> isize {
     0
 }
 
-/// Handles one finger change, on the main thread. `point` is in window points.
+/// Handles one finger change, on the main thread. `point` is in screen
+/// points: an old app's turned window gets it in its own (see uikit::window_turn).
 fn deliver_now(finger: i32, phase: Phase, point: Point) {
-    deliver_in(key_window(), finger, phase, point);
+    deliver_in(key_window(), finger, phase, screen_to_window_with(crate::fw::uikit::window_turn(), point));
 }
 
 /// The same for a given window.
@@ -436,10 +474,15 @@ fn send_to_view(view: Id, finger: i32, selector: &'static str, changed: Id, even
     static SHOWN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     // Tests see every touch; otherwise only the first few are logged.
     if SHOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 || TAPS_ARMED.load(std::sync::atomic::Ordering::Relaxed) {
+        // At the screen point tapped (test taps wait for these lines).
+        let (x, y) = match crate::fw::uikit::window_turn() {
+            Some(turn) => crate::fw::geometry::apply(turn, point.x, point.y),
+            None => (point.x, point.y),
+        };
         crate::log!(
             "touch {finger} {selector} at {:.0},{:.0}: view {}, handled by {}",
-            point.x,
-            point.y,
+            x,
+            y,
             crate::fw::string::describe_class_of(view),
             if handler == 0 { "nobody".to_string() } else { crate::fw::string::describe_class_of(handler) }
         );
@@ -780,7 +823,9 @@ mod tests {
                 4 => (10.0, 10.0, 50.0, 50.0, vec![], false, false),
                 _ => (0.0, 0.0, 568.0, 320.0, vec![], false, true),
             };
-            HitView { blocks, see_through, origin: Point { x, y }, size: Size { width: w, height: h }, is_window: id == 1, subviews }
+            let to_local = Transform { tx: -x, ty: -y, ..IDENTITY };
+            let bounds = crate::fw::geometry::Rect { origin: Point::default(), size: Size { width: w, height: h } };
+            HitView { blocks, see_through, to_local, bounds, is_window: id == 1, subviews }
         };
         let at = |x, y| hit_search(1, Point { x, y }, &node);
         assert_eq!(at(20.0, 20.0), Some(4), "drawn view inside the undrawn scroll view");
