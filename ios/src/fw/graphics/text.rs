@@ -589,30 +589,62 @@ pub(super) fn look_bitmap(look: &TextLook, scale: f64) -> Option<Bitmap> {
     Some(canvas.snapshot())
 }
 
-/// The text picture files made so far, least recently used first.
+/// A look at a scale, as a key: its exact numbers spelled out (Debug prints
+/// each f64 so it reads back the same), so equal looks find one file.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+struct LookKey(String);
+
+impl LookKey {
+    fn of(look: &TextLook, scale: f64) -> LookKey {
+        LookKey(format!("{look:?}@{}", scale.to_bits()))
+    }
+}
+
+/// A text picture file and when it was last on a screen.
+struct TextFile {
+    file: Option<String>,
+    used: u64,
+}
+
+/// The text picture files made so far, by look (B3: found by key, not by a
+/// search through all of them), each with when it was last used.
 #[derive(Default)]
 struct TextFiles {
-    made: Vec<(TextLook, u64, Option<String>)>,
+    made: HashMap<LookKey, TextFile>,
+    clock: u64,
 }
 
 impl TextFiles {
+    /// The next use's time (a screen's looks take one each, in order).
+    fn tick(&mut self) -> u64 {
+        self.clock += 1;
+        self.clock
+    }
+
     /// The files for one screen's looks (made by `make` the first time);
     /// beyond `keep` files the least recently used ones not on this screen
     /// are deleted.
     fn files(&mut self, looks: &[&TextLook], scale: f64, keep: usize, make: impl Fn(&TextLook, f64) -> Option<String>) -> Vec<Option<String>> {
+        let keys: Vec<LookKey> = looks.iter().map(|look| LookKey::of(look, scale)).collect();
         let files = looks
             .iter()
-            .map(|&look| {
-                let entry = match self.made.iter().position(|(seen, seen_scale, _)| seen == look && *seen_scale == scale.to_bits()) {
-                    Some(at) => self.made.remove(at),
-                    None => (look.clone(), scale.to_bits(), make(look, scale)),
-                };
-                let file = entry.2.clone();
-                self.made.push(entry);
-                file
+            .zip(&keys)
+            .map(|(&look, key)| {
+                let used = self.tick();
+                match self.made.get_mut(key) {
+                    Some(found) => {
+                        found.used = used;
+                        found.file.clone()
+                    }
+                    None => {
+                        let file = make(look, scale);
+                        self.made.insert(key.clone(), TextFile { file: file.clone(), used });
+                        file
+                    }
+                }
             })
             .collect();
-        self.trim(keep, scale, looks);
+        self.trim(keep, &keys);
         files
     }
 
@@ -625,34 +657,34 @@ impl TextFiles {
             Have(Option<String>),
             New(usize),
         }
+        let keys: Vec<LookKey> = looks.iter().map(|look| LookKey::of(look, scale)).collect();
         let mut slots: Vec<Slot> = Vec::with_capacity(looks.len());
-        let mut new: Vec<TextLook> = Vec::new();
-        for &look in looks {
+        let mut new: Vec<(LookKey, TextLook)> = Vec::new();
+        for (&look, key) in looks.iter().zip(&keys) {
+            let used = self.tick();
             // A look shown twice on the screen shares the one being drawn.
-            if let Some(at) = new.iter().position(|pending| pending == look) {
+            if let Some(at) = new.iter().position(|(pending, _)| pending == key) {
                 slots.push(Slot::New(at));
                 continue;
             }
-            match self.made.iter().position(|(seen, seen_scale, _)| seen == look && *seen_scale == scale.to_bits()) {
-                Some(at) => {
-                    let entry = self.made.remove(at);
-                    let file = entry.2.clone();
-                    self.made.push(entry);
-                    slots.push(Slot::Have(file));
+            match self.made.get_mut(key) {
+                Some(found) => {
+                    found.used = used;
+                    slots.push(Slot::Have(found.file.clone()));
                 }
                 None => {
-                    let at = new.len();
-                    new.push(look.clone());
-                    self.made.push((look.clone(), scale.to_bits(), None));
-                    slots.push(Slot::New(at));
+                    slots.push(Slot::New(new.len()));
+                    new.push((key.clone(), look.clone()));
+                    self.made.insert(key.clone(), TextFile { file: None, used });
                 }
             }
         }
-        let drawn = draw_in_parallel(&new, scale, draw);
+        let pending: Vec<TextLook> = new.iter().map(|(_, look)| look.clone()).collect();
+        let drawn = draw_in_parallel(&pending, scale, draw);
         // The new looks keep the picture they drew.
-        for (look, file) in new.iter().zip(&drawn) {
-            if let Some(entry) = self.made.iter_mut().find(|(seen, seen_scale, _)| seen == look && *seen_scale == scale.to_bits()) {
-                entry.2 = file.clone();
+        for ((key, _), file) in new.iter().zip(&drawn) {
+            if let Some(entry) = self.made.get_mut(key) {
+                entry.file = file.clone();
             }
         }
         let files = slots
@@ -662,23 +694,22 @@ impl TextFiles {
                 Slot::New(at) => drawn[at].clone(),
             })
             .collect();
-        self.trim(keep, scale, looks);
+        self.trim(keep, &keys);
         files
     }
 
     /// Deletes the least recently used files beyond `keep` that are not on
-    /// this screen (the entries at the front of `made`).
-    fn trim(&mut self, keep: usize, scale: f64, looks: &[&TextLook]) {
-        // The screen's own entries were all moved to the end.
-        let unused = self
-            .made
-            .iter()
-            .take_while(|(seen, seen_scale, _)| !(*seen_scale == scale.to_bits() && looks.contains(&seen)))
-            .count();
-        let extra = self.made.len().saturating_sub(keep).min(unused);
-        for (_, _, file) in self.made.drain(..extra) {
-            if let Some(old) = file {
-                let _ = std::fs::remove_file(old);
+    /// this screen (`shown`).
+    fn trim(&mut self, keep: usize, shown: &[LookKey]) {
+        let extra = self.made.len().saturating_sub(keep);
+        if extra == 0 {
+            return;
+        }
+        let mut old: Vec<(u64, LookKey)> = self.made.iter().filter(|(key, _)| !shown.contains(key)).map(|(key, entry)| (entry.used, key.clone())).collect();
+        old.sort_unstable_by_key(|(used, _)| *used);
+        for (_, key) in old.into_iter().take(extra) {
+            if let Some(TextFile { file: Some(file), .. }) = self.made.remove(&key) {
+                let _ = std::fs::remove_file(file);
             }
         }
     }
@@ -707,8 +738,9 @@ fn draw_in_parallel(looks: &[TextLook], scale: f64, draw: &(dyn Fn(&TextLook, f6
 /// (fw/pictures.rs), each made once; None for a look there is nothing to
 /// draw with.
 pub fn text_pictures(looks: &[&TextLook], scale: f64) -> Vec<Option<String>> {
-    static MADE: Mutex<TextFiles> = Mutex::new(TextFiles { made: Vec::new() });
+    static MADE: Mutex<Option<TextFiles>> = Mutex::new(None);
     let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    let made = made.get_or_insert_with(TextFiles::default);
     let draw = |look: &TextLook, scale: f64| {
         draw_look(look, scale)
             .and_then(|(width, height, rgba)| encode_png(width, height, &rgba, true))
@@ -993,6 +1025,27 @@ mod tests {
         files.files(&[&other], 2.0, 4, make);
         let kept: Vec<bool> = first.iter().map(|f| std::path::Path::new(f.as_ref().unwrap()).exists()).collect();
         assert_eq!(kept, [false, false, true, true, true]);
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// B3: files are found by their look (not a search through all of them),
+    /// and a file on the screen is never deleted however few are kept.
+    #[test]
+    fn a_text_file_is_found_by_its_look_and_kept_while_shown() {
+        let folder = std::env::temp_dir().join(format!("text-files-b3-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let make = |look: &TextLook, _: f64| {
+            let file = folder.join(&look.text).to_string_lossy().into_owned();
+            std::fs::write(&file, b"png").ok().map(|()| file)
+        };
+        let looks: Vec<TextLook> = (0..3).map(|n| look(&format!("shown {n}"), (10.0, 10.0))).collect();
+        let shown: Vec<&TextLook> = looks.iter().collect();
+        let mut files = TextFiles::default();
+        let first = files.files(&shown, 2.0, 0, make);
+        assert!(files.made.contains_key(&LookKey::of(&looks[1], 2.0)), "kept by its look");
+        assert_eq!(files.files(&shown, 2.0, 0, make), first);
+        assert!(first.iter().all(|f| std::path::Path::new(f.as_ref().unwrap()).exists()), "on the screen: never deleted");
+        assert!(!files.made.contains_key(&LookKey::of(&looks[1], 3.0)), "another scale is another file");
         let _ = std::fs::remove_dir_all(&folder);
     }
 

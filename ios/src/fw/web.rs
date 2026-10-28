@@ -720,7 +720,9 @@ mod tests {
         // (Cancelled before its start: other tests run the main loop too.)
         runtime::send(connection, "cancel", &[]);
         runtime::send(connection, "start", &[]);
-        for _ in 0..10 {
+        // Up to 5 s for the failure to come (a busy machine is slow to refuse).
+        let start = std::time::Instant::now();
+        while start.elapsed().as_secs_f64() < 5.0 {
             crate::fw::runloop::run_main_loop_briefly();
             if COUNTS_IN_CALLBACK.lock().unwrap().iter().any(|e| e.0 == failing) {
                 break;

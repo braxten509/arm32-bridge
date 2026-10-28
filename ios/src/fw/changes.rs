@@ -87,7 +87,27 @@ pub fn changed(object: Id) {
     #[cfg(not(test))]
     {
         CHANGES.mark(object, || {});
+        wake_if_elsewhere();
     }
+}
+
+/// A mark from another thread (a picture file finished) wakes the main loop,
+/// which waits up to a quarter second on a still screen (pictures::gap).
+#[cfg(not(test))]
+fn wake_if_elsewhere() {
+    if !crate::fw::runloop::is_main_thread() {
+        ELSEWHERE.fetch_add(1, Ordering::Relaxed);
+        crate::fw::runloop::wake_main();
+    }
+}
+
+/// Marks made on other threads.
+static ELSEWHERE: AtomicU64 = AtomicU64::new(0);
+
+/// How many marks other threads have made: one between the main loop's
+/// look at the pictures and its wait keeps it from waiting.
+pub fn elsewhere() -> u64 {
+    ELSEWHERE.load(Ordering::Relaxed)
 }
 
 /// Bump the counter without marking any object: a change that only needs the
@@ -99,6 +119,8 @@ pub fn touch() {
     {
         LOCAL.with(|g| g.set(g.get() + 1));
     }
+    #[cfg(not(test))]
+    wake_if_elsewhere();
 }
 
 /// The global counter's value now: marks from any thread (a picture file's

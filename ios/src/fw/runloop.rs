@@ -160,6 +160,11 @@ pub fn is_main_thread_id(thread: u64) -> bool {
     MAIN_THREAD.load(Ordering::Relaxed) == thread
 }
 
+/// Wakes the main thread's run loop from its wait (it then runs a turn).
+pub fn wake_main() {
+    MAIN_LOOP.notify();
+}
+
 /// Queues work for the main thread's run loop.
 pub fn post(work: Work) {
     MAIN_LOOP.push(work);
@@ -896,6 +901,10 @@ fn run_loop_until(run_loop: &'static Loop, until: Option<f64>, once: bool, mode:
             }
         }
         let mut wait_until = next_timer.unwrap_or(current + 0.25);
+        // A mark from another thread (a picture file finished) after the
+        // queue is taken below wakes the wait (wake_main takes the queue lock
+        // first); one before it shows in this count.
+        let marks = crate::fw::changes::elsewhere();
         if pictures {
             wait_until = wait_until.min(current + crate::fw::pictures::gap());
         }
@@ -908,7 +917,8 @@ fn run_loop_until(run_loop: &'static Loop, until: Option<f64>, once: bool, mode:
             wait_until = wait_until.min(end);
         }
         let guard = run_loop.queue.lock().unwrap();
-        if !guard.iter().any(|(number, work)| runs_now(*number, work, turn_mode, u64::MAX)) && wait_until > current {
+        let marked = pictures && crate::fw::changes::elsewhere() != marks;
+        if !marked && !guard.iter().any(|(number, work)| runs_now(*number, work, turn_mode, u64::MAX)) && wait_until > current {
             let seconds = (wait_until - current).min(0.25);
             waiting(|| drop(run_loop.wake.wait_timeout(guard, std::time::Duration::from_secs_f64(seconds))));
         }

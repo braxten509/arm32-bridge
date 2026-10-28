@@ -22,14 +22,52 @@ pub fn property_get(object: Id, key: &'static str) -> Option<u64> {
 }
 
 pub fn property_set(object: Id, key: &'static str, value: u64) {
-    PROPERTIES.lock().unwrap().get_or_insert_with(FxHashMap::default).insert((object, key), value);
+    let mut properties = PROPERTIES.lock().unwrap();
+    let properties = properties.get_or_insert_with(FxHashMap::default);
+    properties.insert((object, key), value);
+    stamp_content(properties, object, key);
     crate::fw::changes::changed(object);
+}
+
+/// The key of an object's content stamp among its properties (B1+B2).
+const CONTENT: &str = "~content";
+
+/// Keys that only change how a view is put on the screen (faded, hidden,
+/// what takes its touches, its tag, how it is resized, who it reports to),
+/// not what it draws: they leave its content stamp as it was.
+fn compositing_only(key: &str) -> bool {
+    matches!(
+        key,
+        "alpha" | "hidden" | "opacity" | "userInteraction" | "multipleTouch" | "exclusiveTouch" | "tag" | "autoresizing" | "autoresizes" | "delegate" | "viewController"
+    )
+}
+
+/// A new content stamp for `object`, unless `key` only composites it.
+/// Stamps are never reused, so an object made where a freed one was
+/// doesn't match what was kept for the old one.
+fn stamp_content(properties: &mut FxHashMap<(Id, &'static str), u64>, object: Id, key: &'static str) {
+    static STAMPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if !compositing_only(key) {
+        properties.insert((object, CONTENT), STAMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1);
+    }
+}
+
+/// What an object draws was last changed at this stamp (0: never set):
+/// a picture made from its properties stays good while this holds (B1+B2).
+pub fn content_stamp(object: Id) -> u64 {
+    property_get(object, CONTENT).unwrap_or(0)
 }
 
 /// Sets an object property: like UIKit's, it retains what it holds (this
 /// matters for objects with real counts: pictures, fw/counted.rs).
 pub fn property_set_object(object: Id, key: &'static str, value: Id) {
-    let old = PROPERTIES.lock().unwrap().get_or_insert_with(FxHashMap::default).insert((object, key), value as u64);
+    let old = {
+        let mut properties = PROPERTIES.lock().unwrap();
+        let properties = properties.get_or_insert_with(FxHashMap::default);
+        let old = properties.insert((object, key), value as u64);
+        stamp_content(properties, object, key);
+        old
+    };
     crate::fw::counted::replace(old.unwrap_or(0) as Id, value);
     crate::fw::changes::changed(object);
 }

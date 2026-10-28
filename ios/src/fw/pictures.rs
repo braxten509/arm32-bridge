@@ -787,6 +787,48 @@ fn start_files(image: Id) {
     }
 }
 
+thread_local! {
+    /// B1+B2: labels' looks, with the content stamp and size each was made
+    /// for (Apple keeps a layer's backing store until its content changes):
+    /// this commit's, and the last commit's (a label off the screen for a
+    /// whole commit is let go of).
+    static LOOKS: RefCell<[HashMap<Id, (u64, (f64, f64), Option<TextLook>)>; 2]> = RefCell::new([HashMap::new(), HashMap::new()]);
+    /// Looks worked out (not kept), for the test.
+    static LOOKS_MADE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `label_look` of a label `size` big, kept from an earlier build while
+/// nothing it draws changed (a fade, a move or hiding keep it); worked out
+/// afresh when not caching (a full build for the verify check).
+fn label_look_kept(label: Id, size: (f64, f64)) -> Option<TextLook> {
+    let caching = CACHING.with(|c| c.get());
+    let stamp = crate::fw::uikit::content_stamp(label);
+    if caching {
+        let kept = LOOKS.with(|looks| {
+            let mut looks = looks.borrow_mut();
+            let kept = looks[0].get(&label).or_else(|| looks[1].get(&label)).filter(|(s, z, _)| *s == stamp && *z == size).cloned();
+            kept.inspect(|entry| drop(looks[0].insert(label, entry.clone())))
+        });
+        if let Some((_, _, look)) = kept {
+            return look;
+        }
+    }
+    LOOKS_MADE.with(|m| m.set(m.get() + 1));
+    let look = crate::fw::controls::label_look(label);
+    if caching {
+        LOOKS.with(|looks| looks.borrow_mut()[0].insert(label, (stamp, size, look.clone())));
+    }
+    look
+}
+
+/// A commit's looks become the last commit's.
+fn turn_looks() {
+    LOOKS.with(|looks| {
+        let mut looks = looks.borrow_mut();
+        looks[1] = std::mem::take(&mut looks[0]);
+    });
+}
+
 /// Text drawn over `rect` (None for no text).
 fn text_shown(look: Option<TextLook>, rect: Rect) -> Option<Shown> {
     let look = look?;
@@ -847,6 +889,7 @@ fn keep_reusable(nodes: &[Rc<Node>]) {
     let mut kept = HashMap::new();
     nodes.iter().for_each(|node| keep(node, &mut kept));
     NODE_CACHE.with(|c| *c.borrow_mut() = kept);
+    turn_looks();
 }
 
 /// Whether a built node can be kept and reused on the next commit: nothing
@@ -1012,7 +1055,7 @@ fn snapshot_built(view: Id, classes: &Classes, depth: usize) -> Node {
     }
     // A label that draws itself has its text in its layer's contents.
     if Classes::is(view, classes.label) && !crate::fw::uikit::draws_itself(view) {
-        pictures.extend(text_shown(crate::fw::controls::label_look(view), bounds));
+        pictures.extend(text_shown(label_look_kept(view, (bounds.size.width, bounds.size.height)), bounds));
     }
     // A button's parts are its subviews; a press may last one frame, so the
     // pictures it would show have their files started now.
@@ -2242,12 +2285,31 @@ fn gl_mark(shown: f64) -> String {
 /// When the pictures last changed (frame 0 of a list), for `gap`.
 static LAST_CHANGE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 
-/// How long the main loop waits between ticks: a screen refresh while a
-/// finger is down or the pictures changed in the last 100 ms (a card
-/// dragged, a view the game moves itself), else 50 ms.
+/// How long the main loop waits between ticks. As Core Animation commits
+/// at the end of a turn that changed something, a change not yet committed
+/// goes at the next refresh (at most one list a refresh), and so do moving
+/// pictures (a finger down, or the pictures changed in the last 100 ms: a
+/// card dragged, a view the game moves itself). What changes by itself (a
+/// caret, a picker) or animates keeps a 50 ms tick; a still screen waits a
+/// quarter second, as a mark from another thread wakes the loop
+/// (changes.rs).
 pub fn gap() -> f64 {
     let moving = LAST_CHANGE.lock().unwrap_or_else(|e| e.into_inner()).is_some_and(|at| at.elapsed().as_secs_f64() < 0.1);
-    if moving || crate::fw::touch::fingers_down() { crate::fw::runloop::refresh_seconds() } else { 0.05 }
+    let pending = DRAW_SOON.load(std::sync::atomic::Ordering::Relaxed) || commit_needed();
+    let busy = crate::fw::animation::latest_end().is_some() || LAST_SCREEN.with(|last| always_changing(&last.borrow()));
+    gap_for(pending, moving || crate::fw::touch::fingers_down(), busy, crate::fw::runloop::refresh_seconds())
+}
+
+/// `gap`: with a change waiting, moving pictures, or something on the screen
+/// changing by itself or animating (`busy`).
+fn gap_for(pending: bool, moving: bool, busy: bool, refresh: f64) -> f64 {
+    if pending || moving {
+        refresh
+    } else if busy {
+        0.05
+    } else {
+        0.25
+    }
 }
 
 /// The longest a list is held back for picture files still being written:
@@ -2860,6 +2922,47 @@ mod tests {
         assert_eq!(gl_layers(&nodes), vec![gl], "the GL layer is in the list");
         let empty = new_view("UIWindow", rect(0.0, 0.0, 320.0, 480.0));
         assert!(gl_layers(&[commit_build(empty, None)]).is_empty(), "no GL layer, none listed");
+    }
+
+    /// B1+B2: a label's look is worked out again only when what it shows
+    /// changed (its text, font, colour; its size), not when it fades, hides
+    /// or moves, as Apple keeps a layer's backing store until -setNeedsDisplay.
+    #[test]
+    fn a_labels_look_is_made_again_only_when_its_content_changes() {
+        setup();
+        let label = new_view("UILabel", rect(0.0, 0.0, 100.0, 20.0));
+        runtime::send(label, "setText:", &[crate::fw::string::make("Gold")]);
+        let size = (100.0, 20.0);
+        let made = || LOOKS_MADE.with(|m| m.get());
+        // As a tick's own build does (a full build for the verify check makes every look).
+        let kept = |label: Id, size: (f64, f64)| with_caching(true, || label_look_kept(label, size));
+        let start = made();
+        let first = kept(label, size);
+        assert_eq!(first.as_ref().map(|l| l.text.as_str()), Some("Gold"));
+        kept(label, size);
+        assert_eq!(made(), start + 1, "the same label again: kept");
+        crate::fw::uikit::property_set(label, "alpha", 0.5f64.to_bits());
+        crate::fw::uikit::property_set(label, "hidden", 1);
+        kept(label, size);
+        assert_eq!(made(), start + 1, "fading or hiding keeps the look");
+        runtime::send(label, "setText:", &[crate::fw::string::make("Silver")]);
+        assert_eq!(kept(label, size).map(|l| l.text), Some("Silver".to_string()));
+        assert_eq!(made(), start + 2, "new text: made again");
+        kept(label, (120.0, 20.0));
+        assert_eq!(made(), start + 3, "a new size: made again");
+    }
+
+    /// A3: the next tick comes a refresh after a change not yet committed
+    /// (or while things move), every 50 ms while something on the screen
+    /// changes by itself or animates, and else only every quarter second.
+    #[test]
+    fn the_next_tick_comes_with_a_change_not_a_clock() {
+        let refresh = 1.0 / 120.0;
+        assert_eq!(gap_for(true, false, false, refresh), refresh, "a change waits at most a refresh");
+        assert_eq!(gap_for(false, true, false, refresh), refresh, "moving keeps the screen's pace");
+        assert_eq!(gap_for(true, false, true, refresh), refresh);
+        assert_eq!(gap_for(false, false, true, refresh), 0.05, "a caret or a picker keeps its 50 ms");
+        assert_eq!(gap_for(false, false, false, refresh), 0.25, "a still screen waits a quarter second");
     }
 
     /// On the phone a list is up only once its new pictures are decoded:
