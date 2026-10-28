@@ -472,6 +472,14 @@ extern "C" fn data_set_length(this: Id, _: Sel, length: usize) {
     store(this).resize(length);
 }
 
+/// -setData: the bytes become a copy of the other data's.
+extern "C" fn data_set_data(this: Id, _: Sel, other: Id) {
+    let replacement = bytes(other);
+    let store = store(this);
+    store.resize(0);
+    store.extend(&replacement);
+}
+
 extern "C" fn data_mutable_bytes(this: Id, _: Sel) -> *mut u8 {
     store(this).pointer()
 }
@@ -660,6 +668,7 @@ pub fn register(_: &mut Registry) {
             ("appendBytes:length:", data_append_bytes as usize),
             ("appendData:", data_append_data as usize),
             ("setLength:", data_set_length as usize),
+            ("setData:", data_set_data as usize),
             ("mutableBytes", data_mutable_bytes as usize),
             ("increaseLengthBy:", data_increase_length as usize),
             ("replaceBytesInRange:withBytes:length:", data_replace_bytes as usize),

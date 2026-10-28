@@ -219,6 +219,34 @@ fn blocks_copy_to_the_heap_and_run_when_the_host_calls_them() {
     assert_eq!(g.u32_at(heap + 4) & 0xffff, 4);
 }
 
+/// A block held in a __block variable (its helpers pass BLOCK_BYREF_CALLER |
+/// BLOCK_FIELD_IS_BLOCK, 135): libclosure assigns it as it is, without a
+/// copy, and disposing it does nothing.
+#[test]
+fn a_block_in_a_byref_variable_is_neither_copied_nor_released() {
+    use super::bridge::BLOCK_NEEDS_FREE;
+    let g = Fake::new();
+    let bridge: &'static Mutex<Bridge> = Box::leak(Box::new(Mutex::new(Bridge::new(&ObjcMetadata32::default()).unwrap())));
+    let (stack_isa, malloc_isa) = (g.words(&[0; 5]), g.words(&[0; 5]));
+    {
+        let mut b = bridge.lock().unwrap();
+        b.set_special(stack_isa, Special::StackBlock);
+        b.set_special(malloc_isa, Special::MallocBlock);
+    }
+    let call = move |name: &str, words: &[u32]| {
+        let w = |i: u32| words.get(i as usize).copied().unwrap_or(0);
+        call_function(&Ctx { bridge, g }, name, &w).unwrap() as u32
+    };
+    let descriptor = g.words(&[0, 20]);
+    let block = g.words(&[stack_isa, 0, 0, 0x4301, descriptor]);
+    let slot = g.words(&[0]);
+    call("_Block_object_assign", &[slot, block, 135]);
+    assert_eq!(g.u32_at(slot), block, "the block was copied");
+    let heap = g.words(&[malloc_isa, BLOCK_NEEDS_FREE | 2, 0, 0x4301, descriptor]);
+    call("_Block_object_dispose", &[heap, 135]);
+    assert_eq!(g.u32_at(heap + 4) & 0xfffe, 2, "the block was released");
+}
+
 #[test]
 fn block_counts_change_atomically_and_saturated_counts_stay() {
     use super::bridge::BLOCK_NEEDS_FREE;

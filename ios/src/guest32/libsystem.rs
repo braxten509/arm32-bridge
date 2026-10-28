@@ -40,7 +40,7 @@ const REUSED: &[&str] = &[
     "isatty",
     // time
     "time", "gettimeofday", "clock", "localtime", "localtime_r", "gmtime", "gmtime_r", "mktime", "difftime",
-    "strftime", "nanosleep", "usleep", "sleep", "sched_yield",
+    "strftime", "sched_yield",
     // process
     "getpid", "getppid", "getuid", "geteuid", "getgid", "getegid", "getenv", "setenv", "_exit", "abort",
     "__stack_chk_fail", "setjmp", "_setjmp", "longjmp", "_longjmp", "sigsetjmp", "siglongjmp", "arc4random_buf",
@@ -78,6 +78,7 @@ fn register_darwin() {
     numbers();
     process();
     threads();
+    sleeps();
     atomics();
     data();
 }
@@ -1829,6 +1830,43 @@ fn scheduling() {
             let (attributes, out) = (a.u32(), a.u32());
             mem().write_u32(out, mem().read_u32(attributes + ATTR_PRIORITY));
             Ret::U32(0)
+        })
+        .unwrap(),
+    );
+}
+
+// ---- sleeping ----
+
+/// The sleeps on the main thread must not freeze the screen: while a UIKit
+/// animation runs, the pictures sent now carry coming frames through the
+/// sleep (fw/pictures.rs; on Apple the render server animates on its own).
+/// The Android handler still does the sleeping itself.
+fn sleeps() {
+    function(
+        "usleep",
+        handler!(|uc, a| {
+            let micros = a.u32();
+            crate::fw::pictures::sleep_starting(micros as f64 / 1e6);
+            forward(uc, bionic!("usleep"), [micros, 0, 0, 0])
+        })
+        .unwrap(),
+    );
+    function(
+        "nanosleep",
+        handler!(|uc, a| {
+            let (request, left) = (a.u32(), a.u32());
+            let seconds = mem().read_u32(request) as i32 as f64 + mem().read_u32(request + 4) as i32 as f64 / 1e9;
+            crate::fw::pictures::sleep_starting(seconds.max(0.0));
+            forward(uc, bionic!("nanosleep"), [request, left, 0, 0])
+        })
+        .unwrap(),
+    );
+    function(
+        "sleep",
+        handler!(|uc, a| {
+            let seconds = a.u32();
+            crate::fw::pictures::sleep_starting(seconds as f64);
+            forward(uc, bionic!("sleep"), [seconds, 0, 0, 0])
         })
         .unwrap(),
     );

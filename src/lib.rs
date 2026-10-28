@@ -15,7 +15,11 @@ pub mod ios32;
 pub mod jni_names;
 pub mod log;
 pub mod mem;
+pub mod rtk_textures;
+pub mod rtk_zoom;
 pub mod runtime;
+pub mod texture_pack;
+pub mod wraps;
 
 #[cfg(target_os = "android")]
 pub mod app;

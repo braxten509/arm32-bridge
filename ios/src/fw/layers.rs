@@ -11,11 +11,11 @@
 
 use crate::fw::geometry::{apply, concat, invert, Point, Rect, Size, Transform, Transform3D, IDENTITY, IDENTITY_3D};
 use crate::fw::object::{class_methods, define_class, methods};
-use crate::fw::uikit::{property_get, property_set, property_set_object, view_state};
+use crate::fw::uikit::{property_get, property_set, property_set_object, view_state, view_state_mut};
 use crate::fw::{collections, string};
 use crate::objc::runtime::{self, lock, Class, Id, Sel};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 /// What a layer keeps that doesn't fit the property store.
 #[derive(Clone)]
@@ -38,6 +38,11 @@ struct LayerState {
     offset: f64,
     /// CAReplicatorLayer's step between copies.
     instance_transform: Transform3D,
+    /// It has been through a transaction's commit: from then on its changes
+    /// run implicit actions (a layer changed in the turn it was made doesn't animate).
+    committed: bool,
+    /// Applied to every sublayer, around this layer's anchor point.
+    sublayer_transform: Transform3D,
 }
 
 impl Default for LayerState {
@@ -55,16 +60,49 @@ impl Default for LayerState {
             speed: 1.0,
             offset: 0.0,
             instance_transform: IDENTITY_3D,
+            committed: false,
+            sublayer_transform: IDENTITY_3D,
         }
     }
 }
 
 static LAYERS: Mutex<Option<HashMap<Id, LayerState>>> = Mutex::new(None);
 
+thread_local! {
+    /// Layers made on this thread since its last commit (as Core Animation
+    /// keeps them in the thread's transaction).
+    static NEW: std::cell::RefCell<Vec<Id>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// The layer's state (made on first use). No message may be sent inside `f`.
+/// A change through here marks a change (fw/changes.rs): the pictures rebuild.
 fn with<R>(layer: Id, f: impl FnOnce(&mut LayerState) -> R) -> R {
+    let out = with_quiet(layer, f);
+    crate::fw::changes::changed(layer);
+    out
+}
+
+/// `with` without marking: `created` and `commit_new` only book layers made
+/// in this turn, nothing is drawn differently.
+fn with_quiet<R>(layer: Id, f: impl FnOnce(&mut LayerState) -> R) -> R {
     let mut all = LAYERS.lock().unwrap_or_else(|e| e.into_inner());
-    f(all.get_or_insert_with(HashMap::new).entry(layer).or_default())
+    f(all.get_or_insert_with(HashMap::new).entry(layer).or_insert_with(|| {
+        NEW.with(|new| new.borrow_mut().push(layer));
+        LayerState::default()
+    }))
+}
+
+/// A layer was made (-init).
+pub fn created(layer: Id) {
+    with_quiet(layer, |_| ());
+}
+
+/// This thread's transaction commits: the layers made in it are committed.
+pub fn commit_new() {
+    let new = NEW.with(|new| std::mem::take(&mut *new.borrow_mut()));
+    for layer in new {
+        with_quiet(layer, |s| s.committed = true);
+    }
 }
 
 fn read<R>(layer: Id, f: impl FnOnce(&LayerState) -> R) -> R {
@@ -75,7 +113,7 @@ fn read<R>(layer: Id, f: impl FnOnce(&LayerState) -> R) -> R {
     }
 }
 
-fn is_kind(object: Id, class_name: &str) -> bool {
+pub(crate) fn is_kind(object: Id, class_name: &str) -> bool {
     let class = runtime::class_named(class_name);
     let rt = lock();
     object != 0 && class != 0 && rt.is_subclass(rt.class_of(object), class)
@@ -84,11 +122,25 @@ fn is_kind(object: Id, class_name: &str) -> bool {
 /// The view whose layer this is (0 for a layer of its own).
 pub fn view_of(layer: Id) -> Id {
     let delegate = property_get(layer, "delegate").unwrap_or(0) as Id;
-    if delegate != 0 && is_kind(delegate, "UIView") && view_state(delegate).layer == layer {
+    if delegate != 0 && runtime::is_kind_of(delegate, ui_view_class()) && view_state(delegate).layer == layer {
         delegate
     } else {
         0
     }
+}
+
+static UI_VIEW_CLASS: OnceLock<Class> = OnceLock::new();
+
+/// The UIView class pointer, looked up once (0 while it is not registered yet).
+fn ui_view_class() -> Class {
+    if let Some(&class) = UI_VIEW_CLASS.get() {
+        return class;
+    }
+    let class = runtime::class_named("UIView");
+    if class != 0 {
+        let _ = UI_VIEW_CLASS.set(class);
+    }
+    class
 }
 
 pub fn anchor(layer: Id) -> Point {
@@ -144,7 +196,7 @@ fn own_frame(s: &LayerState) -> Rect {
 
 /// Where a `size` box with its anchor at (0, 0) lands under `t`, as the
 /// smallest rectangle holding it.
-fn transformed_box(size: Size, anchor: Point, t: Transform) -> Rect {
+pub(crate) fn transformed_box(size: Size, anchor: Point, t: Transform) -> Rect {
     let (left, top) = (-size.width * anchor.x, -size.height * anchor.y);
     let corners = [(left, top), (left + size.width, top), (left, top + size.height), (left + size.width, top + size.height)];
     let points = corners.map(|(x, y)| (t.a * x + t.c * y + t.tx, t.b * x + t.d * y + t.ty));
@@ -157,19 +209,27 @@ fn transformed_box(size: Size, anchor: Point, t: Transform) -> Rect {
 /// is the frame's size (kept when the transform squashes it flat), and the
 /// position that puts that box at the frame.
 fn set_own_frame(s: &mut LayerState, rect: Rect) {
-    let t = affine_of(s.transform);
+    let (size, position) = place_in_frame(s.bounds.size, s.anchor, affine_of(s.transform), rect);
+    (s.bounds.size, s.position) = (size, position);
+}
+
+/// For setFrame: under transform `t`: the bounds size whose transformed box
+/// is `rect`'s size (`size` is kept when `t` squashes it flat) and the
+/// position (anchor point) that puts that box at `rect`.
+pub(crate) fn place_in_frame(size: Size, anchor: Point, t: Transform, rect: Rect) -> (Size, Point) {
     let (a, b, c, d) = (t.a.abs(), t.b.abs(), t.c.abs(), t.d.abs());
     // width' = |a| w + |c| h, height' = |b| w + |d| h.
     let det = a * d - b * c;
+    let mut size = size;
     if det.abs() > 1e-12 {
         let w = (d * rect.size.width - c * rect.size.height) / det;
         let h = (a * rect.size.height - b * rect.size.width) / det;
         if w >= 0.0 && h >= 0.0 {
-            s.bounds.size = Size { width: w, height: h };
+            size = Size { width: w, height: h };
         }
     }
-    let offset = transformed_box(s.bounds.size, s.anchor, t);
-    s.position = Point { x: rect.origin.x - offset.origin.x, y: rect.origin.y - offset.origin.y };
+    let offset = transformed_box(size, anchor, t);
+    (size, Point { x: rect.origin.x - offset.origin.x, y: rect.origin.y - offset.origin.y })
 }
 
 pub fn frame(layer: Id) -> Rect {
@@ -179,11 +239,23 @@ pub fn frame(layer: Id) -> Rect {
     }
 }
 
-/// The layer's transform: a view's is its 2D transform.
+/// The layer's transform. A view's layer keeps the whole 3D one it was given
+/// (perspective too); its view's 2D transform is its affine part, and a new
+/// one set on the view replaces it.
 pub fn transform(layer: Id) -> Transform3D {
     match view_of(layer) {
         0 => read(layer, |s| s.transform),
-        view => affine_to_3d(view_state(view).transform),
+        view => {
+            let (full, flat) = (read(layer, |s| s.transform), view_state(view).transform);
+            if affine_of(full) == flat { full } else { affine_to_3d(flat) }
+        }
+    }
+}
+
+/// The view's transform was set: its layer's whole transform is that one.
+pub fn view_transform_set(view: Id, t: Transform) {
+    if let layer @ 1.. = view_state(view).layer {
+        with(layer, |s| s.transform = affine_to_3d(t));
     }
 }
 
@@ -203,7 +275,11 @@ extern "C" fn layer_bounds(this: Id, _: Sel) -> Rect {
 
 extern "C" fn layer_set_bounds(this: Id, _: Sel, rect: Rect) {
     match view_of(this) {
-        0 => with(this, |s| s.bounds = rect),
+        0 => {
+            let action = begin_change(this, "bounds");
+            with(this, |s| s.bounds = rect);
+            end_change(this, "bounds", action);
+        }
         view => crate::fw::uikit::send_rect(view, "setBounds:", rect),
     }
 }
@@ -212,9 +288,121 @@ extern "C" fn layer_position(this: Id, _: Sel) -> Point {
     position(this)
 }
 
+// ----- actions: what a change to a layer's property starts -----
+
+/// What runs after a change: an action object (CAAction) or Core
+/// Animation's implicit animation from the value shown before.
+enum Action {
+    Object(Id),
+    Implicit(crate::fw::animation::Value),
+}
+
+/// The keys an implicit animation can show here.
+const IMPLICIT_KEYS: &[&str] = &["opacity", "position", "bounds", "transform", "backgroundColor"];
+
+fn non_null(object: Id) -> Option<Id> {
+    (object != 0 && !is_kind(object, "NSNull")).then_some(object)
+}
+
+/// A layer's action for a key, as -[CALayer actionForKey:] looks: its
+/// delegate's actionForLayer:forKey:, its actions, its style's actions,
+/// +defaultActionForKey:, then (a committed layer's) implicit animation.
+/// NSNull from any of them means none.
+fn action_for(layer: Id, key: &'static str) -> Option<Action> {
+    let name = string::make(key);
+    let delegate = property_get(layer, "delegate").unwrap_or(0) as Id;
+    if delegate != 0 && runtime::responds(delegate, "actionForLayer:forKey:") {
+        let found = runtime::send(delegate, "actionForLayer:forKey:", &[layer, name]);
+        if found != 0 {
+            return non_null(found).map(Action::Object);
+        }
+    }
+    let in_dictionary = |dictionary: Id| if dictionary != 0 && collections::is_dictionary(dictionary) { collections::dictionary_get(dictionary, name) } else { 0 };
+    let found = in_dictionary(property_get(layer, "actions").unwrap_or(0) as Id);
+    if found != 0 {
+        return non_null(found).map(Action::Object);
+    }
+    let mut style = property_get(layer, "style").unwrap_or(0) as Id;
+    for _ in 0..16 {
+        if style == 0 || !collections::is_dictionary(style) {
+            break;
+        }
+        let found = in_dictionary(collections::dictionary_get(style, string::make("actions")));
+        if found != 0 {
+            return non_null(found).map(Action::Object);
+        }
+        style = collections::dictionary_get(style, string::make("style"));
+    }
+    let class = lock().class_of(layer);
+    let found = runtime::send(class, "defaultActionForKey:", &[name]);
+    if found != 0 {
+        return non_null(found).map(Action::Object);
+    }
+    if !read(layer, |s| s.committed) || !IMPLICIT_KEYS.contains(&key) {
+        return None;
+    }
+    crate::fw::animation::shown_value(layer, key).map(Action::Implicit)
+}
+
+/// Before a layer's property `key` changes: a view's layer tells an open
+/// UIView animation block (UIView's actionForLayer:forKey:); a layer of its
+/// own finds its action unless the transaction disables actions.
+fn begin_change(layer: Id, key: &'static str) -> Option<Action> {
+    match view_of(layer) {
+        0 if !crate::fw::smallclasses::actions_disabled() => action_for(layer, key),
+        0 => None,
+        view => {
+            crate::fw::uikit::will_change(view, key);
+            None
+        }
+    }
+}
+
+/// After the change: the action runs (an implicit animation goes from the
+/// value shown before to the new one, in the transaction's time).
+fn end_change(layer: Id, key: &'static str, action: Option<Action>) {
+    match action {
+        None => {}
+        Some(Action::Object(action)) => {
+            if runtime::responds(action, "runActionForKey:object:arguments:") {
+                runtime::send(action, "runActionForKey:object:arguments:", &[string::make(key), layer, 0]);
+            }
+        }
+        Some(Action::Implicit(from)) => {
+            let animation = runtime::send(runtime::class_named("CABasicAnimation"), "animationWithKeyPath:", &[string::make(key)]);
+            runtime::send(animation, "setFromValue:", &[crate::fw::animation::boxed_value(from)]);
+            crate::fw::animation::add(layer, animation, string::make(key));
+        }
+    }
+}
+
+extern "C" fn layer_action_for_key(this: Id, _: Sel, key: Id) -> Id {
+    let key = string::get(key);
+    match IMPLICIT_KEYS.iter().find(|&&k| k == key).map(|&k| action_for(this, k)) {
+        Some(Some(Action::Object(action))) => action,
+        Some(Some(Action::Implicit(from))) => {
+            let animation = runtime::send(runtime::class_named("CABasicAnimation"), "animationWithKeyPath:", &[string::make(&key)]);
+            runtime::send(animation, "setFromValue:", &[crate::fw::animation::boxed_value(from)]);
+            animation
+        }
+        _ => 0,
+    }
+}
+
+extern "C" fn layer_default_action(_: Class, _: Sel, _key: Id) -> Id {
+    0
+}
+
+crate::fw::uikit::property!(layer_actions, layer_set_actions, "actions", id, 0);
+crate::fw::uikit::property!(layer_style, layer_set_style, "style", id, 0);
+
 extern "C" fn layer_set_position(this: Id, _: Sel, point: Point) {
     match view_of(this) {
-        0 => with(this, |s| s.position = point),
+        0 => {
+            let action = begin_change(this, "position");
+            with(this, |s| s.position = point);
+            end_change(this, "position", action);
+        }
         view => {
             let s = runtime::sel("setCenter:");
             if let Some(imp) = runtime::imp_for(view, s) {
@@ -226,12 +414,21 @@ extern "C" fn layer_set_position(this: Id, _: Sel, point: Point) {
 }
 
 extern "C" fn layer_frame(this: Id, _: Sel) -> Rect {
-    frame(this)
+    match view_of(this) {
+        0 => frame(this),
+        view => crate::fw::uikit::view_frame(view, 0),
+    }
 }
 
 extern "C" fn layer_set_frame(this: Id, _: Sel, rect: Rect) {
     match view_of(this) {
-        0 => with(this, |s| set_own_frame(s, rect)),
+        0 => {
+            // A new frame is a new position and bounds: each runs its action.
+            let (moved, sized) = (begin_change(this, "position"), begin_change(this, "bounds"));
+            with(this, |s| set_own_frame(s, rect));
+            end_change(this, "position", moved);
+            end_change(this, "bounds", sized);
+        }
         view => crate::fw::uikit::send_rect(view, "setFrame:", rect),
     }
 }
@@ -247,7 +444,7 @@ extern "C" fn layer_set_anchor(this: Id, _: Sel, point: Point) {
     let kept = if view != 0 { Some(position(this)) } else { None };
     with(this, |s| s.anchor = point);
     if let Some(at) = kept {
-        let state = view_state(view);
+        let state = view_state_mut(view);
         let size = state.frame.size;
         state.frame.origin = Point { x: at.x - size.width * point.x, y: at.y - size.height * point.y };
     }
@@ -265,11 +462,26 @@ extern "C" fn layer_transform(this: Id, _: Sel) -> Transform3D {
     transform(this)
 }
 
+/// A view's layer keeps the whole transform and gives the view its 2D part.
 extern "C" fn layer_set_transform(this: Id, _: Sel, t: Transform3D) {
-    match view_of(this) {
-        0 => with(this, |s| s.transform = t),
-        view => view_state(view).transform = affine_of(t),
+    let action = begin_change(this, "transform");
+    with(this, |s| s.transform = t);
+    if let view @ 1.. = view_of(this) {
+        view_state_mut(view).transform = affine_of(t);
     }
+    end_change(this, "transform", action);
+}
+
+extern "C" fn layer_sublayer_transform(this: Id, _: Sel) -> Transform3D {
+    sublayer_transform(this)
+}
+
+extern "C" fn layer_set_sublayer_transform(this: Id, _: Sel, t: Transform3D) {
+    with(this, |s| s.sublayer_transform = t);
+}
+
+pub fn sublayer_transform(layer: Id) -> Transform3D {
+    read(layer, |s| s.sublayer_transform)
 }
 
 extern "C" fn layer_affine_transform(this: Id, _: Sel) -> Transform {
@@ -341,14 +553,25 @@ extern "C" fn layer_convert_rect_to(this: Id, _: Sel, rect: Rect, other: Id) -> 
 
 // ----- hierarchy -----
 
-/// The layer above: for a view's layer, its superview's layer.
-fn parent_of(layer: Id) -> Id {
+/// The layer above: for a view's layer, its superview's layer (or the
+/// layer it was added to with addSublayer:).
+pub fn parent_of(layer: Id) -> Id {
     match view_of(layer) {
         0 => read(layer, |s| s.superlayer),
         view => match view_state(view).superview {
-            0 => 0,
+            0 => read(layer, |s| s.superlayer),
             parent => view_state(parent).layer,
         },
+    }
+}
+
+/// A sublayer as drawn: a view's layer is its view (with what only views
+/// show), unless the view has gone back into a superview since.
+fn child_of(layer: Id) -> Option<Child> {
+    match view_of(layer) {
+        0 => Some(Child::Layer(layer)),
+        view if view_state(view).superview == 0 => Some(Child::View(view)),
+        _ => None,
     }
 }
 
@@ -372,7 +595,7 @@ pub enum Child {
 /// were put (as Apple's one list of sublayers has them).
 pub fn children(layer: Id) -> Vec<Child> {
     match view_of(layer) {
-        0 => sublayers_of(layer).into_iter().map(Child::Layer).collect(),
+        0 => sublayers_of(layer).into_iter().filter_map(child_of).collect(),
         view => view_children(view, layer),
     }
 }
@@ -387,7 +610,7 @@ pub fn view_children(view: Id, layer: Id) -> Vec<Child> {
         for (i, &l) in own.iter().enumerate() {
             if above[i] == subview && !placed[i] {
                 placed[i] = true;
-                out.push(Child::Layer(l));
+                out.extend(child_of(l));
             }
         }
     };
@@ -397,7 +620,7 @@ pub fn view_children(view: Id, layer: Id) -> Vec<Child> {
         put_above(subview, &mut out);
     }
     // Above a subview that has gone: where it was is unknown, so on top.
-    out.extend(own.iter().zip(&placed).filter(|(_, &p)| !p).map(|(&l, _)| Child::Layer(l)));
+    out.extend(own.iter().zip(&placed).filter(|(_, &p)| !p).filter_map(|(&l, _)| child_of(l)));
     out
 }
 
@@ -426,6 +649,21 @@ fn attach(parent: Id, layer: Id, index: Option<usize>) {
     }
     // The layer holds what it shows, as on Apple.
     runtime::send(layer, "retain", &[]);
+    // A view's layer leaves its superview's layer: UIKit's subviews are its
+    // layer's sublayers, so the view is no longer drawn (or listed) there.
+    if let view @ 1.. = view_of(layer) {
+        let superview = view_state(view).superview;
+        if superview != 0 && view_of(parent) == superview {
+            // Put back into its own superview's layer: it moves among the subviews.
+            let subviews = &mut view_state_mut(superview).subviews;
+            subviews.retain(|&v| v != view);
+            let at = index.map_or(subviews.len(), |i| i.min(subviews.len()));
+            subviews.insert(at, view);
+            runtime::send(layer, "release", &[]);
+            return;
+        }
+        crate::fw::uikit::detach(view);
+    }
     let old = read(layer, |s| s.superlayer);
     detach(layer);
     let (above, at) = match index {
@@ -449,6 +687,41 @@ fn view_state_of_layer(layer: Id) -> Option<Vec<Id>> {
 
 extern "C" fn layer_superlayer(this: Id, _: Sel) -> Id {
     parent_of(this)
+}
+
+/// Whether the layer is on screen's tree: its topmost layer is a window's.
+pub fn shown(layer: Id) -> bool {
+    let mut current = layer;
+    for _ in 0..256 {
+        let parent = parent_of(current);
+        if parent == 0 {
+            return is_kind(view_of(current), "UIWindow");
+        }
+        current = parent;
+    }
+    false
+}
+
+/// -presentationLayer: a new layer with what shows now (its animations'
+/// values over its own); -modelLayer: the layer itself.
+extern "C" fn layer_presentation(this: Id, _: Sel) -> Id {
+    let shown = crate::fw::animation::presented(this, crate::fw::animation::model_of(this));
+    let class = lock().class_of(this);
+    let copy = runtime::send(runtime::send(class, "alloc", &[]), "init", &[]);
+    let (size, anchor, z, hidden) = (shown.bounds.unwrap_or_else(|| bounds(this)), anchor(this), z_position(this), hidden(this));
+    with(copy, |s| {
+        (s.bounds, s.anchor, s.z, s.position, s.transform) = (size, anchor, z, shown.position, shown.transform);
+    });
+    property_set(copy, "opacity", shown.opacity.to_bits());
+    property_set(copy, "hidden", hidden as u64);
+    if let Some(color) = shown.background {
+        property_set_object(copy, "backgroundColor", crate::fw::graphics::make_color(color));
+    }
+    copy
+}
+
+extern "C" fn layer_model(this: Id, _: Sel) -> Id {
+    this
 }
 
 extern "C" fn layer_sublayers(this: Id, _: Sel) -> Id {
@@ -498,7 +771,12 @@ extern "C" fn layer_replace_sublayer(this: Id, _: Sel, old: Id, new: Id) {
     runtime::send(old, "release", &[]);
 }
 
+/// A view's layer leaves its superview's layer too: the view leaves its
+/// superview (UIKit's superview is its layer's superlayer's delegate).
 extern "C" fn layer_remove_from_superlayer(this: Id, _: Sel) {
+    if let view @ 1.. = view_of(this) {
+        crate::fw::uikit::detach(view);
+    }
     if read(this, |s| s.superlayer) != 0 {
         detach(this);
         runtime::send(this, "release", &[]);
@@ -516,10 +794,12 @@ extern "C" fn layer_opacity(this: Id, _: Sel) -> f32 {
 
 extern "C" fn layer_set_opacity(this: Id, _: Sel, value: f32) {
     let value = (value as f64).clamp(0.0, 1.0);
+    let action = begin_change(this, "opacity");
     match view_of(this) {
         0 => property_set(this, "opacity", value.to_bits()),
         view => property_set(view, "alpha", value.to_bits()),
     }
+    end_change(this, "opacity", action);
 }
 
 extern "C" fn layer_hidden(this: Id, _: Sel) -> bool {
@@ -547,10 +827,12 @@ extern "C" fn layer_background(this: Id, _: Sel) -> Id {
 }
 
 extern "C" fn layer_set_background(this: Id, _: Sel, color: Id) {
+    let action = begin_change(this, "backgroundColor");
     match view_of(this) {
         0 => property_set_object(this, "backgroundColor", color),
         view => property_set_object(view, "background", color),
     }
+    end_change(this, "backgroundColor", action);
 }
 
 extern "C" fn layer_masks(this: Id, _: Sel) -> bool {
@@ -575,12 +857,67 @@ crate::fw::uikit::property!(layer_border_width, layer_set_border_width, "borderW
 crate::fw::uikit::property!(layer_border_color, layer_set_border_color, "borderColor", id, 0);
 crate::fw::uikit::property!(layer_shadow_radius, layer_set_shadow_radius, "shadowRadius", f64, 3.0);
 crate::fw::uikit::property!(layer_shadow_color, layer_set_shadow_color, "shadowColor", id, 0);
-crate::fw::uikit::property!(layer_shadow_path, layer_set_shadow_path, "shadowPath", id, 0);
+crate::fw::uikit::property!(layer_shadow_path, layer_store_shadow_path, "shadowPath", id, 0);
+
+extern "C" fn layer_set_shadow_path(this: Id, sel: Sel, path: Id) {
+    hold_path(this, "shadowPath", path);
+    layer_store_shadow_path(this, sel, path);
+}
+
+/// The layers drawing each CGPath (a shape layer's path, a shadow path) and
+/// under which key: the game may edit a path it installed in place, which
+/// changes those layers (fw/graphics/shapes.rs marks them).
+static PATH_HOLDERS: Mutex<Option<HashMap<Id, Vec<(Id, &'static str)>>>> = Mutex::new(None);
+
+/// `layer` draws `path` under `key` from now on (instead of what it held).
+fn hold_path(layer: Id, key: &'static str, path: Id) {
+    let old = property_get(layer, key).unwrap_or(0) as Id;
+    let mut holders = PATH_HOLDERS.lock().unwrap_or_else(|e| e.into_inner());
+    let holders = holders.get_or_insert_with(HashMap::new);
+    if let Some(list) = holders.get_mut(&old) {
+        list.retain(|&held| held != (layer, key));
+        if list.is_empty() {
+            holders.remove(&old);
+        }
+    }
+    if path != 0 {
+        holders.entry(path).or_default().push((layer, key));
+    }
+}
+
+/// The layers drawing `path` (none for a path only used while drawing).
+pub fn path_holders(path: Id) -> Vec<Id> {
+    PATH_HOLDERS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|h| h.get(&path)).map_or_else(Vec::new, |list| list.iter().map(|&(layer, _)| layer).collect())
+}
 crate::fw::uikit::property!(layer_rasterizes, layer_set_rasterizes, "shouldRasterize", bool, false);
 crate::fw::uikit::property!(layer_rasterization_scale, layer_set_rasterization_scale, "rasterizationScale", f64, 1.0);
-crate::fw::uikit::property!(layer_mask, layer_set_mask, "mask", id, 0);
-crate::fw::uikit::property!(layer_contents, layer_set_contents, "contents", id, 0);
-crate::fw::uikit::property!(layer_contents_gravity, layer_set_contents_gravity, "contentsGravity", id, 0);
+
+/// Which layer a mask layer belongs to (set when a layer takes it as its
+/// `mask`); pictures.rs climbs this to the owner when a mask changes.
+static MASK_OWNERS: Mutex<Option<HashMap<Id, Id>>> = Mutex::new(None);
+
+extern "C" fn layer_set_mask(this: Id, _: Sel, mask: Id) {
+    crate::fw::uikit::property_set_object(this, "mask", mask);
+    if mask != 0 {
+        MASK_OWNERS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(mask, this);
+    }
+}
+
+extern "C" fn layer_mask(this: Id, _: Sel) -> Id {
+    crate::fw::uikit::property_get(this, "mask").unwrap_or(0) as Id
+}
+
+/// The layer whose `mask` this is (0 for none known).
+pub fn mask_owner(mask: Id) -> Id {
+    MASK_OWNERS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&mask)).copied().unwrap_or(0)
+}
+
+/// Whether the layer has state of its own (a game layer, not just a view's).
+pub fn has_state(layer: Id) -> bool {
+    LAYERS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|m| m.contains_key(&layer))
+}
+
+crate::fw::uikit::property!(layer_contents, layer_set_contents, "contents", id, 0);crate::fw::uikit::property!(layer_contents_gravity, layer_set_contents_gravity, "contentsGravity", id, 0);
 crate::fw::uikit::property!(layer_contents_scale, layer_set_contents_scale, "contentsScale", f64, 1.0);
 crate::fw::uikit::property!(layer_geometry_flipped, layer_set_geometry_flipped, "geometryFlipped", bool, false);
 
@@ -660,6 +997,16 @@ pub fn contents_scale(layer: Id) -> f64 {
     layer_contents_scale(layer, 0)
 }
 
+/// Whether the layer shows when turned away from the viewer.
+pub fn double_sided(layer: Id) -> bool {
+    layer_double_sided(layer, 0)
+}
+
+/// Whether it is drawn as one picture (so its opacity is the group's).
+pub fn rasterizes(layer: Id) -> bool {
+    layer_rasterizes(layer, 0)
+}
+
 /// How a layer's edge and shadow look (Core Animation's defaults until set).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Looks {
@@ -688,12 +1035,28 @@ pub fn looks(layer: Id) -> Looks {
     Looks { corner_radius: layer_corner_radius(layer, 0).max(0.0), border, shadow, mask: layer_mask(layer, 0) }
 }
 
-/// A shape layer's path, fill and stroke colours (nil for none), line width
-/// and whether it fills even-odd.
-pub fn shape_look(layer: Id) -> (Id, Id, Id, f64, bool) {
+/// A shape layer's path, fill and stroke colours (nil for none) and whether
+/// it fills even-odd (its line: `shape_line`).
+pub fn shape_look(layer: Id) -> (Id, Id, Id, bool) {
     let rule = shape_fill_rule(layer, 0);
     let even_odd = rule != 0 && string::get(rule) == "even-odd";
-    (shape_path(layer, 0), shape_fill(layer), shape_stroke_color(layer, 0), shape_line_width(layer, 0), even_odd)
+    (shape_path(layer, 0), shape_fill(layer), shape_stroke_color(layer, 0), even_odd)
+}
+
+/// How a shape layer strokes: lineWidth, lineCap, lineJoin, miterLimit,
+/// lineDashPhase and lineDashPattern, as -[CAShapeLayer
+/// _renderForegroundInContext:] sets them on the context.
+pub fn shape_line(layer: Id) -> crate::fw::graphics::StrokeStyle {
+    let named = |value: Id, names: [&str; 3]| if value == 0 { 0 } else { names.iter().position(|&n| n == string::get(value)).unwrap_or(0) as i32 };
+    let pattern = shape_dash(layer, 0);
+    let lengths: Vec<f64> = if pattern == 0 { Vec::new() } else { collections::array_items(pattern).into_iter().map(number_value).collect() };
+    crate::fw::graphics::StrokeStyle {
+        width: shape_line_width(layer, 0),
+        cap: named(shape_line_cap(layer, 0), ["butt", "round", "square"]),
+        join: named(shape_line_join(layer, 0), ["miter", "round", "bevel"]),
+        miter_limit: shape_miter(layer, 0),
+        dash: (!lengths.is_empty()).then(|| (shape_dash_phase(layer, 0), lengths)),
+    }
 }
 
 // ----- time (CAMediaTiming) -----
@@ -780,7 +1143,13 @@ extern "C" fn layer_render_in_context(this: Id, _: Sel, context: Id) {
     crate::fw::graphics::render_layer(context, this);
 }
 
-extern "C" fn layer_draw_in_context(_this: Id, _: Sel, _context: Id) {}
+/// CALayer's own -drawInContext: asks its delegate (-drawLayer:inContext:).
+extern "C" fn layer_draw_in_context(this: Id, _: Sel, context: Id) {
+    let delegate = property_get(this, "delegate").unwrap_or(0) as Id;
+    if delegate != 0 && runtime::responds(delegate, "drawLayer:inContext:") {
+        runtime::send(delegate, "drawLayer:inContext:", &[this, context]);
+    }
+}
 
 // ----- key-value coding -----
 
@@ -958,6 +1327,7 @@ const LAYER_KEYS: &[(&str, Kind)] = &[
     ("lineWidth", Kind::Double),
     ("strokeStart", Kind::Double),
     ("strokeEnd", Kind::Double),
+    ("lineDashPhase", Kind::Double),
 ];
 
 extern "C" fn layer_value_for_key(this: Id, _: Sel, key: Id) -> Id {
@@ -974,8 +1344,8 @@ extern "C" fn layer_class_layer(class: Class, _: Sel) -> Id {
 
 // ----- CAGradientLayer -----
 
-crate::fw::uikit::property!(gradient_colors, gradient_set_colors, "colors", id, 0);
-crate::fw::uikit::property!(gradient_locations, gradient_set_locations, "locations", id, 0);
+crate::fw::uikit::property!(gradient_colors, gradient_set_colors, "colors", copy, 0);
+crate::fw::uikit::property!(gradient_locations, gradient_set_locations, "locations", copy, 0);
 crate::fw::uikit::property!(gradient_type, gradient_set_type, "gradientType", id, 0);
 
 extern "C" fn gradient_start(this: Id, _: Sel) -> Point {
@@ -1032,13 +1402,14 @@ extern "C" fn replicator_set_transform(this: Id, _: Sel, t: Transform3D) {
     with(this, |s| s.instance_transform = t);
 }
 
-/// How many copies of its sublayers a replicator shows (1 for other layers)
-/// and the transform from one copy to the next.
-pub fn replication(layer: Id) -> (usize, Transform3D) {
+/// How many copies of its sublayers a replicator shows (1 for other layers),
+/// the transform from one copy to the next, and how far behind in time each
+/// copy runs the one before (instanceDelay).
+pub fn replication(layer: Id) -> (usize, Transform3D, f64) {
     if !is_kind(layer, "CAReplicatorLayer") {
-        return (1, IDENTITY_3D);
+        return (1, IDENTITY_3D, 0.0);
     }
-    (replicator_count(layer, 0).clamp(0, 1024) as usize, read(layer, |s| s.instance_transform))
+    (replicator_count(layer, 0).clamp(0, 1024) as usize, read(layer, |s| s.instance_transform), replicator_delay(layer, 0))
 }
 
 macro_rules! float_property {
@@ -1058,14 +1429,21 @@ float_property!(replicator_alpha, replicator_set_alpha, "instanceAlphaOffset", 0
 
 // ----- CAShapeLayer -----
 
-crate::fw::uikit::property!(shape_path, shape_set_path, "path", id, 0);
+crate::fw::uikit::property!(shape_path, shape_store_path, "path", id, 0);
+
+extern "C" fn shape_set_path(this: Id, sel: Sel, path: Id) {
+    hold_path(this, "path", path);
+    shape_store_path(this, sel, path);
+}
 crate::fw::uikit::property!(shape_stroke_color, shape_set_stroke_color, "strokeColor", id, 0);
 crate::fw::uikit::property!(shape_line_width, shape_set_line_width, "lineWidth", f64, 1.0);
 crate::fw::uikit::property!(shape_stroke_start, shape_set_stroke_start, "strokeStart", f64, 0.0);
 crate::fw::uikit::property!(shape_stroke_end, shape_set_stroke_end, "strokeEnd", f64, 1.0);
 crate::fw::uikit::property!(shape_line_cap, shape_set_line_cap, "lineCap", id, 0);
 crate::fw::uikit::property!(shape_line_join, shape_set_line_join, "lineJoin", id, 0);
-crate::fw::uikit::property!(shape_dash, shape_set_dash, "lineDashPattern", id, 0);
+// Copied (Core Animation's is `copy`): the game editing its array later marks nothing.
+crate::fw::uikit::property!(shape_dash, shape_set_dash, "lineDashPattern", copy, 0);
+crate::fw::uikit::property!(shape_dash_phase, shape_set_dash_phase, "lineDashPhase", f64, 0.0);
 crate::fw::uikit::property!(shape_fill_rule, shape_set_fill_rule, "fillRule", id, 0);
 crate::fw::uikit::property!(shape_miter, shape_set_miter, "miterLimit", f64, 10.0);
 
@@ -1087,10 +1465,17 @@ extern "C" fn shape_set_fill_color(this: Id, _: Sel, color: Id) {
 
 pub fn register() {
     let layer = runtime::class_named("CALayer");
-    class_methods(layer, &[("layer", layer_class_layer as usize)]);
+    class_methods(layer, &[("layer", layer_class_layer as usize), ("defaultActionForKey:", layer_default_action as usize)]);
     methods(
         layer,
         &[
+            ("actionForKey:", layer_action_for_key as usize),
+            ("actions", layer_actions as usize),
+            ("setActions:", layer_set_actions as usize),
+            ("style", layer_style as usize),
+            ("setStyle:", layer_set_style as usize),
+            ("presentationLayer", layer_presentation as usize),
+            ("modelLayer", layer_model as usize),
             ("bounds", layer_bounds as usize),
             ("setBounds:", layer_set_bounds as usize),
             ("position", layer_position as usize),
@@ -1103,6 +1488,8 @@ pub fn register() {
             ("setZPosition:", layer_set_z as usize),
             ("transform", layer_transform as usize),
             ("setTransform:", layer_set_transform as usize),
+            ("sublayerTransform", layer_sublayer_transform as usize),
+            ("setSublayerTransform:", layer_set_sublayer_transform as usize),
             ("affineTransform", layer_affine_transform as usize),
             ("setAffineTransform:", layer_set_affine_transform as usize),
             ("visibleRect", layer_visible_rect as usize),
@@ -1243,6 +1630,8 @@ pub fn register() {
             ("setLineJoin:", shape_set_line_join as usize),
             ("lineDashPattern", shape_dash as usize),
             ("setLineDashPattern:", shape_set_dash as usize),
+            ("lineDashPhase", shape_dash_phase as usize),
+            ("setLineDashPhase:", shape_set_dash_phase as usize),
             ("fillRule", shape_fill_rule as usize),
             ("setFillRule:", shape_set_fill_rule as usize),
             ("miterLimit", shape_miter as usize),
@@ -1359,6 +1748,144 @@ mod tests {
         // A view's layer opacity is its alpha.
         layer_set_opacity(layer, 0, 0.25);
         assert_eq!(property_get(view, "alpha").map(f64::from_bits), Some(0.25));
+    }
+
+    /// A view's layer's transform and opacity changed inside a UIView
+    /// animation block animate, as UIView's actionForLayer:forKey: makes
+    /// them (SpellCraft's card reveal); its full 3D transform is kept.
+    #[test]
+    fn a_views_layer_changes_animate_in_view_blocks_and_keep_3d() {
+        setup();
+        let view = new_view(Rect::new(0.0, 0.0, 100.0, 100.0));
+        let layer = runtime::send(view, "layer", &[]);
+        let ui_view = runtime::class_named("UIView");
+        runtime::send(ui_view, "beginAnimations:context:", &[0, 0]);
+        send_struct(ui_view, "setAnimationDuration:", 0.5f64);
+        let mut scaled = IDENTITY_3D;
+        (scaled.0[0], scaled.0[5]) = (2.0, 2.0);
+        send_struct(layer, "setTransform:", scaled);
+        send_struct(layer, "setOpacity:", 0.5f32);
+        runtime::send(ui_view, "commitAnimations", &[]);
+        let turn = runtime::send(layer, "animationForKey:", &[string::make("transform")]);
+        let fade = runtime::send(layer, "animationForKey:", &[string::make("opacity")]);
+        assert!(turn != 0 && fade != 0, "both animate");
+        assert_eq!(unboxed::<Transform3D>(runtime::send(turn, "fromValue", &[]), "CATransform3DValue"), Some(IDENTITY_3D));
+        runtime::send(layer, "removeAllAnimations", &[]);
+        // Perspective (m34) stays on a view's layer.
+        let mut card = IDENTITY_3D;
+        card.0[11] = -0.0005;
+        send_struct(layer, "setTransform:", card);
+        assert_eq!(transform(layer).0[11], -0.0005);
+    }
+
+    /// A view's layer added to another layer leaves its old superview (UIKit's
+    /// subviews are its layer's sublayers) and is drawn there as a view.
+    #[test]
+    fn a_views_layer_moved_to_another_layer_leaves_its_superview() {
+        setup();
+        let (parent, child) = (new_view(Rect::new(0.0, 0.0, 100.0, 100.0)), new_view(Rect::new(0.0, 0.0, 10.0, 10.0)));
+        runtime::send(parent, "addSubview:", &[child]);
+        let own = layer_class_layer(runtime::class_named("CALayer"), 0);
+        let child_layer = runtime::send(child, "layer", &[]);
+        layer_add_sublayer(own, 0, child_layer);
+        assert!(!view_state(parent).subviews.contains(&child));
+        assert_eq!(layer_superlayer(child_layer, 0), own);
+        assert_eq!(children(own), [Child::View(child)]);
+    }
+
+    /// A layer of its own animates a change implicitly (0.25 s, from the old
+    /// value) once it has been committed, unless actions are disabled; a
+    /// view's layer doesn't outside an animation block.
+    #[test]
+    fn layers_of_their_own_animate_changes_implicitly() {
+        setup();
+        let transaction = runtime::class_named("CATransaction");
+        let layer = layer_class_layer(runtime::class_named("CALayer"), 0);
+        let opacity = string::make("opacity");
+        send_struct(layer, "setOpacity:", 1.0f32);
+        assert_eq!(runtime::send(layer, "animationForKey:", &[opacity]), 0, "a new layer doesn't animate");
+        crate::fw::animation::commit();
+        send_struct(layer, "setOpacity:", 0.5f32);
+        let fade = runtime::send(layer, "animationForKey:", &[opacity]);
+        assert!(fade != 0, "a committed layer does");
+        assert_eq!(number_value(runtime::send(fade, "fromValue", &[])), 1.0);
+        runtime::send(layer, "removeAllAnimations", &[]);
+        runtime::send(transaction, "begin", &[]);
+        runtime::send(transaction, "setDisableActions:", &[1]);
+        send_struct(layer, "setOpacity:", 0.2f32);
+        runtime::send(transaction, "commit", &[]);
+        assert_eq!(runtime::send(layer, "animationForKey:", &[opacity]), 0, "actions disabled");
+        let view_layer = runtime::send(new_view(Rect::new(0.0, 0.0, 10.0, 10.0)), "layer", &[]);
+        send_struct(view_layer, "setOpacity:", 0.5f32);
+        assert_eq!(runtime::send(view_layer, "animationForKey:", &[opacity]), 0);
+    }
+
+    /// A view's new transform replaces its layer's whole transform, even when
+    /// its 2D part is the same (a perspective set on the layer goes).
+    #[test]
+    fn a_views_transform_replaces_its_layers_3d_one() {
+        setup();
+        let view = new_view(Rect::new(0.0, 0.0, 10.0, 10.0));
+        let layer = runtime::send(view, "layer", &[]);
+        let mut perspective = IDENTITY_3D;
+        perspective.0[11] = -0.002;
+        send_struct(layer, "setTransform:", perspective);
+        send_struct(view, "setTransform:", crate::fw::geometry::IDENTITY);
+        assert_eq!(transform(layer), IDENTITY_3D);
+    }
+
+    /// removeFromSuperlayer on a view's layer takes the view out of its
+    /// superview too (UIKit's superview is its layer's superlayer's delegate).
+    #[test]
+    fn a_views_layer_removed_from_its_superlayer_leaves_the_superview() {
+        setup();
+        let (parent, child) = (new_view(Rect::new(0.0, 0.0, 100.0, 100.0)), new_view(Rect::new(0.0, 0.0, 10.0, 10.0)));
+        runtime::send(parent, "addSubview:", &[child]);
+        let child_layer = runtime::send(child, "layer", &[]);
+        runtime::send(child_layer, "removeFromSuperlayer", &[]);
+        assert!(!view_state(parent).subviews.contains(&child));
+        assert_eq!((view_state(child).superview, layer_superlayer(child_layer, 0)), (0, 0));
+    }
+
+    /// setFrame: on a committed layer of its own eases its size along with its
+    /// place (Apple's implicit action covers bounds too): the size doesn't jump.
+    #[test]
+    fn a_layers_new_frame_eases_its_size_too() {
+        setup();
+        let layer = layer_class_layer(runtime::class_named("CALayer"), 0);
+        layer_set_frame(layer, 0, Rect::new(0.0, 0.0, 100.0, 10.0));
+        crate::fw::animation::commit();
+        // A long implicit animation, so a loaded machine can't get past its
+        // first pixels before the check below.
+        send_struct(runtime::class_named("CATransaction"), "setAnimationDuration:", 10.0f64);
+        send_struct(layer, "setFrame:", Rect::new(0.0, 0.0, 200.0, 10.0));
+        assert!(runtime::send(layer, "animationForKey:", &[string::make("bounds")]) != 0, "the size animates");
+        let shown = runtime::send(layer, "presentationLayer", &[]);
+        let width = unboxed::<Rect>(shown, "bounds").unwrap().size.width;
+        // Near the old size (a busy test run may already be a few
+        // milliseconds into the 0.25 s ease), far from the new one.
+        assert!(width < 150.0, "the old size shows at first: {width}");
+        runtime::send(layer, "removeAllAnimations", &[]);
+    }
+
+    /// presentationLayer: a copy with what shows now (animations included);
+    /// modelLayer: the layer itself.
+    #[test]
+    fn presentation_layers_show_animated_values() {
+        setup();
+        let layer = layer_class_layer(runtime::class_named("CALayer"), 0);
+        assert!(runtime::responds(layer, "presentationLayer") && runtime::responds(layer, "modelLayer"));
+        let slide = runtime::send(runtime::class_named("CABasicAnimation"), "animationWithKeyPath:", &[string::make("position")]);
+        runtime::send(slide, "setFromValue:", &[boxed("valueWithCGPoint:", Point { x: 40.0, y: 40.0 })]);
+        runtime::send(slide, "setToValue:", &[boxed("valueWithCGPoint:", Point { x: 40.0, y: 40.0 })]);
+        send_struct(slide, "setDuration:", 100.0f64);
+        runtime::send(layer, "addAnimation:forKey:", &[slide, 0]);
+        let shown = runtime::send(layer, "presentationLayer", &[]);
+        assert!(shown != 0 && shown != layer);
+        assert_eq!(call_point(shown, "position"), Point { x: 40.0, y: 40.0 });
+        assert_eq!(call_point(layer, "position"), Point::default());
+        assert_eq!(runtime::send(layer, "modelLayer", &[]), layer);
+        runtime::send(layer, "removeAllAnimations", &[]);
     }
 
     /// Layer time: a stopped layer (speed 0) keeps its timeOffset, which

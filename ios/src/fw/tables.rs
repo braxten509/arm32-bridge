@@ -82,11 +82,38 @@ extern "C" fn table_register_nib(this: Id, _: Sel, nib: Id, identifier: Id) {
     }
 }
 
-/// A new cell for `identifier`: from its nib or its registered class
-/// (nothing is ever waiting for reuse here), or nil, as UIKit gives when
-/// neither is registered (the game then makes its own).
+/// Cells whose rows scrolled out of sight (or were reloaded), per table and
+/// reuse identifier, waiting to be dequeued again.
+static REUSE: Mutex<Option<HashMap<(Id, String), Vec<Id>>>> = Mutex::new(None);
+
+/// A cell leaves the table and waits for reuse under its reuse identifier.
+fn put_aside(table: Id, cell: Id) {
+    let identifier = get_id(cell, "reuseIdentifier");
+    // The reuse queue holds it (as UIKit's), before its superview lets go.
+    if identifier != 0 {
+        crate::fw::counted::retain(cell);
+    }
+    runtime::send(cell, "removeFromSuperview", &[]);
+    if identifier == 0 {
+        return;
+    }
+    REUSE.lock().unwrap().get_or_insert_with(HashMap::new).entry((table, string::get(identifier))).or_default().push(cell);
+}
+
+/// A cell for `identifier`: one waiting for reuse (told -prepareForReuse),
+/// else a new one from its nib or its registered class, or nil, as UIKit
+/// gives when neither is registered (the game then makes its own).
 fn make_cell(table: Id, identifier: Id) -> Id {
     let name = if identifier == 0 { String::new() } else { string::get(identifier) };
+    let waiting = REUSE.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(table, name.clone()))).and_then(|list| list.pop());
+    if let Some(cell) = waiting {
+        // Out of the queue, handed back autoreleased (+0), as UIKit's.
+        crate::fw::counted::autorelease(cell);
+        if runtime::responds(cell, "prepareForReuse") {
+            runtime::send(cell, "prepareForReuse", &[]);
+        }
+        return cell;
+    }
     match cell_from_nib(table, &name) {
         0 => match controls::registered_class(table, &format!("cell:{name}")) {
             Some(class) => runtime::send(runtime::send(class, "alloc", &[]), "initWithStyle:reuseIdentifier:", &[0, identifier]),
@@ -131,15 +158,21 @@ fn row_height(table: Id, path: Id) -> f64 {
         .unwrap_or_else(|| property_get(table, "rowHeight").map_or(44.0, f64::from_bits))
 }
 
-/// Asks the data source for every row and puts its cells in the table, one
-/// under the other (after the header view, before the footer view); the
-/// table's content is as tall as they are.
+/// Each table's rows: index path, top and height (content points), top to bottom.
+static PLACES: Mutex<Option<HashMap<Id, Vec<(Id, f64, f64)>>>> = Mutex::new(None);
+
+/// Asks the delegate every row's height first (UIKit's row data), placing
+/// the rows one under the other after the header view, the footer view
+/// after them; the table's content is as tall as they are. Then the rows
+/// on show get their cells (`show_rows`); the cells shown before wait for reuse.
 pub fn load_rows(table: Id) {
     let source = get_id(table, "dataSource");
     for (cell, _) in rows_of(table) {
-        runtime::send(cell, "removeFromSuperview", &[]);
+        put_aside(table, cell);
     }
     ROWS.lock().unwrap().get_or_insert_with(HashMap::new).remove(&table);
+    PLACES.lock().unwrap().get_or_insert_with(HashMap::new).remove(&table);
+    property_set(table, "needsReload", 0);
     if source == 0 {
         return;
     }
@@ -153,28 +186,17 @@ pub fn load_rows(table: Id) {
         runtime::send(table, "addSubview:", &[header]);
         y += height;
     }
-    let delegate = get_id(table, "delegate");
-    let selection = controls::selected(table);
-    let mut shown = Vec::new();
+    let mut places = Vec::new();
     for section in 0..section_count(table) {
         for row in 0..row_count(table, section) {
             let path = runtime::send(runtime::class_named("NSIndexPath"), "indexPathForRow:inSection:", &[row, section]);
             crate::fw::counted::retain(path);
-            let cell = runtime::send(source, "tableView:cellForRowAtIndexPath:", &[table, path]);
-            if cell == 0 {
-                continue;
-            }
             let height = row_height(table, path);
-            set_frame(cell, Rect::new(0.0, y, width, height));
-            layout_cell(cell);
-            set_cell_selected(cell, selection.iter().any(|&p| controls::same_path(p, path)));
-            tell(delegate, "tableView:willDisplayCell:forRowAtIndexPath:", &[table, cell, path]);
-            runtime::send(table, "addSubview:", &[cell]);
-            shown.push((cell, path));
+            places.push((path, y, height));
             y += height;
         }
     }
-    ROWS.lock().unwrap().get_or_insert_with(HashMap::new).insert(table, shown);
+    PLACES.lock().unwrap().get_or_insert_with(HashMap::new).insert(table, places);
     let footer = get_id(table, "tableFooterView");
     if footer != 0 {
         let height = frame_of(footer).size.height;
@@ -184,18 +206,82 @@ pub fn load_rows(table: Id) {
     }
     property_set(table, "contentSize.w", width.to_bits());
     property_set(table, "contentSize.h", y.to_bits());
+    show_rows(table);
 }
 
-/// A table drawn for the first time asks for its rows (UIKit does at its first layout).
-pub fn ensure_rows(table: Id) {
-    if !flag(table, "rowsLoaded", false) && get_id(table, "dataSource") != 0 {
+/// The rows inside the table's bounds have cells (asked of the data source
+/// as they come into view); cells of rows that left it wait for reuse.
+fn show_rows(table: Id) {
+    let source = get_id(table, "dataSource");
+    let places = PLACES.lock().unwrap().as_ref().and_then(|m| m.get(&table).cloned()).unwrap_or_default();
+    let state = view_state(table);
+    let (top, bottom) = (state.bounds_origin.y, state.bounds_origin.y + state.frame.size.height);
+    let width = state.frame.size.width;
+    let delegate = get_id(table, "delegate");
+    // The rows inside the bounds, worked out once (a big table has many rows).
+    let visible: Vec<(Id, f64, f64)> = places.iter().copied().filter(|&(_, y, height)| y + height > top && y < bottom).collect();
+    // Rows that left the bounds give their cells back first, so the rows
+    // coming in can reuse them.
+    let mut old = Vec::new();
+    for (cell, path) in rows_of(table) {
+        if visible.iter().any(|&(p, _, _)| p == path) {
+            old.push((cell, path));
+        } else {
+            put_aside(table, cell);
+            tell(delegate, "tableView:didEndDisplayingCell:forRowAtIndexPath:", &[table, cell, path]);
+        }
+    }
+    let selection = controls::selected(table);
+    let mut shown = Vec::new();
+    for &(path, y, height) in &visible {
+        if let Some(&(cell, _)) = old.iter().find(|&&(_, p)| p == path) {
+            shown.push((cell, path));
+            continue;
+        }
+        if source == 0 {
+            continue;
+        }
+        let cell = runtime::send(source, "tableView:cellForRowAtIndexPath:", &[table, path]);
+        if cell == 0 {
+            continue;
+        }
+        set_frame(cell, Rect::new(0.0, y, width, height));
+        layout_cell(cell);
+        set_cell_selected(cell, selection.iter().any(|&p| controls::same_path(p, path)));
+        tell(delegate, "tableView:willDisplayCell:forRowAtIndexPath:", &[table, cell, path]);
+        runtime::send(table, "addSubview:", &[cell]);
+        shown.push((cell, path));
+    }
+    ROWS.lock().unwrap().get_or_insert_with(HashMap::new).insert(table, shown);
+}
+
+/// The rows are made now if they are due (a table asked about its cells
+/// before its next layout, as UIKit's -_updateVisibleCellsNow does).
+/// Whether they were made.
+pub fn ensure_rows(table: Id) -> bool {
+    let due = (!flag(table, "rowsLoaded", false) || flag(table, "needsReload", false)) && get_id(table, "dataSource") != 0;
+    if due {
         load_rows(table);
     }
+    due
 }
 
+/// UITableView's -reloadData: the rows are made again at the next layout
+/// (or when the game asks for cells first).
 extern "C" fn table_reload(this: Id, _: Sel) {
     controls::clear_selection(this);
-    load_rows(this);
+    property_set(this, "needsReload", 1);
+    runtime::send(this, "setNeedsLayout", &[]);
+}
+
+/// A table lays itself out: rows due are made, and as it scrolls the rows
+/// coming into view get cells.
+extern "C" fn table_layout_subviews(this: Id, _: Sel) {
+    if (!flag(this, "rowsLoaded", false) || flag(this, "needsReload", false)) && get_id(this, "dataSource") != 0 {
+        load_rows(this);
+    } else {
+        show_rows(this);
+    }
 }
 
 extern "C" fn table_set_data_source(this: Id, _: Sel, source: Id) {
@@ -204,19 +290,23 @@ extern "C" fn table_set_data_source(this: Id, _: Sel, source: Id) {
 }
 
 extern "C" fn table_cell_for_path(this: Id, _: Sel, path: Id) -> Id {
+    ensure_rows(this);
     rows_of(this).into_iter().find(|&(_, p)| controls::same_path(p, path)).map_or(0, |(cell, _)| cell)
 }
 
 extern "C" fn table_path_for_cell(this: Id, _: Sel, cell: Id) -> Id {
+    ensure_rows(this);
     rows_of(this).into_iter().find(|&(c, _)| c == cell).map_or(0, |(_, path)| path)
 }
 
 extern "C" fn table_visible_cells(this: Id, _: Sel) -> Id {
+    ensure_rows(this);
     let cells: Vec<Id> = rows_of(this).into_iter().map(|(cell, _)| cell).collect();
     collections::array_from(&cells)
 }
 
 extern "C" fn table_visible_paths(this: Id, _: Sel) -> Id {
+    ensure_rows(this);
     let paths: Vec<Id> = rows_of(this).into_iter().map(|(_, path)| path).collect();
     collections::array_from(&paths)
 }
@@ -469,6 +559,7 @@ pub fn register(_: &mut Registry) {
             ("dequeueReusableCellWithIdentifier:", table_dequeue as usize),
             ("dequeueReusableCellWithIdentifier:forIndexPath:", table_dequeue_for_path as usize),
             ("reloadData", table_reload as usize),
+            ("layoutSubviews", table_layout_subviews as usize),
             ("setDataSource:", table_set_data_source as usize),
             ("cellForRowAtIndexPath:", table_cell_for_path as usize),
             ("indexPathForCell:", table_path_for_cell as usize),

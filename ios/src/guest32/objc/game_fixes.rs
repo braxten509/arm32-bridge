@@ -4,7 +4,7 @@
 use super::bridge::{Bridge, GuestSide};
 use super::functions::Ctx;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 
 /// Whether `-[class name]` is followed by a fix (the class name only made
@@ -13,6 +13,9 @@ pub(super) fn follows(name: &str, class: impl FnOnce() -> String) -> bool {
     match name {
         "dialogViewDidClose:" => class() == "SCAlertController",
         "beginStageInteraction" => class() == "SCTutorialController",
+        "willMoveToWindow:" => class() == "AELiveBarView",
+        "refreshContent" => class() == "SCStoreSectionView",
+        "runAction:" => DUNGEON_PLUNDER.load(Ordering::Relaxed) && class() == "CCTMXTiledMap",
         _ => false,
     }
 }
@@ -27,8 +30,147 @@ pub(super) fn after_message(bridge: &Mutex<Bridge>, g: &dyn GuestSide, receiver:
     match name.as_str() {
         "SCAlertController" => after_dialog_closed(bridge, g, receiver, first),
         "SCTutorialController" => after_stage_interaction(bridge, g, receiver),
+        "AELiveBarView" => hide_news_bar(bridge, g, receiver, first),
+        "SCStoreSectionView" => hide_paid_items(bridge, g, receiver),
+        "CCTMXTiledMap" => after_map_move(bridge, g, receiver, first),
         _ => Ok(()),
     }
+}
+
+/// SpellCraft (owner asked): its news bar, AELiveBarView at the bottom of
+/// the screen, shows news from the game's server, which is gone, so it only
+/// ever says "Offline". It is hidden as it joins a window (`window` not nil;
+/// the bar's own code never shows or hides itself), which also keeps
+/// touches from it; its manager still hears of it as before.
+fn hide_news_bar(bridge: &Mutex<Bridge>, g: &dyn GuestSide, bar: u32, window: u32) -> Result<(), String> {
+    if window != 0 {
+        Ctx { bridge, g }.send(bar, "setHidden:", &[1])?;
+    }
+    Ok(())
+}
+
+/// The shop list `items` without the real-money ones (`paid`), or None when
+/// there are none to take out.
+fn without_paid(items: &[u32], paid: impl Fn(u32) -> Result<bool, String>) -> Result<Option<Vec<u32>>, String> {
+    let mut kept = Vec::with_capacity(items.len());
+    for &item in items {
+        if !paid(item)? {
+            kept.push(item);
+        }
+    }
+    Ok((kept.len() != items.len()).then_some(kept))
+}
+
+/// SpellCraft (owner asked): real-money items (the game's AEStoreKitItem,
+/// gem packs) can't be bought here, so they leave the shop: after
+/// -[SCStoreSectionView refreshContent] made its list (sectionContent), the
+/// list without them takes its place and the shop's scroll list is
+/// refreshed through the game's own methods.
+fn hide_paid_items(bridge: &Mutex<Bridge>, g: &dyn GuestSide, shop: u32) -> Result<(), String> {
+    let Some(paid_class) = bridge.lock().unwrap_or_else(|e| e.into_inner()).classes.class_named("AEStoreKitItem").map(|c| c.address) else {
+        return Ok(());
+    };
+    let c = Ctx { bridge, g };
+    let content = c.send(shop, "sectionContent", &[])?;
+    let items = (0..c.send(content, "count", &[])?).map(|i| c.send(content, "objectAtIndex:", &[i])).collect::<Result<Vec<_>, _>>()?;
+    let Some(kept) = without_paid(&items, |item| Ok(c.send(item, "isKindOfClass:", &[paid_class])? & 0xff != 0))? else {
+        return Ok(());
+    };
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        crate::log!("SpellCraft: real-money items left out of the shop ({} of {})", items.len() - kept.len(), items.len());
+    }
+    let list = c.send(content, "mutableCopy", &[])?;
+    for &item in items.iter().filter(|item| !kept.contains(item)) {
+        c.send(list, "removeObject:", &[item])?;
+    }
+    c.send(shop, "setSectionContent:", &[list])?;
+    c.send(list, "release", &[])?;
+    c.send(c.send(shop, "scrollview", &[])?, "refreshContent", &[])?;
+    Ok(())
+}
+
+/// A cocos2d interval action (CCMoveTo), through the game's own methods.
+pub trait TileMove {
+    fn step(&mut self, dt: f32) -> Result<(), String>;
+    fn elapsed(&self) -> Result<f32, String>;
+    fn duration(&self) -> Result<f32, String>;
+    fn is_done(&self) -> Result<bool, String>;
+}
+
+/// The next tile's move, just started, goes on from the last as one motion:
+/// its first tick (which only stands still) is used up now, and it is moved
+/// on by the time the last one ran past its end (cocos2d keeps a move at its
+/// end and drops that time). Not after a move that was stopped part way.
+pub fn walk_on<M: TileMove>(next: &mut M, last: Option<&M>) -> Result<(), String> {
+    next.step(0.0)?;
+    let Some(last) = last else { return Ok(()) };
+    if !last.is_done()? {
+        return Ok(());
+    }
+    let over = last.elapsed()? - last.duration()?;
+    if over > 0.0 && over < next.duration()? {
+        next.step(over)?;
+    }
+    Ok(())
+}
+
+/// A CCMoveTo in the game.
+struct GuestMove<'a> {
+    c: &'a Ctx<'a>,
+    action: u32,
+}
+
+impl TileMove for GuestMove<'_> {
+    fn step(&mut self, dt: f32) -> Result<(), String> {
+        self.c.send(self.action, "step:", &[dt.to_bits()]).map(|_| ())
+    }
+    fn elapsed(&self) -> Result<f32, String> {
+        Ok(f32::from_bits(self.c.send(self.action, "elapsed", &[])?))
+    }
+    fn duration(&self) -> Result<f32, String> {
+        Ok(f32::from_bits(self.c.send(self.action, "duration", &[])?))
+    }
+    fn is_done(&self) -> Result<bool, String> {
+        Ok(self.c.send(self.action, "isDone", &[])? & 0xff != 0)
+    }
+}
+
+/// Dungeon Plunder is running (its TileMapLayer, found at `install`).
+static DUNGEON_PLUNDER: AtomicBool = AtomicBool::new(false);
+
+/// The last move run on Dungeon Plunder's map (map, CCMoveTo), held
+/// (retained) so its time can still be read once cocos2d lets it go.
+static LAST_MOVE: Mutex<Option<(u32, u32)>> = Mutex::new(None);
+
+/// Dungeon Plunder (owner asked): the map walks one tile per 0.2 s CCMoveTo
+/// (-[TileMapLayer centerTileMapOnTileCoord:tileMap:] 0x1afec), and
+/// -[TileMapLayer update:] (0x1c16c) starts the next only once the last is
+/// done. cocos2d's first tick of a move stands still and the time the last
+/// one ran past its end is dropped, so every tile began with a frame that did
+/// not move (one in 25 at 120 Hz; an iPhone at 60 Hz has one in 13). After
+/// the map runs a move (-[CCNode runAction:]), it goes on from the last
+/// (`walk_on`): the walk is one motion at 0.2 s a tile.
+fn after_map_move(bridge: &Mutex<Bridge>, g: &dyn GuestSide, map: u32, action: u32) -> Result<(), String> {
+    let class = {
+        let b = bridge.lock().unwrap_or_else(|e| e.into_inner());
+        b.class_display(super::bridge::u32_at(g, action)).0
+    };
+    if action == 0 || class != "CCMoveTo" {
+        return Ok(());
+    }
+    let c = Ctx { bridge, g };
+    c.send(action, "retain", &[])?;
+    let last = LAST_MOVE.lock().unwrap_or_else(|e| e.into_inner()).replace((map, action));
+    let mut next = GuestMove { c: &c, action };
+    let walked = match last {
+        Some((last_map, last_action)) if last_map == map => walk_on(&mut next, Some(&GuestMove { c: &c, action: last_action })),
+        _ => walk_on(&mut next, None),
+    };
+    if let Some((_, last_action)) = last {
+        c.send(last_action, "release", &[])?;
+    }
+    walked
 }
 
 /// SpellCraft (owner asked): a tutorial step that waits for an event (the
@@ -107,6 +249,11 @@ static STEPS: Mutex<Vec<(u32, Steps)>> = Mutex::new(Vec::new());
 /// UIApplicationMain, once the game's memory is set up).
 pub(super) fn install(uc: &mut arm32_bridge::runtime::Uc, bridge: &Mutex<Bridge>) {
     let mut b = bridge.lock().unwrap_or_else(|e| e.into_inner());
+    let walks = b.classes.class_named("TileMapLayer").is_some_and(|c| c.methods.contains_key("centerTileMapOnTileCoord:tileMap:"));
+    DUNGEON_PLUNDER.store(walks, Ordering::Relaxed);
+    if walks {
+        crate::log!("Dungeon Plunder: the map walks on from tile to tile without a still frame");
+    }
     let Some(renderer) = b.classes.class_named("SCRenderer").filter(|c| c.methods.contains_key("renderLoop")).map(|c| c.address) else {
         return;
     };
@@ -170,7 +317,16 @@ pub(super) fn render_loop(c: &Ctx, renderer: u32) -> Result<(), String> {
     c.send(renderer, "setLastFrameTimeInSeconds:", &[bits as u32, (bits >> 32) as u32])?;
     c.send(renderer, "setFrameCount:", &[steps])?;
     c.send(renderer, "setDeltaT:", &[(steps as f32 / 60.0).to_bits()])?;
+    let asked = crate::fw::runloop::asked_at_once();
     c.send(renderer, "updateContent", &[])?;
+    // The game's own loop draws before its steps, so what a step asks for at
+    // once runs before anything it left is drawn: the last combat step asks
+    // for endCombatView, which stops the loop before the enemy card is drawn
+    // back at rest. A tick whose steps asked for a call at once leaves the
+    // draw to the next tick (none if that call stopped the loop).
+    if crate::fw::runloop::asked_at_once() != asked {
+        return Ok(());
+    }
     draw(c, renderer, steps, fraction)
 }
 
@@ -428,7 +584,89 @@ pub(super) fn node_transform(uc: &mut arm32_bridge::runtime::Uc, animation: u32,
 
 #[cfg(test)]
 mod tests {
-    use super::{thumb_call, thumb_call_target, HalfSteps, Steps};
+    use super::{thumb_call, thumb_call_target, walk_on, without_paid, HalfSteps, Steps, TileMove};
+
+    /// cocos2d's CCMoveTo as Dungeon Plunder has it: -[CCActionInterval
+    /// step:] (0xa183c; elapsed 0 at the first tick, then + dt; update with
+    /// elapsed / duration kept to 0..1), moving the map along one line.
+    struct Move {
+        duration: f32,
+        elapsed: f32,
+        first_tick: bool,
+        from: f32,
+        to: f32,
+        at: std::rc::Rc<std::cell::Cell<f32>>,
+    }
+
+    impl TileMove for Move {
+        fn step(&mut self, dt: f32) -> Result<(), String> {
+            if std::mem::replace(&mut self.first_tick, false) {
+                self.elapsed = 0.0;
+            } else {
+                self.elapsed += dt;
+            }
+            let t = (self.elapsed / self.duration.max(f32::EPSILON)).clamp(0.0, 1.0);
+            self.at.set(self.from + (self.to - self.from) * t);
+            Ok(())
+        }
+        fn elapsed(&self) -> Result<f32, String> {
+            Ok(self.elapsed)
+        }
+        fn duration(&self) -> Result<f32, String> {
+            Ok(self.duration)
+        }
+        fn is_done(&self) -> Result<bool, String> {
+            Ok(self.elapsed >= self.duration)
+        }
+    }
+
+    /// SpellCraft's shop list without its real-money items (in order); none
+    /// to take out leaves the list alone.
+    #[test]
+    fn real_money_items_leave_the_shop_list() {
+        let paid = |item: u32| Ok(item % 10 == 0);
+        assert_eq!(without_paid(&[1, 20, 3, 40], paid), Ok(Some(vec![1, 3])));
+        assert_eq!(without_paid(&[1, 3], paid), Ok(None));
+    }
+
+    /// Dungeon Plunder's walk at 120 Hz, each frame called up to 0.8 ms after
+    /// its refresh (the game's dt comes from gettimeofday): each frame the action manager
+    /// steps the map's move, then -[TileMapLayer update:] starts the next
+    /// tile's 0.2 s move once it is done. The map moves the same every frame
+    /// (no frame standing still at a tile's start) and 5 tiles a second.
+    #[test]
+    fn dungeon_plunder_walks_on_without_a_still_frame_per_tile() {
+        let at = std::rc::Rc::new(std::cell::Cell::new(0.0f32));
+        let (mut current, mut last): (Option<Move>, Option<Move>) = (None, None);
+        let mut tile = 0.0f32;
+        let mut places = Vec::new();
+        let (mut seed, mut called) = (7u32, 0.0f64);
+        for frame in 0..=480 {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let late = f64::from(seed >> 8) / f64::from(1u32 << 24) * 0.0008;
+            let now = f64::from(frame) / 120.0 + late;
+            let dt = (now - std::mem::replace(&mut called, now)) as f32;
+            if let Some(m) = current.as_mut() {
+                m.step(dt).unwrap();
+                if m.is_done().unwrap() {
+                    last = current.take();
+                }
+            }
+            if current.is_none() {
+                tile += 1.0;
+                let mut next = Move { duration: 0.2, elapsed: 0.0, first_tick: true, from: at.get(), to: tile, at: at.clone() };
+                walk_on(&mut next, last.as_ref()).unwrap();
+                current = Some(next);
+            }
+            places.push(at.get());
+        }
+        // From the second tile on (the walk's very start may stand still once).
+        let steps: Vec<f32> = places.windows(2).skip(30).map(|w| w[1] - w[0]).collect();
+        let (low, high) = steps.iter().fold((f32::MAX, 0.0f32), |(l, h), &s| (l.min(s), h.max(s)));
+        assert!(low > 0.03 && high < 0.06, "every frame moves about 1/24 of a tile: {low}..{high}");
+        let tiles_a_second = (places[480] - places[120]) / 3.0;
+        assert!((tiles_a_second - 5.0).abs() < 0.05, "0.2 s a tile: {tiles_a_second} tiles a second");
+    }
 
     #[test]
     fn thumb_calls_read_and_write_like_the_listing() {

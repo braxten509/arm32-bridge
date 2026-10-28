@@ -121,6 +121,8 @@ fn guest_messages_reach_game_code_host_code_and_super() {
     assert_eq!(runtime::lock().classes[&mirror_class].superclass, host_view);
     // Identity is stable both ways.
     assert_eq!(bridge.lock().unwrap().guest_object(fake, host).unwrap(), object);
+    // Counted from its alloc, for the "would dealloc" log (counted.rs).
+    assert_eq!(crate::fw::counted::game_count(host), Some(1));
 
     // A game method runs as guest code with the guest's words.
     fake.code(0x2011, |w| u64::from(w[2] * 3));
@@ -1180,6 +1182,123 @@ fn cxx_constructors_run_after_alloc_parents_first_and_destructors_at_dealloc_chi
     assert!(fake.freed.lock().unwrap().contains(&object));
 }
 
+static DYING_EVENTS: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+
+/// As Apple's runtime: a game object's -dealloc runs when its last reference
+/// goes, and only then. A superview and an array hold what they keep (the
+/// game's own release is not the last); the last holder letting go runs the
+/// game's -dealloc and its [super dealloc] frees it. The frameworks' later
+/// messages to it do nothing, and the bridge hands it to the game as nil.
+#[test]
+fn a_game_object_deallocs_when_its_last_holder_lets_go() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(crate::run::setup);
+    let fake = Fake::new();
+    let dying = class32(fake, "G32DyingView", ClassTarget::External("UIView".into()), "NSObject", vec![method("dealloc", "v8@0:4", 0x2601), method("poke", "v8@0:4", 0x2611)]);
+    let class = dying.address;
+    let md = ObjcMetadata32 { classes: vec![dying], ..Default::default() };
+    let bridge: &'static Mutex<Bridge> = Box::leak(Box::new(Mutex::new(Bridge::new(&md).unwrap())));
+    install(bridge, fake, &md).unwrap();
+    let event = |name: &'static str| DYING_EVENTS.lock().unwrap().push(name);
+    let super_struct = fake.alloc_permanent(8);
+    fake.code(0x2601, move |w| {
+        event("dealloc");
+        fake.write(super_struct, &[w[0].to_le_bytes(), class.to_le_bytes()].concat());
+        let words = [super_struct, w[1]];
+        send_from_guest(bridge, fake, SendKind::Super2, &|i| words[i as usize]).unwrap();
+        0
+    });
+    fake.code(0x2611, move |_| {
+        event("poke");
+        0
+    });
+    let _hook = mirror::DISPATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    mirror::set_dispatch(Box::new(move |frame: &mut HostFrame| {
+        dispatch_from_host(bridge, fake, frame).unwrap();
+    }));
+    set_dealloc_bridge(bridge, fake);
+    let sel = |name: &str| bridge.lock().unwrap().guest_selector(fake, name);
+    let guest = |host: Id| bridge.lock().unwrap().guest_object(fake, host).unwrap();
+    let events = || std::mem::take(&mut *DYING_EVENTS.lock().unwrap());
+    let new = |name: &str| runtime::send(runtime::send(runtime::class_named(name), "alloc", &[]), "init", &[]);
+    let (superview, array) = (guest(new("UIView")), guest(new("NSMutableArray")));
+
+    // Held by its superview: the game's release is not the last.
+    let view = send(bridge, fake, &[class, sel("alloc")]).unwrap() as u32;
+    let host = bridge.lock().unwrap().host_object(view).unwrap();
+    send(bridge, fake, &[superview, sel("addSubview:"), view]).unwrap();
+    send(bridge, fake, &[view, sel("release")]).unwrap();
+    assert_eq!(events(), Vec::<&str>::new(), "the superview holds it");
+    // Held by an array too: leaving the superview is not the last either.
+    send(bridge, fake, &[array, sel("addObject:"), view]).unwrap();
+    send(bridge, fake, &[view, sel("removeFromSuperview")]).unwrap();
+    assert_eq!(events(), Vec::<&str>::new(), "the array holds it");
+    // The last holder lets go: -dealloc runs at once and frees it.
+    send(bridge, fake, &[array, sel("removeAllObjects")]).unwrap();
+    assert_eq!(events(), ["dealloc"]);
+    assert!(fake.freed.lock().unwrap().contains(&view), "[super dealloc] freed it");
+    // A framework's late message to it reaches nothing; the game sees nil.
+    runtime::send(host, "poke", &[]);
+    assert_eq!(events(), Vec::<&str>::new(), "no game code runs on a freed object");
+    assert_eq!(guest(host), 0);
+    // A view's -dealloc lets go of its subviews (UIKit's), and a controller's
+    // of its view: the last release frees all three.
+    let controller = guest(new("UIViewController"));
+    let (parent, child) = (send(bridge, fake, &[class, sel("alloc")]).unwrap() as u32, send(bridge, fake, &[class, sel("alloc")]).unwrap() as u32);
+    send(bridge, fake, &[parent, sel("addSubview:"), child]).unwrap();
+    send(bridge, fake, &[child, sel("release")]).unwrap();
+    send(bridge, fake, &[controller, sel("setView:"), parent]).unwrap();
+    send(bridge, fake, &[parent, sel("release")]).unwrap();
+    assert_eq!(events(), Vec::<&str>::new(), "the controller holds its view");
+    let host_controller = bridge.lock().unwrap().host_object(controller).unwrap();
+    runtime::send(host_controller, "dealloc", &[]);
+    crate::fw::counted::dealloc_pending();
+    assert_eq!(events(), ["dealloc", "dealloc"]);
+}
+
+/// A long chain of game objects, each freeing the next in its -dealloc (as
+/// SpellCraft's item slots do): Apple's -dealloc just nests on the stack.
+/// Near the translator's nesting limit one waits for the safe point a level
+/// up instead of failing, so every link is still freed.
+#[test]
+fn a_long_chain_of_deallocs_frees_every_link() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(crate::run::setup);
+    static NEXT: Mutex<Vec<(u32, u32)>> = Mutex::new(Vec::new());
+    static FREED_LINKS: Mutex<usize> = Mutex::new(0);
+    let fake = Fake::new();
+    let link = class32(fake, "G32ChainLink", ClassTarget::External("NSObject".into()), "NSObject", vec![method("dealloc", "v8@0:4", 0x2801)]);
+    let class = link.address;
+    let md = ObjcMetadata32 { classes: vec![link], ..Default::default() };
+    let bridge: &'static Mutex<Bridge> = Box::leak(Box::new(Mutex::new(Bridge::new(&md).unwrap())));
+    install(bridge, fake, &md).unwrap();
+    let super_struct = fake.alloc_permanent(8);
+    let sel = |name: &str| bridge.lock().unwrap().guest_selector(fake, name);
+    let release = sel("release");
+    fake.code(0x2801, move |w| {
+        *FREED_LINKS.lock().unwrap() += 1;
+        let next = NEXT.lock().unwrap().iter().find(|e| e.0 == w[0]).map(|e| e.1);
+        if let Some(next) = next {
+            send_from_guest(bridge, fake, SendKind::Normal, &|i| [next, release][i as usize]).unwrap();
+        }
+        fake.write(super_struct, &[w[0].to_le_bytes(), class.to_le_bytes()].concat());
+        let words = [super_struct, w[1]];
+        send_from_guest(bridge, fake, SendKind::Super2, &|i| words[i as usize]).unwrap();
+        0
+    });
+    let _hook = mirror::DISPATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    set_dealloc_bridge(bridge, fake);
+    fake.depth_limit.store(40, std::sync::atomic::Ordering::SeqCst);
+    let links: Vec<u32> = (0..100).map(|_| send(bridge, fake, &[class, sel("alloc")]).unwrap() as u32).collect();
+    // Each link's own +1 is now its holder's: the one before it.
+    NEXT.lock().unwrap().extend(links.windows(2).map(|pair| (pair[0], pair[1])));
+    send(bridge, fake, &[links[0], release]).unwrap();
+    crate::fw::counted::dealloc_pending();
+    assert_eq!(*FREED_LINKS.lock().unwrap(), 100, "every link's -dealloc ran");
+    let freed = fake.freed.lock().unwrap().clone();
+    assert!(links.iter().all(|l| freed.contains(l)), "and every link was freed");
+}
+
 /// UIProgressView's progress is a C float: a 32-bit game's setProgress:
 /// (and setProgress:animated:) reach it with the value it sent.
 #[test]
@@ -1256,6 +1375,159 @@ fn framework_arrays_sort_with_a_game_function() {
     assert_eq!(values(other), [2, 9, 7], "the receiver stays as it was");
     let contexts = contexts.lock().unwrap();
     assert!(!contexts.is_empty() && contexts.iter().all(|&c| c == 77), "{contexts:?}");
+}
+
+/// A game block put in a framework collection stays the collection's (as
+/// Apple's retain of a heap block does): reading it back later gives the
+/// game its own block, alive. SpellCraft's purchase handlers wait in a
+/// dictionary in an array until the purchase ends.
+#[test]
+fn game_blocks_kept_by_framework_collections_come_back_alive() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(crate::run::setup);
+    let fake = Fake::new();
+    let bridge: &'static Mutex<Bridge> = Box::leak(Box::new(Mutex::new(Bridge::new(&ObjcMetadata32::default()).unwrap())));
+    let malloc_isa = fake.words(&[0; 5]);
+    bridge.lock().unwrap().set_special(malloc_isa, Special::MallocBlock);
+    let descriptor = fake.words(&[0, 20]);
+    let heap = |invoke: u32| fake.words(&[malloc_isa, BLOCK_NEEDS_FREE | 2, 0, invoke, descriptor]);
+    let sel = |name: &str| bridge.lock().unwrap().guest_selector(fake, name);
+    let guest = |host: Id| bridge.lock().unwrap().guest_object(fake, host).unwrap();
+    let count = |block: u32| fake.u32_at(block + 4) & BLOCK_REFCOUNT_MASK;
+
+    // dictionaryWithObjectsAndKeys:(handler, @"handler", nil), then objectForKey:.
+    let handler = heap(0x4501);
+    let key = guest(crate::fw::string::make("handler"));
+    let class = bridge.lock().unwrap().framework_class(fake, "NSMutableDictionary").0;
+    let dict = send(bridge, fake, &[class, sel("dictionaryWithObjectsAndKeys:"), handler, key, 0]).unwrap() as u32;
+    assert_eq!(count(handler), 4, "the dictionary holds its own reference");
+    assert_eq!(send(bridge, fake, &[dict, sel("objectForKey:"), key]).unwrap() as u32, handler);
+
+    // addObject:, then objectAtIndex:; the same block is found again.
+    let other = heap(0x4502);
+    let list = guest(runtime::send(runtime::class_named("NSMutableArray"), "new", &[]));
+    send(bridge, fake, &[list, sel("addObject:"), other]).unwrap();
+    assert_eq!(send(bridge, fake, &[list, sel("objectAtIndex:"), 0]).unwrap() as u32, other);
+    assert_eq!(send(bridge, fake, &[list, sel("containsObject:"), other]).unwrap() as u8, 1);
+    assert_eq!(count(other), 4);
+    assert!(!fake.freed.lock().unwrap().contains(&other));
+    // A queue that ran the kept wrapper and lets go of it (its dispose
+    // helper) leaves the collection's reference alone.
+    let kept = bridge.lock().unwrap().host_object_for(fake, other).unwrap();
+    let dispose: extern "C" fn(usize) = unsafe { std::mem::transmute(*((*((kept + 24) as *const usize) + 24) as *const usize)) };
+    dispose(kept);
+    assert_eq!(count(other), 4);
+    assert_eq!(send(bridge, fake, &[list, sel("objectAtIndex:"), 0]).unwrap() as u32, other);
+}
+
+/// A host copy of a game block (_Block_copy) that a collection keeps lives
+/// on through the host's own release of it, as Apple's retain by the
+/// collection keeps it. A kept block belongs to its bridge: another bridge
+/// with a block at the same guest address doesn't get it.
+#[test]
+fn a_kept_host_copy_outlives_its_release_and_belongs_to_its_bridge() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(crate::run::setup);
+    let make = || {
+        let fake = Fake::new();
+        let bridge: &'static Mutex<Bridge> = Box::leak(Box::new(Mutex::new(Bridge::new(&ObjcMetadata32::default()).unwrap())));
+        let malloc_isa = fake.words(&[0; 5]);
+        bridge.lock().unwrap().set_special(malloc_isa, Special::MallocBlock);
+        let descriptor = fake.words(&[0, 20]);
+        (fake, bridge, fake.words(&[malloc_isa, BLOCK_NEEDS_FREE | 2, 0, 0x4601, descriptor]))
+    };
+    let (fake, bridge, block) = make();
+    set_block_owner(fake);
+    let list = runtime::send(runtime::class_named("NSMutableArray"), "new", &[]);
+    let copy = in_wrapper_scope(fake, || {
+        let wrapper = bridge.lock().unwrap().host_object_for(fake, block)?;
+        let copy = crate::libsystem::mach::block_copy(wrapper as *mut _) as usize;
+        runtime::send(list, "addObject:", &[copy]);
+        // The host's release (libsystem's real _Block_release) doesn't end it.
+        crate::libsystem::mach::block_release(copy as *mut _);
+        Ok(copy)
+    })
+    .unwrap();
+    crate::libsystem::mach::block_release(copy as *mut _);
+    assert_eq!(wrapper_guest(copy), Some(block), "still a live wrapper");
+    let guest_list = bridge.lock().unwrap().guest_object(fake, list).unwrap();
+    let at = bridge.lock().unwrap().guest_selector(fake, "objectAtIndex:");
+    assert_eq!(send(bridge, fake, &[guest_list, at, 0]).unwrap() as u32, block);
+
+    // The game keeps it too (its wrapper lives on); a second bridge with a
+    // block at the same guest address gets its own.
+    let add = bridge.lock().unwrap().guest_selector(fake, "addObject:");
+    send(bridge, fake, &[guest_list, add, block]).unwrap();
+    let kept = in_wrapper_scope(fake, || bridge.lock().unwrap().host_object_for(fake, block)).unwrap();
+    assert_eq!(wrapper_guest(kept), Some(block));
+    let (other_fake, other_bridge, other_block) = make();
+    assert_eq!(other_block, block, "the same address in the other guest");
+    let other = in_wrapper_scope(other_fake, || other_bridge.lock().unwrap().host_object_for(other_fake, other_block)).unwrap();
+    assert_ne!(other, kept);
+}
+
+/// performSelector:withObject: on a game method that takes three objects
+/// (SpellCraft's encounterCardSlidOff:finished:context:): as on iOS it runs,
+/// and the arguments the sender didn't pass are nil, not whatever the
+/// argument registers last held.
+#[test]
+fn a_game_method_sent_fewer_arguments_than_it_takes_runs_with_nil_for_the_rest() {
+    use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(crate::run::setup);
+    static SEEN: AtomicU64 = AtomicU64::new(u64::MAX);
+    let fake = Fake::new();
+    let class = class32(fake, "G32CardSlider", ClassTarget::External("NSObject".into()), "NSObject", vec![method("slidOff:finished:context:", "v20@0:4@8@12@16", 0x2601)]);
+    let md = ObjcMetadata32 { classes: vec![class.clone()], ..Default::default() };
+    let bridge: &'static Mutex<Bridge> = Box::leak(Box::new(Mutex::new(Bridge::new(&md).unwrap())));
+    install(bridge, fake, &md).unwrap();
+    fake.code(0x2601, |w| {
+        SEEN.store(u64::from(w[2]) | u64::from(w[3] | w[4]) << 32, SeqCst);
+        0
+    });
+    let sel = |name: &str| bridge.lock().unwrap().guest_selector(fake, name);
+    let object = send(bridge, fake, &[class.address, sel("new")]).unwrap() as u32;
+    let host = bridge.lock().unwrap().host_object(object).unwrap();
+    let card = runtime::send(runtime::class_named("NSObject"), "new", &[]);
+    let _hook = mirror::DISPATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    static FAILED: Mutex<Option<String>> = Mutex::new(None);
+    mirror::set_dispatch(Box::new(move |frame: &mut HostFrame| {
+        if let Err(error) = dispatch_from_host(bridge, fake, frame) {
+            *FAILED.lock().unwrap() = Some(error);
+        }
+    }));
+    runtime::send(host, "performSelector:withObject:", &[runtime::sel("slidOff:finished:context:"), card]);
+    assert_eq!(FAILED.lock().unwrap().take(), None);
+    let guest_card = bridge.lock().unwrap().guest_object(fake, card).unwrap();
+    assert_eq!(SEEN.load(SeqCst), u64::from(guest_card), "it ran, with nil for finished: and context:");
+}
+
+/// -getObjects:andKeys: from a 32-bit game: both arrays come back whole (as
+/// many guest ids as the dictionary holds), either may be NULL.
+#[test]
+fn apple_dictionary_get_objects_and_keys_fills_whole_guest_arrays() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(crate::run::setup);
+    let fake = Fake::new();
+    let bridge: &'static Mutex<Bridge> = Box::leak(Box::new(Mutex::new(Bridge::new(&ObjcMetadata32::default()).unwrap())));
+    let dictionary = runtime::send(runtime::class_named("NSMutableDictionary"), "new", &[]);
+    for (key, value) in [("a", 1), ("b", 2), ("c", 3)] {
+        let number = runtime::send(runtime::class_named("NSNumber"), "numberWithInt:", &[value]);
+        runtime::send(dictionary, "setObject:forKey:", &[number, crate::fw::string::make(key)]);
+    }
+    let sel = bridge.lock().unwrap().guest_selector(fake, "getObjects:andKeys:");
+    let proxy = bridge.lock().unwrap().guest_object(fake, dictionary).unwrap();
+    let (objects, keys) = (fake.words(&[0xeeee; 3]), fake.words(&[0xeeee; 3]));
+    send(bridge, fake, &[proxy, sel, objects, keys]).unwrap();
+    let host = |guest: u32| bridge.lock().unwrap().host_object_for(fake, guest).unwrap();
+    let mut pairs: Vec<(String, i64)> = (0..3)
+        .map(|i| (crate::fw::string::get(host(fake.u32_at(keys + i * 4))), crate::fw::collections::number_as_f64(host(fake.u32_at(objects + i * 4))) as i64))
+        .collect();
+    pairs.sort();
+    assert_eq!(pairs, [("a".to_string(), 1), ("b".to_string(), 2), ("c".to_string(), 3)]);
+    let only_keys = fake.words(&[0xeeee; 3]);
+    send(bridge, fake, &[proxy, sel, 0, only_keys]).unwrap();
+    assert!((0..3).all(|i| fake.u32_at(only_keys + i * 4) != 0xeeee), "keys alone are filled too");
 }
 
 #[test]
@@ -1353,4 +1625,89 @@ fn a_repeated_framework_message_is_remembered_and_still_reaches_the_host() {
     assert!(bridge.lock().unwrap().classes.add_method(class, "setAlpha:", 0x2301, "v12@0:4f8"));
     send(&bridge, fake, &[object, alpha, 0.75f32.to_bits()]).unwrap();
     assert_eq!(seen(), [0.25, 0.5], "the game's method, not the host's");
+}
+
+#[test]
+fn spellcrafts_news_bar_is_hidden_when_it_joins_a_window() {
+    // SpellCraft: its news bar (AELiveBarView) can only say "Offline" now that
+    // its server is gone; the owner asked for it gone. It is hidden as it
+    // joins a window, and left alone as it leaves one; also when our UIKit
+    // (the host) tells it, as it does when the game adds it to a view.
+    use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(crate::run::setup);
+    let base = host_class("G32HostNewsBarBase");
+    let fake = Fake::new();
+    let bar = class32(
+        fake,
+        "AELiveBarView",
+        ClassTarget::External("G32HostNewsBarBase".into()),
+        "G32HostNewsBarBase",
+        vec![method("willMoveToWindow:", "v12@0:4@8", 0x2a01), method("setHidden:", "v12@0:4c8", 0x2a11)],
+    );
+    let class = bar.address;
+    let md = ObjcMetadata32 { classes: vec![bar], ..Default::default() };
+    let bridge: &'static Mutex<Bridge> = Box::leak(Box::new(Mutex::new(Bridge::new(&md).unwrap())));
+    install(bridge, fake, &md).unwrap();
+    let sel = |name: &str| bridge.lock().unwrap().guest_selector(fake, name);
+    let view = send(bridge, fake, &[class, sel("alloc")]).unwrap() as u32;
+    static HIDDEN: AtomicU32 = AtomicU32::new(0);
+    static MOVES: AtomicU32 = AtomicU32::new(0);
+    fake.code(0x2a01, |_| u64::from(MOVES.fetch_add(1, SeqCst)));
+    fake.code(0x2a11, |w| u64::from(HIDDEN.fetch_add(w[2] & 0xff, SeqCst)));
+    // Leaving a window: the game's own method only.
+    send(bridge, fake, &[view, sel("willMoveToWindow:"), 0]).unwrap();
+    assert_eq!((MOVES.load(SeqCst), HIDDEN.load(SeqCst)), (1, 0));
+    // Joining one: the game's method, then hidden.
+    send(bridge, fake, &[view, sel("willMoveToWindow:"), 0x5000]).unwrap();
+    assert_eq!((MOVES.load(SeqCst), HIDDEN.load(SeqCst)), (2, 1));
+    // From the host.
+    let _hook = mirror::DISPATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    mirror::set_dispatch(Box::new(move |frame: &mut HostFrame| {
+        dispatch_from_host(bridge, fake, frame).unwrap();
+    }));
+    let host = bridge.lock().unwrap().host_object(view).unwrap();
+    let selector = runtime::sel("willMoveToWindow:");
+    let imp = runtime::imp_for(host, selector).expect("the game's method answers the host");
+    let mut args = super::convert::HostArgs::default();
+    args.x[..3].copy_from_slice(&[host as u64, selector as u64, runtime::alloc_instance(base) as u64]);
+    mirror::call_host(imp, &args);
+    assert_eq!((MOVES.load(SeqCst), HIDDEN.load(SeqCst)), (3, 2));
+}
+
+/// NSFileHandle's methods have rows in framework_selectors.tsv: a 32-bit game
+/// reaches them with their real types (a missing row is "no type encoding").
+#[test]
+fn guest_file_handles_reach_the_host_with_their_types() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(crate::run::setup);
+    let fake = Fake::new();
+    // No game classes: this is about a framework class's selector rows only.
+    let md = ObjcMetadata32::default();
+    let bridge: &'static Mutex<Bridge> = Box::leak(Box::new(Mutex::new(Bridge::new(&md).unwrap())));
+    install(bridge, fake, &md).unwrap();
+    let (file_class, _) = bridge.lock().unwrap().framework_class(fake, "NSFileHandle");
+    let sel = |name: &str| bridge.lock().unwrap().guest_selector(fake, name);
+
+    let folder = std::env::temp_dir().join(format!("gamebridge-guest-file-{}", std::process::id()));
+    std::fs::create_dir_all(&folder).unwrap();
+    let path = folder.join("guest.txt");
+    std::fs::write(&path, b"hello world").unwrap();
+    let host_path = crate::fw::string::make(&path.to_string_lossy());
+    let guest_path = bridge.lock().unwrap().guest_object(fake, host_path).unwrap();
+
+    let handle = send(bridge, fake, &[file_class, sel("fileHandleForReadingAtPath:"), guest_path]).unwrap() as u32;
+    assert_ne!(handle, 0, "a readable file gives a handle");
+    let data = send(bridge, fake, &[handle, sel("readDataOfLength:"), 5]).unwrap() as u32;
+    let host_data = bridge.lock().unwrap().host_object(data).expect("the data reaches the host");
+    assert_eq!(crate::fw::data::bytes(host_data), b"hello");
+    assert_eq!(send(bridge, fake, &[handle, sel("offsetInFile")]).unwrap(), 5, "offsetInFile as unsigned long long");
+    // A 64-bit argument takes the register pair r2:r3.
+    send(bridge, fake, &[handle, sel("seekToFileOffset:"), 6, 0]).unwrap();
+    let rest = send(bridge, fake, &[handle, sel("readDataToEndOfFile")]).unwrap() as u32;
+    let host_rest = bridge.lock().unwrap().host_object(rest).expect("the rest reaches the host");
+    assert_eq!(crate::fw::data::bytes(host_rest), b"world");
+    send(bridge, fake, &[handle, sel("closeFile")]).unwrap();
+    assert_eq!(send(bridge, fake, &[handle, sel("fileDescriptor")]).unwrap() as i32, -1, "closed");
+    std::fs::remove_dir_all(&folder).unwrap();
 }

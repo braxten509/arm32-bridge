@@ -29,7 +29,10 @@ fn now() -> f64 {
 // ----- run loops: one per thread, the main one also takes posted work -----
 
 pub enum Work {
+    /// A block for the main queue (called; the poster keeps its copy).
     Block(usize),
+    /// The dispatch layer's work for the main queue (dispatch_async/sync).
+    Queue(Box<dyn FnOnce() + Send>),
     /// Our own work for the main thread.
     Native(Box<dyn FnOnce() + Send>),
     /// `modes`: the run loop modes it may run in (None: the common modes).
@@ -45,13 +48,29 @@ fn is_common_mode(mode: &str) -> bool {
 }
 
 /// Whether a loop running in `mode` runs `work`: messages wait for one of
-/// their modes, everything else runs in any.
+/// their modes, main-queue blocks run in the common modes (CFRunLoop serves
+/// the dispatch port only there), everything else runs in any.
 fn runs_in(work: &Work, mode: &str) -> bool {
     match work {
         Work::Message { modes: Some(modes), .. } => modes.iter().any(|m| m == mode || (m == COMMON_MODES && is_common_mode(mode))),
-        Work::Message { modes: None, .. } => is_common_mode(mode),
-        _ => true,
+        Work::Message { modes: None, .. } | Work::Block(_) | Work::Queue(_) => is_common_mode(mode),
+        Work::Native(_) => true,
     }
+}
+
+thread_local! {
+    /// A main-queue block is running on this thread (libdispatch's
+    /// main_q_is_draining): a run loop nested in it runs no other.
+    static MAIN_QUEUE_DRAINING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether a turn whose drain began at `marker` runs work number `number`
+/// now. As Apple's _dispatch_main_queue_callback_4CF, a turn runs only the
+/// main-queue blocks queued before its drain began (ones they queue wait for
+/// the next turn, after the commit), and none while one is running.
+fn runs_now(number: u64, work: &Work, mode: &str, marker: u64) -> bool {
+    let main_queue = matches!(work, Work::Block(_) | Work::Queue(_));
+    runs_in(work, mode) && !(main_queue && (number > marker || MAIN_QUEUE_DRAINING.with(|d| d.get())))
 }
 
 /// A run loop mode argument (nil: the default mode).
@@ -60,7 +79,10 @@ fn mode_name(mode: Id) -> String {
 }
 
 pub struct Loop {
-    queue: Mutex<VecDeque<Work>>,
+    /// Work with its number, in the order it was queued.
+    queue: Mutex<VecDeque<(u64, Work)>>,
+    /// The number of the work queued last (counted under the queue lock).
+    queued: AtomicU64,
     timers: Mutex<Vec<Id>>,
     wake: Condvar,
     /// Set once its thread has run it (the main loop always counts).
@@ -69,18 +91,31 @@ pub struct Loop {
     ended: std::sync::atomic::AtomicBool,
     /// The mode it is running in (-currentMode), None while it isn't running.
     mode: Mutex<Option<String>>,
+    /// For tests: counts as the main loop (the scroll tracking switch applies).
+    #[cfg(test)]
+    test_main: std::sync::atomic::AtomicBool,
 }
 
 impl Loop {
     const fn new() -> Self {
         Loop {
             queue: Mutex::new(VecDeque::new()),
+            queued: AtomicU64::new(0),
             timers: Mutex::new(Vec::new()),
             wake: Condvar::new(),
             ran: std::sync::atomic::AtomicBool::new(false),
             ended: std::sync::atomic::AtomicBool::new(false),
             mode: Mutex::new(None),
+            #[cfg(test)]
+            test_main: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// For tests: counts as the main loop, so the scroll tracking switch
+    /// applies to it (a loop of its own, away from other tests' turns).
+    #[cfg(test)]
+    fn mark_main_for_test(&'static self) {
+        self.test_main.store(true, Ordering::Relaxed);
     }
 
     /// Queues work, unless its thread ended (then the work is let go of).
@@ -90,7 +125,8 @@ impl Loop {
             drop(queue);
             return discard(work);
         }
-        queue.push_back(work);
+        let number = self.queued.fetch_add(1, Ordering::SeqCst) + 1;
+        queue.push_back((number, work));
         drop(queue);
         self.wake.notify_all();
     }
@@ -190,7 +226,8 @@ fn message(target: Id, selector: Sel, argument: Id, done: Option<Arc<(Mutex<bool
 
 fn run_work(work: Work) {
     match work {
-        Work::Block(block) => unsafe { crate::libsystem::mach::call_block(block) },
+        Work::Block(block) => as_main_queue(|| unsafe { crate::libsystem::mach::call_block(block) }),
+        Work::Queue(work) => as_main_queue(work),
         Work::Native(work) => work(),
         Work::Message { target, selector, argument, done, .. } => {
             let name = lock().sel_name(selector);
@@ -198,6 +235,19 @@ fn run_work(work: Work) {
             message_over(target, argument, done);
         }
     }
+}
+
+/// Runs a main-queue block, marked as draining the main queue meanwhile.
+fn as_main_queue(work: impl FnOnce()) {
+    /// Puts the flag back when the block ends, even by unwinding.
+    struct Draining(bool);
+    impl Drop for Draining {
+        fn drop(&mut self) {
+            MAIN_QUEUE_DRAINING.with(|d| d.set(self.0));
+        }
+    }
+    let _draining = Draining(MAIN_QUEUE_DRAINING.with(|d| d.replace(true)));
+    work();
 }
 
 /// A message ran or never will: let go of what it held while it waited (see
@@ -222,17 +272,23 @@ fn discard(work: Work) {
 }
 
 /// When a started thread ends: its run loop takes no more work, and what was
-/// still queued is let go of. A thread that never had one gets one marked
-/// ended (under the lock loops are made with), so work sent to it later is
-/// let go of at once too.
+/// still queued is let go of; its timers end too, letting go of their
+/// targets (Apple's run loop goes with its thread). A thread that never had
+/// one gets one marked ended (under the lock loops are made with), so work
+/// sent to it later is let go of at once too.
 fn end_thread_loop(thread: Id) {
     let run_loop = loop_of(run_loop_of_thread(thread));
     let left: Vec<Work> = {
         let mut queue = run_loop.queue.lock().unwrap();
         run_loop.ended.store(true, Ordering::Relaxed);
-        queue.drain(..).collect()
+        queue.drain(..).map(|(_, work)| work).collect()
     };
     left.into_iter().for_each(discard);
+    let timers = std::mem::take(&mut *run_loop.timers.lock().unwrap());
+    for object in timers {
+        let held = let_go(&mut timer(object));
+        release_held(held);
+    }
 }
 
 // ----- timers (NSTimer and CADisplayLink): { isa, *mut Timer } -----
@@ -252,6 +308,76 @@ pub struct TimerState {
     pub pass_argument: bool,
     /// CADisplayLink: the frame interval the game asked for.
     pub frames: isize,
+    /// A CADisplayLink: fires on the screen's refreshes (vsync.rs).
+    pub display_link: bool,
+    /// The run loop modes it fires in (given when it is scheduled).
+    pub modes: Vec<String>,
+    /// It still holds its target and user info (retained when made, as
+    /// Apple's; let go of when it is done: see `let_go`).
+    pub holds: bool,
+    /// Its call is running (a loop run inside it doesn't fire it again).
+    pub firing: bool,
+}
+
+/// A timer is done (invalidated, cancelled, or fired for the last time):
+/// it fires no more, and what it held is handed back to be released once.
+fn let_go(state: &mut TimerState) -> Option<(Id, Id)> {
+    state.valid = false;
+    std::mem::take(&mut state.holds).then_some((state.target, state.user_info))
+}
+
+/// Releases what a done timer held (outside its lock: a release may run
+/// the game's code).
+fn release_held(held: Option<(Id, Id)>) {
+    for object in held.map(|(target, info)| [target, info]).into_iter().flatten() {
+        if object != 0 {
+            runtime::send(object, "release", &[]);
+        }
+    }
+}
+
+/// How many valid scheduled timers (delayed performs, display links) hold
+/// `object` as target or user info (for the "would dealloc" log, counted.rs).
+pub fn timers_holding(object: Id) -> usize {
+    let mut loops: Vec<&'static Loop> = vec![&MAIN_LOOP];
+    loops.extend(THREAD_RUN_LOOPS.lock().unwrap().iter().map(|&(_, run_loop)| loop_of(run_loop)));
+    loops
+        .into_iter()
+        .map(|run_loop| {
+            let list = run_loop.timers.lock().unwrap().clone();
+            list.into_iter()
+                .filter(|&t| {
+                    let state = timer(t);
+                    state.valid && (state.target == object || state.user_info == object)
+                })
+                .count()
+        })
+        .sum()
+}
+
+/// Whether a timer in `modes` fires while its loop runs in `mode`.
+fn timer_runs_in(modes: &[String], mode: &str) -> bool {
+    modes.iter().any(|m| m == mode || (m == COMMON_MODES && is_common_mode(mode)))
+}
+
+const TRACKING_MODE: &str = "UITrackingRunLoopMode";
+
+/// Whether a loop's turn in `mode` fires a timer in `modes`. Apple switches
+/// the main loop into UITrackingRunLoopMode while a scroll view tracks (see
+/// `run_loop_until`), so a default-mode timer waits during a drag, as on
+/// Apple.
+fn timer_fires_in_turn(modes: &[String], mode: &str) -> bool {
+    timer_runs_in(modes, mode)
+}
+
+/// What a new timer holds: its target and user info, retained (through
+/// their own retain: a game's objects count it in the game's runtime).
+fn hold(target: Id, user_info: Id) {
+    for object in [target, user_info] {
+        if object != 0 {
+            runtime::send(object, "retain", &[]);
+        }
+    }
 }
 
 pub struct Timer(Mutex<TimerState>);
@@ -276,6 +402,10 @@ fn timer(object: Id) -> std::sync::MutexGuard<'static, TimerState> {
             paused: false,
             pass_argument: false,
             frames: 1,
+            display_link: false,
+            modes: Vec::new(),
+            holds: false,
+            firing: false,
         };
         let made = Box::into_raw(Box::new(Timer(Mutex::new(blank))));
         state = match slot.compare_exchange(std::ptr::null_mut(), made, Ordering::AcqRel, Ordering::Acquire) {
@@ -289,13 +419,26 @@ fn timer(object: Id) -> std::sync::MutexGuard<'static, TimerState> {
     unsafe { (*state).0.lock().unwrap() }
 }
 
+/// How many calls the main thread has asked for at once (timers and delayed
+/// performs for 0 s), so a game's frame can tell its step asked for one.
+static AT_ONCE: AtomicU64 = AtomicU64::new(0);
+
+pub fn asked_at_once() -> u64 {
+    AT_ONCE.load(Ordering::Relaxed)
+}
+
 fn make_timer(class: Class, interval: f64, target: Id, selector: Sel, user_info: Id, repeats: bool) -> Id {
     let object = runtime::alloc_instance(class);
-    // The timer holds on to its user info (performSelector:afterDelay:'s argument).
-    crate::fw::counted::keep(user_info);
+    // The timer holds on to its target and user info (performSelector:afterDelay:'s argument).
+    hold(target, user_info);
+    // As NSTimer's: 0 s or less is 0.1 ms.
+    if interval <= 0.0 && is_main_thread() {
+        AT_ONCE.fetch_add(1, Ordering::Relaxed);
+    }
+    let interval = if interval <= 0.0 { 0.0001 } else { interval };
     let state = TimerState {
-        fire_at: now() + interval.max(0.0),
-        interval: interval.max(0.0001),
+        fire_at: now() + interval,
+        interval,
         repeats,
         target,
         selector,
@@ -305,15 +448,30 @@ fn make_timer(class: Class, interval: f64, target: Id, selector: Sel, user_info:
         paused: false,
         pass_argument: false,
         frames: 1,
+        display_link: false,
+        modes: Vec::new(),
+        holds: true,
+        firing: false,
     };
     unsafe { *((object + 8) as *mut *const Timer) = Box::into_raw(Box::new(Timer(Mutex::new(state)))) };
     object
 }
 
-fn schedule(object: Id, run_loop: &'static Loop) {
+/// Adds a timer to a run loop in `mode` (once on a loop; another mode on the
+/// same loop is added to its modes). As CFRunLoop's, a timer is on one run
+/// loop only: adding it to another while it is on one does nothing.
+fn schedule(object: Id, run_loop: &'static Loop, mode: &str) {
     {
         let mut state = timer(object);
-        if state.owner.is_some() || !state.valid {
+        if !state.valid || state.owner.is_some_and(|owner| !std::ptr::eq(owner, run_loop)) {
+            return;
+        }
+        if !state.modes.iter().any(|m| m == mode) {
+            state.modes.push(mode.to_string());
+        }
+        if state.owner.is_some() {
+            drop(state);
+            run_loop.notify();
             return;
         }
         state.owner = Some(run_loop);
@@ -324,7 +482,7 @@ fn schedule(object: Id, run_loop: &'static Loop) {
 
 extern "C" fn timer_scheduled(class: Class, _: Sel, interval: f64, target: Id, selector: Sel, info: Id, repeats: u8) -> Id {
     let object = make_timer(class, interval, target, selector, info, repeats != 0);
-    schedule(object, current_loop());
+    schedule(object, current_loop(), DEFAULT_MODE);
     object
 }
 
@@ -334,7 +492,7 @@ extern "C" fn timer_unscheduled(class: Class, _: Sel, interval: f64, target: Id,
 
 /// A timer made with alloc: first fires at `date` (not scheduled until added to a run loop).
 extern "C" fn timer_init_with_fire_date(this: Id, _: Sel, date: Id, interval: f64, target: Id, selector: Sel, info: Id, repeats: u8) -> Id {
-    crate::fw::counted::keep(info);
+    hold(target, info);
     let wait = if date == 0 { 0.0 } else { runtime_send_f64(date, "timeIntervalSinceNow") };
     let state = TimerState {
         fire_at: now() + wait.max(0.0),
@@ -348,12 +506,21 @@ extern "C" fn timer_init_with_fire_date(this: Id, _: Sel, date: Id, interval: f6
         paused: false,
         pass_argument: false,
         frames: 1,
+        display_link: false,
+        modes: Vec::new(),
+        holds: true,
+        firing: false,
     };
     let made = Box::into_raw(Box::new(Timer(Mutex::new(state))));
     let slot = unsafe { &*((this + 8) as *const std::sync::atomic::AtomicPtr<Timer>) };
     let old = slot.swap(made, Ordering::AcqRel);
     if !old.is_null() {
-        drop(unsafe { Box::from_raw(old) });
+        let old = unsafe { Box::from_raw(old) };
+        let held = {
+            let mut state = old.0.lock().unwrap();
+            let_go(&mut state)
+        };
+        release_held(held);
     }
     this
 }
@@ -377,7 +544,8 @@ extern "C" fn timer_set_fire_date(this: Id, _: Sel, date: Id) {
 }
 
 extern "C" fn timer_invalidate(this: Id, _: Sel) {
-    timer(this).valid = false;
+    let held = let_go(&mut timer(this));
+    release_held(held);
 }
 
 extern "C" fn timer_is_valid(this: Id, _: Sel) -> bool {
@@ -393,7 +561,7 @@ extern "C" fn timer_interval(this: Id, _: Sel) -> f64 {
 }
 
 extern "C" fn timer_fire(this: Id, _: Sel) {
-    let (target, selector) = {
+    let (target, selector, last) = {
         let mut state = timer(this);
         if !state.valid {
             return;
@@ -401,10 +569,18 @@ extern "C" fn timer_fire(this: Id, _: Sel) {
         if !state.repeats {
             state.valid = false;
         }
-        (state.target, state.selector)
+        (state.target, state.selector, !state.repeats)
     };
     let name = lock().sel_name(selector);
+    // Held through the call (see fire_due_timers).
+    hold(target, this);
     runtime::send(target, &name, &[this]);
+    release_held(Some((target, this)));
+    // A one-shot timer lets go of its target after its call.
+    if last {
+        let held = let_go(&mut timer(this));
+        release_held(held);
+    }
 }
 
 // CADisplayLink: a timer at the screen's top refresh rate (IOS_SCREEN_HZ,
@@ -439,11 +615,17 @@ fn keep_frame_interval() -> bool {
 }
 
 extern "C" fn display_link_with_target(class: Class, _: Sel, target: Id, selector: Sel) -> Id {
-    make_timer(class, refresh_seconds(), target, selector, 0, true)
+    let link = make_timer(class, refresh_seconds(), target, selector, 0, true);
+    let mut state = timer(link);
+    state.display_link = true;
+    let (origin, step) = crate::fw::vsync::grid();
+    state.fire_at = crate::fw::vsync::next_on_grid(origin, step, now());
+    drop(state);
+    link
 }
 
-extern "C" fn display_link_add_to_run_loop(this: Id, _: Sel, run_loop: Id, _mode: Id) {
-    schedule(this, loop_of(run_loop));
+extern "C" fn display_link_add_to_run_loop(this: Id, _: Sel, run_loop: Id, mode: Id) {
+    schedule(this, loop_of(run_loop), &mode_name(mode));
 }
 
 extern "C" fn display_link_set_frame_interval(this: Id, _: Sel, frames: isize) {
@@ -472,56 +654,99 @@ extern "C" fn display_link_paused(this: Id, _: Sel) -> bool {
     timer(this).paused
 }
 
+/// The refresh this call is for (the last one), as an iPhone gives it.
 extern "C" fn display_link_timestamp(_this: Id, _: Sel) -> f64 {
-    now()
+    let (origin, step) = crate::fw::vsync::grid();
+    crate::fw::vsync::last_on_grid(origin, step, now())
+}
+
+/// The refresh the frame drawn now is shown at (the next one).
+extern "C" fn display_link_target_timestamp(this: Id, sel: Sel) -> f64 {
+    display_link_timestamp(this, sel) + crate::fw::vsync::grid().1
 }
 
 extern "C" fn display_link_duration(_this: Id, _: Sel) -> f64 {
-    refresh_seconds()
+    crate::fw::vsync::grid().1
 }
 
-/// Fires this loop's due timers. Returns how many fired and when the next one is due.
-fn fire_due_timers(run_loop: &'static Loop) -> (usize, Option<f64>) {
+/// Fires this loop's due timers for `mode`, earliest fire date first (as
+/// CFRunLoop, which keeps them sorted). Returns how many fired and when the
+/// next one is due.
+fn fire_due_timers(run_loop: &'static Loop, mode: &str) -> (usize, Option<f64>) {
     let due: Vec<Id> = {
         let mut list = run_loop.timers.lock().unwrap();
         list.retain(|&t| timer(t).valid);
         let current = now();
-        list.iter().copied().filter(|&t| {
-            let state = timer(t);
-            !state.paused && state.fire_at <= current
-        }).collect()
+        let mut due: Vec<(f64, Id)> = list
+            .iter()
+            .filter_map(|&t| {
+                let state = timer(t);
+                (!state.paused && !state.firing && state.fire_at <= current && timer_fires_in_turn(&state.modes, mode)).then_some((state.fire_at, t))
+            })
+            .collect();
+        due.sort_by(|a, b| a.0.total_cmp(&b.0));
+        due.into_iter().map(|(_, t)| t).collect()
     };
     let mut fired = 0;
     for object in due {
         // An earlier timer's callback may have stopped or paused this one.
-        let (target, selector, argument) = {
+        let (target, selector, argument, last, was_due) = {
             let mut state = timer(object);
             let current = now();
-            if !state.valid || state.paused || state.fire_at > current {
+            if !state.valid || state.paused || state.firing || state.fire_at > current {
                 continue;
             }
+            let was_due = state.fire_at;
             if state.repeats {
-                state.fire_at += state.interval;
-                if state.fire_at < current {
-                    state.fire_at = current + state.interval;
+                if state.display_link {
+                    // The refresh its frame interval's worth of refreshes on,
+                    // however late this call came.
+                    let (origin, step) = crate::fw::vsync::grid();
+                    state.fire_at = crate::fw::vsync::next_on_grid(origin, step, current + (state.interval - step).max(0.0));
+                } else {
+                    // Its next time is worked out once the call returns.
+                    state.firing = true;
                 }
             } else {
                 state.valid = false;
             }
             let argument = if state.pass_argument { state.user_info } else { object };
-            (state.target, state.selector, argument)
+            (state.target, state.selector, argument, !state.repeats, was_due)
         };
         fired += 1;
         TIMERS_FIRED.fetch_add(1, Ordering::Relaxed);
         let name = lock().sel_name(selector);
+        // Held through the call, as __CFRunLoopDoTimer retains the timer's
+        // context: a callback that invalidates its timer can't free its target.
+        hold(target, argument);
         runtime::send(target, &name, &[argument]);
+        {
+            // As __CFRunLoopDoTimer: a repeating timer's next time is the
+            // first on its schedule (from the time it was due) after the call
+            // returned, unless the call set a later one, which is kept. So
+            // what the call asked for at once comes before its next call.
+            let mut state = timer(object);
+            if state.firing {
+                state.firing = false;
+                if state.fire_at <= was_due {
+                    let current = now();
+                    state.fire_at = if current < was_due { was_due } else { crate::fw::vsync::next_on_grid(was_due, state.interval, current) };
+                }
+            }
+        }
+        release_held(Some((target, argument)));
+        // A one-shot timer (a delayed perform) lets go of its target after its call.
+        if last {
+            let held = let_go(&mut timer(object));
+            release_held(held);
+        }
     }
     let list = run_loop.timers.lock().unwrap();
     let next = list
         .iter()
         .filter_map(|&t| {
             let state = timer(t);
-            (state.valid && !state.paused).then_some(state.fire_at)
+            (state.valid && !state.paused && !state.firing && timer_fires_in_turn(&state.modes, mode)).then_some(state.fire_at)
         })
         .reduce(f64::min);
     (fired, next)
@@ -567,6 +792,12 @@ pub fn as_main<R>(f: impl FnOnce() -> R) -> R {
     main_work(true, f)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// For tests: runs on this thread where its loop's turn commits.
+    static AT_COMMIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Runs a loop's queued work and due timers until `until` (or forever), in
 /// run loop mode `mode`. With `once`, returns as soon as something was
 /// handled. Returns true if anything was.
@@ -584,25 +815,39 @@ fn run_loop_until(run_loop: &'static Loop, until: Option<f64>, once: bool, mode:
     // Each turn of the loop has its own autorelease pool, as on Apple.
     let pool = crate::fw::counted::pool_mark();
     let main = std::ptr::eq(run_loop, &MAIN_LOOP);
+    #[cfg(test)]
+    let main = main || run_loop.test_main.load(Ordering::Relaxed);
+    let mut running_mode = mode;
     loop {
+        // UIKit runs the main run loop in UITrackingRunLoopMode while a
+        // scroll view tracks a finger (or its coast/settle): then only
+        // timers in that mode or the common modes fire, and -currentMode
+        // answers it. A loop a game asked for another mode keeps that mode.
+        let turn_mode = if main && mode == DEFAULT_MODE && crate::fw::controls::tracking() { TRACKING_MODE } else { mode };
+        if turn_mode != running_mode {
+            *run_loop.mode.lock().unwrap_or_else(|e| e.into_inner()) = Some(turn_mode.to_string());
+            running_mode = turn_mode;
+        }
+        // A game frame that waited for a newer one reaches the screen (eagl.rs).
+        if main {
+            main_work(main, crate::fw::eagl::show_waiting_frame);
+        }
+        // The main-queue blocks queued from here on wait for the next turn.
+        let marker = run_loop.queued.load(Ordering::SeqCst);
         loop {
             let ran = main_work(main, || {
                 let work = {
                     let mut queue = run_loop.queue.lock().unwrap();
-                    queue.iter().position(|work| runs_in(work, mode)).and_then(|at| queue.remove(at))
+                    queue.iter().position(|(number, work)| runs_now(*number, work, turn_mode, marker)).and_then(|at| queue.remove(at))
                 };
-                work.map(run_work).is_some()
+                work.map(|(_, work)| run_work(work)).is_some()
             });
             if !ran {
                 break;
             }
             handled = true;
         }
-        // UIKit lays out marked views once a turn, before anything is drawn.
-        if main {
-            main_work(main, crate::fw::uikit::layout_pass);
-        }
-        let (fired, mut next_timer) = main_work(main, || fire_due_timers(run_loop));
+        let (fired, mut next_timer) = main_work(main, || fire_due_timers(run_loop, turn_mode));
         handled |= fired > 0;
         if main {
             let (ran, next_later) = main_work(main, run_due_later);
@@ -611,9 +856,17 @@ fn run_loop_until(run_loop: &'static Loop, until: Option<f64>, once: bool, mode:
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
             };
+            // UIKit lays out marked views once a turn, before anything is
+            // drawn: in Core Animation's commit (layout_and_display_if_needed,
+            // at BeforeWaiting), so what this turn's work, timers, display
+            // link and completion blocks marked is laid out together.
+            main_work(main, crate::fw::uikit::layout_pass);
         }
-        crate::fw::counted::pool_drain(pool);
         if once && handled {
+            crate::fw::counted::pool_drain(pool);
+            if main {
+                main_work(main, crate::fw::counted::dealloc_pending);
+            }
             return true;
         }
         // The game's UIKit pictures go to the phone screen from the main thread.
@@ -626,6 +879,16 @@ fn run_loop_until(run_loop: &'static Loop, until: Option<f64>, once: bool, mode:
         if pictures {
             crate::fw::pictures::tick();
         }
+        #[cfg(test)]
+        if let Some(check) = AT_COMMIT.with(|c| c.borrow_mut().take()) {
+            check();
+        }
+        // The turn's pool goes after the commit (UIKit's pool observer comes
+        // after Core Animation's), so what only the pool holds lives through it.
+        crate::fw::counted::pool_drain(pool);
+        if main {
+            main_work(main, crate::fw::counted::dealloc_pending);
+        }
         let current = now();
         if let Some(end) = until {
             if current >= end {
@@ -636,11 +899,16 @@ fn run_loop_until(run_loop: &'static Loop, until: Option<f64>, once: bool, mode:
         if pictures {
             wait_until = wait_until.min(current + crate::fw::pictures::gap());
         }
+        if main {
+            if let Some(due) = main_work(main, crate::fw::eagl::show_waiting_frame) {
+                wait_until = wait_until.min(due);
+            }
+        }
         if let Some(end) = until {
             wait_until = wait_until.min(end);
         }
         let guard = run_loop.queue.lock().unwrap();
-        if !guard.iter().any(|work| runs_in(work, mode)) && wait_until > current {
+        if !guard.iter().any(|(number, work)| runs_now(*number, work, turn_mode, u64::MAX)) && wait_until > current {
             let seconds = (wait_until - current).min(0.25);
             waiting(|| drop(run_loop.wake.wait_timeout(guard, std::time::Duration::from_secs_f64(seconds))));
         }
@@ -750,8 +1018,8 @@ extern "C" fn run_loop_current_mode(this: Id, _: Sel) -> Id {
     mode.as_deref().map_or(0, mode_object)
 }
 
-extern "C" fn run_loop_add_timer(this: Id, _: Sel, timer_object: Id, _mode: Id) {
-    schedule(timer_object, loop_of(this));
+extern "C" fn run_loop_add_timer(this: Id, _: Sel, timer_object: Id, mode: Id) {
+    schedule(timer_object, loop_of(this), &mode_name(mode));
 }
 
 fn sleep_seconds(seconds: f64) {
@@ -892,6 +1160,11 @@ extern "C" fn perform_on_main_modes(this: Id, _: Sel, selector: Sel, argument: I
 static DELAYED: Mutex<Vec<Id>> = Mutex::new(Vec::new());
 
 extern "C" fn perform_after_delay(this: Id, _: Sel, selector: Sel, argument: Id, delay: f64) {
+    perform_after_delay_in(this, selector, argument, delay, &[DEFAULT_MODE.to_string()]);
+}
+
+/// A delayed perform: a one-shot timer in `modes` of this thread's loop.
+fn perform_after_delay_in(this: Id, selector: Sel, argument: Id, delay: f64, modes: &[String]) {
     let object = make_timer(runtime::class_named("NSTimer"), delay, this, selector, argument, false);
     timer(object).pass_argument = true;
     {
@@ -899,7 +1172,9 @@ extern "C" fn perform_after_delay(this: Id, _: Sel, selector: Sel, argument: Id,
         delayed.retain(|&t| timer(t).valid);
         delayed.push(object);
     }
-    schedule(object, current_loop());
+    for mode in modes {
+        schedule(object, current_loop(), mode);
+    }
 }
 
 /// Whether a -performSelector:withObject:afterDelay: of `selector` to
@@ -911,8 +1186,12 @@ pub fn perform_pending(target: Id, selector: Sel) -> bool {
     })
 }
 
-extern "C" fn perform_after_delay_modes(this: Id, s: Sel, selector: Sel, argument: Id, delay: f64, _modes: Id) {
-    perform_after_delay(this, s, selector, argument, delay);
+/// -performSelector:withObject:afterDelay:inModes:: nil or no modes performs
+/// nothing, as Apple's.
+extern "C" fn perform_after_delay_modes(this: Id, _: Sel, selector: Sel, argument: Id, delay: f64, modes: Id) {
+    if let Some(modes) = named_modes(modes) {
+        perform_after_delay_in(this, selector, argument, delay, &modes);
+    }
 }
 
 extern "C" fn perform_in_background(this: Id, _: Sel, selector: Sel, argument: Id) {
@@ -921,22 +1200,36 @@ extern "C" fn perform_in_background(this: Id, _: Sel, selector: Sel, argument: I
 
 /// +cancelPreviousPerformRequestsWithTarget: (the receiver is the class).
 extern "C" fn cancel_previous_requests(_class: Class, _: Sel, target: Id) {
-    for &object in DELAYED.lock().unwrap().iter() {
-        let mut state = timer(object);
-        if state.target == target {
-            state.valid = false;
-        }
-    }
+    cancel_delayed(|t, _, _| t == target);
 }
 
 /// +cancelPreviousPerformRequestsWithTarget:selector:object:
 extern "C" fn cancel_previous_matching(_class: Class, _: Sel, target: Id, selector: Sel, argument: Id) {
-    for &object in DELAYED.lock().unwrap().iter() {
-        let mut state = timer(object);
-        if state.target == target && state.selector == selector && objects_equal(state.user_info, argument) {
-            state.valid = false;
-        }
-    }
+    cancel_delayed(|t, s, info| t == target && s == selector && objects_equal(info, argument));
+}
+
+/// Cancels the waiting delayed performs `matches` picks (given each one's
+/// target, selector and argument). `matches` may run game code (-isEqual:),
+/// so it is asked with no lock held; a perform it picked is cancelled only
+/// if it is still the same waiting perform. What they held is released last.
+fn cancel_delayed(matches: impl Fn(Id, Sel, Id) -> bool) {
+    let delayed = DELAYED.lock().unwrap().clone();
+    let waiting: Vec<(Id, Id, Sel, Id)> = delayed
+        .into_iter()
+        .filter_map(|object| {
+            let state = timer(object);
+            state.valid.then_some((object, state.target, state.selector, state.user_info))
+        })
+        .collect();
+    let held: Vec<Option<(Id, Id)>> = waiting
+        .into_iter()
+        .filter(|&(_, target, selector, info)| matches(target, selector, info))
+        .filter_map(|(object, target, selector, info)| {
+            let mut state = timer(object);
+            (state.valid && state.target == target && state.selector == selector && state.user_info == info).then(|| let_go(&mut state))
+        })
+        .collect();
+    held.into_iter().for_each(release_held);
 }
 
 fn objects_equal(a: Id, b: Id) -> bool {
@@ -955,7 +1248,8 @@ fn new_thread(target: Id, selector: Sel, argument: Id) -> Id {
 
 fn spawn(thread: Id, target: Id, selector: Sel, argument: Id, why: &str) {
     let name = lock().sel_name(selector);
-    // Kept while the thread runs, as Apple's NSThread retains its argument.
+    // Kept while the thread runs, as Apple's NSThread retains its target and argument.
+    crate::fw::counted::keep(target);
     crate::fw::counted::keep(argument);
     crate::log!("thread started: -[{} {name}] ({why})", string::describe_class_of(target));
     std::thread::Builder::new()
@@ -965,8 +1259,11 @@ fn spawn(thread: Id, target: Id, selector: Sel, argument: Id, why: &str) {
             CURRENT_THREAD.with(|cell| cell.set(thread));
             runtime::send(target, &name, &[argument]);
             crate::fw::counted::release(argument);
+            crate::fw::counted::release(target);
             end_thread_loop(thread);
             crate::fw::uikit::property_set(thread, "finished", 1);
+            // The thread's last safe point: what it let go of deallocs here.
+            crate::fw::counted::dealloc_pending();
         })
         .expect("can't start a thread");
 }
@@ -1113,6 +1410,7 @@ pub fn register(r: &mut Registry) {
             ("setPaused:", display_link_set_paused as usize),
             ("isPaused", display_link_paused as usize),
             ("timestamp", display_link_timestamp as usize),
+            ("targetTimestamp", display_link_target_timestamp as usize),
             ("duration", display_link_duration as usize),
         ],
     );
@@ -1192,8 +1490,23 @@ extern "C" fn yes_class(_: Class, _: Sel) -> bool {
     true
 }
 
-extern "C" fn display_link_remove(this: Id, _: Sel, _loop: Id, _mode: Id) {
-    timer(this).valid = false;
+/// Takes the link out of a mode; out of its last one, off its run loop (it
+/// stays valid, holding its target, until -invalidate, as Apple's). A run
+/// loop it isn't on changes nothing.
+extern "C" fn display_link_remove(this: Id, _: Sel, run_loop: Id, mode: Id) {
+    let mode = mode_name(mode);
+    let from = loop_of(run_loop);
+    let owner = {
+        let mut state = timer(this);
+        if !state.owner.is_some_and(|owner| std::ptr::eq(owner, from)) {
+            return;
+        }
+        state.modes.retain(|m| *m != mode);
+        if state.modes.is_empty() { state.owner.take() } else { None }
+    };
+    if let Some(run_loop) = owner {
+        run_loop.timers.lock().unwrap().retain(|&t| t != this);
+    }
 }
 
 #[cfg(test)]
@@ -1220,10 +1533,15 @@ mod frame_rate_tests {
     #[test]
     fn work_posted_for_later_waits_for_its_time() {
         static ORDER: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+        let posted = now();
         post_after(0.15, Box::new(|| ORDER.lock().unwrap().push(2)));
         post_after(0.05, Box::new(|| ORDER.lock().unwrap().push(1)));
         run_main_loop(Some(now() + 0.02));
-        assert!(ORDER.lock().unwrap().is_empty(), "nothing runs before its time");
+        // (Only while the first is still early: a busy machine can take
+        // longer than 0.05 s to get here, and then it is due.)
+        if now() - posted < 0.05 {
+            assert!(ORDER.lock().unwrap().is_empty(), "nothing runs before its time");
+        }
         let end = now() + 0.5;
         while ORDER.lock().unwrap().len() < 2 && now() < end {
             run_main_loop(Some(now() + 0.05));
@@ -1242,6 +1560,86 @@ mod frame_rate_tests {
         runtime::send(timer, "invalidate", &[]);
         assert_eq!(runtime::send(timer, "isValid", &[]) as u8, 0);
         assert_eq!(runtime::send(timer, "userInfo", &[]), 0);
+    }
+}
+
+#[cfg(test)]
+mod main_queue_tests {
+    use super::*;
+    use crate::libsystem::mach::test_blocks::running;
+
+    static RAN: Mutex<Vec<&str>> = Mutex::new(Vec::new());
+
+    fn note(what: &'static str) {
+        RAN.lock().unwrap().push(what);
+    }
+
+    /// Apple's main queue (_dispatch_main_queue_callback_4CF) runs only the
+    /// blocks queued before its drain began: one a block queues runs on the
+    /// loop's next turn, after the commit. A run loop nested in a main-queue
+    /// block runs none (the queue is draining), and private modes run none.
+    #[test]
+    fn a_turn_runs_only_the_main_queue_blocks_queued_before_it() {
+        let run_loop: &'static Loop = Box::leak(Box::new(Loop::new()));
+        let turn = |mode: &str| run_loop_until(run_loop, Some(now() + 0.02), true, mode);
+        let b = running(|| note("b"));
+        run_loop.push(Work::Block(running(move || {
+            note("a");
+            run_loop.push(Work::Block(b));
+        })));
+        turn("custom");
+        assert!(RAN.lock().unwrap().is_empty(), "a main-queue block ran in a private mode");
+        turn(DEFAULT_MODE);
+        assert_eq!(*RAN.lock().unwrap(), ["a"], "the block queued during the drain waits for the next turn");
+        turn(DEFAULT_MODE);
+        assert_eq!(*RAN.lock().unwrap(), ["a", "b"]);
+        RAN.lock().unwrap().clear();
+        run_loop.push(Work::Block(running(move || {
+            note("c");
+            run_loop.push(Work::Native(Box::new(|| note("other work"))));
+            run_loop_until(run_loop, Some(now() + 0.02), false, DEFAULT_MODE);
+            note("c ends");
+        })));
+        run_loop.push(Work::Block(running(|| note("d"))));
+        turn(DEFAULT_MODE);
+        assert_eq!(*RAN.lock().unwrap(), ["c", "other work", "c ends", "d"]);
+    }
+
+    /// A main-queue block that unwinds doesn't leave the main queue marked as
+    /// draining: later blocks still run.
+    #[test]
+    fn a_main_queue_block_that_unwinds_leaves_the_queue_running() {
+        static RAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let run_loop: &'static Loop = Box::leak(Box::new(Loop::new()));
+        run_loop.push(Work::Queue(Box::new(|| panic!("a block that unwinds"))));
+        let turn = || run_loop_until(run_loop, Some(now() + 0.02), true, DEFAULT_MODE);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(turn)).is_err());
+        run_loop.push(Work::Queue(Box::new(|| RAN.store(true, Ordering::SeqCst))));
+        turn();
+        assert!(RAN.load(Ordering::SeqCst), "the main queue stayed marked as draining");
+    }
+
+    /// The turn's autorelease pool is emptied after the commit (UIKit's pool
+    /// observer comes after Core Animation's), so what only the pool holds is
+    /// alive for the commit.
+    #[test]
+    fn what_a_turn_autoreleased_lives_through_its_commit() {
+        const ISA: usize = 0x7000_0000;
+        crate::fw::counted::count_class(ISA);
+        let object = crate::symbols::leak([ISA, 0]);
+        static ALIVE_AT_COMMIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let run_loop: &'static Loop = Box::leak(Box::new(Loop::new()));
+        run_loop.push(Work::Native(Box::new(move || {
+            crate::fw::counted::track(object, |_| {});
+            crate::fw::counted::autorelease(object);
+            AT_COMMIT.with(|c| {
+                *c.borrow_mut() =
+                    Some(Box::new(move || ALIVE_AT_COMMIT.store(crate::fw::counted::count(object).is_some(), Ordering::SeqCst)))
+            });
+        })));
+        run_loop_until(run_loop, Some(now() + 0.02), false, DEFAULT_MODE);
+        assert!(ALIVE_AT_COMMIT.load(Ordering::SeqCst), "the pool let go before the commit");
+        assert_eq!(crate::fw::counted::count(object), None, "the pool let go after it");
     }
 }
 
@@ -1461,6 +1859,368 @@ mod perform_tests {
         let (target_count, argument_count) = COUNTS_WHEN_RUN.lock().unwrap()[0];
         assert!(target_count > held_by_thread && argument_count > 0, "released before it ran: counts {target_count}, {argument_count}");
         assert!(wait_for(|| count_of(target) == held_by_thread && count_of(argument) == 0), "not released after running: counts {}, {}", count_of(target), count_of(argument));
+    }
+
+    /// As Apple's: a timer, a display link and a delayed perform hold their
+    /// target (and user info / argument) until they are invalidated, have
+    /// fired for the last time, or are cancelled.
+    #[test]
+    fn timers_hold_their_target_until_invalidated() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let class = define_class("TimerCountedTarget", "NSObject", 8);
+        methods(class, &[("retain", counted_retain as usize), ("release", counted_release as usize), ("check:", check as usize)]);
+        let make = || {
+            let object = runtime::send(runtime::send(class, "alloc", &[]), "init", &[]);
+            change(object, 1);
+            object
+        };
+        let (target, info) = (make(), make());
+        let timer_class = runtime::class_named("NSTimer");
+        let timer = timer_unscheduled(timer_class, 0, 30.0, target, runtime::sel("check:"), info, 0);
+        assert_eq!((count_of(target), count_of(info)), (2, 2), "a timer holds its target and user info");
+        runtime::send(timer, "invalidate", &[]);
+        runtime::send(timer, "invalidate", &[]);
+        assert_eq!((count_of(target), count_of(info)), (1, 1), "let go of once, when invalidated");
+        let link = display_link_with_target(runtime::class_named("CADisplayLink"), 0, target, runtime::sel("check:"));
+        assert_eq!(count_of(target), 2, "a display link holds its target");
+        runtime::send(link, "invalidate", &[]);
+        assert_eq!(count_of(target), 1);
+        perform_after_delay(target, 0, runtime::sel("check:"), info, 30.0);
+        assert_eq!((count_of(target), count_of(info)), (2, 2), "a delayed perform holds its target and argument");
+        runtime::send(runtime::class_named("NSObject"), "cancelPreviousPerformRequestsWithTarget:", &[target]);
+        assert_eq!((count_of(target), count_of(info)), (1, 1), "let go of when cancelled");
+    }
+
+    static COUNTS_AFTER_STOP: Mutex<Vec<isize>> = Mutex::new(Vec::new());
+
+    extern "C" fn stop_and_check(this: Id, _: Sel, timer: Id) {
+        runtime::send(timer, "invalidate", &[]);
+        COUNTS_AFTER_STOP.lock().unwrap().push(count_of(this));
+    }
+
+    /// As CFRunLoop's (__CFRunLoopDoTimer retains the timer's context around
+    /// the callout): a target only its timer holds outlives the call in which
+    /// it invalidates that timer, both when the loop fires it and on -fire.
+    #[test]
+    fn a_timer_holds_its_target_through_its_call() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        static STOP_LOOP: Loop = Loop::new();
+        let class = define_class("TimerStopTarget", "NSObject", 8);
+        methods(class, &[("retain", counted_retain as usize), ("release", counted_release as usize), ("stop:", stop_and_check as usize)]);
+        let timer_class = runtime::class_named("NSTimer");
+        let make = || {
+            let target = runtime::send(runtime::send(class, "alloc", &[]), "init", &[]);
+            change(target, 1);
+            let made = timer_unscheduled(timer_class, 0, 30.0, target, runtime::sel("stop:"), 0, 1);
+            runtime::send(target, "release", &[]);
+            (target, made)
+        };
+        let (scheduled, made) = make();
+        run_loop_add_timer(run_loop_object(&STOP_LOOP), 0, made, 0);
+        timer(made).fire_at = now() - 0.01;
+        run_loop_until(&STOP_LOOP, Some(now() + 0.02), true, DEFAULT_MODE);
+        let (fired_by_hand, made) = make();
+        runtime::send(made, "fire", &[]);
+        assert_eq!(*COUNTS_AFTER_STOP.lock().unwrap(), [1, 1], "the target was let go of during its own call");
+        assert_eq!((count_of(scheduled), count_of(fired_by_hand)), (0, 0), "let go of after it");
+    }
+
+    static FIRED: Mutex<Vec<Id>> = Mutex::new(Vec::new());
+
+    extern "C" fn fired(_this: Id, _: Sel, timer: Id) {
+        FIRED.lock().unwrap().push(timer);
+    }
+
+    /// Due timers fire earliest fire date first (CFRunLoop keeps them
+    /// sorted), not in the order they were added; a timer for 0 s first
+    /// fires 0.1 ms on, as NSTimer's.
+    #[test]
+    fn due_timers_fire_earliest_first() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        static ORDER_LOOP: Loop = Loop::new();
+        let class = define_class("TimerOrderTarget", "NSObject", 8);
+        methods(class, &[("fired:", fired as usize)]);
+        let target = runtime::send(runtime::send(class, "alloc", &[]), "init", &[]);
+        let timer_class = runtime::class_named("NSTimer");
+        let later = timer_unscheduled(timer_class, 0, 0.0, target, runtime::sel("fired:"), 0, 0);
+        let sooner = timer_unscheduled(timer_class, 0, 0.0, target, runtime::sel("fired:"), 0, 0);
+        timer(later).fire_at = now() - 0.01;
+        timer(sooner).fire_at = now() - 0.02;
+        let run_loop = run_loop_object(&ORDER_LOOP);
+        for t in [later, sooner] {
+            run_loop_add_timer(run_loop, 0, t, 0);
+        }
+        run_loop_until(&ORDER_LOOP, Some(now() + 0.02), true, DEFAULT_MODE);
+        assert_eq!(*FIRED.lock().unwrap(), [sooner, later]);
+        let before = now();
+        let zero = timer_unscheduled(timer_class, 0, 0.0, target, runtime::sel("fired:"), 0, 0);
+        assert!(timer(zero).fire_at >= before + 0.0001 - 1e-9, "a 0 s timer waits 0.1 ms");
+    }
+
+    static SLOW_LOOP: Loop = Loop::new();
+    static SLOW_HEARD: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+
+    /// A game frame that runs longer than its timer's interval and, the
+    /// first time, asks for a call at once (SpellCraft's last combat frame
+    /// asks for endCombatView with performSelector:afterDelay:0).
+    extern "C" fn slow_frame(this: Id, _: Sel, _timer: Id) {
+        let first = SLOW_HEARD.lock().unwrap().is_empty();
+        SLOW_HEARD.lock().unwrap().push("frame");
+        if first {
+            // A loop run inside the call doesn't fire the timer again.
+            run_loop_until(&SLOW_LOOP, Some(now() + 0.005), true, DEFAULT_MODE);
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            let at_once = timer_unscheduled(runtime::class_named("NSTimer"), 0, 0.0, this, runtime::sel("slowDone:"), 0, 0);
+            run_loop_add_timer(run_loop_object(&SLOW_LOOP), 0, at_once, 0);
+        }
+    }
+
+    extern "C" fn slow_done(_this: Id, _: Sel, _timer: Id) {
+        SLOW_HEARD.lock().unwrap().push("done");
+    }
+
+    /// As __CFRunLoopDoTimer: a repeating timer's next firing is worked out
+    /// after its call returns (the first one on its schedule after that
+    /// moment), so a timer for "at once" made during a long call fires
+    /// before the repeating timer's next call; while its call runs, the
+    /// timer doesn't fire again.
+    #[test]
+    fn a_call_asked_for_at_once_in_a_long_timer_call_comes_before_its_next_call() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let class = define_class("TimerSlowFrameTarget", "NSObject", 8);
+        methods(class, &[("slowFrame:", slow_frame as usize), ("slowDone:", slow_done as usize)]);
+        let target = runtime::send(runtime::send(class, "alloc", &[]), "init", &[]);
+        let frames = timer_unscheduled(runtime::class_named("NSTimer"), 0, 1.0 / 60.0, target, runtime::sel("slowFrame:"), 0, 1);
+        run_loop_add_timer(run_loop_object(&SLOW_LOOP), 0, frames, 0);
+        timer(frames).fire_at = now() - 0.001;
+        let deadline = now() + 0.3;
+        while !SLOW_HEARD.lock().unwrap().contains(&"done") && now() < deadline {
+            run_loop_until(&SLOW_LOOP, Some(now() + 0.02), true, DEFAULT_MODE);
+        }
+        runtime::send(frames, "invalidate", &[]);
+        let heard = SLOW_HEARD.lock().unwrap().clone();
+        assert_eq!(heard.get(..2), Some(&["frame", "done"][..]), "heard {heard:?}");
+    }
+
+    /// A delayed perform for 0 s counts as asked for at once (SpellCraft's
+    /// render loop then doesn't draw what its step left: game_fixes.rs);
+    /// one for later doesn't.
+    #[test]
+    fn a_perform_for_no_delay_counts_as_asked_for_at_once() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let class = define_class("AtOnceTarget", "NSObject", 8);
+        methods(class, &[("slowDone:", slow_done as usize)]);
+        let target = runtime::send(runtime::send(class, "alloc", &[]), "init", &[]);
+        let done = runtime::sel("slowDone:");
+        let before = asked_at_once();
+        perform_after_delay(target, 0, done, 0, 30.0);
+        assert_eq!(asked_at_once(), before, "a perform for later");
+        perform_after_delay(target, 0, done, 0, 0.0);
+        assert!(asked_at_once() > before, "a perform for no delay");
+        runtime::send(runtime::class_named("NSObject"), "cancelPreviousPerformRequestsWithTarget:", &[target]);
+    }
+
+    static MODE_FIRED: AtomicUsize = AtomicUsize::new(0);
+
+    extern "C" fn mode_fired(_this: Id, _: Sel, _timer: Id) {
+        MODE_FIRED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A timer fires only while its run loop runs in one of the timer's
+    /// modes (the common modes include the default one).
+    #[test]
+    fn timers_fire_only_in_their_modes() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        static MODES_LOOP: Loop = Loop::new();
+        let class = define_class("TimerModeTarget", "NSObject", 8);
+        methods(class, &[("modeFired:", mode_fired as usize)]);
+        let target = runtime::send(runtime::send(class, "alloc", &[]), "init", &[]);
+        let timer_class = runtime::class_named("NSTimer");
+        let run_loop = run_loop_object(&MODES_LOOP);
+        let only_mine = timer_unscheduled(timer_class, 0, 0.0, target, runtime::sel("modeFired:"), 0, 0);
+        run_loop_add_timer(run_loop, 0, only_mine, string::make("TestTimerMode"));
+        timer(only_mine).fire_at = now() - 0.01;
+        let turn = |mode: &str| run_loop_until(&MODES_LOOP, Some(now() + 0.02), true, mode);
+        turn(DEFAULT_MODE);
+        assert_eq!(MODE_FIRED.load(Ordering::SeqCst), 0, "not in the default mode");
+        turn("TestTimerMode");
+        assert_eq!(MODE_FIRED.load(Ordering::SeqCst), 1, "in its own mode");
+        let common = timer_unscheduled(timer_class, 0, 0.0, target, runtime::sel("modeFired:"), 0, 0);
+        run_loop_add_timer(run_loop, 0, common, string::make(COMMON_MODES));
+        timer(common).fire_at = now() - 0.01;
+        turn(DEFAULT_MODE);
+        assert_eq!(MODE_FIRED.load(Ordering::SeqCst), 2, "the common modes take in the default mode");
+    }
+
+    static OTHER_LOOP_FIRED: AtomicUsize = AtomicUsize::new(0);
+
+    extern "C" fn other_loop_fired(_this: Id, _: Sel, _timer: Id) {
+        OTHER_LOOP_FIRED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A timer is on one run loop only, as CFRunLoop's: adding it to a second
+    /// loop changes nothing (the first doesn't take on the second's mode).
+    #[test]
+    fn a_timer_added_to_a_second_loop_stays_on_its_first() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        static FIRST: Loop = Loop::new();
+        static SECOND: Loop = Loop::new();
+        let class = define_class("TimerTwoLoopsTarget", "NSObject", 8);
+        methods(class, &[("otherLoopFired:", other_loop_fired as usize)]);
+        let target = runtime::send(runtime::send(class, "alloc", &[]), "init", &[]);
+        let t = timer_unscheduled(runtime::class_named("NSTimer"), 0, 0.0, target, runtime::sel("otherLoopFired:"), 0, 0);
+        run_loop_add_timer(run_loop_object(&FIRST), 0, t, 0);
+        run_loop_add_timer(run_loop_object(&SECOND), 0, t, string::make("TestSecondLoopMode"));
+        timer(t).fire_at = now() - 0.01;
+        run_loop_until(&FIRST, Some(now() + 0.02), true, "TestSecondLoopMode");
+        assert_eq!(OTHER_LOOP_FIRED.load(Ordering::SeqCst), 0, "the first loop took on the second's mode");
+        run_loop_until(&FIRST, Some(now() + 0.02), true, DEFAULT_MODE);
+        assert_eq!(OTHER_LOOP_FIRED.load(Ordering::SeqCst), 1, "still fires on its first loop");
+    }
+
+    static REENTER_TARGET: AtomicUsize = AtomicUsize::new(0);
+
+    /// An argument whose -isEqual: cancels other delayed performs.
+    extern "C" fn reentrant_is_equal(_this: Id, _: Sel, _other: Id) -> bool {
+        runtime::send(runtime::class_named("NSObject"), "cancelPreviousPerformRequestsWithTarget:", &[REENTER_TARGET.load(Ordering::SeqCst)]);
+        false
+    }
+
+    /// cancelPreviousPerformRequestsWithTarget:selector:object: compares the
+    /// argument with -isEqual: (game code) outside the timers' locks: an
+    /// -isEqual: that cancels performs itself doesn't hang.
+    #[test]
+    fn an_is_equal_that_cancels_performs_does_not_hang_the_cancel() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let target_class = define_class("CancelReentryTarget", "NSObject", 8);
+        methods(target_class, &[("fired:", fired as usize)]);
+        let argument_class = define_class("CancelReentryArgument", "NSObject", 8);
+        methods(argument_class, &[("isEqual:", reentrant_is_equal as usize)]);
+        let new = |class: Class| runtime::send(runtime::send(class, "alloc", &[]), "init", &[]);
+        let (target, other_target, argument, other) = (new(target_class), new(target_class), new(argument_class), new(target_class));
+        REENTER_TARGET.store(other_target, Ordering::SeqCst);
+        // On a thread loop of its own (never run): if the cancel ever hangs
+        // holding this perform's lock, the main loop's timers aren't caught.
+        std::thread::spawn(move || {
+            CURRENT_THREAD.with(|cell| cell.set(new_thread(0, 0, 0)));
+            perform_after_delay(target, 0, runtime::sel("fired:"), argument, 30.0);
+        })
+        .join()
+        .unwrap();
+        let (finished, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            cancel_previous_matching(0, 0, target, runtime::sel("fired:"), other);
+            let _ = finished.send(());
+        });
+        assert!(done.recv_timeout(std::time::Duration::from_secs(5)).is_ok(), "the cancel hung");
+        assert!(perform_pending(target, runtime::sel("fired:")), "not equal: still waiting");
+    }
+
+    /// -[CADisplayLink removeFromRunLoop:forMode:] for a run loop it isn't on
+    /// leaves it running on its own.
+    #[test]
+    fn removing_a_display_link_from_another_loop_leaves_it_on_its_own() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        static OWN: Loop = Loop::new();
+        static OTHER: Loop = Loop::new();
+        let class = define_class("LinkRemoveTarget", "NSObject", 8);
+        methods(class, &[("fired:", fired as usize)]);
+        let target = runtime::send(runtime::send(class, "alloc", &[]), "init", &[]);
+        let link = display_link_with_target(runtime::class_named("CADisplayLink"), 0, target, runtime::sel("fired:"));
+        display_link_add_to_run_loop(link, 0, run_loop_object(&OWN), 0);
+        display_link_remove(link, 0, run_loop_object(&OTHER), 0);
+        assert!(OWN.timers.lock().unwrap().contains(&link), "taken off its own loop");
+        assert_eq!(timer(link).modes, [DEFAULT_MODE]);
+        display_link_remove(link, 0, run_loop_object(&OWN), 0);
+        assert!(!OWN.timers.lock().unwrap().contains(&link), "removing from its own loop still works");
+    }
+
+    static TRACKING_FIRED: AtomicUsize = AtomicUsize::new(0);
+    static DEFAULT_FIRED: AtomicUsize = AtomicUsize::new(0);
+
+    extern "C" fn tracking_fired(_this: Id, _: Sel, _timer: Id) {
+        TRACKING_FIRED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    extern "C" fn default_fired(_this: Id, _: Sel, _timer: Id) {
+        DEFAULT_FIRED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// While a scroll view tracks, UIKit runs the main loop in
+    /// UITrackingRunLoopMode: default-mode timers wait (a game must add one
+    /// to NSRunLoopCommonModes to keep it going), tracking-mode and common
+    /// ones fire. A programmatic animated scroll is not tracking.
+    #[test]
+    fn a_scroll_tracking_puts_the_main_loop_in_tracking_mode() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        static SCROLL_LOOP: Loop = Loop::new();
+        SCROLL_LOOP.mark_main_for_test();
+        let class = define_class("TimerTrackingTarget", "NSObject", 8);
+        methods(class, &[("trackingFired:", tracking_fired as usize), ("defaultFired:", default_fired as usize)]);
+        let target = runtime::send(runtime::send(class, "alloc", &[]), "init", &[]);
+        let timer = |selector: &str| {
+            let t = timer_unscheduled(runtime::class_named("NSTimer"), 0, 0.0, target, runtime::sel(selector), 0, 0);
+            timer(t).fire_at = now() - 0.01;
+            t
+        };
+        let plain = timer("defaultFired:");
+        run_loop_add_timer(run_loop_object(&SCROLL_LOOP), 0, plain, 0);
+        let tracking = timer("trackingFired:");
+        run_loop_add_timer(run_loop_object(&SCROLL_LOOP), 0, tracking, string::make("UITrackingRunLoopMode"));
+        let turn = || run_loop_until(&SCROLL_LOOP, Some(now() + 0.05), true, DEFAULT_MODE);
+        crate::fw::controls::set_test_tracking(Some(true));
+        turn();
+        assert_eq!(DEFAULT_FIRED.load(Ordering::SeqCst), 0, "a default-mode timer waits while the loop tracks a scroll");
+        assert_eq!(TRACKING_FIRED.load(Ordering::SeqCst), 1, "a tracking-mode timer fires then");
+        crate::fw::controls::set_test_tracking(Some(false));
+        turn();
+        assert_eq!(DEFAULT_FIRED.load(Ordering::SeqCst), 1, "and fires again when the scroll ends");
+        crate::fw::controls::set_test_tracking(None);
+    }
+
+    static KEEP_ALIVE_GO: AtomicBool = AtomicBool::new(false);
+
+    /// A worker thread's body: schedules a repeating keep-alive timer (as
+    /// SpellCraft's AEBackgroundRunLoopThread does) on its own loop, runs it
+    /// once and ends when told to.
+    extern "C" fn keep_alive_then_end(this: Id, _: Sel, _: Id) {
+        timer_scheduled(runtime::class_named("NSTimer"), 0, 30.0, this, runtime::sel("check:"), this, 1);
+        run_loop_until(current_loop(), Some(now() + 0.01), true, DEFAULT_MODE);
+        while !KEEP_ALIVE_GO.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// When a thread ends, its run loop's timers end with it and let go of
+    /// their targets, as Apple's do when the thread's run loop goes.
+    #[test]
+    fn a_threads_timers_let_go_of_their_targets_when_it_ends() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let class = define_class("TimerThreadEndTarget", "NSObject", 8);
+        methods(
+            class,
+            &[("retain", counted_retain as usize), ("release", counted_release as usize), ("check:", check as usize), ("keepAliveThenEnd:", keep_alive_then_end as usize)],
+        );
+        let target = runtime::send(runtime::send(class, "alloc", &[]), "init", &[]);
+        change(target, 1);
+        let thread_class = runtime::class_named("NSThread");
+        let worker = runtime::send(runtime::send(thread_class, "alloc", &[]), "initWithTarget:selector:object:", &[target, runtime::sel("keepAliveThenEnd:"), 0]);
+        runtime::send(worker, "start", &[]);
+        assert!(wait_for(|| count_of(target) >= 3), "the timer holds its target and user info: {}", count_of(target));
+        KEEP_ALIVE_GO.store(true, Ordering::SeqCst);
+        assert!(wait_for(|| runtime::send(worker, "isFinished", &[]) & 0xFF != 0), "the thread never finished");
+        assert!(wait_for(|| count_of(target) == 1), "the ended thread's timer still holds its target: {}", count_of(target));
     }
 
     static RAN_FOR_ENDED: AtomicBool = AtomicBool::new(false);

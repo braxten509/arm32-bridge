@@ -155,9 +155,11 @@ pub fn summary(exception: Id) -> String {
     if exception == 0 {
         return "nil".into();
     }
+    // class_named takes the runtime lock itself, so it comes first.
+    let exception_class = runtime::class_named("NSException");
     let is_exception = {
         let rt = runtime::lock();
-        rt.is_subclass(rt.class_of(exception), runtime::class_named("NSException"))
+        rt.is_subclass(rt.class_of(exception), exception_class)
     };
     if !is_exception {
         return format!("{} ({})", string::describe(exception), string::describe_class_of(exception));
@@ -182,7 +184,8 @@ pub fn uncaught(exception: Id) -> ! {
         })
         .unwrap_or(0);
     if handler != 0 {
-        crate::log!("uncaught Objective-C exception: calling the game's uncaught exception handler");
+        // Named first: the game's handler often ends the app itself.
+        crate::log!("uncaught Objective-C exception: {}; calling the game's uncaught exception handler", summary(exception));
         let handler: extern "C" fn(Id) = unsafe { std::mem::transmute(handler) };
         handler(exception);
     }
@@ -243,4 +246,23 @@ pub fn register(r: &mut Registry) {
             ("raise", exception_raise as usize),
         ],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// summary() must not hold the runtime lock while it looks up
+    /// NSException (that lock is not re-entrant): an uncaught exception
+    /// froze the game in summary() instead of ending it with a STOP line.
+    #[test]
+    fn an_exception_summary_does_not_lock_itself() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let s = string::make;
+        let exception = runtime::send(runtime::class_named("NSException"), "exceptionWithName:reason:userInfo:", &[s("Name"), s("why"), 0]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(summary(exception)).unwrap());
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_millis(500)).as_deref(), Ok("Name: why"));
+    }
 }

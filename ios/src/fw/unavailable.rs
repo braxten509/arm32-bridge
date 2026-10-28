@@ -7,7 +7,7 @@
 use crate::fw::controls::{later, not_drawn, tell};
 use crate::fw::geometry::{Rect, Size};
 use crate::fw::object::{class_methods, define_class, methods};
-use crate::fw::uikit::{property_get, property_set, screen_points, view_state};
+use crate::fw::uikit::{property_get, property_set, screen_points, view_state_mut};
 use crate::objc::runtime::{self, lock, Class, Id, Sel};
 use crate::symbols::{leak, Registry};
 
@@ -59,7 +59,7 @@ fn banner_size(kind: isize) -> Size {
 fn banner_setup(this: Id, kind: isize) -> Id {
     property_set(this, "adType", kind as u64);
     property_set(this, "notDrawn", 1);
-    view_state(this).frame.size = banner_size(kind);
+    view_state_mut(this).frame.size = banner_size(kind);
     this
 }
 
@@ -319,6 +319,7 @@ fn answer_no_access(handler: usize) {
         let header = handler as *const crate::libsystem::mach::BlockHeader;
         let invoke: extern "C" fn(usize, bool, Id) = unsafe { std::mem::transmute((*header).invoke) };
         invoke(handler, false, error);
+        crate::libsystem::mach::block_release(handler as *mut _);
     });
     crate::libsystem::mach::dispatch_async(crate::libsystem::mach::dispatch_get_global_queue(0, 0), call);
 }
@@ -388,7 +389,12 @@ extern "C" fn tweet_completion(this: Id, _: Sel) -> usize {
 
 extern "C" fn tweet_set_completion(this: Id, _: Sel, handler: usize) {
     let handler = if handler == 0 { 0 } else { crate::libsystem::mach::block_copy(handler as *mut _) as usize };
+    let old = property_get(this, "completionHandler").unwrap_or(0) as usize;
     property_set(this, "completionHandler", handler as u64);
+    // A copy property: the handler it replaces is let go of.
+    if old != 0 {
+        crate::libsystem::mach::block_release(old as *mut _);
+    }
 }
 
 /// Shown, the sheet closes as cancelled (iOS says there are no Twitter

@@ -198,6 +198,265 @@ extern "C" fn enumerator_at_path(_this: Id, _: Sel, path: Id) -> Id {
     collections::enumerator(names.iter().map(|n| string::make(n)).collect())
 }
 
+// ----- NSFileHandle: { isa, *mut Handle } -----
+
+/// An open file (None once -closeFile ran, as Apple's descriptor is -1 then).
+struct Handle {
+    file: Option<std::fs::File>,
+    /// Whether -dealloc closes it: the +fileHandleFor... handles own their
+    /// descriptor (Apple 0x89749); -initWithFileDescriptor: does not.
+    close_on_dealloc: bool,
+}
+
+fn handle(object: Id) -> &'static mut Handle {
+    unsafe {
+        let slot = (object + 8) as *mut *mut Handle;
+        if (*slot).is_null() {
+            *slot = Box::into_raw(Box::new(Handle { file: None, close_on_dealloc: false }));
+        }
+        &mut **slot
+    }
+}
+
+/// The handle's open file; a closed one raises NSFileHandleOperationException,
+/// as Apple's operations do.
+fn open_file(this: Id) -> Option<&'static mut std::fs::File> {
+    let handle = handle(this);
+    if handle.file.is_none() {
+        crate::fw::collections::raise_named("NSFileHandleOperationException", "*** -[NSFileHandle]: the file handle is closed".into());
+    }
+    handle.file.as_mut()
+}
+
+fn operation_failed(what: &str, error: std::io::Error) {
+    crate::fw::collections::raise_named("NSFileHandleOperationException", format!("*** -[NSFileHandle {what}]: {error}"));
+}
+
+fn with_file(path: Id, options: std::fs::OpenOptions) -> Id {
+    let object = runtime::alloc_instance(runtime::class_named("NSFileHandle"));
+    match options.open(path_of(path)) {
+        Ok(file) => {
+            let handle = handle(object);
+            handle.file = Some(file);
+            handle.close_on_dealloc = true;
+        }
+        Err(_) => return 0,
+    }
+    object
+}
+
+extern "C" fn file_handle_for_reading(_: Class, _: Sel, path: Id) -> Id {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    with_file(path, options)
+}
+
+extern "C" fn file_handle_for_writing(_: Class, _: Sel, path: Id) -> Id {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true);
+    with_file(path, options)
+}
+
+extern "C" fn file_handle_for_updating(_: Class, _: Sel, path: Id) -> Id {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true);
+    with_file(path, options)
+}
+
+/// The one handle for a standard stream (Apple's is a handle on the stream,
+/// not a new duplicate of it each time a game asks).
+static STANDARD_INPUT: OnceLock<Id> = OnceLock::new();
+static STANDARD_OUTPUT: OnceLock<Id> = OnceLock::new();
+static STANDARD_ERROR: OnceLock<Id> = OnceLock::new();
+
+fn standard_handle(fd: i32, slot: &'static OnceLock<Id>) -> Id {
+    *slot.get_or_init(|| {
+        let object = runtime::alloc_instance(runtime::class_named("NSFileHandle"));
+        let copy = unsafe { libc::dup(fd) };
+        if copy >= 0 {
+            use std::os::unix::io::FromRawFd;
+            handle(object).file = Some(unsafe { std::fs::File::from_raw_fd(copy) });
+        }
+        object
+    })
+}
+
+extern "C" fn file_handle_standard_input(_: Class, _: Sel) -> Id {
+    standard_handle(0, &STANDARD_INPUT)
+}
+
+extern "C" fn file_handle_standard_output(_: Class, _: Sel) -> Id {
+    standard_handle(1, &STANDARD_OUTPUT)
+}
+
+extern "C" fn file_handle_standard_error(_: Class, _: Sel) -> Id {
+    standard_handle(2, &STANDARD_ERROR)
+}
+
+extern "C" fn file_handle_null_device(_: Class, _: Sel) -> Id {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true);
+    with_file(string::make("/dev/null"), options)
+}
+
+extern "C" fn file_handle_init(this: Id, _: Sel) -> Id {
+    handle(this);
+    this
+}
+
+extern "C" fn file_handle_init_descriptor(this: Id, _: Sel, descriptor: i32) -> Id {
+    file_handle_init_descriptor_close(this, 0, descriptor, 0)
+}
+
+/// -initWithFileDescriptor:closeOnDealloc: as Apple's: the handle uses the
+/// descriptor, and -dealloc closes it only when told to.
+extern "C" fn file_handle_init_descriptor_close(this: Id, _: Sel, descriptor: i32, close: u8) -> Id {
+    use std::os::unix::io::FromRawFd;
+    let handle = handle(this);
+    if descriptor >= 0 {
+        handle.file = Some(unsafe { std::fs::File::from_raw_fd(descriptor) });
+    }
+    handle.close_on_dealloc = close != 0;
+    this
+}
+
+/// -dealloc closes a handle that owns its descriptor, as Apple's does (0x89749).
+extern "C" fn file_handle_dealloc(this: Id, _: Sel) {
+    let handle = handle(this);
+    if handle.close_on_dealloc {
+        handle.file = None;
+    }
+}
+
+extern "C" fn file_handle_read_length(this: Id, _: Sel, length: usize) -> Id {
+    use std::io::Read;
+    let Some(file) = open_file(this) else { return 0 };
+    let mut bytes = Vec::new();
+    match file.take(length as u64).read_to_end(&mut bytes) {
+        Ok(_) => crate::fw::counted::autorelease(crate::fw::data::make(&bytes)),
+        Err(error) => {
+            operation_failed("readDataOfLength:", error);
+            0
+        }
+    }
+}
+
+extern "C" fn file_handle_read_to_end(this: Id, _: Sel) -> Id {
+    use std::io::Read;
+    let Some(file) = open_file(this) else { return 0 };
+    let mut bytes = Vec::new();
+    match file.read_to_end(&mut bytes) {
+        Ok(_) => crate::fw::counted::autorelease(crate::fw::data::make(&bytes)),
+        Err(error) => {
+            operation_failed("readDataToEndOfFile", error);
+            0
+        }
+    }
+}
+
+/// The rest of a regular file, or one read of what a pipe or socket holds now
+/// (Apple's -availableData: waits for neither the writer nor 4 KiB).
+extern "C" fn file_handle_available(this: Id, _: Sel) -> Id {
+    use std::io::Read;
+    use std::os::unix::io::AsRawFd;
+    let Some(file) = open_file(this) else { return 0 };
+    let mut bytes = Vec::new();
+    if is_regular_file(file.as_raw_fd()) {
+        if let Err(error) = file.read_to_end(&mut bytes) {
+            operation_failed("availableData", error);
+            return 0;
+        }
+    } else {
+        let mut buffer = [0u8; 4096];
+        match file.read(&mut buffer) {
+            Ok(read) => bytes.extend_from_slice(&buffer[..read]),
+            Err(error) => {
+                operation_failed("availableData", error);
+                return 0;
+            }
+        }
+    }
+    crate::fw::counted::autorelease(crate::fw::data::make(&bytes))
+}
+
+fn is_regular_file(descriptor: i32) -> bool {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    unsafe { libc::fstat(descriptor, &mut stat) == 0 && (stat.st_mode & libc::S_IFMT) == libc::S_IFREG }
+}
+
+extern "C" fn file_handle_write(this: Id, _: Sel, data: Id) -> Id {
+    use std::io::Write;
+    let Some(file) = open_file(this) else { return 0 };
+    if data == 0 {
+        return 0;
+    }
+    if let Err(error) = file.write_all(&crate::fw::data::bytes(data)) {
+        operation_failed("writeData:", error);
+    }
+    this
+}
+
+extern "C" fn file_handle_offset(this: Id, _: Sel) -> u64 {
+    use std::io::Seek;
+    let Some(file) = open_file(this) else { return 0 };
+    match file.stream_position() {
+        Ok(position) => position,
+        Err(error) => {
+            operation_failed("offsetInFile", error);
+            0
+        }
+    }
+}
+
+extern "C" fn file_handle_seek(this: Id, _: Sel, offset: u64) {
+    use std::io::Seek;
+    let Some(file) = open_file(this) else { return };
+    if let Err(error) = file.seek(std::io::SeekFrom::Start(offset)) {
+        operation_failed("seekToFileOffset:", error);
+    }
+}
+
+extern "C" fn file_handle_seek_end(this: Id, _: Sel) -> u64 {
+    use std::io::Seek;
+    let Some(file) = open_file(this) else { return 0 };
+    match file.seek(std::io::SeekFrom::End(0)) {
+        Ok(position) => position,
+        Err(error) => {
+            operation_failed("seekToEndOfFile", error);
+            0
+        }
+    }
+}
+
+/// -truncateFileAtOffset: sets the file's length and leaves the offset there
+/// (Apple 0xa4842).
+extern "C" fn file_handle_truncate(this: Id, _: Sel, offset: u64) {
+    use std::io::Seek;
+    let Some(file) = open_file(this) else { return };
+    if let Err(error) = file.set_len(offset) {
+        operation_failed("truncateFileAtOffset:", error);
+    } else if let Err(error) = file.seek(std::io::SeekFrom::Start(offset)) {
+        operation_failed("truncateFileAtOffset:", error);
+    }
+}
+
+extern "C" fn file_handle_synchronize(this: Id, _: Sel) {
+    let Some(file) = open_file(this) else { return };
+    if let Err(error) = file.sync_all() {
+        operation_failed("synchronizeFile", error);
+    }
+}
+
+extern "C" fn file_handle_descriptor(this: Id, _: Sel) -> isize {
+    use std::os::unix::io::AsRawFd;
+    handle(this).file.as_ref().map_or(-1, |file| file.as_raw_fd() as isize)
+}
+
+extern "C" fn file_handle_close(this: Id, _: Sel) {
+    // Dropping the File closes its descriptor, as -closeFile does.
+    handle(this).file = None;
+}
+
 // ----- NSLocale -----
 
 static LOCALE: OnceLock<Id> = OnceLock::new();
@@ -427,6 +686,39 @@ pub fn register(r: &mut Registry) {
             ("fileSystemRepresentationWithPath:", file_system_representation_with_path as usize),
         ],
     );
+    let file_handle = define_class("NSFileHandle", "NSObject", 16);
+    class_methods(
+        file_handle,
+        &[
+            ("fileHandleForReadingAtPath:", file_handle_for_reading as usize),
+            ("fileHandleForWritingAtPath:", file_handle_for_writing as usize),
+            ("fileHandleForUpdatingAtPath:", file_handle_for_updating as usize),
+            ("fileHandleWithStandardInput", file_handle_standard_input as usize),
+            ("fileHandleWithStandardOutput", file_handle_standard_output as usize),
+            ("fileHandleWithStandardError", file_handle_standard_error as usize),
+            ("fileHandleWithNullDevice", file_handle_null_device as usize),
+        ],
+    );
+    methods(
+        file_handle,
+        &[
+            ("init", file_handle_init as usize),
+            ("initWithFileDescriptor:", file_handle_init_descriptor as usize),
+            ("initWithFileDescriptor:closeOnDealloc:", file_handle_init_descriptor_close as usize),
+            ("dealloc", file_handle_dealloc as usize),
+            ("readDataOfLength:", file_handle_read_length as usize),
+            ("readDataToEndOfFile", file_handle_read_to_end as usize),
+            ("availableData", file_handle_available as usize),
+            ("writeData:", file_handle_write as usize),
+            ("offsetInFile", file_handle_offset as usize),
+            ("seekToFileOffset:", file_handle_seek as usize),
+            ("seekToEndOfFile", file_handle_seek_end as usize),
+            ("truncateFileAtOffset:", file_handle_truncate as usize),
+            ("synchronizeFile", file_handle_synchronize as usize),
+            ("fileDescriptor", file_handle_descriptor as usize),
+            ("closeFile", file_handle_close as usize),
+        ],
+    );
     let locale = define_class("NSLocale", "NSObject", 8);
     class_methods(
         locale,
@@ -478,6 +770,106 @@ mod tests {
         let french = runtime::send(class, "localeWithLocaleIdentifier:", &[string::make("fr")]);
         assert_eq!(name(french, "kCFLocaleIdentifierKey", "fr"), some("français"));
         let japanese = runtime::send(class, "localeWithLocaleIdentifier:", &[string::make("ja_JP")]);
-        assert_eq!(name(japanese, "kCFLocaleLanguageCodeKey", "ja"), some("日本語"));
+        assert_eq!(name(japanese, "kCFLocaleLanguageCodeKey", "ja"), Some("日本語".to_string()));
+    }
+
+    /// NSFileHandle reads, writes, seeks and closes as Apple's does:
+    /// +fileHandleForReadingAtPath:/+fileHandleForWritingAtPath:, the read
+    /// methods, -writeData:, -offsetInFile, -seekToFileOffset:,
+    /// -seekToEndOfFile, -fileDescriptor (closed: -1) and -closeFile.
+    #[test]
+    fn file_handles_read_write_seek_and_close() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let folder = std::env::temp_dir().join(format!("gamebridge-filehandle-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let class = runtime::class_named("NSFileHandle");
+        let reading = folder.join("reading.txt");
+        std::fs::write(&reading, b"hello world").unwrap();
+        let path = string::make(&reading.to_string_lossy());
+        let handle = runtime::send(class, "fileHandleForReadingAtPath:", &[path]);
+        assert_ne!(handle, 0, "a readable file gives a handle");
+        let first = runtime::send(handle, "readDataOfLength:", &[5usize]);
+        assert_eq!(crate::fw::data::bytes(first), b"hello");
+        assert_eq!(runtime::send(handle, "offsetInFile", &[]), 5, "the read moved the offset");
+        runtime::send(handle, "seekToFileOffset:", &[6usize]);
+        let rest = runtime::send(handle, "readDataToEndOfFile", &[]);
+        assert_eq!(crate::fw::data::bytes(rest), b"world");
+        assert_eq!(runtime::send(handle, "seekToEndOfFile", &[]), 11, "the end of the file");
+        assert!(runtime::send(handle, "fileDescriptor", &[]) as isize >= 0);
+        runtime::send(handle, "closeFile", &[]);
+        assert_eq!(runtime::send(handle, "fileDescriptor", &[]) as isize, -1, "a closed handle has no descriptor");
+        assert_eq!(runtime::send(class, "fileHandleForReadingAtPath:", &[string::make(&folder.join("missing.txt").to_string_lossy())]), 0, "no file, no handle");
+
+        let writing = folder.join("writing.txt");
+        std::fs::write(&writing, b"").unwrap();
+        let writer = runtime::send(class, "fileHandleForWritingAtPath:", &[string::make(&writing.to_string_lossy())]);
+        assert_ne!(writer, 0, "an existing file opens for writing");
+        runtime::send(writer, "writeData:", &[crate::fw::data::make(b"abc")]);
+        runtime::send(writer, "synchronizeFile", &[]);
+        runtime::send(writer, "closeFile", &[]);
+        assert_eq!(std::fs::read(&writing).unwrap(), b"abc");
+
+        // -truncateFileAtOffset: leaves the offset at the new end too (Apple
+        // 0xa4842).
+        let editing = folder.join("truncate.txt");
+        std::fs::write(&editing, b"abcdef").unwrap();
+        let editor = runtime::send(class, "fileHandleForUpdatingAtPath:", &[string::make(&editing.to_string_lossy())]);
+        runtime::send(editor, "seekToFileOffset:", &[4usize]);
+        runtime::send(editor, "truncateFileAtOffset:", &[3usize]);
+        assert_eq!(runtime::send(editor, "offsetInFile", &[]) as u64, 3, "the offset moved to the end");
+        assert_eq!(std::fs::read(&editing).unwrap(), b"abc");
+        runtime::send(editor, "closeFile", &[]);
+
+        // The standard handles are one object each (one descriptor), and a
+        // handle closes its file when it is deallocated.
+        let first = runtime::send(class, "fileHandleWithStandardOutput", &[]);
+        let second = runtime::send(class, "fileHandleWithStandardOutput", &[]);
+        assert_eq!(first, second, "standard output is one handle, not a new dup each call");
+        let doomed = runtime::send(class, "fileHandleForReadingAtPath:", &[string::make(&reading.to_string_lossy())]);
+        assert_ne!(runtime::send(doomed, "fileDescriptor", &[]) as isize, -1);
+        runtime::send(doomed, "dealloc", &[]);
+        assert_eq!(runtime::send(doomed, "fileDescriptor", &[]) as isize, -1, "dealloc closed the handle's file");
+        std::fs::remove_dir_all(&folder).unwrap();
+    }
+
+    /// -availableData returns what a pipe holds after one read (it must not
+    /// wait for the writer to close) and the rest of a regular file.
+    #[test]
+    fn available_data_reads_a_pipe_once_and_a_file_to_the_end() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "a pipe");
+        let class = runtime::class_named("NSFileHandle");
+        let handle = runtime::send(
+            runtime::send(class, "alloc", &[]),
+            "initWithFileDescriptor:closeOnDealloc:",
+            &[fds[0] as usize, 1],
+        );
+        assert_ne!(handle, 0, "-initWithFileDescriptor:closeOnDealloc:");
+        let wrote = unsafe { libc::write(fds[1], b"abc".as_ptr() as *const libc::c_void, 3) };
+        assert_eq!(wrote, 3);
+        let (done, got) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let data = runtime::send(handle, "availableData", &[]);
+            let _ = done.send(crate::fw::data::bytes(data));
+        });
+        let bytes = got.recv_timeout(std::time::Duration::from_millis(500)).expect("availableData waited for the pipe to close");
+        assert_eq!(bytes, b"abc", "one read gives what the pipe holds");
+        unsafe { libc::close(fds[1]) };
+
+        let folder = std::env::temp_dir().join(format!("gamebridge-available-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("large.txt");
+        let contents: Vec<u8> = (0..5000).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &contents).unwrap();
+        let reader = runtime::send(class, "fileHandleForReadingAtPath:", &[string::make(&path.to_string_lossy())]);
+        let first = runtime::send(reader, "readDataOfLength:", &[100usize]);
+        assert_eq!(crate::fw::data::bytes(first), contents[..100], "the first hundred bytes");
+        let rest = runtime::send(reader, "availableData", &[]);
+        assert_eq!(crate::fw::data::bytes(rest), contents[100..], "the rest of the file, not just 4 KiB");
+        runtime::send(reader, "closeFile", &[]);
+        std::fs::remove_dir_all(&folder).unwrap();
     }
 }

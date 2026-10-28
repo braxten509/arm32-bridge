@@ -12,7 +12,7 @@ const DUPLICATE: i32 = -25299;
 const BAD_PARAMETER: i32 = -50;
 const IO_ERROR: i32 = -36;
 
-const CONTROL_KEYS: &[&str] = &["r_Data", "r_Attributes", "r_Ref", "r_PersistentRef", "m_Limit", "v_Data", "u_AuthUI", "u_OpPrompt"];
+const CONTROL_KEYS: &[&str] = &["r_Data", "r_Attributes", "r_Ref", "r_PersistentRef", "m_Limit", "v_Data", "v_PersistentRef", "u_AuthUI", "u_OpPrompt"];
 
 static LOCK: Mutex<()> = Mutex::new(());
 
@@ -99,9 +99,50 @@ fn same_value(stored: &plist::Value, wanted: Id) -> bool {
 }
 
 fn matches(item: &Item, query: &[(String, Id)]) -> bool {
-    query.iter().filter(|(k, _)| !CONTROL_KEYS.contains(&k.as_str())).all(|(key, wanted)| {
-        item.iter().any(|(k, v)| k == key && same_value(v, *wanted))
-    })
+    let by_reference = query.iter().filter(|(k, _)| k == "v_PersistentRef").all(|(_, wanted)| data::is_data(*wanted) && data::bytes(*wanted) == persistent_ref(item));
+    by_reference
+        && query.iter().filter(|(k, _)| !CONTROL_KEYS.contains(&k.as_str())).all(|(key, wanted)| item.iter().any(|(k, v)| k == key && same_value(v, *wanted)))
+}
+
+/// Each item's own number, saved with it (Apple's keychain rows have one);
+/// not an attribute, so never handed out or matched.
+const ROW_KEY: &str = "gb_row";
+
+/// An item's persistent reference (kSecValuePersistentRef): bytes naming it
+/// by its saved row number, so it finds the same item in a later run, even
+/// after an update. Items saved before rows were numbered: all their
+/// attributes but the secret.
+fn persistent_ref(item: &Item) -> Vec<u8> {
+    let mut bytes = b"gbkc".to_vec();
+    match item.iter().find(|(k, _)| k == ROW_KEY) {
+        Some((_, row)) => bytes.extend_from_slice(format!("{row:?}").as_bytes()),
+        None => {
+            for (key, value) in item.iter().filter(|(k, _)| k != "v_Data") {
+                bytes.extend_from_slice(format!("{key}={value:?}\0").as_bytes());
+            }
+        }
+    }
+    bytes
+}
+
+/// A new row number, never given out before (like Apple's rowids, a deleted
+/// item's number stays unused): past every saved row, every number handed
+/// out in this run, and the clock in microseconds, so a later run does not
+/// reuse a number whose item was deleted.
+fn next_row(items: &[Item]) -> i64 {
+    static LAST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    let rows = items.iter().filter_map(|item| match item.iter().find(|(k, _)| k == ROW_KEY) {
+        Some((_, plist::Value::Integer(row))) => Some(*row),
+        _ => None,
+    });
+    let saved = rows.max().unwrap_or(0);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros() as i64);
+    let mut row = 0;
+    let _ = LAST.fetch_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |last| {
+        row = (last + 1).max(saved + 1).max(now);
+        Some(row)
+    });
+    row
 }
 
 /// A key item's SecKeyRef: made from its stored bytes (public RSA keys);
@@ -117,21 +158,42 @@ fn result_for(item: &Item, query: &[(String, Id)]) -> Id {
     let get = |name: &str| query.iter().find(|(k, _)| k == name).map(|(_, v)| *v).unwrap_or(0);
     let want_data = truthy(get("r_Data"));
     let want_attributes = truthy(get("r_Attributes"));
-    if truthy(get("r_Ref")) && !want_data && !want_attributes {
+    let want_persistent = truthy(get("r_PersistentRef"));
+    let want_ref = truthy(get("r_Ref"));
+    let kinds = [want_data, want_attributes, want_persistent, want_ref].iter().filter(|&&w| w).count();
+    if want_ref && kinds == 1 {
         return key_ref(item);
     }
     let stored_data = || match item.iter().find(|(k, _)| k == "v_Data").map(|(_, v)| v) {
         Some(plist::Value::Data(bytes)) => data::make(bytes),
         _ => data::make(&[]),
     };
-    if want_attributes {
-        let mut entries: Vec<(String, plist::Value)> = item.iter().filter(|(k, _)| k != "v_Data").cloned().collect();
+    if want_persistent && kinds == 1 {
+        return data::make(&persistent_ref(item));
+    }
+    // More than one kind asked for: a dictionary of them (the attributes too when asked).
+    if want_attributes || kinds > 1 {
+        let mut entries: Vec<(String, plist::Value)> = if want_attributes {
+            item.iter().filter(|(k, _)| k != "v_Data" && k != ROW_KEY).cloned().collect()
+        } else {
+            Vec::new()
+        };
         if want_data {
             if let Some(v) = item.iter().find(|(k, _)| k == "v_Data") {
                 entries.push(v.clone());
             }
         }
-        return plist::to_object(&plist::Value::Dict(entries));
+        if want_persistent {
+            entries.push(("v_PersistentRef".into(), plist::Value::Data(persistent_ref(item))));
+        }
+        let dictionary = plist::to_object(&plist::Value::Dict(entries));
+        let key = if want_ref { key_ref(item) } else { 0 };
+        if key == 0 {
+            return dictionary;
+        }
+        let mut pairs = collections::dictionary_pairs(dictionary);
+        pairs.push((string::make("v_Ref"), key));
+        return collections::dictionary_from(&pairs);
     }
     if want_data {
         return stored_data();
@@ -181,14 +243,15 @@ extern "C" fn add(attributes: Id, result: *mut Id) -> i32 {
         Ok(items) => items,
         Err(code) => return code,
     };
-    let new_item = item_from(&attributes);
+    let mut new_item = item_from(&attributes);
     let new_identity = identity(&new_item);
     if items.iter().any(|item| identity(item) == new_identity) {
         return DUPLICATE;
     }
+    new_item.push((ROW_KEY.into(), plist::Value::Integer(next_row(&items))));
     if !result.is_null() {
-        let wants_ref = attributes.iter().any(|(k, v)| k == "r_Ref" && truthy(*v));
-        unsafe { *result = if wants_ref { key_ref(&new_item) } else { 0 } };
+        // What was asked for (a key's reference, its persistent reference...).
+        unsafe { *result = result_for(&new_item, &attributes) };
     }
     items.push(new_item);
     if save(&items) { SUCCESS } else { BAD_PARAMETER }
@@ -330,6 +393,7 @@ pub fn register(r: &mut Registry) {
         ("kSecAttrDescription", "desc"),
         ("kSecAttrComment", "icmt"),
         ("kSecValueData", "v_Data"),
+        ("kSecValuePersistentRef", "v_PersistentRef"),
         ("kSecReturnData", "r_Data"),
         ("kSecReturnAttributes", "r_Attributes"),
         ("kSecReturnPersistentRef", "r_PersistentRef"),
@@ -360,4 +424,58 @@ pub fn register(r: &mut Registry) {
     r.function("CFRetain", cf_retain as usize);
     r.function("CFRelease", cf_release as usize);
     let _ = runtime::sel;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// kSecReturnPersistentRef hands back data naming the item, which finds
+    /// it again as kSecValuePersistentRef (and no other item).
+    #[test]
+    fn a_persistent_ref_finds_its_item_again() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let item = |account: &str| -> Item {
+            vec![
+                ("class".into(), plist::Value::String("genp".into())),
+                ("acct".into(), plist::Value::String(account.into())),
+                ("svce".into(), plist::Value::String("game".into())),
+                ("v_Data".into(), plist::Value::Data(b"secret".to_vec())),
+            ]
+        };
+        let (mine, other) = (item("me"), item("you"));
+        let reference = result_for(&mine, &[("r_PersistentRef".into(), collections::number_bool(true))]);
+        assert!(reference != 0 && data::is_data(reference) && !data::bytes(reference).is_empty());
+        let query = [("v_PersistentRef".to_string(), reference)];
+        assert!(matches(&mine, &query));
+        assert!(!matches(&other, &query));
+        // Asked with the attributes, it is one of them.
+        let attributes = result_for(&mine, &[("r_PersistentRef".into(), collections::number_bool(true)), ("r_Attributes".into(), collections::number_bool(true))]);
+        let found = collections::dictionary_get(attributes, string::make("v_PersistentRef"));
+        assert_eq!(data::bytes(found), data::bytes(reference));
+
+        // Each item has its own: two with no account or service (told apart
+        // by label here), or the same attributes under two saved row numbers.
+        let labelled = |label: &str| -> Item { vec![("class".into(), plist::Value::String("genp".into())), ("labl".into(), plist::Value::String(label.into()))] };
+        let pref = |item: &Item| data::bytes(result_for(item, &[("r_PersistentRef".into(), collections::number_bool(true))]));
+        assert_ne!(pref(&labelled("a")), pref(&labelled("b")));
+        let numbered = |row: i64| -> Item {
+            let mut item = labelled("a");
+            item.push((ROW_KEY.into(), plist::Value::Integer(row)));
+            item
+        };
+        assert_ne!(pref(&numbered(1)), pref(&numbered(2)));
+        let attributes = result_for(&numbered(1), &[("r_Attributes".into(), collections::number_bool(true))]);
+        assert_eq!(collections::dictionary_get(attributes, string::make(ROW_KEY)), 0, "the row number is ours, not an attribute");
+        // A row number is never given out again, even once its item is
+        // deleted (a saved reference must not find a later item).
+        let first = next_row(&[]);
+        assert!(next_row(&[]) > first, "the deleted item's number stays unused");
+        assert!(next_row(&[numbered(i64::MAX / 2)]) > i64::MAX / 2);
+        // The reference and the persistent reference together: a dictionary.
+        let both = result_for(&mine, &[("r_Ref".into(), collections::number_bool(true)), ("r_PersistentRef".into(), collections::number_bool(true))]);
+        assert!(collections::is_dictionary(both));
+        assert_eq!(data::bytes(collections::dictionary_get(both, string::make("v_PersistentRef"))), data::bytes(reference));
+    }
 }

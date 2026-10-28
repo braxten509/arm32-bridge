@@ -817,8 +817,7 @@ pub fn register(r: &mut Registry) {
     r.data("kCFNumberPositiveInfinity", leak(collections::number_float(f64::INFINITY)));
     r.data("kCFNumberNegativeInfinity", leak(collections::number_float(f64::NEG_INFINITY)));
 
-    // The run loop runs every mode alike, so the common modes are simply a
-    // name of their own.
+    // The common modes: the default and tracking modes (runloop.rs).
     let common = leak(string::make("kCFRunLoopCommonModes"));
     r.data("NSRunLoopCommonModes", common);
     r.data("kCFRunLoopCommonModes", common);

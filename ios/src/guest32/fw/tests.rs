@@ -524,6 +524,29 @@ const GL_TEXTURE_COORD_ARRAY: u32 = 0x8078;
 const GL_TEXTURE_ENV: u32 = 0x2300;
 const GL_TEXTURE_ENV_MODE: u32 = 0x2200;
 
+// OpenGL ES 2/3 state the turned present path touches (and puts back).
+const GL_FRAMEBUFFER: u32 = 0x8D40;
+const GL_RENDERBUFFER: u32 = 0x8D41;
+const GL_COLOR_ATTACHMENT0: u32 = 0x8CE0;
+const GL_SCISSOR_TEST: u32 = 0x0C11;
+const GL_COLOR_BUFFER_BIT: u32 = 0x4000;
+const GL_BLEND: u32 = 0x0BE2;
+const GL_DEPTH_TEST: u32 = 0x0B71;
+const GL_CULL_FACE: u32 = 0x0B44;
+const GL_DITHER: u32 = 0x0BD0;
+const GL_POLYGON_OFFSET_FILL: u32 = 0x8037;
+const GL_TEXTURE0: u32 = 0x84C0;
+const GL_TEXTURE2: u32 = 0x84C2;
+const GL_CURRENT_PROGRAM: u32 = 0x8B8D;
+const GL_VERTEX_ARRAY_BINDING: u32 = 0x85B5;
+const GL_ACTIVE_TEXTURE: u32 = 0x84E0;
+const GL_TEXTURE_BINDING_2D: u32 = 0x8069;
+const GL_SAMPLER_BINDING: u32 = 0x8919;
+const GL_COLOR_CLEAR_VALUE: u32 = 0x0C22;
+const GL_COLOR_WRITEMASK: u32 = 0x0C23;
+const GL_VIEWPORT: u32 = 0x0BA2;
+const GL_SCISSOR_BOX: u32 = 0x0C10;
+
 /// [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES1], made current.
 fn es1_context() -> usize {
     let class = crate::objc::runtime::class_named("EAGLContext");
@@ -730,6 +753,106 @@ fn es1_frames_reach_the_window_and_the_game_state_stays() {
     if x0 > 0 || y0 > 0 {
         assert_eq!(pixel(&pixels, window_width, 0, 0), [0, 0, 0, 255], "black around the picture");
     }
+    crate::fw::eagl::use_test_window(0, 0);
+    make_current(0);
+}
+
+/// A view whose layer is a CAEAGLLayer (a GL view hand-turned by the game is
+/// a legitimate iOS case, needing no old-game Info.plist): the turn comes
+/// from the view's own transform.
+#[test]
+fn es3_frames_are_turned_with_the_layers_view_and_game_state_stays() {
+    use crate::fw::geometry::{Rect, Transform};
+    setup();
+    let context = eagl_context(0);
+    make_current(context);
+
+    extern "C" fn gl_layer_class(_: crate::objc::runtime::Class, _: crate::objc::runtime::Sel) -> crate::objc::runtime::Class {
+        crate::objc::runtime::class_named("CAEAGLLayer")
+    }
+    let gl_view_class = crate::fw::object::define_class("GLPresentView", "UIView", 8);
+    crate::fw::object::class_methods(gl_view_class, &[("layerClass", gl_layer_class as usize)]);
+    let window = crate::objc::runtime::send(crate::objc::runtime::class_named("UIWindow"), "alloc", &[]);
+    crate::fw::uikit::send_rect(window, "initWithFrame:", Rect::new(0.0, 0.0, 568.0, 320.0));
+    let view = crate::objc::runtime::send(gl_view_class, "alloc", &[]);
+    crate::fw::uikit::send_rect(view, "initWithFrame:", Rect::new(0.0, 0.0, 4.0, 4.0));
+    crate::fw::uikit::view_state_mut(view).transform = Transform { a: 0.0, b: -1.0, c: 1.0, d: 0.0, tx: 0.0, ty: 0.0 };
+    crate::objc::runtime::send(window, "addSubview:", &[view]);
+    let layer = crate::objc::runtime::send(view, "layer", &[]);
+
+    // A 4x4 renderbuffer in a framebuffer, its storage given by the layer.
+    let names = alloc(8);
+    call("glGenFramebuffers", [1, names, 0, 0], &[]);
+    call("glGenRenderbuffers", [1, names + 4, 0, 0], &[]);
+    let (framebuffer, renderbuffer) = (mem().read_u32(names), mem().read_u32(names + 4));
+    call("glBindFramebuffer", [GL_FRAMEBUFFER, framebuffer, 0, 0], &[]);
+    call("glBindRenderbuffer", [GL_RENDERBUFFER, renderbuffer, 0, 0], &[]);
+    assert_ne!(crate::objc::runtime::send(context, "renderbufferStorage:fromDrawable:", &[GL_RENDERBUFFER as usize, layer as usize]), 0, "the layer gave the renderbuffer its storage");
+    call("glFramebufferRenderbuffer", [GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, renderbuffer], &[]);
+    assert_eq!(call("glCheckFramebufferStatus", [GL_FRAMEBUFFER, 0, 0, 0], &[]).0, 0x8CD5, "the framebuffer is complete");
+
+    // A distinct colour in each quadrant (framebuffer coordinates, y up).
+    call("glEnable", [GL_SCISSOR_TEST, 0, 0, 0], &[]);
+    for (x, y, colour) in [(0u32, 0u32, [1.0f32, 0.0, 0.0]), (2, 0, [0.0, 1.0, 0.0]), (0, 2, [0.0, 0.0, 1.0]), (2, 2, [1.0, 1.0, 0.0])] {
+        call("glScissor", [x, y, 2, 2], &[]);
+        call("glClearColor", [f(colour[0]), f(colour[1]), f(colour[2]), f(1.0)], &[]);
+        call("glClear", [GL_COLOR_BUFFER_BIT, 0, 0, 0], &[]);
+    }
+
+    // The game left all kinds of GL state set; presenting must not change it.
+    call("glViewport", [1, 2, 3, 4], &[]);
+    call("glClearColor", [f(0.25), f(0.5), f(0.75), f(1.0)], &[]);
+    call("glColorMask", [1, 0, 1, 1], &[]);
+    for cap in [GL_BLEND, GL_DEPTH_TEST, GL_CULL_FACE, GL_DITHER, GL_POLYGON_OFFSET_FILL] {
+        call("glEnable", [cap, 0, 0, 0], &[]);
+    }
+    call("glScissor", [0, 0, 1, 1], &[]);
+    let vao_names = alloc(4);
+    call("glGenVertexArrays", [1, vao_names, 0, 0], &[]);
+    let vao = mem().read_u32(vao_names);
+    call("glBindVertexArray", [vao, 0, 0, 0], &[]);
+    call("glGenTextures", [1, names, 0, 0], &[]);
+    let texture = mem().read_u32(names);
+    call("glActiveTexture", [GL_TEXTURE0, 0, 0, 0], &[]);
+    call("glBindTexture", [GL_TEXTURE_2D, texture, 0, 0], &[]);
+    call("glGenSamplers", [1, names, 0, 0], &[]);
+    let sampler = mem().read_u32(names);
+    call("glBindSampler", [0, sampler, 0, 0], &[]);
+    call("glActiveTexture", [GL_TEXTURE2, 0, 0, 0], &[]);
+
+    let (window_width, window_height) = (64u32, 48u32);
+    crate::fw::eagl::use_test_window(window_width as i32, window_height as i32);
+    assert_ne!(crate::objc::runtime::send(context, "presentRenderbuffer:", &[GL_RENDERBUFFER as usize]), 0, "the frame was shown");
+    assert_eq!(call("glGetError", [0; 4], &[]).0, 0, "no GL error");
+
+    // Everything the game set is as it was.
+    assert_eq!(gl_ints(GL_CURRENT_PROGRAM, 1), [0], "current program");
+    assert_eq!(gl_ints(GL_VERTEX_ARRAY_BINDING, 1), [vao], "vertex array binding");
+    assert_eq!(gl_ints(GL_ACTIVE_TEXTURE, 1), [GL_TEXTURE2], "active texture");
+    call("glActiveTexture", [GL_TEXTURE0, 0, 0, 0], &[]);
+    let unit0 = (gl_ints(GL_TEXTURE_BINDING_2D, 1)[0], gl_ints(GL_SAMPLER_BINDING, 1)[0]);
+    call("glActiveTexture", [GL_TEXTURE2, 0, 0, 0], &[]);
+    assert_eq!(unit0, (texture, sampler), "unit 0's texture and sampler");
+    assert_eq!(gl_ints(GL_VIEWPORT, 4), [1, 2, 3, 4], "viewport");
+    assert_eq!(gl_floats(GL_COLOR_CLEAR_VALUE, 4), [0.25, 0.5, 0.75, 1.0], "clear colour");
+    assert_eq!(gl_ints(GL_COLOR_WRITEMASK, 4), [1, 0, 1, 1], "colour mask");
+    for (cap, name) in [(GL_BLEND, "blend"), (GL_DEPTH_TEST, "depth"), (GL_CULL_FACE, "cull"), (GL_DITHER, "dither"), (GL_POLYGON_OFFSET_FILL, "polygon offset"), (GL_SCISSOR_TEST, "scissor")] {
+        assert_eq!(call("glIsEnabled", [cap, 0, 0, 0], &[]).0 & 0xff, 1, "{name}");
+    }
+    assert_eq!(gl_ints(GL_SCISSOR_BOX, 4), [0, 0, 1, 1], "scissor box");
+
+    // The window shows the picture turned a quarter turn: the buffer's
+    // top-left is the window's bottom-left, and so on around.
+    call("glBindFramebuffer", [GL_FRAMEBUFFER, 0, 0, 0], &[]);
+    call("glColorMask", [1, 1, 1, 1], &[]);
+    let pixels = read_pixels(window_width, window_height);
+    call("glBindFramebuffer", [GL_FRAMEBUFFER, framebuffer, 0, 0], &[]);
+    let (x0, y0, x1, y1) = crate::fw::eagl::picture_area(window_width as i32, window_height as i32);
+    assert_eq!(pixel(&pixels, window_width, x0 as u32 + 1, y0 as u32 + 1), [0, 0, 255, 255], "top-left lands bottom-left");
+    assert_eq!(pixel(&pixels, window_width, x1 as u32 - 1, y0 as u32 + 1), [255, 0, 0, 255], "bottom-left lands bottom-right");
+    assert_eq!(pixel(&pixels, window_width, x0 as u32 + 1, y1 as u32 - 1), [255, 255, 0, 255], "top-right lands top-left");
+    assert_eq!(pixel(&pixels, window_width, x1 as u32 - 1, y1 as u32 - 1), [0, 255, 0, 255], "bottom-right lands top-right");
+
     crate::fw::eagl::use_test_window(0, 0);
     make_current(0);
 }

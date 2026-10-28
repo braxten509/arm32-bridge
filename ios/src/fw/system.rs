@@ -42,7 +42,7 @@ pub fn guest_memory() -> Option<GuestMemory> {
     *GUEST_MEMORY.read().unwrap_or_else(|e| e.into_inner())
 }
 
-fn guest_memory_at(address: usize) -> Option<GuestMemory> {
+pub(crate) fn guest_memory_at(address: usize) -> Option<GuestMemory> {
     GUEST_MEMORY.read().unwrap_or_else(|e| e.into_inner()).filter(|m| (m.owns)(address))
 }
 
@@ -172,10 +172,15 @@ fn chain(names: &[&str]) -> Vec<String> {
     names.iter().map(|n| n.to_string()).collect()
 }
 
-/// `object`'s class and its superclasses by name.
+/// The class `object` saves as (its -classForKeyedArchiver, by default its
+/// -classForCoder: a class-cluster member names its public class) and that
+/// class's superclasses, by name.
 fn class_chain(object: Id) -> Vec<String> {
     let mut out = Vec::new();
-    let mut class = runtime::lock().class_of(object);
+    let mut class = match runtime::send(object, "classForKeyedArchiver", &[]) {
+        0 => runtime::lock().class_of(object),
+        named => named,
+    };
     while class != 0 && out.len() < 64 {
         out.push(runtime::lock().class_name(class));
         class = runtime::send(class, "superclass", &[]);
@@ -1166,8 +1171,31 @@ extern "C" fn motion_start_with_frame_handler(this: Id, s: Sel, _frame: usize, _
 
 extern "C" fn ignore(_this: Id, _: Sel) {}
 
+/// -[NSObject classForCoder]: the object's own class.
+extern "C" fn class_for_coder(this: Id, _: Sel) -> Class {
+    runtime::send(this, "class", &[])
+}
+
+/// -[NSObject classForKeyedArchiver]: -classForCoder.
+extern "C" fn class_for_keyed_archiver(this: Id, _: Sel) -> Class {
+    runtime::send(this, "classForCoder", &[])
+}
+
+/// +[NSObject version]: 0 unless a class sets one.
+extern "C" fn class_version(_class: Class, _: Sel) -> isize {
+    0
+}
+
+/// -[NSTimeZone initWithName:]: the zone +timeZoneWithName: gives.
+extern "C" fn time_zone_init_with_name(_this: Id, _: Sel, name: Id) -> Id {
+    time_zone_with_name(runtime::class_named("NSTimeZone"), 0, name)
+}
+
 pub fn register(_: &mut Registry) {
     register_coders();
+    let object = runtime::class_named("NSObject");
+    methods(object, &[("classForCoder", class_for_coder as usize), ("classForKeyedArchiver", class_for_keyed_archiver as usize)]);
+    class_methods(object, &[("version", class_version as usize)]);
 
     let zone = define_class("NSTimeZone", "NSObject", 8);
     class_methods(
@@ -1190,6 +1218,7 @@ pub fn register(_: &mut Registry) {
             ("description", time_zone_name as usize),
             ("abbreviation", time_zone_abbreviation as usize),
             ("isDaylightSavingTime", time_zone_is_daylight_saving as usize),
+            ("initWithName:", time_zone_init_with_name as usize),
         ],
     );
 
@@ -1489,5 +1518,27 @@ mod tests {
         let party = collections::array_items(runtime::send(reader, "decodeObjectForKey:", &[string::make("party")]));
         assert_eq!(string::get(field(party[0], "name") as Id), "Drake");
         runtime::send(reader, "finishDecoding", &[]);
+    }
+
+    extern "C" fn public_face(_this: Id, _: Sel) -> Class {
+        hero_class()
+    }
+
+    /// The archive names the class -classForKeyedArchiver gives (by default
+    /// -classForCoder): a class-cluster member saves as its public class.
+    #[test]
+    fn apple_archives_name_the_class_for_keyed_archiver() {
+        ready();
+        let _ = hero_class();
+        let member = define_class("CoderTestHeroMember", "CoderTestHero", 8);
+        methods(member, &[("classForCoder", public_face as usize)]);
+        let object = runtime::alloc_instance(member);
+        property_set(object, "name", string::make("Member") as u64);
+        let data = runtime::send(runtime::class_named("NSKeyedArchiver"), "archivedDataWithRootObject:", &[object]);
+        let text = format!("{:?}", plist::parse(&crate::fw::data::bytes(data)).unwrap());
+        assert!(text.contains("CoderTestHero") && !text.contains("CoderTestHeroMember"), "{text}");
+        let back = runtime::send(runtime::class_named("NSKeyedUnarchiver"), "unarchiveObjectWithData:", &[data]);
+        let class = runtime::lock().class_of(back);
+        assert_eq!(class, hero_class());
     }
 }

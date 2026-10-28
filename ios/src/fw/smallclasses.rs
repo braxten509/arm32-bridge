@@ -6,7 +6,7 @@ use crate::libsystem::mach::{block_copy, call_block, BlockHeader};
 use crate::objc::runtime::{self, lock, Class, Id, Sel};
 use crate::symbols::{leak, Registry};
 use std::cell::RefCell;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 // ----- NSIndexPath: { isa, *mut Vec<usize> } -----
 
@@ -285,54 +285,102 @@ struct Transaction {
     disable_actions: Option<bool>,
     duration: Option<f64>,
     timing: Option<Id>,
-    completion: usize,
-    /// Completion blocks of nested transactions, run with this one's.
-    pending: Vec<usize>,
+    /// Its completion block's continuation (setCompletionBlock:).
+    continuation: Option<Arc<Continuation>>,
     values: Id,
-    /// The animations (the layers' copies) added in it or a nested one.
-    animations: Vec<Id>,
 }
 
 impl Transaction {
     fn new(implicit: bool) -> Self {
-        Transaction { implicit, disable_actions: None, duration: None, timing: None, completion: 0, pending: Vec::new(), values: 0, animations: Vec::new() }
-    }
-
-    fn blocks(self) -> (Vec<usize>, Vec<Id>) {
-        let mut blocks = self.pending;
-        if self.completion != 0 {
-            blocks.push(self.completion);
-        }
-        (blocks, self.animations)
+        Transaction { implicit, disable_actions: None, duration: None, timing: None, continuation: None, values: 0 }
     }
 }
 
-/// An animation was added to a layer: the innermost transaction's
-/// completion waits for it (Core Animation's rule).
+/// A completion block waiting to run (Core Animation's
+/// CA::Transaction::Continuation): counted once by its transaction until
+/// that commits, once by each animation added after it was set (until that
+/// stops), and once by each nested transaction's continuation. At no count
+/// left the block goes to the main queue and lets go of its parent: an
+/// outer block waits for the inner ones, an inner one never for the outer.
+pub(crate) struct Continuation {
+    block: usize,
+    parent: Option<Arc<Continuation>>,
+    count: Mutex<usize>,
+}
+
+impl Continuation {
+    fn hold(&self) {
+        *self.count.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+    }
+
+    fn release(self: &Arc<Self>) {
+        let left = {
+            let mut count = self.count.lock().unwrap_or_else(|e| e.into_inner());
+            *count = count.saturating_sub(1);
+            *count
+        };
+        if left == 0 {
+            if self.block != 0 {
+                post_blocks(vec![self.block]);
+            }
+            if let Some(parent) = &self.parent {
+                parent.release();
+            }
+        }
+    }
+}
+
+/// The innermost continuation (walking outward from the innermost transaction).
+fn current_continuation() -> Option<Arc<Continuation>> {
+    TRANSACTIONS.with(|t| t.borrow().iter().rev().find_map(|t| t.continuation.clone()))
+}
+
+/// The animations (the layers' copies) holding a continuation.
+static HELD: Mutex<Vec<(Id, Arc<Continuation>)>> = Mutex::new(Vec::new());
+
+/// An animation was added to a layer: the innermost completion block
+/// (walking outward) waits for it (Core Animation's rule).
 pub fn animation_added(animation: Id) {
-    with_top(|t| t.animations.push(animation));
+    // As Apple's addAnimation:forKey: the transaction is made (implicit) if none is open.
+    with_top(|_| ());
+    if let Some(continuation) = current_continuation() {
+        continuation.hold();
+        HELD.lock().unwrap_or_else(|e| e.into_inner()).push((animation, continuation));
+    }
 }
 
-/// Committed completion blocks still waiting for some of their animations.
-static WAITING: Mutex<Vec<(Vec<usize>, Vec<Id>)>> = Mutex::new(Vec::new());
-
-/// An animation ended or was removed: completions waiting only for it run.
+/// An animation ended or was removed: it lets go of its completion block.
 pub fn animation_finished(animation: Id) {
-    let ready: Vec<usize> = {
-        let mut waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
-        for (_, animations) in waiting.iter_mut() {
-            animations.retain(|&a| a != animation);
-        }
-        let (ready, still): (Vec<_>, Vec<_>) = waiting.drain(..).partition(|(_, animations)| animations.is_empty());
-        *waiting = still;
-        ready.into_iter().flat_map(|(blocks, _)| blocks).collect()
+    let gone: Vec<Arc<Continuation>> = {
+        let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+        let (gone, still): (Vec<_>, Vec<_>) = held.drain(..).partition(|(a, _)| *a == animation);
+        *held = still;
+        gone.into_iter().map(|(_, c)| c).collect()
     };
-    post_blocks(ready);
+    for continuation in gone {
+        continuation.release();
+    }
 }
 
 /// What a duration of 0 stands for in an animation added now.
 pub fn animation_duration() -> f64 {
     ca_duration(0, 0)
+}
+
+/// The timing function given to an animation added now without one (0: none).
+pub fn animation_timing() -> Id {
+    ca_timing(0, 0)
+}
+
+/// The delegate given to an animation added now without one (the
+/// transaction's "animationDelegate" value; 0: none).
+pub fn animation_delegate() -> Id {
+    ca_value_for_key(0, 0, string::make("animationDelegate"))
+}
+
+/// Whether layers' changes made now run no actions (+setDisableActions:).
+pub fn actions_disabled() -> bool {
+    ca_disable_actions(0, 0)
 }
 
 thread_local! {
@@ -341,17 +389,10 @@ thread_local! {
 
 const DEFAULT_DURATION: f64 = 0.25;
 
-/// Runs completion blocks on the main run loop once their animations are
-/// over (now, when none still runs).
-fn run_completions((blocks, animations): (Vec<usize>, Vec<Id>)) {
-    if blocks.is_empty() {
-        return;
-    }
-    let animations: Vec<Id> = animations.into_iter().filter(|&a| crate::fw::animation::in_progress(a)).collect();
-    if animations.is_empty() {
-        post_blocks(blocks);
-    } else {
-        WAITING.lock().unwrap_or_else(|e| e.into_inner()).push((blocks, animations));
+/// A transaction ended: it lets go of its completion block.
+fn finish(transaction: Transaction) {
+    if let Some(continuation) = transaction.continuation {
+        continuation.release();
     }
 }
 
@@ -394,30 +435,19 @@ extern "C" fn ca_begin(_: Class, _: Sel) {
     TRANSACTIONS.with(|t| t.borrow_mut().push(Transaction::new(false)));
 }
 
-/// A nested transaction's completion blocks wait for the outer
-/// transaction, as on Apple.
+/// The transaction lets go of its completion block: it runs once the
+/// animations added after it was set, and nested transactions' blocks, are
+/// done (Apple's continuations; an inner block doesn't wait for the outer).
 extern "C" fn ca_commit(_: Class, _: Sel) {
-    let ready = TRANSACTIONS.with(|t| {
+    let ended = TRANSACTIONS.with(|t| {
         let mut list = t.borrow_mut();
         if list.last().map(|top| top.implicit).unwrap_or(true) {
             return None;
         }
-        let (finished, animations) = list.pop().unwrap().blocks();
-        match list.last_mut() {
-            Some(parent) => {
-                parent.pending.extend(finished);
-                parent.animations.extend(animations);
-                if list.len() == 1 && list[0].implicit {
-                    // The implicit one waited for this transaction.
-                    commit_implicit_later();
-                }
-                Some((Vec::new(), Vec::new()))
-            }
-            None => Some((finished, animations)),
-        }
+        list.pop()
     });
-    match ready {
-        Some(blocks) => run_completions(blocks),
+    match ended {
+        Some(transaction) => finish(transaction),
         None => crate::log!("CATransaction commit without begin; ignored"),
     }
 }
@@ -429,7 +459,7 @@ extern "C" fn ca_flush(_: Class, _: Sel) {
         if list.len() == 1 && list[0].implicit { list.pop() } else { None }
     });
     if let Some(transaction) = implicit {
-        run_completions(transaction.blocks());
+        finish(transaction);
     }
 }
 
@@ -460,15 +490,25 @@ extern "C" fn ca_set_timing(_: Class, _: Sel, value: Id) {
 }
 
 extern "C" fn ca_completion(_: Class, _: Sel) -> usize {
-    lookup(|t| (t.completion != 0).then_some(t.completion)).unwrap_or(0)
+    current_continuation().map_or(0, |c| c.block)
 }
 
 /// Outside any begin/commit the block belongs to the implicit transaction,
-/// which runs it when it commits; as on Apple, setting another block (or nil)
-/// replaces it.
+/// which lets go of it when it commits. As on Apple, setting another block
+/// (or nil) lets go of the old one, which still runs once nothing holds it;
+/// the new one holds the next one out until it has run.
 extern "C" fn ca_set_completion(_: Class, _: Sel, block: usize) {
     let block = if block == 0 { 0 } else { block_copy(block as *mut BlockHeader) as usize };
-    with_top(|t| t.completion = block);
+    let old = with_top(|t| t.continuation.take());
+    if let Some(old) = old {
+        old.release();
+    }
+    let parent = current_continuation();
+    if let Some(parent) = &parent {
+        parent.hold();
+    }
+    let continuation = Arc::new(Continuation { block, parent, count: Mutex::new(1) });
+    with_top(|t| t.continuation = Some(continuation));
 }
 
 extern "C" fn ca_value_for_key(class: Class, s: Sel, key: Id) -> Id {

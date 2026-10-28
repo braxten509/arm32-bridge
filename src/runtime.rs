@@ -379,6 +379,13 @@ static GL_CHECK: AtomicBool = AtomicBool::new(false);
 /// inside a handler stops at its own return address.
 const MAX_DEPTH: u32 = 64;
 pub const FIRST_STUB: u32 = MAX_DEPTH;
+/// How deeply host→guest calls may nest (call_guest refuses one more).
+pub const MAX_CALL_DEPTH: u32 = MAX_DEPTH;
+
+/// How deeply host→guest calls are nested on `uc` now.
+pub fn call_depth(uc: &Uc) -> u32 {
+    uc.get_data().depth
+}
 const SVC: u32 = 0xEF00_0000;
 const BX_LR: u32 = 0xE12F_FF1E;
 const UDF: u32 = 0xE7F0_00F0;

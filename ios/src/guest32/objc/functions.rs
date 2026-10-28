@@ -862,11 +862,13 @@ const FIELD_IS_BYREF: u32 = 8;
 const BYREF_CALLER: u32 = 128;
 
 /// _Block_object_assign(destination, object, flags): what a block's copy
-/// helper does for each captured object, block or __block variable.
+/// helper does for each captured object, block or __block variable. A
+/// __block variable's own value (BLOCK_BYREF_CALLER) is assigned as it is.
 fn block_object_assign(c: &Ctx, w: Words) -> Result<u64, String> {
     let (destination, object, flags) = (w(0), w(1), w(2));
     let value = match flags & 0x1f {
-        FIELD_IS_OBJECT if flags & BYREF_CALLER == 0 => c.retain(object)?,
+        _ if flags & BYREF_CALLER != 0 => object,
+        FIELD_IS_OBJECT => c.retain(object)?,
         FIELD_IS_BLOCK => block_copy(c, object)?,
         FIELD_IS_BYREF => byref_copy(c, object)?,
         _ => object,
@@ -879,7 +881,8 @@ fn block_object_assign(c: &Ctx, w: Words) -> Result<u64, String> {
 fn block_object_dispose(c: &Ctx, w: Words) -> Result<u64, String> {
     let (object, flags) = (w(0), w(1));
     match flags & 0x1f {
-        FIELD_IS_OBJECT if flags & BYREF_CALLER == 0 => c.release(object)?,
+        _ if flags & BYREF_CALLER != 0 => {}
+        FIELD_IS_OBJECT => c.release(object)?,
         FIELD_IS_BLOCK => block_release(c, object)?,
         FIELD_IS_BYREF => byref_release(c, object)?,
         _ => {}

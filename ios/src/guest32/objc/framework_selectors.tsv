@@ -33,9 +33,15 @@
 #                Struct fields of CGPoint/CGSize/CGRect/CGAffineTransform/
 #                UIEdgeInsets are always CGFloat. Float returns need no
 #                mark: the host's return register tells float from double.
-#   in-array     id-pointer arguments are arrays of as many ids as the last
-#                integer argument says, read before the call;
-#   out-array    the same, filled by the host (not read first).
+#   in-array     id- and CGFloat-pointer arguments are arrays of as many
+#                elements as the last integer argument (or NSRange length)
+#                says, read before the call;
+#   out-array    the same, filled by the host (not read first);
+#   counted-out  id- and CGFloat-pointer arguments are arrays the host fills
+#                with as many elements as it writes to the integer
+#                out-parameter (-getLineDash:count:phase:); the host gets
+#                room for COUNTED_OUT_MOST (guest32/objc/convert.rs).
+#                A lone CGFloat pointer is read and written back as a double.
 #   host-bytes   the result points to host bytes, as many as the integer
 #                out-parameter says: the guest gets its own copy, kept until
 #                the receiver is announced as finished
@@ -46,6 +52,7 @@
 #
 # A selector missing here stops the game with its name when a framework
 # object receives it (never guessed).
+_unhighlight	v@:
 abortParsing	v@:
 absoluteString	@@:
 absoluteURL	@@:
@@ -100,6 +107,9 @@ anchorPoint	{CGPoint=ff}@:
 animateWithDuration:animations:	v@:d@?
 animateWithDuration:animations:completion:	v@:d@?@?
 animateWithDuration:delay:options:animations:completion:	v@:ddI@?@?
+animationDuration	d@:
+animationImages	@@:
+animationRepeatCount	i@:
 animationWithKeyPath:	@@:@
 anyObject	@@:
 appendAttributedString:	v@:@
@@ -128,6 +138,7 @@ attributesAtIndex:effectiveRange:	@@:I^{_NSRange=II}
 authenticateWithCompletionHandler:	v@:@?
 autorelease	@@:
 automaticallyNotifiesObserversForKey:	c@:@
+availableData	@@:
 awakeFromNib	v@:
 backgroundColor	@@:
 baselineAdjustment	i@:
@@ -158,6 +169,7 @@ buttonWithType:	@@:i
 bytes	r^v@:
 callStackReturnAddresses	@@:
 canBecomeFirstResponder	c@:
+canCancelContentTouches	c@:
 cancelButtonIndex	i@:
 cancelLocalNotification:	v@:@
 cancelPreviousPerformRequestsWithTarget:	v@:@
@@ -195,6 +207,7 @@ characterSetWithRange:	@@:{_NSRange=II}
 class	#@:
 clearColor	@@:
 clipsToBounds	c@:
+closeFile	v@:
 closePath	v@:
 code	i@:
 colorWithRed:green:blue:alpha:	@@:ffff
@@ -293,6 +306,7 @@ decodeValueOfObjCType:at:	v@:r*^v
 defaultCenter	@@:
 defaultManager	@@:
 defaultQueue	@@:
+delaysContentTouches	c@:
 delaysTouchesBegan	c@:
 delaysTouchesEnded	c@:
 delegate	@@:
@@ -335,9 +349,11 @@ domain	@@:
 doubleForKey:	d@:@
 doubleValue	d@:
 drain	v@:
+drawAtPoint:blendMode:alpha:	v@:{CGPoint=ff}if
 drawAtPoint:forWidth:withFont:lineBreakMode:	{CGSize=ff}@:{CGPoint=ff}f@i
 drawAtPoint:withFont:	{CGSize=ff}@:{CGPoint=ff}@
 drawInRect:	v@:{CGRect={CGPoint=ff}{CGSize=ff}}
+drawInRect:blendMode:alpha:	v@:{CGRect={CGPoint=ff}{CGSize=ff}}if
 drawInRect:withFont:	{CGSize=ff}@:{CGRect={CGPoint=ff}{CGSize=ff}}@
 drawInRect:withFont:lineBreakMode:	{CGSize=ff}@:{CGRect={CGPoint=ff}{CGSize=ff}}@i
 drawInRect:withFont:lineBreakMode:alignment:	{CGSize=ff}@:{CGRect={CGPoint=ff}{CGSize=ff}}@ii
@@ -365,12 +381,21 @@ errorWithDomain:code:userInfo:	@@:@i@
 evaluateWithObject:	c@:@
 exceptionWithName:reason:userInfo:	@@:@@@
 expressionType	I@:
+fileDescriptor	i@:
 fileExistsAtPath:	c@:@
 fileExistsAtPath:isDirectory:	c@:@^c
+fileHandleForReadingAtPath:	@@:@
+fileHandleForUpdatingAtPath:	@@:@
+fileHandleForWritingAtPath:	@@:@
+fileHandleWithNullDevice	@@:
+fileHandleWithStandardError	@@:
+fileHandleWithStandardInput	@@:
+fileHandleWithStandardOutput	@@:
 fileSystemRepresentation	r*@:
 fileURLWithPath:	@@:@
 fileURLWithPath:isDirectory:	@@:@c
 fill	v@:
+fillWithBlendMode:alpha:	v@:if
 filteredArrayUsingPredicate:	@@:@
 finishEncoding	v@:
 finishTransaction:	v@:@
@@ -387,11 +412,14 @@ fragment	@@:
 frame	{CGRect={CGPoint=ff}{CGSize=ff}}@:
 frameLength	I@:
 functionWithName:	@@:@
+gestureRecognizerShouldBegin:	c@:@
 gestureRecognizers	@@:
 getArgument:atIndex:	v@:^vi
 getArgumentTypeAtIndex:	r*@:I
 getBytes:length:	v@:^vI
 getCFRunLoop	^{__CFRunLoop=}@:
+getLineDash:count:phase:	v@:^f^i^f	counted-out
+getObjects:range:	v@:^@{_NSRange=II}	out-array
 getResourceValue:forKey:error:	c@:^@@^@
 getReturnValue:	v@:^v
 getUUIDBytes:	v@:^C
@@ -404,7 +432,9 @@ handleFailureInMethod:object:file:lineNumber:description:	v@::@@i@	format
 hash	I@:
 hasPrefix:	c@:@
 hasSuffix:	c@:@
+highlightedAnimationImages	@@:
 highlightedImage	@@:
+hitTest:withEvent:	@@:{CGPoint=ff}@
 host	@@:
 hour	i@:
 HTTPMethod	@@:
@@ -457,6 +487,8 @@ initWithData:	@@:@
 initWithData:encoding:	@@:@I
 initWithDictionary:copyItems:	@@:@c
 initWithDomain:code:userInfo:	@@:@i@
+initWithFileDescriptor:	@@:i
+initWithFileDescriptor:closeOnDealloc:	@@:ic
 initWithFireDate:interval:target:selector:userInfo:repeats:	@@:@d@:@c
 initWithFloat:	@@:f	float
 initWithFormat:	@@:@	format
@@ -514,6 +546,7 @@ invoke	v@:
 invokeWithTarget:	v@:@
 isAbsolutePath	c@:
 isAdvertisingTrackingEnabled	c@:
+isAnimating	c@:
 isAtEnd	c@:
 isAuthenticated	c@:
 isBannerLoaded	c@:
@@ -563,6 +596,9 @@ length	I@:
 lengthOfBytesUsingEncoding:	I@:I
 lightGrayColor	@@:
 lineBreakMode	i@:
+lineCapStyle	i@:
+lineDashPhase	f@:
+lineJoinStyle	i@:
 lineNumber	i@:
 loadAchievementsWithCompletionHandler:	v@:@?
 loadData:MIMEType:textEncodingName:baseURL:	v@:@@@@
@@ -614,6 +650,7 @@ minimumFontSize	f@:
 minimumNumberOfTouches	I@:
 minimumPressDuration	d@:
 minusSet:	v@:@
+miterLimit	f@:
 modalTransitionStyle	i@:
 modalViewController	@@:
 model	@@:
@@ -662,6 +699,7 @@ objectForInfoDictionaryKey:	@@:@
 objectForKey:	@@:@
 objectForKeyedSubscript:	@@:@
 objectsPassingTest:	@@:@?
+offsetInFile	Q@:
 openURL:	c@:@
 orangeColor	@@:
 originalTransaction	@@:
@@ -697,7 +735,9 @@ placeholderCompletedAchievementImage	@@:
 play	c@:	ambiguous:AVAudioPlayer
 playbackState	i@:
 playerID	@@:
+pointMostlyInside:withEvent:	c@:{CGPoint=ff}@
 pointerValue	^v@:
+pointInside:withEvent:	c@:{CGPoint=ff}@
 pointSize	f@:
 position	{CGPoint=ff}@:
 postNotification:	v@:@
@@ -739,6 +779,8 @@ rangeOfCharacterFromSet:	{_NSRange=II}@:@
 rangeOfString:	{_NSRange=II}@:@
 rangeOfString:options:	{_NSRange=II}@:@I
 rangeOfString:options:range:	{_NSRange=II}@:@I{_NSRange=II}
+readDataOfLength:	@@:I
+readDataToEndOfFile	@@:
 reason	@@:
 redColor	@@:
 regularExpressionWithPattern:options:error:	@@:@I^@
@@ -801,7 +843,7 @@ runMode:beforeDate:	c@:@@
 runUntilDate:	v@:@
 scale	f@:
 scanCharactersFromSet:intoString:	c@:@^@
-scanFloat:	c@:^f
+scanFloat:	c@:^f	float
 scanHexInt:	c@:^I
 scanInt:	c@:^i
 scanInteger:	c@:^i
@@ -816,6 +858,8 @@ scheme	@@:
 screen	@@:
 scrollRectToVisible:animated:	v@:{CGRect={CGPoint=ff}{CGSize=ff}}c
 secondsFromGMT	i@:
+seekToEndOfFile	Q@:
+seekToFileOffset:	v@:Q
 segueWithIdentifier:source:destination:performHandler:	@@:@@@@?
 selectedRowInComponent:	i@:i
 selectRow:inComponent:animated:	v@:iic
@@ -855,8 +899,10 @@ setAnimationDelay:	v@:d
 setAnimationDelegate:	v@:@
 setAnimationDidStopSelector:	v@::
 setAnimationDuration:	v@:d
+setAnimationImages:	v@:@
 setAnimationRepeatAutoreverses:	v@:c
 setAnimationRepeatCount:	v@:f	float
+setAnimationRepeatCount:	v@:i	class:UIImageView
 setAnimations:	v@:@
 setAnimationStartDate:	v@:@
 setAnimationTransition:forView:cache:	v@:i@c
@@ -885,6 +931,7 @@ setBounds:	v@:{CGRect={CGPoint=ff}{CGSize=ff}}
 setByAddingObjectsFromSet:	@@:@
 setCachePolicy:	v@:I
 setCalculationMode:	v@:@
+setCanCancelContentTouches:	v@:c
 setCancelButtonIndex:	v@:i
 setCancelsTouchesInView:	v@:c
 setCategory:	v@:@
@@ -916,6 +963,7 @@ setCurrentTime:	v@:d
 setData:forPasteboardType:	v@:@@
 setDateFormat:	v@:@
 setDateStyle:	v@:I
+setDelaysContentTouches:	v@:c
 setDelaysTouchesBegan:	v@:c
 setDelaysTouchesEnded:	v@:c
 setDelegate:	v@:@
@@ -943,6 +991,7 @@ setGeometryFlipped:	v@:c
 setGestureRecognizers:	v@:@
 setHidden:	v@:c
 setHighlighted:	v@:c
+setHighlightedAnimationImages:	v@:@
 setHighlightedImage:	v@:@
 setHTTPBody:	v@:@
 setHTTPMethod:	v@:@
@@ -966,6 +1015,9 @@ setLength:	v@:I
 setLenient:	v@:c
 setLineBreakMode:	v@:i
 setLineCapStyle:	v@:i
+setLineDash:count:phase:	v@:^fif	in-array
+setLineDashPhase:	v@:f
+setLineJoinStyle:	v@:i
 setLineWidth:	v@:f
 setLocale:	v@:@
 setLocations:	v@:@
@@ -982,6 +1034,7 @@ setMinimumFontSize:	v@:f
 setMinimumNumberOfTouches:	v@:I
 setMinimumPressDuration:	v@:d
 setMinPlayers:	v@:I
+setMiterLimit:	v@:f
 setModalPresentationStyle:	v@:i
 setModalTransitionStyle:	v@:i
 setMovieControlMode:	v@:i
@@ -1062,6 +1115,7 @@ setString:	v@:@
 setStroke	v@:
 setStrokeColor:	v@:^{CGColor=}
 setSubject:	v@:@
+setSublayerTransform:	v@:{CATransform3D=ffffffffffffffff}
 setTag:	v@:i
 setTarget:	v@:@
 setText:	v@:@
@@ -1079,6 +1133,7 @@ setToRecipients:	v@:@
 setToValue:	v@:@
 setTrackImage:	v@:@
 setTrackTintColor:	v@:@
+setTracking:	v@:c
 setTransform:	v@:{CGAffineTransform=ffffff}
 setTransform:	v@:{CATransform3D=ffffffffffffffff}	class:CALayer
 setTranslation:inView:	v@:{CGPoint=ff}@
@@ -1173,8 +1228,10 @@ stringWithFormat:	@@:@	format
 stringWithString:	@@:@
 stringWithUTF8String:	@@:r*
 stroke	v@:
+strokeWithBlendMode:alpha:	v@:if
 subarrayWithRange:	@@:{_NSRange=II}
 subdataWithRange:	@@:{_NSRange=II}
+sublayerTransform	{CATransform3D=ffffffffffffffff}@:
 subpredicates	@@:
 substringFromIndex:	@@:I
 substringToIndex:	@@:I
@@ -1183,6 +1240,7 @@ subviews	@@:
 superview	@@:
 supportedInterfaceOrientationsForWindow:	I@:@
 synchronize	c@:
+synchronizeFile	v@:
 systemFontOfSize:	@@:f
 systemLocale	@@:
 systemName	@@:
@@ -1211,6 +1269,8 @@ touchesBegan:withEvent:	v@:@@
 touchesCancelled:withEvent:	v@:@@
 touchesEnded:withEvent:	v@:@@
 touchesMoved:withEvent:	v@:@@
+touchesShouldBegin:withEvent:inContentView:	c@:@@@
+touchesShouldCancelInContentView:	c@:@
 trackImage	@@:
 trackTintColor	@@:
 transactionDate	@@:
@@ -1222,6 +1282,7 @@ transform	{CGAffineTransform=ffffff}@:
 transform	{CATransform3D=ffffffffffffffff}@:	class:CALayer
 transitionFromViewController:toViewController:duration:options:animations:completion:	v@:@@dI@?@?
 translationInView:	{CGPoint=ff}@:@
+truncateFileAtOffset:	v@:Q
 tryLock	c@:
 type	@@:
 type	i@:	class:UIEvent
@@ -1275,6 +1336,7 @@ whitespaceAndNewlineCharacterSet	@@:
 whitespaceCharacterSet	@@:
 willChangeValueForKey:	v@:@
 windows	@@:
+writeData:	v@:@
 writeToFile:atomically:	c@:@c
 writeToFile:options:error:	c@:@I^@
 yellowColor	@@:

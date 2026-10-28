@@ -6,12 +6,15 @@ use crate::fw::object::{class_methods, define_class, methods};
 use crate::fw::{collections, string};
 use crate::objc::runtime::{self, lock, Class, Id, Sel};
 use crate::symbols::{leak, Registry};
+use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 // ----- simple stored properties -----
 
-static PROPERTIES: Mutex<Option<HashMap<(Id, &'static str), u64>>> = Mutex::new(None);
+// The property table is read on every getter: keyed by (object, key name), so
+// a fast hash (FxHash) is enough and much cheaper than the default SipHash.
+static PROPERTIES: Mutex<Option<FxHashMap<(Id, &'static str), u64>>> = Mutex::new(None);
 static CONTROLLER_CHILDREN: Mutex<Option<HashMap<Id, Vec<Id>>>> = Mutex::new(None);
 
 pub fn property_get(object: Id, key: &'static str) -> Option<u64> {
@@ -19,14 +22,16 @@ pub fn property_get(object: Id, key: &'static str) -> Option<u64> {
 }
 
 pub fn property_set(object: Id, key: &'static str, value: u64) {
-    PROPERTIES.lock().unwrap().get_or_insert_with(HashMap::new).insert((object, key), value);
+    PROPERTIES.lock().unwrap().get_or_insert_with(FxHashMap::default).insert((object, key), value);
+    crate::fw::changes::changed(object);
 }
 
 /// Sets an object property: like UIKit's, it retains what it holds (this
 /// matters for objects with real counts: pictures, fw/counted.rs).
 pub fn property_set_object(object: Id, key: &'static str, value: Id) {
-    let old = PROPERTIES.lock().unwrap().get_or_insert_with(HashMap::new).insert((object, key), value as u64);
+    let old = PROPERTIES.lock().unwrap().get_or_insert_with(FxHashMap::default).insert((object, key), value as u64);
     crate::fw::counted::replace(old.unwrap_or(0) as Id, value);
+    crate::fw::changes::changed(object);
 }
 
 /// Makes a getter and setter pair that keep a value per object.
@@ -37,6 +42,26 @@ macro_rules! property {
         }
         extern "C" fn $set(this: Id, _: Sel, value: Id) {
             $crate::fw::uikit::property_set_object(this, $key, value);
+        }
+    };
+    // Not retained: UIKit's delegates, data sources and targets.
+    ($get:ident, $set:ident, $key:literal, assign, $default:expr) => {
+        extern "C" fn $get(this: Id, _: Sel) -> Id {
+            property_get(this, $key).map(|v| v as Id).unwrap_or($default)
+        }
+        extern "C" fn $set(this: Id, _: Sel, value: Id) {
+            $crate::fw::uikit::property_set(this, $key, value as u64);
+        }
+    };
+    // Copied on set, as UIKit's and Core Animation's `copy` properties: the
+    // game can mutate what it kept, and the stored value stays as set.
+    ($get:ident, $set:ident, $key:literal, copy, $default:expr) => {
+        extern "C" fn $get(this: Id, _: Sel) -> Id {
+            property_get(this, $key).map(|v| v as Id).unwrap_or($default)
+        }
+        extern "C" fn $set(this: Id, _: Sel, value: Id) {
+            let copy = if value == 0 { 0 } else { $crate::objc::runtime::send(value, "copy", &[]) };
+            $crate::fw::uikit::property_set_object(this, $key, copy);
         }
     };
     ($get:ident, $set:ident, $key:literal, bool, $default:expr) => {
@@ -168,7 +193,18 @@ fn told_screen(display: (f64, f64), info: Option<&crate::fw::plist::Value>, file
         .fold((480.0, 320.0), |best, size| if size.0 > best.0 { size } else { best });
     // The Plus and X iPhones (736 and 812 points long) are 3x screens.
     let scale = if long == 736.0 || long == 812.0 { 3.0 } else { 2.0 };
+    let long = narrower(plist_text(info, "CFBundleIdentifier")).filter(|_| long == 568.0).unwrap_or(long);
     (long, short, scale)
+}
+
+/// The width a game is told its 568-point screen has when its own art is
+/// narrower: SpellCraft's fight backgrounds end about 5 points short of each
+/// side of an iPhone 5 (dark bands); it lays itself out to any width.
+fn narrower(bundle: Option<&str>) -> Option<f64> {
+    match bundle? {
+        "com.appyentertainment.spellcraft" => Some(557.0),
+        _ => None,
+    }
 }
 
 /// The scale screens are reported at when they fill the display (an
@@ -407,11 +443,6 @@ fn screen_bounds() -> Rect {
     Rect::new(0.0, 0.0, w, h)
 }
 
-fn oriented_bounds() -> Rect {
-    let (w, h, _) = current_geometry().oriented;
-    Rect::new(0.0, 0.0, w, h)
-}
-
 static MAIN_SCREEN: OnceLock<Id> = OnceLock::new();
 static CURRENT_DEVICE: OnceLock<Id> = OnceLock::new();
 
@@ -466,7 +497,22 @@ extern "C" fn device_system_name(_this: Id, _: Sel) -> Id {
 }
 
 extern "C" fn device_system_version(_this: Id, _: Sel) -> Id {
-    string::make("8.2")
+    string::make(system_version_for(app_info()))
+}
+
+/// The iOS an app is told it runs on: an app built with the iOS 6 SDK or
+/// older gets 6.1, the system it was made for (games compare it to choose
+/// their iOS 6 or iOS 7+ ways); newer apps get 8.2 (Infinity Blade II needs
+/// an iOS 8 answer).
+fn system_version_for(info: Option<&crate::fw::plist::Value>) -> &'static str {
+    let sdk = plist_text(info, "DTSDKName").and_then(sdk_major).or_else(|| plist_text(info, "DTPlatformVersion").and_then(sdk_major));
+    if sdk.is_some_and(|major| major <= 6) { "6.1" } else { "8.2" }
+}
+
+/// The app was built with the iOS 6 SDK or older: it gets iOS 6's look
+/// where UIKit draws for it (alerts and action sheets, fw/controls.rs).
+pub(crate) fn built_for_ios6() -> bool {
+    system_version_for(app_info()) == "6.1"
 }
 
 extern "C" fn device_name(_this: Id, _: Sel) -> Id {
@@ -539,9 +585,29 @@ pub struct ViewState {
     pub needs_layout: bool,
     /// Own layout has started and its subtree is still being laid out.
     layout_active: bool,
+    /// Marked for -drawRect: in the next display pass (every view starts
+    /// marked, as UIKit draws a view the first time it shows).
+    needs_display: bool,
 }
 
-pub fn view_state(view: Id) -> &'static mut ViewState {
+pub fn view_state(view: Id) -> &'static ViewState {
+    view_state_slot(view)
+}
+
+/// A write to a view's state that changes what is drawn: marks a change
+/// (fw/changes.rs) so the pictures are rebuilt.
+pub fn view_state_mut(view: Id) -> &'static mut ViewState {
+    crate::fw::changes::changed(view);
+    view_state_slot(view)
+}
+
+/// A write that only books layout or display (needs_layout, layout_active,
+/// needs_display), not what is drawn: marks nothing.
+fn view_state_raw(view: Id) -> &'static mut ViewState {
+    view_state_slot(view)
+}
+
+fn view_state_slot(view: Id) -> &'static mut ViewState {
     unsafe {
         let slot = (view + 8) as *mut *mut ViewState;
         if (*slot).is_null() {
@@ -555,7 +621,9 @@ pub fn view_state(view: Id) -> &'static mut ViewState {
                 window: 0,
                 needs_layout: false,
                 layout_active: false,
+                needs_display: true,
             }));
+            DISPLAY_PENDING.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         &mut **slot
     }
@@ -583,7 +651,14 @@ property!(view_tag, view_set_tag, "tag", isize, 0);
 property!(view_autoresizing, view_set_autoresizing, "autoresizing", isize, 0);
 property!(view_autoresizes, view_set_autoresizes, "autoresizes", bool, true);
 property!(view_content_mode, view_set_content_mode, "contentMode", isize, 0);
-property!(view_background, view_set_background, "background", id, 0);
+extern "C" fn view_background(this: Id, _: Sel) -> Id {
+    property_get(this, "background").unwrap_or(0) as Id
+}
+
+extern "C" fn view_set_background(this: Id, _: Sel, color: Id) {
+    will_change(this, "backgroundColor");
+    property_set(this, "background", color as u64);
+}
 
 extern "C" fn view_content_scale(this: Id, _: Sel) -> f64 {
     property_get(this, "contentScale").map(f64::from_bits).unwrap_or(1.0)
@@ -606,11 +681,11 @@ fn make_layer_for(view: Id) {
     let layer_class = runtime::send(class, "layerClass", &[]);
     let layer = runtime::send(runtime::send(layer_class, "alloc", &[]), "init", &[]);
     property_set(layer, "delegate", view as u64);
-    view_state(view).layer = layer;
+    view_state_mut(view).layer = layer;
 }
 
 extern "C" fn view_init_with_frame(this: Id, _: Sel, frame: Rect) -> Id {
-    view_state(this).frame = frame;
+    view_state_mut(this).frame = frame;
     make_layer_for(this);
     this
 }
@@ -623,17 +698,42 @@ extern "C" fn view_init(this: Id, _: Sel) -> Id {
     f(this, s, frame)
 }
 
-extern "C" fn view_frame(this: Id, _: Sel) -> Rect {
-    view_state(this).frame
+/// As in UIKit, a transformed view's frame is the smallest box holding its
+/// transformed bounds (`state.frame` keeps the untransformed one: center
+/// and bounds size).
+pub(crate) extern "C" fn view_frame(this: Id, _: Sel) -> Rect {
+    let state = view_state(this);
+    if state.transform == IDENTITY {
+        return state.frame;
+    }
+    let (frame, transform) = (state.frame, state.transform);
+    let anchor = crate::fw::layers::view_anchor(this);
+    let center = Point { x: frame.origin.x + frame.size.width * anchor.x, y: frame.origin.y + frame.size.height * anchor.y };
+    let b = crate::fw::layers::transformed_box(frame.size, anchor, transform);
+    Rect { origin: Point { x: center.x + b.origin.x, y: center.y + b.origin.y }, size: b.size }
 }
 
+/// A transformed view keeps its transform: the bounds and center change so
+/// the transformed box lands on `frame` (Core Animation's way).
 extern "C" fn view_set_frame(this: Id, _: Sel, frame: Rect) {
     will_change(this, "position");
-    let state = view_state(this);
+    will_change(this, "bounds");
+    let anchor = crate::fw::layers::view_anchor(this);
+    let state = view_state_mut(this);
     let old = state.frame.size;
-    state.frame = frame;
-    if old != frame.size {
+    if state.transform == IDENTITY {
+        state.frame = frame;
+    } else {
+        let (size, center) = crate::fw::layers::place_in_frame(old, anchor, state.transform, frame);
+        state.frame = Rect { origin: Point { x: center.x - size.width * anchor.x, y: center.y - size.height * anchor.y }, size };
+    }
+    let new = state.frame.size;
+    if old != new {
         resized_view(this, old);
+        // UIViewAnimationOptionLayoutSubviews: laid out inside the block.
+        if block_lays_out() {
+            lay_out_tree(this, 0);
+        }
     }
 }
 
@@ -673,16 +773,19 @@ extern "C" fn view_bounds(this: Id, _: Sel) -> Rect {
 /// New bounds keep the view's center (its layer's position, at the layer's
 /// anchor point) where it is.
 extern "C" fn view_set_bounds(this: Id, _: Sel, bounds: Rect) {
-    will_change(this, "position");
+    will_change(this, "bounds");
     let center = view_center(this, 0);
     let anchor = crate::fw::layers::view_anchor(this);
-    let state = view_state(this);
+    let state = view_state_mut(this);
     let old = state.frame.size;
     state.bounds_origin = bounds.origin;
     state.frame.size = bounds.size;
     state.frame.origin = Point { x: center.x - bounds.size.width * anchor.x, y: center.y - bounds.size.height * anchor.y };
     if old != bounds.size {
         resized_view(this, old);
+        if block_lays_out() {
+            lay_out_tree(this, 0);
+        }
     }
 }
 
@@ -697,7 +800,7 @@ extern "C" fn view_center(this: Id, _: Sel) -> Point {
 extern "C" fn view_set_center(this: Id, _: Sel, center: Point) {
     will_change(this, "position");
     let anchor = crate::fw::layers::view_anchor(this);
-    let state = view_state(this);
+    let state = view_state_mut(this);
     state.frame.origin = Point { x: center.x - state.frame.size.width * anchor.x, y: center.y - state.frame.size.height * anchor.y };
 }
 
@@ -707,7 +810,9 @@ extern "C" fn view_transform(this: Id, _: Sel) -> Transform {
 
 extern "C" fn view_set_transform(this: Id, _: Sel, transform: Transform) {
     will_change(this, "transform");
-    view_state(this).transform = transform;
+    view_state_mut(this).transform = transform;
+    // As UIKit's: the layer's whole transform becomes this one (no perspective left).
+    crate::fw::layers::view_transform_set(this, transform);
 }
 
 extern "C" fn view_layer(this: Id, _: Sel) -> Id {
@@ -728,7 +833,7 @@ static LAYOUT_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 
 fn set_needs_layout(view: Id) {
     if view != 0 {
-        view_state(view).needs_layout = true;
+        view_state_raw(view).needs_layout = true;
         LAYOUT_PENDING.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
@@ -745,13 +850,16 @@ struct ActiveLayout(Id);
 
 impl Drop for ActiveLayout {
     fn drop(&mut self) {
-        view_state(self.0).layout_active = false;
+        view_state_raw(self.0).layout_active = false;
     }
 }
 
 /// A new size lays out the view and its superview, and (as UIKit does at
 /// once) moves and sizes its subviews by their autoresizing masks.
 fn resized_view(view: Id, old: Size) {
+    if view_content_mode(view, 0) == 3 {
+        view_set_needs_display(view, 0);
+    }
     request_layout_for_change(view);
     request_layout_for_change(view_state(view).superview);
     if property_get(view, "autoresizes").is_none_or(|v| v != 0) {
@@ -810,8 +918,8 @@ fn lay_out_tree(view: Id, depth: usize) {
     }
     // Keep the guard through child layout, since child sizing can invalidate
     // its parent. Clean parents stay inactive and still accept those changes.
-    let _active = if std::mem::take(&mut view_state(view).needs_layout) {
-        view_state(view).layout_active = true;
+    let _active = if std::mem::take(&mut view_state_raw(view).needs_layout) {
+        view_state_raw(view).layout_active = true;
         let active = ActiveLayout(view);
         lay_out(view);
         Some(active)
@@ -833,6 +941,70 @@ pub fn layout_pass() {
     }
 }
 
+/// A view was marked for drawing since the last display pass.
+static DISPLAY_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// The display pass (Core Animation's commit draws marked layers), run as
+/// the screen's pictures are made: see `display_tree`.
+pub fn display_pass() {
+    if DISPLAY_PENDING.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        for window in windows() {
+            display_tree(window);
+        }
+    }
+}
+
+/// A shown view marked for display whose class has its own -drawRect: is
+/// drawn into its layer's contents: its bounds at the screen's scale, the
+/// UIKit context current, as UIKit's -displayLayer: does; down the tree. A
+/// hidden view keeps its mark until it shows.
+pub(crate) fn display_tree(view: Id) {
+    if view_hidden(view, 0) {
+        return;
+    }
+    if std::mem::replace(&mut view_state_raw(view).needs_display, false) && draws_itself(view) {
+        draw_view(view);
+    }
+    for child in view_state(view).subviews.clone() {
+        display_tree(child);
+    }
+}
+
+/// Whether a view's class has a -drawRect: of its own (UIView's draws nothing).
+pub(crate) fn draws_itself(view: Id) -> bool {
+    runtime::imp_for(view, runtime::sel("drawRect:")).is_some_and(|imp| imp != view_draw_rect as usize) && !crate::fw::controls::label_draws_plainly(view)
+}
+
+fn draw_view(view: Id) {
+    let bounds = view_bounds(view, 0);
+    let layer = view_layer(view, 0);
+    if !(bounds.size.width > 0.0 && bounds.size.height > 0.0) {
+        runtime::send(layer, "setContents:", &[0]);
+        return;
+    }
+    let scale = screen_points().2;
+    let picture = crate::fw::graphics::draw_picture(bounds.size, scale, bounds.origin, || send_rect(view, "drawRect:", bounds));
+    let set_scale = runtime::sel("setContentsScale:");
+    if let Some(imp) = runtime::imp_for(layer, set_scale) {
+        let f: extern "C" fn(Id, Sel, f64) = unsafe { std::mem::transmute(imp) };
+        f(layer, set_scale, scale);
+    }
+    runtime::send(layer, "setContents:", &[picture]);
+    crate::fw::counted::release(picture);
+}
+
+extern "C" fn view_draw_rect(_: Id, _: Sel, _: Rect) {}
+
+/// -setNeedsDisplay (and ...InRect:, which redraws all of it here).
+extern "C" fn view_set_needs_display(this: Id, _: Sel) {
+    view_state_raw(this).needs_display = true;
+    DISPLAY_PENDING.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+extern "C" fn view_set_needs_display_in_rect(this: Id, _: Sel, _: Rect) {
+    view_set_needs_display(this, 0);
+}
+
 extern "C" fn view_set_needs_layout(this: Id, _: Sel) {
     set_needs_layout(this);
 }
@@ -841,7 +1013,7 @@ extern "C" fn view_layout_if_needed(this: Id, _: Sel) {
     lay_out_tree(this, 0);
 }
 
-fn window_of(view: Id) -> Id {
+pub(crate) fn window_of(view: Id) -> Id {
     let mut current = view;
     let window_class = runtime::class_named("UIWindow");
     for _ in 0..256 {
@@ -869,12 +1041,16 @@ fn tell_window_move(view: Id, window: Option<Id>) {
     }
 }
 
-fn detach(view: Id) {
+/// Takes a view out of its superview, which lets go of it (a superview
+/// retains its subviews, as UIKit's; a game view deallocs at the next safe
+/// point if nothing else holds it, see fw/counted.rs).
+pub(crate) fn detach(view: Id) {
     let parent = view_state(view).superview;
     if parent != 0 {
-        view_state(parent).subviews.retain(|&v| v != view);
-        view_state(view).superview = 0;
+        view_state_mut(parent).subviews.retain(|&v| v != view);
+        view_state_mut(view).superview = 0;
         request_layout_for_change(parent);
+        crate::fw::counted::release(view);
     }
 }
 
@@ -926,22 +1102,27 @@ fn attach_with_geometry(parent: Id, view: Id, index: Option<usize>, geometry: Ge
     let old_parent = view_state(view).superview;
     let moving = old_parent != parent;
     let (old_window, new_window) = (if old_parent != 0 { window_of(old_parent) } else { 0 }, window_of(parent));
+    // As UIKit's _addSubview:positioned:relativeTo: (0x59f27): the window
+    // hooks for the whole subtree first, then the old superview's
+    // willRemoveSubview:, then willMoveToSuperview:.
     if moving {
+        if old_window != new_window {
+            tell_window_move(view, Some(new_window));
+        }
         if old_parent != 0 {
             runtime::send(old_parent, "willRemoveSubview:", &[view]);
         }
         runtime::send(view, "willMoveToSuperview:", &[parent]);
-        if old_window != new_window {
-            tell_window_move(view, Some(new_window));
-        }
     }
+    // The new superview holds it before the old one lets go.
+    crate::fw::counted::retain(view);
     detach(view);
-    let list = &mut view_state(parent).subviews;
+    let list = &mut view_state_mut(parent).subviews;
     match index {
         Some(i) => list.insert(i.min(list.len()), view),
         None => list.push(view),
     }
-    view_state(view).superview = parent;
+    view_state_mut(view).superview = parent;
     correct_controller_child_frame(parent, view, geometry);
     request_layout_for_change(view);
     request_layout_for_change(parent);
@@ -964,14 +1145,27 @@ extern "C" fn view_insert_subview(this: Id, _: Sel, view: Id, index: isize) {
     attach(this, view, Some(index.max(0) as usize));
 }
 
+/// Where the sibling is once `view` has left the list (attach takes it out
+/// before it puts it back), as UIKit looks for it after the removal.
+fn sibling_place(this: Id, view: Id, sibling: Id) -> Option<usize> {
+    let list = &view_state(this).subviews;
+    list.iter().filter(|&&v| v != view).position(|&v| v == sibling)
+}
+
 extern "C" fn view_insert_above(this: Id, _: Sel, view: Id, sibling: Id) {
-    let index = view_state(this).subviews.iter().position(|&v| v == sibling).map(|i| i + 1);
-    attach(this, view, index);
+    attach(this, view, sibling_place(this, view, sibling).map(|i| i + 1));
 }
 
 extern "C" fn view_insert_below(this: Id, _: Sel, view: Id, sibling: Id) {
-    let index = view_state(this).subviews.iter().position(|&v| v == sibling);
-    attach(this, view, index);
+    attach(this, view, sibling_place(this, view, sibling));
+}
+
+/// -[UIView dealloc] (a game view's [super dealloc] reaches it): its
+/// subviews leave it and are let go of, as UIKit's.
+extern "C" fn view_dealloc(this: Id, _: Sel) {
+    for subview in view_state(this).subviews.clone() {
+        detach(subview);
+    }
 }
 
 extern "C" fn view_remove_from_superview(this: Id, _: Sel) {
@@ -980,7 +1174,7 @@ extern "C" fn view_remove_from_superview(this: Id, _: Sel) {
 }
 
 extern "C" fn view_bring_to_front(this: Id, _: Sel, view: Id) {
-    let list = &mut view_state(this).subviews;
+    let list = &mut view_state_mut(this).subviews;
     if let Some(i) = list.iter().position(|&v| v == view) {
         list.remove(i);
         list.push(view);
@@ -988,7 +1182,7 @@ extern "C" fn view_bring_to_front(this: Id, _: Sel, view: Id) {
 }
 
 extern "C" fn view_send_to_back(this: Id, _: Sel, view: Id) {
-    let list = &mut view_state(this).subviews;
+    let list = &mut view_state_mut(this).subviews;
     if let Some(i) = list.iter().position(|&v| v == view) {
         list.remove(i);
         list.insert(0, view);
@@ -1040,6 +1234,29 @@ extern "C" fn view_with_tag(this: Id, _: Sel, tag: isize) -> Id {
 
 extern "C" fn view_size_that_fits(this: Id, _: Sel, _size: Size) -> Size {
     view_state(this).frame.size
+}
+
+/// -sizeToFit as UIKit's (0x4f877): the size -sizeThatFits: answers for
+/// the current one, through -setFrame: (-setBounds: when transformed).
+extern "C" fn view_size_to_fit(this: Id, _: Sel) {
+    let s = runtime::sel("sizeThatFits:");
+    let Some(imp) = runtime::imp_for(this, s) else { return };
+    let fits: extern "C" fn(Id, Sel, Size) -> Size = unsafe { std::mem::transmute(imp) };
+    let size = fits(this, s, view_state(this).frame.size);
+    if view_state(this).transform == IDENTITY {
+        let frame = view_frame(this, 0);
+        send_rect(this, "setFrame:", Rect { origin: frame.origin, size });
+    } else {
+        send_rect(this, "setBounds:", Rect { origin: view_state(this).bounds_origin, size });
+    }
+}
+
+extern "C" fn view_hit_test(this: Id, _: Sel, point: Point, event: Id) -> Id {
+    crate::fw::touch::view_hit_test(this, point, event)
+}
+
+extern "C" fn view_point_inside(this: Id, _: Sel, point: Point, _event: Id) -> bool {
+    crate::fw::touch::view_point_inside(this, point)
 }
 
 /// A view's points to screen points; nil stands for `beside`'s window (its
@@ -1100,20 +1317,50 @@ extern "C" fn view_convert_rect_to(this: Id, _: Sel, rect: Rect, other: Id) -> R
 
 // ----- UIView animations: as in UIKit, what an animations block (or an
 // iOS 3 style +beginAnimations:context: ... +commitAnimations block)
-// changes on a view (its center or frame's place, transform, alpha) takes
-// the new value at once, and the view's layer gets a Core Animation
-// animation from what showed before (fw/animation.rs), so it moves on
-// screen over the block's duration, after its delay, along its curve.
-// The completion block hears finished = YES when they all end (NO when one
-// was removed or replaced first); a block that animates nothing hears YES
-// on the next turn of the main run loop. Sizes change at once. -----
+// changes on a view (its center or frame's place, size, transform, alpha,
+// background colour) takes the new value at once, and the view's layer gets
+// a Core Animation animation from the old value (fw/animation.rs), so it
+// moves on screen over the block's duration, after its delay, along its
+// curve, as UIView's actionForLayer:forKey: does. The old value is the
+// model's (what shows now with BeginFromCurrentState); a property set to
+// the value it already had gets no animation, so one running goes on. The
+// completion block hears finished = YES when they all end (NO when one was
+// removed or replaced first); a block that animates nothing hears YES on
+// the next turn of the main run loop. -----
+
+/// UIViewAnimationOptions that change a block here.
+const LAYOUT_SUBVIEWS: usize = 1 << 0;
+const BEGIN_FROM_CURRENT_STATE: usize = 1 << 2;
+const OVERRIDE_INHERITED_DURATION: usize = 1 << 5;
+const OVERRIDE_INHERITED_CURVE: usize = 1 << 6;
+
+/// A block's timing and the UIViewAnimationOptions it was given.
+#[derive(Clone, Copy, Debug)]
+struct BlockTiming {
+    timing: crate::fw::animation::ViewTiming,
+    options: usize,
+}
+
+impl std::ops::Deref for BlockTiming {
+    type Target = crate::fw::animation::ViewTiming;
+    fn deref(&self) -> &Self::Target {
+        &self.timing
+    }
+}
+
+impl std::ops::DerefMut for BlockTiming {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.timing
+    }
+}
 
 /// One open animation block: its settings, what it changed (view, key
-/// path, the value shown before) and the sizes of the views it moved.
+/// path, the value before), and an iOS 3 block's view transition (the
+/// view, UIViewAnimationTransition), made when it is committed.
 struct OpenBlock {
-    timing: crate::fw::animation::ViewTiming,
+    timing: BlockTiming,
     changes: Vec<(Id, &'static str, crate::fw::animation::Value)>,
-    sizes: Vec<(Id, Size)>,
+    transition: Option<(Id, usize)>,
 }
 
 thread_local! {
@@ -1128,41 +1375,51 @@ fn with_open_blocks<R>(f: impl FnOnce(&mut Vec<OpenBlock>) -> R) -> R {
     OPEN_BLOCKS.with(|blocks| f(&mut blocks.borrow_mut()))
 }
 
-/// What the view's layer shows of `key` now (its animations included).
-fn shown_value(view: Id, key: &str) -> crate::fw::animation::Value {
-    use crate::fw::animation::{presented, Shown, Value};
-    let model = Shown { opacity: view_alpha(view, 0), position: view_center(view, 0), transform: view_state(view).transform };
+/// The view's own (model) value of an animated key (its layer's whole 3D transform).
+fn model_value(view: Id, key: &str) -> crate::fw::animation::Value {
+    use crate::fw::animation::Value;
     let layer = view_state(view).layer;
-    let shown = if layer == 0 { model } else { presented(layer, model) };
     match key {
-        "opacity" => Value::Number(shown.opacity),
-        "transform" => Value::Transform(crate::fw::layers::affine_to_3d(shown.transform)),
-        _ => Value::Point(shown.position),
+        "opacity" => Value::Number(view_alpha(view, 0)),
+        "transform" if layer != 0 => Value::Transform(crate::fw::layers::transform(layer)),
+        "transform" => Value::Transform(crate::fw::layers::affine_to_3d(view_state(view).transform)),
+        "bounds" => Value::Rect(view_bounds(view, 0)),
+        "backgroundColor" => Value::Color(crate::fw::graphics::color_rgba(view_background(view, 0)).unwrap_or([0.0; 4])),
+        _ => Value::Point(view_center(view, 0)),
     }
 }
 
-/// A setter is about to change `key` of the view: an open animation block
-/// notes what showed before (once per view and key).
-fn will_change(view: Id, key: &'static str) {
+/// What the view's layer shows of `key` now (its animations included).
+fn shown_value(view: Id, key: &str) -> crate::fw::animation::Value {
+    match view_state(view).layer {
+        0 => model_value(view, key),
+        // A view's layer's bounds are the view's (not in animation::model_of).
+        layer if key == "bounds" => crate::fw::animation::presented_value_at(layer, key, model_value(view, key), crate::fw::runloop::media_time()),
+        layer => crate::fw::animation::shown_value(layer, key).unwrap_or_else(|| model_value(view, key)),
+    }
+}
+
+/// A setter is about to change `key` of the view (or of its layer,
+/// fw/layers.rs): an open animation block notes the value before (once per
+/// view and key): the model's, or with BeginFromCurrentState what shows.
+pub(crate) fn will_change(view: Id, key: &'static str) {
     if !ANIMATIONS_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    let noted = with_open_blocks(|blocks| blocks.last().map(|block| block.changes.iter().any(|&(v, k, _)| v == view && k == key)));
-    match noted {
-        None | Some(true) => {}
-        Some(false) => {
-            let before = shown_value(view, key);
-            let size = view_state(view).frame.size;
-            with_open_blocks(|blocks| {
-                if let Some(block) = blocks.last_mut() {
-                    block.changes.push((view, key, before));
-                    if key == "position" {
-                        block.sizes.push((view, size));
-                    }
-                }
-            });
+    let noted = with_open_blocks(|blocks| blocks.last().map(|block| (block.changes.iter().any(|&(v, k, _)| v == view && k == key), block.timing.options)));
+    let Some((false, options)) = noted else { return };
+    let before = if options & BEGIN_FROM_CURRENT_STATE != 0 { shown_value(view, key) } else { model_value(view, key) };
+    with_open_blocks(|blocks| {
+        if let Some(block) = blocks.last_mut() {
+            block.changes.push((view, key, before));
         }
-    }
+    });
+}
+
+/// Whether the innermost open block lays out resized views at once
+/// (UIViewAnimationOptionLayoutSubviews).
+fn block_lays_out() -> bool {
+    with_open_blocks(|blocks| blocks.last().is_some_and(|block| block.timing.options & LAYOUT_SUBVIEWS != 0))
 }
 
 /// UIViewAnimationOptions / UIViewAnimationCurve as a timing curve.
@@ -1177,52 +1434,63 @@ fn view_curve(curve: usize) -> crate::fw::animation::Curve {
     .unwrap_or(Curve::LINEAR)
 }
 
-fn view_timing(duration: f64, delay: f64, options: usize) -> crate::fw::animation::ViewTiming {
+fn view_timing(duration: f64, delay: f64, options: usize) -> BlockTiming {
     const REPEAT: usize = 1 << 3;
     const AUTOREVERSE: usize = 1 << 4;
-    crate::fw::animation::ViewTiming {
+    let timing = crate::fw::animation::ViewTiming {
         duration,
         delay: delay.max(0.0),
         curve: view_curve(options >> 16),
         repeat_count: if options & REPEAT != 0 { f64::INFINITY } else { 0.0 },
         autoreverses: options & AUTOREVERSE != 0,
         asked: crate::fw::runloop::media_time(),
-    }
+    };
+    BlockTiming { timing, options }
 }
 
-fn open_block(timing: crate::fw::animation::ViewTiming) {
-    with_open_blocks(|blocks| blocks.push(OpenBlock { timing, changes: Vec::new(), sizes: Vec::new() }));
+/// As UIKit's _setupAnimationWithDuration: (0x56e6d): a block opened inside
+/// another takes the outer one's duration and curve unless its options
+/// override them.
+fn inherited(mut timing: BlockTiming) -> BlockTiming {
+    if let Some(outer) = with_open_blocks(|blocks| blocks.last().map(|block| block.timing)) {
+        if timing.options & OVERRIDE_INHERITED_DURATION == 0 {
+            timing.duration = outer.duration;
+        }
+        if timing.options & OVERRIDE_INHERITED_CURVE == 0 {
+            timing.curve = outer.curve;
+        }
+    }
+    timing
+}
+
+fn open_block(timing: BlockTiming) {
+    with_open_blocks(|blocks| blocks.push(OpenBlock { timing, changes: Vec::new(), transition: None }));
 }
 
 /// Closes the innermost block: each change that left a different value
-/// gets its animation. A view whose size changed too moves at once (its
-/// size isn't animated here, and its middle sliding while the size jumps
-/// looks worse). Answers the animations started.
+/// gets its animation, and its view transition its CATransition with the
+/// block's duration and curve as they are now (UIKit's popAnimationState,
+/// 0x48e22). Answers the animations started.
 fn close_block() -> Vec<Id> {
     let Some(block) = with_open_blocks(|blocks| blocks.pop()) else { return Vec::new() };
     if block.timing.duration <= 0.0 {
         return Vec::new();
     }
     let mut started = Vec::new();
-    for (view, key, before) in block.changes {
-        if key == "position" && block.sizes.iter().any(|&(v, size)| v == view && size != view_state(view).frame.size) {
-            continue;
+    if let Some((view, transition)) = block.transition {
+        let copy = add_view_transition(view_layer(view, 0), transition, block.timing.duration, block.timing.curve);
+        if copy != 0 {
+            started.push(copy);
         }
-        let model = {
-            use crate::fw::animation::Value;
-            match key {
-                "opacity" => Value::Number(view_alpha(view, 0)),
-                "transform" => Value::Transform(crate::fw::layers::affine_to_3d(view_state(view).transform)),
-                _ => Value::Point(view_center(view, 0)),
-            }
-        };
-        if model == before {
+    }
+    for (view, key, before) in block.changes {
+        if model_value(view, key) == before {
             continue;
         }
         if view_state(view).layer == 0 {
             make_layer_for(view);
         }
-        let copy = crate::fw::animation::animate_view_change(view_state(view).layer, key, before, block.timing);
+        let copy = crate::fw::animation::animate_view_change(view_state(view).layer, key, before, block.timing.timing);
         if copy != 0 {
             started.push(copy);
         }
@@ -1259,7 +1527,7 @@ fn when_all_stopped(started: Vec<Id>, done: Box<dyn FnOnce(bool) + Send>, later:
 
 /// Runs `animations` as an animation block and hands the completion call
 /// to `later` when nothing was animated.
-fn animate_with(timing: crate::fw::animation::ViewTiming, animations: usize, completion: usize, later: impl FnOnce(Box<dyn FnOnce() + Send>)) {
+fn animate_with(timing: BlockTiming, animations: usize, completion: usize, later: impl FnOnce(Box<dyn FnOnce() + Send>)) {
     open_block(timing);
     if animations != 0 {
         unsafe { crate::libsystem::mach::call_block(animations) };
@@ -1271,13 +1539,16 @@ fn animate_with(timing: crate::fw::animation::ViewTiming, animations: usize, com
             let header = block as *const crate::libsystem::mach::BlockHeader;
             let invoke: extern "C" fn(usize, u8) = unsafe { std::mem::transmute((*header).invoke) };
             invoke(block, finished as u8);
+            // UIViewAnimationBlockDelegate lets go of its copy when it goes.
+            crate::libsystem::mach::block_release(block as *mut _);
         });
         when_all_stopped(started, done, later);
     }
 }
 
-fn animate(timing: crate::fw::animation::ViewTiming, animations: usize, completion: usize) {
-    animate_with(timing, animations, completion, |work| crate::fw::runloop::post(crate::fw::runloop::Work::Native(work)));
+/// +animateWithDuration:...: a block (inheriting an outer one's timing).
+fn animate(timing: BlockTiming, animations: usize, completion: usize) {
+    animate_with(inherited(timing), animations, completion, |work| crate::fw::runloop::post(crate::fw::runloop::Work::Native(work)));
 }
 
 extern "C" fn animate_simple(_: Class, _: Sel, duration: f64, animations: usize) {
@@ -1296,9 +1567,9 @@ extern "C" fn animate_delay(_: Class, _: Sel, duration: f64, delay: f64, options
 // (blocks nest), the +setAnimation… calls set up the innermost one and
 // +commitAnimations closes it, animating as above (0.2 s, ease in-out
 // unless set). The delegate's will-start selector is sent on the next turn
-// of the main run loop, its did-stop selector when the animations end (on
-// the next turn when none started), with the block's id, finished and its
-// context (animationDidStop:finished:context:). -----
+// of the main run loop, its did-stop selector when the animations end
+// (inside +commitAnimations when none started, with no will-start), with
+// the block's id, finished and its context (animationDidStop:finished:context:). -----
 
 #[derive(Clone, Copy)]
 struct OldAnimation {
@@ -1317,11 +1588,17 @@ fn with_open_animation(change: impl FnOnce(&mut OldAnimation)) {
     }
 }
 
-fn with_open_timing(change: impl FnOnce(&mut crate::fw::animation::ViewTiming)) {
+fn with_open_timing(change: impl FnOnce(&mut BlockTiming)) {
     with_open_blocks(|blocks| {
         if let Some(block) = blocks.last_mut() {
             change(&mut block.timing);
         }
+    });
+}
+
+extern "C" fn set_animation_begins_from_current_state(_: Class, _: Sel, value: u8) {
+    with_open_timing(|timing| {
+        timing.options = if value != 0 { timing.options | BEGIN_FROM_CURRENT_STATE } else { timing.options & !BEGIN_FROM_CURRENT_STATE };
     });
 }
 
@@ -1382,25 +1659,38 @@ fn send_to_delegate(delegate: Id, selector: Sel, args: &[usize]) {
     runtime::send(delegate, &name, &args[..count]);
 }
 
-/// +commitAnimations: closes the innermost block; delegate calls that come
-/// on the next run-loop turn go to `later`.
+/// The delegate's selector for a block's start or stop: the one set, else
+/// (as UIKit's UIViewAnimationState) the delegate's own method by its
+/// default names, longest first.
+fn delegate_selector(delegate: Id, set: Sel, defaults: &[&str]) -> Sel {
+    if set != 0 {
+        return set;
+    }
+    defaults.iter().find(|name| runtime::responds(delegate, name)).map_or(0, |name| runtime::sel(name))
+}
+
+/// +commitAnimations: closes the innermost block. As UIKit's
+/// popAnimationState (0x48e22): with nothing animated, the did-stop call is
+/// made inside the commit and will-start never comes; else will-start comes
+/// on the next run-loop turn (`later`) and did-stop when they end.
 fn commit_old_animation(mut later: impl FnMut(Box<dyn FnOnce() + Send>)) {
-    let Some(done) = OLD_ANIMATIONS.lock().unwrap_or_else(|e| e.into_inner()).pop() else { return };
+    let Some(mut done) = OLD_ANIMATIONS.lock().unwrap_or_else(|e| e.into_inner()).pop() else { return };
     // An iOS 3 block's animations begin at its commit, not its begin.
     with_open_timing(|timing| timing.asked = crate::fw::runloop::media_time());
     let started = close_block();
+    if done.delegate != 0 {
+        done.will_start = delegate_selector(done.delegate, done.will_start, &["animationWillStart:context:", "animationWillStart:"]);
+        done.did_stop = delegate_selector(done.delegate, done.did_stop, &["animationDidStop:finished:context:", "animationDidStop:finished:", "animationDidStop:"]);
+    }
     if done.delegate == 0 || (done.will_start == 0 && done.did_stop == 0) {
         runtime::send(done.id, "release", &[]);
         return;
     }
     runtime::send(done.delegate, "retain", &[]);
     if started.is_empty() {
-        later(Box::new(move || {
-            send_to_delegate(done.delegate, done.will_start, &[done.id, done.context]);
-            send_to_delegate(done.delegate, done.did_stop, &[done.id, collections::number_bool(true), done.context]);
-            runtime::send(done.delegate, "release", &[]);
-            runtime::send(done.id, "release", &[]);
-        }));
+        send_to_delegate(done.delegate, done.did_stop, &[done.id, collections::number_bool(true), done.context]);
+        runtime::send(done.delegate, "release", &[]);
+        runtime::send(done.id, "release", &[]);
         return;
     }
     later(Box::new(move || send_to_delegate(done.delegate, done.will_start, &[done.id, done.context])));
@@ -1418,7 +1708,17 @@ extern "C" fn commit_animations(_: Class, _: Sel) {
 
 // Settings with nothing to show here.
 extern "C" fn ignore_class_word(_: Class, _: Sel, _value: usize) {}
-extern "C" fn ignore_animation_transition(_: Class, _: Sel, _transition: usize, _view: Id, _cache: u8) {}
+
+/// +setAnimationTransition:forView:cache: (UIViewAnimationTransition 1-4:
+/// flips and curls) in an iOS 3 block: kept with the block; its commit
+/// makes UIKit's transition on the view's layer (`close_block`).
+extern "C" fn set_animation_transition(_: Class, _: Sel, transition: usize, view: Id, _cache: u8) {
+    with_open_blocks(|blocks| {
+        if let Some(block) = blocks.last_mut() {
+            block.transition = (view != 0 && transition != 0).then_some((view, transition));
+        }
+    });
+}
 
 #[allow(clippy::too_many_arguments)]
 extern "C" fn animate_spring(
@@ -1438,54 +1738,107 @@ extern "C" fn animate_spring(
 }
 
 /// As UIKit: the animations block's changes aren't animated one by one
-/// (the view's contents cross-fade or flip as a whole, which isn't drawn
-/// here, so they show at once); the completion comes after the duration.
-extern "C" fn transition_with_view(_: Class, _: Sel, _view: Id, duration: f64, options: usize, animations: usize, completion: usize) {
-    if let Some(seconds) = transition_fade(duration, options) {
-        crate::fw::pictures::cross_fade(seconds);
-    }
+/// (the view's contents cross-fade or flip as a whole: a transition on its
+/// layer); the completion comes after the duration.
+extern "C" fn transition_with_view(_: Class, _: Sel, view: Id, duration: f64, options: usize, animations: usize, completion: usize) {
+    add_options_transition(view_layer(view, 0), duration, options);
     animate_with(view_timing(0.0, 0.0, 0), animations, completion, |work| crate::fw::runloop::post_after(duration.max(0.0), work));
 }
 
-/// How long the screen fades for a view or controller transition with
-/// these options (UIViewAnimationOptionTransition*, bits 20-22): the
-/// cross-dissolve as asked; flips and curls cross-dissolve too (not drawn
-/// here). None for no transition or no time.
-pub(crate) fn transition_fade(duration: f64, options: usize) -> Option<f64> {
-    (duration > 0.0 && (options >> 20) & 7 != 0).then_some(duration)
+/// The transition a view or controller transition's options ask for
+/// (UIViewAnimationOptionTransition*, bits 20-22, along their curve) on `layer`.
+fn add_options_transition(layer: Id, duration: f64, options: usize) {
+    add_view_transition(layer, (options >> 20) & 7, duration, view_timing(duration, 0.0, options).timing.curve);
+}
+
+/// As UIKit's +[UIViewAnimationState popAnimationState] (0x48e22, its table
+/// at 0x48e76): a view transition is a CATransition on the layer, its type
+/// and subtype by the transition (1 and 2 flips from the left and right, 6
+/// and 7 from the top and bottom, all "oglFlip"; 3 curl up "pageCurl", 4
+/// curl down "pageUnCurl", 5 the cross-dissolve "fade"), with the duration
+/// and curve given, filling both ways. Answers the layer's running copy (0:
+/// nothing, for no transition or no time).
+pub(crate) fn add_view_transition(layer: Id, transition: usize, duration: f64, curve: crate::fw::animation::Curve) -> Id {
+    let (kind, subtype) = match transition {
+        1 => ("oglFlip", "fromLeft"),
+        2 => ("oglFlip", "fromRight"),
+        3 => ("pageCurl", ""),
+        4 => ("pageUnCurl", ""),
+        5 => ("fade", ""),
+        6 => ("oglFlip", "fromTop"),
+        7 => ("oglFlip", "fromBottom"),
+        _ => return 0,
+    };
+    if layer == 0 || duration <= 0.0 {
+        return 0;
+    }
+    let animation = runtime::send(runtime::class_named("CATransition"), "animation", &[]);
+    runtime::send(animation, "setType:", &[string::make(kind)]);
+    if !subtype.is_empty() {
+        runtime::send(animation, "setSubtype:", &[string::make(subtype)]);
+    }
+    property_set(animation, "duration", duration.to_bits());
+    runtime::send(animation, "setTimingFunction:", &[crate::fw::animation::timing_function(curve)]);
+    runtime::send(animation, "setFillMode:", &[string::make("both")]);
+    crate::fw::animation::add(layer, animation, string::make("transition"))
 }
 
 /// UIViewAnimationOptionShowHideTransitionViews: hide/show instead of
 /// removing/adding.
 const SHOW_HIDE_TRANSITION_VIEWS: usize = 1 << 8;
 
-/// transitionFromView:toView:: toView takes fromView's place in its
-/// superview (or, with ShowHideTransitionViews, one is hidden and the other shown).
+/// transitionFromView:toView: as UIKit's (0x572e0, the same
+/// _transitionFromView: as controllers use): toView is added on top of
+/// fromView's superview (with ShowHideTransitionViews, shown); fromView
+/// leaves (or hides) at once with a transition style, else when the
+/// transition ends; the completion comes after `duration`.
 extern "C" fn transition_from_view(_: Class, _: Sel, from: Id, to: Id, duration: f64, options: usize, completion: usize) {
-    if let Some(seconds) = transition_fade(duration, options) {
-        crate::fw::pictures::cross_fade(seconds);
+    // The transition runs on the views' superview's layer.
+    let parent = if from == 0 { 0 } else { view_state(from).superview };
+    if parent != 0 {
+        add_options_transition(view_layer(parent, 0), duration, options);
     }
-    if options & SHOW_HIDE_TRANSITION_VIEWS != 0 {
-        property_set(from, "hidden", 1);
+    let show_hide = options & SHOW_HIDE_TRANSITION_VIEWS != 0;
+    if show_hide {
         property_set(to, "hidden", 0);
-    } else {
-        let parent = view_state(from).superview;
-        if parent != 0 && to != 0 {
-            let index = view_state(parent).subviews.iter().position(|&v| v == from);
-            attach(parent, to, index.map(|i| i + 1));
-        }
-        runtime::send(from, "removeFromSuperview", &[]);
+    } else if parent != 0 && to != 0 {
+        runtime::send(parent, "addSubview:", &[to]);
     }
-    animate(view_timing(0.0, 0.0, 0), 0, completion);
+    let take_away = move || {
+        if from != 0 && from != to {
+            if show_hide {
+                property_set(from, "hidden", 1);
+            } else {
+                runtime::send(from, "removeFromSuperview", &[]);
+            }
+        }
+    };
+    let styled = (options >> 20) & 7 != 0;
+    if styled {
+        take_away();
+    }
+    let completion = if completion == 0 { 0 } else { crate::libsystem::mach::block_copy(completion as *mut _) as usize };
+    crate::fw::runloop::post_after(
+        duration.max(0.0),
+        Box::new(move || {
+            if !styled {
+                take_away();
+            }
+            if completion != 0 {
+                let header = completion as *const crate::libsystem::mach::BlockHeader;
+                let invoke: extern "C" fn(usize, u8) = unsafe { std::mem::transmute((*header).invoke) };
+                invoke(completion, 1);
+                crate::libsystem::mach::block_release(completion as *mut _);
+            }
+        }),
+    );
 }
 
 extern "C" fn perform_without_animation(_: Class, _: Sel, actions: usize) {
     let was = ANIMATIONS_ENABLED.swap(false, std::sync::atomic::Ordering::Relaxed);
-    animate(view_timing(0.0, 0.0, 0), actions, 0);
+    animate_with(view_timing(0.0, 0.0, 0), actions, 0, |_| {});
     ANIMATIONS_ENABLED.store(was, std::sync::atomic::Ordering::Relaxed);
 }
-
-extern "C" fn ignore_class_bool(_: Class, _: Sel, _value: u8) {}
 
 // ----- -beginIgnoringInteractionEvents / -endIgnoringInteractionEvents:
 // while they nest above zero, new touches go nowhere (games wrap screen
@@ -1535,18 +1888,30 @@ pub fn windows() -> Vec<Id> {
     WINDOWS.lock().unwrap().clone()
 }
 
+/// As UIKit's (0x458d6): the window comes forward, its root controller's
+/// view joins it now if it isn't there yet (setRootViewController: waits
+/// for a shown window), and -makeKeyWindow makes it the key window.
 extern "C" fn window_make_key_and_visible(this: Id, _: Sel) {
-    *KEY_WINDOW.lock().unwrap() = this;
     let was_shown = on_screen(this);
+    let root = property_get(this, "rootViewController").unwrap_or(0) as Id;
+    if !was_shown && root != 0 {
+        let view = runtime::send(root, "view", &[]);
+        if view != 0 && view_state(view).superview != this {
+            place_upright(this, view);
+            attach(this, view, None);
+        }
+        put_on_screen(root);
+    }
     let mut windows = WINDOWS.lock().unwrap();
     if !windows.contains(&this) {
         windows.push(this);
+        crate::fw::changes::changed(this);
     }
     drop(windows);
     set_needs_layout(this);
     property_set(this, "hidden", 0);
     crate::log!("window {this:#x} shown");
-    let root = property_get(this, "rootViewController").unwrap_or(0) as Id;
+    runtime::send(this, "makeKeyWindow", &[]);
     let showing_root = will_appear(root, false);
     // The other controllers whose views are in the window come on screen with it.
     let arriving = if was_shown { Vec::new() } else { appearing(this) };
@@ -1623,6 +1988,11 @@ fn did_disappear(controller: Id, animated: bool) {
 /// Whether a view is in a window that is shown.
 fn on_screen(view: Id) -> bool {
     let window = window_of(view);
+    window != 0 && window_shown(window)
+}
+
+/// Whether a window is in the shown list and not hidden.
+pub(crate) fn window_shown(window: Id) -> bool {
     window != 0 && property_get(window, "hidden").unwrap_or(0) == 0 && WINDOWS.lock().unwrap().contains(&window)
 }
 
@@ -1764,12 +2134,18 @@ extern "C" fn window_make_key(this: Id, _: Sel) {
     *KEY_WINDOW.lock().unwrap() = this;
 }
 
+extern "C" fn window_is_key(this: Id, _: Sel) -> bool {
+    this == key_window()
+}
+
 extern "C" fn window_root_controller(this: Id, _: Sel) -> Id {
     property_get(this, "rootViewController").unwrap_or(0) as Id
 }
 
+/// The window retains its root controller, as UIKit's.
 extern "C" fn window_set_root_controller(this: Id, _: Sel, controller: Id) {
     let old = property_get(this, "rootViewController").unwrap_or(0) as Id;
+    crate::fw::counted::retain(controller);
     property_set(this, "rootViewController", controller as u64);
     // A new root takes the old one's place: its view leaves the window.
     let shown = WINDOWS.lock().unwrap().contains(&this);
@@ -1785,10 +2161,12 @@ extern "C" fn window_set_root_controller(this: Id, _: Sel, controller: Id) {
             did_disappear(old, false);
         }
     }
-    if controller != 0 {
+    // As UIKit (0x3c95e): the new root's view joins the window only while it
+    // shows; a hidden window adds it in -makeKeyAndVisible.
+    if controller != 0 && shown {
         // As UIKit: the view is loaded (viewDidLoad) before viewWillAppear:.
         let view = runtime::send(controller, "view", &[]);
-        let showing = shown && will_appear(controller, false);
+        let showing = will_appear(controller, false);
         if view != 0 {
             place_upright(this, view);
             attach(this, view, None);
@@ -1798,6 +2176,7 @@ extern "C" fn window_set_root_controller(this: Id, _: Sel, controller: Id) {
             did_appear(controller, false);
         }
     }
+    crate::fw::counted::release(old);
 }
 
 /// Tells a controller of ours (fw/controls.rs: navigation controllers) that
@@ -1875,7 +2254,7 @@ impl Drop for ForwardingDepth {
 
 /// UIResponder's default for the touch methods: pass the call to the next
 /// responder (nothing when there is none, or it doesn't handle touches).
-fn pass_touch(this: Id, name: &'static str, touches: Id, event: Id) {
+pub(crate) fn pass_touch(this: Id, name: &'static str, touches: Id, event: Id) {
     if TOUCH_FORWARDING.with(std::cell::Cell::get) >= 256 {
         return;
     }
@@ -1913,26 +2292,49 @@ extern "C" fn controller_view(this: Id, _: Sel) -> Id {
     }
     runtime::send(this, "loadView", &[]);
     if property_get(this, "view").is_none() {
-        let view = runtime::send(runtime::class_named("UIView"), "alloc", &[]);
-        let s = runtime::sel("initWithFrame:");
-        let imp = runtime::imp_for(view, s).unwrap();
-        let f: extern "C" fn(Id, Sel, Rect) -> Id = unsafe { std::mem::transmute(imp) };
-        let view = f(view, s, oriented_bounds());
-        property_set(this, "view", view as u64);
-        // The view's next responder is its controller, as with setView:.
-        property_set(view, "viewController", this as u64);
+        load_default_view(this);
     }
     runtime::send(this, "viewDidLoad", &[]);
     property_get(this, "view").unwrap_or(0) as Id
 }
 
+/// UIViewController's -loadView without a nib (0xecc9a): a plain view the
+/// screen's bounds (_defaultInitialViewFrame: portrait in iOS 6), flexible
+/// width and height (18), given with -setView:.
+pub(crate) fn load_default_view(controller: Id) {
+    let view = runtime::send(runtime::class_named("UIView"), "alloc", &[]);
+    let s = runtime::sel("initWithFrame:");
+    let imp = runtime::imp_for(view, s).unwrap();
+    let f: extern "C" fn(Id, Sel, Rect) -> Id = unsafe { std::mem::transmute(imp) };
+    let view = f(view, s, screen_bounds());
+    runtime::send(view, "setAutoresizingMask:", &[18]);
+    runtime::send(controller, "setView:", &[view]);
+}
+
+/// A controller retains its view, as UIKit's.
 extern "C" fn controller_set_view(this: Id, _: Sel, view: Id) {
-    if let Some(old) = property_get(this, "view").map(|old| old as Id).filter(|&old| old != view && property_get(old, "viewController") == Some(this as u64)) {
+    let old = property_get(this, "view").unwrap_or(0) as Id;
+    if old != 0 && old != view && property_get(old, "viewController") == Some(this as u64) {
         property_set(old, "viewController", 0);
     }
+    crate::fw::counted::retain(view);
     property_set(this, "view", view as u64);
     if view != 0 {
         property_set(view, "viewController", this as u64);
+    }
+    crate::fw::counted::release(old);
+}
+
+/// -[UIViewController dealloc] (a game controller's [super dealloc] reaches
+/// it): it lets go of its view and its child controllers, as UIKit's.
+extern "C" fn controller_dealloc(this: Id, _: Sel) {
+    controller_set_view(this, 0, 0);
+    let children = CONTROLLER_CHILDREN.lock().unwrap().as_mut().and_then(|all| all.remove(&this)).unwrap_or_default();
+    for child in children {
+        if property_get(child, "parentController") == Some(this as u64) {
+            property_set(child, "parentController", 0);
+        }
+        crate::fw::counted::release(child);
     }
 }
 
@@ -1964,45 +2366,199 @@ extern "C" fn controller_should_autorotate_to(_this: Id, _: Sel, orientation: is
     matches!(orientation, 1..=4) && current_interface().mask & (1 << orientation) != 0
 }
 
-/// Runs a completion block (no arguments) later on the main run loop, the
-/// way UIKit calls it once a presentation or dismissal has finished.
-fn complete_later(completion: usize) {
-    if completion != 0 {
-        let block = crate::libsystem::mach::block_copy(completion as *mut _) as usize;
-        crate::fw::runloop::post(crate::fw::runloop::Work::Block(block));
+/// Runs a completion block (no arguments) on the main run loop once a
+/// presentation or dismissal has finished: after its `seconds` of
+/// animation, or on the next turn when it had none.
+fn complete_after(seconds: f64, completion: usize) {
+    if completion == 0 {
+        return;
+    }
+    let block = crate::libsystem::mach::block_copy(completion as *mut _) as usize;
+    if seconds > 0.0 {
+        crate::fw::runloop::post_after(
+            seconds,
+            Box::new(move || {
+                let header = block as *const crate::libsystem::mach::BlockHeader;
+                let invoke: extern "C" fn(usize) = unsafe { std::mem::transmute((*header).invoke) };
+                invoke(block);
+                crate::libsystem::mach::block_release(block as *mut _);
+            }),
+        );
+    } else {
+        // A main-queue block; our copy goes once it ran (UIViewControllerAction's copy + autorelease).
+        crate::fw::runloop::post(crate::fw::runloop::Work::Queue(Box::new(move || {
+            unsafe { crate::libsystem::mach::call_block(block) };
+            crate::libsystem::mach::block_release(block as *mut _);
+        })));
     }
 }
 
-/// Links `controller` as shown by `this`, and puts its view in the window.
-fn present(this: Id, controller: Id, animated: bool) {
+/// A modal transition still to end (a presentation's or dismissal's late
+/// part): the controller shown or hidden, the one presenting or dismissing
+/// it (UIKit's currentAction is set on that one while it runs), its window,
+/// its number, and the end. A newer transition of the same controller runs
+/// it first, so a late end never touches what the newer one shows.
+struct ModalEnd {
+    controller: Id,
+    owner: Id,
+    window: Id,
+    number: u64,
+    end: Box<dyn FnOnce() + Send>,
+}
+
+static MODAL_ENDS: Mutex<Vec<ModalEnd>> = Mutex::new(Vec::new());
+static MODAL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A modal transition of `controller` begins: one still running ends now.
+fn modal_begin(controller: Id) {
+    let older: Vec<ModalEnd> = {
+        let mut ends = MODAL_ENDS.lock().unwrap_or_else(|e| e.into_inner());
+        let (older, rest) = std::mem::take(&mut *ends).into_iter().partition(|end| end.controller == controller);
+        *ends = rest;
+        older
+    };
+    for older in older {
+        (older.end)();
+    }
+}
+
+/// Runs a transition's `end` after `seconds`, unless a newer one ran it
+/// first; until then `owner` is busy and `window` takes no new touches.
+fn modal_end_after(controller: Id, owner: Id, window: Id, seconds: f64, end: Box<dyn FnOnce() + Send>) {
+    let number = MODAL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    MODAL_ENDS.lock().unwrap_or_else(|e| e.into_inner()).push(ModalEnd { controller, owner, window, number, end });
+    crate::fw::runloop::post_after(
+        seconds,
+        Box::new(move || {
+            let end = {
+                let mut ends = MODAL_ENDS.lock().unwrap_or_else(|e| e.into_inner());
+                ends.iter().position(|end| end.number == number).map(|i| ends.remove(i).end)
+            };
+            if let Some(end) = end {
+                end();
+            }
+        }),
+    );
+}
+
+/// Whether a modal transition `owner` presents or dismisses still runs
+/// (UIKit's currentAction): it presents and dismisses nothing more until then.
+fn modal_busy(owner: Id) -> bool {
+    MODAL_ENDS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|end| end.owner == owner)
+}
+
+/// Whether a modal transition runs in `window`. UIKit's transition view
+/// ignores interaction events while it runs (UITransitionView sets that up
+/// in initWithFrame:, 0xcb144): new touches there go nowhere.
+pub fn modal_transition_running(window: Id) -> bool {
+    MODAL_ENDS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|end| end.window == window)
+}
+
+/// How long UIKit's modal transition runs for a controller's
+/// modalTransitionStyle (UITransitionView defaultDurationForTransition:,
+/// 0xcb581): cover vertical and cross-dissolve 0.4 s, flip 0.7 s, partial curl 0.6 s.
+fn modal_seconds(controller: Id) -> f64 {
+    match runtime::send(controller, "modalTransitionStyle", &[]) as isize {
+        1 => 0.7,
+        3 => 0.6,
+        _ => 0.4,
+    }
+}
+
+/// A presented view's way on or off screen: cover vertical slides it from
+/// (or to) just below the screen; `off` puts the view below the screen (its
+/// model value) and slides it there from where it is. The other styles are
+/// view transitions on the window's layer (as Apple documents them: flip
+/// horizontal from the right on the way in and from the left on the way
+/// out, cross-dissolve, partial curl up and down again; the curl goes all
+/// the way here), the leaving view taken out at once as UIKit's transition
+/// view does.
+fn modal_motion(controller: Id, view: Id, seconds: f64, off: bool) {
+    let style = runtime::send(controller, "modalTransitionStyle", &[]);
+    if style != 0 {
+        let transition = match (style, off) {
+            (1, false) => 2,
+            (1, true) => 1,
+            (3, false) => 3,
+            (3, true) => 4,
+            _ => 5,
+        };
+        let window = window_of(view);
+        if window != 0 {
+            add_view_transition(view_layer(window, 0), transition, seconds, view_curve(0));
+        }
+        if off && view_state(view).superview != 0 {
+            take_out(view);
+        }
+        return;
+    }
+    // One screen height down on screen, in window points (an old app's window is turned).
+    let (_, high, _) = screen_points();
+    let back = window_turn().and_then(crate::fw::geometry::invert).unwrap_or(IDENTITY);
+    let (x0, y0) = crate::fw::geometry::apply(back, 0.0, 0.0);
+    let (x1, y1) = crate::fw::geometry::apply(back, 0.0, high);
+    let center = view_center(view, 0);
+    let below = Point { x: center.x + x1 - x0, y: center.y + y1 - y0 };
+    let from = if off {
+        view_set_center(view, 0, below);
+        center
+    } else {
+        below
+    };
+    let layer = view_layer(view, 0);
+    crate::fw::animation::animate_view_change(layer, "position", crate::fw::animation::Value::Point(from), view_timing(seconds, 0.0, 0).timing);
+}
+
+/// Links `controller` as shown by `this`, and puts its view in the window;
+/// how long its transition runs. As UIKit's (0xf4d3a), refused (None, with
+/// UIKit's warning) while `this` already presents one or its transition runs.
+fn present(this: Id, controller: Id, animated: bool) -> Option<f64> {
+    let shown = property_get(this, "presented").unwrap_or(0) as Id;
+    if controller != 0 && shown != 0 {
+        crate::log!("Warning: Attempt to present {controller:#x} on {this:#x} which is already presenting {shown:#x}");
+        return None;
+    }
+    if controller != 0 && modal_busy(this) {
+        crate::log!("Warning: Attempt to present {controller:#x} on {this:#x} while a presentation is in progress!");
+        return None;
+    }
     crate::log!("view controller {this:#x} shows {} {controller:#x} on top", crate::fw::string::describe_class_of(controller));
+    // Held until its dismissal has finished (UIKit's presenting controller
+    // retains what it presents).
+    crate::fw::counted::retain(controller);
     property_set(this, "presented", controller as u64);
+    let mut seconds = 0.0;
     if controller != 0 {
         property_set(controller, "presenting", this as u64);
         // Screens for services this phone doesn't offer have nothing to show.
         if !runtime::responds(controller, "gamebridgeAnswerShown") {
-            show_presented(this, controller, animated);
+            seconds = show_presented(this, controller, animated);
         }
         put_on_screen(controller);
     }
+    Some(seconds)
 }
 
 /// A full-screen presentation, as on iPhones: the presented controller's
 /// view fills the window, and the presenting controller's view leaves it
 /// (kept as "coveredView" for the way back), with the appearance messages.
-fn show_presented(presenter: Id, controller: Id, animated: bool) {
+/// Animated (as UIKit's modal transition), the new view comes in over the
+/// old one, which leaves when it is done, and the did-appear messages wait
+/// for that too. Answers how long it runs.
+fn show_presented(presenter: Id, controller: Id, animated: bool) -> f64 {
     let presenter_view = property_get(presenter, "view").unwrap_or(0) as Id;
     let window = match if presenter_view != 0 { window_of(presenter_view) } else { 0 } {
         0 => key_window(),
         window => window,
     };
     if window == 0 {
-        return; // nothing is on screen yet: only linked
+        return 0.0; // nothing is on screen yet: only linked
     }
+    modal_begin(controller);
     let covered = if presenter_view != 0 && view_state(presenter_view).superview == window { presenter_view } else { 0 };
     let view = runtime::send(controller, "view", &[]);
     if view == 0 {
-        return;
+        return 0.0;
     }
     let showing = will_appear(controller, animated);
     let hiding = covered != 0 && will_disappear(presenter, animated);
@@ -2012,43 +2568,77 @@ fn show_presented(presenter: Id, controller: Id, animated: bool) {
     attach(window, view, None);
     property_set(controller, "presentedInWindow", window as u64);
     if covered != 0 {
-        take_out(covered);
         property_set(controller, "coveredView", covered as u64);
     }
-    if hiding {
-        did_disappear(presenter, animated);
+    let finish = move || {
+        if covered != 0 && view_state(covered).superview == window {
+            take_out(covered);
+        }
+        if hiding {
+            did_disappear(presenter, animated);
+        }
+        if showing {
+            did_appear(controller, animated);
+        }
+    };
+    if !animated {
+        finish();
+        return 0.0;
     }
-    if showing {
-        did_appear(controller, animated);
-    }
+    let seconds = modal_seconds(controller);
+    modal_motion(controller, view, seconds, false);
+    modal_end_after(controller, presenter, window, seconds, Box::new(finish));
+    seconds
 }
 
 /// Takes a presented controller's view out of its window and, with
-/// `restore`, puts back the view it covered; `uncovered` (the controller
-/// that view belongs to) hears that it appears again.
-fn hide_presented(controller: Id, uncovered: Id, animated: bool, restore: bool) {
+/// `restore`, puts back under it the view `bottom` (the stack's lowest
+/// presented controller; `controller` itself for a lone screen) covered;
+/// `uncovered` (the controller that view belongs to) hears that it appears
+/// again. Animated, the view goes off over the uncovered one and leaves
+/// when that is done. Answers how long it runs.
+fn hide_presented(controller: Id, bottom: Id, uncovered: Id, animated: bool, restore: bool) -> f64 {
+    modal_begin(controller);
     let Some(window) = property_get(controller, "presentedInWindow").map(|window| window as Id).filter(|&window| window != 0) else {
-        return;
+        return 0.0;
     };
     let view = property_get(controller, "view").unwrap_or(0) as Id;
-    let covered = property_get(controller, "coveredView").unwrap_or(0) as Id;
+    let covered = property_get(bottom, "coveredView").unwrap_or(0) as Id;
+    property_set(bottom, "coveredView", 0);
     let hiding = will_disappear(controller, animated);
     let showing = restore && covered != 0 && will_appear(uncovered, animated);
-    if restore && covered != 0 {
+    if restore && covered != 0 && view_state(covered).superview != window {
         let index = view_state(window).subviews.iter().position(|&v| v == view);
         attach(window, covered, index);
     }
-    if view != 0 && view_state(view).superview == window {
-        take_out(view);
-    }
     property_set(controller, "presentedInWindow", 0);
     property_set(controller, "coveredView", 0);
-    if hiding {
-        did_disappear(controller, animated);
+    let in_window = view != 0 && view_state(view).superview == window;
+    let seconds = if animated && in_window { modal_seconds(controller) } else { 0.0 };
+    let center = if view != 0 { view_center(view, 0) } else { Point::default() };
+    let finish = move || {
+        if view != 0 && view_state(view).superview == window {
+            take_out(view);
+        }
+        if seconds > 0.0 {
+            // Back where it was, for a later presentation.
+            view_set_center(view, 0, center);
+        }
+        if hiding {
+            did_disappear(controller, animated);
+        }
+        if showing {
+            did_appear(uncovered, animated);
+        }
+    };
+    if seconds > 0.0 {
+        modal_motion(controller, view, seconds, true);
+        // Only the top screen closes animated: `uncovered` is the dismissing one.
+        modal_end_after(controller, uncovered, window, seconds, Box::new(finish));
+    } else {
+        finish();
     }
-    if showing {
-        did_appear(uncovered, animated);
-    }
+    seconds
 }
 
 /// Screens for services this phone doesn't offer answer the way iOS does
@@ -2062,37 +2652,45 @@ fn answer_shown_later(controller: Id) {
 }
 
 extern "C" fn controller_present(this: Id, _: Sel, controller: Id, animated: u8) {
-    present(this, controller, animated != 0);
-    answer_shown_later(controller);
+    if present(this, controller, animated != 0).is_some() {
+        answer_shown_later(controller);
+    }
 }
 
 extern "C" fn controller_present_completion(this: Id, _: Sel, controller: Id, animated: u8, completion: usize) {
-    present(this, controller, animated != 0);
-    // As on iOS: the presentation finishes (completion block) before the
-    // user can close the screen. The run loop keeps this order.
-    complete_later(completion);
-    answer_shown_later(controller);
+    // Refused, the completion never runs (as UIKit's).
+    if let Some(seconds) = present(this, controller, animated != 0) {
+        // As on iOS: the presentation finishes (completion block) before the
+        // user can close the screen. The run loop keeps this order.
+        complete_after(seconds, completion);
+        answer_shown_later(controller);
+    }
 }
 
 /// dismissViewControllerAnimated: sent to the presenting controller closes
 /// what it shows and everything shown on top of that; sent to the shown
 /// controller itself (nothing on top) it is passed to the one that
-/// presented it.
-fn dismiss(this: Id, animated: bool) {
+/// presented it. Answers how long it runs; as UIKit's (0xf6736), refused
+/// (None, with UIKit's warning) while a transition of either runs.
+fn dismiss(this: Id, animated: bool) -> Option<f64> {
     let owner = match property_get(this, "presented") {
         Some(shown) if shown != 0 => this,
         _ => property_get(this, "presenting").unwrap_or(0) as Id,
     };
-    if owner != 0 {
-        close_presented(owner, animated, true);
+    if modal_busy(this) || (owner != 0 && modal_busy(owner)) {
+        crate::log!("Warning: Attempt to dismiss from view controller {this:#x} while a presentation or dismiss is in progress!");
+        return None;
     }
+    Some(if owner != 0 { close_presented(owner, animated, true) } else { 0.0 })
 }
 
 /// Closes everything `owner` presents, top first, and unlinks it. With
 /// `restore` (a dismissal) each view put back the view it covered, so
 /// `owner`'s comes back on screen; without (`owner` is leaving its window)
-/// the presented views just go.
-fn close_presented(owner: Id, animated: bool, restore: bool) {
+/// the presented views just go. As Apple documents it, only the top screen
+/// closes animated (with its own transition style); the ones between are
+/// removed at once, unseen. Answers how long it runs.
+fn close_presented(owner: Id, animated: bool, restore: bool) -> f64 {
     let mut shown = property_get(owner, "presented").unwrap_or(0) as Id;
     property_set(owner, "presented", 0);
     // Walk up the stack: A shows B shows C; dismissing from A closes B and C.
@@ -2104,26 +2702,40 @@ fn close_presented(owner: Id, animated: bool, restore: bool) {
         closed.push(shown);
         shown = property_get(shown, "presented").unwrap_or(0) as Id;
     }
-    // Their views leave the window top first; only the bottom one puts back
-    // the view it covered: `owner`'s comes back on screen, and the ones in
-    // between (never uncovered) hear nothing.
+    // Their views leave the window top first. The top one puts back the view
+    // the bottom one covered, under itself: `owner`'s comes back on screen
+    // as the top one goes, and the ones in between (never uncovered) hear nothing.
+    let mut seconds = 0.0f64;
+    let bottom = closed.first().copied().unwrap_or(0);
     for (index, &controller) in closed.iter().enumerate().rev() {
-        hide_presented(controller, if index == 0 { owner } else { 0 }, animated, restore && index == 0);
+        let top = index + 1 == closed.len();
+        seconds = seconds.max(hide_presented(controller, if top { bottom } else { controller }, if top { owner } else { 0 }, animated && top, restore && top));
     }
-    for shown in closed {
+    for &shown in &closed {
         property_set(shown, "presenting", 0);
         property_set(shown, "presented", 0);
         property_set(shown, "onScreen", 0); // shown again later: announced again
     }
+    // The presenters let go once the dismissal has finished: autoreleased
+    // then, so the controllers outlive the turn (a controller that dismissed
+    // itself is still running).
+    let let_go = move || closed.iter().for_each(|&shown| _ = crate::fw::counted::autorelease(shown));
+    if seconds > 0.0 {
+        crate::fw::runloop::post_after(seconds, Box::new(let_go));
+    } else {
+        let_go();
+    }
+    seconds
 }
 
 extern "C" fn controller_dismiss(this: Id, _: Sel, animated: u8) {
     dismiss(this, animated != 0);
 }
 
-extern "C" fn controller_dismiss_completion(this: Id, s: Sel, animated: u8, completion: usize) {
-    controller_dismiss(this, s, animated);
-    complete_later(completion);
+extern "C" fn controller_dismiss_completion(this: Id, _: Sel, animated: u8, completion: usize) {
+    if let Some(seconds) = dismiss(this, animated != 0) {
+        complete_after(seconds, completion);
+    }
 }
 
 property!(controller_presenting, controller_set_presenting, "presenting", id, 0);
@@ -2176,6 +2788,9 @@ extern "C" fn controller_parent(this: Id, _: Sel) -> Id {
     property_get(this, "parentController").unwrap_or(0) as Id
 }
 
+/// As UIKit's _addChildViewController:performHierarchyCheck:notifyWillMove:
+/// (0xee73c): a child of another parent hears willMoveToParentViewController:
+/// nil and leaves it first; then willMoveToParentViewController: self.
 extern "C" fn controller_add_child(this: Id, _: Sel, child: Id) {
     if child == 0 {
         return;
@@ -2184,27 +2799,42 @@ extern "C" fn controller_add_child(this: Id, _: Sel, child: Id) {
     if previous == this {
         return;
     }
-    {
+    if previous != 0 {
+        runtime::send(child, "willMoveToParentViewController:", &[0]);
+        runtime::send(child, "removeFromParentViewController", &[]);
+    }
+    runtime::send(child, "willMoveToParentViewController:", &[this]);
+    // The parent's list retains its children, as UIKit's array does.
+    crate::fw::counted::retain(child);
+    let left = {
         let mut all = CONTROLLER_CHILDREN.lock().unwrap();
         let all = all.get_or_insert_with(HashMap::new);
-        if previous != 0 {
-            if let Some(children) = all.get_mut(&previous) {
-                children.retain(|&controller| controller != child);
-            }
-        }
+        // (A game's own removeFromParentViewController may not have called ours.)
+        let left = all.get_mut(&previous).map_or(0, |children| take_child(children, child));
         all.entry(this).or_default().push(child);
-    }
+        left
+    };
     property_set(child, "parentController", this as u64);
+    (0..left).for_each(|_| crate::fw::counted::release(child));
+}
+
+/// Takes `child` out of a parent's list; how many times it was there.
+fn take_child(children: &mut Vec<Id>, child: Id) -> usize {
+    let before = children.len();
+    children.retain(|&controller| controller != child);
+    before - children.len()
 }
 
 extern "C" fn controller_remove_from_parent(this: Id, _: Sel) {
     let parent = property_get(this, "parentController").unwrap_or(0) as Id;
+    let mut left = 0;
     if parent != 0 {
         if let Some(children) = CONTROLLER_CHILDREN.lock().unwrap().as_mut().and_then(|all| all.get_mut(&parent)) {
-            children.retain(|&controller| controller != this);
+            left = take_child(children, this);
         }
     }
     property_set(this, "parentController", 0);
+    (0..left).for_each(|_| crate::fw::counted::release(this));
 }
 
 extern "C" fn controller_children(this: Id, _: Sel) -> Id {
@@ -2212,12 +2842,23 @@ extern "C" fn controller_children(this: Id, _: Sel) -> Id {
 }
 
 /// transitionFromViewController:toViewController:duration:options:animations:completion:
-/// between two children of the receiver: the new child's view takes the old
-/// one's place in its superview (with ShowHideTransitionViews, the old view
-/// is hidden instead), the animations block runs, and after `duration` the
-/// old view leaves, the appearance calls finish and completion(YES) runs.
+/// between two children of the receiver, as UIKit's _transitionFromView:
+/// (0x57c47): the old child hears viewWillDisappear:, the new one
+/// viewWillAppear:, the new view is added on top of the old one's superview
+/// and the animations block runs; with a transition style the old view
+/// leaves at once (the superview's layer runs the transition from what it
+/// showed: fw/pictures.rs).
+/// After `duration`: viewDidDisappear:, the old view leaves (no style),
+/// viewDidAppear:, completion(YES). Nothing lays the new view out here: the
+/// run loop's layout pass does, after viewWillAppear:. With
+/// ShowHideTransitionViews the views are hidden and shown instead.
 #[allow(clippy::too_many_arguments)]
 pub(crate) extern "C" fn controller_transition(_this: Id, _: Sel, from: Id, to: Id, duration: f64, options: usize, animations: usize, completion: usize) {
+    transition_controllers(from, to, duration, options, animations, completion, |seconds, work| crate::fw::runloop::post_after(seconds, work));
+}
+
+/// The transition, its end handed to `later` (with the seconds to wait).
+fn transition_controllers(from: Id, to: Id, duration: f64, options: usize, animations: usize, completion: usize, later: impl FnOnce(f64, Box<dyn FnOnce() + Send>)) {
     let from_view = if from == 0 { 0 } else { runtime::send(from, "view", &[]) };
     let to_view = if to == 0 { 0 } else { runtime::send(to, "view", &[]) };
     let on_screen = from != 0 && property_get(from, "appeared") == Some(1);
@@ -2230,40 +2871,48 @@ pub(crate) extern "C" fn controller_transition(_this: Id, _: Sel, from: Id, to: 
         }
         list
     };
-    // The arriving view is laid out before its controller hears
-    // viewWillAppear: (SpellCraft opens a tutorial box there and adds its
-    // drawer in -viewDidLayoutSubviews: laid out later, the drawer covered it).
-    if on_screen && to_view != 0 {
-        set_needs_layout(to_view);
-        lay_out_tree(to_view, 0);
-    }
     let hiding: Vec<Id> = if on_screen { with_inside(from, from_view).into_iter().filter(|&c| will_disappear(c, true)).collect() } else { Vec::new() };
     let showing: Vec<Id> = if on_screen { with_inside(to, to_view).into_iter().filter(|&c| will_appear(c, true)).collect() } else { Vec::new() };
     let show_hide = options & SHOW_HIDE_TRANSITION_VIEWS != 0;
+    let styled = (options >> 20) & 7 != 0;
+    let differ = from_view != 0 && from_view != to_view;
+    let parent = if from_view == 0 { 0 } else { view_state(from_view).superview };
     if show_hide {
         property_set(to_view, "hidden", 0);
-    } else if from_view != 0 && to_view != 0 {
-        let parent = view_state(from_view).superview;
-        if parent != 0 {
-            let index = view_state(parent).subviews.iter().position(|&v| v == from_view);
-            attach(parent, to_view, index.map(|i| i + 1));
-        }
+    } else if parent != 0 && to_view != 0 {
+        runtime::send(parent, "addSubview:", &[to_view]);
     }
-    if let Some(seconds) = transition_fade(duration, options) {
-        crate::fw::pictures::cross_fade(seconds);
+    // The transition runs on the views' superview's layer.
+    if parent != 0 {
+        add_options_transition(view_layer(parent, 0), duration, options);
     }
     let completion = if completion == 0 { 0 } else { crate::libsystem::mach::block_copy(completion as *mut _) as usize };
+    // What the end works with is held until it ran, as UIKit's transition
+    // block captures (retains) the controllers and their views.
+    let held: Vec<Id> = [from, to, from_view, to_view].into_iter().chain(hiding.iter().copied()).chain(showing.iter().copied()).collect();
+    held.iter().for_each(|&object| {
+        crate::fw::counted::retain(object);
+    });
     animate_with(view_timing(duration, 0.0, options), animations, 0, |_| {});
-    crate::fw::runloop::post_after(
+    if styled && differ {
+        if show_hide {
+            property_set(from_view, "hidden", 1);
+        } else {
+            runtime::send(from_view, "removeFromSuperview", &[]);
+        }
+    }
+    later(
         duration.max(0.0),
         Box::new(move || {
-            if show_hide {
-                property_set(from_view, "hidden", 1);
-            } else if from_view != 0 && from_view != to_view {
-                runtime::send(from_view, "removeFromSuperview", &[]);
-            }
             for controller in hiding {
                 did_disappear(controller, true);
+            }
+            if !styled && differ {
+                if show_hide {
+                    property_set(from_view, "hidden", 1);
+                } else {
+                    runtime::send(from_view, "removeFromSuperview", &[]);
+                }
             }
             for controller in showing {
                 did_appear(controller, true);
@@ -2272,7 +2921,9 @@ pub(crate) extern "C" fn controller_transition(_this: Id, _: Sel, from: Id, to: 
                 let header = completion as *const crate::libsystem::mach::BlockHeader;
                 let invoke: extern "C" fn(usize, u8) = unsafe { std::mem::transmute((*header).invoke) };
                 invoke(completion, 1);
+                crate::libsystem::mach::block_release(completion as *mut _);
             }
+            held.into_iter().for_each(crate::fw::counted::release);
         }),
     );
 }
@@ -2280,13 +2931,14 @@ pub(crate) extern "C" fn controller_transition(_this: Id, _: Sel, from: Id, to: 
 // ----- layers -----
 
 extern "C" fn layer_init(this: Id, _: Sel) -> Id {
+    crate::fw::layers::created(this);
     this
 }
 
 property!(layer_opaque, layer_set_opaque, "opaque", bool, false);
 property!(layer_drawable_properties, layer_set_drawable_properties, "drawableProperties", id, 0);
 property!(layer_contents_scale, layer_set_contents_scale, "contentsScale", f64, 1.0);
-property!(layer_delegate, layer_set_delegate, "delegate", id, 0);
+property!(layer_delegate, layer_set_delegate, "delegate", assign, 0);
 
 // ----- colours: { isa, r, g, b, a } -----
 
@@ -2609,6 +3261,106 @@ extern "C" fn image_view_init_with_image(this: Id, _: Sel, image: Id) -> Id {
 }
 
 property!(image_view_image, image_view_set_image, "image", id, 0);
+property!(image_view_highlighted, image_view_set_highlighted, "highlighted", bool, false);
+// UIKit's private -setDrawMode: (a button's parts: 1 dimmed when disabled,
+// 2 darker when pressed); drawn as `image_view_drawn`.
+property!(image_view_draw_mode, image_view_set_draw_mode, "drawMode", isize, 0);
+
+/// The picture an image view draws for `image`: drawn darker in a draw
+/// mode (Apple: "drawn darker"; still solid, not see-through).
+pub fn image_view_drawn(view: Id, image: Id) -> Id {
+    if image == 0 || image_view_draw_mode(view, 0) == 0 {
+        return image;
+    }
+    match crate::fw::graphics::darker_image(image) {
+        0 => image,
+        darker => darker,
+    }
+}
+
+/// The picture an image view shows: its highlighted one while highlighted
+/// (when it has one), else its image.
+pub fn image_view_shown(view: Id) -> Id {
+    let highlighted = property_get(view, "highlightedImage").unwrap_or(0) as Id;
+    if highlighted != 0 && image_view_highlighted(view, 0) {
+        return highlighted;
+    }
+    property_get(view, "image").unwrap_or(0) as Id
+}
+
+property!(image_view_animation_images, image_view_set_animation_images_kept, "animationImages", id, 0);
+property!(image_view_highlighted_animation_images, image_view_set_highlighted_animation_images_kept, "highlightedAnimationImages", id, 0);
+
+/// Keeps a copy of `list` (nil stays nil) with `keep`: the animation lists
+/// are `copy` properties.
+fn keep_copy(this: Id, s: Sel, list: Id, keep: extern "C" fn(Id, Sel, Id)) {
+    let copy = if list == 0 { 0 } else { runtime::send(list, "copy", &[]) };
+    keep(this, s, copy);
+    crate::fw::counted::release(copy);
+}
+
+extern "C" fn image_view_set_animation_images(this: Id, s: Sel, list: Id) {
+    keep_copy(this, s, list, image_view_set_animation_images_kept);
+}
+
+extern "C" fn image_view_set_highlighted_animation_images(this: Id, s: Sel, list: Id) {
+    keep_copy(this, s, list, image_view_set_highlighted_animation_images_kept);
+}
+property!(image_view_animation_duration, image_view_set_animation_duration, "animationDuration", f64, 0.0);
+property!(image_view_animation_repeat_count, image_view_set_animation_repeat_count, "animationRepeatCount", isize, 0);
+
+/// The key (and key path) of an image view's picture-by-picture animation.
+const IMAGE_ANIMATION: &str = "contents";
+
+/// The pictures an image view animates through: its highlighted ones while
+/// highlighted (when it has them), else animationImages.
+fn image_view_animation_list(view: Id) -> Vec<Id> {
+    let highlighted = image_view_highlighted_animation_images(view, 0);
+    let list = if image_view_highlighted(view, 0) && highlighted != 0 { highlighted } else { image_view_animation_images(view, 0) };
+    if list == 0 { Vec::new() } else { collections::array_items(list) }
+}
+
+/// -[UIImageView startAnimating], as UIKit does it: a discrete key frame
+/// animation of the pictures' CGImages on the layer's contents, lasting
+/// animationDuration (0: a 30th of a second a picture), repeated
+/// animationRepeatCount times (0: for ever, and then kept when done).
+extern "C" fn image_view_start_animating(this: Id, _: Sel) {
+    let pictures = image_view_animation_list(this);
+    if pictures.is_empty() || image_view_is_animating(this, 0) {
+        return;
+    }
+    let values: Vec<Id> = pictures.iter().map(|&p| crate::fw::graphics::image_cg(p)).filter(|&cg| cg != 0).collect();
+    let animation = runtime::send(runtime::send(runtime::class_named("CAKeyframeAnimation"), "alloc", &[]), "init", &[]);
+    let set = |key: &str, value: Id| runtime::send(animation, "setValue:forKey:", &[value, string::make(key)]);
+    set("keyPath", string::make(IMAGE_ANIMATION));
+    set("values", collections::array_from(&values));
+    set("calculationMode", string::make("discrete"));
+    let repeats = image_view_animation_repeat_count(this, 0);
+    set("repeatCount", collections::number_float(if repeats > 0 { repeats as f64 } else { f32::INFINITY as f64 }));
+    let duration = image_view_animation_duration(this, 0);
+    set("duration", collections::number_float(if duration != 0.0 { duration } else { pictures.len() as f64 / 30.0 }));
+    set("removedOnCompletion", collections::number_bool(repeats > 0));
+    let layer = runtime::send(this, "layer", &[]);
+    runtime::send(layer, "addAnimation:forKey:", &[animation, string::make(IMAGE_ANIMATION)]);
+}
+
+extern "C" fn image_view_stop_animating(this: Id, _: Sel) {
+    if image_view_is_animating(this, 0) {
+        runtime::send(runtime::send(this, "layer", &[]), "removeAnimationForKey:", &[string::make(IMAGE_ANIMATION)]);
+    }
+}
+
+extern "C" fn image_view_is_animating(this: Id, _: Sel) -> bool {
+    runtime::send(runtime::send(this, "layer", &[]), "animationForKey:", &[string::make(IMAGE_ANIMATION)]) != 0
+}
+
+/// The UIImage of its animation pictures an image view's running animation
+/// shows at media time `now` (None while it doesn't animate).
+pub fn image_view_animating_at(view: Id, now: f64) -> Option<Id> {
+    let layer = view_state(view).layer;
+    let shown = crate::fw::animation::presented_contents_at(layer, now)?;
+    image_view_animation_list(view).into_iter().find(|&p| crate::fw::graphics::image_cg(p) == shown)
+}
 
 // ----- the application object (more of it) -----
 
@@ -2676,7 +3428,7 @@ extern "C" fn accelerometer_shared(_: Class, _: Sel) -> Id {
     *SHARED.get_or_init(|| runtime::alloc_instance(runtime::class_named("UIAccelerometer")) as usize) as Id
 }
 
-property!(accelerometer_delegate, accelerometer_set_delegate, "delegate", id, 0);
+property!(accelerometer_delegate, accelerometer_set_delegate, "delegate", assign, 0);
 property!(accelerometer_interval, accelerometer_set_interval, "updateInterval", f64, 0.0);
 
 extern "C" fn app_scheduled_notifications(_this: Id, _: Sel) -> Id {
@@ -2818,8 +3570,8 @@ pub fn register(r: &mut Registry) {
             ("setAnimationCurve:", set_animation_curve as usize),
             ("setAnimationRepeatCount:", set_animation_repeat_count as usize),
             ("setAnimationRepeatAutoreverses:", set_animation_repeat_autoreverses as usize),
-            ("setAnimationBeginsFromCurrentState:", ignore_class_bool as usize),
-            ("setAnimationTransition:forView:cache:", ignore_animation_transition as usize),
+            ("setAnimationBeginsFromCurrentState:", set_animation_begins_from_current_state as usize),
+            ("setAnimationTransition:forView:cache:", set_animation_transition as usize),
             ("setAnimationsEnabled:", set_animations_enabled as usize),
             ("areAnimationsEnabled", animations_enabled as usize),
         ],
@@ -2850,6 +3602,7 @@ pub fn register(r: &mut Registry) {
             ("insertSubview:aboveSubview:", view_insert_above as usize),
             ("insertSubview:belowSubview:", view_insert_below as usize),
             ("removeFromSuperview", view_remove_from_superview as usize),
+            ("dealloc", view_dealloc as usize),
             ("bringSubviewToFront:", view_bring_to_front as usize),
             ("sendSubviewToBack:", view_send_to_back as usize),
             ("subviews", view_subviews as usize),
@@ -2883,12 +3636,16 @@ pub fn register(r: &mut Registry) {
             ("setBackgroundColor:", view_set_background as usize),
             ("contentScaleFactor", view_content_scale as usize),
             ("setContentScaleFactor:", view_set_content_scale as usize),
-            ("setNeedsDisplay", nothing as usize),
+            ("setNeedsDisplay", view_set_needs_display as usize),
+            ("setNeedsDisplayInRect:", view_set_needs_display_in_rect as usize),
+            ("drawRect:", view_draw_rect as usize),
             ("setNeedsLayout", view_set_needs_layout as usize),
             ("layoutIfNeeded", view_layout_if_needed as usize),
             ("layoutSubviews", nothing as usize),
-            ("sizeToFit", nothing as usize),
+            ("sizeToFit", view_size_to_fit as usize),
             ("sizeThatFits:", view_size_that_fits as usize),
+            ("hitTest:withEvent:", view_hit_test as usize),
+            ("pointInside:withEvent:", view_point_inside as usize),
             ("convertPoint:fromView:", view_convert_point_from as usize),
             ("convertPoint:toView:", view_convert_point_to as usize),
             ("convertRect:fromView:", view_convert_rect_from as usize),
@@ -2911,7 +3668,7 @@ pub fn register(r: &mut Registry) {
             ("setScreen:", ignore_id as usize),
             ("windowLevel", window_level as usize),
             ("setWindowLevel:", window_set_level as usize),
-            ("isKeyWindow", yes as usize),
+            ("isKeyWindow", window_is_key as usize),
         ],
     );
 
@@ -2925,6 +3682,7 @@ pub fn register(r: &mut Registry) {
             ("initWithNibName:bundle:", crate::fw::storyboard::controller_init_with_nib as usize),
             ("view", controller_view as usize),
             ("setView:", controller_set_view as usize),
+            ("dealloc", controller_dealloc as usize),
             ("isViewLoaded", controller_is_view_loaded as usize),
             ("loadView", crate::fw::storyboard::controller_load_view as usize),
             ("viewDidLoad", nothing as usize),
@@ -3058,6 +3816,21 @@ pub fn register(r: &mut Registry) {
             ("isUserInteractionEnabled", image_view_user_interaction as usize),
             ("image", image_view_image as usize),
             ("setImage:", image_view_set_image as usize),
+            ("isHighlighted", image_view_highlighted as usize),
+            ("setHighlighted:", image_view_set_highlighted as usize),
+            ("drawMode", image_view_draw_mode as usize),
+            ("setDrawMode:", image_view_set_draw_mode as usize),
+            ("animationImages", image_view_animation_images as usize),
+            ("setAnimationImages:", image_view_set_animation_images as usize),
+            ("highlightedAnimationImages", image_view_highlighted_animation_images as usize),
+            ("setHighlightedAnimationImages:", image_view_set_highlighted_animation_images as usize),
+            ("animationDuration", image_view_animation_duration as usize),
+            ("setAnimationDuration:", image_view_set_animation_duration as usize),
+            ("animationRepeatCount", image_view_animation_repeat_count as usize),
+            ("setAnimationRepeatCount:", image_view_set_animation_repeat_count as usize),
+            ("startAnimating", image_view_start_animating as usize),
+            ("stopAnimating", image_view_stop_animating as usize),
+            ("isAnimating", image_view_is_animating as usize),
         ],
     );
 
@@ -3123,6 +3896,54 @@ mod tests {
     use super::*;
     use crate::fw::geometry::{apply, concat};
     use crate::fw::plist::Value;
+
+    /// A 32-bit game reaches UIImageView's animation methods and
+    /// CAShapeLayer's dash phase through framework_selectors.tsv rows with
+    /// Apple's types (UIImageView's -setAnimationRepeatCount: an NSInteger,
+    /// UIView's +setAnimationRepeatCount: a C float).
+    #[test]
+    fn image_view_animation_and_dash_phase_selectors_have_32_bit_rows() {
+        let table = crate::guest32::objc::selectors::FrameworkSelectors::builtin();
+        let image_view = |class: &str| class == "UIImageView";
+        for (selector, encoding) in [
+            ("animationImages", "@@:"),
+            ("setAnimationImages:", "v@:@"),
+            ("highlightedAnimationImages", "@@:"),
+            ("setHighlightedAnimationImages:", "v@:@"),
+            ("animationDuration", "d@:"),
+            ("setAnimationDuration:", "v@:d"),
+            ("animationRepeatCount", "i@:"),
+            ("setAnimationRepeatCount:", "v@:i"),
+            ("startAnimating", "v@:"),
+            ("stopAnimating", "v@:"),
+            ("isAnimating", "c@:"),
+            ("lineDashPhase", "f@:"),
+            ("setLineDashPhase:", "v@:f"),
+        ] {
+            let row = table.get_for(selector, image_view).map(|row| row.encoding);
+            assert_eq!(row, Some(encoding), "{selector}");
+        }
+        let view_class = table.get_for("setAnimationRepeatCount:", |_| false).unwrap();
+        assert!(view_class.real_float && view_class.encoding == "v@:f", "UIView's class method keeps its C float");
+    }
+
+    /// animationImages and highlightedAnimationImages are copied when set
+    /// (Apple's properties are `copy`): changing the game's array afterwards
+    /// changes nothing.
+    #[test]
+    fn image_view_animation_lists_are_copied() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let view = runtime::send(runtime::class_named("UIImageView"), "alloc", &[]);
+        send_rect(view, "initWithFrame:", Rect::new(0.0, 0.0, 4.0, 4.0));
+        for (set, get) in [("setAnimationImages:", "animationImages"), ("setHighlightedAnimationImages:", "highlightedAnimationImages")] {
+            let list = runtime::send(runtime::class_named("NSMutableArray"), "array", &[]);
+            runtime::send(list, "addObject:", &[string::make("one")]);
+            runtime::send(view, set, &[list]);
+            runtime::send(list, "addObject:", &[string::make("two")]);
+            assert_eq!(collections::array_items(runtime::send(view, get, &[])).len(), 1, "{get} kept the game's array");
+        }
+    }
 
     /// convertPoint:/convertRect: go through frames, bounds origins and
     /// transforms (around the center) up to the window and, between
@@ -3377,8 +4198,12 @@ mod tests {
 
     #[test]
     fn dismissing_closes_the_stack_and_animations_complete() {
-        // A shows B shows C (stand-in ids; only the stored links are used).
-        let (a, b, c) = (0x7a00, 0x7b00, 0x7c00);
+        // A shows B shows C (plain objects; only the stored links are used,
+        // and the dismissed ones are let go of).
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let plain = || runtime::alloc_instance(runtime::class_named("NSObject"));
+        let (a, b, c) = (plain(), plain(), plain());
         for (from, to) in [(a, b), (b, c)] {
             property_set(from, "presented", to as u64);
             property_set(to, "presenting", from as u64);
@@ -3469,16 +4294,9 @@ mod tests {
         send("setAnimationDidStopSelector:", &[runtime::sel("reelStopped:")]);
         commit_old_animation(|work| queued.push(work));
         commit_old_animation(|work| queued.push(work));
-        assert!(HEARD.lock().unwrap().is_empty(), "nothing is told before the next run-loop turn");
-        assert_eq!(queued.len(), 2);
-        for work in queued.drain(..) {
-            work();
-        }
-        assert_eq!(
-            *HEARD.lock().unwrap(),
-            [("reel", inner, None, 0), ("starting", outer, None, 0x1234), ("stopped", outer, Some(true), 0x1234)],
-            "each block keeps its own delegate selectors"
-        );
+        // Nothing animated: did-stop inside each commit, no will-start (UIKit's popAnimationState).
+        assert!(queued.is_empty());
+        assert_eq!(*HEARD.lock().unwrap(), [("reel", inner, None, 0), ("stopped", outer, Some(true), 0x1234)], "each block keeps its own delegate selectors");
         // No delegate: nothing to tell; a commit with no begin is ignored.
         send("beginAnimations:context:", &[0, 0]);
         commit_old_animation(|work| queued.push(work));
@@ -3502,7 +4320,7 @@ mod tests {
         send_rect(view, "initWithFrame:", Rect::new(0.0, 0.0, 100.0, 100.0));
         let layer = view_state(view).layer;
         let shown = |t: f64| {
-            let model = crate::fw::animation::Shown { opacity: view_alpha(view, 0), position: view_center(view, 0), transform: view_state(view).transform };
+            let model = crate::fw::animation::Shown::new(view_alpha(view, 0), view_center(view, 0), crate::fw::layers::transform(layer), None);
             crate::fw::animation::presented_at(layer, model, t)
         };
         #[repr(C)]
@@ -3565,15 +4383,16 @@ mod tests {
         crate::fw::animation::tick_at(Some(layer), start + 0.35);
         assert_eq!(STOPPED.load(SeqCst), 2, "did-stop with finished = YES at the end");
 
-        // A view resized as it moves goes there at once: its size isn't
-        // animated, and its middle sliding while the size jumps looks worse.
+        // A view resized as it moves slides there (its size animates too).
         let resize = crate::fw::media::make_callback(view, |v| send_rect(v, "setFrame:", Rect::new(300.0, 0.0, 40.0, 100.0)));
         let start = crate::fw::runloop::media_time();
         animate_delay(0, 0, 0.4, 0.0, LINEAR, resize, 0);
-        assert_eq!(shown(start + 0.2).position, Point { x: 320.0, y: 50.0 }, "resized: no slide");
+        assert!((shown(start + 0.2).position.x - 185.0).abs() < 2.0, "resized: slides halfway too");
 
         // While the app ignores interaction events, new touches go nowhere.
-        // (UIApplication's methods; no shared application in a test.)
+        // (UIApplication's methods; no shared application in a test. The
+        // switch is app-wide: held under the lock tests that tap take.)
+        let _turn = crate::fw::typing::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         begin_ignoring_interaction(0, 0);
         begin_ignoring_interaction(0, 0);
         end_ignoring_interaction(0, 0);
@@ -3650,12 +4469,14 @@ mod tests {
         take();
         let e = |object: Id, what: &str, other: Id| (object, format!("{what} {other:#x}"));
         runtime::send(parent, "addSubview:", &[view]);
+        // As UIKit's _addSubview:positioned:relativeTo: (0x59f27): the window
+        // hooks for the whole subtree come before willMoveToSuperview:.
         assert_eq!(
             take(),
             [
-                e(view, "willMoveToSuperview:", parent),
                 e(view, "willMoveToWindow:", window),
                 e(inner, "willMoveToWindow:", window),
+                e(view, "willMoveToSuperview:", parent),
                 e(view, "didMoveToWindow", window),
                 e(inner, "didMoveToWindow", window),
                 e(view, "didMoveToSuperview", parent),
@@ -3707,6 +4528,23 @@ mod tests {
         runtime::send(parent, "addSubview:", &[sibling]);
         runtime::send(parent, "addSubview:", &[child]);
         assert_eq!(view_state(parent).subviews, [sibling, child], "a lower child still moves to the front");
+    }
+
+    #[test]
+    fn a_subview_moved_above_or_below_a_sibling_lands_next_to_it() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let new = || runtime::send(runtime::alloc_instance(runtime::class_named("UIView")), "init", &[]);
+        let (parent, a, b, c) = (new(), new(), new(), new());
+        for view in [a, b, c] {
+            runtime::send(parent, "addSubview:", &[view]);
+        }
+        runtime::send(parent, "insertSubview:aboveSubview:", &[a, b]);
+        assert_eq!(view_state(parent).subviews, [b, a, c], "a lower subview moved above a sibling goes just above it");
+        runtime::send(parent, "insertSubview:belowSubview:", &[b, c]);
+        assert_eq!(view_state(parent).subviews, [a, b, c], "a lower subview moved below a sibling goes just below it");
+        runtime::send(parent, "insertSubview:belowSubview:", &[c, a]);
+        assert_eq!(view_state(parent).subviews, [c, a, b], "a higher subview moved below a sibling goes just below it");
     }
 
     #[test]
@@ -3839,6 +4677,36 @@ mod tests {
         assert_eq!(take(), [(controller, "viewWillLayoutSubviews"), (root, "layoutSubviews"), (controller, "viewDidLayoutSubviews")]);
     }
 
+    /// Layout belongs to Core Animation's commit, at the end of the run loop
+    /// turn: a view a timer (or a completion block) adds and marks is laid
+    /// out in that same turn, before its pictures are made.
+    #[test]
+    fn a_view_a_timer_adds_is_laid_out_in_the_same_turn() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        static LAID_OUT: Mutex<Vec<Id>> = Mutex::new(Vec::new());
+        static PARTS: Mutex<Option<(Id, Id)>> = Mutex::new(None);
+        extern "C" fn layout(this: Id, _: Sel) {
+            LAID_OUT.lock().unwrap().push(this);
+        }
+        extern "C" fn add_now(_this: Id, _: Sel, _: Id) {
+            let (window, view) = PARTS.lock().unwrap().expect("parts");
+            runtime::send(window, "addSubview:", &[view]);
+            runtime::send(view, "setNeedsLayout", &[]);
+        }
+        let view_class = define_class("TurnLayoutTestView", "UIView", 16);
+        methods(view_class, &[("layoutSubviews", layout as usize), ("addNow:", add_now as usize)]);
+        let window = view_init_with_frame(runtime::send(runtime::class_named("UIWindow"), "alloc", &[]), 0, screen_bounds());
+        window_make_key_and_visible(window, 0);
+        let view = view_init_with_frame(runtime::send(view_class, "alloc", &[]), 0, Rect::new(0.0, 0.0, 10.0, 10.0));
+        *PARTS.lock().unwrap() = Some((window, view));
+        let s = runtime::sel("performSelector:withObject:afterDelay:");
+        let perform: extern "C" fn(Id, Sel, Sel, Id, f64) = unsafe { std::mem::transmute(runtime::imp_for(view, s).unwrap()) };
+        perform(view, s, runtime::sel("addNow:"), 0, 0.0);
+        crate::fw::runloop::run_main_loop_briefly();
+        assert!(LAID_OUT.lock().unwrap().contains(&view), "not laid out in the turn its timer added it");
+    }
+
     /// -renderInContext: lays the layer tree out first, as Core Animation
     /// does: a view never shown that adds its parts in -layoutSubviews (as
     /// SpellCraft's cards do) is drawn with them.
@@ -3862,6 +4730,91 @@ mod tests {
         runtime::send(runtime::send(card, "layer", &[]), "renderInContext:", &[context]);
         let pixels = crate::fw::graphics::test_end_context();
         assert_eq!(pixels.get(..4), Some(&[255, 0, 0, 255][..]), "the part added during layout is drawn");
+    }
+
+    /// -renderInContext: places a picture by its view's content mode and cuts
+    /// a clipping view's own picture to its bounds. SpellCraft's monster heart
+    /// fill is a full-size heart shown bottom-aligned (6) in a short clipping
+    /// view; drawn centred and uncut, it hung below the heart on the card.
+    #[test]
+    fn a_picture_of_a_view_keeps_a_clipped_bottom_picture_inside() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let holder = view_init_with_frame(runtime::send(runtime::class_named("UIView"), "alloc", &[]), 0, Rect::new(0.0, 0.0, 4.0, 8.0));
+        let fill = view_init_with_frame(runtime::send(runtime::class_named("UIImageView"), "alloc", &[]), 0, Rect::new(0.0, 4.0, 4.0, 2.0));
+        let red = crate::fw::graphics::test_solid_image(4.0, 4.0, [1.0, 0.0, 0.0, 1.0]);
+        runtime::send(fill, "setImage:", &[red]);
+        runtime::send(fill, "setContentMode:", &[6]);
+        runtime::send(fill, "setClipsToBounds:", &[1]);
+        runtime::send(holder, "addSubview:", &[fill]);
+        let context = crate::fw::graphics::test_begin_context(4.0, 8.0);
+        runtime::send(runtime::send(holder, "layer", &[]), "renderInContext:", &[context]);
+        let pixels = crate::fw::graphics::test_end_context();
+        let red_rows: Vec<usize> = (0..8).filter(|row| pixels[row * 16..row * 16 + 4] == [255, 0, 0, 255]).collect();
+        assert_eq!(red_rows, [4, 5], "only the fill view's own rows are red");
+    }
+
+    /// UIKit draws a view whose class has its own drawRect: into its layer's
+    /// contents (its bounds at the screen's scale) before the screen shows
+    /// it, and again only after setNeedsDisplay. SpellCraft's health, mana
+    /// and level bars draw their fill this way (they stayed empty).
+    #[test]
+    fn views_with_their_own_draw_rect_draw_into_their_layer() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        static DRAWN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        static GREEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        extern "C" fn draw(_: Id, _: Sel, rect: Rect) {
+            DRAWN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let green = GREEN.load(std::sync::atomic::Ordering::SeqCst);
+            crate::fw::graphics::test_fill(rect, if green { [0.0, 1.0, 0.0, 1.0] } else { [1.0, 0.0, 0.0, 1.0] });
+        }
+        let class = define_class("G32SelfDrawnBar", "UIView", 16);
+        methods(class, &[("drawRect:", draw as usize)]);
+        let bar = view_init_with_frame(runtime::send(class, "alloc", &[]), 0, Rect::new(5.0, 5.0, 10.0, 4.0));
+        let plain = view_init_with_frame(runtime::send(runtime::class_named("UIView"), "alloc", &[]), 0, Rect::new(0.0, 0.0, 30.0, 30.0));
+        runtime::send(plain, "addSubview:", &[bar]);
+        let scale = screen_points().2;
+        let first_pixel = |view: Id| {
+            let contents = crate::fw::layers::contents(runtime::send(view, "layer", &[]));
+            assert_ne!(contents, 0, "the drawing is the layer's contents");
+            assert_eq!(crate::fw::graphics::cg_size(contents), Some(((10.0 * scale) as usize, (4.0 * scale) as usize)));
+            crate::fw::graphics::straight_pixels(contents).unwrap()[..4].to_vec()
+        };
+        display_tree(plain);
+        assert_eq!(DRAWN.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(first_pixel(bar), [255, 0, 0, 255]);
+        assert_eq!(crate::fw::layers::contents(runtime::send(plain, "layer", &[])), 0, "a view without drawRect: draws nothing");
+        display_tree(plain);
+        assert_eq!(DRAWN.load(std::sync::atomic::Ordering::SeqCst), 1, "not drawn again unless asked");
+        GREEN.store(true, std::sync::atomic::Ordering::SeqCst);
+        runtime::send(bar, "setNeedsDisplay", &[]);
+        display_tree(plain);
+        assert_eq!(DRAWN.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(first_pixel(bar), [0, 255, 0, 255]);
+    }
+
+    /// A transformed view's frame is the box its transformed bounds fill,
+    /// and setFrame: keeps the transform: SpellCraft's drawer shrinks each
+    /// 160x200 card to half and then sets frame (x, 0, frame's size); the
+    /// card must fill y 0-100 (it showed at 50-150, half cut off).
+    #[test]
+    fn a_transformed_views_frame_is_its_transformed_box() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let rect = |view: Id, name: &str| {
+            let s = runtime::sel(name);
+            let f: extern "C" fn(Id, Sel) -> Rect = unsafe { std::mem::transmute(runtime::imp_for(view, s).unwrap()) };
+            f(view, s)
+        };
+        let card = view_init_with_frame(runtime::send(runtime::class_named("UIView"), "alloc", &[]), 0, Rect::new(0.0, 0.0, 160.0, 200.0));
+        send_transform(card, "setTransform:", Transform { a: 0.5, d: 0.5, ..IDENTITY });
+        assert_eq!(rect(card, "frame"), Rect::new(40.0, 50.0, 80.0, 100.0));
+        send_rect(card, "setFrame:", Rect::new(10.0, 0.0, 80.0, 100.0));
+        assert_eq!(rect(card, "frame"), Rect::new(10.0, 0.0, 80.0, 100.0));
+        assert_eq!(rect(card, "bounds"), Rect::new(0.0, 0.0, 160.0, 200.0), "bounds keep the card's own size");
+        assert_eq!(view_center(card, 0), Point { x: 50.0, y: 50.0 });
+        assert_eq!(rect(runtime::send(card, "layer", &[]), "frame"), Rect::new(10.0, 0.0, 80.0, 100.0), "the layer's frame too");
     }
 
     /// UIKit's autoresizing: a view's new size moves and sizes its subviews
@@ -3924,6 +4877,10 @@ mod tests {
         assert_eq!(told_screen(display, None, &tall, true), (958.0, 540.0, 2.0));
         let info = Value::Dict(vec![("UILaunchStoryboardName".into(), Value::String("Launch".into()))]);
         assert_eq!(told_screen(display, Some(&info), &[], false), (1212.0, 540.0, 2.0));
+        // SpellCraft's fight backgrounds are drawn about 557 points wide: it gets a screen that
+        // wide, so no dark band shows at the sides (it lays itself out to any width).
+        let spellcraft = Value::Dict(vec![("CFBundleIdentifier".into(), Value::String("com.appyentertainment.spellcraft".into()))]);
+        assert_eq!(told_screen(display, Some(&spellcraft), &tall, false), (557.0, 320.0, 2.0));
     }
 
     #[test]
@@ -3983,6 +4940,16 @@ mod tests {
         assert_eq!(reported_screen((568.0, 320.0, 2.0), Some(&newer)), (568.0, 320.0, 2.0));
         assert_eq!(interface(Some(&newer), false), Interface { orientation: 3, mask: (1 << 3) | (1 << 4) });
         assert!(!legacy_screen(None));
+    }
+
+    /// An app built with the iOS 6 SDK (or older) is told it runs on iOS 6.1,
+    /// the system it was made for; newer apps keep the newer answer.
+    #[test]
+    fn old_apps_are_told_the_ios_they_were_made_for() {
+        assert_eq!(system_version_for(Some(&screen_info("iphoneos6.1", &[]))), "6.1");
+        assert_eq!(system_version_for(Some(&screen_info("iphoneos5.0", &[]))), "6.1");
+        assert_eq!(system_version_for(Some(&screen_info("iphoneos8.2", &[]))), "8.2");
+        assert_eq!(system_version_for(None), "8.2");
     }
 
     fn old_landscape(orientation: &str) -> Geometry {
@@ -4162,8 +5129,11 @@ mod tests {
 
     #[test]
     fn controller_links_identify_a_view_without_a_back_pointer() {
-        let parent = 0x1110;
-        let child = 0x2120;
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        // Real controllers: adding a child sends it willMoveToParentViewController:.
+        let new_controller = || runtime::send(runtime::send(runtime::class_named("UIViewController"), "alloc", &[]), "init", &[]);
+        let (parent, child) = (new_controller(), new_controller());
         let parent_view = 0x3130;
         let child_view = 0x4140;
         property_set(parent, "view", parent_view as u64);
@@ -4179,8 +5149,10 @@ mod tests {
 
     #[test]
     fn only_a_linked_controller_view_gets_an_old_landscape_frame() {
-        let parent = 0x1010;
-        let child = 0x2020;
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let new_controller = || runtime::send(runtime::send(runtime::class_named("UIViewController"), "alloc", &[]), "init", &[]);
+        let (parent, child) = (new_controller(), new_controller());
         controller_add_child(parent, 0, child);
         assert_eq!(property_get(child, "parentController"), Some(parent as u64));
         let info = screen_info("iphoneos7.0", &["UIInterfaceOrientationLandscapeRight"]);
@@ -4204,8 +5176,8 @@ mod tests {
         assert_eq!(controller_child_frame(portrait_geometry, Size { width: 320.0, height: 568.0 }, portrait, IDENTITY, true), None);
         controller_remove_from_parent(child, 0);
         assert_eq!(property_get(child, "parentController"), Some(0));
-        let old_view = 0x3030;
-        let new_view = 0x4040;
+        let plain = || runtime::alloc_instance(runtime::class_named("NSObject"));
+        let (old_view, new_view) = (plain(), plain());
         property_set(old_view, "viewController", child as u64);
         property_set(child, "view", old_view as u64);
         controller_set_view(child, 0, new_view);
@@ -4224,9 +5196,12 @@ mod tests {
         let new_view = |class: Class, frame: Rect| view_init_with_frame(runtime::send(class, "alloc", &[]), 0, frame);
         let new_controller = || runtime::send(runtime::send(runtime::class_named("UIViewController"), "alloc", &[]), "init", &[]);
         let presenter = new_controller();
-        runtime::send(presenter, "setView:", &[new_view(runtime::class_named("UIView"), Rect::new(0.0, 0.0, 320.0, 568.0))]);
+        let presenter_view = new_view(runtime::class_named("UIView"), Rect::new(0.0, 0.0, 320.0, 568.0));
+        runtime::send(presenter, "setView:", &[presenter_view]);
         let window = new_view(runtime::class_named("UIWindow"), Rect::new(0.0, 0.0, 320.0, 568.0));
         runtime::send(window, "setRootViewController:", &[presenter]);
+        // The window isn't shown, so (as on iOS) the root view waits: put it in by hand.
+        runtime::send(window, "addSubview:", &[presenter_view]);
         let presented = new_controller();
         let presented_view = new_view(runtime::class_named("UIView"), Rect::default());
         runtime::send(presented, "setView:", &[presented_view]);
@@ -4296,5 +5271,561 @@ mod tests {
             ["touchesBegan:withEvent:", "touchesMoved:withEvent:", "touchesEnded:withEvent:", "touchesCancelled:withEvent:"],
             "a plain child passes through its scroll view (and parent) once each"
         );
+    }
+
+    /// A global completion block (copying keeps it) that calls `invoke` with finished.
+    fn test_completion(invoke: extern "C" fn(usize, u8)) -> usize {
+        #[repr(C)]
+        struct Completion {
+            isa: usize,
+            flags: i32,
+            reserved: i32,
+            invoke: usize,
+            descriptor: usize,
+        }
+        static DESCRIPTOR: [usize; 2] = [0, std::mem::size_of::<Completion>()];
+        leak(Completion { isa: 0, flags: 1 << 28, reserved: 0, invoke: invoke as usize, descriptor: DESCRIPTOR.as_ptr() as usize })
+    }
+
+    /// As UIKit's hitTest:withEvent: (0x4eb01): each view is asked through
+    /// its own pointInside:withEvent:, so a game's override decides
+    /// (SpellCraft's SCCardDraggingView lets taps off its deck through).
+    #[test]
+    fn hit_testing_asks_each_views_own_point_inside() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        extern "C" fn never_inside(_: Id, _: Sel, _p: Point, _e: Id) -> bool {
+            false
+        }
+        let class = define_class("UIKitTestPassThroughView", "UIView", 16);
+        methods(class, &[("pointInside:withEvent:", never_inside as usize)]);
+        let window = new_test_view("UIWindow", Rect::new(0.0, 0.0, 568.0, 320.0));
+        let below = new_test_view("UIView", Rect::new(0.0, 0.0, 568.0, 320.0));
+        let cover = view_init_with_frame(runtime::send(class, "alloc", &[]), 0, Rect::new(0.0, 0.0, 568.0, 320.0));
+        attach(window, below, None);
+        attach(window, cover, None);
+        assert_eq!(crate::fw::touch::hit_test(window, Point { x: 100.0, y: 100.0 }), below, "the cover said no");
+        for name in ["pointInside:withEvent:", "hitTest:withEvent:"] {
+            assert!(runtime::imp_for(below, runtime::sel(name)).is_some(), "UIView answers {name} (games call it, or super)");
+        }
+    }
+
+    /// transitionFromViewController: as UIKit's _transitionFromView (0x57c47):
+    /// will-disappear, will-appear, the new view added on top of its
+    /// superview, and with a transition style the old view leaves at once;
+    /// no layout of the new view before viewWillAppear:. At the end:
+    /// did-disappear, did-appear, completion(YES).
+    #[test]
+    fn controller_transitions_put_the_new_view_on_top_and_drop_the_old_at_once() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        static EVENTS: Mutex<Vec<(Id, String)>> = Mutex::new(Vec::new());
+        extern "C" fn note(this: Id, s: Sel) {
+            EVENTS.lock().unwrap().push((this, lock().sel_name(s)));
+        }
+        extern "C" fn note_bool(this: Id, s: Sel, _animated: bool) {
+            note(this, s);
+        }
+        extern "C" fn completed(_block: usize, finished: u8) {
+            EVENTS.lock().unwrap().push((0, format!("completion {finished}")));
+        }
+        let class = define_class("UIKitTestTransitionController", "UIViewController", 8);
+        methods(
+            class,
+            &[
+                ("viewWillAppear:", note_bool as usize),
+                ("viewDidAppear:", note_bool as usize),
+                ("viewWillDisappear:", note_bool as usize),
+                ("viewDidDisappear:", note_bool as usize),
+                ("viewDidLayoutSubviews", note as usize),
+            ],
+        );
+        let new_controller = || {
+            let controller = runtime::send(runtime::send(class, "alloc", &[]), "init", &[]);
+            runtime::send(controller, "setView:", &[new_test_view("UIView", Rect::new(0.0, 0.0, 568.0, 320.0))]);
+            controller
+        };
+        let (from, to) = (new_controller(), new_controller());
+        let (from_view, to_view) = (property_get(from, "view").unwrap() as Id, property_get(to, "view").unwrap() as Id);
+        let root = new_test_view("UIView", Rect::new(0.0, 0.0, 568.0, 320.0));
+        let hud = new_test_view("UIView", Rect::new(0.0, 0.0, 50.0, 50.0));
+        attach(root, from_view, None);
+        attach(root, hud, None);
+        property_set(from, "appeared", 1);
+        EVENTS.lock().unwrap().clear();
+        const CROSS_DISSOLVE: usize = 0x500000;
+        let mut ending: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
+        transition_controllers(from, to, 0.5, CROSS_DISSOLVE, 0, test_completion(completed), |seconds, work| {
+            assert_eq!(seconds, 0.5);
+            ending.push(work)
+        });
+        assert_eq!(view_state(root).subviews, [hud, to_view], "the new view on top, the old one gone at once");
+        let take = || std::mem::take(&mut *EVENTS.lock().unwrap());
+        assert_eq!(take(), [(from, "viewWillDisappear:".to_string()), (to, "viewWillAppear:".to_string())], "no layout before viewWillAppear:");
+        ending.pop().unwrap()();
+        assert_eq!(take(), [(from, "viewDidDisappear:".to_string()), (to, "viewDidAppear:".to_string()), (0, "completion 1".to_string())]);
+    }
+
+    /// transitionFromView:toView: (0x572e0): toView added on top; fromView
+    /// leaves at once with a transition style, else when the transition ends.
+    #[test]
+    fn view_transitions_add_on_top_and_remove_when_apple_does() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let parent = new_test_view("UIView", Rect::new(0.0, 0.0, 568.0, 320.0));
+        let (from, hud, to) = (new_test_view("UIView", Rect::default()), new_test_view("UIView", Rect::default()), new_test_view("UIView", Rect::default()));
+        attach(parent, from, None);
+        attach(parent, hud, None);
+        transition_from_view(0, 0, from, to, 0.5, 0x500000, 0);
+        assert_eq!(view_state(parent).subviews, [hud, to], "with a style: on top, the old view gone at once");
+        let other = new_test_view("UIView", Rect::default());
+        transition_from_view(0, 0, to, other, 0.5, 0, 0);
+        assert_eq!(view_state(parent).subviews, [hud, to, other], "no style: the old view stays until the end");
+    }
+
+    /// UIKit lets go of its copy of a completion block once it ran
+    /// (UIViewAnimationBlockDelegate, UIViewControllerAction): each copy we
+    /// make is released after the call, so the block's dispose helper runs.
+    #[test]
+    fn completion_blocks_are_released_after_they_run() {
+        use crate::libsystem::mach::test_blocks::{counting, Counts};
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let counts: &'static Counts = Box::leak(Box::default());
+        let mut queued: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
+        animate_with(view_timing(0.2, 0.0, 0), 0, counting(counts), |work| queued.push(work));
+        queued.pop().unwrap()();
+        assert_eq!(counts.get(), (1, 1), "(copies, disposals): an animation block's completion");
+        transition_controllers(0, 0, 0.0, 0, 0, counting(counts), |_, work| queued.push(work));
+        queued.pop().unwrap()();
+        assert_eq!(counts.get(), (2, 2), "transitionFromViewController:'s");
+        let parent = new_test_view("UIView", Rect::new(0.0, 0.0, 568.0, 320.0));
+        let (from, to) = (new_test_view("UIView", Rect::default()), new_test_view("UIView", Rect::default()));
+        attach(parent, from, None);
+        transition_from_view(0, 0, from, to, 0.0, 0, counting(counts));
+        complete_after(0.0, counting(counts));
+        complete_after(0.01, counting(counts));
+        let end = crate::fw::runloop::media_time() + 0.5;
+        while counts.get().1 < 5 && crate::fw::runloop::media_time() < end {
+            crate::fw::runloop::run_main_loop_briefly();
+        }
+        assert_eq!(counts.get(), (5, 5), "transitionFromView:'s and a presentation's");
+    }
+
+    /// +commitAnimations with nothing animated tells the delegate's did-stop
+    /// inside the commit (no will-start), as UIKit's popAnimationState; with
+    /// no selectors set, the delegate's own animationDidStop:finished:context:.
+    #[test]
+    fn empty_old_style_commits_tell_did_stop_at_once() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        static HEARD: Mutex<Vec<(&'static str, Id, Option<bool>, usize)>> = Mutex::new(Vec::new());
+        extern "C" fn stopped(_: Id, _: Sel, id: Id, finished: Id, context: usize) {
+            HEARD.lock().unwrap().push(("stopped", id, Some(collections::number_as_f64(finished) != 0.0), context));
+        }
+        extern "C" fn starting(_: Id, _: Sel, id: Id, context: usize) {
+            HEARD.lock().unwrap().push(("starting", id, None, context));
+        }
+        let class = define_class("UIKitTestEmptyCommitDelegate", "NSObject", 8);
+        methods(class, &[("animationDidStop:finished:context:", stopped as usize), ("animationWillStart:context:", starting as usize)]);
+        let delegate = runtime::send(runtime::send(class, "alloc", &[]), "init", &[]);
+        let uiview = runtime::class_named("UIView");
+        let send = |name: &str, args: &[usize]| runtime::send(uiview, name, args);
+        let (outer, inner) = (string::make("spin"), string::make("reel"));
+        let mut queued: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
+        send("beginAnimations:context:", &[outer, 0x1234]);
+        send("setAnimationDelegate:", &[delegate]);
+        send("setAnimationWillStartSelector:", &[runtime::sel("animationWillStart:context:")]);
+        send("setAnimationDidStopSelector:", &[runtime::sel("animationDidStop:finished:context:")]);
+        commit_old_animation(|work| queued.push(work));
+        assert_eq!(*HEARD.lock().unwrap(), [("stopped", outer, Some(true), 0x1234)], "nothing animated: did-stop inside the commit, no will-start");
+        HEARD.lock().unwrap().clear();
+        send("beginAnimations:context:", &[inner, 7]);
+        send("setAnimationDelegate:", &[delegate]);
+        commit_old_animation(|work| queued.push(work));
+        assert_eq!(*HEARD.lock().unwrap(), [("stopped", inner, Some(true), 7)], "the delegate's own animationDidStop:finished:context:");
+        assert!(queued.is_empty());
+    }
+
+    /// The from value is the old model value (the presentation only with
+    /// BeginFromCurrentState), and setting the value a property already has
+    /// adds no animation: a running one goes on and finishes with YES.
+    #[test]
+    fn setting_the_value_an_animation_heads_for_adds_no_animation() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        static FIRST: AtomicUsize = AtomicUsize::new(0);
+        static SECOND: AtomicUsize = AtomicUsize::new(0);
+        extern "C" fn first(_: usize, finished: u8) {
+            FIRST.store(1 + finished as usize, SeqCst);
+        }
+        extern "C" fn second(_: usize, finished: u8) {
+            SECOND.store(1 + finished as usize, SeqCst);
+        }
+        const LINEAR: usize = 3 << 16;
+        const FROM_CURRENT_STATE: usize = 1 << 2;
+        let view = new_test_view("UIView", Rect::new(0.0, 0.0, 100.0, 100.0));
+        let layer = view_state(view).layer;
+        let fade_out = crate::fw::media::make_callback(view, |v| view_set_alpha(v, 0, 0.0));
+        let start = crate::fw::runloop::media_time();
+        let mut queued: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
+        animate_with(view_timing(0.4, 0.0, LINEAR), fade_out, test_completion(first), |work| queued.push(work));
+        animate_with(view_timing(0.4, 0.0, LINEAR), fade_out, test_completion(second), |work| queued.push(work));
+        assert_eq!(queued.len(), 1, "the same value again animates nothing (its completion waits a turn)");
+        crate::fw::animation::tick_at(Some(layer), start + 0.45);
+        assert_eq!(FIRST.load(SeqCst), 2, "the first fade was not replaced: finished = YES");
+        queued.pop().unwrap()();
+        assert_eq!(SECOND.load(SeqCst), 2);
+
+        // Halfway through a fade out, fading in again starts from the model
+        // value (0), or with BeginFromCurrentState from what shows (~0.5).
+        let fade_in = crate::fw::media::make_callback(view, |v| view_set_alpha(v, 0, 1.0));
+        let from_value = || {
+            let animation = runtime::send(layer, "animationForKey:", &[string::make("opacity")]);
+            crate::fw::animation::read_value(runtime::send(animation, "fromValue", &[]))
+        };
+        for (options, expected) in [(LINEAR, 0.0), (LINEAR | FROM_CURRENT_STATE, 0.5)] {
+            view_set_alpha(view, 0, 1.0);
+            let mut half_done = view_timing(0.4, 0.0, LINEAR);
+            half_done.asked -= 0.2;
+            animate_with(half_done, fade_out, 0, |_| {});
+            animate_with(view_timing(0.4, 0.0, options), fade_in, 0, |_| {});
+            match from_value() {
+                Some(crate::fw::animation::Value::Number(v)) => assert!((v - expected).abs() < 0.05, "options {options:#x}: from {v}"),
+                other => panic!("options {options:#x}: {other:?}"),
+            }
+        }
+    }
+
+    /// A block opened inside another takes the outer duration and curve
+    /// (unless OverrideInheritedDuration/Curve); with LayoutSubviews, a
+    /// resized view lays out at once inside the block.
+    #[test]
+    fn nested_animation_blocks_take_the_outer_blocks_timing() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let view = new_test_view("UIView", Rect::new(0.0, 0.0, 100.0, 100.0));
+        let layer = view_state(view).layer;
+        let inner = crate::fw::media::make_callback(view, |v| {
+            let moves = crate::fw::media::make_callback(v, |v| view_set_center(v, 0, Point { x: 150.0, y: 50.0 }));
+            animate_delay(0, 0, 0.2, 0.0, 0, moves, 0);
+        });
+        const LINEAR: usize = 3 << 16;
+        let start = crate::fw::runloop::media_time();
+        animate_delay(0, 0, 1.0, 0.0, LINEAR, inner, 0);
+        let model = crate::fw::animation::Shown::new(1.0, view_center(view, 0), crate::fw::layers::affine_to_3d(IDENTITY), None);
+        let half = crate::fw::animation::presented_at(layer, model, start + 0.5);
+        assert!((half.position.x - 100.0).abs() < 2.0, "halfway at 0.5 s of the outer 1 s: {half:?}");
+
+        static LAYOUTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        extern "C" fn layout(_: Id, _: Sel) {
+            LAYOUTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        let class = define_class("UIKitTestLayoutInBlockView", "UIView", 16);
+        methods(class, &[("layoutSubviews", layout as usize)]);
+        let laid = view_init_with_frame(runtime::send(class, "alloc", &[]), 0, Rect::new(0.0, 0.0, 10.0, 10.0));
+        let grow = crate::fw::media::make_callback(laid, |v| send_rect(v, "setFrame:", Rect::new(0.0, 0.0, 40.0, 40.0)));
+        const LAYOUT_SUBVIEWS: usize = 1;
+        animate_delay(0, 0, 0.3, 0.0, LAYOUT_SUBVIEWS, grow, 0);
+        assert_eq!(LAYOUTS.load(std::sync::atomic::Ordering::SeqCst), 1, "laid out inside the block");
+    }
+
+    /// Size and background colour animate in a block, as UIKit's
+    /// actionForLayer:forKey: keys "bounds" and "backgroundColor".
+    #[test]
+    fn size_and_colour_animate_in_a_block() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let view = new_test_view("UIView", Rect::new(0.0, 0.0, 100.0, 100.0));
+        let layer = view_state(view).layer;
+        view_set_background(view, 0, crate::fw::graphics::make_color([0.0, 0.0, 0.0, 1.0]));
+        let change = crate::fw::media::make_callback(view, |v| {
+            send_rect(v, "setFrame:", Rect::new(300.0, 0.0, 40.0, 100.0));
+            runtime::send(v, "setBackgroundColor:", &[crate::fw::graphics::make_color([1.0, 1.0, 1.0, 1.0])]);
+        });
+        const LINEAR: usize = 3 << 16;
+        let start = crate::fw::runloop::media_time();
+        animate_delay(0, 0, 0.4, 0.0, LINEAR, change, 0);
+        for key in ["bounds", "position", "backgroundColor"] {
+            assert_ne!(runtime::send(layer, "animationForKey:", &[string::make(key)]), 0, "{key} animates");
+        }
+        let model = crate::fw::animation::Shown::new(1.0, view_center(view, 0), crate::fw::layers::affine_to_3d(IDENTITY), None);
+        let half = crate::fw::animation::presented_at(layer, model, start + 0.2);
+        assert!((half.position.x - 185.0).abs() < 2.0, "the centre halfway too: {half:?}");
+    }
+
+    /// UIViewController's loadView without a nib (0xecc9a): a view the
+    /// screen's bounds, flexible width and height.
+    #[test]
+    fn a_default_controller_view_fills_the_screen_and_resizes() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let controller = runtime::send(runtime::send(runtime::class_named("UIViewController"), "alloc", &[]), "init", &[]);
+        let view = runtime::send(controller, "view", &[]);
+        assert_eq!(view_state(view).frame, screen_bounds());
+        assert_eq!(view_autoresizing(view, 0), 18, "flexible width and height");
+    }
+
+    /// addChildViewController: sends willMoveToParentViewController: (nil
+    /// and removal first, when the child had another parent).
+    #[test]
+    fn adding_a_child_controller_tells_it_first() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        static HEARD: Mutex<Vec<(Id, Id)>> = Mutex::new(Vec::new());
+        extern "C" fn will_move(this: Id, _: Sel, parent: Id) {
+            HEARD.lock().unwrap().push((this, parent));
+        }
+        let class = define_class("UIKitTestMovingChildController", "UIViewController", 8);
+        methods(class, &[("willMoveToParentViewController:", will_move as usize)]);
+        let new = |class: Class| runtime::send(runtime::send(class, "alloc", &[]), "init", &[]);
+        let (first, second, child) = (new(runtime::class_named("UIViewController")), new(runtime::class_named("UIViewController")), new(class));
+        runtime::send(first, "addChildViewController:", &[child]);
+        runtime::send(second, "addChildViewController:", &[child]);
+        assert_eq!(*HEARD.lock().unwrap(), [(child, first), (child, 0), (child, second)]);
+        assert_eq!(controller_children_list(first), Vec::<Id>::new());
+    }
+
+    /// The root controller's view joins a window only once it shows
+    /// (makeKeyAndVisible, which sends makeKeyWindow); only the key window is key.
+    #[test]
+    fn a_hidden_windows_root_view_waits_for_make_key_and_visible() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        static MADE_KEY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        extern "C" fn make_key(this: Id, s: Sel) {
+            MADE_KEY.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            window_make_key(this, s);
+        }
+        let class = define_class("UIKitTestKeyWindow", "UIWindow", 16);
+        methods(class, &[("makeKeyWindow", make_key as usize)]);
+        let window = view_init_with_frame(runtime::send(class, "alloc", &[]), 0, Rect::new(0.0, 0.0, 320.0, 568.0));
+        let controller = runtime::send(runtime::send(runtime::class_named("UIViewController"), "alloc", &[]), "init", &[]);
+        runtime::send(window, "setRootViewController:", &[controller]);
+        assert_eq!(runtime::send(controller, "isViewLoaded", &[]) & 0xFF, 0, "not loaded while the window is hidden");
+        let other = new_test_view("UIWindow", Rect::new(0.0, 0.0, 320.0, 568.0));
+        let previous_key = key_window();
+        runtime::send(window, "makeKeyAndVisible", &[]);
+        let view = property_get(controller, "view").unwrap_or(0) as Id;
+        assert!(view != 0 && view_state(view).superview == window, "added as the window shows");
+        assert_eq!(MADE_KEY.load(std::sync::atomic::Ordering::SeqCst), 1, "makeKeyWindow sent");
+        assert_ne!(runtime::send(window, "isKeyWindow", &[]) & 0xFF, 0);
+        assert_eq!(runtime::send(other, "isKeyWindow", &[]) & 0xFF, 0, "another window isn't key");
+        runtime::send(window, "setHidden:", &[1]);
+        WINDOWS.lock().unwrap().retain(|&w| w != window);
+        *KEY_WINDOW.lock().unwrap() = previous_key;
+    }
+
+    /// An animated presentation as UIKit's: the presented view slides up
+    /// (cover vertical, 0.4 s) over the presenter's, which leaves only when
+    /// the slide ends.
+    #[test]
+    fn animated_presentations_slide_over_the_presenter() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let new_controller = |view: Id| {
+            let controller = runtime::send(runtime::send(runtime::class_named("UIViewController"), "alloc", &[]), "init", &[]);
+            runtime::send(controller, "setView:", &[view]);
+            controller
+        };
+        let window = new_test_view("UIWindow", Rect::new(0.0, 0.0, 568.0, 320.0));
+        let presenter_view = new_test_view("UIView", Rect::new(0.0, 0.0, 568.0, 320.0));
+        let presenter = new_controller(presenter_view);
+        runtime::send(window, "addSubview:", &[presenter_view]);
+        let shown_view = new_test_view("UIView", Rect::new(0.0, 0.0, 568.0, 320.0));
+        let shown = new_controller(shown_view);
+        runtime::send(presenter, "presentViewController:animated:completion:", &[shown, 1, 0]);
+        assert_eq!(view_state(window).subviews, [presenter_view, shown_view], "the presenter's view stays under it while it slides");
+        assert_ne!(runtime::send(view_state(shown_view).layer, "animationForKey:", &[string::make("position")]), 0, "it slides");
+    }
+
+    /// A modal transition's late end belongs to it alone: presenting the
+    /// same screen again while its dismissal still slides keeps the new
+    /// view in the window and the screen on it.
+    #[test]
+    fn a_newer_presentation_outlives_an_older_dismissals_end() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let new_controller = |view: Id| {
+            let controller = runtime::send(runtime::send(runtime::class_named("UIViewController"), "alloc", &[]), "init", &[]);
+            runtime::send(controller, "setView:", &[view]);
+            controller
+        };
+        let window = new_test_view("UIWindow", Rect::new(0.0, 0.0, 568.0, 320.0));
+        let presenter_view = new_test_view("UIView", Rect::new(0.0, 0.0, 568.0, 320.0));
+        let presenter = new_controller(presenter_view);
+        runtime::send(window, "addSubview:", &[presenter_view]);
+        let shown_view = new_test_view("UIView", Rect::new(0.0, 0.0, 568.0, 320.0));
+        let shown = new_controller(shown_view);
+        runtime::send(presenter, "presentViewController:animated:completion:", &[shown, 1, 0]);
+        runtime::send(presenter, "dismissViewControllerAnimated:completion:", &[1, 0]);
+        runtime::send(presenter, "presentViewController:animated:completion:", &[shown, 1, 0]);
+        let end = crate::fw::runloop::media_time() + 0.5;
+        while crate::fw::runloop::media_time() < end {
+            crate::fw::runloop::run_main_loop_briefly();
+        }
+        assert_eq!(view_state(window).subviews, [shown_view], "the new view stays; the presenter's left when the new slide ended");
+        assert_eq!(property_get(shown, "appeared"), Some(1), "on screen");
+        assert_eq!(view_center(shown_view, 0), Point { x: 284.0, y: 160.0 });
+    }
+
+    /// As UIKit's presentViewController:withTransition:completion: (0xf4d3a)
+    /// and dismissViewControllerWithTransition:completion: (0xf6736): while
+    /// a controller's transition runs, another present or a dismiss from it
+    /// is refused, and so is a present from one already presenting; its
+    /// transition view (UITransitionView, ignoring interaction events from
+    /// initWithFrame:) takes no new touches until the slide is done.
+    #[test]
+    fn a_running_modal_transition_refuses_more_and_takes_no_touches() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        static HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        extern "C" fn hit(_: Id, _: Sel, _point: Point, _event: Id) -> Id {
+            HITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            0
+        }
+        let class = define_class("UIKitTestModalWindow", "UIWindow", 16);
+        methods(class, &[("hitTest:withEvent:", hit as usize)]);
+        let window = view_init_with_frame(runtime::send(class, "alloc", &[]), 0, Rect::new(0.0, 0.0, 568.0, 320.0));
+        let new_controller = |view: Id| {
+            let controller = runtime::send(runtime::send(runtime::class_named("UIViewController"), "alloc", &[]), "init", &[]);
+            runtime::send(controller, "setView:", &[view]);
+            controller
+        };
+        let presenter_view = new_test_view("UIView", Rect::new(0.0, 0.0, 568.0, 320.0));
+        let presenter = new_controller(presenter_view);
+        runtime::send(window, "addSubview:", &[presenter_view]);
+        let shown_view = new_test_view("UIView", Rect::new(0.0, 0.0, 568.0, 320.0));
+        let shown = new_controller(shown_view);
+        let other_view = new_test_view("UIView", Rect::new(0.0, 0.0, 568.0, 320.0));
+        let other = new_controller(other_view);
+        let tap = |finger: i32| {
+            crate::fw::touch::deliver_in(window, finger, crate::fw::touch::Phase::Began, Point { x: 5.0, y: 5.0 });
+            crate::fw::touch::deliver_in(window, finger, crate::fw::touch::Phase::Ended, Point { x: 5.0, y: 5.0 });
+        };
+        runtime::send(presenter, "presentViewController:animated:completion:", &[shown, 1, 0]);
+        runtime::send(presenter, "presentViewController:animated:completion:", &[other, 0, 0]);
+        runtime::send(presenter, "dismissViewControllerAnimated:completion:", &[1, 0]);
+        assert_eq!(property_get(presenter, "presented"), Some(shown as u64), "the second present and the dismiss were refused");
+        assert_eq!(view_state(other_view).superview, 0);
+        tap(9801);
+        assert_eq!(HITS.load(std::sync::atomic::Ordering::SeqCst), 0, "no new touch while it slides");
+        let end = crate::fw::runloop::media_time() + 0.5;
+        while crate::fw::runloop::media_time() < end {
+            crate::fw::runloop::run_main_loop_briefly();
+        }
+        tap(9802);
+        assert_eq!(HITS.load(std::sync::atomic::Ordering::SeqCst), 1, "touches again once it is done");
+        // Done, but still presenting: another present is refused.
+        runtime::send(presenter, "presentViewController:animated:completion:", &[other, 0, 0]);
+        assert_eq!(property_get(presenter, "presented"), Some(shown as u64), "already presenting");
+        assert_eq!(view_state(window).subviews, [shown_view]);
+        runtime::send(presenter, "dismissViewControllerAnimated:completion:", &[0, 0]);
+        assert_eq!(view_state(window).subviews, [presenter_view], "a dismiss once it is done goes");
+    }
+
+    /// As UIKit's +[UIViewAnimationState popAnimationState] (0x48e22): an iOS
+    /// 3 block's setAnimationTransition:forView:cache: is made into its
+    /// CATransition when the block is committed, with the block's duration
+    /// and curve as they are then, and the block's did-stop waits for it
+    /// (a block that only swaps subviews under a flip still animates).
+    #[test]
+    fn an_old_style_blocks_transition_is_made_at_its_commit() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        static STOPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        extern "C" fn stopped(_: Id, _: Sel, _id: Id, _finished: Id, _context: usize) {
+            STOPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        let class = define_class("G32TransitionBlockDelegate", "NSObject", 8);
+        methods(class, &[("animationDidStop:finished:context:", stopped as usize)]);
+        let delegate = runtime::send(runtime::send(class, "alloc", &[]), "init", &[]);
+        let view = new_test_view("UIView", Rect::new(0.0, 0.0, 100.0, 100.0));
+        let layer = view_layer(view, 0);
+        let ui_view = runtime::class_named("UIView");
+        runtime::send(ui_view, "beginAnimations:context:", &[0, 0]);
+        runtime::send(ui_view, "setAnimationTransition:forView:cache:", &[2, view, 1]);
+        set_animation_duration(ui_view, 0, 0.6);
+        set_animation_curve(ui_view, 0, 3);
+        runtime::send(ui_view, "setAnimationDelegate:", &[delegate]);
+        assert_eq!(runtime::send(layer, "animationForKey:", &[string::make("transition")]), 0, "nothing before the commit");
+        let mut queued: Vec<Box<dyn FnOnce() + Send>> = Vec::new();
+        commit_old_animation(|work| queued.push(work));
+        let transition = runtime::send(layer, "animationForKey:", &[string::make("transition")]);
+        assert_ne!(transition, 0, "made at the commit");
+        assert_eq!(property_get(transition, "duration").map(f64::from_bits), Some(0.6), "the block's duration then");
+        assert_eq!(crate::fw::animation::curve_of(runtime::send(transition, "timingFunction", &[])).map(|c| c.0), Some([0.0, 0.0, 1.0, 1.0]), "and its curve");
+        assert_eq!(STOPS.load(std::sync::atomic::Ordering::SeqCst), 0, "did-stop waits for the transition");
+        runtime::send(layer, "removeAllAnimations", &[]);
+    }
+
+    /// As Apple documents dismissViewControllerAnimated:completion:, a stack
+    /// dismissed from below: only the top screen goes animated (its own
+    /// style: cover vertical slides it down), the ones between are removed
+    /// at once, and the completion comes when the top one is gone. What shows
+    /// under it while it slides is the dismissing controller's view.
+    #[test]
+    fn a_dismissed_stack_slides_only_its_top_screen_away() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        static DONE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        #[repr(C)]
+        struct Completion {
+            isa: usize,
+            flags: i32,
+            reserved: i32,
+            invoke: usize,
+            descriptor: usize,
+        }
+        extern "C" fn completion_invoke(_block: usize) {
+            DONE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        static DESCRIPTOR: [usize; 2] = [0, std::mem::size_of::<Completion>()];
+        let completion = leak(Completion { isa: 0, flags: 1 << 28, reserved: 0, invoke: completion_invoke as usize, descriptor: DESCRIPTOR.as_ptr() as usize });
+        let new_controller = |view: Id| {
+            let controller = runtime::send(runtime::send(runtime::class_named("UIViewController"), "alloc", &[]), "init", &[]);
+            runtime::send(controller, "setView:", &[view]);
+            controller
+        };
+        let settle = || {
+            let end = crate::fw::runloop::media_time() + 0.5;
+            while crate::fw::runloop::media_time() < end {
+                crate::fw::runloop::run_main_loop_briefly();
+            }
+        };
+        let window = new_test_view("UIWindow", Rect::new(0.0, 0.0, 568.0, 320.0));
+        let views: Vec<Id> = (0..3).map(|_| new_test_view("UIView", Rect::new(0.0, 0.0, 568.0, 320.0))).collect();
+        let [a, b, c] = [new_controller(views[0]), new_controller(views[1]), new_controller(views[2])];
+        runtime::send(window, "addSubview:", &[views[0]]);
+        runtime::send(a, "presentViewController:animated:completion:", &[b, 1, 0]);
+        settle();
+        runtime::send(b, "presentViewController:animated:completion:", &[c, 1, 0]);
+        settle();
+        assert_eq!(view_state(window).subviews, [views[2]]);
+        runtime::send(a, "dismissViewControllerAnimated:completion:", &[1, completion]);
+        assert_eq!(view_state(window).subviews, [views[0], views[2]], "the top screen slides off over A's; B's is gone");
+        assert_ne!(runtime::send(view_state(views[2]).layer, "animationForKey:", &[string::make("position")]), 0, "it slides");
+        assert_eq!(DONE.load(std::sync::atomic::Ordering::SeqCst), 0, "the completion waits for the slide");
+        settle();
+        assert_eq!(view_state(window).subviews, [views[0]]);
+        assert_eq!(DONE.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(property_get(a, "appeared"), Some(1), "A is on screen again");
+        assert_eq!(view_center(views[2], 0), Point { x: 284.0, y: 160.0 }, "the top view is back where it was");
+    }
+
+    /// sizeToFit sets the frame's size to sizeThatFits: (the view's own, for UIView).
+    #[test]
+    fn size_to_fit_asks_size_that_fits() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        extern "C" fn fits(_: Id, _: Sel, _size: Size) -> Size {
+            Size { width: 30.0, height: 12.0 }
+        }
+        let class = define_class("UIKitTestFittingView", "UIView", 16);
+        methods(class, &[("sizeThatFits:", fits as usize)]);
+        let view = view_init_with_frame(runtime::send(class, "alloc", &[]), 0, Rect::new(5.0, 6.0, 100.0, 100.0));
+        runtime::send(view, "sizeToFit", &[]);
+        assert_eq!(view_state(view).frame, Rect::new(5.0, 6.0, 30.0, 12.0));
     }
 }

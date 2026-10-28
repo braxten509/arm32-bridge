@@ -357,10 +357,7 @@ impl<'a> Xml<'a> {
             "true" => Value::Bool(true),
             "false" => Value::Bool(false),
             "data" => Value::Data(base64_decode(&self.text_until_close("data")?)),
-            "date" => {
-                self.text_until_close("date")?;
-                Value::Date(0.0)
-            }
+            "date" => Value::Date(date_seconds(&self.text_until_close("date")?).unwrap_or(0.0)),
             _ => return None,
         })
     }
@@ -520,25 +517,71 @@ fn parse_binary(bytes: &[u8]) -> Option<Value> {
 
 // ----- objects -----
 
+/// The list as objects, its dictionaries and arrays mutable.
 pub fn to_object(value: &Value) -> Id {
+    to_objects(value, true)
+}
+
+/// The list as objects, its dictionaries and arrays immutable (what
+/// NSUserDefaults keeps and hands back).
+pub fn to_immutable_object(value: &Value) -> Id {
+    to_objects(value, false)
+}
+
+fn to_objects(value: &Value, mutable: bool) -> Id {
+    let made = |object: Id| if mutable { crate::objc::runtime::send(object, "mutableCopy", &[]) } else { object };
     match value {
         Value::Dict(entries) => {
-            let pairs: Vec<(Id, Id)> = entries.iter().map(|(k, v)| (string::make(k), to_object(v))).collect();
-            let dict = collections::dictionary_from(&pairs);
-            crate::objc::runtime::send(dict, "mutableCopy", &[])
+            let pairs: Vec<(Id, Id)> = entries.iter().map(|(k, v)| (string::make(k), to_objects(v, mutable))).collect();
+            made(collections::dictionary_from(&pairs))
         }
         Value::Array(items) => {
-            let list: Vec<Id> = items.iter().map(to_object).collect();
-            crate::objc::runtime::send(collections::array_from(&list), "mutableCopy", &[])
+            let list: Vec<Id> = items.iter().map(|item| to_objects(item, mutable)).collect();
+            made(collections::array_from(&list))
         }
         Value::String(s) => string::make(s),
         Value::Integer(n) => collections::number_int(*n),
         Value::Real(f) => collections::number_float(*f),
         Value::Bool(b) => collections::number_bool(*b),
         Value::Data(bytes) => crate::fw::data::make(bytes),
-        Value::Date(_) => collections::number_float(0.0),
+        Value::Date(seconds) => crate::fw::misc::date(*seconds),
         Value::Uid(n) => collections::number_int(*n as i64),
     }
+}
+
+/// Seconds since 2001-01-01 as an XML list's date text (whole seconds, UTC).
+fn date_text(seconds: f64) -> String {
+    let total = (seconds.floor() as i64).saturating_add(978_307_200);
+    let (days, rest) = (total.div_euclid(86_400), total.rem_euclid(86_400));
+    // Days since 1970-01-01 to a calendar date (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z - era * 146_097;
+    let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 { shifted_month + 3 } else { shifted_month - 9 };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z", rest / 3600, rest / 60 % 60, rest % 60)
+}
+
+/// An XML list's date text ("2026-10-29T20:53:20Z") as seconds since 2001-01-01.
+fn date_seconds(text: &str) -> Option<f64> {
+    let text = text.trim().trim_end_matches('Z');
+    let (date, time) = text.split_once('T').unwrap_or((text, "00:00:00"));
+    let mut date_parts = date.splitn(3, '-').map(|p| p.parse::<i64>());
+    let (year, month, day) = (date_parts.next()?.ok()?, date_parts.next().unwrap_or(Ok(1)).ok()?, date_parts.next().unwrap_or(Ok(1)).ok()?);
+    let mut time_parts = time.splitn(3, ':').map(|p| p.parse::<f64>());
+    let (hour, minute, second) = (time_parts.next()?.ok()?, time_parts.next().unwrap_or(Ok(0.0)).ok()?, time_parts.next().unwrap_or(Ok(0.0)).ok()?);
+    // A calendar date to days since 1970-01-01 (Howard Hinnant's algorithm).
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    Some((days * 86_400) as f64 + hour * 3600.0 + minute * 60.0 + second - 978_307_200.0)
 }
 
 pub fn from_object(object: Id) -> Option<Value> {
@@ -548,15 +591,17 @@ pub fn from_object(object: Id) -> Option<Value> {
     if string::is_string(object) {
         return Some(Value::String(string::get(object)));
     }
+    // One value that isn't a list (or a key that isn't a string) makes the
+    // whole list not one, as Apple's: nothing is dropped quietly.
     if collections::is_dictionary(object) {
         let entries = collections::dictionary_pairs(object)
             .into_iter()
-            .filter_map(|(k, v)| Some((string::get(k), from_object(v)?)))
-            .collect();
+            .map(|(k, v)| Some((string::is_string(k).then(|| string::get(k))?, from_object(v)?)))
+            .collect::<Option<_>>()?;
         return Some(Value::Dict(entries));
     }
     if collections::is_array(object) {
-        return Some(Value::Array(collections::array_items(object).into_iter().filter_map(from_object).collect()));
+        return Some(Value::Array(collections::array_items(object).into_iter().map(from_object).collect::<Option<_>>()?));
     }
     if collections::is_number(object) {
         // The number's own kind and exact value (integers don't pass through a double).
@@ -570,6 +615,10 @@ pub fn from_object(object: Id) -> Option<Value> {
     }
     if crate::fw::data::is_data(object) {
         return Some(Value::Data(crate::fw::data::bytes(object)));
+    }
+    let date_class = crate::objc::runtime::class_named("NSDate");
+    if date_class != 0 && crate::objc::runtime::send(object, "isKindOfClass:", &[date_class]) & 0xFF != 0 {
+        return Some(Value::Date(crate::fw::dates::date_seconds(object)));
     }
     crate::log!("can't save {} in a settings file", string::describe(object));
     None
@@ -600,7 +649,7 @@ pub fn to_xml(value: &Value) -> String {
             Value::Bool(true) => out.push_str(&format!("{pad}<true/>\n")),
             Value::Bool(false) => out.push_str(&format!("{pad}<false/>\n")),
             Value::Data(bytes) => out.push_str(&format!("{pad}<data>{}</data>\n", base64_encode(bytes))),
-            Value::Date(_) => out.push_str(&format!("{pad}<date>2001-01-01T00:00:00Z</date>\n")),
+            Value::Date(seconds) => out.push_str(&format!("{pad}<date>{}</date>\n", date_text(*seconds))),
             Value::Uid(n) => out.push_str(&format!("{pad}<dict>\n{pad}\t<key>CF$UID</key>\n{pad}\t<integer>{n}</integer>\n{pad}</dict>\n")),
         }
     }
@@ -868,6 +917,47 @@ mod tests {
         // .strings tables still load leniently, an empty one as an empty table.
         assert!(matches!(parse_strings(b""), Some(Value::Dict(entries)) if entries.is_empty()));
         assert!(matches!(parse_strings(b"\"key\";"), Some(Value::Dict(entries)) if entries.len() == 1 && entries[0].0 == "key"));
+    }
+
+    /// A list holding anything that isn't one (deep inside too), or a
+    /// dictionary with a key that isn't a string, is not a property list:
+    /// writeToFile: says NO and NSUserDefaults refuses it, nothing is dropped.
+    #[test]
+    fn apple_lists_with_a_bad_value_inside_are_refused_whole() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let thing = runtime::send(runtime::class_named("NSObject"), "new", &[]);
+        let one = runtime::send(runtime::class_named("NSNumber"), "numberWithInt:", &[1]);
+        let fine = string::make("fine");
+        let inner = collections::array_from(&[fine, thing]);
+        assert!(from_object(inner).is_none(), "an array with an object");
+        assert!(from_object(collections::dictionary_from(&[(string::make("k"), inner)])).is_none(), "nested");
+        assert!(from_object(collections::dictionary_from(&[(one, fine)])).is_none(), "a number key");
+        assert!(from_object(collections::dictionary_from(&[(string::make("k"), fine)])).is_some());
+        let path = std::env::temp_dir().join(format!("apple-plist-refused-{}.plist", std::process::id()));
+        let written = runtime::send(inner, "writeToFile:atomically:", &[string::make(path.to_str().unwrap()), 1]) & 0xFF;
+        assert_eq!(written, 0);
+        assert!(!path.exists());
+    }
+
+    /// Dates save with their real value and load back as NSDate, in XML and
+    /// binary lists (they were dropped on save and read as the number 0).
+    #[test]
+    fn apple_dates_save_and_load_as_dates() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let when = 815_000_000.5;
+        let saved = from_object(collections::array_from(&[crate::fw::misc::date(when)]));
+        assert!(matches!(&saved, Some(Value::Array(items)) if matches!(items[..], [Value::Date(d)] if d == when)), "{saved:?}");
+        let xml = to_xml(saved.as_ref().unwrap());
+        assert!(xml.contains("<date>2026-10-29T20:53:20Z</date>"), "{xml}");
+        for bytes in [xml.into_bytes(), to_binary(saved.as_ref().unwrap())] {
+            let back = to_object(&parse(&bytes).unwrap());
+            let date = collections::array_items(back)[0];
+            let is_date = runtime::send(date, "isKindOfClass:", &[runtime::class_named("NSDate")]) & 0xFF != 0;
+            assert!(is_date, "{}", string::describe(date));
+            assert_eq!(crate::fw::misc::date_value(date).floor(), when.floor());
+        }
     }
 
     /// Numbers keep their kind and exact value through a list, both formats:

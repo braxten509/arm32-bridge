@@ -3,6 +3,7 @@
 
 use super::bridge::GuestSide;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub const BASE: u32 = 0x10_0000;
@@ -18,6 +19,9 @@ pub struct Fake {
     code: Mutex<HashMap<u32, Code>>,
     functions: Mutex<Vec<String>>,
     pub freed: Mutex<Vec<u32>>,
+    /// How deeply calls may nest (as the translator's return traps limit them).
+    pub depth_limit: AtomicU32,
+    depth: AtomicU32,
 }
 
 unsafe impl Sync for Fake {}
@@ -32,6 +36,8 @@ impl Fake {
             code: Mutex::new(HashMap::new()),
             functions: Mutex::new(Vec::new()),
             freed: Mutex::new(Vec::new()),
+            depth_limit: AtomicU32::new(u32::MAX),
+            depth: AtomicU32::new(0),
         }))
     }
     pub fn code(&self, imp: u32, f: impl Fn(&[u32]) -> u64 + Send + Sync + 'static) {
@@ -98,6 +104,15 @@ impl GuestSide for Fake {
     }
     fn call(&self, imp: u32, words: &[u32]) -> Result<u64, String> {
         let code = self.code.lock().unwrap().get(&imp).cloned().ok_or(format!("no fake code at {imp:#x}"))?;
-        Ok(code(words))
+        if self.depth.load(Ordering::SeqCst) >= self.depth_limit.load(Ordering::SeqCst) {
+            return Err("guest calls nested too deeply".into());
+        }
+        self.depth.fetch_add(1, Ordering::SeqCst);
+        let result = code(words);
+        self.depth.fetch_sub(1, Ordering::SeqCst);
+        Ok(result)
+    }
+    fn nested_calls_left(&self) -> u32 {
+        self.depth_limit.load(Ordering::SeqCst).saturating_sub(self.depth.load(Ordering::SeqCst))
     }
 }

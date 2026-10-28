@@ -40,8 +40,21 @@ fn answer_later(handler: usize, arguments: [Id; 3]) {
         let header = handler as *const crate::libsystem::mach::BlockHeader;
         let invoke: extern "C" fn(usize, Id, Id, Id) = unsafe { std::mem::transmute((*header).invoke) };
         invoke(handler, arguments[0], arguments[1], arguments[2]);
+        // The answer's own copy goes once it has run.
+        release_block(handler);
     });
     post(Work::Block(block));
+}
+
+/// _Block_release (libsystem's, by its exported name).
+fn release_block(block: usize) {
+    if block == 0 {
+        return;
+    }
+    if let Some((address, _)) = crate::symbols::lookup("__Block_release") {
+        let release: extern "C" fn(usize) = unsafe { std::mem::transmute(address) };
+        release(block);
+    }
 }
 
 extern "C" fn local_player(_: Class, _: Sel) -> Id {
@@ -57,10 +70,38 @@ extern "C" fn nothing(_this: Id, _: Sel) -> Id {
     0
 }
 
-/// setAuthenticateHandler: (iOS 6+): handler(viewController, error).
+/// The local player's authenticateHandler (a copy), kept as iOS 6 keeps it.
+/// Read and copied under this lock, so another thread setting a new one
+/// cannot let it go in between (Apple's atomic copy property).
+static AUTHENTICATE_HANDLER: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+
+/// setAuthenticateHandler: (iOS 6+): handler(viewController, error). It is
+/// kept (the getter gives it back) and asked again each time the game comes
+/// back to the foreground, as GameKit does while nobody is signed in.
 extern "C" fn set_authenticate_handler(_this: Id, _: Sel, handler: usize) {
     crate::log!("Game Center: sign-in asked for; answering 'not available'");
-    answer_later(handler, [0, offline_error(), 0]);
+    let kept = if handler == 0 { 0 } else { crate::libsystem::mach::block_copy(handler as *mut _) as usize };
+    let replaced = {
+        let mut current = AUTHENTICATE_HANDLER.lock().unwrap_or_else(|e| e.into_inner());
+        answer_later(kept, [0, offline_error(), 0]);
+        std::mem::replace(&mut *current, kept)
+    };
+    // The handler it replaces is let go, as Apple's copy property setter does
+    // (an answer still waiting holds its own copy), outside the lock: its
+    // dispose may run game code.
+    release_block(replaced);
+}
+
+extern "C" fn authenticate_handler(_this: Id, _: Sel) -> usize {
+    *AUTHENTICATE_HANDLER.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The game came back to the foreground: a kept authenticateHandler hears
+/// again that nobody is signed in. Whether one was asked.
+pub fn ask_authenticate_handler_again() -> bool {
+    let handler = AUTHENTICATE_HANDLER.lock().unwrap_or_else(|e| e.into_inner());
+    answer_later(*handler, [0, offline_error(), 0]);
+    *handler != 0
 }
 
 /// Methods whose block takes only an error, or (result, error) with no result.
@@ -222,9 +263,12 @@ extern "C" fn shared_matchmaker(_: Class, _: Sel) -> Id {
 object_property!(invite_handler, set_invite_handler_raw, "inviteHandler");
 
 extern "C" fn set_invite_handler(this: Id, s: Sel, handler: usize) {
-    // Kept, never called: no invitations can arrive.
+    // Kept, never called: no invitations can arrive. A copy property: the
+    // handler it replaces is let go of.
     let handler = if handler != 0 { crate::libsystem::mach::block_copy(handler as *mut _) as usize } else { 0 };
+    let old = invite_handler(this, s);
     set_invite_handler_raw(this, s, handler);
+    release_block(old);
 }
 
 /// Matchmaking requests fail at once: the player isn't signed in.
@@ -365,7 +409,7 @@ pub fn register(r: &mut Registry) {
             ("playerID", nothing as usize),
             ("alias", nothing as usize),
             ("displayName", nothing as usize),
-            ("authenticateHandler", nothing as usize),
+            ("authenticateHandler", authenticate_handler as usize),
             ("setAuthenticateHandler:", set_authenticate_handler as usize),
             ("authenticateWithCompletionHandler:", error_only as usize),
             ("loadFriendsWithCompletionHandler:", nothing_then_error as usize),
@@ -703,6 +747,27 @@ mod tests {
         let (address, kind) = crate::symbols::lookup(&format!("_{name}")).unwrap_or_else(|| panic!("{name} is not exported"));
         assert_eq!(kind, crate::symbols::Kind::Data, "{name}");
         unsafe { *(address as *const Id) }
+    }
+
+    /// iOS 6's authenticateHandler is kept: the getter gives it back, and
+    /// coming back to the foreground asks it again (still not signed in).
+    #[test]
+    fn the_authenticate_handler_is_kept_and_asked_again_on_return() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        extern "C" fn invoke(_block: usize, _view_controller: Id, _error: Id) {}
+        let block: &'static crate::libsystem::mach::BlockHeader = Box::leak(Box::new(crate::libsystem::mach::BlockHeader {
+            isa: 0,
+            flags: 1 << 28,
+            reserved: 0,
+            invoke: invoke as usize,
+            descriptor: std::ptr::null(),
+        }));
+        let handler = block as *const _ as usize;
+        let player = runtime::send(runtime::class_named("GKLocalPlayer"), "localPlayer", &[]);
+        runtime::send(player, "setAuthenticateHandler:", &[handler]);
+        assert_eq!(runtime::send(player, "authenticateHandler", &[]), handler);
+        assert!(ask_authenticate_handler_again(), "asked again on return");
     }
 
     /// Games compare a sign-in error's domain with GKErrorDomain, and the

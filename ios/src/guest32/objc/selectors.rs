@@ -14,15 +14,18 @@ pub enum Varargs {
     VaList,
 }
 
-/// Pointer-to-id arguments of a counted message (`objects:count:`): they
-/// hold as many ids as the message's last integer argument says, read
-/// before the call (`in-array`) or filled by it (`out-array`).
+/// Pointer arguments of a counted message (`objects:count:`, CGFloat
+/// `pattern:count:`): they hold as many elements as the message's last
+/// integer argument says, read before the call (`in-array`) or filled by it
+/// (`out-array`); or as many as the host writes to the message's integer
+/// out-parameter, filled by it (`counted-out`, -getLineDash:count:phase:).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum IdArrays {
     #[default]
     None,
     In,
     Out,
+    CountedOut,
 }
 
 #[derive(Clone, Debug)]
@@ -84,6 +87,8 @@ impl FrameworkSelectors {
                 IdArrays::In
             } else if notes.contains(&"out-array") {
                 IdArrays::Out
+            } else if notes.contains(&"counted-out") {
+                IdArrays::CountedOut
             } else {
                 IdArrays::None
             };

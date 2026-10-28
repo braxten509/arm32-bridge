@@ -89,6 +89,7 @@ pub fn register() {
         "CGContextRetain" => fn(context: Obj) -> Obj;
         "CGColorSpaceCreateDeviceRGB" => fn() -> Obj;
         "CGColorSpaceCreateDeviceGray" => fn() -> Obj;
+        "CGColorSpaceCreateIndexed" => fn(base: Obj, last: Word, table: Ptr) -> Obj;
         "CGColorSpaceGetNumberOfComponents" => fn(space: Obj) -> Word;
         "CGColorSpaceRelease" => fn(space: Obj);
         "CGColorCreate" => fn(space: Obj, components: ColorPtr) -> Obj;
@@ -125,6 +126,9 @@ pub fn register() {
         "CGContextSetStrokeColorSpace" => fn(context: Obj, space: Obj);
         "CGContextSetAlpha" => fn(context: Obj, alpha: Float);
         "CGContextSetLineWidth" => fn(context: Obj, width: Float);
+        "CGContextSetLineCap" => fn(context: Obj, cap: I32);
+        "CGContextSetLineJoin" => fn(context: Obj, join: I32);
+        "CGContextSetMiterLimit" => fn(context: Obj, limit: Float);
         "CGContextSetBlendMode" => fn(context: Obj, mode: I32);
         "CGContextSetShadow" => fn(context: Obj, offset: Size, blur: Float);
         "CGContextSetShadowWithColor" => fn(context: Obj, offset: Size, blur: Float, color: Obj);
@@ -389,6 +393,19 @@ fn special() {
             let values = guest_floats(points, count * 2);
             let host: Vec<Point> = values.chunks_exact(2).map(|p| Point { x: p[0], y: p[1] }).collect();
             unsafe { stroke(context, host.as_ptr(), host.len()) };
+            Ret::Void
+        }),
+    );
+    // CGContextSetLineDash(context, phase, lengths, count): CGFloat lengths.
+    function(
+        "CGContextSetLineDash",
+        handler!(|uc, a| {
+            let (context, phase, lengths, count) = (object_to_host(a.u32()), f32::from_bits(a.u32()) as f64, a.u32(), a.u32() as usize);
+            let Some(set) = host_fn!("CGContextSetLineDash": unsafe extern "C" fn(usize, f64, *const f64, usize)) else {
+                return super::no_host_function(uc, "CGContextSetLineDash");
+            };
+            let values = if lengths == 0 { Vec::new() } else { guest_floats(lengths, count.min(64)) };
+            unsafe { set(context, phase, if values.is_empty() { std::ptr::null() } else { values.as_ptr() }, values.len()) };
             Ret::Void
         }),
     );

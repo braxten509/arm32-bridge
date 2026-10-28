@@ -283,6 +283,65 @@ fn counted_id_arrays_and_fast_enumeration() {
     assert_eq!(fields, [16, buffer, state + 12]);
 }
 
+/// -getObjects:range: (`out-array` with no integer argument): the array
+/// holds as many ids as the range's length, each written back as a guest id.
+#[test]
+fn apple_id_arrays_counted_by_a_range_length() {
+    let mut b = Fake::new();
+    let row = super::selectors::FrameworkSelectors::builtin().get("getObjects:range:").expect("a getObjects:range: row");
+    let options = HostCallOptions { arrays: row.arrays, ..plain() };
+    let buffer = BASE + 0x600;
+    b.put(buffer, &[0xee; 3 * 4]);
+    let call = prepare_host_call(&row.signature, options, &words(&[1, 2, buffer, 4, 3]), &mut b).unwrap();
+    assert_eq!(call.out_counts(), [3], "room for the range's 3 ids");
+    let host_buffer = call.args.x[2] as *mut u64;
+    unsafe {
+        for (i, id) in [0x51u32, 0x52, 0x53].iter().enumerate() {
+            *host_buffer.add(i) = (HOST_ID + *id as usize) as u64;
+        }
+    }
+    finish_host_call(call, &HostRet { x: [0, 0], d: [0; 4] }, &mut b).unwrap();
+    let ids: Vec<u32> = b.get(buffer, 12).chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    assert_eq!(ids, [0x51, 0x52, 0x53]);
+}
+
+/// CGFloat arrays: -setLineDash:count:phase: reads `count` 32-bit floats as
+/// the host's doubles (`in-array`); -getLineDash:count:phase: gets as many
+/// back as the host writes to the count (`counted-out`), never more; a C
+/// `float *` (`float`, -[NSScanner scanFloat:]) stays 4 bytes.
+#[test]
+fn cgfloat_arrays_cross_as_doubles() {
+    let mut b = Fake::new();
+    let floats = |values: &[f32]| values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+    let pattern = BASE + 0x300;
+    b.put(pattern, &floats(&[4.0, 2.5]));
+    let sig = Signature::parse("v@:^fif").unwrap();
+    let options = HostCallOptions { arrays: IdArrays::In, ..plain() };
+    let call = prepare_host_call(&sig, options, &words(&[1, 2, pattern, 2, 1.0f32.to_bits()]), &mut b).unwrap();
+    assert_eq!(unsafe { std::slice::from_raw_parts(call.args.x[2] as *const f64, 2) }, [4.0, 2.5]);
+
+    let (out, count, phase) = (BASE + 0x400, BASE + 0x440, BASE + 0x450);
+    b.put(out, &[0xee; 16]);
+    let sig = Signature::parse("v@:^f^i^f").unwrap();
+    let options = HostCallOptions { arrays: IdArrays::CountedOut, ..plain() };
+    let call = prepare_host_call(&sig, options, &words(&[1, 2, out, count, phase]), &mut b).unwrap();
+    unsafe {
+        let host = call.args.x[2] as *mut f64;
+        (*host, *host.add(1), *host.add(2)) = (3.0, 1.5, 9.0);
+        *(call.args.x[3] as *mut i64) = 2;
+        *(call.args.x[4] as *mut f64) = 0.5;
+    }
+    finish_host_call(call, &HostRet { x: [0, 0], d: [0; 4] }, &mut b).unwrap();
+    assert_eq!(b.get(out, 12), [floats(&[3.0, 1.5]), vec![0xee; 4]].concat(), "two written, the third left alone");
+    assert_eq!((b.get(count, 4), b.get(phase, 4)), (2i32.to_le_bytes().to_vec(), floats(&[0.5])));
+
+    let sig = Signature::parse("c@:^f").unwrap();
+    let call = prepare_host_call(&sig, HostCallOptions { real_float: true, ..plain() }, &words(&[1, 2, phase]), &mut b).unwrap();
+    unsafe { *(call.args.x[2] as *mut f32) = 7.25 };
+    finish_host_call(call, &HostRet { x: [1, 0], d: [0; 4] }, &mut b).unwrap();
+    assert_eq!(b.get(phase, 4), floats(&[7.25]));
+}
+
 #[test]
 fn variadic_arguments_go_to_stack_slots() {
     let mut b = Fake::new();
@@ -306,6 +365,11 @@ fn variadic_arguments_go_to_stack_slots() {
     // nil-ended object lists end with a 0 slot.
     let call = prepare_host_call(&sig, HostCallOptions { varargs: Varargs::NilList, ..plain() }, &words(&[1, 2, 0x10, 0x20, 0x30, 0]), &mut b).unwrap();
     assert_eq!(call.args.stack, [(HOST_ID + 0x20) as u64, (HOST_ID + 0x30) as u64, 0]);
+    // A nil first object (the last named argument, as SpellCraft's
+    // otherButtonTitles:nil) is the whole list: the words after it are the
+    // caller's own stack, not part of the list.
+    let call = prepare_host_call(&sig, HostCallOptions { varargs: Varargs::NilList, ..plain() }, &words(&[1, 2, 0, 0x30, 0x40, 0]), &mut b).unwrap();
+    assert_eq!(call.args.stack, Vec::<u64>::new());
 }
 
 /// A positional specifier ("%2$@") names one argument by place: the highest
@@ -348,6 +412,21 @@ fn host_calls_into_guest_methods_convert_both_ways() {
     assert_eq!(frame.ret.x[0] & 0xff, 1);
 }
 
+/// A raw pointer the game gave the host (+beginAnimations:context:'s
+/// void *) comes back unchanged where the game's method says id
+/// (SpellCraft's -encounterCardSlidOff:finished:context:(id), v20@0:4@8@12@16),
+/// as Apple passes the same pointer on: not converted as a host object.
+#[test]
+fn a_game_pointer_comes_back_unchanged_where_its_method_says_id() {
+    let mut b = Fake::new();
+    let sig = Signature::parse("v20@0:4@8@12@16").unwrap();
+    let context = BASE + 0x40;
+    let mut frame = HostFrame::default();
+    frame.x[..5].copy_from_slice(&[(HOST_ID + 1) as u64, (HOST_SEL + 2) as u64, (HOST_ID + 3) as u64, (HOST_ID + 4) as u64, b.host_address(context) as u64]);
+    let call = prepare_guest_call(&sig, &frame, &mut b).unwrap();
+    assert_eq!(&call.words[2..5], &[3, 4, context]);
+}
+
 #[test]
 fn host_pointer_arguments_reach_guest_methods_as_typed_temporaries() {
     let mut b = Fake::new();
@@ -374,6 +453,27 @@ fn host_pointer_arguments_reach_guest_methods_as_typed_temporaries() {
     b.put(call.words[2], &[1]);
     finish_guest_call(call, 0, 0, &mut frame, &mut b).unwrap();
     assert_eq!(flags, [1, 0xaa]);
+    // -scrollViewWillEndDragging:withVelocity:targetContentOffset: (CGPoint *):
+    // the game reads and moves the target as two floats; the host sees doubles.
+    let sig = Signature::parse("v20@0:4@8{CGPoint=ff}12^{CGPoint=ff}20").unwrap();
+    let mut target = [60.0f64, 0.0];
+    let mut frame = HostFrame::default();
+    frame.x[..4].copy_from_slice(&[(HOST_ID + 1) as u64, (HOST_SEL + 2) as u64, (HOST_ID + 3) as u64, target.as_mut_ptr() as u64]);
+    frame.d[0] = 0.5f64.to_bits();
+    let call = prepare_guest_call(&sig, &frame, &mut b).unwrap();
+    assert_eq!(&call.words[3..5], &[f(0.5), f(0.0)]);
+    let temp = call.words[5];
+    assert_eq!(b.get(temp, 8), [f(60.0).to_le_bytes(), f(0.0).to_le_bytes()].concat());
+    b.put(temp, &[f(200.0).to_le_bytes(), f(0.0).to_le_bytes()].concat());
+    finish_guest_call(call, 0, 0, &mut frame, &mut b).unwrap();
+    assert_eq!(target, [200.0, 0.0]);
+    // Left alone by the game, the host's doubles stay exactly as they were
+    // (not rounded through floats), so the host sees no change.
+    let mut target = [309.749916583f64, 0.1];
+    frame.x[3] = target.as_mut_ptr() as u64;
+    let call = prepare_guest_call(&sig, &frame, &mut b).unwrap();
+    finish_guest_call(call, 0, 0, &mut frame, &mut b).unwrap();
+    assert_eq!(target.map(f64::to_bits), [309.749916583f64, 0.1].map(f64::to_bits));
 }
 
 /// A remembered message's plan (worked out once) converts each later call

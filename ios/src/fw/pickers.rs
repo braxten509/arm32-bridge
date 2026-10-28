@@ -13,9 +13,9 @@ use crate::fw::graphics::TextLook;
 use crate::fw::object::{define_class, methods};
 use crate::fw::uikit::{property, property_get, property_set, view_state};
 use crate::fw::string;
-use crate::objc::runtime::{self, Id, Sel};
+use crate::objc::runtime::{self, Class, Id, Sel};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 /// Something a page control or picker shows, in its own points.
 #[derive(Clone, Debug, PartialEq)]
@@ -154,8 +154,8 @@ fn with<R>(picker: Id, f: impl FnOnce(&mut Picker) -> R) -> R {
     f(PICKERS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).entry(picker).or_default())
 }
 
-property!(source, set_source, "dataSource", id, 0);
-property!(picker_delegate, set_picker_delegate, "delegate", id, 0);
+property!(source, set_source, "dataSource", assign, 0);
+property!(picker_delegate, set_picker_delegate, "delegate", assign, 0);
 property!(shows_indicator, set_shows_indicator, "showsSelectionIndicator", bool, false);
 
 fn ask(receiver: Id, name: &str, args: &[usize]) -> Option<usize> {
@@ -370,18 +370,31 @@ extern "C" fn picker_init_with_frame(this: Id, _: Sel, frame: Rect) -> Id {
 
 /// What a page control or picker shows (None for other views).
 pub fn pieces(view: Id) -> Option<Vec<Piece>> {
-    let is = |name: &str| {
-        let class = runtime::class_named(name);
-        let rt = runtime::lock();
-        class != 0 && rt.is_subclass(rt.class_of(view), class)
-    };
-    if is("UIPageControl") {
-        Some(page_pieces(view))
-    } else if is("UIPickerView") {
-        Some(picker_pieces(view))
-    } else {
-        None
+    let page = picker_class(&PAGE_CONTROL_CLASS, "UIPageControl");
+    if page != 0 && runtime::is_kind_of(view, page) {
+        return Some(page_pieces(view));
     }
+    let picker = picker_class(&PICKER_VIEW_CLASS, "UIPickerView");
+    if picker != 0 && runtime::is_kind_of(view, picker) {
+        return Some(picker_pieces(view));
+    }
+    None
+}
+
+static PAGE_CONTROL_CLASS: OnceLock<Class> = OnceLock::new();
+static PICKER_VIEW_CLASS: OnceLock<Class> = OnceLock::new();
+
+/// A class pointer looked up once it exists; while it is 0 (not registered
+/// yet) it is re-checked, so classes defined later are still found.
+fn picker_class(cell: &'static OnceLock<Class>, name: &str) -> Class {
+    if let Some(&class) = cell.get() {
+        return class;
+    }
+    let class = runtime::class_named(name);
+    if class != 0 {
+        let _ = cell.set(class);
+    }
+    class
 }
 
 pub fn register() {

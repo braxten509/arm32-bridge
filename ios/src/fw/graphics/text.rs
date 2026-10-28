@@ -371,8 +371,9 @@ impl ttf_parser::OutlineBuilder for Pen<'_> {
 impl Canvas {
     /// Lines of text in `rect` (UIKit's coordinates: its top is the first
     /// line's top), aligned in its width and cut at its edges, filled
-    /// and/or stroked as the context's text drawing mode says; the clip
-    /// modes then add the glyphs' shapes to the context's clip.
+    /// and/or stroked as the context's text drawing mode says, casting the
+    /// context's shadow (on its own surface, as big as the glyphs and the
+    /// pen); the clip modes then add the glyphs' shapes to the context's clip.
     fn draw_text(&mut self, font: &Font, lines: &[Vec<char>], rect: Rect, align: isize) {
         // CGTextDrawingMode: fill, stroke, fill+stroke, invisible, then the same four adding to the clip.
         let mode = self.state.text_mode;
@@ -410,21 +411,29 @@ impl Canvas {
         if fill || stroke {
             // Painted only inside the rect (an unbounded side stays open;
             // the one line always shown may be taller than the rect).
-            let saved = self.state.clip.clone();
             let open = |start: f64, length: f64| if length.is_finite() { (start, length) } else { (start - 1e6, 2e6) };
             let (x, width) = open(rect.origin.x, rect.size.width);
             let (y, height) = open(rect.origin.y, rect.size.height.max(lines.len() as f64 * font.line_height()));
-            let mut bounds = shapes::Outline::default();
-            let ctm = self.state.ctm;
-            bounds.rect(Rect::new(x, y, width, height), &|(x, y)| geometry::apply(ctm, x, y));
-            self.clip_to(&bounds, false);
-            if fill {
-                self.fill_outline(&outline, false);
-            }
-            if stroke {
-                self.stroke_outline(&outline);
-            }
-            self.state.clip = saved;
+            let inside = Rect::new(x, y, width, height);
+            // The glyphs move with a shadow's surface (`by`); its CTM already has.
+            self.shadowed(
+                |c| c.outline_area(&outline, stroke),
+                |c, by| {
+                    let saved = c.state.clip.clone();
+                    let mut bounds = shapes::Outline::default();
+                    let ctm = c.state.ctm;
+                    bounds.rect(inside, &|(x, y)| geometry::apply(ctm, x, y));
+                    c.clip_to(&bounds, false);
+                    let glyphs = outline.moved(by);
+                    if fill {
+                        c.fill_outline(&glyphs, false);
+                    }
+                    if stroke {
+                        c.stroke_outline(&glyphs);
+                    }
+                    c.state.clip = saved;
+                },
+            );
         }
         if clip {
             self.clip_to(&outline, false);
@@ -705,7 +714,9 @@ pub fn text_pictures(looks: &[&TextLook], scale: f64) -> Vec<Option<String>> {
             .and_then(|(width, height, rgba)| encode_png(width, height, &rgba, true))
             .and_then(|bytes| write_png_file(&format!("text \"{}\"", look.text), &bytes))
     };
-    made.files_parallel(looks, scale, 256, &draw)
+    // Tests keep every file: side by side, one test's screens would delete
+    // the files another is about to read (compose.rs KEPT_CHECKS).
+    made.files_parallel(looks, scale, if cfg!(test) { usize::MAX } else { 256 }, &draw)
 }
 
 /// The NSString methods this file adds (32-bit games reach them through
@@ -820,6 +831,71 @@ mod tests {
         let f: extern "C" fn(Id, Sel, Id, Size, isize) -> Size = unsafe { std::mem::transmute(imp) };
         let measured = f(string, s, system_font(20.0), narrow.size, 0);
         assert_eq!((measured.width, measured.height), (two.width, two.height));
+    }
+
+    /// Text drawn into a context with a shadow casts it, as every Quartz
+    /// drawing does (CGContextSetShadow then -drawInRect:withFont:).
+    #[test]
+    fn strings_cast_the_contexts_shadow() {
+        let all = Rect::new(0.0, 0.0, W as f64, H as f64);
+        let (_, plain) = draw("i", all, 0, 0);
+        let shadow = Some(Shadow { offset: (10.0, 0.0), blur: 0.0, color: [0.0, 0.0, 1.0, 1.0] });
+        let (_, shadowed) = render_with("i", all, |c| c.state.shadow = shadow);
+        let (plain, shadowed) = (columns(&plain), columns(&shadowed));
+        assert_eq!(shadowed.last(), Some(&(plain.last().unwrap() + 10)), "shadow 10 pixels right: {plain:?} {shadowed:?}");
+        // The shadow's drawing surface covers the letters, not the canvas.
+        let layer = LAST_LAYER.with(|last| last.get());
+        assert!(layer.pixels() < W * H / 4, "a {layer:?} layer for one small letter");
+    }
+
+    /// Text drawn with a clip mode and a shadow: the letters still clip the
+    /// context (not only the shadow's own drawing surface).
+    #[test]
+    fn shadowed_clip_text_clips_the_context() {
+        let all = Rect::new(0.0, 0.0, W as f64, H as f64);
+        let shadow = Some(Shadow { offset: (2.0, 0.0), blur: 0.0, color: [0.0, 0.0, 1.0, 1.0] });
+        let (_, after) = render_with_after("i", all, |c| {
+            c.state.shadow = shadow;
+            c.state.text_mode = 4;
+        });
+        assert!(!after[H - 1][W - 1], "a fill after clip text painted outside the letters");
+    }
+
+    /// `render_with`, then the whole canvas filled (shadow off) before the
+    /// pixels are read.
+    fn render_with_after(text: &str, rect: Rect, before: impl FnOnce(&mut Canvas)) -> (Size, Vec<Vec<bool>>) {
+        setup();
+        let context = bitmap_context_create(std::ptr::null_mut(), W, H, 8, 0, space_object(Space::Rgb), PREMULTIPLIED_LAST);
+        context_translate_ctm(context, 0.0, H as f64);
+        context_scale_ctm(context, 1.0, -1.0);
+        context_set_rgb_fill_color(context, 1.0, 0.0, 0.0, 1.0);
+        before(&mut locked(context).unwrap());
+        graphics_push_context(context);
+        let size = super::draw(string::make(text), rect, system_font(20.0), 0, 0, false);
+        graphics_pop_context();
+        let mut c = locked(context).unwrap();
+        c.state.shadow = None;
+        c.fill_rect(Rect::new(0.0, 0.0, W as f64, H as f64));
+        let (bytes_per_row, memory) = (c.bytes_per_row, c.memory().to_vec());
+        let painted = (0..H).map(|row| (0..W).map(|x| memory[row * bytes_per_row + x * 4 + 3] > 0).collect()).collect();
+        (size, painted)
+    }
+
+    /// `draw` with `before` run on the context first.
+    fn render_with(text: &str, rect: Rect, before: impl FnOnce(&mut Canvas)) -> (Size, Vec<Vec<bool>>) {
+        setup();
+        let context = bitmap_context_create(std::ptr::null_mut(), W, H, 8, 0, space_object(Space::Rgb), PREMULTIPLIED_LAST);
+        context_translate_ctm(context, 0.0, H as f64);
+        context_scale_ctm(context, 1.0, -1.0);
+        context_set_rgb_fill_color(context, 1.0, 0.0, 0.0, 1.0);
+        before(&mut locked(context).unwrap());
+        graphics_push_context(context);
+        let size = super::draw(string::make(text), rect, system_font(20.0), 0, 0, false);
+        graphics_pop_context();
+        let mut c = locked(context).unwrap();
+        let (bytes_per_row, memory) = (c.bytes_per_row, c.memory().to_vec());
+        let painted = (0..H).map(|row| (0..W).map(|x| memory[row * bytes_per_row + x * 4 + 3] > 0).collect()).collect();
+        (size, painted)
     }
 
     fn look(text: &str, size: (f64, f64)) -> TextLook {

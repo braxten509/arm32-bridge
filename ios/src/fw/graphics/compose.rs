@@ -25,7 +25,11 @@ fn capped(scale: f64, width: f64, height: f64) -> f64 {
 /// animation made a moment ago goes, file and all, about 2 s later. Counted
 /// in checks, not time, so a check that takes long to make its pictures
 /// never loses its own first ones.
-const KEPT_CHECKS: u64 = 40;
+///
+/// Tests keep everything: they run side by side, each making screen checks
+/// of its own, so the shared count would let one test's checks clean up
+/// files another test is about to read.
+const KEPT_CHECKS: u64 = if cfg!(test) { u64::MAX } else { 40 };
 
 /// Screen checks so far (fw/pictures.rs counts them).
 static CHECKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -162,7 +166,7 @@ pub fn gradient_picture(size: (f64, f64), start: Point, end: Point, stops: &[([f
 
 /// A shape layer's path (figures in the layer's points, a closed one ending
 /// at its start) filled and stroked, over `area` of the layer's points.
-pub fn shape_picture(area: Rect, figures: &[Vec<Point>], fill: Option<[f64; 4]>, even_odd: bool, stroke: Option<([f64; 4], f64)>, scale: f64) -> Option<String> {
+pub fn shape_picture(area: Rect, figures: &[Vec<Point>], fill: Option<[f64; 4]>, even_odd: bool, stroke: Option<([f64; 4], StrokeStyle)>, scale: f64) -> Option<String> {
     if !drawable(area.size.width, area.size.height) {
         return None;
     }
@@ -174,8 +178,9 @@ pub fn shape_picture(area: Rect, figures: &[Vec<Point>], fill: Option<[f64; 4]>,
             c.state.fill = color;
             c.fill_outline(&outline, even_odd);
         }
-        if let Some((color, width)) = stroke {
-            (c.state.stroke, c.state.line_width) = (color, width);
+        if let Some((color, style)) = &stroke {
+            c.state.stroke = *color;
+            c.set_stroke_style(style);
             c.stroke_outline(&outline);
         }
         save(&mut c, "a shape layer")
@@ -218,7 +223,8 @@ fn decoded(path: &str) -> Option<Arc<Bitmap>> {
         return Some(found.clone());
     }
     let (bitmap, _) = decode(&std::fs::read(path).ok()?)?;
-    let bitmap = Arc::new(bitmap);
+    // An indexed picture is turned into colours once, not at every draw.
+    let bitmap = Arc::new(bitmap.unindexed().unwrap_or(bitmap));
     let mut files = FILES.lock().unwrap_or_else(|e| e.into_inner());
     let files = files.get_or_insert_with(HashMap::new);
     if files.len() >= 64 {
@@ -237,9 +243,74 @@ fn scale_of(t: Transform) -> f64 {
 fn covered(pictures: &[Picture]) -> Option<Rect> {
     pictures
         .iter()
-        .map(|p| meet(screen_box(p.place, Rect::new(0.0, 0.0, p.area.0, p.area.1)), p.clip))
+        .map(|p| meet(picture_box(p, Rect::new(0.0, 0.0, p.area.0, p.area.1)), p.clip))
         .filter(|r| r.size.width > 0.0 && r.size.height > 0.0)
         .reduce(union)
+}
+
+/// A picture's place with its perspective (fw/pictures.rs `Proj`): rows
+/// (a, b, p0), (c, d, p1), (tx, ty, w); a point is a row on the left.
+fn projective(p: &Picture) -> [f64; 9] {
+    let (t, [p0, p1, w]) = (p.place, p.perspective.unwrap_or([0.0, 0.0, 1.0]));
+    [t.a, t.b, p0, t.c, t.d, p1, t.tx, t.ty, w]
+}
+
+/// Where `m` puts (x, y); None behind the eye.
+fn project(m: &[f64; 9], x: f64, y: f64) -> Option<(f64, f64)> {
+    let w = x * m[2] + y * m[5] + m[8];
+    (w > 1e-9).then(|| ((x * m[0] + y * m[3] + m[6]) / w, (x * m[1] + y * m[4] + m[7]) / w))
+}
+
+/// The inverse of a 3x3 map (None when it flattens the plane).
+fn invert_3(m: &[f64; 9]) -> Option<[f64; 9]> {
+    let cofactor = |r: usize, c: usize| {
+        let (r0, r1) = ((r + 1) % 3, (r + 2) % 3);
+        let (c0, c1) = ((c + 1) % 3, (c + 2) % 3);
+        m[r0 * 3 + c0] * m[r1 * 3 + c1] - m[r0 * 3 + c1] * m[r1 * 3 + c0]
+    };
+    let determinant: f64 = (0..3).map(|c| m[c] * cofactor(0, c)).sum();
+    (determinant.abs() > 1e-12).then(|| std::array::from_fn(|i| cofactor(i % 3, i / 3) / determinant))
+}
+
+/// The screen area `rect` (in a picture's own points) covers, its perspective too.
+fn picture_box(p: &Picture, rect: Rect) -> Rect {
+    match p.perspective {
+        None => screen_box(p.place, rect),
+        Some(_) => projected_box(&projective(p), rect),
+    }
+}
+
+/// The screen area `rect` covers through the projective map `m`.
+fn projected_box(m: &[f64; 9], rect: Rect) -> Rect {
+    let corners: Option<Vec<(f64, f64)>> = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)]
+        .iter()
+        .map(|(u, v)| project(m, rect.origin.x + u * rect.size.width, rect.origin.y + v * rect.size.height))
+        .collect();
+    let Some(corners) = corners else { return Rect::default() };
+    let (left, right) = corners.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), c| (lo.min(c.0), hi.max(c.0)));
+    let (top, bottom) = corners.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), c| (lo.min(c.1), hi.max(c.1)));
+    Rect::new(left, top, right - left, bottom - top)
+}
+
+/// A group's place with its perspective (as `projective`).
+fn group_projective(group: &Group) -> [f64; 9] {
+    let (t, [p0, p1, w]) = (group.place, group.perspective.unwrap_or([0.0, 0.0, 1.0]));
+    [t.a, t.b, p0, t.c, t.d, p1, t.tx, t.ty, w]
+}
+
+/// A group's nearest affine place (its own when it has no perspective).
+fn group_flat(group: &Group) -> Transform {
+    let t = group.place;
+    match group.perspective {
+        Some([_, _, w]) if w.abs() > 1e-12 => Transform { a: t.a / w, b: t.b / w, c: t.c / w, d: t.d / w, tx: t.tx / w, ty: t.ty / w },
+        _ => t,
+    }
+}
+
+/// A point in a group's own points on the canvas (`screen`: screen points to its pixels).
+fn group_point(group: &Group, screen: Transform, x: f64, y: f64) -> (f64, f64) {
+    let (sx, sy) = project(&group_projective(group), x, y).unwrap_or((x, y));
+    geometry::apply(screen, sx, sy)
 }
 
 fn union(a: Rect, b: Rect) -> Rect {
@@ -251,7 +322,7 @@ fn union(a: Rect, b: Rect) -> Rect {
 
 /// The shadow's offset in screen points.
 fn screen_offset(group: &Group, offset: (f64, f64)) -> (f64, f64) {
-    let t = group.place;
+    let t = group_flat(group);
     (t.a * offset.0 + t.c * offset.1, t.b * offset.0 + t.d * offset.1)
 }
 
@@ -265,20 +336,20 @@ fn region(group: &Group, clip: Rect, content: &[Picture], mask: &[Picture]) -> O
                 let points: Vec<Point> = figures.iter().flatten().copied().collect();
                 let (x0, x1) = points.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| (lo.min(p.x), hi.max(p.x)));
                 let (y0, y1) = points.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| (lo.min(p.y), hi.max(p.y)));
-                (x0 < x1 && y0 < y1).then(|| screen_box(group.place, Rect::new(x0, y0, x1 - x0, y1 - y0)))
+                (x0 < x1 && y0 < y1).then(|| projected_box(&group_projective(group), Rect::new(x0, y0, x1 - x0, y1 - y0)))
             }
             None => area,
         };
         if let Some(source) = source {
             let (dx, dy) = screen_offset(group, shadow.offset);
-            let margin = 1.5 * shadow.radius * scale_of(group.place) + 1.0;
+            let margin = 3.0 * shadow.radius * scale_of(group_flat(group)) + 1.0;
             let moved = Rect::new(source.origin.x + dx - margin, source.origin.y + dy - margin, source.size.width + 2.0 * margin, source.size.height + 2.0 * margin);
             area = Some(area.map_or(moved, |a| union(a, moved)));
         }
     }
     let mut area = area?;
     if group.clips {
-        area = meet(area, screen_box(group.place, group.bounds));
+        area = meet(area, projected_box(&group_projective(group), group.bounds));
     }
     if group.masked {
         area = meet(area, covered(mask)?);
@@ -293,7 +364,7 @@ fn region(group: &Group, clip: Rect, content: &[Picture], mask: &[Picture]) -> O
 /// and then the pictures as they were.
 pub fn group_pictures(start: &Picture, content: &[Picture], mask: &[Picture], scale: f64) -> Vec<Picture> {
     let Some(group) = start.group.as_deref() else { return content.to_vec() };
-    let only_shadow = !group.clips && !group.masked;
+    let only_shadow = !group.clips && !group.masked && group.opacity >= 1.0;
     let fallback = if only_shadow { content.to_vec() } else { Vec::new() };
     if only_shadow && group.shadow.is_none() {
         return fallback;
@@ -304,7 +375,8 @@ pub fn group_pictures(start: &Picture, content: &[Picture], mask: &[Picture], sc
     let Some(file) = made(key, || composite(group, area, k, content, mask, only_shadow, start.corner)) else { return fallback };
     let size = (pixels(area.size.width, k) as f64 / k, pixels(area.size.height, k) as f64 / k);
     let place = Transform { tx: area.origin.x, ty: area.origin.y, ..IDENTITY };
-    let picture = Picture { path: file, place, area: size, alpha: 1.0, mode: 0, size, text: None, clip: start.clip, group: None, corner: start.corner };
+    // A rasterized layer's opacity fades the whole picture.
+    let picture = Picture { path: file, place, area: size, alpha: group.opacity, mode: 0, size, text: None, clip: start.clip, group: None, corner: start.corner, perspective: None };
     if only_shadow {
         std::iter::once(picture).chain(content.iter().cloned()).collect()
     } else {
@@ -337,18 +409,14 @@ fn draw_pictures(c: &mut Canvas, pictures: &[Picture], screen: Transform, outer:
             outline.rounded_rect(Rect::new(b.origin.x * s, b.origin.y, b.size.width * s, b.size.height), ry, &|(x, y)| (x / s, y));
             c.clip_to(&outline, false);
         }
-        c.state.ctm = geometry::concat(p.place, screen);
         c.state.alpha = p.alpha.clamp(0.0, 1.0);
         let ((aw, ah), (sw, sh)) = (p.area, p.size);
-        let rect = match p.mode {
-            _ if sw <= 0.0 || sh <= 0.0 => Rect::new(0.0, 0.0, aw, ah),
-            0 => Rect::new(0.0, 0.0, aw, ah),
-            1 | 2 => {
-                let k = if p.mode == 1 { (aw / sw).min(ah / sh) } else { (aw / sw).max(ah / sh) };
-                Rect::new((aw - sw * k) / 2.0, (ah - sh * k) / 2.0, sw * k, sh * k)
-            }
-            _ => Rect::new((aw - sw) / 2.0, (ah - sh) / 2.0, sw, sh),
-        };
+        let rect = super::render::content_rect(Rect::new(0.0, 0.0, aw, ah), (sw, sh), p.mode);
+        if p.perspective.is_some() {
+            draw_in_perspective(c, p, &bitmap, rect, screen);
+            continue;
+        }
+        c.state.ctm = geometry::concat(p.place, screen);
         if p.mode == 2 {
             // Filling and cropped to its area.
             let mut outline = shapes::Outline::default();
@@ -359,6 +427,33 @@ fn draw_pictures(c: &mut Canvas, pictures: &[Picture], screen: Transform, outer:
         c.draw_bitmap(rect, &bitmap, &|u, v| (u, 1.0 - v));
     }
     c.state.clip = None;
+}
+
+/// A picture inside a layer turned in 3D (`Picture::perspective`), as the
+/// phone draws one: its content `rect` (its own points) cut to where the
+/// projective place puts it, each pixel taken from the point it shows.
+fn draw_in_perspective(c: &mut Canvas, p: &Picture, bitmap: &Bitmap, rect: Rect, screen: Transform) {
+    let m = projective(p);
+    let Some(back) = invert_3(&m) else { return };
+    let shown = if p.mode == 2 { meet(rect, Rect::new(0.0, 0.0, p.area.0, p.area.1)) } else { rect };
+    let corners: Option<Vec<Point>> = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)]
+        .iter()
+        .map(|(u, v)| project(&m, shown.origin.x + u * shown.size.width, shown.origin.y + v * shown.size.height).map(|(x, y)| Point { x, y }))
+        .collect();
+    let Some(corners) = corners else { return };
+    c.clip_to(&outline_of(&[corners], &|(x, y)| geometry::apply(screen, x, y)), false);
+    let area = picture_box(p, shown);
+    if area.size.width <= 0.0 || area.size.height <= 0.0 || rect.size.width <= 0.0 || rect.size.height <= 0.0 {
+        return;
+    }
+    c.state.ctm = screen;
+    c.draw_bitmap(area, bitmap, &|u, v| {
+        // (u, v) across the screen area (v up from its bottom) back to the picture's own points.
+        let (x, y) = (area.origin.x + u * area.size.width, area.origin.y + (1.0 - v) * area.size.height);
+        let w = x * back[2] + y * back[5] + back[8];
+        let (px, py) = ((x * back[0] + y * back[3] + back[6]) / w, (x * back[1] + y * back[4] + back[7]) / w);
+        ((px - rect.origin.x) / rect.size.width, (py - rect.origin.y) / rect.size.height)
+    });
 }
 
 /// The canvas's pixels, premultiplied, rows from the top.
@@ -381,7 +476,7 @@ fn from_top(cover: Vec<f32>, width: usize, height: usize) -> Vec<f32> {
 }
 
 /// A Gaussian blur of `sigma` pixels, as three box blurs each way.
-fn blur(values: Vec<f32>, width: usize, height: usize, sigma: f64) -> Vec<f32> {
+pub(super) fn blur(values: Vec<f32>, width: usize, height: usize, sigma: f64) -> Vec<f32> {
     if sigma < 0.5 {
         return values;
     }
@@ -419,15 +514,17 @@ fn composite(group: &Group, area: Rect, k: f64, content: &[Picture], mask: &[Pic
     let (width, height) = (pixels(area.size.width, k), pixels(area.size.height, k));
     let mut c = canvas_at(area.origin, width, height, k)?;
     let screen = c.state.ctm;
-    let layer = geometry::concat(group.place, screen);
+    let layer = |(x, y): (f64, f64)| group_point(group, screen, x, y);
     draw_pictures(&mut c, content, screen, outer);
     let mut out = premultiplied(&mut c);
     if let Some(shadow) = &group.shadow {
         let alpha = match &shadow.path {
-            Some(figures) => from_top(outline_of(figures, &|(x, y)| geometry::apply(layer, x, y)).cover(false, width, height), width, height),
+            Some(figures) => from_top(outline_of(figures, &layer).cover(false, width, height), width, height),
             None => out.iter().map(|p| p[3]).collect(),
         };
-        let alpha = blur(alpha, width, height, shadow.radius / 2.0 * scale_of(group.place) * k);
+        // Core Animation's blur: a Gaussian whose deviation is shadowRadius
+        // (renderInContext: gives Quartz a blur of twice the radius).
+        let alpha = blur(alpha, width, height, shadow.radius * scale_of(group_flat(group)) * k);
         let (dx, dy) = screen_offset(group, shadow.offset);
         let (dx, dy) = ((dx * k).round() as isize, (dy * k).round() as isize);
         let color = premultiply(shadow.color);
@@ -444,7 +541,7 @@ fn composite(group: &Group, area: Rect, k: f64, content: &[Picture], mask: &[Pic
     let mut keep = |cover: &[f32]| out.iter_mut().zip(cover).for_each(|(pixel, &k)| *pixel = scaled(*pixel, k));
     if group.clips {
         let mut outline = shapes::Outline::default();
-        outline.rounded_rect(group.bounds, group.radius, &|(x, y)| geometry::apply(layer, x, y));
+        outline.rounded_rect(group.bounds, group.radius, &layer);
         keep(&from_top(outline.cover(false, width, height), width, height));
     }
     if group.masked {

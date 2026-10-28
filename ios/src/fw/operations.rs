@@ -10,7 +10,7 @@
 
 use crate::fw::object::{class_methods, define_class, methods};
 use crate::fw::{collections, object, runloop, string};
-use crate::libsystem::mach::{block_copy, call_block, BlockHeader};
+use crate::libsystem::mach::{block_copy, block_release, call_block, BlockHeader};
 use crate::objc::runtime::{self, Class, Id, Sel};
 use crate::symbols::Registry;
 use std::cell::Cell;
@@ -27,6 +27,8 @@ const POLL: Duration = Duration::from_millis(20);
 #[derive(Default)]
 struct Operation {
     cancelled: bool,
+    /// -start was called (a second -start is refused).
+    started: bool,
     executing: bool,
     finished: bool,
     /// The finish was handled: queue slot freed, waiters woken, completion run.
@@ -67,8 +69,15 @@ fn ask(op: Id, selector: &str) -> bool {
     runtime::send(op, selector, &[]) & 0xFF != 0
 }
 
-fn kvo(op: Id, key: &str, value: bool) {
-    object::kvo_notify(op, key, collections::number_bool(value));
+/// The operation's own change of `key`, announced around the change as a
+/// setter's is (Apple's NSOperation sends will/didChangeValueForKey:): a
+/// Prior notice sees the old state, and Old values reach dependent paths.
+/// Called without STATE held (observers read the state).
+fn changing<R>(op: Id, key: &str, change: impl FnOnce() -> R) -> R {
+    object::will_change(op, key);
+    let result = change();
+    object::did_change(op, key);
+    result
 }
 
 /// Called whenever the operation may have finished: once its isFinished says
@@ -82,7 +91,10 @@ fn finished_now(op: Id) -> bool {
         let state = operation(op);
         let first = !state.done;
         state.done = true;
-        first.then_some((state.queue, state.completion))
+        // Held while it runs (taken under the lock: a new completion block
+        // may replace and release it meanwhile).
+        let completion = if first && state.completion != 0 { block_copy(state.completion as *mut BlockHeader) as usize } else { 0 };
+        first.then_some((state.queue, completion))
     });
     let Some((queue_object, completion)) = first else { return true };
     if queue_object != 0 {
@@ -96,7 +108,22 @@ fn finished_now(op: Id) -> bool {
         schedule(queue_object);
     }
     if completion != 0 {
-        std::thread::spawn(move || unsafe { call_block(completion) });
+        // The operation too, as Apple's completion call captures it.
+        crate::fw::counted::retain(op);
+        std::thread::spawn(move || {
+            unsafe { call_block(completion) };
+            block_release(completion as *mut BlockHeader);
+            crate::fw::counted::release(op);
+            // The thread's only safe point.
+            crate::fw::counted::dealloc_pending();
+        });
+    }
+    // Its queue lets go of it. Whoever is still working with it holds it
+    // too (the queue's runner during -start, the poller while it watches),
+    // so it outlives the -finish that told us, as Apple's queue lets go of
+    // it later (___NSOQDelayedFinishOperations).
+    if queue_object != 0 {
+        crate::fw::counted::release(op);
     }
     true
 }
@@ -109,7 +136,9 @@ fn finished_now(op: Id) -> bool {
 static PENDING: Mutex<Vec<(Id, Instant, Duration)>> = Mutex::new(Vec::new());
 const SLOWEST_POLL: Duration = Duration::from_secs(1);
 
+/// The list holds what it watches, so a finished one is still there to ask.
 fn watch(op: Id) {
+    crate::fw::counted::retain(op);
     let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
     let start_poller = pending.is_empty();
     pending.push((op, Instant::now() + POLL, POLL));
@@ -130,7 +159,12 @@ fn watch(op: Id) {
                     *at = now + *wait;
                 }
             }
-            if pending.is_empty() {
+            let empty = pending.is_empty();
+            drop(pending);
+            done.iter().for_each(|&op| crate::fw::counted::release(op));
+            // A safe point: what this round let go of deallocs here.
+            crate::fw::counted::dealloc_pending();
+            if empty {
                 return;
             }
         });
@@ -147,42 +181,40 @@ extern "C" fn op_init(this: Id, _: Sel) -> Id {
 extern "C" fn op_start(this: Id, _: Sel) {
     let cancelled = with_state(|| {
         let op = operation(this);
-        if op.finished || op.executing {
+        if op.started || op.finished || op.executing {
             return None;
         }
-        op.executing = !op.cancelled;
+        op.started = true;
         Some(op.cancelled)
     });
+    let finish = || {
+        with_state(|| {
+            let op = operation(this);
+            op.executing = false;
+            op.finished = true;
+        })
+    };
     match cancelled {
         None => {
             crate::log!("NSOperation started twice (NSInvalidArgumentException on iOS); ignored");
             return;
         }
         Some(false) => {
-            kvo(this, "isExecuting", true);
+            changing(this, "isExecuting", || with_state(|| operation(this).executing = true));
             runtime::send(this, "main", &[]);
+            changing(this, "isFinished", || changing(this, "isExecuting", finish));
         }
-        Some(true) => {}
+        Some(true) => changing(this, "isFinished", finish),
     }
-    with_state(|| {
-        let op = operation(this);
-        op.executing = false;
-        op.finished = true;
-    });
-    if cancelled == Some(false) {
-        kvo(this, "isExecuting", false);
-    }
-    kvo(this, "isFinished", true);
     finished_now(this);
 }
 
 /// Subclasses tell the queue about their own state through KVO notices,
-/// which also go on to the operation's observers.
+/// which also go on to the operation's observers (NSObject's
+/// -didChangeValueForKey:, paired with their -willChangeValueForKey:).
 extern "C" fn op_did_change(this: Id, _: Sel, key: Id) {
     let key = string::get(key);
-    if matches!(key.as_str(), "isFinished" | "isExecuting" | "isCancelled" | "isReady") {
-        kvo(this, &key, ask(this, &key));
-    }
+    object::did_change(this, &key);
     match key.as_str() {
         "isFinished" => {
             finished_now(this);
@@ -199,11 +231,12 @@ extern "C" fn op_did_change(this: Id, _: Sel, key: Id) {
 extern "C" fn op_main(_this: Id, _: Sel) {}
 
 extern "C" fn op_cancel(this: Id, _: Sel) {
-    let first = with_state(|| !std::mem::replace(&mut operation(this).cancelled, true));
+    if with_state(|| operation(this).cancelled) {
+        return;
+    }
+    // A cancelled operation still waiting is ready at once (it only finishes).
+    let first = changing(this, "isReady", || changing(this, "isCancelled", || with_state(|| !std::mem::replace(&mut operation(this).cancelled, true))));
     if first {
-        kvo(this, "isCancelled", true);
-        // A cancelled operation still waiting is ready at once (it only finishes).
-        kvo(this, "isReady", true);
         for queue_object in all_queues() {
             schedule(queue_object);
         }
@@ -232,14 +265,22 @@ extern "C" fn op_is_concurrent(_this: Id, _: Sel) -> bool {
     false
 }
 
+/// The dependencies are held, as Apple's array retains them.
 extern "C" fn op_add_dependency(this: Id, _: Sel, other: Id) {
     if other != 0 {
+        crate::fw::counted::retain(other);
         with_state(|| operation(this).dependencies.push(other));
     }
 }
 
 extern "C" fn op_remove_dependency(this: Id, _: Sel, other: Id) {
-    with_state(|| operation(this).dependencies.retain(|&d| d != other));
+    let removed = with_state(|| {
+        let list = &mut operation(this).dependencies;
+        let before = list.len();
+        list.retain(|&d| d != other);
+        before - list.len()
+    });
+    (0..removed).for_each(|_| crate::fw::counted::release(other));
     for queue_object in all_queues() {
         schedule(queue_object);
     }
@@ -247,16 +288,24 @@ extern "C" fn op_remove_dependency(this: Id, _: Sel, other: Id) {
 
 extern "C" fn op_dependencies(this: Id, _: Sel) -> Id {
     let list = with_state(|| operation(this).dependencies.clone());
-    collections::array_from(&list)
+    collections::array_autoreleased(&list)
 }
 
+/// Retained under the lock and autoreleased, as Apple's: a completion block
+/// set meanwhile can't free it under the caller.
 extern "C" fn op_completion_block(this: Id, _: Sel) -> usize {
-    with_state(|| operation(this).completion)
+    let block = with_state(|| block_copy(operation(this).completion as *mut BlockHeader) as usize);
+    crate::fw::counted::autorelease_block(block)
 }
 
 extern "C" fn op_set_completion_block(this: Id, _: Sel, block: usize) {
     let block = if block == 0 { 0 } else { block_copy(block as *mut BlockHeader) as usize };
-    with_state(|| operation(this).completion = block);
+    let old = with_state(|| std::mem::replace(&mut operation(this).completion, block));
+    // A copy property: the block it replaces is let go of (outside the lock:
+    // its dispose may run game code).
+    if old != 0 {
+        block_release(old as *mut BlockHeader);
+    }
 }
 
 extern "C" fn op_priority(this: Id, _: Sel) -> isize {
@@ -287,7 +336,22 @@ extern "C" fn op_wait(this: Id, _: Sel) {
         if operation(this).done {
             return;
         }
-        drop(FINISHED.wait_timeout(guard, POLL).unwrap_or_else(|e| e.into_inner()));
+        // A 32-bit game's thread waiting here must let the queues' threads
+        // run game code (GIL mode: ARM32_PARALLEL=0, Unicorn), as runloop's
+        // waits do: the notification post would otherwise hold the lock the
+        // observer's block needs and wait for ever.
+        let waited = waiting(|| FINISHED.wait_timeout(guard, POLL).unwrap_or_else(|e| e.into_inner()));
+        drop(waited);
+    }
+}
+
+/// Runs a wait without the guest lock (see runloop.rs `waiting`).
+fn waiting<R>(wait: impl FnOnce() -> R) -> R {
+    use arm32_bridge::runtime::{gil_held, parallel, without_gil};
+    if !parallel() && gil_held() {
+        without_gil(wait)
+    } else {
+        wait()
     }
 }
 
@@ -412,12 +476,18 @@ fn schedule(object: Id) {
         });
         let Some(main) = claimed else { continue };
         let run = move || {
+            // Held while we work with it: its -start may finish it, and the
+            // queue then lets go of it, before we ask it again here.
+            crate::fw::counted::retain(op);
             let before = CURRENT.with(|c| c.replace(object));
             runtime::send(op, "start", &[]);
             CURRENT.with(|c| c.set(before));
             if !finished_now(op) {
                 watch(op);
             }
+            crate::fw::counted::release(op);
+            // A safe point: what finishing let go of deallocs here.
+            crate::fw::counted::dealloc_pending();
         };
         if main {
             runloop::post(runloop::Work::Native(Box::new(run)));
@@ -459,6 +529,8 @@ fn add(this: Id, op: Id) -> bool {
         return false;
     }
     with_state(|| operation(op).queue = this);
+    // The queue holds it until it has finished, as Apple's does.
+    crate::fw::counted::retain(op);
     with_queue(this, |q| q.waiting.push_back(op));
     true
 }
@@ -489,7 +561,7 @@ extern "C" fn queue_add_operations(this: Id, s: Sel, list: Id, wait: u8) {
 
 extern "C" fn queue_operations(this: Id, _: Sel) -> Id {
     let list: Vec<Id> = with_queue(this, |q| q.running.iter().chain(q.waiting.iter()).copied().collect());
-    collections::array_from(&list)
+    collections::array_autoreleased(&list)
 }
 
 extern "C" fn queue_operation_count(this: Id, _: Sel) -> usize {
@@ -649,6 +721,120 @@ mod tests {
         let op = block_operation(runtime::class_named("NSBlockOperation"), self::block(second, 0));
         queue_add_operations(queue_object, 0, collections::array_from(&[op]), 1);
         COMPLETION_DONE.store(true, Ordering::SeqCst);
+    }
+
+    /// An operation holds its dependencies, as Apple's retains them: a
+    /// game's operation it waits on can't dealloc under it.
+    #[test]
+    fn an_operation_holds_its_dependencies() {
+        use crate::fw::counted;
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let class = crate::fw::object::define_class("GameCountedDependency", "NSOperation", 8);
+        counted::count_game_class(class);
+        let new = |class: Id| runtime::send(runtime::send(class, "alloc", &[]), "init", &[]);
+        let (op, dependency) = (new(runtime::class_named("NSOperation")), new(class));
+        counted::watch_game_object(dependency);
+        runtime::send(op, "addDependency:", &[dependency]);
+        assert_eq!(counted::game_count(dependency), Some(2), "held by the operation");
+        runtime::send(op, "removeDependency:", &[dependency]);
+        assert_eq!(counted::game_count(dependency), Some(1), "let go of");
+    }
+
+    /// -completionBlock hands the block back retained and autoreleased, as
+    /// Apple's (__NSOperationInternal completionBlock): replacing it meanwhile
+    /// doesn't free it under the caller.
+    #[test]
+    fn the_completion_block_getter_outlives_a_replacement() {
+        use crate::libsystem::mach::test_blocks::{counting, Counts};
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        static COUNTS: Counts = Counts { copies: std::sync::atomic::AtomicUsize::new(0), disposes: std::sync::atomic::AtomicUsize::new(0) };
+        let op = runtime::send(runtime::send(runtime::class_named("NSOperation"), "alloc", &[]), "init", &[]);
+        op_set_completion_block(op, 0, counting(&COUNTS));
+        let mark = crate::fw::counted::pool_mark();
+        let got = op_completion_block(op, 0);
+        op_set_completion_block(op, 0, 0);
+        assert_eq!(COUNTS.get(), (1, 0), "freed while the caller still had it");
+        assert_ne!(got, 0);
+        crate::fw::counted::pool_drain(mark);
+        assert_eq!(COUNTS.get(), (1, 1), "let go of when the pool drained");
+    }
+
+    /// Operations of a game class whose own -start finishes them (at once,
+    /// sending the isFinished notice) or not (a later isFinished tells).
+    static FINISHED_OPS: Mutex<Vec<Id>> = Mutex::new(Vec::new());
+    static COUNT_IN_START: Mutex<Vec<Option<usize>>> = Mutex::new(Vec::new());
+
+    extern "C" fn own_is_finished(this: Id, _: Sel) -> bool {
+        FINISHED_OPS.lock().unwrap().contains(&this)
+    }
+
+    extern "C" fn finish_in_start(this: Id, _: Sel) {
+        let key = string::make("isFinished");
+        runtime::send(this, "willChangeValueForKey:", &[key]);
+        FINISHED_OPS.lock().unwrap().push(this);
+        runtime::send(this, "didChangeValueForKey:", &[key]);
+        // As the bridge does when a game's host call returns.
+        crate::fw::counted::dealloc_pending();
+        COUNT_IN_START.lock().unwrap().push(crate::fw::counted::game_count(this));
+    }
+
+    extern "C" fn start_and_return(_this: Id, _: Sel) {}
+
+    fn game_operation(name: &str, start: extern "C" fn(Id, Sel)) -> Id {
+        let class = crate::fw::object::define_class(name, "NSOperation", 8);
+        methods(class, &[("start", start as usize), ("isFinished", own_is_finished as usize)]);
+        crate::fw::counted::count_game_class(class);
+        let op = runtime::send(runtime::send(class, "alloc", &[]), "init", &[]);
+        crate::fw::counted::watch_game_object(op);
+        op
+    }
+
+    /// Adds `op` to a new queue and lets go of the game's own reference
+    /// before the queue starts it, so only the queue holds it.
+    fn hand_to_queue(op: Id) {
+        let queue_object = runtime::send(runtime::send(runtime::class_named("NSOperationQueue"), "alloc", &[]), "init", &[]);
+        queue_set_suspended(queue_object, 0, 1);
+        queue_add_operation(queue_object, 0, op);
+        runtime::send(op, "release", &[]);
+        queue_set_suspended(queue_object, 0, 0);
+    }
+
+    fn wait_until(what: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !what() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        what()
+    }
+
+    /// An operation the queue holds outlives the -start in which it finishes
+    /// itself (Apple's queue lets go of a finished operation later, from
+    /// ___NSOQDelayedFinishOperations), and is let go of after it.
+    #[test]
+    fn a_queued_operation_outlives_its_own_finish() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let op = game_operation("GameFinishesInStart", finish_in_start);
+        hand_to_queue(op);
+        assert!(wait_until(|| !COUNT_IN_START.lock().unwrap().is_empty()), "never started");
+        assert_eq!(COUNT_IN_START.lock().unwrap()[0], Some(1), "let go of inside its own -start");
+        assert!(wait_until(|| crate::fw::counted::game_count(op) == Some(0)), "never let go of");
+    }
+
+    /// An operation finished by its own later isFinished (no notice: the
+    /// queue's poller learns it) deallocs on the poller's thread.
+    #[test]
+    fn an_operation_the_poller_finds_finished_deallocs() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let op = game_operation("GameFinishesLater", start_and_return);
+        hand_to_queue(op);
+        assert!(wait_until(|| PENDING.lock().unwrap().iter().any(|&(o, _, _)| o == op)), "never watched");
+        let mut log = crate::report::LineWatch::now();
+        FINISHED_OPS.lock().unwrap().push(op);
+        assert!(log.wait_for(&format!("dealloc GameFinishesLater {op:#x}"), Duration::from_millis(500)), "never dealloced");
     }
 
     #[test]

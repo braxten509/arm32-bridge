@@ -94,6 +94,8 @@ struct Recognizer {
     waiting: Option<isize>,
     /// When the sequence it waits in began.
     wait_since: f64,
+    /// The views the touches of this sequence hit (asked gestureRecognizerShouldBegin:).
+    touch_views: Vec<Id>,
 }
 
 impl Recognizer {
@@ -119,6 +121,7 @@ impl Recognizer {
             requires: Vec::new(),
             waiting: None,
             wait_since: 0.0,
+            touch_views: Vec::new(),
         }
     }
 
@@ -206,7 +209,7 @@ property!(enabled, set_enabled_raw, "gestureEnabled", bool, true);
 property!(cancels_touches, set_cancels_touches, "cancelsTouchesInView", bool, true);
 property!(delays_began, set_delays_began, "delaysTouchesBegan", bool, false);
 property!(delays_ended, set_delays_ended, "delaysTouchesEnded", bool, true);
-property!(delegate, set_delegate, "gestureDelegate", id, 0);
+property!(delegate, set_delegate, "gestureDelegate", assign, 0);
 property!(taps_required, set_taps_required, "numberOfTapsRequired", isize, 1);
 property!(touches_required, set_touches_required, "numberOfTouchesRequired", isize, 1);
 property!(minimum_touches, set_minimum_touches, "minimumNumberOfTouches", isize, 1);
@@ -359,6 +362,16 @@ extern "C" fn set_translation(this: Id, _: Sel, translation: Point, view: Id) {
     });
 }
 
+/// UIPanGestureRecognizer's -_removeHysteresisFromTranslation: as the pan
+/// begins, the distance it took to start comes off the translation, each
+/// axis toward zero, so the game's drag doesn't jump by it.
+fn remove_hysteresis(recognizer: Id) {
+    let view = with(recognizer, |r| r.view).unwrap_or(0);
+    let moved = translation_in_view(recognizer, 0, view);
+    let less = |v: f64| if v > 0.0 { (v - PAN_START).max(0.0) } else { (v + PAN_START).min(0.0) };
+    set_translation(recognizer, 0, Point { x: less(moved.x), y: less(moved.y) }, view);
+}
+
 extern "C" fn velocity_in_view(this: Id, _: Sel, view: Id) -> Point {
     along_view(with(this, |r| r.velocity).unwrap_or_default(), view)
 }
@@ -439,6 +452,11 @@ extern "C" fn view_remove(this: Id, _: Sel, recognizer: Id) {
     }
 }
 
+/// -[UIView gestureRecognizerShouldBegin:]: YES (a game's view may say NO).
+extern "C" fn view_should_begin(_this: Id, _: Sel, _recognizer: Id) -> bool {
+    true
+}
+
 pub fn recognizers_of(view: Id) -> Vec<Id> {
     VIEWS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|v| v.get(&view)).cloned().unwrap_or_default()
 }
@@ -473,8 +491,16 @@ fn fire(recognizer: Id) {
     }
 }
 
-/// Asks the delegate gestureRecognizerShouldBegin: (yes when it doesn't say).
+/// UIKit's -_shouldBegin: each view the touches hit is asked
+/// -gestureRecognizerShouldBegin: (a UIView method, YES unless the game's
+/// view says otherwise), then the delegate (yes when it doesn't say).
 fn may_begin(recognizer: Id) -> bool {
+    let views = with(recognizer, |r| r.touch_views.clone()).unwrap_or_default();
+    for view in views {
+        if runtime::responds(view, "gestureRecognizerShouldBegin:") && runtime::send(view, "gestureRecognizerShouldBegin:", &[recognizer]) & 0xFF == 0 {
+            return false;
+        }
+    }
     let delegate = delegate(recognizer, 0);
     if delegate == 0 || !runtime::responds(delegate, "gestureRecognizerShouldBegin:") {
         return true;
@@ -730,6 +756,7 @@ fn settle(recognizer: Id) {
     if done {
         with(recognizer, |r| {
             (r.state, r.taps) = (POSSIBLE, 0);
+            r.touch_views.clear();
             // A new pinch starts at scale 1 and a new rotation at 0, as UIKit's do.
             (r.start_spread, r.spread_base, r.scale, r.rotation) = (None, 1.0, 1.0, 0.0);
         });
@@ -778,7 +805,31 @@ fn holding(finger: i32) -> bool {
 /// view hears it: feeds the recognizers following the finger, and says
 /// what becomes of the view's touch.
 pub fn touch_changed(view: Id, touch: Id, finger: i32, phase: Phase, point: Point) -> Verdict {
-    on_main(|| decide_touch(view, touch, finger, phase, point))
+    touch_changed_in(view, touch, 0, finger, phase, point)
+}
+
+/// The same with the touch's UIEvent, which the recognizers' own touch
+/// methods are given.
+pub fn touch_changed_in(view: Id, touch: Id, event: Id, finger: i32, phase: Phase, point: Point) -> Verdict {
+    on_main(|| decide_touch(view, touch, event, finger, phase, point))
+}
+
+/// UIGestureRecognizer's touch methods: each recognizer following the
+/// finger hears the change (a game's recognizer class follows touches there).
+fn tell_recognizers(list: &[Id], touch: Id, event: Id, phase: Phase) {
+    if touch == 0 {
+        return;
+    }
+    let name = match phase {
+        Phase::Began => "touchesBegan:withEvent:",
+        Phase::Moved => "touchesMoved:withEvent:",
+        Phase::Ended => "touchesEnded:withEvent:",
+        Phase::Cancelled => "touchesCancelled:withEvent:",
+    };
+    let touches = crate::fw::misc::set_from(&[touch]);
+    for &recognizer in list {
+        runtime::send(recognizer, name, &[touches, event]);
+    }
 }
 
 /// Recognizers are main-thread state, decided one change at a time. On the
@@ -793,16 +844,24 @@ fn on_main<R>(work: impl FnOnce() -> R) -> R {
     work()
 }
 
-fn decide_touch(view: Id, touch: Id, finger: i32, phase: Phase, point: Point) -> Verdict {
+fn decide_touch(view: Id, touch: Id, event: Id, finger: i32, phase: Phase, point: Point) -> Verdict {
     let now = runloop::media_time();
     if phase == Phase::Began {
         let list: Vec<Id> = recognizers_for(view).into_iter().filter(|&g| may_receive(g, touch)).collect();
         if list.is_empty() {
             return if holding(finger) { Verdict::Hold } else { Verdict::Pass };
         }
+        for &recognizer in &list {
+            with(recognizer, |r| {
+                if !r.touch_views.contains(&view) {
+                    r.touch_views.push(view);
+                }
+            });
+        }
         FINGERS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(finger, list);
     }
     let list = FINGERS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|f| f.get(&finger)).cloned().unwrap_or_default();
+    tell_recognizers(&list, touch, event, phase);
     let mut took = false;
     for &recognizer in &list {
         let settings = settings_of(recognizer);
@@ -810,6 +869,9 @@ fn decide_touch(view: Id, touch: Id, finger: i32, phase: Phase, point: Point) ->
         if out.recognized && !may_begin(recognizer) {
             with(recognizer, |r| r.state = FAILED);
             out = Step::default();
+        }
+        if out.recognized && kind_of(recognizer) == Kind::Pan {
+            remove_hysteresis(recognizer);
         }
         if out.recognized && with(recognizer, |r| !r.requires.is_empty()).unwrap_or(false) {
             // It must wait for the others to fail first (`resolve`).
@@ -1092,6 +1154,7 @@ pub fn register() {
     methods(
         runtime::class_named("UIView"),
         &[
+            ("gestureRecognizerShouldBegin:", view_should_begin as usize),
             ("addGestureRecognizer:", view_add as usize),
             ("removeGestureRecognizer:", view_remove as usize),
             ("gestureRecognizers", view_recognizers as usize),
@@ -1215,7 +1278,8 @@ mod tests {
         assert_eq!(touch_changed(inner, 0, 2, Phase::Moved, p(70.0, 50.0)), Verdict::Took, "the pan takes the touch");
         touch_changed(inner, 0, 2, Phase::Moved, p(80.0, 60.0));
         touch_changed(inner, 0, 2, Phase::Ended, p(90.0, 60.0));
-        assert_eq!(take(), [(pan, BEGAN, p(20.0, 0.0)), (pan, CHANGED, p(30.0, 10.0)), (pan, ENDED, p(40.0, 10.0))]);
+        // UIKit takes the 10-point start off the translation (per axis), so it doesn't jump.
+        assert_eq!(take(), [(pan, BEGAN, p(10.0, 0.0)), (pan, CHANGED, p(20.0, 10.0)), (pan, ENDED, p(30.0, 10.0))]);
         assert_eq!(state(tap, 0), POSSIBLE, "the failed tap is ready again");
 
         // Turned off: nothing.
@@ -1226,6 +1290,75 @@ mod tests {
         assert!(take().is_empty());
         view_remove(outer, 0, tap);
         assert_eq!(recognizers_of(outer), [pan]);
+    }
+
+    static OWN_TOUCHES_HEARD: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    /// Recognizers hear the touches themselves (-touchesBegan:withEvent: and
+    /// the rest), so a game's recognizer class can follow them its own way.
+    #[test]
+    fn recognizers_hear_the_touch_methods() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        extern "C" fn note(_this: Id, s: Sel, touches: Id, _event: Id) {
+            let count = runtime::send(touches, "count", &[]);
+            OWN_TOUCHES_HEARD.lock().unwrap().push(format!("{} {count}", lock().sel_name(s).trim_end_matches(":withEvent:")));
+        }
+        let class = define_class("GestureTestOwnTouches", "UITapGestureRecognizer", 8);
+        methods(class, &[("touchesBegan:withEvent:", note as usize), ("touchesEnded:withEvent:", note as usize)]);
+        let view = runtime::send(runtime::class_named("UIView"), "alloc", &[]);
+        crate::fw::uikit::send_rect(view, "initWithFrame:", Rect::new(0.0, 0.0, 300.0, 300.0));
+        let recognizer = runtime::send(runtime::send(class, "alloc", &[]), "init", &[]);
+        view_add(view, 0, recognizer);
+        let touch = runtime::alloc_instance(runtime::class_named("UITouch"));
+        crate::fw::runloop::as_main(|| {
+            touch_changed(view, touch, 831, Phase::Began, p(50.0, 50.0));
+            touch_changed(view, touch, 831, Phase::Ended, p(50.0, 50.0));
+        });
+        assert_eq!(std::mem::take(&mut *OWN_TOUCHES_HEARD.lock().unwrap()), ["touchesBegan 1", "touchesEnded 1"]);
+        view_remove(view, 0, recognizer);
+    }
+
+    static REFUSE_HEARD: Mutex<Vec<Id>> = Mutex::new(Vec::new());
+
+    extern "C" fn handle_refused(_this: Id, _: Sel, recognizer: Id) {
+        REFUSE_HEARD.lock().unwrap().push(recognizer);
+    }
+
+    /// UIKit asks the touched view too (-[UIView gestureRecognizerShouldBegin:],
+    /// YES by default), before the delegate: SpellCraft's card view says NO
+    /// outside its deck, so a tap there doesn't recognize, delegate or not.
+    #[test]
+    fn the_touched_view_may_refuse_a_recognizer() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        crate::fw::runloop::as_main(|| {
+            extern "C" fn refuse(_this: Id, _: Sel, _recognizer: Id) -> bool {
+                false
+            }
+            let refusing = define_class("GestureTestRefusingView", "UIView", 8);
+            methods(refusing, &[("gestureRecognizerShouldBegin:", refuse as usize)]);
+            let target_class = define_class("GestureTestRefuseTarget", "NSObject", 8);
+            methods(target_class, &[("handle:", handle_refused as usize)]);
+            let target = runtime::send(runtime::send(target_class, "alloc", &[]), "init", &[]);
+            let outer = runtime::send(runtime::class_named("UIView"), "alloc", &[]);
+            crate::fw::uikit::send_rect(outer, "initWithFrame:", Rect::new(0.0, 0.0, 300.0, 300.0));
+            let inner = runtime::send(refusing, "alloc", &[]);
+            crate::fw::uikit::send_rect(inner, "initWithFrame:", Rect::new(10.0, 10.0, 100.0, 100.0));
+            runtime::send(outer, "addSubview:", &[inner]);
+            let tap = init_with_target(runtime::alloc_instance(runtime::class_named("UITapGestureRecognizer")), 0, target, runtime::sel("handle:"));
+            view_add(outer, 0, tap);
+            let heard = || std::mem::take(&mut *REFUSE_HEARD.lock().unwrap());
+
+            touch_changed(inner, 0, 821, Phase::Began, p(50.0, 50.0));
+            assert_eq!(touch_changed(inner, 0, 821, Phase::Ended, p(50.0, 50.0)), Verdict::Pass, "refused: the view keeps its touch");
+            assert!(heard().is_empty(), "the touched view said NO");
+            touch_changed(outer, 0, 822, Phase::Began, p(200.0, 200.0));
+            touch_changed(outer, 0, 822, Phase::Ended, p(200.0, 200.0));
+            assert_eq!(heard(), [tap], "a plain view lets it begin");
+            assert!(runtime::send(outer, "gestureRecognizerShouldBegin:", &[tap]) & 0xFF != 0, "UIView's own answer is YES");
+            view_remove(outer, 0, tap);
+        });
     }
 
     /// A single tap that must wait for a double tap to fail is told once the
@@ -1289,14 +1422,15 @@ mod tests {
         touch(804, Phase::Ended, p(120.0, 50.0));
         assert!(take().iter().all(|h| h.0 != pan), "off during the touch");
 
-        // Scaled 2x: 30 window points are 15 of the view's.
+        // Scaled 2x: 30 window points are 15 of the view's, less the 10 it
+        // took the pan to start (in the view's points: 20 of the window's).
         let s = runtime::sel("setTransform:");
         let set_transform: extern "C" fn(Id, Sel, crate::fw::geometry::Transform) = unsafe { std::mem::transmute(runtime::imp_for(view, s).unwrap()) };
         set_transform(view, s, crate::fw::geometry::Transform { a: 2.0, b: 0.0, c: 0.0, d: 2.0, tx: 0.0, ty: 0.0 });
         touch(805, Phase::Began, p(50.0, 50.0));
         touch(805, Phase::Moved, p(80.0, 50.0));
-        assert_eq!(translation_in_view(pan, 0, view), p(15.0, 0.0));
-        assert_eq!(translation_in_view(pan, 0, 0), p(30.0, 0.0), "the window's points");
+        assert_eq!(translation_in_view(pan, 0, view), p(5.0, 0.0));
+        assert_eq!(translation_in_view(pan, 0, 0), p(10.0, 0.0), "the window's points");
         set_translation(pan, 0, p(0.0, 0.0), view);
         touch(805, Phase::Moved, p(90.0, 50.0));
         assert_eq!(translation_in_view(pan, 0, view), p(5.0, 0.0));

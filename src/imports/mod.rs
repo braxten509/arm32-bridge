@@ -86,6 +86,7 @@ pub fn handler_for(name: &str) -> Option<Handler> {
         .or_else(|| activity::handler(name))
         .or_else(|| egl::handler(name))
         .or_else(|| sles::handler(name))
+        .or_else(|| crate::wraps::handler(name))
 }
 
 /// Loads 32-bit libraries (and the game libraries next to them) without

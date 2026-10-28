@@ -255,6 +255,20 @@ system! {
     glTexParameterfv(target: Enum, name: Enum, values: *const f32);
     glViewport(x: i32, y: i32, width: i32, height: i32);
     glScissor(x: i32, y: i32, width: i32, height: i32);
+    glCreateShader(kind: Enum) -> u32;
+    glCreateProgram() -> u32;
+    glAttachShader(program: u32, shader: u32);
+    glDeleteShader(shader: u32);
+    glUseProgram(program: u32);
+    glGetUniformLocation(program: u32, name: *const libc::c_char) -> i32;
+    glUniform1i(location: i32, value: i32);
+    glUniform4fv(location: i32, count: i32, values: *const f32);
+    glDrawArrays(mode: Enum, first: i32, count: i32);
+    glGenTextures(count: i32, out: *mut u32);
+    glActiveTexture(unit: Enum);
+    glBindSampler(unit: u32, sampler: u32);
+    glGenVertexArrays(count: i32, out: *mut u32);
+    glBindVertexArray(vao: u32);
 }
 
 pub const VIEWPORT: Enum = 0x0BA2;
@@ -372,8 +386,28 @@ const ATTACHMENT_OBJECT_TYPE: Enum = 0x8CD0;
 const ATTACHMENT_OBJECT_NAME: Enum = 0x8CD1;
 const ATTACHMENT_TEXTURE_LEVEL: Enum = 0x8CD2;
 const TEXTURE: Enum = 0x1702;
-const TEXTURE_2D: Enum = 0x0DE1;
-const TEXTURE_BINDING_2D: Enum = 0x8069;
+pub const TEXTURE_2D: Enum = 0x0DE1;
+pub const TEXTURE_BINDING_2D: Enum = 0x8069;
+pub const TEXTURE0: Enum = 0x84C0;
+pub const ACTIVE_TEXTURE: Enum = 0x84E0;
+pub const SAMPLER_BINDING: Enum = 0x8919;
+pub const CURRENT_PROGRAM: Enum = 0x8B8D;
+pub const VERTEX_ARRAY_BINDING: Enum = 0x85B5;
+pub const VERTEX_SHADER: Enum = 0x8B31;
+pub const FRAGMENT_SHADER: Enum = 0x8B30;
+pub const DEPTH_TEST: Enum = 0x0B71;
+pub const STENCIL_TEST: Enum = 0x0B90;
+pub const CULL_FACE: Enum = 0x0B44;
+pub const POLYGON_OFFSET_FILL: Enum = 0x8037;
+pub const SAMPLE_ALPHA_TO_COVERAGE: Enum = 0x809E;
+pub const SAMPLE_COVERAGE: Enum = 0x80A0;
+pub const DITHER: Enum = 0x0BD0;
+pub const TRANSFORM_FEEDBACK_ACTIVE: Enum = 0x8E24;
+pub const TRIANGLE_STRIP: Enum = 0x0005;
+pub const TEXTURE_MAG_FILTER: Enum = 0x2800;
+pub const TEXTURE_WRAP_S: Enum = 0x2802;
+pub const TEXTURE_WRAP_T: Enum = 0x2803;
+pub const CLAMP_TO_EDGE: Enum = 0x812F;
 const TEXTURE_WIDTH: Enum = 0x1000;
 const TEXTURE_HEIGHT: Enum = 0x1001;
 const BUFFER_SIZE: Enum = 0x8764;
@@ -392,8 +426,8 @@ const EXTENSIONS: Enum = 0x1F03;
 const BGRA: Enum = 0x80E1;
 const HALF_FLOAT_OES: Enum = 0x8D61;
 const HALF_FLOAT: Enum = 0x140B;
-const COMPILE_STATUS: Enum = 0x8B81;
-const LINK_STATUS: Enum = 0x8B82;
+pub const COMPILE_STATUS: Enum = 0x8B81;
+pub const LINK_STATUS: Enum = 0x8B82;
 const MAX_SAMPLES: Enum = 0x8D57;
 
 // ----- Apple extensions that are the same as a standard function -----
@@ -1151,7 +1185,7 @@ extern "C" fn compressed_tex_image_2d(target: Enum, level: i32, internal: Enum, 
 // driver's override, every mipmapped texture gets the chip's most (up to
 // 16x) instead, whatever the game asks for.
 
-const TEXTURE_MIN_FILTER: Enum = 0x2801;
+pub const TEXTURE_MIN_FILTER: Enum = 0x2801;
 const TEXTURE_MAX_ANISOTROPY: Enum = 0x84FE;
 const MAX_TEXTURE_MAX_ANISOTROPY: Enum = 0x84FF;
 

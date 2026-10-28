@@ -92,44 +92,71 @@ extern "C" fn set_member(this: Id, _: Sel, item: Id) -> Id {
 }
 
 extern "C" fn set_any(this: Id, _: Sel) -> Id {
-    items(this).first().copied().unwrap_or(0)
+    collections::hash_order(&items(this)).first().copied().unwrap_or(0)
 }
 
 extern "C" fn set_all(this: Id, _: Sel) -> Id {
-    collections::array_from(&items(this).clone())
+    collections::array_from(&collections::hash_order(&items(this)))
 }
 
 extern "C" fn set_add(this: Id, _: Sel, item: Id) {
     add(this, item);
 }
 
+/// Takes out the members `gone` picks; a 32-bit game's objects among them
+/// are let go of, as Apple's set releases them (pictures never are, as in
+/// fw/collections.rs).
+fn remove_where(set: Id, gone: impl Fn(Id) -> bool) {
+    let mut removed = Vec::new();
+    items(set).retain(|&i| {
+        let out = gone(i);
+        if out {
+            removed.push(i);
+        }
+        !out
+    });
+    removed.iter().for_each(|&i| crate::fw::counted::game_release(i));
+}
+
 extern "C" fn set_remove(this: Id, _: Sel, item: Id) {
-    items(this).retain(|&i| !same(i, item));
+    remove_where(this, |i| same(i, item));
 }
 
 extern "C" fn set_remove_all(this: Id, _: Sel) {
-    items(this).clear();
+    remove_where(this, |_| true);
 }
 
 extern "C" fn set_enumerator(this: Id, _: Sel) -> Id {
-    collections::enumerator(items(this).clone())
+    collections::enumerator(collections::hash_order(&items(this)))
 }
 
+/// An immutable set's copy is the set itself, as Apple's is.
 extern "C" fn set_copy(this: Id, _: Sel, _zone: usize) -> Id {
+    let immutable = runtime::class_named("NSSet");
+    if runtime::lock().class_of(this) == immutable {
+        return this;
+    }
+    new_copy(this)
+}
+
+/// A new NSSet with the same members (kept).
+fn new_copy(this: Id) -> Id {
     let object = runtime::alloc_instance(runtime::class_named("NSSet"));
     *items(object) = items(this).clone();
+    items(object).iter().for_each(|&i| crate::fw::counted::keep(i));
     object
 }
 
 extern "C" fn set_mutable_copy(this: Id, _: Sel, _zone: usize) -> Id {
     let object = runtime::alloc_instance(runtime::class_named("NSMutableSet"));
     *items(object) = items(this).clone();
+    items(object).iter().for_each(|&i| crate::fw::counted::keep(i));
     object
 }
 
 extern "C" fn set_enumerate(this: Id, _: Sel, state: *mut [usize; 8], buffer: *mut Id, length: usize) -> usize {
     unsafe {
-        let list = items(this);
+        let list = collections::hash_order(&items(this));
         let start = (*state)[0];
         if start >= list.len() {
             return 0;
@@ -212,7 +239,7 @@ extern "C" fn set_union(this: Id, _: Sel, other: Id) {
 
 extern "C" fn set_minus(this: Id, _: Sel, other: Id) {
     let remove = items(other).clone();
-    items(this).retain(|&i| !remove.iter().any(|&r| same(i, r)));
+    remove_where(this, |i| remove.iter().any(|&r| same(i, r)));
 }
 
 extern "C" fn set_intersects(this: Id, _: Sel, other: Id) -> bool {
@@ -224,27 +251,27 @@ extern "C" fn set_is_subset(this: Id, _: Sel, other: Id) -> bool {
 }
 
 extern "C" fn set_adding(this: Id, _: Sel, item: Id) -> Id {
-    let object = set_copy(this, 0, 0);
+    let object = new_copy(this);
     add(object, item);
     object
 }
 
 extern "C" fn set_adding_set(this: Id, _: Sel, other: Id) -> Id {
-    let object = set_copy(this, 0, 0);
+    let object = new_copy(this);
     let more = if other == 0 { Vec::new() } else { collections::array_items(runtime::send(other, "allObjects", &[])) };
     more.into_iter().for_each(|item| add(object, item));
     object
 }
 
 extern "C" fn set_adding_array(this: Id, _: Sel, array: Id) -> Id {
-    let object = set_copy(this, 0, 0);
+    let object = new_copy(this);
     collections::array_items(array).into_iter().for_each(|item| add(object, item));
     object
 }
 
 extern "C" fn set_intersect(this: Id, _: Sel, other: Id) {
     let keep = if other == 0 { Vec::new() } else { collections::array_items(runtime::send(other, "allObjects", &[])) };
-    items(this).retain(|&i| keep.iter().any(|&k| same(i, k)));
+    remove_where(this, |i| !keep.iter().any(|&k| same(i, k)));
 }
 
 /// The members a test block (object, &stop) -> BOOL picks, as a new set.
@@ -908,6 +935,7 @@ pub fn register(r: &mut Registry) {
             ("timeIntervalSinceNow", date_interval_now as usize),
             ("timeIntervalSinceDate:", date_interval_since as usize),
             ("dateByAddingTimeInterval:", date_by_adding as usize),
+            ("addTimeInterval:", date_by_adding as usize),
             ("compare:", date_compare as usize),
             ("isEqual:", date_is_equal as usize),
             ("isEqualToDate:", date_is_equal as usize),
@@ -1026,6 +1054,23 @@ extern "C" fn uuid_new(class: Class, _: Sel) -> Id {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// setByAdding… make a new set and leave the receiver as it was, also
+    /// an immutable NSSet (whose -copy is itself).
+    #[test]
+    fn adding_to_a_set_leaves_the_original_alone() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let [a, b, c, d] = ["a", "b", "c", "d"].map(string::make);
+        let original = set_from(&[a]);
+        let more = [
+            runtime::send(original, "setByAddingObject:", &[b]),
+            runtime::send(original, "setByAddingObjectsFromSet:", &[set_from(&[c])]),
+            runtime::send(original, "setByAddingObjectsFromArray:", &[collections::array_from(&[d])]),
+        ];
+        assert_eq!(*items(original), [a], "the original changed");
+        assert_eq!(more.map(|set| items(set).len()), [2, 2, 2]);
+    }
 
     /// A link relative to a base resolves the standard way (RFC 3986's own examples).
     #[test]

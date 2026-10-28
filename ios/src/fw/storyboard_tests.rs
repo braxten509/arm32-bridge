@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::fw::collections;
+use crate::fw::controls::Insets;
 use crate::fw::geometry::{Point, Rect, Size};
 use crate::fw::object::{class_methods, define_class, methods};
 use crate::fw::string;
@@ -28,6 +29,7 @@ enum Held {
     Point(Point),
     Size(Size),
     Rect(Rect),
+    Insets(Insets),
 }
 
 static HELD: Mutex<Option<HashMap<Id, HashMap<String, Held>>>> = Mutex::new(None);
@@ -95,6 +97,12 @@ extern "C" fn coder_rect(this: Id, _: Sel, key: Id) -> Rect {
     match held(this, key) {
         Some(Held::Rect(value)) => value,
         _ => Rect::default(),
+    }
+}
+extern "C" fn coder_insets(this: Id, _: Sel, key: Id) -> Insets {
+    match held(this, key) {
+        Some(Held::Insets(value)) => value,
+        _ => Insets::default(),
     }
 }
 
@@ -241,6 +249,33 @@ extern "C" fn game_view_init_with_frame(this: Id, _: Sel, _frame: Rect) -> Id {
     this
 }
 
+/// What a game view's own setters were sent while it was decoded, with how
+/// many subviews it had then.
+static GAME_SETTERS: Mutex<Vec<(Id, &'static str, usize)>> = Mutex::new(Vec::new());
+
+/// [super name:value] from the game view: UIView's own setter.
+fn view_super<A>(this: Id, name: &str, value: A) {
+    let sel = runtime::sel(name);
+    let class = runtime::class_named("UIView");
+    let imp = lock().lookup(class, sel).unwrap();
+    unsafe { std::mem::transmute::<usize, extern "C" fn(Id, Sel, A)>(imp)(this, sel, value) }
+}
+
+extern "C" fn game_view_set_background(this: Id, _: Sel, color: Id) {
+    GAME_SETTERS.lock().unwrap().push((this, "setBackgroundColor:", view_state(this).subviews.len()));
+    view_super(this, "setBackgroundColor:", color);
+}
+extern "C" fn game_button_set_shows_touch(this: Id, _: Sel, _shows: u8) {
+    GAME_SETTERS.lock().unwrap().push((this, "setShowsTouchWhenHighlighted:", 0));
+}
+extern "C" fn game_field_set_text(this: Id, _: Sel, _text: Id) {
+    GAME_SETTERS.lock().unwrap().push((this, "setText:", 0));
+}
+extern "C" fn game_view_set_hidden(this: Id, _: Sel, hidden: u8) {
+    GAME_SETTERS.lock().unwrap().push((this, "setHidden:", view_state(this).subviews.len()));
+    view_super(this, "setHidden:", hidden);
+}
+
 fn setup() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -261,6 +296,7 @@ fn setup() {
                 ("decodeCGPointForKey:", coder_point as usize),
                 ("decodeCGSizeForKey:", coder_size as usize),
                 ("decodeCGRectForKey:", coder_rect as usize),
+                ("decodeUIEdgeInsetsForKey:", coder_insets as usize),
             ],
         );
         let nib_class = define_class(TEST_NIB_CLASS, "NSObject", 8);
@@ -293,6 +329,18 @@ fn setup() {
         let game_view = define_class("StoryboardTestGameView", "UIView", 16);
         methods(game_view, &[("initWithFrame:", game_view_init_with_frame as usize)]);
         lock().classes.get_mut(&game_view).unwrap().from_game = true;
+        // A game view with its own setters (as games override them).
+        let setter_view = define_class("StoryboardTestSetterView", "UIView", 16);
+        methods(setter_view, &[("setBackgroundColor:", game_view_set_background as usize), ("setHidden:", game_view_set_hidden as usize)]);
+        lock().classes.get_mut(&setter_view).unwrap().from_game = true;
+        // A game button and text field with their own setters.
+        let game_button = define_class("StoryboardTestGameButton", "UIButton", 16);
+        methods(game_button, &[("setShowsTouchWhenHighlighted:", game_button_set_shows_touch as usize)]);
+        let game_field = define_class("StoryboardTestGameField", "UITextField", 16);
+        methods(game_field, &[("setText:", game_field_set_text as usize)]);
+        for class in [game_button, game_field] {
+            lock().classes.get_mut(&class).unwrap().from_game = true;
+        }
     });
 }
 
@@ -460,12 +508,228 @@ fn a_view_reads_its_place_look_and_subviews_from_a_coder() {
     assert!(flag(view, "isMultipleTouchEnabled"));
     assert_ne!(runtime::send(view, "layer", &[]), 0, "the view has its layer");
 
+    // Nothing stored: what -[UIView initWithCoder:] reads from absent keys
+    // (opaque NO, autoresizing subviews off), not -initWithFrame:'s defaults.
     let plain = decoded("UIView", vec![]);
     assert_eq!(call::<Rect>(plain, "frame"), Rect::default());
     assert_eq!(call::<f64>(plain, "alpha"), 1.0);
-    assert!(flag(plain, "isOpaque"));
+    assert!(!flag(plain, "isOpaque"));
+    assert!(!flag(plain, "autoresizesSubviews"));
     assert!(flag(plain, "isUserInteractionEnabled"));
     assert!(!flag(plain, "isHidden"));
+}
+
+/// A nib view takes touches unless the nib says not (UIUserInteractionDisabled),
+/// image views and labels too: their -initWithFrame: default doesn't apply.
+/// The look is set through the view's own setters (a game's overrides run),
+/// after its subviews are in.
+#[test]
+fn nib_views_take_touches_unless_told_and_their_setters_are_sent() {
+    setup();
+    let image_view = decoded("UIImageView", vec![("UIBounds", Held::Rect(Rect::new(0.0, 0.0, 40.0, 40.0)))]);
+    assert!(flag(image_view, "isUserInteractionEnabled"), "an image view from a nib takes touches");
+    assert!(!flag(image_view, "isOpaque"));
+    let label = decoded("UILabel", vec![("UIText", text("x"))]);
+    assert!(flag(label, "isUserInteractionEnabled"), "a label from a nib takes touches unless the nib says not");
+
+    let red = runtime::send(runtime::class_named("UIColor"), "redColor", &[]);
+    let child = plain_view(5.0, 5.0);
+    let view = decoded("StoryboardTestSetterView", vec![("UISubviews", array(&[child])), ("UIBackgroundColor", Held::Object(red))]);
+    let sent: Vec<(&str, usize)> = GAME_SETTERS.lock().unwrap().iter().filter(|(id, ..)| *id == view).map(|&(_, name, count)| (name, count)).collect();
+    assert_eq!(sent, [("setHidden:", 1), ("setBackgroundColor:", 1)], "the game's setters, after the subviews");
+    assert_eq!(runtime::send(view, "backgroundColor", &[]), red);
+}
+
+/// A scroll view's paging, bouncing, indicators, size, zoom and delegate
+/// from a nib; what isn't stored keeps UIScrollView's defaults.
+#[test]
+fn a_scroll_view_reads_its_scrolling_from_a_coder() {
+    setup();
+    let delegate = runtime::send(runtime::send(runtime::class_named("NSObject"), "alloc", &[]), "init", &[]);
+    let scroll = decoded(
+        "UIScrollView",
+        vec![
+            ("UIBounds", Held::Rect(Rect::new(0.0, 0.0, 320.0, 100.0))),
+            ("UIPagingEnabled", Held::Bool(true)),
+            ("UIAlwaysBounceHorizontal", Held::Bool(true)),
+            ("UIShowsHorizontalScrollIndicator", Held::Bool(false)),
+            ("UIBounceEnabled", Held::Bool(false)),
+            ("UIContentSize", Held::Size(Size { width: 960.0, height: 100.0 })),
+            ("UIMaximumZoomScale", Held::Double(2.0)),
+            ("UIDelegate", Held::Object(delegate)),
+        ],
+    );
+    assert!(flag(scroll, "isPagingEnabled"));
+    assert!(flag(scroll, "alwaysBounceHorizontal"));
+    assert!(!flag(scroll, "showsHorizontalScrollIndicator"));
+    assert!(!flag(scroll, "bounces"));
+    assert_eq!(call::<Size>(scroll, "contentSize"), Size { width: 960.0, height: 100.0 });
+    assert_eq!(call::<f64>(scroll, "maximumZoomScale"), 2.0);
+    assert_eq!(runtime::send(scroll, "delegate", &[]), delegate);
+    let plain = decoded("UIScrollView", vec![("UIScrollDisabled", Held::Bool(true))]);
+    assert!(!flag(plain, "isScrollEnabled"));
+    assert!(!flag(plain, "isPagingEnabled") && flag(plain, "bounces") && flag(plain, "showsVerticalScrollIndicator"));
+}
+
+/// A text field's text, look and keyboard from a nib, and a text view's.
+#[test]
+fn text_fields_and_text_views_read_their_text_from_a_coder() {
+    setup();
+    let white = decoded("UIColor", vec![("UIWhite", Held::Double(1.0)), ("UIAlpha", Held::Double(1.0))]);
+    let font = decoded("UIFont", vec![("UIFontName", text("Philosopher")), ("UIFontPointSize", Held::Double(20.0))]);
+    let field = decoded(
+        "UITextField",
+        vec![
+            ("UIBounds", Held::Rect(Rect::new(0.0, 0.0, 200.0, 30.0))),
+            ("UIText", text("Merlin")),
+            ("UITextColor", Held::Object(white)),
+            ("UIFont", Held::Object(font)),
+            ("UITextAlignment", Held::Integer(1)),
+            ("UIPlaceholder", text("Name")),
+            ("UIBorderStyle", Held::Integer(3)),
+            ("UIClearButtonMode", Held::Integer(3)),
+            ("UIClearsOnBeginEditing", Held::Bool(true)),
+            ("UIMinimumFontSize", Held::Double(14.0)),
+            ("UIAdjustsFontSizeToFit", Held::Bool(true)),
+            ("UIAutocapitalizationType", Held::Integer(1)),
+            ("UIAutocorrectionType", Held::Integer(1)),
+            ("UIKeyboardType", Held::Integer(7)),
+            ("UIReturnKeyType", Held::Integer(9)),
+            ("UIEnablesReturnKeyAutomatically", Held::Bool(true)),
+            ("UISecureTextEntry", Held::Bool(true)),
+        ],
+    );
+    assert_eq!(text_of(field, "text"), "Merlin");
+    assert_eq!(runtime::send(field, "textColor", &[]), white);
+    assert_eq!(runtime::send(field, "font", &[]), font);
+    assert_eq!(text_of(field, "placeholder"), "Name");
+    for (getter, value) in [
+        ("textAlignment", 1),
+        ("borderStyle", 3),
+        ("clearButtonMode", 3),
+        ("autocapitalizationType", 1),
+        ("autocorrectionType", 1),
+        ("keyboardType", 7),
+        ("returnKeyType", 9),
+    ] {
+        assert_eq!(call::<isize>(field, getter), value, "{getter}");
+    }
+    assert!(flag(field, "clearsOnBeginEditing") && flag(field, "adjustsFontSizeToFitWidth"));
+    assert!(flag(field, "enablesReturnKeyAutomatically") && flag(field, "isSecureTextEntry"));
+    assert_eq!(call::<f64>(field, "minimumFontSize"), 14.0);
+
+    let view = decoded(
+        "UITextView",
+        vec![
+            ("UIBounds", Held::Rect(Rect::new(0.0, 0.0, 200.0, 80.0))),
+            ("UIText", text("An offer")),
+            ("UIFont", Held::Object(font)),
+            ("UITextColor", Held::Object(white)),
+            ("UITextAlignment", Held::Integer(2)),
+            ("UIEditable", Held::Bool(false)),
+        ],
+    );
+    assert_eq!(text_of(view, "text"), "An offer");
+    assert_eq!(runtime::send(view, "font", &[]), font);
+    assert_eq!(runtime::send(view, "textColor", &[]), white);
+    assert_eq!(call::<isize>(view, "textAlignment"), 2);
+    assert!(!flag(view, "isEditable"));
+}
+
+/// A button's type, edge insets and title line break from a nib; a rounded
+/// rect button (UIRoundedRectButton) is a button.
+#[test]
+fn a_button_reads_its_type_insets_and_line_break_from_a_coder() {
+    setup();
+    let insets = |top, left, bottom, right| Insets { top, left, bottom, right };
+    let button = decoded(
+        "UIButton",
+        vec![
+            ("UIBounds", Held::Rect(Rect::new(0.0, 0.0, 100.0, 40.0))),
+            ("UIButtonType", Held::Integer(1)),
+            ("UIContentEdgeInsets", Held::Insets(insets(0.0, 10.0, 0.0, 0.0))),
+            ("UITitleEdgeInsets", Held::Insets(insets(2.0, 0.0, 0.0, 0.0))),
+            ("UIImageEdgeInsets", Held::Insets(insets(0.0, 0.0, 0.0, 4.0))),
+            ("UILineBreakMode", Held::Integer(0)),
+        ],
+    );
+    assert_eq!(call::<isize>(button, "buttonType"), 1);
+    assert_eq!(call::<Insets>(button, "contentEdgeInsets"), insets(0.0, 10.0, 0.0, 0.0));
+    assert_eq!(call::<Insets>(button, "titleEdgeInsets"), insets(2.0, 0.0, 0.0, 0.0));
+    assert_eq!(call::<Insets>(button, "imageEdgeInsets"), insets(0.0, 0.0, 0.0, 4.0));
+    assert_eq!(call::<isize>(runtime::send(button, "titleLabel", &[]), "lineBreakMode"), 0);
+    assert!(runtime::existing_class("UIRoundedRectButton", false).is_some(), "UIRoundedRectButton exists");
+    let rounded = decoded("UIRoundedRectButton", vec![("UIButtonType", Held::Integer(1))]);
+    assert!(is_kind_of(rounded, "UIButton"));
+    assert_eq!(call::<isize>(rounded, "buttonType"), 1);
+}
+
+/// Older nibs keep the button's "reverses title shadow" setting under
+/// UIReversesTitleShadowOnHighlight; UIKit reads either name.
+#[test]
+fn a_button_reads_either_name_of_its_shadow_reversing() {
+    setup();
+    let newer = decoded("UIButton", vec![("UIReversesTitleShadowWhenHighlighted", Held::Bool(true))]);
+    let older = decoded("UIButton", vec![("UIReversesTitleShadowOnHighlight", Held::Bool(true))]);
+    let plain = decoded("UIButton", vec![]);
+    assert!(flag(newer, "reversesTitleShadowWhenHighlighted"));
+    assert!(flag(older, "reversesTitleShadowWhenHighlighted"), "the older name is read too");
+    assert!(!flag(plain, "reversesTitleShadowWhenHighlighted"));
+}
+
+/// The decoders send the setters UIKit's own decoders send by message, so
+/// a game's subclass hears them (a button's -setShowsTouchWhenHighlighted:,
+/// a text field's -setText:).
+#[test]
+fn decoders_send_the_setters_a_game_can_override() {
+    setup();
+    let button = decoded("StoryboardTestGameButton", vec![("UIShowsTouchWhenHighlighted", Held::Bool(true))]);
+    let field = decoded("StoryboardTestGameField", vec![("UIText", text("Merlin"))]);
+    let heard = |object: Id| -> Vec<&str> { GAME_SETTERS.lock().unwrap().iter().filter(|(id, ..)| *id == object).map(|&(_, name, _)| name).collect() };
+    assert_eq!(heard(button), ["setShowsTouchWhenHighlighted:"]);
+    assert_eq!(heard(field), ["setText:"]);
+}
+
+/// A spinner's style and state, a slider's values and a web view's settings
+/// from a nib.
+#[test]
+fn spinners_sliders_and_web_views_read_their_settings_from_a_coder() {
+    setup();
+    let red = runtime::send(runtime::class_named("UIColor"), "redColor", &[]);
+    let spinner = decoded(
+        "UIActivityIndicatorView",
+        vec![
+            ("UIActivityIndicatorViewStyle", Held::Integer(2)),
+            ("UIHidesWhenStopped", Held::Bool(false)),
+            ("UIAnimating", Held::Bool(true)),
+            ("UITintColor", Held::Object(red)),
+        ],
+    );
+    assert_eq!(call::<isize>(spinner, "activityIndicatorViewStyle"), 2);
+    assert!(!flag(spinner, "hidesWhenStopped"));
+    assert!(flag(spinner, "isAnimating"));
+    assert_eq!(runtime::send(spinner, "color", &[]), red);
+
+    let slider = decoded("UISlider", vec![("UIValue", Held::Double(5.0)), ("UIMinValue", Held::Double(1.0)), ("UIMaxValue", Held::Double(20.0))]);
+    assert_eq!((call::<f32>(slider, "value"), call::<f32>(slider, "minimumValue"), call::<f32>(slider, "maximumValue")), (5.0, 1.0, 20.0));
+    assert!(flag(slider, "isContinuous"), "continuous unless the nib says not");
+    assert!(is_kind_of(slider, "UIControl"));
+
+    let delegate = runtime::send(runtime::send(runtime::class_named("NSObject"), "alloc", &[]), "init", &[]);
+    let web = decoded("UIWebView", vec![("UIScalesPageToFit", Held::Bool(true)), ("UIDelegate", Held::Object(delegate))]);
+    assert!(flag(web, "scalesPageToFit"));
+    assert_eq!(runtime::send(web, "delegate", &[]), delegate);
+}
+
+/// A nib window starts hidden (until it is made visible) and gets its root
+/// view controller from the nib.
+#[test]
+fn a_nib_window_gets_its_root_view_controller() {
+    setup();
+    let controller = runtime::send(runtime::send(runtime::class_named("UIViewController"), "alloc", &[]), "init", &[]);
+    let window = decoded("UIWindow", vec![("UIBounds", Held::Rect(Rect::new(0.0, 0.0, 320.0, 480.0))), ("UIRootViewController", Held::Object(controller))]);
+    assert_eq!(runtime::send(window, "rootViewController", &[]), controller);
+    assert!(flag(window, "isHidden"), "a nib window waits to be made visible");
 }
 
 /// A nib's window marked "Full Screen at Launch" (UIResizesToFullScreen)
@@ -505,15 +769,13 @@ fn a_progress_bar_reads_its_progress_from_a_coder() {
 
 /// -[UIView initWithCoder:] doesn't run -initWithFrame: overrides of the
 /// game's classes (iOS never calls it while decoding), but our own classes'
-/// setup still happens (a label doesn't take touches by default).
+/// setup still happens (a text view isn't drawn as a plain view).
 #[test]
 fn decoding_skips_the_games_init_with_frame_but_keeps_ours() {
     setup();
     let view = decoded("StoryboardTestGameView", vec![("UIBounds", Held::Rect(Rect::new(0.0, 0.0, 40.0, 20.0)))]);
     assert!(!GAME_INIT_WITH_FRAME.lock().unwrap().contains(&view), "the game's initWithFrame: was called");
     assert_eq!(call::<Rect>(view, "frame").size, Size { width: 40.0, height: 20.0 });
-    let label = decoded("UILabel", vec![("UIBounds", Held::Rect(Rect::new(0.0, 0.0, 40.0, 20.0)))]);
-    assert!(!flag(label, "isUserInteractionEnabled"), "a label takes no touches unless the nib says so (UILabel's own setup ran)");
     let text = decoded("UITextView", vec![("UIBounds", Held::Rect(Rect::new(0.0, 0.0, 40.0, 20.0)))]);
     assert_eq!(property_get(text, "notDrawn"), Some(1), "UITextView's own setup ran");
 }
@@ -731,6 +993,37 @@ fn a_button_reads_its_content_per_state_from_a_coder() {
     assert!(flag(button, "isUserInteractionEnabled"), "buttons take touches");
 }
 
+static CODER_LAYOUTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+extern "C" fn coder_button_layout(this: Id, s: Sel) {
+    CODER_LAYOUTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let class = runtime::class_named("UIButton"); // before taking the lock: it locks too
+    let imp = lock().lookup(class, s).unwrap();
+    unsafe { std::mem::transmute::<usize, extern "C" fn(Id, Sel)>(imp)(this, s) }
+}
+
+/// A button saved selected, with content for that state, is filled in
+/// without being laid out (Apple's -initWithCoder: takes its content table
+/// as it is): the game's -layoutSubviews doesn't run inside its init; it is
+/// marked, and laid out later shows the selected title.
+#[test]
+fn a_decoded_selected_button_is_not_laid_out_during_its_init() {
+    setup();
+    let class = define_class("StoryboardTestLayoutButton", "UIButton", 16);
+    methods(class, &[("layoutSubviews", coder_button_layout as usize)]);
+    let selected = decoded("UIButtonContent", vec![("UITitle", text("On"))]);
+    let content = collections::dictionary_from(&[(collections::number_int(4), selected)]);
+    let before = CODER_LAYOUTS.load(std::sync::atomic::Ordering::SeqCst);
+    let button = decoded(
+        "StoryboardTestLayoutButton",
+        vec![("UIBounds", Held::Rect(Rect::new(0.0, 0.0, 80.0, 30.0))), ("UISelected", Held::Bool(true)), ("UIButtonStatefulContent", Held::Object(content))],
+    );
+    assert_eq!(CODER_LAYOUTS.load(std::sync::atomic::Ordering::SeqCst), before, "no layout inside initWithCoder:");
+    runtime::send(button, "layoutIfNeeded", &[]);
+    assert_eq!(CODER_LAYOUTS.load(std::sync::atomic::Ordering::SeqCst), before + 1, "marked for layout");
+    assert_eq!(string::get(runtime::send(runtime::send(button, "titleLabel", &[]), "text", &[])), "On");
+}
+
 /// Colours: separate parts (UIRed...), the "r g b" text older readers use,
 /// white, and a system colour by name.
 #[test]
@@ -872,9 +1165,17 @@ fn a_segue_prepares_and_presents_its_destination_in_the_window() {
     assert_eq!(runtime::send(destination, "presentingViewController", &[]), source);
     assert_eq!(view_state(destination_view).superview, window, "the presented view is in the window");
     assert_eq!(call::<Rect>(destination_view, "frame"), call::<Rect>(window, "bounds"), "full screen");
-    assert_eq!(view_state(source_view).superview, 0, "the source's view leaves the window, as on iOS");
+    // Animated (a modal segue animates): the new view slides up over the
+    // source's for 0.4 s; then the source's view leaves the window, as on iOS.
+    let mut told = events_of(&[source, destination]);
+    let end = crate::fw::runloop::media_time() + 0.5;
+    while view_state(source_view).superview != 0 && crate::fw::runloop::media_time() < end {
+        crate::fw::runloop::run_main_loop_briefly();
+    }
+    told.extend(events_of(&[source, destination]));
+    assert_eq!(view_state(source_view).superview, 0, "the source's view leaves the window once the slide is done");
     assert_eq!(
-        events_of(&[source, destination]),
+        told,
         [
             (source, "prepareForSegue:sender:".to_string()),
             (destination, "viewWillAppear: YES".to_string()),
@@ -908,6 +1209,11 @@ fn a_segue_prepares_and_presents_its_destination_in_the_window() {
     runtime::send(template, "perform:", &[source_view]);
     assert_eq!(runtime::send(source, "presentedViewController", &[]), destination);
     assert_eq!(property_get(source, "testPreparedSender"), Some(source_view as u64), "the button is the sender");
+    // A dismiss while the slide runs is refused (as UIKit's): wait for it.
+    let end = crate::fw::runloop::media_time() + 0.5;
+    while view_state(source_view).superview != 0 && crate::fw::runloop::media_time() < end {
+        crate::fw::runloop::run_main_loop_briefly();
+    }
     runtime::send(source, "dismissViewControllerAnimated:completion:", &[0, 0]);
     assert_eq!(view_state(source_view).superview, window);
 
@@ -978,12 +1284,15 @@ fn the_main_storyboard_makes_and_shows_the_window() {
     assert_eq!(call::<Rect>(window, "frame"), Rect::new(0.0, 0.0, width, height), "the screen's size");
     assert_eq!(runtime::send(delegate, "window", &[]), window, "the delegate is given the window");
     assert_eq!(runtime::send(window, "rootViewController", &[]), controller);
-    assert_eq!(view_state(view).superview, window);
+    // As UIKit's setRootViewController: (0x3c95e): the root's view joins a
+    // window only once it shows.
+    assert_eq!(view_state(view).superview, 0, "the window is still hidden");
     assert!(!crate::fw::uikit::windows().contains(&window), "not shown before the app's launch code");
     assert!(events_of(&[controller]).is_empty());
 
     show_main_window(delegate, window);
     assert!(crate::fw::uikit::windows().contains(&window), "shown after didFinishLaunching");
+    assert_eq!(view_state(view).superview, window);
     assert_eq!(events_of(&[controller]), [(controller, "viewWillAppear: NO".to_string()), (controller, "viewDidAppear: NO".to_string())]);
     show_main_window(delegate, window);
     assert!(events_of(&[controller]).is_empty(), "shown once");
@@ -1029,12 +1338,13 @@ fn a_controller_is_laid_out_before_it_appears() {
     assert_eq!(told, ["viewWillAppear: NO", "viewDidLayoutSubviews", "viewDidAppear: NO"]);
 }
 
-/// transitionFromViewController: lays the arriving view out before its
-/// controller hears viewWillAppear:: SpellCraft opens a tutorial box in
-/// -viewWillAppear: and adds its drawer in -viewDidLayoutSubviews; laid out
-/// later, the drawer covered the box.
+/// transitionFromViewController: as UIKit's _transitionFromView: (0x57c47):
+/// nothing lays the arriving view out in the call, so its controller hears
+/// viewWillAppear: first; the run loop's layout pass lays it out before
+/// viewDidAppear:. (An earlier fix laid it out before viewWillAppear: for
+/// SpellCraft's tutorial box and drawer; Apple's order is kept here.)
 #[test]
-fn a_transition_lays_out_the_arriving_view_before_it_appears() {
+fn a_transition_lays_out_the_arriving_view_after_will_appear() {
     setup();
     let make = |class: &str| runtime::send(runtime::send(runtime::class_named(class), "alloc", &[]), "init", &[]);
     let window = new_window();
@@ -1047,14 +1357,20 @@ fn a_transition_lays_out_the_arriving_view_before_it_appears() {
     runtime::send(parent_view, "addSubview:", &[runtime::send(from, "view", &[])]);
     runtime::send(parent, "addChildViewController:", &[to]);
     let _ = runtime::send(to, "view", &[]);
-    let _ = events_of(&[parent, from, to]);
-    crate::fw::uikit::controller_transition(parent, 0, from, to, 0.0, 0, 0, 0);
-    let told: Vec<String> = events_of(&[to]).into_iter().map(|e| e.1).collect();
-    assert_eq!(told, ["viewDidLayoutSubviews", "viewWillAppear: YES"]);
+    // As main-loop work, so other tests' run loop turns (which lay out shown
+    // windows at the end of each turn) can't come in between.
+    let mut told: Vec<String> = crate::fw::runloop::as_main(|| {
+        let _ = events_of(&[parent, from, to]);
+        crate::fw::uikit::controller_transition(parent, 0, from, to, 0.0, 0, 0, 0);
+        events_of(&[to]).into_iter().map(|e| e.1).collect()
+    });
+    assert_eq!(told.first().map(String::as_str), Some("viewWillAppear: YES"), "nothing laid out before it");
     let end = crate::fw::runloop::media_time() + 0.3;
-    while !events_of(&[to]).iter().any(|e| e.1 == "viewDidAppear: YES") && crate::fw::runloop::media_time() < end {
+    while !told.iter().any(|e| e == "viewDidAppear: YES") && crate::fw::runloop::media_time() < end {
         crate::fw::runloop::run_main_loop_briefly();
+        told.extend(events_of(&[to]).into_iter().map(|e| e.1));
     }
+    assert_eq!(told, ["viewWillAppear: YES", "viewDidLayoutSubviews", "viewDidAppear: YES"]);
 }
 
 /// UIKit's rule for every controller, not just the window's root: a
@@ -1147,18 +1463,27 @@ fn transitions_and_stacked_dismissals_tell_the_right_controllers() {
     runtime::send(runtime::send(to, "view", &[]), "addSubview:", &[runtime::send(inside, "view", &[])]);
     let _ = events_of(&[parent, from, to, inside]);
     crate::fw::uikit::controller_transition(parent, 0, from, to, 0.0, 0, 0, 0);
-    assert_eq!(
-        events_of(&[from, to, inside]),
-        [event(from, "viewWillDisappear: YES"), event(to, "viewWillAppear: YES"), event(inside, "viewWillAppear: YES")],
-        "only the starts"
-    );
+    // The starts come at once; the ends after the (zero-length) animation,
+    // at a later main-loop turn. Another test may turn the shared main loop
+    // meanwhile, so the ends can already be here: the order is what counts.
+    let mut heard = events_of(&[from, to, inside]);
     let end = crate::fw::runloop::media_time() + 0.3;
-    let mut rest = Vec::new();
-    while !rest.contains(&event(inside, "viewDidAppear: YES")) && crate::fw::runloop::media_time() < end {
+    while !heard.contains(&event(inside, "viewDidAppear: YES")) && crate::fw::runloop::media_time() < end {
         crate::fw::runloop::run_main_loop_briefly();
-        rest.extend(events_of(&[from, to, inside]));
+        heard.extend(events_of(&[from, to, inside]));
     }
-    assert_eq!(rest, [event(from, "viewDidDisappear: YES"), event(to, "viewDidAppear: YES"), event(inside, "viewDidAppear: YES")]);
+    assert_eq!(
+        heard,
+        [
+            event(from, "viewWillDisappear: YES"),
+            event(to, "viewWillAppear: YES"),
+            event(inside, "viewWillAppear: YES"),
+            event(from, "viewDidDisappear: YES"),
+            event(to, "viewDidAppear: YES"),
+            event(inside, "viewDidAppear: YES"),
+        ],
+        "the starts, then the ends"
+    );
 
     // A shows B shows C; dismissing from A.
     let (a, b, c) = (make("StoryboardTestController"), make("StoryboardTestController"), make("StoryboardTestController"));

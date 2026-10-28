@@ -52,6 +52,10 @@ pub trait GuestSide: Sync {
     fn without_guest_lock(&self, wait: &mut dyn FnMut()) {
         wait()
     }
+    /// How many more guest calls may nest on this thread now.
+    fn nested_calls_left(&self) -> u32 {
+        u32::MAX
+    }
 }
 
 /// The function a framework method's guest IMP is: objc_msgSend's stand-in,
@@ -120,6 +124,8 @@ struct HostBlock {
     invoke: usize,
     descriptor: *const WrapperDescriptor,
     guest: usize,
+    /// The bridge that made it (Bridge::id): kept blocks are per bridge.
+    owner: usize,
 }
 
 #[repr(C)]
@@ -224,7 +230,7 @@ fn live_wrappers<R>(f: impl FnOnce(&mut HashSet<usize>) -> R) -> R {
 }
 
 /// The guest block a host block runs, if it is one of the bridge's.
-fn wrapper_guest(host: usize) -> Option<u32> {
+pub(crate) fn wrapper_guest(host: usize) -> Option<u32> {
     live_wrappers(|live| live.contains(&host)).then(|| unsafe { (*(host as *const HostBlock)).guest as u32 })
 }
 
@@ -244,11 +250,82 @@ extern "C" fn wrapper_copy(destination: *mut HostBlock, source: *const HostBlock
 }
 
 extern "C" fn wrapper_dispose(block: *mut HostBlock) {
+    // The bridge's own wrappers (not heap copies: no BLOCK_NEEDS_FREE) are
+    // given back by the bridge: at the end of their call, or never once a
+    // holder keeps one (keep_wrapper). A release of one by a queue that
+    // ran it must not take the reference a collection still counts on.
+    if unsafe { (*block).flags } as u32 & BLOCK_NEEDS_FREE == 0 {
+        return;
+    }
     live_wrappers(|live| live.remove(&(block as usize)));
     let guest = unsafe { (*block).guest as u32 };
     if let Some(g) = *BLOCK_OWNER.read().unwrap_or_else(|e| e.into_inner()) {
         if let Err(error) = super::functions::release_guest_block(g, guest) {
             crate::log!("32-bit Objective-C: releasing block {guest:#x}: {error}");
+        }
+    }
+}
+
+/// (bridge, guest block) a host holder kept (a collection, a queued
+/// message) -> the one wrapper that now lives on with its guest reference
+/// (Apple's holder retains the heap block itself). The game passing the
+/// block again gets the same wrapper, so the holder finds it
+/// (containsObject:, removeObject:).
+static KEPT_WRAPPERS: Mutex<Option<HashMap<(usize, u32), usize>>> = Mutex::new(None);
+
+/// The bridge's own wrappers a holder on another thread kept: they live on
+/// when the call that made them ends (end_wrapper_scope).
+static KEEP_AT_END: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+
+fn kept_wrappers<R>(f: impl FnOnce(&mut HashMap<(usize, u32), usize>) -> R) -> R {
+    f(KEPT_WRAPPERS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::default))
+}
+
+fn keep_at_end<R>(f: impl FnOnce(&mut HashSet<usize>) -> R) -> R {
+    f(KEEP_AT_END.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashSet::default))
+}
+
+/// A wrapper that lives on from now: the block's lasting one, unless it
+/// already has one (then this one is simply never let go).
+fn keep_forever(wrapper: Box<HostBlock>) {
+    let key = (wrapper.owner, wrapper.guest as u32);
+    let host = Box::into_raw(wrapper) as usize;
+    kept_wrappers(|kept| {
+        kept.entry(key).or_insert(host);
+    });
+}
+
+/// counted::keep's hook: a game block a host holder keeps lives on.
+/// - one of this thread's call wrappers leaves the call's list now;
+/// - one of another thread's goes when its call ends (KEEP_AT_END);
+/// - a host copy (_Block_copy'd) gets a saturated count, which no
+///   _Block_release takes down, so it is never freed under the holder.
+fn keep_wrapper(object: runtime::Id) {
+    if !live_wrappers(|live| live.contains(&object)) {
+        return;
+    }
+    let block = object as *mut HostBlock;
+    if unsafe { (*block).flags } as u32 & BLOCK_NEEDS_FREE != 0 {
+        let flags = unsafe { &*(std::ptr::addr_of_mut!((*block).flags) as *const std::sync::atomic::AtomicI32) };
+        flags.fetch_or(BLOCK_REFCOUNT_MASK as i32, std::sync::atomic::Ordering::AcqRel);
+        let key = unsafe { ((*block).owner, (*block).guest as u32) };
+        kept_wrappers(|kept| {
+            kept.entry(key).or_insert(object);
+        });
+        return;
+    }
+    if kept_wrappers(|kept| kept.values().any(|&host| host == object)) {
+        return;
+    }
+    let mine = SCOPED_WRAPPERS.with(|w| {
+        let mut w = w.borrow_mut();
+        let at = w.iter().position(|b| &**b as *const HostBlock as usize == object)?;
+        Some(w.remove(at))
+    });
+    match mine {
+        Some(wrapper) => keep_forever(wrapper),
+        None => {
+            keep_at_end(|keep| keep.insert(object));
         }
     }
 }
@@ -267,7 +344,12 @@ fn end_wrapper_scope(g: &dyn GuestSide, mark: usize) -> Result<(), String> {
         w.split_off(at)
     });
     for wrapper in ended {
-        live_wrappers(|live| live.remove(&(&*wrapper as *const HostBlock as usize)));
+        let host = &*wrapper as *const HostBlock as usize;
+        if keep_at_end(|keep| keep.remove(&host)) {
+            keep_forever(wrapper);
+            continue;
+        }
+        live_wrappers(|live| live.remove(&host));
         super::functions::release_guest_block(g, wrapper.guest as u32)?;
     }
     Ok(())
@@ -283,11 +365,16 @@ pub fn in_wrapper_scope<R>(g: &dyn GuestSide, work: impl FnOnce() -> Result<R, S
 }
 
 pub struct Bridge {
+    /// Tells this bridge's kept block wrappers from another's (a second
+    /// bridge in the process may have a block at the same guest address).
+    id: usize,
     pub classes: GuestClasses,
     to_host: HashMap<u32, usize>,
     to_guest: HashMap<usize, u32>,
     /// Game instances whose guest memory the bridge allocated.
     game_instances: HashMap<u32, ()>,
+    /// Host forms of game objects that were deallocated: nil to the game.
+    dead: HashSet<usize>,
     framework: HashMap<String, (u32, u32)>,
     framework_by_guest: HashMap<u32, (String, bool)>,
     /// Host framework class -> its guest class (from `framework`, by name).
@@ -326,12 +413,16 @@ impl Bridge {
     pub fn new(md: &ObjcMetadata32) -> Result<Bridge, String> {
         let classes = GuestClasses::from_metadata(md)?;
         let framework_initializers = classes.framework_category_entries().iter().any(|(_, meta, sel)| *meta && sel == "initialize");
+        crate::fw::counted::set_keep_hook(keep_wrapper);
+        static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
         Ok(Bridge {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             framework_initializers,
             classes,
             to_host: HashMap::default(),
             to_guest: HashMap::default(),
             game_instances: HashMap::default(),
+            dead: HashSet::default(),
             framework: HashMap::default(),
             framework_by_guest: HashMap::default(),
             framework_isa: HashMap::default(),
@@ -400,8 +491,12 @@ impl Bridge {
     /// A host block that runs guest block `block` (which must already be a
     /// heap or global block; see functions::block_copy). It holds a
     /// reference to the guest block until the bridge call that made it ends;
-    /// a host that keeps it copies it and holds its own.
+    /// a host that keeps it copies it and holds its own, or keeps the wrapper
+    /// (keep_wrapper), which then lives on as the block's one wrapper.
     fn host_block(&mut self, g: &dyn GuestSide, block: u32) -> usize {
+        if let Some(kept) = kept_wrappers(|kept| kept.get(&(self.id, block)).copied()) {
+            return kept;
+        }
         retain_guest_block(g, block);
         let isa = crate::symbols::lookup("__NSConcreteStackBlock").map(|s| s.0).unwrap_or(0);
         let wrapper = Box::new(HostBlock {
@@ -411,6 +506,7 @@ impl Bridge {
             invoke: mirror::trampoline_address(),
             descriptor: &WRAPPER_DESCRIPTOR,
             guest: block as usize,
+            owner: self.id,
         });
         let host = &*wrapper as *const HostBlock as usize;
         live_wrappers(|live| live.insert(host));
@@ -479,10 +575,15 @@ impl Bridge {
         found
     }
 
-    /// Forgets a game object whose host form was deallocated; frees its guest memory.
+    /// Forgets a game object whose host form was deallocated; frees its guest
+    /// memory. The host form (never freed) is nil to the game from now on.
     pub fn forget(&mut self, g: &dyn GuestSide, guest: u32) {
         if let Some(host) = self.to_host.remove(&guest) {
             self.to_guest.remove(&host);
+            crate::fw::counted::forget_game_object(host);
+            if self.game_instances.contains_key(&guest) {
+                self.dead.insert(host);
+            }
         }
         if self.game_instances.remove(&guest).is_some() {
             g.free(guest);
@@ -535,7 +636,7 @@ impl Bridge {
 
     /// The guest object for a host object (made on first sight).
     pub fn guest_object(&mut self, g: &dyn GuestSide, host: usize) -> Result<u32, String> {
-        if host == 0 {
+        if host == 0 || self.dead.contains(&host) {
             return Ok(0);
         }
         if let Some(block) = wrapper_guest(host) {
@@ -584,6 +685,7 @@ impl Bridge {
                 g.write(object, &vec![0u8; size as usize]);
                 g.write(object, &guest_class.to_le_bytes());
                 self.game_instances.insert(object, ());
+                crate::fw::counted::watch_game_object(host);
                 if !self.own_methods_up(guest_class, CXX_CONSTRUCT).is_empty() {
                     UNCONSTRUCTED.with(|u| u.borrow_mut().push(object));
                 }
@@ -1291,11 +1393,16 @@ fn send_unobserved(
         }
     };
     // Test switch IOS_TRACE_MESSAGES: the same "-[Class selector]" lines the
-    // host's messages get, with the guest's class names.
+    // host's messages get, with the guest's class names, and the first two
+    // argument words (as numbers and as floats); a traced game method's
+    // answer is logged too (it runs nested, not jumped into, for that).
+    let mut traced = None;
     if runtime::message_trace_on() {
         let (class_name, class_is_meta) = b.class_display(u32_at(g, receiver));
         if let Some(text) = runtime::traced_message_text(&class_name, class_is_meta, &name) {
-            crate::log!("32-bit message {text}");
+            let (a, c) = (words(first + 2), words(first + 3));
+            crate::log!("32-bit message {text} ({a:#x} {}, {c:#x} {})", f32::from_bits(a), f32::from_bits(c));
+            traced = Some(text);
         }
     }
     let receiver_word = first;
@@ -1314,7 +1421,10 @@ fn send_unobserved(
                 b.classes.remember_send(isa, sel, send);
             }
             drop(b);
-            let result = call_game_method(g, send, &get, may_jump && !fixed)?;
+            let result = call_game_method(g, send, &get, may_jump && !fixed && traced.is_none())?;
+            if let Some(text) = &traced {
+                crate::log!("32-bit message {text} answered {:#x} {}", result.r0, f32::from_bits(result.r0));
+            }
             if fixed {
                 super::game_fixes::after_message(bridge, g, receiver, get(first + 2))?;
             }
@@ -1405,6 +1515,10 @@ fn send_unobserved(
                     let in_place = name == "sortUsingFunction:context:";
                     return sort_with_game_function(bridge, g, receiver, get(first + 2), get(first + 3), in_place);
                 }
+                "getObjects:andKeys:" if !meta => {
+                    drop(b);
+                    return dictionary_objects_and_keys(bridge, g, receiver, get(first + 2), get(first + 3));
+                }
                 _ => {}
             }
             // No host method: Apple's forwarding (forward.rs).
@@ -1474,6 +1588,8 @@ fn send_unobserved(
             drop(b);
             // An exception the host method raises is thrown in the game once it returns.
             let (mut ret, raised) = crate::fw::exception::catching(|| mirror::call_host(imp, &call.args));
+            // What the call let go of for the last time deallocs before the game goes on.
+            crate::fw::counted::dealloc_pending();
             // -bytes / -mutableBytes: data bytes live in guest memory (fw::data)
             // and pass as they are; bytes in host memory get a guest copy
             // (writes through a mutableBytes copy would not reach the host object).
@@ -1533,6 +1649,8 @@ fn call_remembered_host(
     let call = convert::prepare_planned(&host.signature, &host.plan, host.options, words, &mut Session { bridge: &mut b, g })?;
     drop(b);
     let (ret, raised) = crate::fw::exception::catching(|| mirror::call_host(imp, &call.args));
+    // What the call let go of for the last time deallocs before the game goes on.
+    crate::fw::counted::dealloc_pending();
     let mut b = lock(bridge);
     let result = convert::finish_host_call(call, &ret, &mut Session { bridge: &mut b, g })?;
     if let Some(exception) = raised {
@@ -1609,6 +1727,25 @@ fn sort_with_game_function(
     Ok(GuestRet { r0: lock(bridge).guest_object(g, sorted)?, r1: 0 })
 }
 
+/// -getObjects:andKeys: on a framework dictionary: the game's two arrays get
+/// as many guest ids as the dictionary holds (a row could only size them by
+/// an integer argument, which this selector has none of). Either may be NULL.
+fn dictionary_objects_and_keys(bridge: &Mutex<Bridge>, g: &dyn GuestSide, receiver: u32, objects: u32, keys: u32) -> Result<GuestRet, String> {
+    let dictionary = lock(bridge).host_object_for(g, receiver)?;
+    let count = runtime::send(dictionary, "count", &[]);
+    let (mut values, mut names) = (vec![0usize; count], vec![0usize; count]);
+    runtime::send(dictionary, "getObjects:andKeys:", &[values.as_mut_ptr() as usize, names.as_mut_ptr() as usize]);
+    let mut b = lock(bridge);
+    for (out, hosts) in [(objects, &values), (keys, &names)] {
+        if out == 0 {
+            continue;
+        }
+        let guests = hosts.iter().map(|&host| b.guest_object(g, host)).collect::<Result<Vec<u32>, String>>()?;
+        g.write(out, &guests.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>());
+    }
+    Ok(GuestRet { r0: 0, r1: 0 })
+}
+
 /// A guest call to a C function the host layer implements (`address`),
 /// converted by `sig` (its arguments only, no self/_cmd).
 pub fn call_host_function(
@@ -1661,6 +1798,40 @@ pub fn forward_host_message(bridge: &Mutex<Bridge>, g: &dyn GuestSide, frame: &m
 
 /// The mirror trampoline's hook: a host message to a game object runs the
 /// game's method by its own type encoding.
+/// The bridge that game objects whose last reference went are sent -dealloc
+/// through (counted.rs).
+pub fn set_dealloc_bridge(bridge: &'static Mutex<Bridge>, g: &'static dyn GuestSide) {
+    crate::fw::counted::set_dealloc_hook(
+        std::sync::Arc::new(move |host| {
+            if let Err(error) = dealloc_game_object(bridge, g, host) {
+                crate::log!("32-bit Objective-C: -dealloc of {host:#x} failed: {error}");
+            }
+        }),
+        // Room for the -dealloc's own calls ([super dealloc], C++ destructors, releases).
+        std::sync::Arc::new(move || g.nested_calls_left() > DEALLOC_CALL_ROOM),
+    );
+}
+
+/// Nested guest calls a -dealloc is given room for before it waits for a
+/// safe point further out.
+const DEALLOC_CALL_ROOM: u32 = 16;
+
+/// Sends -dealloc to a game object as the game would: its own -dealloc (whose
+/// [super dealloc] frees it), or the framework's for a class without one.
+/// An object this bridge doesn't know (another bridge's) is left alone.
+fn dealloc_game_object(bridge: &Mutex<Bridge>, g: &dyn GuestSide, host: usize) -> Result<(), String> {
+    let words = {
+        let mut b = lock(bridge);
+        let Some(&guest) = b.to_guest.get(&host) else { return Ok(()) };
+        if !b.game_instances.contains_key(&guest) {
+            return Ok(());
+        }
+        [guest, b.guest_selector(g, "dealloc")]
+    };
+    send_from_guest(bridge, g, SendKind::Normal, &|i| words.get(i as usize).copied().unwrap_or(0))?;
+    Ok(())
+}
+
 pub fn dispatch_from_host(bridge: &Mutex<Bridge>, g: &dyn GuestSide, frame: &mut HostFrame) -> Result<(), String> {
     let mut b = lock(bridge);
     let host_self = frame.x[0] as usize;
@@ -1683,6 +1854,12 @@ pub fn dispatch_from_host(bridge: &Mutex<Bridge>, g: &dyn GuestSide, frame: &mut
     }
     let name = unsafe { runtime::cstr(frame.x[1] as usize) };
     let guest_self = b.guest_object(g, host_self)?;
+    // A deallocated game object: a message to nil (a holder that didn't
+    // retain it, as Apple's delegates and observers don't, sends late).
+    if guest_self == 0 {
+        frame.ret = Default::default();
+        return Ok(());
+    }
     let isa = u32_at(g, guest_self);
     // IOS_TRACE_MESSAGES also names the host's calls into game methods
     // (control actions, timers, delegate calls).
@@ -1715,10 +1892,15 @@ pub fn dispatch_from_host(bridge: &Mutex<Bridge>, g: &dyn GuestSide, frame: &mut
     };
     let sig = Signature::parse_method(&types)?;
     let call = convert::prepare_guest_call(&sig, frame, &mut Session { bridge: &mut b, g })?;
+    // A game method a fix follows (game_fixes.rs), sent by our frameworks.
+    let fixed = super::game_fixes::follows(&name, || b.class_display(isa).0);
     drop(b);
     // Constructed before its first method runs (-init sent by the host's +new).
     construct_pending(bridge, g)?;
     let r = g.call(imp, &call.words)?;
+    if fixed {
+        super::game_fixes::after_message(bridge, g, guest_self, call.words.get(2).copied().unwrap_or(0))?;
+    }
     let mut b = lock(bridge);
     convert::finish_guest_call(call, r as u32, (r >> 32) as u32, frame, &mut Session { bridge: &mut b, g })
 }

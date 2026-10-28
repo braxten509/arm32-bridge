@@ -12,8 +12,66 @@ fn four(code: &[u8; 4]) -> u32 {
     u32::from_be_bytes(*code)
 }
 
-extern "C" fn audio_session_initialize(_run_loop: usize, _mode: usize, _listener: usize, _data: usize) -> i32 {
+/// The interruption listener given to AudioSessionInitialize (function, its
+/// data): void listener(void *data, UInt32 state).
+static LISTENER: std::sync::Mutex<Option<(usize, usize)>> = std::sync::Mutex::new(None);
+
+extern "C" fn audio_session_initialize(_run_loop: usize, _mode: usize, listener: usize, data: usize) -> i32 {
+    if listener != 0 {
+        *LISTENER.lock().unwrap_or_else(|e| e.into_inner()) = Some((listener, data));
+    }
     0
+}
+
+// ----- interruptions -----
+
+/// The sound session is interrupted (between begin and end).
+static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// From the phone app: Android's audio focus went (a call, another app's
+/// sound) or came back. On iOS that is an interruption of the app's sound
+/// session; `should_resume` (at the end) says the sound may start again, as
+/// after a call. Delivered on the main loop, where iOS tells the app.
+pub fn audio_interruption(began: bool, should_resume: bool) {
+    crate::log!("sound: interruption {}", if began { "began" } else { "ended" });
+    crate::fw::runloop::post(crate::fw::runloop::Work::Native(Box::new(move || interrupt_now(began, should_resume))));
+}
+
+/// An interruption begins or ends, as iOS 6 tells it: the C listener
+/// (kAudioSessionBeginInterruption 1, kAudioSessionEndInterruption 0), the
+/// AVAudioSession delegate (beginInterruption; endInterruptionWithFlags:
+/// with AVAudioSessionInterruptionFlags_ShouldResume, else endInterruption),
+/// then AVAudioSessionInterruptionNotification (type Began 1 / Ended 0;
+/// at the end the option ShouldResume 1 or 0). Nothing for a begin while
+/// interrupted or an end without one.
+fn interrupt_now(began: bool, should_resume: bool) {
+    use std::sync::atomic::Ordering;
+    if INTERRUPTED.swap(began, Ordering::SeqCst) == began {
+        return;
+    }
+    let listener = *LISTENER.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((function, data)) = listener {
+        let call: extern "C" fn(usize, u32) = unsafe { std::mem::transmute(function) };
+        call(data, began as u32);
+    }
+    let session = session_shared(0, 0);
+    let delegate = property_get(session, "delegate").unwrap_or(0) as Id;
+    if delegate != 0 {
+        if began {
+            if runtime::responds(delegate, "beginInterruption") {
+                runtime::send(delegate, "beginInterruption", &[]);
+            }
+        } else if runtime::responds(delegate, "endInterruptionWithFlags:") {
+            runtime::send(delegate, "endInterruptionWithFlags:", &[should_resume as usize]);
+        } else if runtime::responds(delegate, "endInterruption") {
+            runtime::send(delegate, "endInterruption", &[]);
+        }
+    }
+    let mut info = vec![(string::make("AVAudioSessionInterruptionTypeKey"), collections::number_int(began as i64))];
+    if !began {
+        info.push((string::make("AVAudioSessionInterruptionOptionKey"), collections::number_int(should_resume as i64)));
+    }
+    crate::fw::foundation::post("AVAudioSessionInterruptionNotification", session, collections::dictionary_from(&info));
 }
 
 /// AudioSessionGetProperty(id, *size, *data).
@@ -117,6 +175,15 @@ extern "C" fn two(_this: Id, _: Sel) -> isize {
 
 extern "C" fn ignore_id(_this: Id, _: Sel, _value: Id) {}
 
+/// The session's delegate (AVAudioSessionDelegate) hears interruptions; not retained, as Apple's.
+extern "C" fn session_set_delegate(this: Id, _: Sel, delegate: Id) {
+    property_set(this, "delegate", delegate as u64);
+}
+
+extern "C" fn session_delegate(this: Id, _: Sel) -> Id {
+    property_get(this, "delegate").unwrap_or(0) as Id
+}
+
 // ----- NSURL-based video: AVURLAsset, AVPlayerItem, AVPlayer, AVPlayerLayer -----
 
 extern "C" fn asset_with_url(class: Class, _: Sel, url: Id, _options: Id) -> Id {
@@ -207,6 +274,12 @@ fn showing() -> std::sync::MutexGuard<'static, Option<Showing>> {
     SHOWING.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Whether the phone's video player shows a video now (it sits under the
+/// iPhone pictures, so pictures.rs leaves it uncovered).
+pub fn video_showing() -> bool {
+    showing().is_some()
+}
+
 /// The phone app: the video with this token played to its end (or failed).
 pub fn video_ended(token: u64) {
     let finished = {
@@ -245,7 +318,11 @@ pub fn shows_video(view: Id) -> bool {
     if property_get(view, "moviePlayerOf").is_some() {
         return true;
     }
-    let layer = crate::fw::uikit::view_state(view).layer;
+    layer_shows_video(crate::fw::uikit::view_state(view).layer)
+}
+
+/// Whether a layer is an AVPlayerLayer with a player (covers what is under it).
+pub fn layer_shows_video(layer: Id) -> bool {
     layer != 0
         && property_get(layer, "player").is_some_and(|player| player != 0)
         && runtime::send(layer, "isKindOfClass:", &[runtime::class_named("AVPlayerLayer") as Id]) & 0xFF != 0
@@ -433,8 +510,6 @@ extern "C" fn layer_with_player(class: Class, _: Sel, player: Id) -> Id {
 }
 
 extern "C" fn item_add_observer(this: Id, s: Sel, observer: Id, key: Id, options: usize, context: usize) {
-    let imp = runtime::imp_for(runtime::class_named("NSObject"), runtime::sel("instanceMethodForSelector:"));
-    let _ = imp;
     let generic: extern "C" fn(Id, Sel, Id, Id, usize, usize) = unsafe {
         std::mem::transmute(object_method("addObserver:forKeyPath:options:context:"))
     };
@@ -442,7 +517,8 @@ extern "C" fn item_add_observer(this: Id, s: Sel, observer: Id, key: Id, options
     if string::get(key) == "status" {
         let data = this;
         let block = make_callback(data, |item| {
-            crate::fw::object::kvo_notify(item, "status", collections::number_int(1));
+            // AVPlayerItemStatusUnknown (0) to ReadyToPlay (1).
+            crate::fw::object::kvo_notify(item, "status", collections::number_int(0), collections::number_int(1));
         });
         crate::fw::runloop::post(crate::fw::runloop::Work::Block(block));
     }
@@ -476,8 +552,60 @@ extern "C" fn movie_url(this: Id, _: Sel) -> Id {
     property_get(this, "url").unwrap_or(0) as Id
 }
 
+/// setContentURL: the movie playing stops (said so) and the new one loads
+/// again; one that was playing starts the new movie once loaded (a later
+/// turn) when shouldAutoplay, as MediaPlayer does.
 extern "C" fn movie_set_url(this: Id, _: Sel, url: Id) {
+    let was_playing = property_get(this, "playbackState") == Some(MOVIE_PLAYING);
+    if property_get(this, "playbackState").unwrap_or(MOVIE_STOPPED) != MOVIE_STOPPED {
+        movie_stop(this, 0);
+    }
     property_set(this, "url", url as u64);
+    property_set(this, "loadTold", 0);
+    if was_playing && property_get(this, "shouldAutoplay").unwrap_or(1) != 0 {
+        crate::fw::runloop::post(crate::fw::runloop::Work::Native(Box::new(move || {
+            if property_get(this, "playbackState").unwrap_or(MOVIE_STOPPED) == MOVIE_STOPPED {
+                movie_play(this, 0);
+            }
+        })));
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test takes the notices at once: running the main loop to get them
+    /// would run other tests' queued work too.
+    static NOTICES_AT_ONCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Posts a movie player notification on a later turn, as MediaPlayer does.
+fn movie_notice_later(player: Id, name: &'static str) {
+    #[cfg(test)]
+    if NOTICES_AT_ONCE.with(|n| n.get()) {
+        return crate::fw::foundation::post(name, player, 0);
+    }
+    crate::fw::runloop::post(crate::fw::runloop::Work::Native(Box::new(move || crate::fw::foundation::post(name, player, 0))));
+}
+
+/// The movie is loaded (here at once): its load state, duration and
+/// preload are announced once per movie.
+fn movie_loaded(player: Id) {
+    if property_get(player, "loadTold").unwrap_or(0) != 0 {
+        return;
+    }
+    property_set(player, "loadTold", 1);
+    for name in ["MPMoviePlayerLoadStateDidChangeNotification", "MPMovieDurationAvailableNotification", "MPMoviePlayerContentPreloadDidFinishNotification"] {
+        movie_notice_later(player, name);
+    }
+}
+
+/// A new playback state, announced when it changed.
+fn set_movie_state(player: Id, state: u64) {
+    let old = property_get(player, "playbackState").unwrap_or(MOVIE_STOPPED);
+    property_set(player, "playbackState", state);
+    if old != state {
+        movie_notice_later(player, "MPMoviePlayerPlaybackStateDidChangeNotification");
+    }
 }
 
 fn movie_path(player: Id) -> String {
@@ -487,24 +615,26 @@ fn movie_path(player: Id) -> String {
 
 extern "C" fn movie_play(this: Id, _: Sel) {
     property_set(this, "moviePlayer", 1);
-    property_set(this, "playbackState", MOVIE_PLAYING);
+    movie_loaded(this);
+    set_movie_state(this, MOVIE_PLAYING);
     show_video(this, this, &movie_path(this));
 }
 
 extern "C" fn movie_prepare(this: Id, _: Sel) {
     // shouldAutoplay (YES unless the game says no) starts it once ready.
     if property_get(this, "shouldAutoplay").unwrap_or(1) != 0 && property_get(this, "playbackState").unwrap_or(MOVIE_STOPPED) == MOVIE_STOPPED {
-        movie_play(this, 0);
+        return movie_play(this, 0);
     }
+    movie_loaded(this);
 }
 
 extern "C" fn movie_pause(this: Id, s: Sel) {
-    property_set(this, "playbackState", MOVIE_PAUSED);
+    set_movie_state(this, MOVIE_PAUSED);
     player_pause(this, s);
 }
 
 extern "C" fn movie_stop(this: Id, _: Sel) {
-    property_set(this, "playbackState", MOVIE_STOPPED);
+    set_movie_state(this, MOVIE_STOPPED);
     property_set(this, "rate", 0);
     close_video_of(this);
 }
@@ -522,7 +652,7 @@ fn movie_player_ended(player: Id) {
         if property_get(player, "repeatMode") == Some(1) {
             return show_video(player, player, &movie_path(player));
         }
-        property_set(player, "playbackState", MOVIE_STOPPED);
+        set_movie_state(player, MOVIE_STOPPED);
         let info = crate::fw::collections::dictionary_from(&[(
             string::make("MPMoviePlayerPlaybackDidFinishReasonUserInfoKey"),
             crate::fw::collections::number_int(0),
@@ -692,7 +822,8 @@ pub fn register(r: &mut Registry) {
             ("IOBufferDuration", io_buffer_duration as usize),
             ("outputVolume", output_volume as usize),
             ("outputNumberOfChannels", two as usize),
-            ("setDelegate:", ignore_id as usize),
+            ("setDelegate:", session_set_delegate as usize),
+            ("delegate", session_delegate as usize),
         ],
     );
     for (name, value) in [
@@ -700,6 +831,9 @@ pub fn register(r: &mut Registry) {
         ("AVAudioSessionCategorySoloAmbient", "AVAudioSessionCategorySoloAmbient"),
         ("AVAudioSessionCategoryPlayback", "AVAudioSessionCategoryPlayback"),
         ("AVAudioSessionCategoryPlayAndRecord", "AVAudioSessionCategoryPlayAndRecord"),
+        ("AVAudioSessionInterruptionNotification", "AVAudioSessionInterruptionNotification"),
+        ("AVAudioSessionInterruptionTypeKey", "AVAudioSessionInterruptionTypeKey"),
+        ("AVAudioSessionInterruptionOptionKey", "AVAudioSessionInterruptionOptionKey"),
         ("AVPlayerItemDidPlayToEndTimeNotification", "AVPlayerItemDidPlayToEndTimeNotification"),
         ("AVLayerVideoGravityResizeAspect", "AVLayerVideoGravityResizeAspect"),
         ("AVLayerVideoGravityResizeAspectFill", "AVLayerVideoGravityResizeAspectFill"),
@@ -765,5 +899,113 @@ mod tests {
         let result = audio_session_get_property(four(b"aiav"), &mut size, &mut available as *mut u32 as *mut u8);
         assert_eq!(result, 0, "kAudioSessionProperty_AudioInputAvailable was refused");
         assert_eq!((available, size), (0, 4));
+    }
+
+    static INTERRUPTIONS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    extern "C" fn c_listener(data: usize, state: u32) {
+        INTERRUPTIONS.lock().unwrap_or_else(|e| e.into_inner()).push(format!("listener {data:#x} {state}"));
+    }
+
+    extern "C" fn delegate_begin(_this: Id, _: Sel) {
+        INTERRUPTIONS.lock().unwrap_or_else(|e| e.into_inner()).push("beginInterruption".into());
+    }
+
+    extern "C" fn delegate_end(_this: Id, _: Sel, flags: usize) {
+        INTERRUPTIONS.lock().unwrap_or_else(|e| e.into_inner()).push(format!("endInterruptionWithFlags: {flags}"));
+    }
+
+    extern "C" fn interruption_heard(_this: Id, _: Sel, notification: Id) {
+        let info = runtime::send(notification, "userInfo", &[]);
+        let number = |key: &str| {
+            let value = collections::dictionary_get(info, string::make(key));
+            if value == 0 { -1 } else { runtime::send(value, "integerValue", &[]) as isize }
+        };
+        let text = format!("notification type {} option {}", number("AVAudioSessionInterruptionTypeKey"), number("AVAudioSessionInterruptionOptionKey"));
+        INTERRUPTIONS.lock().unwrap_or_else(|e| e.into_inner()).push(text);
+    }
+
+    /// Android's audio focus lost and given back (a phone call) is an iOS
+    /// interruption: the C listener from AudioSessionInitialize hears begin
+    /// (1) and end (0), the AVAudioSession delegate beginInterruption and
+    /// endInterruptionWithFlags: (should resume), and observers
+    /// AVAudioSessionInterruptionNotification with its type and option.
+    /// A second loss while interrupted, or a gain without one, says nothing.
+    #[test]
+    fn losing_audio_focus_interrupts_the_audio_session() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            crate::run::setup();
+            let delegate = define_class("InterruptionTestDelegate", "NSObject", 8);
+            methods(delegate, &[("beginInterruption", delegate_begin as usize), ("endInterruptionWithFlags:", delegate_end as usize), ("heard:", interruption_heard as usize)]);
+        });
+        let heard = || std::mem::take(&mut *INTERRUPTIONS.lock().unwrap_or_else(|e| e.into_inner()));
+        assert_eq!(audio_session_initialize(0, 0, c_listener as usize, 0x55), 0);
+        let session = runtime::send(runtime::class_named("AVAudioSession"), "sharedInstance", &[]);
+        let delegate = runtime::alloc_instance(runtime::class_named("InterruptionTestDelegate"));
+        runtime::send(session, "setDelegate:", &[delegate]);
+        let center = runtime::send(runtime::class_named("NSNotificationCenter"), "defaultCenter", &[]);
+        let name = string::make("AVAudioSessionInterruptionNotification");
+        runtime::send(center, "addObserver:selector:name:object:", &[delegate, runtime::sel("heard:"), name, session]);
+
+        interrupt_now(true, false);
+        assert_eq!(heard(), ["listener 0x55 1", "beginInterruption", "notification type 1 option -1"]);
+        interrupt_now(true, false);
+        assert!(heard().is_empty(), "already interrupted");
+        interrupt_now(false, true);
+        assert_eq!(heard(), ["listener 0x55 0", "endInterruptionWithFlags: 1", "notification type 0 option 1"]);
+        interrupt_now(false, true);
+        assert!(heard().is_empty(), "not interrupted");
+        runtime::send(center, "removeObserver:", &[delegate]);
+        runtime::send(session, "setDelegate:", &[0]);
+    }
+
+    static MOVIE_HEARD: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    extern "C" fn movie_heard(_this: Id, _: Sel, notification: Id) {
+        // (Never a panic here: it would abort the test run from C.)
+        MOVIE_HEARD.lock().unwrap_or_else(|e| e.into_inner()).push(string::get(runtime::send(notification, "name", &[])));
+    }
+
+    /// The movie player tells its observers what Apple's does: once loaded,
+    /// the load state, the duration and the preload; each change of
+    /// playback state.
+    #[test]
+    fn the_movie_player_posts_load_and_playback_state_changes() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            crate::run::setup();
+            let listener = define_class("MovieTestListener", "NSObject", 8);
+            methods(listener, &[("heard:", movie_heard as usize)]);
+        });
+        let url = runtime::send(runtime::class_named("NSURL"), "fileURLWithPath:", &[string::make("/nowhere/movie.mp4")]);
+        let movie = runtime::send(runtime::send(runtime::class_named("MPMoviePlayerController"), "alloc", &[]), "initWithContentURL:", &[url]);
+        let listener = runtime::alloc_instance(runtime::class_named("MovieTestListener"));
+        let center = runtime::send(runtime::class_named("NSNotificationCenter"), "defaultCenter", &[]);
+        runtime::send(center, "addObserver:selector:name:object:", &[listener, runtime::sel("heard:"), 0, movie]);
+        NOTICES_AT_ONCE.with(|n| n.set(true));
+        runtime::send(movie, "setShouldAutoplay:", &[0]);
+        runtime::send(movie, "prepareToPlay", &[]);
+        runtime::send(movie, "pause", &[]);
+        runtime::send(movie, "pause", &[]);
+        runtime::send(movie, "stop", &[]);
+        let wanted = [
+            "MPMoviePlayerLoadStateDidChangeNotification",
+            "MPMovieDurationAvailableNotification",
+            "MPMoviePlayerContentPreloadDidFinishNotification",
+            "MPMoviePlayerPlaybackStateDidChangeNotification",
+            "MPMoviePlayerPlaybackStateDidChangeNotification",
+        ];
+        assert_eq!(*MOVIE_HEARD.lock().unwrap(), wanted, "a pause while paused changes nothing");
+        // A new movie in a paused player: it stops (said so). (Not a playing
+        // one: with no video screen here, play ends at once on the main loop,
+        // which other tests run.)
+        runtime::send(movie, "pause", &[]);
+        MOVIE_HEARD.lock().unwrap().clear();
+        let other = runtime::send(runtime::class_named("NSURL"), "fileURLWithPath:", &[string::make("/nowhere/other.mp4")]);
+        runtime::send(movie, "setContentURL:", &[other]);
+        assert_eq!(runtime::send(movie, "playbackState", &[]), 0, "stopped");
+        assert_eq!(*MOVIE_HEARD.lock().unwrap(), ["MPMoviePlayerPlaybackStateDidChangeNotification"]);
+        NOTICES_AT_ONCE.with(|n| n.set(false));
     }
 }

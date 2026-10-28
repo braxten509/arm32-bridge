@@ -3,8 +3,13 @@
 use crate::objc::runtime::{self, lock, Class, Id, Sel};
 use crate::symbols::Registry;
 
+/// Like Apple's _objc_rootAlloc: a class with its own +allocWithZone: (a
+/// singleton keeping its one copy) is asked through it.
 extern "C" fn alloc(class: Class, _: Sel) -> Id {
-    runtime::alloc_instance(class)
+    match runtime::imp_for(class, runtime::sel("allocWithZone:")) {
+        Some(imp) if imp as usize != alloc_with_zone as usize => runtime::send(class, "allocWithZone:", &[0]),
+        _ => runtime::alloc_instance(class),
+    }
 }
 
 extern "C" fn alloc_with_zone(class: Class, _: Sel, _zone: usize) -> Id {
@@ -21,6 +26,22 @@ extern "C" fn return_self(this: Id, _: Sel) -> Id {
 }
 
 extern "C" fn nothing(_this: Id, _: Sel) {}
+
+// Reference counting: nothing is freed yet, but a 32-bit game's objects are
+// counted for the "would dealloc" log (counted.rs).
+extern "C" fn retain(this: Id, _: Sel) -> Id {
+    crate::fw::counted::game_retain(this);
+    this
+}
+
+extern "C" fn release(this: Id, _: Sel) {
+    crate::fw::counted::game_release(this);
+}
+
+extern "C" fn autorelease(this: Id, _: Sel) -> Id {
+    crate::fw::counted::game_autorelease(this);
+    this
+}
 
 extern "C" fn retain_count(_this: Id, _: Sel) -> usize {
     1
@@ -144,7 +165,8 @@ extern "C" fn dealloc(this: Id, _: Sel) {
 // `observed_setter_key` instead (objc_msgSend, runtime::send, and 32-bit
 // games' messages), which gives the same notifications to every sender
 // that goes through objc_msgSend. For a key path "a.b" the setter of its
-// first key on the object counts.
+// first key on the object counts, and so do the keys each key depends on
+// (+keyPathsForValuesAffecting<Key>).
 
 /// NSKeyValueObservingOptions.
 const OPTION_NEW: usize = 1;
@@ -165,6 +187,10 @@ struct KeyObserver {
     /// value of the first key, and so on (shorter when one is nil). As
     /// Apple's, a change of any of these keys is a change of the path.
     chain: Vec<Id>,
+    /// The keys the path's keys depend on (+keyPathsForValuesAffecting<Key>,
+    /// followed to their own objects and dependents): a change of one of
+    /// these is a change of the path too, as Apple's.
+    extra: Vec<(Id, String)>,
 }
 
 impl KeyObserver {
@@ -172,10 +198,74 @@ impl KeyObserver {
         self.path.split('.')
     }
 
+    /// Every (object, key) whose change is a change of this path.
+    fn links(&self) -> impl Iterator<Item = (Id, &str)> {
+        self.chain.iter().copied().zip(self.keys()).chain(self.extra.iter().map(|(o, k)| (*o, k.as_str())))
+    }
+
     /// Whether `key` of `object` is a link of this path.
     fn watches(&self, object: Id, key: &str) -> bool {
-        self.chain.iter().zip(self.keys()).any(|(o, k)| *o == object && k == key)
+        self.links().any(|(o, k)| o == object && k == key)
     }
+}
+
+/// The key paths `key` of `object` depends on: its class's
+/// +keyPathsForValuesAffectingValueForKey: (asked once per class and key).
+fn affecting_paths(object: Id, key: &str) -> Vec<String> {
+    static ASKED: std::sync::Mutex<Option<std::collections::HashMap<(Class, String), Vec<String>>>> = std::sync::Mutex::new(None);
+    let class = lock().class_of(object);
+    let id = (class, key.to_string());
+    if let Some(paths) = ASKED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&id)) {
+        return paths.clone();
+    }
+    // NSObject's class method: an NSProxy (its own root) has none, and
+    // sending it there would fall to the proxy's abstract forwarding.
+    let set = if runtime::responds(class, "keyPathsForValuesAffectingValueForKey:") {
+        runtime::send(class, "keyPathsForValuesAffectingValueForKey:", &[crate::fw::string::make(key)])
+    } else {
+        0
+    };
+    let paths: Vec<String> = if set == 0 {
+        Vec::new()
+    } else {
+        // Apple refuses a key that depends on itself.
+        crate::fw::collections::array_items(runtime::send(set, "allObjects", &[])).into_iter().map(crate::fw::string::get).filter(|p| p != key).collect()
+    };
+    ASKED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(id, paths.clone());
+    paths
+}
+
+/// The dependent links of a path's chain (see `KeyObserver::extra`).
+fn dependents_of(chain: &[Id], path: &str) -> Vec<(Id, String)> {
+    fn add(object: Id, key: &str, out: &mut Vec<(Id, String)>, depth: usize) {
+        if depth > 8 {
+            return;
+        }
+        for dependent in affecting_paths(object, key) {
+            let chain = chain_of(object, &dependent);
+            for (o, k) in chain.iter().zip(dependent.split('.')) {
+                if !out.iter().any(|(oo, kk)| oo == o && kk == k) {
+                    out.push((*o, k.to_string()));
+                    add(*o, k, out, depth + 1);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for (object, key) in chain.iter().zip(path.split('.')) {
+        add(*object, key, &mut out, 0);
+    }
+    out
+}
+
+/// +keyPathsForValuesAffectingValueForKey:: +keyPathsForValuesAffecting<Key>
+/// when the class has it, else an empty set.
+extern "C" fn key_paths_affecting(class: Class, _: Sel, key: Id) -> Id {
+    let name = format!("keyPathsForValuesAffecting{}", capitalized(&crate::fw::string::get(key)));
+    if runtime::responds(class, &name) {
+        return runtime::send(class, &name, &[]);
+    }
+    crate::fw::misc::set_from(&[])
 }
 
 /// The objects along `path` from `object` (see `KeyObserver::chain`).
@@ -195,11 +285,21 @@ fn chain_of(object: Id, path: &str) -> Vec<Id> {
 /// Follows the path again after a link changed, so the observer watches the
 /// new objects and no longer the old ones.
 fn refollow(watchers: &[KeyObserver]) {
-    for watcher in watchers.iter().filter(|w| w.path.contains('.')) {
+    for watcher in watchers.iter().filter(|w| w.path.contains('.') || !w.extra.is_empty()) {
         let chain = chain_of(watcher.object, &watcher.path);
+        let extra = dependents_of(&chain, &watcher.path);
         let mut o = observing();
+        let o = &mut *o;
         if let Some(w) = o.observers.iter_mut().find(|w| w.serial == watcher.serial) {
+            let before = link_setters(w);
             w.chain = chain;
+            w.extra = extra;
+            let after = link_setters(w);
+            // Most changes only swap the objects along the path, not its keys.
+            if before != after {
+                count_setters(o, before, false);
+                count_setters(o, after, true);
+            }
         }
     }
 }
@@ -210,14 +310,21 @@ struct Observing {
     /// name and by selector.
     setters: std::collections::BTreeSet<String>,
     setter_sels: std::collections::BTreeSet<Sel>,
-    /// Changes announced by -willChangeValueForKey: and not yet done: the
-    /// object, key, and each observer's serial with its old value.
-    pending: Vec<(Id, String, Vec<(u64, Id)>)>,
+    /// How many links of all observers have each setter name.
+    setter_counts: std::collections::BTreeMap<String, usize>,
     next_serial: u64,
 }
 
 static OBSERVING: std::sync::Mutex<Observing> =
-    std::sync::Mutex::new(Observing { observers: Vec::new(), setters: std::collections::BTreeSet::new(), setter_sels: std::collections::BTreeSet::new(), pending: Vec::new(), next_serial: 0 });
+    std::sync::Mutex::new(Observing { observers: Vec::new(), setters: std::collections::BTreeSet::new(), setter_sels: std::collections::BTreeSet::new(), setter_counts: std::collections::BTreeMap::new(), next_serial: 0 });
+
+thread_local! {
+    /// Changes this thread announced by -willChangeValueForKey: and not yet
+    /// done: the object, key, and each observer's serial with its old value.
+    /// Per thread, as Apple's (_NSKeyValuePopPendingNotificationPerThread):
+    /// two threads changing the same key keep their own old values.
+    static PENDING: std::cell::RefCell<Vec<(Id, String, Vec<(u64, Id)>)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 /// How many observers there are: message senders skip all of this at 0.
 static OBSERVER_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -231,10 +338,40 @@ fn setter_names(key: &str) -> [String; 2] {
     [format!("set{capitalized}:"), format!("_set{capitalized}:")]
 }
 
-fn refresh_setters(o: &mut Observing) {
-    o.setters = o.observers.iter().flat_map(|w| w.keys().flat_map(setter_names).collect::<Vec<_>>()).collect();
-    o.setter_sels = o.setters.iter().map(|name| runtime::sel(name)).collect();
+/// The setter names of an observer's links, one pair per link (so adding
+/// and taking away the same links balance).
+fn link_setters(w: &KeyObserver) -> Vec<String> {
+    w.links().flat_map(|(_, key)| setter_names(key)).collect()
+}
+
+/// Counts setter names in (or out): the observed setters are the names some
+/// link still has. Each observer change only touches its own links, not
+/// every observer's.
+fn count_setters(o: &mut Observing, names: Vec<String>, add: bool) {
+    for name in names {
+        let count = o.setter_counts.entry(name.clone()).or_insert(0);
+        if add {
+            *count += 1;
+            if *count == 1 {
+                o.setter_sels.insert(runtime::sel(&name));
+                o.setters.insert(name);
+            }
+        } else {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                o.setter_counts.remove(&name);
+                o.setter_sels.remove(&runtime::sel(&name));
+                o.setters.remove(&name);
+            }
+        }
+    }
     OBSERVER_COUNT.store(o.observers.len(), std::sync::atomic::Ordering::SeqCst);
+}
+
+/// How many KVO registrations name `object`, as observer or as observed
+/// (for the "would dealloc" log, counted.rs).
+pub fn kvo_registrations_naming(object: Id) -> usize {
+    observing().observers.iter().filter(|w| w.observer == object || w.object == object).count()
 }
 
 /// Whether anything is observed at all (a cheap check for every message).
@@ -261,14 +398,18 @@ pub fn observed_setter_key(object: Id, selector: &str) -> Option<String> {
         let found = o
             .observers
             .iter()
-            .flat_map(|w| w.chain.iter().zip(w.keys()))
-            .find(|(o, key)| **o == object && setter_names(key).iter().any(|s| s == selector))
+            .flat_map(|w| w.links())
+            .find(|(o, key)| *o == object && setter_names(key).iter().any(|s| s == selector))
             .map(|(_, key)| key.to_string());
         found?
     };
+    notifies_automatically(object, &key).then_some(key)
+}
+
+/// Whether the class of `object` announces changes of `key` itself.
+fn notifies_automatically(object: Id, key: &str) -> bool {
     let class = lock().class_of(object);
-    let automatic = runtime::send(class, "automaticallyNotifiesObserversForKey:", &[crate::fw::string::make(&key)]) & 0xFF != 0;
-    automatic.then_some(key)
+    runtime::send(class, "automaticallyNotifiesObserversForKey:", &[crate::fw::string::make(key)]) & 0xFF != 0
 }
 
 fn observers_of(object: Id, key: &str) -> Vec<KeyObserver> {
@@ -314,7 +455,7 @@ pub fn will_change(object: Id, key: &str) {
         return;
     }
     let olds: Vec<(u64, Id)> = watchers.iter().map(|w| (w.serial, if w.options & OPTION_OLD != 0 { value_at(w.object, &w.path) } else { 0 })).collect();
-    observing().pending.push((object, key.to_string(), olds.clone()));
+    PENDING.with(|p| p.borrow_mut().push((object, key.to_string(), olds.clone())));
     for (watcher, (_, old)) in watchers.iter().zip(&olds) {
         if watcher.options & OPTION_PRIOR != 0 {
             tell(watcher, None, Some(*old), true);
@@ -322,17 +463,17 @@ pub fn will_change(object: Id, key: &str) {
     }
 }
 
-/// -didChangeValueForKey:: tells each observer the new value (and the old
-/// one its -willChangeValueForKey: noted).
+/// -didChangeValueForKey:: tells each observer its -willChangeValueForKey:
+/// found the new value (and the old one it noted). As Apple's
+/// _NSKeyValueDidChange, without a pending will it tells nobody.
 pub fn did_change(object: Id, key: &str) {
-    let olds = {
-        let mut o = observing();
-        match o.pending.iter().rposition(|(obj, k, _)| *obj == object && k == key) {
-            Some(at) => o.pending.remove(at).2,
-            None => Vec::new(),
-        }
-    };
-    let watchers = observers_of(object, key);
+    let popped = PENDING.with(|p| {
+        let mut p = p.borrow_mut();
+        let at = p.iter().rposition(|(obj, k, _)| *obj == object && k == key)?;
+        Some(p.remove(at).2)
+    });
+    let Some(olds) = popped else { return };
+    let watchers: Vec<KeyObserver> = observing().observers.iter().filter(|w| olds.iter().any(|(serial, _)| *serial == w.serial)).cloned().collect();
     refollow(&watchers);
     if let Some(w) = watchers.iter().find(|w| w.object != object) {
         static LOGGED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -350,12 +491,13 @@ pub fn did_change(object: Id, key: &str) {
 extern "C" fn add_key_observer(this: Id, _: Sel, observer: Id, path: Id, options: usize, context: usize) {
     let path = crate::fw::string::get(path);
     let chain = chain_of(this, &path);
+    let extra = dependents_of(&chain, &path);
     let watcher = {
         let mut o = observing();
         o.next_serial += 1;
-        let watcher = KeyObserver { serial: o.next_serial, object: this, path, observer, options, context, chain };
+        let watcher = KeyObserver { serial: o.next_serial, object: this, path, observer, options, context, chain, extra };
         o.observers.push(watcher.clone());
-        refresh_setters(&mut o);
+        count_setters(&mut o, link_setters(&watcher), true);
         watcher
     };
     if options & OPTION_INITIAL != 0 {
@@ -365,14 +507,29 @@ extern "C" fn add_key_observer(this: Id, _: Sel, observer: Id, path: Id, options
 }
 
 /// Takes away the latest matching registration (and with a context, only
-/// one made with it).
+/// one made with it). None: NSRangeException, as Apple's.
 fn remove_observer(this: Id, observer: Id, path: Id, context: Option<usize>) {
-    let path = crate::fw::string::get(path);
-    let mut o = observing();
-    if let Some(at) = o.observers.iter().rposition(|w| w.object == this && w.observer == observer && w.path == path && context.is_none_or(|c| c == w.context)) {
-        o.observers.remove(at);
-        refresh_setters(&mut o);
+    let text = crate::fw::string::get(path);
+    {
+        let mut o = observing();
+        if let Some(at) = o.observers.iter().rposition(|w| w.object == this && w.observer == observer && w.path == text && context.is_none_or(|c| c == w.context)) {
+            let gone = o.observers.remove(at);
+            count_setters(&mut o, link_setters(&gone), false);
+            return;
+        }
     }
+    let describe = |object: Id| format!("<{} {object:#x}>", crate::fw::string::describe_class_of(object));
+    let reason = format!("Cannot remove an observer {} for the key path \"{text}\" from {} because it is not registered as an observer.", describe(observer), describe(this));
+    crate::log!("removeObserver:forKeyPath: {reason} Raising NSRangeException");
+    crate::fw::exception::raise(exception_named("NSRangeException", &reason));
+}
+
+fn exception_named(name: &str, reason: &str) -> Id {
+    runtime::send(
+        runtime::class_named("NSException"),
+        "exceptionWithName:reason:userInfo:",
+        &[crate::fw::string::make(name), crate::fw::string::make(reason), 0],
+    )
 }
 
 extern "C" fn remove_key_observer(this: Id, _: Sel, observer: Id, path: Id) {
@@ -395,13 +552,21 @@ extern "C" fn automatically_notifies(_class: Class, _: Sel, _key: Id) -> bool {
     true
 }
 
-/// Tells observers of `key` on `object` that the framework changed it to `value`.
-pub fn kvo_notify(object: Id, key: &str, value: Id) {
+/// Tells observers of `key` on `object` that the framework changed it from
+/// `old` to `new`, as a setter's change is told: Prior first, then the change.
+pub fn kvo_notify(object: Id, key: &str, old: Id, new: Id) {
     let watchers = observers_of(object, key);
+    if watchers.is_empty() {
+        return;
+    }
+    let own = |w: &KeyObserver| w.object == object && w.path == key;
+    for watcher in watchers.iter().filter(|w| w.options & OPTION_PRIOR != 0) {
+        tell(watcher, None, own(watcher).then_some(old), true);
+    }
     refollow(&watchers);
     for watcher in &watchers {
-        let new = if watcher.object == object && watcher.path == key { value } else { value_at(watcher.object, &watcher.path) };
-        tell(watcher, Some(new), None, false);
+        let value = if own(watcher) { new } else { value_at(watcher.object, &watcher.path) };
+        tell(watcher, Some(value), own(watcher).then_some(old), false);
     }
 }
 
@@ -414,9 +579,9 @@ pub fn define(_: &mut Registry) -> Class {
     };
     m("init", return_self as usize);
     m("self", return_self as usize);
-    m("retain", return_self as usize);
-    m("autorelease", return_self as usize);
-    m("release", nothing as usize);
+    m("retain", retain as usize);
+    m("autorelease", autorelease as usize);
+    m("release", release as usize);
     m("dealloc", dealloc as usize);
     m("retainCount", retain_count as usize);
     m("class", class_of_instance as usize);
@@ -474,7 +639,13 @@ pub fn define(_: &mut Registry) -> Class {
     c("resolveInstanceMethod:", resolve_nothing as usize);
     c("resolveClassMethod:", resolve_nothing as usize);
     c("automaticallyNotifiesObserversForKey:", automatically_notifies as usize);
+    c("keyPathsForValuesAffectingValueForKey:", key_paths_affecting as usize);
+    c("accessInstanceVariablesDirectly", class_answer_yes as usize);
     class
+}
+
+extern "C" fn class_answer_yes(_class: Class, _: Sel) -> bool {
+    true
 }
 
 /// NSProxy: the other root class. It has only the NSObject protocol's
@@ -486,9 +657,9 @@ pub fn define_proxy() -> Class {
     methods(
         class,
         &[
-            ("retain", return_self as usize),
-            ("autorelease", return_self as usize),
-            ("release", nothing as usize),
+            ("retain", retain as usize),
+            ("autorelease", autorelease as usize),
+            ("release", release as usize),
             ("dealloc", dealloc as usize),
             ("finalize", nothing as usize),
             ("retainCount", retain_count as usize),
@@ -903,12 +1074,31 @@ fn write_field(field: &Field, value: Id) -> bool {
     true
 }
 
+/// The instance variable key-value coding may use for `key`: only when the
+/// class's +accessInstanceVariablesDirectly says YES, as Apple's.
+fn ivar_for(this: Id, key: &str) -> Option<Field> {
+    let class = lock().class_of(this);
+    if runtime::send(class, "accessInstanceVariablesDirectly", &[]) & 0xFF == 0 {
+        return None;
+    }
+    field_for(this, key)
+}
+
+/// Whether key-value coding can store a value in `field` (see `write_field`).
+fn field_writable(field: &Field) -> bool {
+    match field.kind.as_bytes().first() {
+        Some(b'@') => !field.guest || crate::fw::system::guest_memory().is_some(),
+        Some(b'c' | b'C' | b'B' | b's' | b'S' | b'i' | b'I' | b'l' | b'L' | b'q' | b'Q' | b'f' | b'd') => true,
+        _ => false,
+    }
+}
+
 extern "C" fn value_for_key(this: Id, _: Sel, key: Id) -> Id {
     let name = crate::fw::string::get(key);
     if let Some(sel) = getter(this, &name) {
         return boxed_result(this, sel);
     }
-    match field_for(this, &name).and_then(|field| read_field(&field)) {
+    match ivar_for(this, &name).and_then(|field| read_field(&field)) {
         Some(value) => value,
         None => runtime::send(this, "valueForUndefinedKey:", &[key]),
     }
@@ -941,8 +1131,12 @@ extern "C" fn set_value_for_undefined_key(this: Id, _: Sel, _value: Id, key: Id)
     raise_unknown_key(this, "setValue:forUndefinedKey:", key);
 }
 
+/// NSObject's -setNilValueForKey: raises NSInvalidArgumentException.
 extern "C" fn set_nil_value_for_key(this: Id, _: Sel, key: Id) {
-    crate::log!("setValue:forKey: nil for {}'s number key {}; ignored", crate::fw::string::describe_class_of(this), crate::fw::string::get(key));
+    let class = crate::fw::string::describe_class_of(this);
+    let reason = format!("[<{class} {this:#x}> setNilValueForKey]: could not set nil as the value for the key {}.", crate::fw::string::get(key));
+    crate::log!("setValue:forKey: {reason} Raising NSInvalidArgumentException");
+    crate::fw::exception::raise(exception_named("NSInvalidArgumentException", &reason));
 }
 
 /// Calls setter `sel` with `value` unboxed for its argument type.
@@ -991,11 +1185,21 @@ extern "C" fn set_value_for_key(this: Id, _: Sel, value: Id, key: Id) {
     let cap = capitalized(&name);
     match [format!("set{cap}:"), format!("_set{cap}:")].into_iter().find(|n| runtime::responds(this, n)) {
         Some(setter) => call_setter(this, runtime::sel(&setter), value, key),
-        None => match field_for(this, &name) {
+        None => match ivar_for(this, &name) {
             Some(field) if value == 0 && !field.kind.starts_with('@') => {
                 runtime::send(this, "setNilValueForKey:", &[key]);
             }
-            Some(field) if write_field(&field, value) => {}
+            // As Apple's _NSSetValueAndNotifyForKeyInIvar: observers hear it.
+            Some(field) if field_writable(&field) => {
+                let notify = kvo_active() && !observers_of(this, &name).is_empty() && notifies_automatically(this, &name);
+                if notify {
+                    will_change(this, &name);
+                }
+                write_field(&field, value);
+                if notify {
+                    did_change(this, &name);
+                }
+            }
             _ => {
                 runtime::send(this, "setValue:forUndefinedKey:", &[value, key]);
             }
@@ -1405,7 +1609,7 @@ mod tests {
 
     /// Key-value coding's setter path announces a change of an observed key,
     /// as objc_msgSend's does: SpellCraft sets a wand's spell with
-    /// setValue:forKey:. The direct-ivar fallback (no setter) stays quiet.
+    /// setValue:forKey:.
     #[test]
     fn setting_an_observed_key_by_key_value_coding_notifies() {
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1427,6 +1631,338 @@ mod tests {
         assert_eq!(take(), [], "removed");
         assert_eq!(string::get(thing_title(object, 0)), "quiet");
         assert_eq!(string::get(runtime::send(object, "performSelector:", &[runtime::sel("title")])), "quiet", "performSelector: still answers");
+    }
+
+    /// What the shared note-taking observer below heard: observer, key path,
+    /// "new" and "old" (None when the change has no such entry), and whether
+    /// it was a Prior notice.
+    type Note = (Id, String, Option<String>, Option<String>, bool);
+    static NOTES: std::sync::Mutex<Vec<Note>> = std::sync::Mutex::new(Vec::new());
+
+    extern "C" fn note_observe(this: Id, _: Sel, path: Id, _object: Id, change: Id, _context: usize) {
+        let entry = |key: &str| {
+            let value = collections::dictionary_get(change, string::make(key));
+            (value != 0).then(|| if string::is_string(value) { string::get(value) } else { string::describe(value) })
+        };
+        let prior = collections::dictionary_get(change, string::make("notificationIsPrior")) != 0;
+        NOTES.lock().unwrap().push((this, string::get(path), entry("new"), entry("old"), prior));
+    }
+
+    /// A fresh note-taking observer and a way to take what it heard.
+    fn note_taker() -> (Id, impl Fn() -> Vec<(String, Option<String>, Option<String>, bool)>) {
+        static CLASS: std::sync::OnceLock<Class> = std::sync::OnceLock::new();
+        let class = *CLASS.get_or_init(|| {
+            let class = define_class("KvoNoteWatcher", "NSObject", 8);
+            methods(class, &[("observeValueForKeyPath:ofObject:change:context:", note_observe as usize)]);
+            class
+        });
+        let watcher = runtime::alloc_instance(class);
+        let take = move || {
+            let mut all = NOTES.lock().unwrap();
+            let (mine, others): (Vec<Note>, Vec<Note>) = all.drain(..).partition(|n| n.0 == watcher);
+            *all = others;
+            mine.into_iter().map(|(_, path, new, old, prior)| (path, new, old, prior)).collect()
+        };
+        (watcher, take)
+    }
+
+    fn text(t: &str) -> Option<String> {
+        Some(t.to_string())
+    }
+
+    /// -didChangeValueForKey: tells only the observers its
+    /// -willChangeValueForKey: found, as Apple's: alone it tells nobody, and
+    /// an observer added in between hears nothing of that change.
+    #[test]
+    fn did_change_tells_only_whom_will_change_found() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let s = string::make;
+        let (watcher, take) = note_taker();
+        let object = thing("before", 0, 0);
+        runtime::send(object, "addObserver:forKeyPath:options:context:", &[watcher, s("title"), 1 | 2, 0]);
+        runtime::send(object, "didChangeValueForKey:", &[s("title")]);
+        assert_eq!(take(), [], "a did without a will");
+        let other = thing("other", 0, 0);
+        runtime::send(other, "willChangeValueForKey:", &[s("title")]);
+        runtime::send(other, "addObserver:forKeyPath:options:context:", &[watcher, s("title"), 1 | 2, 0]);
+        runtime::send(other, "didChangeValueForKey:", &[s("title")]);
+        assert_eq!(take(), [], "added between the will and the did");
+        runtime::send(object, "willChangeValueForKey:", &[s("title")]);
+        runtime::send(object, "didChangeValueForKey:", &[s("title")]);
+        assert_eq!(take(), [("title".to_string(), text("before"), text("before"), false)], "a will/did pair still tells");
+    }
+
+    extern "C" fn dep_full_title(this: Id, _: Sel) -> Id {
+        string::make(&format!("Mr {}", string::get(thing_title(this, 0))))
+    }
+    extern "C" fn dep_child_title(this: Id, _: Sel) -> Id {
+        let child = thing_child(this, 0);
+        string::make(&format!("child {}", if child == 0 { String::new() } else { string::get(thing_title(child, 0)) }))
+    }
+    extern "C" fn dep_affecting_full_title(_class: Class, _: Sel) -> Id {
+        crate::fw::misc::set_from(&[string::make("title")])
+    }
+    extern "C" fn dep_affecting_child_title(_class: Class, _: Sel) -> Id {
+        crate::fw::misc::set_from(&[string::make("child.title")])
+    }
+
+    /// +keyPathsForValuesAffecting<Key>: observing a derived key observes
+    /// the key paths it depends on, and their changes are told as changes of
+    /// the derived key (with its old and new values). SpellCraft has about
+    /// 140 of these ("item.icon", "spec.hidden", ...).
+    #[test]
+    fn observers_of_a_derived_key_hear_changes_of_the_keys_it_depends_on() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let s = string::make;
+        thing("define the parent class", 0, 0);
+        let class = define_class("KvoDepThing", "KvcTestThing", 8);
+        methods(class, &[("fullTitle", dep_full_title as usize), ("childTitle", dep_child_title as usize)]);
+        class_methods(
+            class,
+            &[("keyPathsForValuesAffectingFullTitle", dep_affecting_full_title as usize), ("keyPathsForValuesAffectingChildTitle", dep_affecting_child_title as usize)],
+        );
+        let make = |title: &str, child: Id| {
+            let object = runtime::alloc_instance(class);
+            crate::fw::uikit::property_set(object, "title", s(title) as u64);
+            crate::fw::uikit::property_set(object, "child", child as u64);
+            object
+        };
+        let msg_send: extern "C" fn(Id, Sel, Id) = unsafe { std::mem::transmute(runtime::ios_objc_msgSend as usize) };
+        let (watcher, take) = note_taker();
+        let object = make("Al", 0);
+        runtime::send(object, "addObserver:forKeyPath:options:context:", &[watcher, s("fullTitle"), 1 | 2, 0]);
+        msg_send(object, runtime::sel("setTitle:"), s("Bob"));
+        assert_eq!(take(), [("fullTitle".to_string(), text("Mr Bob"), text("Mr Al"), false)]);
+
+        let (first, second) = (thing("one", 0, 0), thing("two", 0, 0));
+        let parent = make("p", first);
+        runtime::send(parent, "addObserver:forKeyPath:options:context:", &[watcher, s("childTitle"), 1, 0]);
+        msg_send(first, runtime::sel("setTitle:"), s("uno"));
+        assert_eq!(take(), [("childTitle".to_string(), text("child uno"), None, false)], "the end of a dependent key path");
+        msg_send(parent, runtime::sel("setChild:"), second);
+        assert_eq!(take(), [("childTitle".to_string(), text("child two"), None, false)], "a link of it");
+        msg_send(first, runtime::sel("setTitle:"), s("left"));
+        assert_eq!(take(), [], "the old child is no longer depended on");
+        msg_send(second, runtime::sel("setTitle:"), s("dos"));
+        assert_eq!(take(), [("childTitle".to_string(), text("child dos"), None, false)], "the new one is");
+
+        runtime::send(object, "removeObserver:forKeyPath:", &[watcher, s("fullTitle")]);
+        runtime::send(parent, "removeObserver:forKeyPath:", &[watcher, s("childTitle")]);
+        msg_send(object, runtime::sel("setTitle:"), s("Cy"));
+        msg_send(second, runtime::sel("setTitle:"), s("tres"));
+        assert_eq!(take(), [], "removed");
+    }
+
+    /// A key path through an NSProxy: the proxy's class has no
+    /// +keyPathsForValuesAffectingValueForKey: (NSProxy is its own root), so
+    /// it is not asked; asking it raised NSProxy's methodSignatureForSelector:
+    /// exception (SpellCraft froze on Play).
+    #[test]
+    fn a_key_path_through_a_proxy_observes_without_an_exception() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let proxy = runtime::alloc_instance(runtime::class_named("NSProxy"));
+        let parent = thing("parent", 0, proxy);
+        let (watcher, _take) = note_taker();
+        let path = string::make("child.title");
+        let (_, raised) = crate::fw::exception::catching(|| runtime::send(parent, "addObserver:forKeyPath:options:context:", &[watcher, path, 1, 0]));
+        assert_eq!(raised.map(|e| string::get(runtime::send(e, "reason", &[]))), None);
+        runtime::send(parent, "removeObserver:forKeyPath:", &[watcher, path]);
+    }
+
+    static SINGLETON: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    extern "C" fn singleton_alloc_with_zone(class: Class, _: Sel, _zone: usize) -> Id {
+        let object = runtime::alloc_instance(class);
+        SINGLETON.store(object, std::sync::atomic::Ordering::SeqCst);
+        object
+    }
+
+    /// Apple's +alloc goes through a class's own +allocWithZone: (Infinity
+    /// Blade's store manager keeps its single copy there; skipped, the store
+    /// got a nil observer and the game stopped).
+    #[test]
+    fn alloc_goes_through_a_classes_own_alloc_with_zone() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let class = define_class("AllocZoneSingleton", "NSObject", 8);
+        class_methods(class, &[("allocWithZone:", singleton_alloc_with_zone as usize)]);
+        let object = runtime::send(class, "alloc", &[]);
+        assert_ne!(object, 0);
+        assert_eq!(SINGLETON.load(std::sync::atomic::Ordering::SeqCst), object);
+        let made = runtime::send(class, "new", &[]);
+        assert_eq!(SINGLETON.load(std::sync::atomic::Ordering::SeqCst), made);
+    }
+
+    /// The fields hook that was there before the ivar test put its own in.
+    static EARLIER_FIELDS: std::sync::Mutex<Option<FieldsHook>> = std::sync::Mutex::new(None);
+
+    /// Objects of the ivar test classes keep `_title` at offset 8; anything
+    /// else goes to the hook that was there before.
+    fn ivar_fields(object: Id, name: &str) -> Option<Field> {
+        let class_name = { let rt = lock(); rt.class_name(rt.class_of(object)) };
+        if matches!(class_name.as_str(), "KvcIvarThing" | "KvcClosedThing") {
+            return (name == "_title").then(|| Field { at: object + 8, kind: "@".into(), guest: false });
+        }
+        let earlier = *EARLIER_FIELDS.lock().unwrap();
+        earlier.and_then(|hook| hook(object, name))
+    }
+
+    extern "C" fn closed_ivars(_class: Class, _: Sel) -> bool {
+        false
+    }
+
+    /// Key-value coding of a key that has only an instance variable, as
+    /// Foundation's: setValue:forKey: tells the key's observers, and a class
+    /// whose +accessInstanceVariablesDirectly says NO has no such key.
+    #[test]
+    fn key_value_coding_of_an_ivar_notifies_and_asks_the_class_first() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let s = string::make;
+        // The hook is the whole process's (wire.rs puts the 32-bit bridge's
+        // in): this test's passes other objects on and is taken out after.
+        let earlier = std::mem::replace(&mut *EXTRA_FIELDS.write().unwrap(), Some(ivar_fields));
+        *EARLIER_FIELDS.lock().unwrap() = earlier;
+        struct Restore(Option<FieldsHook>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                *EXTRA_FIELDS.write().unwrap_or_else(|e| e.into_inner()) = self.0;
+            }
+        }
+        let _restore = Restore(earlier);
+        let open = define_class("KvcIvarThing", "NSObject", 16);
+        let closed = define_class("KvcClosedThing", "NSObject", 16);
+        class_methods(closed, &[("accessInstanceVariablesDirectly", closed_ivars as usize)]);
+        let (watcher, take) = note_taker();
+        let object = runtime::alloc_instance(open);
+        runtime::send(object, "addObserver:forKeyPath:options:context:", &[watcher, s("title"), 1, 0]);
+        runtime::send(object, "setValue:forKey:", &[s("first"), s("title")]);
+        assert_eq!(take(), [("title".to_string(), text("first"), None, false)], "an ivar set by setValue:forKey:");
+        assert_eq!(string::get(runtime::send(object, "valueForKey:", &[s("title")])), "first");
+        let shut = runtime::alloc_instance(closed);
+        let (_, raised) = crate::fw::exception::catching(|| runtime::send(shut, "valueForKey:", &[s("title")]));
+        assert!(raised.is_some(), "no ivar access: an unknown key");
+    }
+
+    /// Foundation's raises: removing an observer that isn't registered
+    /// (NSRangeException) and nil for a number key (NSInvalidArgumentException).
+    #[test]
+    fn removing_a_stranger_and_setting_nil_for_a_number_raise() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let s = string::make;
+        let (watcher, _take) = note_taker();
+        let object = thing("t", 3, 0);
+        let name_of = |raised: Option<Id>| raised.map(|e| string::get(runtime::send(e, "name", &[])));
+        let (_, raised) = crate::fw::exception::catching(|| runtime::send(object, "removeObserver:forKeyPath:", &[watcher, s("title")]));
+        assert_eq!(name_of(raised), text("NSRangeException"), "not registered");
+        runtime::send(object, "addObserver:forKeyPath:options:context:", &[watcher, s("title"), 1, 0]);
+        let (_, raised) = crate::fw::exception::catching(|| runtime::send(object, "removeObserver:forKeyPath:", &[watcher, s("title")]));
+        assert_eq!(raised, None, "registered");
+        let (_, raised) = crate::fw::exception::catching(|| runtime::send(object, "setValue:forKey:", &[0, s("count")]));
+        assert_eq!(name_of(raised), text("NSInvalidArgumentException"), "nil for a number");
+        assert_eq!(thing_count(object, 0), 3);
+    }
+
+    /// The framework's own changes (an operation finishing) give observers
+    /// the old value and the Prior notice, as a real setter's do.
+    #[test]
+    fn framework_changes_tell_the_old_value_and_prior() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let s = string::make;
+        let (watcher, take) = note_taker();
+        let operation = runtime::send(runtime::class_named("NSOperation"), "new", &[]);
+        runtime::send(operation, "addObserver:forKeyPath:options:context:", &[watcher, s("isFinished"), 1 | 2 | 8, 0]);
+        runtime::send(operation, "start", &[]);
+        let no = string::describe(collections::number_bool(false));
+        let yes = string::describe(collections::number_bool(true));
+        assert_eq!(take(), [("isFinished".to_string(), None, Some(no.clone()), true), ("isFinished".to_string(), Some(yes), Some(no), false)]);
+    }
+
+    /// isFinished as read by the observer during each notice: Prior, then the change.
+    static STATE_SEEN: std::sync::Mutex<Vec<(bool, bool)>> = std::sync::Mutex::new(Vec::new());
+
+    extern "C" fn state_observe(_this: Id, _: Sel, _path: Id, object: Id, change: Id, _context: usize) {
+        let prior = collections::dictionary_get(change, string::make("notificationIsPrior")) != 0;
+        let finished = runtime::send(object, "isFinished", &[]) & 0xFF != 0;
+        STATE_SEEN.lock().unwrap().push((prior, finished));
+    }
+
+    /// The framework's own changes are announced around the change, as a
+    /// setter's are: an observer reading the state in the Prior notice sees
+    /// the old state, and in the change notice the new one.
+    #[test]
+    fn a_prior_notice_of_a_framework_change_comes_before_the_change() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let class = define_class("KvoStateWatcher", "NSObject", 8);
+        methods(class, &[("observeValueForKeyPath:ofObject:change:context:", state_observe as usize)]);
+        let watcher = runtime::alloc_instance(class);
+        let operation = runtime::send(runtime::class_named("NSOperation"), "new", &[]);
+        runtime::send(operation, "addObserver:forKeyPath:options:context:", &[watcher, string::make("isFinished"), 1 | 8, 0]);
+        runtime::send(operation, "start", &[]);
+        assert_eq!(*STATE_SEEN.lock().unwrap(), [(true, false), (false, true)]);
+    }
+
+    /// Changes announced on two threads at once keep their own old values:
+    /// Apple keeps -willChangeValueForKey:'s pending changes per thread.
+    #[test]
+    fn pending_changes_belong_to_their_thread() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let s = string::make;
+        let (watcher, take) = note_taker();
+        let object = thing("one", 0, 0);
+        runtime::send(object, "addObserver:forKeyPath:options:context:", &[watcher, s("title"), 1 | 2, 0]);
+        let (willed, go) = (std::sync::mpsc::channel::<()>(), std::sync::mpsc::channel::<()>());
+        let (willed_tx, willed_rx) = willed;
+        let (go_tx, go_rx) = go;
+        let other = std::thread::spawn(move || {
+            runtime::send(object, "willChangeValueForKey:", &[string::make("title")]);
+            willed_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+            runtime::send(object, "didChangeValueForKey:", &[string::make("title")]);
+        });
+        willed_rx.recv().unwrap();
+        crate::fw::uikit::property_set(object, "title", s("two") as u64);
+        runtime::send(object, "willChangeValueForKey:", &[s("title")]);
+        go_tx.send(()).unwrap();
+        other.join().unwrap();
+        assert_eq!(take(), [("title".to_string(), text("two"), text("one"), false)], "the other thread's did tells its own old value");
+        runtime::send(object, "didChangeValueForKey:", &[s("title")]);
+        assert_eq!(take(), [("title".to_string(), text("two"), text("two"), false)], "and this thread's its own");
+    }
+
+    /// A game object's -retain/-release/-autorelease (NSObject's) count it,
+    /// and its last release logs its dealloc at the next safe point.
+    #[test]
+    fn a_game_objects_last_release_is_logged_as_a_would_be_dealloc() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        use crate::fw::counted;
+        let class = define_class("GameCountedThing", "NSObject", 8);
+        counted::count_game_class(class);
+        let object = runtime::send(runtime::send(class, "alloc", &[]), "init", &[]);
+        counted::watch_game_object(object);
+        runtime::send(object, "retain", &[]);
+        assert_eq!(counted::game_count(object), Some(2));
+        runtime::send(object, "release", &[]);
+        let mut watch = crate::report::LineWatch::now();
+        runtime::send(object, "release", &[]);
+        assert_eq!(counted::game_count(object), Some(0));
+        counted::dealloc_pending();
+        assert!(watch.wait_for(&format!("dealloc GameCountedThing {object:#x}"), std::time::Duration::from_millis(500)), "logged");
+        let pooled = runtime::send(runtime::send(class, "alloc", &[]), "init", &[]);
+        counted::watch_game_object(pooled);
+        let mark = counted::pool_mark();
+        runtime::send(pooled, "autorelease", &[]);
+        assert_eq!(counted::game_count(pooled), Some(1), "an autorelease waits for its pool");
+        counted::pool_drain(mark);
+        assert_eq!(counted::game_count(pooled), Some(0));
     }
 
     /// Fields of a 32-bit game's object: long is 4 bytes, 8-byte values may

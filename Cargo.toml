@@ -18,6 +18,8 @@ unicorn-engine = { version = "2.1.5", default-features = false, features = ["arc
 guest32-image = { path = "ios/guest32-image" }
 # The bridge's memory allocator (src/lib.rs); local-dynamic TLS because Android loads the bridge with dlopen.
 mimalloc = { version = "0.1.52", features = ["local_dynamic_tls"] }
+# AI-upscaled picture packs (src/texture_pack.rs): pure-Rust WebP, lossy with alpha.
+image-webp = "0.2"
 
 [workspace]
 members = ["converter", "pacer", "ios", "ios/guest32-image"]

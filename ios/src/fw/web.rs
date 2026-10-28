@@ -214,33 +214,61 @@ extern "C" fn request_set_method(this: Id, _: Sel, method: Id) {
 }
 
 // ----- NSURLConnection: every connection fails as offline -----
+// As Apple's NSURLConnectionInternal: -initWithInfo: retains the delegate
+// and the connection (CFRetain), so a delegate only its connection holds
+// lives until the last callback; the block of
+// -_withConnectionDisconnectFromConnection: lets go of both after it (or at
+// -cancel, after which the delegate hears nothing more).
 
-fn report_failure(connection: Id, delegate: Id) {
+fn hold_delegate(connection: Id, delegate: Id) {
+    property_set(connection, "delegate", delegate as u64);
+    if delegate != 0 {
+        runtime::send(delegate, "retain", &[]);
+        runtime::send(connection, "retain", &[]);
+    }
+}
+
+/// Lets go of the delegate (once: a second failure or cancel finds none).
+fn disconnect(connection: Id) {
+    let delegate = property_get(connection, "delegate").unwrap_or(0) as Id;
+    if delegate != 0 {
+        property_set(connection, "delegate", 0);
+        runtime::send(delegate, "release", &[]);
+        runtime::send(connection, "release", &[]);
+    }
+}
+
+fn report_failure(connection: Id) {
     let url = property_get(property_get(connection, "request").unwrap_or(0) as Id, "url").unwrap_or(0) as Id;
     crate::log!("web request {} refused: offline", string::describe(url));
-    let pair = Box::into_raw(Box::new((connection, delegate))) as usize;
-    let block = crate::fw::media::make_callback(pair, |data| {
-        let (connection, delegate) = *unsafe { Box::from_raw(data as *mut (Id, Id)) };
+    let block = crate::fw::media::make_callback(connection, |connection| {
+        let delegate = property_get(connection, "delegate").unwrap_or(0) as Id;
         if delegate != 0 && runtime::responds(delegate, "connection:didFailWithError:") {
             runtime::send(delegate, "connection:didFailWithError:", &[connection, offline_error()]);
         }
+        disconnect(connection);
     });
     crate::fw::runloop::post(crate::fw::runloop::Work::Block(block));
 }
 
 extern "C" fn connection_init(this: Id, _: Sel, request: Id, delegate: Id) -> Id {
     property_set(this, "request", request as u64);
-    report_failure(this, delegate);
+    hold_delegate(this, delegate);
+    report_failure(this);
     this
 }
 
 extern "C" fn connection_init_start(this: Id, _: Sel, request: Id, delegate: Id, start: u8) -> Id {
     property_set(this, "request", request as u64);
-    property_set(this, "delegate", delegate as u64);
+    hold_delegate(this, delegate);
     if start != 0 {
-        report_failure(this, delegate);
+        report_failure(this);
     }
     this
+}
+
+extern "C" fn connection_cancel(this: Id, _: Sel) {
+    disconnect(this);
 }
 
 extern "C" fn connection_with_request(class: Class, s: Sel, request: Id, delegate: Id) -> Id {
@@ -248,9 +276,17 @@ extern "C" fn connection_with_request(class: Class, s: Sel, request: Id, delegat
     connection_init(object, s, request, delegate)
 }
 
+/// -originalRequest / -currentRequest: the request it was made with (no
+/// redirect is ever followed here).
+extern "C" fn connection_request(this: Id, _: Sel) -> Id {
+    property_get(this, "request").unwrap_or(0) as Id
+}
+
 extern "C" fn connection_start(this: Id, _: Sel) {
-    let delegate = property_get(this, "delegate").unwrap_or(0) as Id;
-    report_failure(this, delegate);
+    // A cancelled (or finished) connection has let go of its delegate.
+    if property_get(this, "delegate").unwrap_or(0) != 0 {
+        report_failure(this);
+    }
 }
 
 extern "C" fn connection_send_sync(_: Class, _: Sel, request: Id, response: *mut Id, error: *mut Id) -> Id {
@@ -275,6 +311,8 @@ extern "C" fn connection_send_async(_: Class, _: Sel, request: Id, _queue: Id, h
         let header = handler as *const crate::libsystem::mach::BlockHeader;
         let invoke: extern "C" fn(usize, Id, Id, Id) = unsafe { std::mem::transmute((*header).invoke) };
         invoke(handler, 0, 0, offline_error());
+        // NSURLConnection lets go of its copy once the handler has run.
+        crate::libsystem::mach::block_release(handler as *mut _);
     });
     crate::fw::runloop::post(crate::fw::runloop::Work::Block(block));
 }
@@ -491,7 +529,9 @@ pub fn register(r: &mut Registry) {
             ("initWithRequest:delegate:", connection_init as usize),
             ("initWithRequest:delegate:startImmediately:", connection_init_start as usize),
             ("start", connection_start as usize),
-            ("cancel", nothing as usize),
+            ("currentRequest", connection_request as usize),
+            ("originalRequest", connection_request as usize),
+            ("cancel", connection_cancel as usize),
             ("scheduleInRunLoop:forMode:", ignore_id_id as usize),
             ("unscheduleFromRunLoop:forMode:", ignore_id_id as usize),
             ("useCredential:forAuthenticationChallenge:", connection_answer_challenge as usize),
@@ -621,6 +661,76 @@ extern "C" fn no_with(_: Class, _: Sel, _value: Id) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static COUNTS: Mutex<Vec<(Id, isize)>> = Mutex::new(Vec::new());
+    static COUNTS_IN_CALLBACK: Mutex<Vec<(Id, isize)>> = Mutex::new(Vec::new());
+
+    fn count_of(object: Id) -> isize {
+        COUNTS.lock().unwrap().iter().find(|(o, _)| *o == object).map_or(0, |e| e.1)
+    }
+
+    fn change(object: Id, by: isize) {
+        let mut counts = COUNTS.lock().unwrap();
+        match counts.iter_mut().find(|(o, _)| *o == object) {
+            Some(entry) => entry.1 += by,
+            None => counts.push((object, by)),
+        }
+    }
+
+    extern "C" fn counted_retain(this: Id, _: Sel) -> Id {
+        change(this, 1);
+        this
+    }
+
+    extern "C" fn counted_release(this: Id, _: Sel) {
+        change(this, -1);
+    }
+
+    extern "C" fn failed(this: Id, _: Sel, _connection: Id, _error: Id) {
+        COUNTS_IN_CALLBACK.lock().unwrap().push((this, count_of(this)));
+    }
+
+    /// As Apple's NSURLConnectionInternal (-initWithInfo: retains the
+    /// delegate; the block of _withConnectionDisconnectFromConnection
+    /// releases it after the last callback): a delegate only its connection
+    /// holds hears the failure and is let go of after it; a cancelled
+    /// connection tells its delegate nothing more and lets go of it.
+    #[test]
+    fn a_connection_holds_its_delegate_until_its_last_callback() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let class = define_class("WebHeldDelegate", "NSObject", 8);
+        methods(
+            class,
+            &[("retain", counted_retain as usize), ("release", counted_release as usize), ("connection:didFailWithError:", failed as usize)],
+        );
+        let url = runtime::send(runtime::class_named("NSURL"), "URLWithString:", &[string::make("http://example.com/")]);
+        let request = runtime::send(runtime::class_named("NSURLRequest"), "requestWithURL:", &[url]);
+        let connect = |start: bool| {
+            let delegate = runtime::send(runtime::send(class, "alloc", &[]), "init", &[]);
+            change(delegate, 1);
+            let connection = runtime::send(runtime::class_named("NSURLConnection"), "alloc", &[]);
+            runtime::send(connection, "initWithRequest:delegate:startImmediately:", &[request, delegate, start as usize]);
+            runtime::send(delegate, "release", &[]);
+            (delegate, connection)
+        };
+        let (failing, _) = connect(true);
+        let (cancelled, connection) = connect(false);
+        // (Cancelled before its start: other tests run the main loop too.)
+        runtime::send(connection, "cancel", &[]);
+        runtime::send(connection, "start", &[]);
+        for _ in 0..10 {
+            crate::fw::runloop::run_main_loop_briefly();
+            if COUNTS_IN_CALLBACK.lock().unwrap().iter().any(|e| e.0 == failing) {
+                break;
+            }
+        }
+        let heard = COUNTS_IN_CALLBACK.lock().unwrap().clone();
+        assert_eq!(heard.iter().filter(|e| e.0 == failing).map(|e| e.1).collect::<Vec<_>>(), [1], "heard once, still held");
+        assert!(!heard.iter().any(|e| e.0 == cancelled), "a cancelled connection says nothing");
+        assert_eq!((count_of(failing), count_of(cancelled)), (0, 0), "both let go of");
+    }
 
     #[test]
     fn url_caches_keep_their_capacities_and_the_shared_one_can_change() {

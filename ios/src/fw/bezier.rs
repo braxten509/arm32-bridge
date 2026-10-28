@@ -10,6 +10,8 @@ use crate::fw::graphics;
 use crate::fw::object::{class_methods, define_class, methods};
 use crate::fw::uikit::{property, property_get, property_set};
 use crate::objc::runtime::{self, Class, Id, Sel};
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 /// The path's CGPath (made on first use).
 fn path_of(this: Id) -> Id {
@@ -144,30 +146,39 @@ extern "C" fn bezier_fill(this: Id, _: Sel) {
     }
 }
 
-/// Strokes the path in the current UIKit context with its stroke colour.
+/// Strokes the path in the current UIKit context with its stroke colour and
+/// its own width, cap, join, miter limit and dash.
 extern "C" fn bezier_stroke(this: Id, _: Sel) {
     let context = graphics::current_ui_context();
     if context != 0 {
-        graphics::stroke_path_in(context, path_of(this), bezier_line_width(this, 0));
+        let style = graphics::StrokeStyle {
+            width: bezier_line_width(this, 0),
+            cap: bezier_cap(this, 0) as i32,
+            join: bezier_join(this, 0) as i32,
+            miter_limit: bezier_miter(this, 0),
+            dash: DASHES.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|d| d.get(&this).cloned()),
+        };
+        graphics::stroke_path_in(context, path_of(this), &style);
     }
 }
 
-/// The blend mode draws as normal (as everywhere here); the alpha applies.
-extern "C" fn bezier_fill_blend(this: Id, s: Sel, _mode: i32, alpha: f64) {
-    with_alpha(alpha, || bezier_fill(this, s));
+/// The blend mode and alpha are set for the drawing (CGContextSetBlendMode,
+/// CGContextSetAlpha), not added to the context's.
+extern "C" fn bezier_fill_blend(this: Id, s: Sel, mode: i32, alpha: f64) {
+    with_alpha(mode, alpha, || bezier_fill(this, s));
 }
 
-extern "C" fn bezier_stroke_blend(this: Id, s: Sel, _mode: i32, alpha: f64) {
-    with_alpha(alpha, || bezier_stroke(this, s));
+extern "C" fn bezier_stroke_blend(this: Id, s: Sel, mode: i32, alpha: f64) {
+    with_alpha(mode, alpha, || bezier_stroke(this, s));
 }
 
-fn with_alpha(alpha: f64, draw: impl FnOnce()) {
+fn with_alpha(mode: i32, alpha: f64, draw: impl FnOnce()) {
     let context = graphics::current_ui_context();
     if context == 0 {
         return;
     }
     graphics::save_state(context);
-    graphics::multiply_alpha(context, alpha);
+    graphics::set_alpha_and_blend(context, alpha, mode);
     draw();
     graphics::restore_state(context);
 }
@@ -179,8 +190,40 @@ extern "C" fn bezier_add_clip(this: Id, _: Sel) {
     }
 }
 
-/// Dashes aren't drawn (lines stay whole).
-extern "C" fn bezier_set_dash(_this: Id, _: Sel, _pattern: *const f64, _count: isize, _phase: f64) {}
+/// Paths' dashes (phase, lengths), by path.
+static DASHES: Mutex<Option<HashMap<Id, (f64, Vec<f64>)>>> = Mutex::new(None);
+
+/// -setLineDash:count:phase: (no pattern: lines whole again).
+extern "C" fn bezier_set_dash(this: Id, _: Sel, pattern: *const f64, count: isize, phase: f64) {
+    let mut dashes = DASHES.lock().unwrap_or_else(|e| e.into_inner());
+    let dashes = dashes.get_or_insert_with(HashMap::new);
+    if pattern.is_null() || count <= 0 {
+        dashes.remove(&this);
+    } else {
+        // At most as many lengths as a 32-bit game's -getLineDash:count:phase:
+        // has room for (guest32/objc/convert.rs COUNTED_OUT_MOST).
+        dashes.insert(this, (phase, unsafe { std::slice::from_raw_parts(pattern, (count as usize).min(MOST_DASHES)) }.to_vec()));
+    }
+}
+
+const MOST_DASHES: usize = 4096;
+
+/// -getLineDash:count:phase: (each out pointer may be NULL).
+extern "C" fn bezier_get_dash(this: Id, _: Sel, pattern: *mut f64, count: *mut isize, phase: *mut f64) {
+    let dash = DASHES.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|d| d.get(&this).cloned());
+    let (start, lengths) = dash.unwrap_or_default();
+    unsafe {
+        if !pattern.is_null() {
+            std::ptr::copy_nonoverlapping(lengths.as_ptr(), pattern, lengths.len());
+        }
+        if !count.is_null() {
+            *count = lengths.len() as isize;
+        }
+        if !phase.is_null() {
+            *phase = start;
+        }
+    }
+}
 
 extern "C" fn bezier_copy(this: Id, _: Sel, _zone: usize) -> Id {
     // The class first: alloc_instance takes the runtime lock too.
@@ -191,6 +234,10 @@ extern "C" fn bezier_copy(this: Id, _: Sel, _zone: usize) -> Id {
         if let Some(value) = property_get(this, key) {
             property_set(copy, key, value);
         }
+    }
+    let mut dashes = DASHES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(dash) = dashes.as_ref().and_then(|d| d.get(&this).cloned()) {
+        dashes.get_or_insert_with(HashMap::new).insert(copy, dash);
     }
     copy
 }
@@ -267,6 +314,7 @@ pub fn register() {
             ("strokeWithBlendMode:alpha:", bezier_stroke_blend as usize),
             ("addClip", bezier_add_clip as usize),
             ("setLineDash:count:phase:", bezier_set_dash as usize),
+            ("getLineDash:count:phase:", bezier_get_dash as usize),
             ("copyWithZone:", bezier_copy as usize),
         ],
     );
@@ -313,5 +361,42 @@ mod tests {
         let rounded = bezier_rounded(class, 0, Rect::new(0.0, 0.0, 10.0, 10.0), 4.0);
         assert!(bezier_contains(rounded, 0, Point { x: 5.0, y: 5.0 }));
         assert!(!bezier_contains(rounded, 0, Point { x: 0.3, y: 0.3 }), "the corner is cut round");
+    }
+
+    /// fillWithBlendMode:alpha: sets the alpha and blend mode (not on top
+    /// of the context's); -stroke draws with the path's cap and dashes.
+    #[test]
+    fn bezier_settings_apply_to_their_drawing() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let class = runtime::class_named("UIBezierPath");
+        let red = crate::fw::graphics::make_color([1.0, 0.0, 0.0, 1.0]);
+        graphics::test_begin_context(10.0, 4.0);
+        let context = graphics::current_ui_context();
+        color_set(red, 0);
+        graphics::save_state(context);
+        graphics::multiply_alpha(context, 0.5);
+        bezier_fill_blend(bezier_rect(class, 0, Rect::new(0.0, 0.0, 2.0, 2.0)), 0, 0, 1.0);
+        bezier_fill_blend(bezier_rect(class, 0, Rect::new(0.0, 0.0, 1.0, 1.0)), 0, 16, 1.0);
+        graphics::restore_state(context);
+        let capped = bezier_path(class, 0);
+        bezier_move(capped, 0, Point { x: 3.0, y: 1.0 });
+        bezier_line(capped, 0, Point { x: 5.0, y: 1.0 });
+        bezier_set_line_width(capped, 0, 2.0);
+        bezier_set_cap(capped, 0, 1);
+        bezier_stroke(capped, 0);
+        let dashed = bezier_path(class, 0);
+        bezier_move(dashed, 0, Point { x: 0.0, y: 3.0 });
+        bezier_line(dashed, 0, Point { x: 10.0, y: 3.0 });
+        bezier_set_line_width(dashed, 0, 2.0);
+        let pattern = [2.0, 2.0];
+        bezier_set_dash(dashed, 0, pattern.as_ptr(), 2, 0.0);
+        bezier_stroke(dashed, 0);
+        let pixels = graphics::test_end_context();
+        let at = |x: usize, y: usize| pixels[(y * 10 + x) * 4..(y * 10 + x) * 4 + 4].to_vec();
+        assert_eq!(at(1, 1), [255, 0, 0, 255], "its own alpha, 1");
+        assert_eq!(at(0, 0)[3], 0, "the clear blend mode clears");
+        assert!(at(5, 1)[3] > 100, "a round cap past the end: {:?}", at(5, 1));
+        assert_eq!((at(0, 3)[3], at(2, 3)[3]), (255, 0), "a dash, then a gap");
     }
 }

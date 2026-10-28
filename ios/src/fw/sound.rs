@@ -1222,6 +1222,9 @@ fn add_player(player: Id, source: Source, error: *mut Id) -> Id {
     };
     let made = Player::new(source, rate);
     PLAYERS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(player, made);
+    if !crate::fw::counted::is_tracked(player) {
+        crate::fw::counted::track(player, player_gone);
+    }
     player
 }
 
@@ -1338,6 +1341,27 @@ extern "C" fn player_url(this: Id, _: Sel) -> Id {
 
 extern "C" fn player_data(this: Id, _: Sel) -> Id {
     property_get(this, "data").unwrap_or(0) as Id
+}
+
+extern "C" fn player_retain(this: Id, _: Sel) -> Id {
+    crate::fw::counted::retain(this)
+}
+
+extern "C" fn player_release(this: Id, _: Sel) {
+    crate::fw::counted::release(this)
+}
+
+extern "C" fn player_autorelease(this: Id, _: Sel) -> Id {
+    crate::fw::counted::autorelease(this)
+}
+
+extern "C" fn player_retain_count(this: Id, _: Sel) -> usize {
+    crate::fw::counted::count(this).unwrap_or(1)
+}
+
+/// A player's last reference went: it stops, as Apple's -dealloc does.
+fn player_gone(this: Id) {
+    player_dealloc(this, 0);
 }
 
 extern "C" fn player_dealloc(this: Id, _: Sel) {
@@ -1793,8 +1817,14 @@ pub fn register(r: &mut Registry) {
             ("setMeteringEnabled:", player_ignore_bool as usize),
             ("setEnableRate:", player_ignore_bool as usize),
             ("dealloc", player_dealloc as usize),
+            ("retain", player_retain as usize),
+            ("release", player_release as usize),
+            ("autorelease", player_autorelease as usize),
+            ("retainCount", player_retain_count as usize),
         ],
     );
+    // Players count references: one let go of while playing goes quiet.
+    crate::fw::counted::count_class(player);
 }
 
 #[cfg(test)]
@@ -1979,6 +2009,28 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         assert_eq!(runtime::send(from_file, "url", &[]), url);
         assert_eq!(runtime::send(from_file, "data", &[]), 0);
+    }
+
+    /// A player whose last reference goes stops playing, as Apple's
+    /// -dealloc does; one still held plays on.
+    #[test]
+    fn a_released_player_stops_playing() {
+        crate::run::setup();
+        let make = || {
+            let player = runtime::send(runtime::class_named("AVAudioPlayer"), "alloc", &[]);
+            runtime::send(player, "initWithData:error:", &[crate::fw::data::make(&wav(22050, 0.5)), 0])
+        };
+        let (released, held) = (make(), make());
+        runtime::send(released, "setNumberOfLoops:", &[usize::MAX]);
+        runtime::send(released, "play", &[]);
+        runtime::send(held, "retain", &[]);
+        runtime::send(held, "play", &[]);
+        assert_eq!(runtime::send(released, "isPlaying", &[]) & 0xFF, 1);
+        runtime::send(released, "release", &[]);
+        runtime::send(held, "release", &[]);
+        assert_eq!(runtime::send(released, "isPlaying", &[]) & 0xFF, 0, "released: stopped");
+        assert_eq!(runtime::send(held, "isPlaying", &[]) & 0xFF, 1, "still held: plays on");
+        runtime::send(held, "stop", &[]);
     }
 
     /// AVAudioPlayer reads what AudioFile reads: a CAF file plays its sound,

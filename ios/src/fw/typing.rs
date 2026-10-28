@@ -38,6 +38,91 @@ fn keyboard_follows() {
     }
 }
 
+/// Whether the keyboard is up, as the game was told (UIKeyboard notifications).
+static KEYBOARD_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+thread_local! {
+    /// Set while one text input takes over from another: the keyboard stays up.
+    static TAKING_OVER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// How long the keyboard takes to slide in or out (UIKit's 0.25 s).
+const KEYBOARD_ANIMATION: f64 = 0.25;
+
+/// The keyboard's frame on the screen, up or down (216 points tall upright, 162 sideways).
+fn keyboard_frame(up: bool) -> Rect {
+    let (wide, high, _) = crate::fw::uikit::screen_points();
+    let height = if wide < high { 216.0 } else { 162.0 };
+    Rect::new(0.0, if up { high - height } else { high }, wide, height)
+}
+
+/// The userInfo of a keyboard notification: its frames before and after,
+/// and the slide's duration and curve.
+fn keyboard_info(showing: bool) -> Id {
+    let value = |rect: Rect| {
+        let class = runtime::class_named("NSValue");
+        let s = runtime::sel("valueWithCGRect:");
+        match runtime::imp_for(class as Id, s) {
+            Some(imp) => unsafe { std::mem::transmute::<usize, extern "C" fn(Id, Sel, Rect) -> Id>(imp)(class as Id, s, rect) },
+            None => 0,
+        }
+    };
+    let (begin, end) = (keyboard_frame(!showing), keyboard_frame(showing));
+    let point = |rect: Rect| {
+        let class = runtime::class_named("NSValue");
+        let s = runtime::sel("valueWithCGPoint:");
+        let center = crate::fw::geometry::Point { x: rect.origin.x + rect.size.width / 2.0, y: rect.origin.y + rect.size.height / 2.0 };
+        match runtime::imp_for(class as Id, s) {
+            Some(imp) => unsafe { std::mem::transmute::<usize, extern "C" fn(Id, Sel, crate::fw::geometry::Point) -> Id>(imp)(class as Id, s, center) },
+            None => 0,
+        }
+    };
+    let entries = [
+        ("UIKeyboardFrameBeginUserInfoKey", value(begin)),
+        ("UIKeyboardFrameEndUserInfoKey", value(end)),
+        ("UIKeyboardBoundsUserInfoKey", value(Rect::new(0.0, 0.0, end.size.width, end.size.height))),
+        ("UIKeyboardCenterBeginUserInfoKey", point(begin)),
+        ("UIKeyboardCenterEndUserInfoKey", point(end)),
+        ("UIKeyboardAnimationDurationUserInfoKey", crate::fw::collections::number_float(KEYBOARD_ANIMATION)),
+        ("UIKeyboardAnimationCurveUserInfoKey", crate::fw::collections::number_int(7)),
+    ];
+    let pairs: Vec<(Id, Id)> = entries.iter().filter(|(_, v)| *v != 0).map(|&(k, v)| (string::make(k), v)).collect();
+    crate::fw::collections::dictionary_from(&pairs)
+}
+
+/// The keyboard comes up or goes down: UIKeyboardWillShow/WillHide now,
+/// Did… once it has slid (as UIKit posts them).
+fn keyboard_moves(up: bool) {
+    if KEYBOARD_UP.swap(up, Ordering::SeqCst) == up {
+        return;
+    }
+    let will = if up { "UIKeyboardWillShowNotification" } else { "UIKeyboardWillHideNotification" };
+    let slide = KEYBOARD_SLIDE.fetch_add(1, Ordering::SeqCst) + 1;
+    crate::fw::foundation::post(will, 0, keyboard_info(up));
+    crate::fw::runloop::post_after(KEYBOARD_ANIMATION, Box::new(move || slide_done(slide)));
+}
+
+/// Each keyboard slide's number, and the last one that ended.
+static KEYBOARD_SLIDE: AtomicUsize = AtomicUsize::new(0);
+static KEYBOARD_SLID: AtomicUsize = AtomicUsize::new(0);
+
+/// The keyboard has slid in or out (now: its slide's time is up).
+#[cfg(test)]
+pub(crate) fn keyboard_settled() {
+    slide_done(KEYBOARD_SLIDE.load(Ordering::SeqCst));
+}
+
+/// Slide `slide` ended, once (a newer slide makes an older one's end moot):
+/// UIKeyboardDidShow/DidHide.
+fn slide_done(slide: usize) {
+    if slide != KEYBOARD_SLIDE.load(Ordering::SeqCst) || KEYBOARD_SLID.swap(slide, Ordering::SeqCst) == slide {
+        return;
+    }
+    let up = KEYBOARD_UP.load(Ordering::SeqCst);
+    let did = if up { "UIKeyboardDidShowNotification" } else { "UIKeyboardDidHideNotification" };
+    crate::fw::foundation::post(did, 0, keyboard_info(up));
+}
+
 /// What is being edited (0: nothing); the phone shows its keyboard while
 /// something is.
 pub fn first_responder() -> Id {
@@ -152,8 +237,14 @@ extern "C" fn become_first_responder(this: Id, _: Sel) -> bool {
         return false;
     }
     let old = first_responder();
-    if old != 0 && runtime::send(old, "resignFirstResponder", &[]) & 0xFF == 0 {
-        return false;
+    if old != 0 {
+        // The keyboard stays up while one input takes over from another.
+        TAKING_OVER.with(|t| t.set(true));
+        let resigned = runtime::send(old, "resignFirstResponder", &[]) & 0xFF != 0;
+        TAKING_OVER.with(|t| t.set(false));
+        if !resigned {
+            return false;
+        }
     }
     FIRST_RESPONDER.store(this, Ordering::Relaxed);
     if kind.field && flag(this, "clearsOnBeginEditing", false) {
@@ -166,6 +257,7 @@ extern "C" fn become_first_responder(this: Id, _: Sel) -> bool {
         crate::fw::controls::send_actions(this, EDITING_DID_BEGIN, 0);
     }
     notify(kind.began, this);
+    keyboard_moves(true);
     true
 }
 
@@ -184,6 +276,9 @@ extern "C" fn resign_first_responder(this: Id, _: Sel) -> bool {
         crate::fw::controls::send_actions(this, EDITING_DID_END, 0);
     }
     notify(kind.ended, this);
+    if !TAKING_OVER.with(std::cell::Cell::get) {
+        keyboard_moves(false);
+    }
     true
 }
 
@@ -197,9 +292,9 @@ extern "C" fn can_become_first_responder(this: Id, _: Sel) -> bool {
 
 /// A tap on a text field (let go on it) starts editing it.
 extern "C" fn field_touches_ended(this: Id, s: Sel, touches: Id, event: Id) {
-    let passing = flag(this, "passingTouches", false);
+    let tracking = runtime::send(this, "isTracking", &[]) & 0xFF != 0;
     crate::fw::controls::control_touches_ended(this, s, touches, event);
-    if !passing && flag(this, "touchInside", false) {
+    if tracking && flag(this, "touchInside", false) {
         runtime::send(this, "becomeFirstResponder", &[]);
     }
 }

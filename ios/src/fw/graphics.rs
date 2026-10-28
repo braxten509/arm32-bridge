@@ -36,7 +36,7 @@ pub use compose::{box_picture, cg_picture, cg_size, gradient_picture, group_pict
 pub use render::render_layer;
 pub use shapes::{
     clip_path_in, fill_path_in, new_path, path_append, path_apply, path_arc, path_bounds, path_close, path_contains, path_copy, path_curve, path_current,
-    path_is_empty, path_line, path_move, path_oval, path_points, path_quad, path_rect, path_rounded_rect, stroke_path_in,
+    path_is_empty, path_line, path_move, path_oval, path_points, path_quad, path_rect, path_rounded_rect, stroke_path_in, StrokeStyle,
 };
 
 /// The current UIKit context (UIGraphicsGetCurrentContext), 0 when none.
@@ -56,6 +56,14 @@ pub fn restore_state(context: Id) {
 pub fn multiply_alpha(context: Id, alpha: f64) {
     if let Some(mut c) = canvas("-[UIBezierPath fillWithBlendMode:alpha:]", context) {
         c.state.alpha = (c.state.alpha * alpha).clamp(0.0, 1.0);
+    }
+}
+
+/// Sets a context's alpha and CGBlendMode (CGContextSetAlpha,
+/// CGContextSetBlendMode), as -[UIBezierPath fillWithBlendMode:alpha:] does.
+pub fn set_alpha_and_blend(context: Id, alpha: f64, blend_mode: i32) {
+    if let Some(mut c) = canvas("-[UIBezierPath fillWithBlendMode:alpha:]", context) {
+        (c.state.alpha, c.state.blend_mode) = (alpha.clamp(0.0, 1.0), blend_mode);
     }
 }
 
@@ -83,6 +91,29 @@ pub enum Space {
     Gray,
     /// No colour space: alpha-only bitmaps.
     None,
+    /// Palette indices into these RGB colours (CGColorSpaceCreateIndexed;
+    /// ImageIO's for palette PNGs without transparency).
+    Indexed(&'static Palette),
+}
+
+/// An indexed colour space's colours, by index.
+pub type Palette = [[u8; 3]; 256];
+
+/// The one kept copy of a palette (pictures share them; the few distinct
+/// palettes a game's files have stay for the run).
+fn palette_ref(colours: &[[u8; 3]]) -> &'static Palette {
+    static KEPT: Mutex<Vec<&'static Palette>> = Mutex::new(Vec::new());
+    let mut palette = [[0u8; 3]; 256];
+    for (slot, colour) in palette.iter_mut().zip(colours) {
+        *slot = *colour;
+    }
+    let mut kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&found) = kept.iter().find(|&&p| *p == palette) {
+        return found;
+    }
+    let made: &'static Palette = Box::leak(Box::new(palette));
+    kept.push(made);
+    made
 }
 
 pub const ALPHA_MASK: u32 = 0x1F;
@@ -107,6 +138,8 @@ enum Slot {
     Gray,
     Alpha,
     Skip,
+    /// A palette index (the layout's palette gives its colour).
+    Index,
 }
 
 /// Where each 8-bit component of one pixel sits in memory.
@@ -118,6 +151,8 @@ pub struct Layout {
     /// Four-byte RGB pixels: the byte places of red, green, blue and the
     /// fourth component, read and written without going slot by slot.
     fast: Option<Fast>,
+    /// An indexed format's colours.
+    palette: Option<&'static Palette>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -151,7 +186,12 @@ pub fn layout(space: Space, bits_per_component: usize, bits_per_pixel: usize, in
         (Space::Gray, NONE_SKIP_LAST) => &[Gray, Skip],
         (Space::Gray, NONE_SKIP_FIRST) => &[Skip, Gray],
         (Space::None, ALPHA_ONLY) => &[Alpha],
+        (Space::Indexed(_), ALPHA_NONE) => &[Index],
         _ => return None,
+    };
+    let palette = match space {
+        Space::Indexed(palette) => Some(palette),
+        _ => None,
     };
     if bits_per_pixel != list.len() * 8 {
         return None;
@@ -168,18 +208,19 @@ pub fn layout(space: Space, bits_per_component: usize, bits_per_pixel: usize, in
         (4, Some(red), Some(green), Some(blue), Some(fourth)) => Some(Fast { red, green, blue, fourth, alpha: slots[fourth] == Alpha }),
         _ => None,
     };
-    Some(Layout { slots, bytes: list.len(), premultiplied: matches!(alpha, PREMULTIPLIED_LAST | PREMULTIPLIED_FIRST), fast })
+    Some(Layout { slots, bytes: list.len(), premultiplied: matches!(alpha, PREMULTIPLIED_LAST | PREMULTIPLIED_FIRST), fast, palette })
 }
 
 /// The formats a bitmap context can draw into (Apple's list for 8 bits per
 /// component on iPhone: RGB with premultiplied or skipped alpha, plain gray,
-/// alpha only).
+/// alpha only; never indexed).
 fn context_supported(space: Space, bits_per_pixel: usize, info: u32) -> bool {
     let alpha = info & ALPHA_MASK;
     match space {
         Space::Rgb => bits_per_pixel == 32 && matches!(alpha, PREMULTIPLIED_LAST | PREMULTIPLIED_FIRST | NONE_SKIP_LAST | NONE_SKIP_FIRST),
         Space::Gray => bits_per_pixel == 8 && alpha == ALPHA_NONE,
         Space::None => bits_per_pixel == 8 && alpha == ALPHA_ONLY,
+        Space::Indexed(_) => false,
     }
 }
 
@@ -214,6 +255,10 @@ impl Layout {
                 Slot::Gray => out[..3].fill(v),
                 Slot::Alpha => out[3] = v,
                 Slot::Skip => {}
+                Slot::Index => {
+                    let colour = self.palette.map_or([0; 3], |p| p[byte as usize]);
+                    out[..3].copy_from_slice(&colour.map(|c| c as f32 / 255.0));
+                }
             }
         }
         out
@@ -275,6 +320,8 @@ impl Layout {
                 Slot::Gray => to_byte(0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]),
                 Slot::Alpha => to_byte(c[3]),
                 Slot::Skip => 255,
+                // Never drawn into (no indexed contexts).
+                Slot::Index => 0,
             };
         }
     }
@@ -361,6 +408,20 @@ impl Bitmap {
         mix(top, bottom, fy)
     }
 
+    /// An indexed picture's colours (a skipped fourth byte), for drawing it
+    /// by the fast ways; None for any other picture.
+    fn unindexed(&self) -> Option<Bitmap> {
+        let Space::Indexed(palette) = self.space else { return None };
+        let mut data = Vec::with_capacity(self.width * self.height * 4);
+        for row in 0..self.height {
+            for &index in &self.data[row * self.bytes_per_row..row * self.bytes_per_row + self.width] {
+                let [r, g, b] = palette[index as usize];
+                data.extend_from_slice(&[r, g, b, 255]);
+            }
+        }
+        Some(Bitmap { width: self.width, height: self.height, bits_per_pixel: 32, bytes_per_row: self.width * 4, info: NONE_SKIP_LAST, space: Space::Rgb, data })
+    }
+
     /// Rows top to bottom as straight RGBA bytes (no row padding).
     fn straight_rgba(&self) -> Option<Vec<u8>> {
         let layout = self.layout()?;
@@ -378,55 +439,131 @@ impl Bitmap {
 /// The biggest picture read (bytes of pixels), like ImageIO's own limits.
 const MOST_PIXEL_BYTES: usize = 1 << 30;
 
-/// A PNG made by Apple's pngcrush ("CgBI"): raw deflate data, BGRA with
-/// premultiplied alpha. iOS reads it as that format directly. Broken files
-/// give None (nil), never a crash.
-fn decode_cgbi(bytes: &[u8]) -> Option<Bitmap> {
+/// A PNG's chunks (kind, body) before IEND; None when one runs past the end.
+fn png_chunks(bytes: &[u8]) -> Option<Vec<(&[u8], &[u8])>> {
     let mut at = 8usize;
-    let (mut width, mut height, mut idat) = (0usize, 0usize, Vec::new());
+    let mut chunks = Vec::new();
     while at.checked_add(12)? <= bytes.len() {
         let length = u32::from_be_bytes(bytes[at..at + 4].try_into().ok()?) as usize;
         let kind = &bytes[at + 4..at + 8];
         let body = bytes.get(at + 8..at.checked_add(8 + length)?)?;
-        match kind {
-            b"IHDR" => {
-                if body.len() < 13 {
-                    return None;
-                }
-                width = u32::from_be_bytes(body[0..4].try_into().ok()?) as usize;
-                height = u32::from_be_bytes(body[4..8].try_into().ok()?) as usize;
-                if body[8] != 8 || body[9] != 6 || body[12] != 0 {
-                    crate::log!("crushed PNG: bit depth {} colour type {} interlace {} not read", body[8], body[9], body[12]);
-                    return None;
-                }
-            }
-            b"IDAT" => idat.extend_from_slice(body),
-            b"IEND" => break,
-            _ => {}
+        if kind == b"IEND" {
+            break;
         }
+        chunks.push((kind, body));
         at += 12 + length;
     }
-    let stride = width.checked_mul(4)?;
-    if width == 0 || height == 0 || stride.checked_mul(height)? > MOST_PIXEL_BYTES {
-        return None;
-    }
-    let raw = miniz_oxide::inflate::decompress_to_vec_with_limit(&idat, (stride + 1) * height).ok()?;
-    let data = unfilter(&raw, width, height, 4)?;
-    Some(Bitmap {
-        width,
-        height,
-        bits_per_pixel: 32,
-        bytes_per_row: width * 4,
-        info: PREMULTIPLIED_FIRST | ORDER_32_LITTLE,
-        space: Space::Rgb,
-        data,
-    })
+    Some(chunks)
 }
 
-/// Undoes PNG's per-row filters.
-fn unfilter(raw: &[u8], width: usize, height: usize, bpp: usize) -> Option<Vec<u8>> {
-    let stride = width.checked_mul(bpp)?;
-    if width == 0 || height == 0 || raw.len() < height.checked_mul(stride + 1)? {
+/// What a PNG's header says: width, height, bit depth, colour type, interlaced.
+fn png_header(chunks: &[(&[u8], &[u8])]) -> Option<(usize, usize, u8, u8, bool)> {
+    let body = chunks.iter().find(|(kind, _)| *kind == b"IHDR")?.1;
+    if body.len() < 13 {
+        return None;
+    }
+    let width = u32::from_be_bytes(body[0..4].try_into().ok()?) as usize;
+    let height = u32::from_be_bytes(body[4..8].try_into().ok()?) as usize;
+    let pixels = width.checked_mul(height)?.checked_mul(4)?;
+    (width > 0 && height > 0 && pixels <= MOST_PIXEL_BYTES).then_some((width, height, body[8], body[9], body[12] != 0))
+}
+
+fn png_data(chunks: &[(&[u8], &[u8])]) -> Vec<u8> {
+    chunks.iter().filter(|(kind, _)| *kind == b"IDAT").flat_map(|(_, body)| body.iter().copied()).collect()
+}
+
+/// A PNG made by Apple's pngcrush ("CgBI"): raw deflate data, blue before
+/// red, alpha premultiplied. iOS reads it as that format directly: BGRA, or
+/// BGR with a skipped fourth byte. Broken files give None (nil), never a crash.
+fn decode_cgbi(bytes: &[u8]) -> Option<Bitmap> {
+    let chunks = png_chunks(bytes)?;
+    let (width, height, depth, kind, interlaced) = png_header(&chunks)?;
+    let channels = match (depth, kind) {
+        (8, 6) => 4,
+        (8, 2) => 3,
+        _ => {
+            crate::log!("crushed PNG: bit depth {depth} colour type {kind} not read");
+            return None;
+        }
+    };
+    let stride = width * channels;
+    let raw = miniz_oxide::inflate::decompress_to_vec_with_limit(&png_data(&chunks), (stride + 8) * height + 64).ok()?;
+    let rows = png_rows(&raw, width, height, channels * 8, interlaced)?;
+    let (data, info) = match channels {
+        4 => (rows, PREMULTIPLIED_FIRST | ORDER_32_LITTLE),
+        _ => (rows.chunks(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect(), NONE_SKIP_FIRST | ORDER_32_LITTLE),
+    };
+    Some(Bitmap { width, height, bits_per_pixel: 32, bytes_per_row: width * 4, info, space: Space::Rgb, data })
+}
+
+/// A palette PNG without transparency as ImageIO reads it: one byte of
+/// palette index per pixel (1, 2 and 4-bit indices widened to a byte) in an
+/// indexed colour space. None for any other PNG (read the usual way).
+fn decode_palette(bytes: &[u8]) -> Option<Bitmap> {
+    let chunks = png_chunks(bytes)?;
+    let (width, height, depth, kind, interlaced) = png_header(&chunks)?;
+    if kind != 3 || !matches!(depth, 1 | 2 | 4 | 8) || chunks.iter().any(|(kind, _)| *kind == b"tRNS") {
+        return None;
+    }
+    let colours: Vec<[u8; 3]> = chunks.iter().find(|(kind, _)| *kind == b"PLTE")?.1.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+    let bits = depth as usize;
+    let stride = (width * bits).div_ceil(8);
+    let raw = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&png_data(&chunks), (stride + 8) * height + 64).ok()?;
+    let rows = png_rows(&raw, width, height, bits, interlaced)?;
+    let data = match bits {
+        8 => rows,
+        _ => (0..height).flat_map(|y| (0..width).map(move |x| (y, x))).map(|(y, x)| (rows[y * stride + x * bits / 8] >> (8 - bits - x * bits % 8)) & ((1u8 << bits) - 1)).collect(),
+    };
+    Some(Bitmap { width, height, bits_per_pixel: 8, bytes_per_row: width, info: ALPHA_NONE, space: Space::Indexed(palette_ref(&colours)), data })
+}
+
+/// A PNG's pixel rows (filters undone, interlaced passes put in place):
+/// `bits` per pixel, each row `width * bits` bits rounded up to bytes.
+fn png_rows(raw: &[u8], width: usize, height: usize, bits: usize, interlaced: bool) -> Option<Vec<u8>> {
+    let distance = (bits / 8).max(1);
+    let stride = width.checked_mul(bits)?.div_ceil(8);
+    if !interlaced {
+        return unfilter_rows(raw, stride, height, distance);
+    }
+    let mut out = vec![0u8; stride.checked_mul(height)?];
+    let mut at = 0;
+    // Adam7: each pass's first pixel and its steps across and down.
+    for (x0, y0, dx, dy) in [(0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4), (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2)] {
+        let (w, h) = (width.saturating_sub(x0).div_ceil(dx), height.saturating_sub(y0).div_ceil(dy));
+        if w == 0 || h == 0 {
+            continue;
+        }
+        let pass_stride = (w * bits).div_ceil(8);
+        let size = (pass_stride + 1) * h;
+        let pass = unfilter_rows(raw.get(at..at + size)?, pass_stride, h, distance)?;
+        at += size;
+        for py in 0..h {
+            for px in 0..w {
+                copy_pixel(&pass[py * pass_stride..], px, &mut out[(y0 + py * dy) * stride..], x0 + px * dx, bits);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Pixel `from_x` of one row into pixel `to_x` of another (`bits` per pixel).
+fn copy_pixel(from: &[u8], from_x: usize, to: &mut [u8], to_x: usize, bits: usize) {
+    if bits >= 8 {
+        let n = bits / 8;
+        to[to_x * n..to_x * n + n].copy_from_slice(&from[from_x * n..from_x * n + n]);
+        return;
+    }
+    let mask = (1u8 << bits) - 1;
+    let value = (from[from_x * bits / 8] >> (8 - bits - from_x * bits % 8)) & mask;
+    let shift = 8 - bits - to_x * bits % 8;
+    let byte = &mut to[to_x * bits / 8];
+    *byte = (*byte & !(mask << shift)) | (value << shift);
+}
+
+/// Undoes PNG's per-row filters over rows of `stride` bytes, each byte
+/// predicted from the one `bpp` bytes before it.
+fn unfilter_rows(raw: &[u8], stride: usize, height: usize, bpp: usize) -> Option<Vec<u8>> {
+    if stride == 0 || height == 0 || raw.len() < height.checked_mul(stride + 1)? {
         return None;
     }
     let mut out = vec![0u8; stride * height];
@@ -476,12 +613,19 @@ pub fn orientation_from_exif(exif: u8) -> i64 {
 }
 
 /// Decodes PNG (also crushed) or JPEG into the formats ImageIO gives on iOS:
-/// RGBA with straight alpha last, RGB with a skipped fourth byte, plain gray.
+/// RGBA with straight alpha last, RGB with a skipped fourth byte, plain gray,
+/// palette indices (palette PNGs without transparency).
 /// Also gives the file's orientation (UIImageOrientation) from its EXIF tag;
 /// the pixels stay as stored, as in the CGImage on iOS.
 pub fn decode(bytes: &[u8]) -> Option<(Bitmap, i64)> {
     if bytes.len() > 16 && &bytes[1..4] == b"PNG" && &bytes[12..16] == b"CgBI" {
         return decode_cgbi(bytes).map(|b| (b, 0));
+    }
+    // The header's colour type (byte 25) says whether it has a palette.
+    if bytes.len() > 26 && &bytes[1..4] == b"PNG" && bytes[25] == 3 {
+        if let Some(bitmap) = decode_palette(bytes) {
+            return Some((bitmap, 0));
+        }
     }
     let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?.into_decoder().ok()?;
     let orientation = decoder.orientation().map_or(0, |o| orientation_from_exif(o.to_exif()));
@@ -527,6 +671,8 @@ struct ImageState {
     /// CGImageGetDataProvider's provider: the one a mask was made with, else
     /// one of the pixels made when first asked for; released with the image.
     provider: OnceLock<Id>,
+    /// An indexed picture's colours, made the first time it is drawn.
+    colours: Mutex<Option<Arc<Bitmap>>>,
 }
 
 /// An image mask as the game made it.
@@ -572,14 +718,14 @@ fn wrap<T>(class: Class, value: T) -> Id {
 
 /// A new CGImage with one reference (the caller's, as CGBitmapContextCreateImage gives).
 pub fn make_image(bitmap: Bitmap) -> Id {
-    make_picture(ImageState { bitmap: RwLock::new(Some(Arc::new(bitmap))), mask: None, provider: OnceLock::new() })
+    make_picture(ImageState { bitmap: RwLock::new(Some(Arc::new(bitmap))), mask: None, provider: OnceLock::new(), colours: Mutex::new(None) })
 }
 
 /// A new image mask with one reference: `samples` decoded to 8-bit gray,
 /// `format` and `provider` as the game gave them (the mask holds the provider).
 fn make_mask(samples: Bitmap, format: MaskFormat, provider: Id) -> Id {
     counted::retain(provider);
-    make_picture(ImageState { bitmap: RwLock::new(Some(Arc::new(samples))), mask: Some(format), provider: OnceLock::from(provider) })
+    make_picture(ImageState { bitmap: RwLock::new(Some(Arc::new(samples))), mask: Some(format), provider: OnceLock::from(provider), colours: Mutex::new(None) })
 }
 
 fn make_picture(picture: ImageState) -> Id {
@@ -595,6 +741,7 @@ fn mask_format(object: Id) -> Option<&'static MaskFormat> {
 fn free_image(object: Id) {
     if let Some(s) = state::<ImageState>(object, classes().image) {
         *s.bitmap.write().unwrap_or_else(|e| e.into_inner()) = None;
+        *s.colours.lock().unwrap_or_else(|e| e.into_inner()) = None;
         if let Some(&provider) = s.provider.get() {
             counted::release(provider);
         }
@@ -604,6 +751,17 @@ fn free_image(object: Id) {
 /// The picture's pixels (kept alive while in use, even if released meanwhile).
 fn image(object: Id) -> Option<Arc<Bitmap>> {
     state::<ImageState>(object, classes().image)?.bitmap.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// The pixels to draw a picture with: an indexed one's colours, made once.
+fn drawable(object: Id) -> Option<Arc<Bitmap>> {
+    let bitmap = image(object)?;
+    if !matches!(bitmap.space, Space::Indexed(_)) {
+        return Some(bitmap);
+    }
+    let s = state::<ImageState>(object, classes().image)?;
+    let mut colours = s.colours.lock().unwrap_or_else(|e| e.into_inner());
+    Some(colours.get_or_insert_with(|| Arc::new(bitmap.unindexed().expect("indexed"))).clone())
 }
 
 fn is_mask(object: Id) -> bool {
@@ -755,11 +913,25 @@ extern "C" fn cf_style_release(object: Id) {
 
 fn space_object(space: Space) -> Id {
     static OBJECTS: OnceLock<[Id; 2]> = OnceLock::new();
+    // One shared object per palette, like the device spaces.
+    static INDEXED: Mutex<Vec<(usize, Id)>> = Mutex::new(Vec::new());
     let objects = OBJECTS.get_or_init(|| [wrap(classes().space, Space::Rgb), wrap(classes().space, Space::Gray)]);
     match space {
         Space::Rgb => objects[0],
         Space::Gray => objects[1],
         Space::None => 0,
+        Space::Indexed(palette) => {
+            let key = palette as *const Palette as usize;
+            let mut indexed = INDEXED.lock().unwrap_or_else(|e| e.into_inner());
+            match indexed.iter().find(|(k, _)| *k == key) {
+                Some(&(_, object)) => object,
+                None => {
+                    let object = wrap(classes().space, space);
+                    indexed.push((key, object));
+                    object
+                }
+            }
+        }
     }
 }
 
@@ -770,7 +942,7 @@ fn space_of(object: Id) -> Space {
 fn space_components(space: Space) -> usize {
     match space {
         Space::Rgb => 3,
-        Space::Gray => 1,
+        Space::Gray | Space::Indexed(_) => 1,
         Space::None => 0,
     }
 }
@@ -781,6 +953,16 @@ extern "C" fn space_create_rgb() -> Id {
 extern "C" fn space_create_gray() -> Id {
     space_object(Space::Gray)
 }
+/// CGColorSpaceCreateIndexed over an RGB base: `last` + 1 colours of
+/// three bytes in `table`; NULL for other bases.
+extern "C" fn space_create_indexed(base: Id, last: usize, table: *const u8) -> Id {
+    if space_of(base) != Space::Rgb || table.is_null() || last > 255 {
+        return 0;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(table, 3 * (last + 1)) };
+    let colours: Vec<[u8; 3]> = bytes.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+    space_object(Space::Indexed(palette_ref(&colours)))
+}
 extern "C" fn space_get_number_of_components(space: Id) -> usize {
     space_components(space_of(space))
 }
@@ -789,6 +971,10 @@ extern "C" fn space_get_number_of_components(space: Id) -> usize {
 fn to_rgba(space: Space, values: &[f64]) -> [f64; 4] {
     match space {
         Space::Gray => [values[0], values[0], values[0], values[1]],
+        Space::Indexed(palette) => {
+            let [r, g, b] = palette[values[0].round().clamp(0.0, 255.0) as usize].map(|c| c as f64 / 255.0);
+            [r, g, b, values[1]]
+        }
         _ => [values[0], values[1], values[2], values[3]],
     }
 }
@@ -905,12 +1091,41 @@ struct GraphicsState {
     /// Colour spaces CGContextSetFillColor / SetStrokeColor read components in.
     fill_space: Space,
     stroke_space: Space,
-    /// CGBlendMode (only normal, clear and copy differ here).
+    /// CGBlendMode (shapes::composite).
     blend_mode: i32,
     /// How much of each device pixel (rows from the bottom) drawing may touch.
     clip: Option<Arc<Vec<f32>>>,
     /// CGTextDrawingMode: fill, stroke or both (fw/graphics/text.rs).
     text_mode: i32,
+    /// CGContextSetShadow: offset (device pixels, y up), blur and colour
+    /// (straight); drawing casts it.
+    shadow: Option<Shadow>,
+    /// CGLineCap (butt 0, round 1, square 2) and CGLineJoin (miter 0, round
+    /// 1, bevel 2), the miter limit, and the dash (phase, lengths).
+    line_cap: i32,
+    line_join: i32,
+    miter_limit: f64,
+    dash: Option<Arc<(f64, Vec<f64>)>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Shadow {
+    offset: (f64, f64),
+    blur: f64,
+    color: [f64; 4],
+}
+
+impl Shadow {
+    /// How far its blur spreads, in pixels (three box passes of about the
+    /// deviation each).
+    fn reach(&self) -> i64 {
+        (1.5 * self.blur).ceil() as i64 + 2
+    }
+
+    /// Its offset in whole device pixels (y up).
+    fn step(&self) -> (i64, i64) {
+        (self.offset.0.round() as i64, self.offset.1.round() as i64)
+    }
 }
 
 impl GraphicsState {
@@ -921,13 +1136,89 @@ impl GraphicsState {
             alpha: 1.0,
             stroke: [0.0, 0.0, 0.0, 1.0],
             line_width: 1.0,
-            fill_space: Space::Rgb,
-            stroke_space: Space::Rgb,
+            // A new context's colour spaces are DeviceGray (UIKit sets
+            // DeviceRGB for drawRect:, `draw_picture`).
+            fill_space: Space::Gray,
+            stroke_space: Space::Gray,
             blend_mode: 0,
             clip: None,
             text_mode: 0,
+            shadow: None,
+            line_cap: 0,
+            line_join: 0,
+            miter_limit: 10.0,
+            dash: None,
         }
     }
+}
+
+/// What a transparency layer (CGContextBeginTransparencyLayer) is drawn
+/// over: the context's own pixels and state, put back when it ends.
+struct Under {
+    data: *mut u8,
+    owned: Option<Vec<u8>>,
+    layout: Layout,
+    bytes_per_row: usize,
+    width: usize,
+    height: usize,
+    state: GraphicsState,
+    /// Where the layer's own pixels lie on what it was begun on (they may
+    /// reach past its edges, to what casts a shadow onto it).
+    area: Area,
+    /// Past the pixel budget: no pixels of its own; the drawing went straight
+    /// on with the alpha, blend and clip it was begun with (no shadow).
+    direct: bool,
+    /// The coverage kept for what it was begun on (`Canvas::cover`).
+    cover: Option<Vec<f32>>,
+}
+
+/// Device pixels x0..x1, y0..y1 (y up), past a canvas's edges too.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Area {
+    x0: i64,
+    y0: i64,
+    x1: i64,
+    y1: i64,
+}
+
+impl Area {
+    pub(super) const NONE: Area = Area { x0: 0, y0: 0, x1: 0, y1: 0 };
+
+    fn is_empty(self) -> bool {
+        self.x0 >= self.x1 || self.y0 >= self.y1
+    }
+
+    fn pixels(self) -> usize {
+        if self.is_empty() { 0 } else { ((self.x1 - self.x0) * (self.y1 - self.y0)) as usize }
+    }
+
+    fn meet(self, other: Area) -> Area {
+        Area { x0: self.x0.max(other.x0), y0: self.y0.max(other.y0), x1: self.x1.min(other.x1), y1: self.y1.min(other.y1) }
+    }
+
+    /// The box around both.
+    fn join(self, other: Area) -> Area {
+        Area { x0: self.x0.min(other.x0), y0: self.y0.min(other.y0), x1: self.x1.max(other.x1), y1: self.y1.max(other.y1) }
+    }
+
+    fn grown(self, by: i64) -> Area {
+        Area { x0: self.x0 - by, y0: self.y0 - by, x1: self.x1 + by, y1: self.y1 + by }
+    }
+
+    fn moved(self, (dx, dy): (i64, i64)) -> Area {
+        Area { x0: self.x0 + dx, y0: self.y0 + dy, x1: self.x1 + dx, y1: self.y1 + dy }
+    }
+}
+
+/// The most pixels open transparency layers may hold at once (four of
+/// compose.rs's biggest pictures).
+const LAYER_PIXELS: usize = 16_000_000;
+
+#[cfg(test)]
+thread_local! {
+    /// The pixels the last transparency layer begun on this thread covers
+    /// (tests check how big the layers drawings make are).
+    pub(super) static LAST_LAYER: std::cell::Cell<Area> = const { std::cell::Cell::new(Area::NONE) };
 }
 
 pub struct Canvas {
@@ -944,6 +1235,14 @@ pub struct Canvas {
     saved: Vec<GraphicsState>,
     /// The path being built, in device space.
     path: shapes::Outline,
+    /// Open transparency layers, innermost last: while one is open, drawing
+    /// goes into its own premultiplied RGBA pixels.
+    layers: Vec<Under>,
+    /// How much of each pixel (rows from the bottom) the drawing covered:
+    /// kept only in a shadowed drawing's layer that is put down in a mode
+    /// where its clear parts count (`shapes::clear_source_counts`), so a
+    /// clear picture clears what it covers and nothing past it.
+    cover: Option<Vec<f32>>,
 }
 
 // The memory is the game's or the canvas's own; it's only touched under the context's lock.
@@ -968,7 +1267,7 @@ impl Canvas {
             (Space::Rgb, _) => 32,
             (Space::Gray, ALPHA_NONE) => 8,
             (Space::Gray, _) => 16,
-            (Space::None, _) => 8,
+            (Space::None | Space::Indexed(_), _) => 8,
         } * bits_per_component
             / 8;
         let layout = match layout(space, bits_per_component, bits_per_pixel, info) {
@@ -985,8 +1284,9 @@ impl Canvas {
         }
         let least = width * layout.bytes;
         let bytes_per_row = match bytes_per_row {
-            // Apple picks the row size itself: rounded up to 16 bytes for its own memory.
-            0 if data.is_null() => (least + 15) & !15,
+            // Apple picks the row size itself: rounded up to 32 bytes for its
+            // own memory (CGBitmapGetAlignedBytesPerRow).
+            0 if data.is_null() => (least + 31) & !31,
             0 => least,
             n if n < least => return Err(format!("invalid data bytes/row: should be at least {least} for {bits_per_component} integer bits/component, {} components", space_components(space))),
             n => n,
@@ -1010,6 +1310,8 @@ impl Canvas {
             state: GraphicsState::new(),
             saved: Vec::new(),
             path: shapes::Outline::default(),
+            layers: Vec::new(),
+            cover: None,
         })
     }
 
@@ -1019,6 +1321,8 @@ impl Canvas {
         self.state = GraphicsState::new();
         self.saved = Vec::new();
         self.path = shapes::Outline::default();
+        self.layers = Vec::new();
+        self.cover = None;
         self.data = std::ptr::null_mut();
         self.width = 0;
         self.height = 0;
@@ -1031,39 +1335,45 @@ impl Canvas {
         unsafe { std::slice::from_raw_parts_mut(self.data, self.bytes_per_row * self.height) }
     }
 
-    /// Device pixel (x, y from the bottom) composited with `src` (premultiplied).
-    fn blend(&mut self, x: usize, y: usize, src: [f32; 4], blend: &Blend) {
-        let src = match &self.state.clip {
-            Some(clip) => scaled(src, clip.get(y * self.width + x).copied().unwrap_or(0.0)),
-            None => src,
+    /// Device pixel (x, y from the bottom) composited with `src`
+    /// (premultiplied, the alpha applied) as far as `cover` (how much of the
+    /// pixel the drawing covers) and the clip reach. `Over` uses the state's
+    /// blend mode: what it makes of the pixel is mixed with what is there by
+    /// the cover, so a Porter-Duff mode leaves what the drawing misses.
+    fn blend(&mut self, x: usize, y: usize, src: [f32; 4], cover: f32, blend: &Blend) {
+        let k = match &self.state.clip {
+            Some(clip) => cover * clip.get(y * self.width + x).copied().unwrap_or(0.0),
+            None => cover,
+        };
+        let width = self.width;
+        if let Some(covered) = self.cover.as_mut().and_then(|c| c.get_mut(y * width + x)) {
+            *covered += k - *covered * k;
+        }
+        let mode = match blend {
+            Blend::Over => self.state.blend_mode,
+            Blend::Clear => shapes::BLEND_CLEAR,
+            Blend::Copy => shapes::BLEND_COPY,
         };
         let (layout, at) = (self.layout, (self.height - 1 - y) * self.bytes_per_row + x * self.layout.bytes);
-        let clear = self.state.blend_mode == shapes::BLEND_CLEAR;
         let pixel = &mut self.memory()[at..at + layout.bytes];
-        // An opaque source over what is there is the source (dst * 0 = 0).
-        if matches!(blend, Blend::Over) && !clear && src[3] == 1.0 {
-            return layout.write(pixel, src);
-        }
-        let dst = layout.read(pixel);
-        let out = match blend {
-            Blend::Over if clear => scaled(dst, 1.0 - src[3]),
-            Blend::Over => over(src, dst),
-            Blend::Clear => scaled(dst, 1.0 - src[3]),
-            // Painted through `copy` (it needs the coverage on its own).
-            Blend::Copy => src,
+        let out = match mode {
+            shapes::BLEND_NORMAL => {
+                let src = scaled(src, k);
+                // An opaque source over what is there is the source (dst * 0 = 0).
+                if src[3] == 1.0 {
+                    return layout.write(pixel, src);
+                }
+                over(src, layout.read(pixel))
+            }
+            // The source's alpha says how much is cleared.
+            shapes::BLEND_CLEAR => scaled(layout.read(pixel), 1.0 - src[3] * k),
+            mode => {
+                let dst = layout.read(pixel);
+                let made = shapes::composite(mode, src, dst);
+                [0, 1, 2, 3].map(|i| dst[i] + (made[i] - dst[i]) * k)
+            }
         };
         layout.write(pixel, out);
-    }
-
-    /// Device pixel (x, y from the bottom) becomes `src` (premultiplied) as
-    /// far as `coverage` and the clip reach, keeping the rest of what is there.
-    fn copy(&mut self, x: usize, y: usize, src: [f32; 4], coverage: f32) {
-        let clip = self.state.clip.as_ref().map_or(1.0, |clip| clip.get(y * self.width + x).copied().unwrap_or(0.0));
-        let k = coverage * clip;
-        let (layout, at) = (self.layout, (self.height - 1 - y) * self.bytes_per_row + x * self.layout.bytes);
-        let pixel = &mut self.memory()[at..at + layout.bytes];
-        let dst = layout.read(pixel);
-        layout.write(pixel, [0, 1, 2, 3].map(|i| src[i] * k + dst[i] * (1.0 - k)));
     }
 
     /// Paints the user-space rectangle: `shade` gives the premultiplied
@@ -1115,10 +1425,7 @@ impl Canvas {
                     }
                     let (ux, uy) = if swapped { (row.0, column.1) } else { (column.0, row.1) };
                     let color = shade(ux.clamp(min_x, max_x), uy.clamp(min_y, max_y));
-                    match blend {
-                        Blend::Copy => self.copy(x + x_start, y + y_start, scaled(color, alpha), coverage as f32),
-                        _ => self.blend(x + x_start, y + y_start, scaled(color, coverage as f32 * alpha), &blend),
-                    }
+                    self.blend(x + x_start, y + y_start, scaled(color, alpha), coverage as f32, &blend);
                 }
             }
             return;
@@ -1142,10 +1449,7 @@ impl Canvas {
                 }
                 let (ux, uy) = geometry::apply(inverse, fx + 0.5, fy + 0.5);
                 let color = shade(ux.clamp(min_x, max_x), uy.clamp(min_y, max_y));
-                match blend {
-                    Blend::Copy => self.copy(x, y, scaled(color, alpha), coverage as f32),
-                    _ => self.blend(x, y, scaled(color, coverage as f32 * alpha), &blend),
-                }
+                self.blend(x, y, scaled(color, alpha), coverage as f32, &blend);
             }
         }
     }
@@ -1191,7 +1495,7 @@ impl Canvas {
     /// the same cleared bytes, so they are set row by row (as `paint` would
     /// set them one by one). Whether it applied.
     fn clear_whole_pixels(&mut self, rect: Rect) -> bool {
-        if self.state.clip.is_some() {
+        if self.state.clip.is_some() || self.cover.is_some() {
             return false;
         }
         let Some(area) = self.whole_pixels(rect) else { return false };
@@ -1223,6 +1527,9 @@ impl Canvas {
     /// from its left, v down from its top in user space, i.e. its max y)
     /// into (s, t) in the picture (t down from its first row).
     fn draw_bitmap(&mut self, rect: Rect, bitmap: &Bitmap, map: &dyn Fn(f64, f64) -> (f64, f64)) {
+        if let Some(colours) = bitmap.unindexed() {
+            return self.draw_bitmap(rect, &colours, map);
+        }
         let Some(source) = bitmap.layout() else {
             crate::log!("CGContextDrawImage: picture format {:#x} ({} bits/pixel) not readable", bitmap.info, bitmap.bits_per_pixel);
             return;
@@ -1261,6 +1568,11 @@ impl Canvas {
         // Axis-aligned only: no rotation, no 90-degree swap, so source x is a
         // function of device x alone and source y of device y alone.
         if ctm.b != 0.0 || ctm.c != 0.0 || ctm.a == 0.0 || ctm.d == 0.0 {
+            return false;
+        }
+        // Only the normal and clear blends are worked out here, without
+        // keeping coverage (`cover`).
+        if !matches!(self.state.blend_mode, shapes::BLEND_NORMAL | shapes::BLEND_CLEAR) || self.cover.is_some() {
             return false;
         }
         let (Some(sf), Some(df)) = (source.fast, self.layout.fast) else {
@@ -1405,6 +1717,9 @@ impl Canvas {
     /// pixel per device pixel, on pixel edges, no turn) is read straight
     /// from its pixels; anything else is sampled by `draw_bitmap`.
     fn draw_image(&mut self, rect: Rect, bitmap: &Bitmap) {
+        if let Some(colours) = bitmap.unindexed() {
+            return self.draw_image(rect, &colours);
+        }
         if !self.draw_whole_pixels(rect, bitmap) {
             self.draw_bitmap(rect, bitmap, &|u, v| (u, v));
         }
@@ -1421,7 +1736,8 @@ impl Canvas {
         // float blend handles the in-between ones) when nothing clips or
         // fades, the blend is normal and both layouts have fixed byte places.
         let straight = self.state.clip.is_none()
-            && self.state.blend_mode != shapes::BLEND_CLEAR
+            && self.state.blend_mode == shapes::BLEND_NORMAL
+            && self.cover.is_none()
             && self.state.alpha == 1.0
             && source.fast.is_some()
             && self.layout.fast.is_some();
@@ -1444,7 +1760,7 @@ impl Canvas {
                 if straight {
                     self.blend_straight(x, y, pixel, source);
                 } else {
-                    self.blend(x, y, scaled(source.read(pixel), alpha), &Blend::Over);
+                    self.blend(x, y, scaled(source.read(pixel), alpha), 1.0, &Blend::Over);
                 }
             }
         }
@@ -1466,7 +1782,7 @@ impl Canvas {
             memory[at + df.blue] = pixel[sf.blue];
             memory[at + df.fourth] = 255;
         } else {
-            self.blend(x, y, source.read(pixel), &Blend::Over);
+            self.blend(x, y, source.read(pixel), 1.0, &Blend::Over);
         }
     }
 
@@ -1493,22 +1809,206 @@ impl Canvas {
                     }
                     t = 1.0;
                 }
-                self.blend(x, y, scaled(premultiply(gradient.at(t)), alpha), &Blend::Over);
+                self.blend(x, y, scaled(premultiply(gradient.at(t)), alpha), 1.0, &Blend::Over);
             }
         }
     }
 
-    /// The picture in it now (a copy, as Core Graphics gives).
+    /// CGContextBeginTransparencyLayer: later drawing goes into clear pixels
+    /// of its own, with alpha 1, the normal blend, no shadow and no clip (the
+    /// context's are applied when the layer is put down).
+    ///
+    /// The layer's pixels cover only what can show: the canvas and, with a
+    /// shadow, what casts one onto it (past the edges too), cut to `area`
+    /// when the drawing can reach no further. Drawing goes in through a
+    /// CTM (and path) moved to the layer's corner. Past the budget
+    /// (LAYER_PIXELS) no layer is made: the drawing goes straight on with
+    /// the context's alpha, blend and clip, and no shadow.
+    ///
+    /// `drawing`: the layer holds one shadowed drawing (`shadowed`), whose
+    /// clear parts outside what it covers must not count when it is put down.
+    pub(super) fn begin_layer(&mut self, area: Option<Area>, drawing: bool) {
+        let canvas = self.whole();
+        let wanted = match self.state.shadow {
+            Some(shadow) => canvas.join(canvas.moved((-shadow.step().0, -shadow.step().1)).grown(shadow.reach())),
+            None => canvas,
+        };
+        let mut region = area.map_or(wanted, |area| area.meet(wanted));
+        if region.is_empty() {
+            // Nothing of it can show: drawn into one pixel and dropped.
+            region = Area { x0: canvas.x1, y0: canvas.y1, x1: canvas.x1 + 1, y1: canvas.y1 + 1 };
+        }
+        #[cfg(test)]
+        LAST_LAYER.with(|last| last.set(region));
+        let held: usize = self.layers.iter().filter(|under| !under.direct).map(|under| under.area.pixels()).sum();
+        let (width, height) = (self.width, self.height);
+        if held + region.pixels() > LAYER_PIXELS {
+            crate::log!("CGContextBeginTransparencyLayer: {}x{} is past the layer budget; drawn straight on", region.x1 - region.x0, region.y1 - region.y0);
+            let under = Under { data: self.data, owned: None, layout: self.layout, bytes_per_row: self.bytes_per_row, width, height, state: self.state.clone(), area: canvas, direct: true, cover: None };
+            self.state.shadow = None;
+            self.layers.push(under);
+            return;
+        }
+        let (w, h) = ((region.x1 - region.x0) as usize, (region.y1 - region.y0) as usize);
+        let mut pixels = vec![0u8; w * h * 4];
+        let keeps_cover = drawing && shapes::clear_source_counts(self.state.blend_mode);
+        let cover = std::mem::replace(&mut self.cover, keeps_cover.then(|| vec![0.0; w * h]));
+        let under = Under { data: self.data, owned: self.owned.take(), layout: self.layout, bytes_per_row: self.bytes_per_row, width, height, state: self.state.clone(), area: region, direct: false, cover };
+        self.data = pixels.as_mut_ptr();
+        self.owned = Some(pixels);
+        self.layout = layout(Space::Rgb, 8, 32, PREMULTIPLIED_LAST).expect("RGBA layout");
+        (self.width, self.height, self.bytes_per_row) = (w, h, w * 4);
+        let by = (-region.x0 as f64, -region.y0 as f64);
+        (self.state.ctm.tx, self.state.ctm.ty) = (self.state.ctm.tx + by.0, self.state.ctm.ty + by.1);
+        self.path.shift(by);
+        self.state.alpha = 1.0;
+        self.state.blend_mode = 0;
+        self.state.shadow = None;
+        self.state.clip = None;
+        self.layers.push(under);
+    }
+
+    /// CGContextEndTransparencyLayer: the layer's pixels are put down as one
+    /// picture over what it was begun on, with the state from then (alpha,
+    /// blend, shadow, clip), which comes back.
+    pub(super) fn end_layer(&mut self) {
+        let Some(under) = self.layers.pop() else { return };
+        if under.direct {
+            self.state = under.state;
+            return;
+        }
+        let pixels = self.owned.take().unwrap_or_default();
+        let (w, h) = (self.width, self.height);
+        self.data = under.data;
+        self.owned = under.owned;
+        self.layout = under.layout;
+        (self.width, self.height, self.bytes_per_row) = (under.width, under.height, under.bytes_per_row);
+        self.state = under.state;
+        self.path.shift((under.area.x0 as f64, under.area.y0 as f64));
+        let cover = std::mem::replace(&mut self.cover, under.cover);
+        if pixels.len() == w * h * 4 {
+            self.put_down(&pixels, w, h, under.area, cover.as_deref());
+        }
+    }
+
+    /// A layer's premultiplied RGBA pixels (`w` x `h`, rows from the top,
+    /// lying at `at`) drawn over the canvas with the alpha, blend, clip and
+    /// shadow; what falls past the canvas's edges is left out. Its clear
+    /// pixels count only in modes where they change things, and then, with
+    /// `cover` (how much of each pixel the drawing covered, rows from the
+    /// bottom), only as far as the drawing covered them.
+    fn put_down(&mut self, pixels: &[u8], w: usize, h: usize, at: Area, cover: Option<&[f32]>) {
+        let (width, height) = (self.width as i64, self.height as i64);
+        // A layer pixel's place on the canvas (device x, y up).
+        let place = |u: i64, row: i64| (at.x0 + u, at.y0 + h as i64 - 1 - row);
+        let inside = |(x, y): (i64, i64)| (0..width).contains(&x) && (0..height).contains(&y);
+        let source = layout(Space::Rgb, 8, 32, PREMULTIPLIED_LAST).expect("RGBA layout");
+        let alpha = self.state.alpha as f32;
+        if let Some(shadow) = self.state.shadow {
+            // The cover with room round it for the blur to spread into.
+            let reach = shadow.reach() as usize;
+            let (bw, bh) = (w + 2 * reach, h + 2 * reach);
+            let mut cover = vec![0f32; bw * bh];
+            for row in 0..h {
+                for u in 0..w {
+                    cover[(row + reach) * bw + u + reach] = pixels[(row * w + u) * 4 + 3] as f32 / 255.0;
+                }
+            }
+            // Quartz's blur is about twice the Gaussian's deviation.
+            let cover = compose::blur(cover, bw, bh, shadow.blur / 2.0);
+            let (dx, dy) = shadow.step();
+            let color = scaled(premultiply(shadow.color), alpha);
+            for brow in 0..bh {
+                for bx in 0..bw {
+                    let k = cover[brow * bw + bx];
+                    let (x, y) = place(bx as i64 - reach as i64, brow as i64 - reach as i64);
+                    let (x, y) = (x + dx, y + dy);
+                    if k > 0.0 && inside((x, y)) {
+                        self.blend(x as usize, y as usize, scaled(color, k.min(1.0)), 1.0, &Blend::Over);
+                    }
+                }
+            }
+        }
+        let clear_counts = shapes::clear_source_counts(self.state.blend_mode);
+        for row in 0..h {
+            for u in 0..w {
+                let from = (row * w + u) * 4;
+                let (x, y) = place(u as i64, row as i64);
+                if (pixels[from + 3] == 0 && !clear_counts) || !inside((x, y)) {
+                    continue;
+                }
+                let color = source.read(&pixels[from..from + 4]);
+                // The drawing's own colour where it covered part of a pixel.
+                let (color, k) = match cover {
+                    Some(cover) => match cover[(h - 1 - row) * w + u] {
+                        k if k <= 0.0 => continue,
+                        k if k < 1.0 => (scaled(color, 1.0 / k).map(|v| v.min(1.0)), k),
+                        _ => (color, 1.0),
+                    },
+                    None => (color, 1.0),
+                };
+                self.blend(x as usize, y as usize, scaled(color, alpha), k, &Blend::Over);
+            }
+        }
+    }
+
+    /// Runs `draw` so that it casts the context's shadow (if it has one), as
+    /// Quartz draws every shape: drawn on its own, then put down with it.
+    /// `area` gives the pixels the drawing can land in (past the canvas's
+    /// edges too). `draw` is told how far device-space outlines made before
+    /// it must move to land in the layer (0 without a shadow).
+    fn shadowed(&mut self, area: impl FnOnce(&Canvas) -> Area, draw: impl FnOnce(&mut Canvas, (f64, f64))) {
+        if self.state.shadow.is_none() {
+            return draw(self, (0.0, 0.0));
+        }
+        let area = area(self);
+        self.begin_layer(Some(area), true);
+        let by = match self.layers.last() {
+            Some(under) if !under.direct => (-under.area.x0 as f64, -under.area.y0 as f64),
+            _ => (0.0, 0.0),
+        };
+        draw(self, by);
+        self.end_layer();
+    }
+
+    /// Every pixel.
+    fn whole(&self) -> Area {
+        Area { x0: 0, y0: 0, x1: self.width as i64, y1: self.height as i64 }
+    }
+
+    /// The pixels a device-space box (left, bottom, right, top; y up)
+    /// touches, `margin` pixels more all round (past the edges too).
+    pub(super) fn area_around(&self, (left, bottom, right, top): (f64, f64, f64, f64), margin: f64) -> Area {
+        // Not-a-number goes to 0, endless to far away.
+        let at = |v: f64| v.clamp(-1e12, 1e12) as i64;
+        Area { x0: at((left - margin).floor()), y0: at((bottom - margin).floor()), x1: at((right + margin).ceil()), y1: at((top + margin).ceil()) }
+    }
+
+    /// The pixels a user-space rectangle covers.
+    fn rect_area(&self, rect: Rect) -> Area {
+        let r = standard(rect);
+        let corners = [(r.origin.x, r.origin.y), (r.origin.x + r.size.width, r.origin.y), (r.origin.x, r.origin.y + r.size.height), (r.origin.x + r.size.width, r.origin.y + r.size.height)]
+            .map(|(x, y)| geometry::apply(self.state.ctm, x, y));
+        let (xs, ys) = (corners.map(|p| p.0), corners.map(|p| p.1));
+        let low = |v: [f64; 4]| v.into_iter().fold(f64::INFINITY, f64::min);
+        let high = |v: [f64; 4]| v.into_iter().fold(f64::NEG_INFINITY, f64::max);
+        self.area_around((low(xs), low(ys), high(xs), high(ys)), 1.0)
+    }
+
+    /// The picture in it now (a copy, as Core Graphics gives); the context's
+    /// own pixels while a transparency layer is open.
     fn snapshot(&mut self) -> Bitmap {
-        let data = self.memory().to_vec();
-        Bitmap {
-            width: self.width,
-            height: self.height,
-            bits_per_pixel: self.bits_per_pixel,
-            bytes_per_row: self.bytes_per_row,
-            info: self.info,
-            space: self.space,
-            data,
+        let (width, height, bytes_per_row, data) = self.base();
+        let data = if data.is_null() { Vec::new() } else { unsafe { std::slice::from_raw_parts(data, bytes_per_row * height) }.to_vec() };
+        Bitmap { width, height, bits_per_pixel: self.bits_per_pixel, bytes_per_row, info: self.info, space: self.space, data }
+    }
+
+    /// The context's own pixels (width, height, bytes per row, memory),
+    /// under any open transparency layers.
+    fn base(&self) -> (usize, usize, usize, *mut u8) {
+        match self.layers.first() {
+            Some(under) => (under.width, under.height, under.bytes_per_row, under.data),
+            None => (self.width, self.height, self.bytes_per_row, self.data),
         }
     }
 }
@@ -1567,17 +2067,18 @@ extern "C" fn bitmap_context_create_image(context: Id) -> Id {
     snapshot.map_or(0, make_image)
 }
 
+/// The context's own pixels (not an open transparency layer's).
 extern "C" fn bitmap_context_get_data(context: Id) -> *mut u8 {
-    locked(context).map_or(std::ptr::null_mut(), |c| c.data)
+    locked(context).map_or(std::ptr::null_mut(), |c| c.base().3)
 }
 extern "C" fn bitmap_context_get_width(context: Id) -> usize {
-    locked(context).map_or(0, |c| c.width)
+    locked(context).map_or(0, |c| c.base().0)
 }
 extern "C" fn bitmap_context_get_height(context: Id) -> usize {
-    locked(context).map_or(0, |c| c.height)
+    locked(context).map_or(0, |c| c.base().1)
 }
 extern "C" fn bitmap_context_get_bytes_per_row(context: Id) -> usize {
-    locked(context).map_or(0, |c| c.bytes_per_row)
+    locked(context).map_or(0, |c| c.base().2)
 }
 extern "C" fn bitmap_context_get_bits_per_component(context: Id) -> usize {
     locked(context).map_or(0, |_| 8)
@@ -1643,7 +2144,7 @@ extern "C" fn context_set_alpha(context: Id, alpha: f64) {
 }
 extern "C" fn context_fill_rect(context: Id, rect: Rect) {
     if let Some(mut c) = canvas("CGContextFillRect", context) {
-        c.fill_rect(rect);
+        c.shadowed(|c| c.rect_area(rect), |c, _| c.fill_rect(rect));
     }
 }
 extern "C" fn context_clear_rect(context: Id, rect: Rect) {
@@ -1653,17 +2154,17 @@ extern "C" fn context_clear_rect(context: Id, rect: Rect) {
 }
 extern "C" fn context_draw_image(context: Id, rect: Rect, picture: Id) {
     // The picture first: it may be this same context's picture or need the runtime.
-    let Some(bitmap) = image(picture) else {
+    let Some(bitmap) = drawable(picture) else {
         complain("CGContextDrawImage", "image", picture);
         return;
     };
     let mask = is_mask(picture);
     if let Some(mut c) = canvas("CGContextDrawImage", context) {
         if !mask {
-            c.draw_image(rect, &bitmap);
+            c.shadowed(|c| c.rect_area(rect), |c, _| c.draw_image(rect, &bitmap));
         } else if let Some(painted) = mask_in_color(&bitmap, c.state.fill) {
             // An image mask paints the fill colour where it lets through.
-            c.draw_image(rect, &painted);
+            c.shadowed(|c| c.rect_area(rect), |c, _| c.draw_image(rect, &painted));
         }
     }
 }
@@ -1673,7 +2174,7 @@ extern "C" fn context_draw_linear_gradient(context: Id, gradient: Id, start: Poi
         return;
     };
     if let Some(mut c) = canvas("CGContextDrawLinearGradient", context) {
-        c.draw_linear_gradient(g, start, end, options);
+        c.shadowed(Canvas::whole, |c, _| c.draw_linear_gradient(g, start, end, options));
     }
 }
 
@@ -1733,17 +2234,19 @@ extern "C" fn ui_rect_fill(rect: Rect) {
     }
 }
 
+/// UIGraphicsPushContext: the stack holds the context while it is on it.
 extern "C" fn graphics_push_context(context: Id) {
+    counted::retain(context);
     CONTEXTS.with(|stack| stack.borrow_mut().push(ImageContext { context, scale: 1.0, own: false }));
 }
 
+/// UIGraphicsPopContext: whatever is on top goes (an image context too)
+/// and the stack lets go of it.
 extern "C" fn graphics_pop_context() {
-    CONTEXTS.with(|stack| {
-        let mut stack = stack.borrow_mut();
-        if stack.last().is_some_and(|c| !c.own) {
-            stack.pop();
-        }
-    });
+    let popped = CONTEXTS.with(|stack| stack.borrow_mut().pop());
+    if let Some(popped) = popped {
+        counted::release(popped.context);
+    }
 }
 
 /// An autoreleased UIImage of what the current image context holds (as on iOS).
@@ -1855,8 +2358,146 @@ pub fn dot_picture(rgba: [f64; 4]) -> Option<String> {
         .clone()
 }
 
+/// A pressed button's glow (showsTouchWhenHighlighted, fw/controls.rs):
+/// our own drawing of a soft white spot, GLOW_POINTS across at 2x, solid in
+/// the middle and fading to nothing at its edge. Made once, kept.
+pub fn glow_image() -> Id {
+    const GLOW_POINTS: usize = 20;
+    static MADE: OnceLock<usize> = OnceLock::new();
+    *MADE.get_or_init(|| {
+        let n = GLOW_POINTS * 2;
+        let radius = n as f64 / 2.0;
+        let mut data = Vec::with_capacity(n * n * 4);
+        for y in 0..n {
+            for x in 0..n {
+                let distance = (x as f64 + 0.5 - radius).hypot(y as f64 + 0.5 - radius) / radius;
+                // Solid to a third of the way out, then a smooth fall to the edge.
+                let t = ((distance - 0.33) / 0.67).clamp(0.0, 1.0);
+                let alpha = ((1.0 - t * t * (3.0 - 2.0 * t)) * 255.0).round() as u8;
+                // Premultiplied white.
+                data.extend([alpha, alpha, alpha, alpha]);
+            }
+        }
+        let bitmap = Bitmap { width: n, height: n, bits_per_pixel: 32, bytes_per_row: n * 4, info: PREMULTIPLIED_LAST, space: Space::Rgb, data };
+        let info = uikit::ImageInfo { pixels: (n as u32, n as u32), scale: 2.0, cg: OnceLock::from(make_image(bitmap)), ..Default::default() };
+        uikit::make_image(info)
+    })
+}
+
+/// How an iOS 6 style glossy box looks (alerts, action sheets and their
+/// buttons, fw/controls.rs): a top-to-bottom gradient, a white shine over
+/// the upper part, rounded corners and an edge line. Colours straight RGBA.
+#[derive(Clone, Copy)]
+pub struct Gloss {
+    pub top: [f64; 4],
+    pub bottom: [f64; 4],
+    /// The white shine's strength at the very top (0: none).
+    pub shine: f64,
+    /// How far down the shine reaches, as a part of the height.
+    pub shine_depth: f64,
+    pub edge: [f64; 4],
+    pub edge_width: f64,
+    pub radius: f64,
+}
+
+/// A UIImage of `width` x `height` points at 2x of a glossy box: our own
+/// drawing of iOS 6's look, with smoothed corners.
+pub fn glossy_image(width: f64, height: f64, look: &Gloss) -> Id {
+    let (w, h) = ((width * 2.0).round().max(1.0) as usize, (height * 2.0).round().max(1.0) as usize);
+    let (radius, edge) = (look.radius * 2.0, look.edge_width * 2.0);
+    let mix = |a: [f64; 4], b: [f64; 4], t: f64| -> [f64; 4] { std::array::from_fn(|i| a[i] + (b[i] - a[i]) * t) };
+    // Over: `top` (straight) laid on `under` (straight).
+    let over = |under: [f64; 4], top: [f64; 4]| -> [f64; 4] {
+        let alpha = top[3] + under[3] * (1.0 - top[3]);
+        if alpha <= 0.0 {
+            return [0.0; 4];
+        }
+        let channel = |i: usize| (top[i] * top[3] + under[i] * under[3] * (1.0 - top[3])) / alpha;
+        [channel(0), channel(1), channel(2), alpha]
+    };
+    let mut data = Vec::with_capacity(w * h * 4);
+    for y in 0..h {
+        for x in 0..w {
+            let (px, py) = (x as f64 + 0.5, y as f64 + 0.5);
+            // Distance inside the rounded rectangle's edge (negative outside).
+            let (cx, cy) = (px.clamp(radius, w as f64 - radius), py.clamp(radius, h as f64 - radius));
+            let inside = if (px - cx).abs() > 0.0 || (py - cy).abs() > 0.0 {
+                radius - (px - cx).hypot(py - cy)
+            } else {
+                px.min(py).min(w as f64 - px).min(h as f64 - py).max(radius)
+            };
+            let cover = (inside + 0.5).clamp(0.0, 1.0);
+            let t = py / h as f64;
+            let mut colour = mix(look.top, look.bottom, t);
+            if look.shine > 0.0 && t < look.shine_depth {
+                // Strongest at the top, a clear lower edge where it stops.
+                let shine = look.shine * (0.55 + 0.45 * (1.0 - t / look.shine_depth));
+                colour = over(colour, [1.0, 1.0, 1.0, shine]);
+            }
+            if inside < edge {
+                colour = over(colour, look.edge);
+            }
+            let alpha = colour[3] * cover;
+            data.extend([colour[0] * alpha, colour[1] * alpha, colour[2] * alpha, alpha].map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8));
+        }
+    }
+    let bitmap = Bitmap { width: w, height: h, bits_per_pixel: 32, bytes_per_row: w * 4, info: PREMULTIPLIED_LAST, space: Space::Rgb, data };
+    let info = uikit::ImageInfo { pixels: (w as u32, h as u32), scale: 2.0, cg: OnceLock::from(make_image(bitmap)), ..Default::default() };
+    uikit::make_image(info)
+}
+
 /// Darker copies made of UIImages (pressed buttons), by the image they copy.
 static DARKER: Mutex<Option<std::collections::HashMap<Id, Id>>> = Mutex::new(None);
+
+/// A view's drawing (-drawRect:, UIKit's display): a see-through UIKit
+/// context of `size` points at `scale` pixels per point, its origin moved to
+/// the bounds' `origin`, made current while `draw` runs. The CGImage it
+/// made, one reference (the caller's); 0 for an empty size.
+pub fn draw_picture(size: Size, scale: f64, origin: Point, draw: impl FnOnce()) -> Id {
+    graphics_begin_image_context_with_options(size, false, scale);
+    let context = CONTEXTS.with(|stack| stack.borrow().last().filter(|c| c.own).map(|c| c.context));
+    let Some(context) = context else { return 0 };
+    context_translate_ctm(context, -origin.x, -origin.y);
+    if let Some(mut c) = canvas("-[UIView drawRect:]", context) {
+        // UIKit's -drawLayer:inContext: draws in DeviceRGB.
+        (c.state.fill_space, c.state.stroke_space) = (Space::Rgb, Space::Rgb);
+    }
+    draw();
+    // drawRect: may leave contexts it pushed (or pop this one): they go
+    // down to this one, which is ended if still there.
+    let picture = bitmap_context_create_image(context);
+    let left = CONTEXTS.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        match stack.iter().rposition(|c| c.context == context) {
+            Some(at) => stack.split_off(at),
+            None => Vec::new(),
+        }
+    });
+    for ended in left {
+        counted::release(ended.context);
+    }
+    picture
+}
+
+/// `look` drawn over `rect` of `context` at the context's own pixels per
+/// point, so text is sharp.
+fn draw_text_look(function: &str, context: Id, look: &TextLook, rect: Rect) {
+    let scale = canvas(function, context).map_or(1.0, |c| (c.state.ctm.a * c.state.ctm.d - c.state.ctm.b * c.state.ctm.c).abs().sqrt()).clamp(1.0, 4.0);
+    if let Some(bitmap) = text::look_bitmap(look, scale) {
+        if let Some(mut c) = canvas(function, context) {
+            c.draw_bitmap(rect, &bitmap, &|u, v| (u, 1.0 - v));
+        }
+    }
+}
+
+/// `look` drawn over `rect` of the current UIKit context (UILabel's
+/// drawTextInRect:); nothing with no context.
+pub fn draw_text_here(look: &TextLook, rect: Rect) {
+    let context = current_context();
+    if context != 0 {
+        draw_text_look("-[UILabel drawTextInRect:]", context, look, rect);
+    }
+}
 
 /// For tests: opens a UIKit image context of `width` x `height` points at
 /// 1x and returns it.
@@ -1875,6 +2516,23 @@ pub fn test_end_context() -> Vec<u8> {
     counted::release(picture);
     graphics_end_image_context();
     pixels
+}
+
+/// For tests: a 1x UIImage of `width` x `height` points all `rgba` (kept).
+#[cfg(test)]
+pub fn test_solid_image(width: f64, height: f64, rgba: [f64; 4]) -> Id {
+    test_begin_context(width, height);
+    test_fill(Rect::new(0.0, 0.0, width, height), rgba);
+    let image = counted::retain(graphics_get_image_from_current_image_context());
+    graphics_end_image_context();
+    image
+}
+
+/// For tests: fills `rect` of the current UIKit context with `rgba` (UIRectFill).
+#[cfg(test)]
+pub fn test_fill(rect: Rect, rgba: [f64; 4]) {
+    set_fill_in(current_context(), rgba);
+    ui_rect_fill(rect);
 }
 
 /// A CGImage's pixels as straight RGBA rows from the top.
@@ -1931,12 +2589,54 @@ pub fn image_cg(picture: Id) -> Id {
     })
 }
 
+/// `make`, and whether a picture file it asked for was still being written
+/// on its own thread (see `picture_file`).
+pub fn noting_unready<T>(make: impl FnOnce() -> T) -> (T, bool) {
+    let before = UNREADY.with(|u| u.replace(false));
+    let made = make();
+    // (An outer `noting_unready` still sees it.)
+    let unready = UNREADY.with(|u| u.replace(before || u.get()));
+    (made, unready)
+}
+
+thread_local! {
+    /// A picture file asked for on this thread was still being written.
+    static UNREADY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+static HELD_WRITERS: (Mutex<Vec<Id>>, std::sync::Condvar) = (Mutex::new(Vec::new()), std::sync::Condvar::new());
+
+/// For tests: holds (or lets go) the thread writing `picture`'s files.
+#[cfg(test)]
+pub fn test_hold_writing(picture: Id, held: bool) {
+    let mut list = HELD_WRITERS.0.lock().unwrap_or_else(|e| e.into_inner());
+    list.retain(|&p| p != picture);
+    if held {
+        list.push(picture);
+    }
+    HELD_WRITERS.1.notify_all();
+}
+
+/// A writer thread waits here while a test holds its picture.
+fn writer_may_start(picture: Id) {
+    #[cfg(test)]
+    {
+        let mut list = HELD_WRITERS.0.lock().unwrap_or_else(|e| e.into_inner());
+        while list.contains(&picture) {
+            list = HELD_WRITERS.1.wait(list).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+    let _ = picture;
+}
+
 /// A file the phone app can show for this UIImage as UIKit would draw it: the
 /// picture's own file when it is upright, else an upright PNG made once
 /// (pictures made in memory, turned photos). None if it can't be made.
 ///
 /// The PNG is made on its own thread (not the game's main thread); until it
-/// is ready this gives None and the picture shows from the next update.
+/// is ready this gives None (noted for `noting_unready`, so the list can
+/// wait for it) and the picture shows from the next update.
 pub fn picture_file(picture: Id) -> Option<String> {
     let info = uikit::image_info(picture)?;
     if info.orientation == 0 && !info.path.is_empty() {
@@ -1949,15 +2649,20 @@ pub fn picture_file(picture: Id) -> Option<String> {
         // Held while the file is made, so the image can't go meanwhile.
         counted::retain(picture);
         std::thread::spawn(move || {
+            writer_may_start(picture);
             let made = write_picture_file(picture);
             if let Some(info) = uikit::image_info(picture) {
+                let ready = made.is_some();
                 if let Err(Some(file)) = info.picture_file.set(made) {
                     let _ = std::fs::remove_file(file);
+                } else if ready {
+                    crate::fw::changes::touch();
                 }
             }
             counted::release(picture);
         });
     }
+    UNREADY.with(|u| u.set(true));
     None
 }
 
@@ -1974,17 +2679,22 @@ pub fn picture_part_file(picture: Id, part: usize) -> Option<String> {
         // Held while the files are made, so the image can't go meanwhile.
         counted::retain(picture);
         std::thread::spawn(move || {
+            writer_may_start(picture);
             let made = write_part_files(picture);
             if let Some(info) = uikit::image_info(picture) {
+                let ready = made.iter().any(Option::is_some);
                 if let Err(files) = info.part_files.set(made) {
                     for file in files.into_iter().flatten() {
                         let _ = std::fs::remove_file(file);
                     }
+                } else if ready {
+                    crate::fw::changes::touch();
                 }
             }
             counted::release(picture);
         });
     }
+    UNREADY.with(|u| u.set(true));
     None
 }
 
@@ -2113,22 +2823,132 @@ pub fn orient(orientation: i64, u: f64, v: f64) -> (f64, f64) {
     }
 }
 
-/// -[UIImage drawInRect:]: upright in UIKit's coordinates (top at the
-/// rectangle's min y), turned by the image's orientation.
-fn ui_image_draw(picture: Id, rect: Rect) {
-    let Some(bitmap) = image(image_cg(picture)) else { return };
-    let orientation = ui_image_orientation(picture, 0);
+/// -[UIImage drawInRect:blendMode:alpha:]: upright in UIKit's coordinates
+/// (top at the rectangle's min y), turned by the image's orientation, a
+/// stretchable one in nine parts; with this blend mode and alpha (not on
+/// top of the context's), casting the context's shadow.
+fn ui_image_draw(picture: Id, rect: Rect, blend_mode: i32, alpha: f64) {
+    // The picture first: it may need the runtime.
+    let Some(shown) = shown_image(picture) else { return };
     if let Some(mut c) = canvas("-[UIImage drawInRect:]", current_context()) {
-        c.draw_bitmap(rect, &bitmap, &|u, v| orient(orientation, u, 1.0 - v));
+        let saved = (c.state.alpha, c.state.blend_mode);
+        (c.state.alpha, c.state.blend_mode) = (alpha.clamp(0.0, 1.0), blend_mode);
+        c.shadowed(|c| c.rect_area(rect), |c, _| draw_shown(c, &shown, rect));
+        (c.state.alpha, c.state.blend_mode) = saved;
     }
 }
 
+/// What drawing a UIImage takes: its pixels, orientation, cap insets
+/// (points: top, left, bottom, right), scale and whether its middle tiles.
+pub(super) struct ShownImage {
+    bitmap: Arc<Bitmap>,
+    orientation: i64,
+    caps: Option<[f64; 4]>,
+    scale: f64,
+    tile: bool,
+}
+
+pub(super) fn shown_image(picture: Id) -> Option<ShownImage> {
+    let bitmap = drawable(image_cg(picture))?;
+    let info = uikit::image_info(picture)?;
+    let caps = info.caps.filter(|caps| caps.iter().any(|&cap| cap > 0.0));
+    Some(ShownImage { bitmap, orientation: info.orientation, caps, scale: if info.scale > 0.0 { info.scale } else { 1.0 }, tile: info.tile })
+}
+
+/// A UIImage drawn over `rect` of a canvas as UIKit draws it: turned by its
+/// orientation; with cap insets, cut at them into nine parts whose corners
+/// keep their size while the edges and middle stretch (or tile, for
+/// UIImageResizingModeTile) between them (-[UIImage drawInRect:]'s
+/// _Draw3PartSlice), each part drawn from its own pixels only.
+pub(super) fn draw_shown(c: &mut Canvas, shown: &ShownImage, rect: Rect) {
+    let (bitmap, orientation) = (&shown.bitmap, shown.orientation);
+    let Some(caps) = shown.caps else {
+        c.draw_bitmap(rect, bitmap, &|u, v| orient(orientation, u, 1.0 - v));
+        return;
+    };
+    let (scale, tile) = (shown.scale, shown.tile);
+    let turned = matches!(orientation, 2 | 3 | 6 | 7);
+    let (width, height) = if turned { (bitmap.height, bitmap.width) } else { (bitmap.width, bitmap.height) };
+    let [top, left, bottom, right] = caps.map(|cap| (cap * scale).round().max(0.0) as usize);
+    let rect = standard(rect);
+    // Where the three parts of a side go: the caps keep their size (shrunk
+    // alike when they don't fit), the middle takes the rest.
+    let places = |parts: [(usize, usize); 3], start: f64, length: f64| {
+        let (first, last) = (parts[0].1 as f64 / scale, parts[2].1 as f64 / scale);
+        let k = if first + last > length && first + last > 0.0 { length / (first + last) } else { 1.0 };
+        let (first, last) = (first * k, last * k);
+        [(start, first), (start + first, length - first - last), (start + length - last, last)]
+    };
+    let (columns, rows) = (cuts(width, left, right), cuts(height, top, bottom));
+    let (across, down) = (places(columns, rect.origin.x, rect.size.width), places(rows, rect.origin.y, rect.size.height));
+    for (j, (&(y, h), &(dy, dh))) in rows.iter().zip(&down).enumerate() {
+        for (i, (&(x, w), &(dx, dw))) in columns.iter().zip(&across).enumerate() {
+            if w == 0 || h == 0 || dw <= 0.0 || dh <= 0.0 {
+                continue;
+            }
+            let Some(part) = crop_upright(bitmap, orientation, (width, height), (x, y, w, h)) else { continue };
+            let map = |u: f64, v: f64| orient(orientation, u, 1.0 - v);
+            let target = Rect::new(dx, dy, dw, dh);
+            if tile && (i == 1 || j == 1) {
+                // Tiled at the part's own size from its top left, cut to its place.
+                let (tw, th) = (if i == 1 { w as f64 / scale } else { dw }, if j == 1 { h as f64 / scale } else { dh });
+                let saved = c.state.clip.clone();
+                let mut outline = shapes::Outline::default();
+                outline.rect(target, &c.to_device());
+                c.clip_to(&outline, false);
+                let mut ty = dy;
+                while ty < dy + dh - 1e-9 {
+                    let mut tx = dx;
+                    while tx < dx + dw - 1e-9 {
+                        c.draw_bitmap(Rect::new(tx, ty, tw, th), &part, &map);
+                        tx += tw;
+                    }
+                    ty += th;
+                }
+                c.state.clip = saved;
+            } else {
+                c.draw_bitmap(target, &part, &map);
+            }
+        }
+    }
+}
+
+/// The pixels of a picture under part (x, y, w, h) of it as shown upright
+/// (`upright`: its shown width and height), in its stored orientation.
+fn crop_upright(bitmap: &Bitmap, orientation: i64, upright: (usize, usize), (x, y, w, h): (usize, usize, usize, usize)) -> Option<Bitmap> {
+    let source = bitmap.layout()?;
+    let corner = |u: usize, v: usize| orient(orientation, u as f64 / upright.0 as f64, v as f64 / upright.1 as f64);
+    let ((s0, t0), (s1, t1)) = (corner(x, y), corner(x + w, y + h));
+    let column = |s: f64| (s * bitmap.width as f64).round() as usize;
+    let row = |t: f64| (t * bitmap.height as f64).round() as usize;
+    let (x0, x1) = (column(s0.min(s1)), column(s0.max(s1)).min(bitmap.width));
+    let (y0, y1) = (row(t0.min(t1)), row(t0.max(t1)).min(bitmap.height));
+    if x0 >= x1 || y0 >= y1 {
+        return None;
+    }
+    let mut data = Vec::with_capacity((x1 - x0) * (y1 - y0) * source.bytes);
+    for r in y0..y1 {
+        let at = r * bitmap.bytes_per_row;
+        data.extend_from_slice(&bitmap.data[at + x0 * source.bytes..at + x1 * source.bytes]);
+    }
+    let bytes_per_row = (x1 - x0) * source.bytes;
+    Some(Bitmap { width: x1 - x0, height: y1 - y0, bits_per_pixel: bitmap.bits_per_pixel, bytes_per_row, info: bitmap.info, space: bitmap.space, data })
+}
+
 extern "C" fn ui_image_draw_in_rect(this: Id, _: Sel, rect: Rect) {
-    ui_image_draw(this, rect);
+    ui_image_draw(this, rect, 0, 1.0);
+}
+
+extern "C" fn ui_image_draw_in_rect_blend(this: Id, _: Sel, rect: Rect, blend_mode: i32, alpha: f64) {
+    ui_image_draw(this, rect, blend_mode, alpha);
 }
 
 extern "C" fn ui_image_draw_at_point(this: Id, _: Sel, point: Point) {
-    ui_image_draw(this, Rect { origin: point, size: uikit::image_points(this) });
+    ui_image_draw(this, Rect { origin: point, size: uikit::image_points(this) }, 0, 1.0);
+}
+
+extern "C" fn ui_image_draw_at_point_blend(this: Id, _: Sel, point: Point, blend_mode: i32, alpha: f64) {
+    ui_image_draw(this, Rect { origin: point, size: uikit::image_points(this) }, blend_mode, alpha);
 }
 
 /// The picture upright (orientation applied), as straight RGBA rows.
@@ -2279,7 +3099,9 @@ pub fn register(r: &mut Registry) {
             ("initWithData:", ui_image_init_with_data as usize),
             ("initWithData:scale:", ui_image_init_with_data_scale as usize),
             ("drawInRect:", ui_image_draw_in_rect as usize),
+            ("drawInRect:blendMode:alpha:", ui_image_draw_in_rect_blend as usize),
             ("drawAtPoint:", ui_image_draw_at_point as usize),
+            ("drawAtPoint:blendMode:alpha:", ui_image_draw_at_point_blend as usize),
         ],
     );
 
@@ -2302,6 +3124,7 @@ pub fn register(r: &mut Registry) {
     // Colour spaces are shared; colours and gradients are small and kept.
     r.function("CGColorSpaceCreateDeviceRGB", space_create_rgb as usize);
     r.function("CGColorSpaceCreateDeviceGray", space_create_gray as usize);
+    r.function("CGColorSpaceCreateIndexed", space_create_indexed as usize);
     r.function("CGColorSpaceGetNumberOfComponents", space_get_number_of_components as usize);
     r.function("CGColorSpaceRelease", nothing as usize);
     r.function("CGColorCreate", color_create as usize);
@@ -2631,7 +3454,7 @@ mod tests {
     fn crushed_png_rows_unfilter() {
         // Two rows of one RGBA pixel: "sub" can't apply, "up" adds the row above.
         let raw = [0, 10, 20, 30, 40, 2, 1, 1, 1, 1];
-        assert_eq!(unfilter(&raw, 1, 2, 4).unwrap(), [10, 20, 30, 40, 11, 21, 31, 41]);
+        assert_eq!(unfilter_rows(&raw, 4, 2, 4).unwrap(), [10, 20, 30, 40, 11, 21, 31, 41]);
         // A broken crushed PNG (header chunk too short) is nil, not a crash.
         let mut broken = b"\x89PNG\r\n\x1a\n".to_vec();
         for (kind, body) in [(b"CgBI", [0u8; 4]), (b"IHDR", [0, 0, 0, 1])] {
@@ -2641,6 +3464,162 @@ mod tests {
             broken.extend_from_slice(&[0; 4]);
         }
         assert!(decode(&broken).is_none());
+    }
+
+    fn setup() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+    }
+
+    /// A PNG file of these chunks (signature first, each with its CRC).
+    pub(super) fn png_of(chunks: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
+        let crc = |bytes: &[u8]| {
+            let mut c = !0u32;
+            for &b in bytes {
+                c ^= b as u32;
+                for _ in 0..8 {
+                    c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+                }
+            }
+            !c
+        };
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        for (kind, body) in chunks {
+            png.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            let start = png.len();
+            png.extend_from_slice(*kind);
+            png.extend_from_slice(body);
+            let sum = crc(&png[start..]);
+            png.extend_from_slice(&sum.to_be_bytes());
+        }
+        png
+    }
+
+    pub(super) fn header(width: u32, height: u32, depth: u8, kind: u8) -> Vec<u8> {
+        [&width.to_be_bytes()[..], &height.to_be_bytes(), &[depth, kind, 0, 0, 0]].concat()
+    }
+
+    fn pixel_at(pixels: &[u8], width: usize, x: usize, y: usize) -> [u8; 4] {
+        pixels[(y * width + x) * 4..(y * width + x) * 4 + 4].try_into().unwrap()
+    }
+
+    /// Crushed PNGs of other colour types read too (ImageIO reads them):
+    /// a crushed RGB file keeps its pixels blue, green, red.
+    #[test]
+    fn crushed_rgb_pngs_are_read() {
+        let idat = miniz_oxide::deflate::compress_to_vec(&[0, 3, 2, 1, 6, 5, 4], 6);
+        let png = png_of(&[(b"CgBI", vec![0x50, 0, 0x20, 6]), (b"IHDR", header(2, 1, 8, 2)), (b"IDAT", idat), (b"IEND", Vec::new())]);
+        let (bitmap, _) = decode(&png).expect("read");
+        assert_eq!(bitmap.straight_rgba().unwrap(), [1, 2, 3, 255, 4, 5, 6, 255]);
+    }
+
+    /// A stretchable image is drawn in nine parts cut at its caps: the
+    /// corners keep their size and the middle stretches. -drawInRect: draws
+    /// at full alpha whatever the context's (drawInRect:blendMode:alpha:
+    /// sets its own).
+    #[test]
+    fn stretchable_images_draw_in_nine_parts_at_their_own_alpha() {
+        setup();
+        let (red, blue) = ([1.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]);
+        test_begin_context(3.0, 3.0);
+        test_fill(Rect::new(0.0, 0.0, 3.0, 3.0), blue);
+        for (x, y) in [(0.0, 0.0), (2.0, 0.0), (0.0, 2.0), (2.0, 2.0)] {
+            test_fill(Rect::new(x, y, 1.0, 1.0), red);
+        }
+        let corners = counted::retain(graphics_get_image_from_current_image_context());
+        graphics_end_image_context();
+        let stretchy = runtime::send(corners, "stretchableImageWithLeftCapWidth:topCapHeight:", &[1, 1]);
+        let context = test_begin_context(9.0, 10.0);
+        context_set_alpha(context, 0.5);
+        uikit::send_rect(stretchy, "drawInRect:", Rect::new(0.0, 0.0, 9.0, 9.0));
+        let s = runtime::sel("drawInRect:blendMode:alpha:");
+        let imp = runtime::imp_for(corners, s).expect("drawInRect:blendMode:alpha:");
+        let draw: extern "C" fn(Id, Sel, Rect, i32, f64) = unsafe { std::mem::transmute(imp) };
+        draw(corners, s, Rect::new(0.0, 9.0, 3.0, 1.0), 0, 0.5);
+        let pixels = test_end_context();
+        assert_eq!(pixel_at(&pixels, 9, 0, 0), [255, 0, 0, 255], "a corner, at full alpha");
+        assert_eq!(pixel_at(&pixels, 9, 8, 8), [255, 0, 0, 255]);
+        assert_eq!(pixel_at(&pixels, 9, 1, 1), [0, 0, 255, 255], "the middle stretched");
+        assert_eq!(pixel_at(&pixels, 9, 4, 0), [0, 0, 255, 255], "the top edge stretched");
+        assert!(pixel_at(&pixels, 9, 1, 9)[3].abs_diff(128) <= 1, "its own alpha: {:?}", pixel_at(&pixels, 9, 1, 9));
+    }
+
+    /// A shadowed drawing's layer has pixels only for the drawing (its
+    /// shadow spreads round them when put down); past the pixel budget a
+    /// layer is drawn straight on, its alpha applied piece by piece.
+    #[test]
+    fn layers_cover_only_their_drawing_and_stop_at_a_budget() {
+        let mut c = Canvas::new(std::ptr::null_mut(), 2000, 2000, 8, 0, Space::Rgb, PREMULTIPLIED_LAST).unwrap();
+        let at = |c: &mut Canvas, x: usize, y: usize| -> [u8; 4] { c.memory()[((1999 - y) * 2000 + x) * 4..][..4].try_into().unwrap() };
+        c.state.shadow = Some(Shadow { offset: (0.0, 0.0), blur: 2.0, color: [0.0, 0.0, 0.0, 1.0] });
+        let rect = Rect::new(10.0, 20.0, 4.0, 3.0);
+        let mut seen = None;
+        c.shadowed(|c| c.rect_area(rect), |c, _| {
+            seen = c.layers.last().map(|under| (under.area, c.width, c.height));
+            c.fill_rect(rect);
+        });
+        // x 10..14, y 20..23, a pixel more all round.
+        assert_eq!(seen, Some((Area { x0: 9, y0: 19, x1: 15, y1: 24 }, 6, 5)));
+        assert_eq!(at(&mut c, 11, 21)[3], 255);
+        assert!(at(&mut c, 11, 24)[3] > 0, "the shadow reaches past the drawing");
+        c.state.shadow = None;
+        c.state.fill = [1.0, 0.0, 0.0, 1.0];
+        for _ in 0..4 {
+            c.begin_layer(None, false);
+        }
+        assert!(c.layers.iter().all(|under| !under.direct));
+        c.state.alpha = 0.5;
+        c.begin_layer(None, false);
+        assert!(c.layers.last().unwrap().direct, "past the budget");
+        c.fill_rect(Rect::new(0.0, 0.0, 1.0, 1.0));
+        for _ in 0..5 {
+            c.end_layer();
+        }
+        let red = at(&mut c, 0, 0);
+        assert!(red[0].abs_diff(128) <= 1 && red[1] == 0 && red[3].abs_diff(128) <= 1, "{red:?}");
+    }
+
+    /// A shape just past the canvas's edge still casts its shadow onto it
+    /// (Quartz draws the shape where it is, then its shadow moved).
+    #[test]
+    fn shapes_off_the_canvas_cast_their_shadows_onto_it() {
+        let mut c = Canvas::new(std::ptr::null_mut(), 20, 20, 8, 0, Space::Rgb, PREMULTIPLIED_LAST).unwrap();
+        c.state.shadow = Some(Shadow { offset: (8.0, -4.0), blur: 0.0, color: [0.0, 0.0, 0.0, 1.0] });
+        // Left of and above the canvas: x -6..-2, y 22..25; its shadow x 2..6, y 18..21.
+        let rect = Rect::new(-6.0, 22.0, 4.0, 3.0);
+        c.shadowed(|c| c.rect_area(rect), |c, _| c.fill_rect(rect));
+        let at = |c: &mut Canvas, x: usize, y: usize| {
+            let row = (19 - y) * c.bytes_per_row;
+            c.memory()[row + x * 4 + 3]
+        };
+        assert_eq!((at(&mut c, 3, 18), at(&mut c, 5, 19)), (255, 255), "the shadow lands");
+        assert_eq!((at(&mut c, 7, 18), at(&mut c, 3, 17)), (0, 0), "nothing past it");
+    }
+
+    /// UIKit's image contexts pad rows to 32 bytes (CGBitmapGetAlignedBytesPerRow).
+    #[test]
+    fn image_context_rows_are_padded_to_32_bytes() {
+        setup();
+        graphics_begin_image_context_with_options(Size { width: 9.0, height: 1.0 }, false, 1.0);
+        assert_eq!(bitmap_context_get_bytes_per_row(current_context()), 64);
+        graphics_end_image_context();
+    }
+
+    /// UIGraphicsPushContext holds the context; UIGraphicsPopContext pops
+    /// whatever is on top (an image context too) and lets go of it.
+    #[test]
+    fn push_holds_and_pop_takes_any_context() {
+        setup();
+        let own = bitmap_context_create(std::ptr::null_mut(), 2, 2, 8, 0, space_create_rgb(), PREMULTIPLIED_LAST);
+        graphics_push_context(own);
+        assert_eq!(counted::count(own), Some(2), "pushing holds it");
+        let image_context = counted::retain(test_begin_context(1.0, 1.0));
+        graphics_pop_context();
+        assert_eq!((current_context(), counted::count(image_context)), (own, Some(1)), "the image context popped and let go of");
+        graphics_pop_context();
+        assert_eq!((current_context(), counted::count(own)), (0, Some(1)));
+        counted::release(image_context);
+        counted::release(own);
     }
 
     #[test]

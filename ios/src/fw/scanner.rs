@@ -361,11 +361,6 @@ pub fn trim(units: &[u16], s: &Set) -> Vec<u16> {
     units[start..end].to_vec()
 }
 
-extern "C" fn by_trimming(this: Id, _: Sel, characters: Id) -> Id {
-    let trimmed = trim(&units_of(this), &set(characters));
-    string::make(&String::from_utf16_lossy(&trimmed))
-}
-
 const BACKWARDS: usize = 4;
 
 extern "C" fn range_of_character_options(this: Id, _: Sel, characters: Id, options: usize) -> string::Range {
@@ -849,7 +844,6 @@ pub fn register(_: &mut Registry) {
     methods(
         string_class,
         &[
-            ("stringByTrimmingCharactersInSet:", by_trimming as usize),
             ("rangeOfCharacterFromSet:", range_of_character as usize),
             ("rangeOfCharacterFromSet:options:", range_of_character_options as usize),
             ("rangeOfCharacterFromSet:options:range:", range_of_character_in as usize),

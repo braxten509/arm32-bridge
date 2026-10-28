@@ -9,7 +9,7 @@ use crate::symbols::{leak, leak_cstr};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::ffi::CStr;
 use std::sync::atomic::Ordering;
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
 
 pub type Id = usize;
 pub type Sel = usize;
@@ -76,6 +76,9 @@ pub struct Runtime {
     selectors: HashMap<String, Sel>,
     selector_names: HashMap<Sel, String>,
     cache: HashMap<(Class, Sel), Imp>,
+    /// Classes whose +initialize has finished all the way up their chain
+    /// (it never goes back, and a class's superclass never changes).
+    chain_done: std::collections::HashSet<Class>,
     /// (lookup class, selector) whose resolver was called and added nothing:
     /// it is not asked again until the class's method table changes.
     resolutions_refused: HashSet<(Class, Sel)>,
@@ -246,14 +249,32 @@ impl Runtime {
             .unwrap_or_else(|| format!("<unknown class {class:#x}>"))
     }
 
-    pub fn is_subclass(&self, mut class: Class, of: Class) -> bool {
-        while class != 0 {
-            if class == of {
-                return true;
-            }
-            class = self.classes.get(&class).map(|r| r.superclass).unwrap_or(0);
+    pub fn is_subclass(&self, class: Class, of: Class) -> bool {
+        if of == 0 {
+            return false;
         }
-        false
+        if let Some(hit) = cached_subclass(class, of) {
+            return hit;
+        }
+        let mut current = class;
+        // `known` means the walk reached a definite answer: it found `of`, or
+        // it hit a real root (superclass 0). A walk that stops at a class we
+        // have not registered yet is not definite — that class's chain may
+        // still grow — so its result is not cached.
+        let (result, known) = loop {
+            if current == of {
+                break (true, true);
+            }
+            match self.classes.get(&current) {
+                Some(rec) if rec.superclass == 0 => break (false, true),
+                Some(rec) => current = rec.superclass,
+                None => break (false, false),
+            }
+        };
+        if known {
+            subclass_cache().write().unwrap_or_else(|e| e.into_inner()).insert((class, of), result);
+        }
+        result
     }
 
     /// Makes a class and its metaclass; the class pointer is returned.
@@ -361,6 +382,38 @@ impl Runtime {
         let isa = self.class_of(object);
         self.classes.get(&isa).map(|r| r.meta).unwrap_or(false)
     }
+}
+
+/// Cached `(class, of)` subclass results. A class's superclass chain is fixed
+/// once the class is registered (see `realize`/`build_class_pair`), so an
+/// entry never goes stale. It is keyed by the class pointer, not the name, so
+/// classes made at run time get their own entry, and a class that is not yet
+/// registered is never cached (its chain may still grow).
+fn subclass_cache() -> &'static RwLock<HashMap<(Class, Class), bool>> {
+    static CACHE: OnceLock<RwLock<HashMap<(Class, Class), bool>>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(HashMap::default()))
+}
+
+fn cached_subclass(class: Class, of: Class) -> Option<bool> {
+    subclass_cache().read().unwrap_or_else(|e| e.into_inner()).get(&(class, of)).copied()
+}
+
+/// Whether `object` is an instance of `of` (or one of its subclasses), read
+/// without taking the runtime lock when the answer is already cached. Used on
+/// the picture hot path so repeated checks of the same class stay cheap.
+pub fn is_kind_of(object: Id, of: Class) -> bool {
+    if object == 0 || of == 0 {
+        return false;
+    }
+    // The object's isa is a plain word: reading it needs no lock.
+    let class = unsafe { *(object as *const usize) };
+    if class == of {
+        return true;
+    }
+    if let Some(hit) = cached_subclass(class, of) {
+        return hit;
+    }
+    lock().is_subclass(class, of)
 }
 
 pub fn sel(name: &str) -> Sel {
@@ -816,15 +869,21 @@ pub fn imp_for(receiver: Id, sel: Sel) -> Option<Imp> {
         let (isa, is_class) = (rt.class_of(receiver), rt.is_class_object(receiver));
         // A parent's +initialize may finish its child first, so every class
         // up the chain must be Done.
-        let mut at = if is_class { receiver } else { isa };
-        let all_done = loop {
-            match rt.classes.get(&at) {
-                Some(rec) if rec.init == Init::Done => at = rec.superclass,
-                Some(_) => break false,
-                None => break at == 0,
-            }
-        };
+        let start = if is_class { receiver } else { isa };
+        let mut at = start;
+        let known = rt.chain_done.contains(&start);
+        let all_done = known
+            || loop {
+                match rt.classes.get(&at) {
+                    Some(rec) if rec.init == Init::Done => at = rec.superclass,
+                    Some(_) => break false,
+                    None => break at == 0,
+                }
+            };
         if all_done {
+            if !known {
+                rt.chain_done.insert(start);
+            }
             return rt.lookup(isa, sel);
         }
         (isa, is_class)
@@ -867,18 +926,20 @@ pub fn send(receiver: Id, sel_name: &str, args: &[usize]) -> usize {
     call_with_words(imp, receiver, s, args)
 }
 
+/// Calls `imp` with every argument register x2-x7 set: the words sent, then
+/// zeros. A method that takes more arguments than were sent (a 32-bit game
+/// method typed with three objects, sent performSelector:withObject:) reads
+/// nil for the rest, never what the registers last held (the 32-bit bridge
+/// converts every argument its types name). Extra registers are harmless to
+/// a method that takes fewer.
 fn call_with_words(imp: Imp, receiver: Id, s: Sel, args: &[usize]) -> usize {
+    assert!(args.len() <= 6, "send: too many arguments");
+    let mut w = [0usize; 6];
+    w[..args.len()].copy_from_slice(args);
     unsafe {
-        match args {
-            [] => std::mem::transmute::<Imp, extern "C" fn(Id, Sel) -> usize>(imp)(receiver, s),
-            [a] => std::mem::transmute::<Imp, extern "C" fn(Id, Sel, usize) -> usize>(imp)(receiver, s, *a),
-            [a, b] => std::mem::transmute::<Imp, extern "C" fn(Id, Sel, usize, usize) -> usize>(imp)(receiver, s, *a, *b),
-            [a, b, c] => std::mem::transmute::<Imp, extern "C" fn(Id, Sel, usize, usize, usize) -> usize>(imp)(receiver, s, *a, *b, *c),
-            [a, b, c, d] => std::mem::transmute::<Imp, extern "C" fn(Id, Sel, usize, usize, usize, usize) -> usize>(imp)(
-                receiver, s, *a, *b, *c, *d,
-            ),
-            _ => panic!("send: too many arguments"),
-        }
+        std::mem::transmute::<Imp, extern "C" fn(Id, Sel, usize, usize, usize, usize, usize, usize) -> usize>(imp)(
+            receiver, s, w[0], w[1], w[2], w[3], w[4], w[5],
+        )
     }
 }
 

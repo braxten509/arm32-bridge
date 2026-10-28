@@ -34,10 +34,11 @@
 //! the controller's table (UpstreamPlaceholder-N: the controller and its
 //! segue templates), and buttons send -perform: to the templates.
 
+use crate::fw::controls::Insets;
 use crate::fw::geometry::{Point, Rect, Size};
 use crate::fw::object::{class_methods, define_class, methods};
 use crate::fw::plist::Value;
-use crate::fw::uikit::{property_get, property_set, property_set_object, view_state};
+use crate::fw::uikit::{property_get, property_set, property_set_object, view_state, view_state_mut};
 use crate::fw::{collections, string};
 use crate::objc::runtime::{self, lock, Class, Id, Sel};
 use crate::symbols::Registry;
@@ -82,6 +83,10 @@ fn decode_size(coder: Id, key: &str) -> Size {
 
 fn decode_rect(coder: Id, key: &str) -> Rect {
     coder_call::<Rect>(coder, "decodeCGRectForKey:", key).unwrap_or_default()
+}
+
+fn decode_insets(coder: Id, key: &str) -> Insets {
+    coder_call::<Insets>(coder, "decodeUIEdgeInsetsForKey:", key).unwrap_or_default()
 }
 
 /// The object for a key, when the coder has one.
@@ -159,6 +164,27 @@ fn own_send_size(object: Id, name: &str, value: Size) {
     }
 }
 
+fn own_send_insets(object: Id, name: &str, value: Insets) {
+    if let Some((imp, sel)) = framework_imp(object, name) {
+        unsafe { std::mem::transmute::<usize, extern "C" fn(Id, Sel, Insets)>(imp)(object, sel, value) }
+    }
+}
+
+fn own_send_float(object: Id, name: &str, value: f32) {
+    if let Some((imp, sel)) = framework_imp(object, name) {
+        unsafe { std::mem::transmute::<usize, extern "C" fn(Id, Sel, f32)>(imp)(object, sel, value) }
+    }
+}
+
+/// Sends a message taking one argument as objc_msgSend does: a game's own
+/// version runs (UIKit's -initWithCoder: sends some of its setters).
+fn send_with<A>(object: Id, name: &str, value: A) {
+    let sel = runtime::sel(name);
+    if let Some(imp) = runtime::imp_for(object, sel) {
+        unsafe { std::mem::transmute::<usize, extern "C" fn(Id, Sel, A)>(imp)(object, sel, value) }
+    }
+}
+
 /// [super initWithCoder:] from one of our classes: `class`'s parent's method.
 fn super_init_with_coder(this: Id, class: &str, coder: Id) -> Id {
     let sel = runtime::sel("initWithCoder:");
@@ -196,8 +222,11 @@ fn is_kind_of(object: Id, class_name: &str) -> bool {
 // ----- views -----
 
 /// The frame a nib gives a view: its size from UIBounds, placed by its
-/// centre (UICenter), as UIKit stores views.
+/// centre (UICenter), as UIKit stores views (older nibs keep a UIFrame).
 fn decoded_frame(coder: Id) -> Rect {
+    if contains(coder, "UIFrame") {
+        return decode_rect(coder, "UIFrame");
+    }
     let size = if contains(coder, "UIBounds") { decode_rect(coder, "UIBounds").size } else { Size::default() };
     match contains(coder, "UICenter").then(|| decode_point(coder, "UICenter")) {
         Some(center) => Rect::new(center.x - size.width / 2.0, center.y - size.height / 2.0, size.width, size.height),
@@ -207,8 +236,15 @@ fn decoded_frame(coder: Id) -> Rect {
 
 /// -[UIView initWithCoder:]. Our classes set themselves up in
 /// -initWithFrame:, so the nearest one of ours does that (a game's own
-/// -initWithFrame: is not run: iOS doesn't call it while decoding); then
-/// what the nib stores is set straight into the view.
+/// -initWithFrame: is not run: iOS doesn't call it while decoding; UIKit's
+/// own setup step stands for it). Then, as UIKit's: the subviews are added
+/// (-addSubview:), and every setting is set whether the nib stores it or
+/// not: an absent key reads as NO / 0 / nil (alpha 1), so a nib view takes
+/// touches unless UIUserInteractionDisabled says not, whatever its class's
+/// -initWithFrame: default (UILabel, UIImageView). Opaque, hidden, the
+/// background, alpha, content mode and clipping go through the view's own
+/// setters (a game's overrides run); the touch and resizing flags are set
+/// in the view itself.
 extern "C" fn view_init_with_coder(this: Id, _: Sel, coder: Id) -> Id {
     let frame = decoded_frame(coder);
     let this = match framework_imp(this, "initWithFrame:") {
@@ -218,52 +254,50 @@ extern "C" fn view_init_with_coder(this: Id, _: Sel, coder: Id) -> Id {
     if this == 0 {
         return 0;
     }
-    if contains(coder, "UIBounds") {
-        view_state(this).bounds_origin = decode_rect(coder, "UIBounds").origin;
-    }
-    if let Some(color) = object_for(coder, "UIBackgroundColor") {
-        property_set_object(this, "background", color);
-    }
-    if let Some(alpha) = double_for(coder, "UIAlpha") {
-        property_set(this, "alpha", alpha.to_bits());
-    }
-    for (key, stored) in [
-        ("UIHidden", "hidden"),
-        ("UIOpaque", "opaque"),
-        ("UIClipsToBounds", "clips"),
-        ("UIAutoresizeSubviews", "autoresizes"),
-        ("UIMultipleTouchEnabled", "multipleTouch"),
-    ] {
-        if let Some(value) = bool_for(coder, key) {
-            property_set(this, stored, value as u64);
-        }
-    }
-    if let Some(disabled) = bool_for(coder, "UIUserInteractionDisabled") {
-        property_set(this, "userInteraction", !disabled as u64);
-    }
-    for (key, stored) in [("UITag", "tag"), ("UIAutoresizingMask", "autoresizing"), ("UIContentMode", "contentMode")] {
-        if let Some(value) = integer_for(coder, key) {
-            property_set(this, stored, value as u64);
-        }
+    if !contains(coder, "UIFrame") && contains(coder, "UIBounds") {
+        view_state_mut(this).bounds_origin = decode_rect(coder, "UIBounds").origin;
     }
     if let Some(subviews) = object_for(coder, "UISubviews") {
         for child in collections::array_items(subviews) {
-            own_send(this, "addSubview:", &[child]);
+            runtime::send(this, "addSubview:", &[child]);
         }
     }
+    send_with(this, "setOpaque:", decode_bool(coder, "UIOpaque") as u8);
+    send_with(this, "setHidden:", decode_bool(coder, "UIHidden") as u8);
+    if let Some(color) = object_for(coder, "UIBackgroundColor").filter(|&color| color != 0) {
+        send_with(this, "setBackgroundColor:", color);
+    }
+    property_set(this, "tag", decode_integer(coder, "UITag") as u64);
+    property_set(this, "userInteraction", !decode_bool(coder, "UIUserInteractionDisabled") as u64);
+    property_set(this, "multipleTouch", decode_bool(coder, "UIMultipleTouchEnabled") as u64);
+    property_set(this, "exclusiveTouch", decode_bool(coder, "UIExclusiveTouch") as u64);
+    property_set(this, "autoresizes", decode_bool(coder, "UIAutoresizeSubviews") as u64);
+    property_set(this, "autoresizing", (decode_integer(coder, "UIAutoresizingMask") & 0x3f) as u64);
+    send_with(this, "setAlpha:", double_for(coder, "UIAlpha").unwrap_or(1.0));
+    send_with(this, "setClearsContextBeforeDrawing:", bool_for(coder, "UIClearsContextBeforeDrawing").unwrap_or(true) as u8);
+    send_with(this, "setContentMode:", decode_integer(coder, "UIContentMode"));
+    send_with(this, "setClipsToBounds:", decode_bool(coder, "UIClipsToBounds") as u8);
     this
 }
 
-/// -[UIWindow initWithCoder:]: a window marked "Full Screen at Launch"
-/// (UIResizesToFullScreen) takes the screen's size, whatever iPhone the nib
-/// was drawn for.
+/// -[UIWindow initWithCoder:]: a window starts hidden (the nib's "visible at
+/// launch" windows are shown by the nib, -makeKeyAndVisible); one marked
+/// "Full Screen at Launch" (UIResizesToFullScreen) takes the screen's size,
+/// whatever iPhone the nib was drawn for; UIRootViewController is its root.
 extern "C" fn window_init_with_coder(this: Id, _: Sel, coder: Id) -> Id {
     let this = super_init_with_coder(this, "UIWindow", coder);
-    if this != 0 && bool_for(coder, "UIResizesToFullScreen") == Some(true) {
+    if this == 0 {
+        return 0;
+    }
+    send_with(this, "setHidden:", 1u8);
+    if decode_bool(coder, "UIResizesToFullScreen") {
         let (width, height, _) = crate::fw::uikit::reported_screen_points();
         if let Some((imp, sel)) = framework_imp(this, "setFrame:") {
             unsafe { std::mem::transmute::<usize, extern "C" fn(Id, Sel, Rect)>(imp)(this, sel, Rect::new(0.0, 0.0, width, height)) }
         }
+    }
+    if let Some(root) = object_for(coder, "UIRootViewController").filter(|&root| root != 0) {
+        runtime::send(this, "setRootViewController:", &[root]);
     }
     this
 }
@@ -352,6 +386,206 @@ extern "C" fn progress_init_with_coder(this: Id, _: Sel, coder: Id) -> Id {
         if let Some(value) = object_for(coder, key) {
             set(this, runtime::sel(key), value);
         }
+    }
+    this
+}
+
+/// -[UIScrollView initWithCoder:]: paging, bouncing, indicators, content
+/// size and insets, zoom and the delegate; what the nib doesn't store keeps
+/// UIScrollView's defaults (bounces, indicators shown, zoom 1).
+extern "C" fn scroll_init_with_coder(this: Id, _: Sel, coder: Id) -> Id {
+    let this = super_init_with_coder(this, "UIScrollView", coder);
+    if this == 0 {
+        return 0;
+    }
+    for (key, setter) in [
+        ("UIPagingEnabled", "setPagingEnabled:"),
+        ("UIDirectionalLockEnabled", "setDirectionalLockEnabled:"),
+        ("UIBouncesZoom", "setBouncesZoom:"),
+        ("UIAlwaysBounceVertical", "setAlwaysBounceVertical:"),
+        ("UIAlwaysBounceHorizontal", "setAlwaysBounceHorizontal:"),
+        ("UIBounceEnabled", "setBounces:"),
+        ("UIShowsHorizontalScrollIndicator", "setShowsHorizontalScrollIndicator:"),
+        ("UIShowsVerticalScrollIndicator", "setShowsVerticalScrollIndicator:"),
+        ("UIDelaysContentTouches", "setDelaysContentTouches:"),
+        ("UICanCancelContentTouches", "setCanCancelContentTouches:"),
+    ] {
+        if let Some(value) = bool_for(coder, key) {
+            own_send(this, setter, &[value as usize]);
+        }
+    }
+    if let Some(disabled) = bool_for(coder, "UIScrollDisabled") {
+        own_send(this, "setScrollEnabled:", &[!disabled as usize]);
+    }
+    if contains(coder, "UIContentSize") {
+        own_send_size(this, "setContentSize:", decode_size(coder, "UIContentSize"));
+    }
+    for (key, setter) in [("UIContentInset", "setContentInset:"), ("UIScrollIndicatorInsets", "setScrollIndicatorInsets:")] {
+        if contains(coder, key) {
+            own_send_insets(this, setter, decode_insets(coder, key));
+        }
+    }
+    if let Some(style) = integer_for(coder, "UIIndicatorStyle") {
+        own_send(this, "setIndicatorStyle:", &[style as usize]);
+    }
+    for (key, setter) in [("UIMinimumZoomScale", "setMinimumZoomScale:"), ("UIMaximumZoomScale", "setMaximumZoomScale:")] {
+        if let Some(scale) = double_for(coder, key) {
+            own_send_double(this, setter, scale);
+        }
+    }
+    if let Some(delegate) = object_for(coder, "UIDelegate") {
+        own_send(this, "setDelegate:", &[delegate]);
+    }
+    this
+}
+
+/// Sends a message to a decoded object either as objc_msgSend does (a
+/// game's override runs: what UIKit's decoder sends by message) or to our
+/// own method (what UIKit sets inside the object, or sends elsewhere).
+fn decoder_send(object: Id, name: &str, arguments: &[usize], by_message: bool) {
+    if by_message {
+        if runtime::imp_for(object, runtime::sel(name)).is_some() {
+            runtime::send(object, name, arguments);
+        }
+    } else {
+        own_send(object, name, arguments);
+    }
+}
+
+/// What text fields and text views share: the text, its look, and the
+/// keyboard's settings (UITextInputTraits). As UIKit's: the font, text and
+/// alignment are sent to the object by message; a text view's colour too
+/// (a text field's goes to its inner label); a text field's keyboard
+/// settings too (a text view's go to its inner traits object).
+fn decode_text(this: Id, coder: Id, field: bool) {
+    for (key, setter, by_message) in [("UIFont", "setFont:", true), ("UITextColor", "setTextColor:", !field), ("UIText", "setText:", true)] {
+        if let Some(value) = object_for(coder, key) {
+            decoder_send(this, setter, &[value], by_message);
+        }
+    }
+    if let Some(value) = integer_for(coder, "UITextAlignment") {
+        decoder_send(this, "setTextAlignment:", &[value as usize], true);
+    }
+    for (key, setter) in [
+        ("UIAutocapitalizationType", "setAutocapitalizationType:"),
+        ("UIAutocorrectionType", "setAutocorrectionType:"),
+        ("UISpellCheckingType", "setSpellCheckingType:"),
+        ("UIKeyboardType", "setKeyboardType:"),
+        ("UIKeyboardAppearance", "setKeyboardAppearance:"),
+        ("UIReturnKeyType", "setReturnKeyType:"),
+    ] {
+        if let Some(value) = integer_for(coder, key) {
+            decoder_send(this, setter, &[value as usize], field);
+        }
+    }
+    for (key, setter) in [("UIEnablesReturnKeyAutomatically", "setEnablesReturnKeyAutomatically:"), ("UISecureTextEntry", "setSecureTextEntry:")] {
+        if let Some(value) = bool_for(coder, key) {
+            decoder_send(this, setter, &[value as usize], field);
+        }
+    }
+}
+
+/// -[UITextField initWithCoder:]
+extern "C" fn text_field_init_with_coder(this: Id, _: Sel, coder: Id) -> Id {
+    let this = super_init_with_coder(this, "UITextField", coder);
+    if this == 0 {
+        return 0;
+    }
+    decode_text(this, coder, true);
+    for (key, setter) in [("UIPlaceholder", "setPlaceholder:"), ("UIDelegate", "setDelegate:")] {
+        if let Some(value) = object_for(coder, key) {
+            own_send(this, setter, &[value]);
+        }
+    }
+    for (key, setter, by_message) in [("UIBorderStyle", "setBorderStyle:", true), ("UIClearButtonMode", "setClearButtonMode:", false)] {
+        if let Some(value) = integer_for(coder, key) {
+            decoder_send(this, setter, &[value as usize], by_message);
+        }
+    }
+    for (key, setter) in [("UIClearsOnBeginEditing", "setClearsOnBeginEditing:"), ("UIAdjustsFontSizeToFit", "setAdjustsFontSizeToFitWidth:")] {
+        if let Some(value) = bool_for(coder, key) {
+            own_send(this, setter, &[value as usize]);
+        }
+    }
+    if let Some(size) = double_for(coder, "UIMinimumFontSize") {
+        own_send_double(this, "setMinimumFontSize:", size);
+    }
+    this
+}
+
+/// -[UITextView initWithCoder:] (a scroll view: its content size and the
+/// rest come from UIScrollView's).
+extern "C" fn text_view_init_with_coder(this: Id, _: Sel, coder: Id) -> Id {
+    let this = super_init_with_coder(this, "UITextView", coder);
+    if this == 0 {
+        return 0;
+    }
+    decode_text(this, coder, false);
+    if let Some(editable) = bool_for(coder, "UIEditable") {
+        decoder_send(this, "setEditable:", &[editable as usize], true);
+    }
+    if let Some(types) = integer_for(coder, "UIDataDetectorTypes") {
+        decoder_send(this, "setDataDetectorTypes:", &[types as usize], true);
+    }
+    this
+}
+
+/// -[UIActivityIndicatorView initWithCoder:]
+extern "C" fn spinner_init_with_coder(this: Id, _: Sel, coder: Id) -> Id {
+    let this = super_init_with_coder(this, "UIActivityIndicatorView", coder);
+    if this == 0 {
+        return 0;
+    }
+    if let Some(style) = integer_for(coder, "UIActivityIndicatorViewStyle") {
+        own_send(this, "setActivityIndicatorViewStyle:", &[style as usize]);
+    }
+    if let Some(hides) = bool_for(coder, "UIHidesWhenStopped") {
+        own_send(this, "setHidesWhenStopped:", &[hides as usize]);
+    }
+    if let Some(color) = object_for(coder, "UITintColor") {
+        own_send(this, "setColor:", &[color]);
+    }
+    if decode_bool(coder, "UIAnimating") {
+        own_send(this, "startAnimating", &[]);
+    }
+    this
+}
+
+/// -[UISlider initWithCoder:]: value and range (maximum 1 and continuous
+/// unless the nib says otherwise).
+extern "C" fn slider_init_with_coder(this: Id, _: Sel, coder: Id) -> Id {
+    let this = super_init_with_coder(this, "UISlider", coder);
+    if this == 0 {
+        return 0;
+    }
+    own_send_float(this, "setMinimumValue:", decode_double(coder, "UIMinValue") as f32);
+    own_send_float(this, "setMaximumValue:", double_for(coder, "UIMaxValue").unwrap_or(1.0) as f32);
+    own_send_float(this, "setValue:", decode_double(coder, "UIValue") as f32);
+    own_send(this, "setContinuous:", &[bool_for(coder, "UIContinuous").unwrap_or(true) as usize]);
+    for (key, setter) in [
+        ("UIMinimumTintColor", "setMinimumTrackTintColor:"),
+        ("UIMaximumTintColor", "setMaximumTrackTintColor:"),
+        ("UIThumbTintColor", "setThumbTintColor:"),
+    ] {
+        if let Some(color) = object_for(coder, key) {
+            decoder_send(this, setter, &[color], true);
+        }
+    }
+    this
+}
+
+/// -[UIWebView initWithCoder:]
+extern "C" fn web_view_init_with_coder(this: Id, _: Sel, coder: Id) -> Id {
+    let this = super_init_with_coder(this, "UIWebView", coder);
+    if this == 0 {
+        return 0;
+    }
+    own_send(this, "setScalesPageToFit:", &[decode_bool(coder, "UIScalesPageToFit") as usize]);
+    if let Some(delegate) = object_for(coder, "UIDelegate") {
+        own_send(this, "setDelegate:", &[delegate]);
+    }
+    if let Some(types) = integer_for(coder, "UIDataDetectorTypes") {
+        decoder_send(this, "setDataDetectorTypes:", &[types as usize], true);
     }
     this
 }
@@ -448,15 +682,21 @@ extern "C" fn control_init_with_coder(this: Id, _: Sel, coder: Id) -> Id {
     this
 }
 
-/// -[UIButton initWithCoder:]: the title label's font and shadow, and per
-/// state (UIButtonStatefulContent: state number -> UIButtonContent) the
+/// -[UIButton initWithCoder:]: its type (UIButtonType; 1 is a rounded rect
+/// button), edge insets, the title label's font, shadow and line break, and
+/// per state (UIButtonStatefulContent: state number -> UIButtonContent) the
 /// title, its colours and the pictures.
 extern "C" fn button_init_with_coder(this: Id, _: Sel, coder: Id) -> Id {
     let this = super_init_with_coder(this, "UIButton", coder);
     if this == 0 {
         return 0;
     }
-    let label = runtime::send(this, "titleLabel", &[]);
+    if let Some(kind) = integer_for(coder, "UIButtonType") {
+        property_set(this, "buttonType", kind as u64);
+    }
+    // The title view itself (as -_setFont: makes it), not laid out yet:
+    // the game's -layoutSubviews isn't run before its init is done.
+    let label = crate::fw::controls::button_title_view(this);
     if label != 0 {
         if let Some(font) = object_for(coder, "UIFont") {
             own_send(label, "setFont:", &[font]);
@@ -464,32 +704,54 @@ extern "C" fn button_init_with_coder(this: Id, _: Sel, coder: Id) -> Id {
         if contains(coder, "UITitleShadowOffset") {
             own_send_size(label, "setShadowOffset:", decode_size(coder, "UITitleShadowOffset"));
         }
+        if let Some(mode) = integer_for(coder, "UILineBreakMode") {
+            own_send(label, "setLineBreakMode:", &[mode as usize]);
+        }
+    }
+    for (key, setter) in [
+        ("UIContentEdgeInsets", "setContentEdgeInsets:"),
+        ("UITitleEdgeInsets", "setTitleEdgeInsets:"),
+        ("UIImageEdgeInsets", "setImageEdgeInsets:"),
+    ] {
+        if contains(coder, key) {
+            own_send_insets(this, setter, decode_insets(coder, key));
+        }
+    }
+    // Older nibs name the shadow setting UIReversesTitleShadowOnHighlight.
+    let reverses = bool_for(coder, "UIReversesTitleShadowWhenHighlighted").or_else(|| bool_for(coder, "UIReversesTitleShadowOnHighlight"));
+    if let Some(value) = reverses {
+        own_send(this, "setReversesTitleShadowWhenHighlighted:", &[value as usize]);
+    }
+    // UIKit sends this one by message (a game's override hears it); the
+    // others it sets in the button itself.
+    if let Some(value) = bool_for(coder, "UIShowsTouchWhenHighlighted") {
+        send_with(this, "setShowsTouchWhenHighlighted:", value as u8);
     }
     for (key, setter) in [
         ("UIAdjustsImageWhenHighlighted", "setAdjustsImageWhenHighlighted:"),
         ("UIAdjustsImageWhenDisabled", "setAdjustsImageWhenDisabled:"),
-        ("UIShowsTouchWhenHighlighted", "setShowsTouchWhenHighlighted:"),
     ] {
         if let Some(value) = bool_for(coder, key) {
             own_send(this, setter, &[value as usize]);
         }
     }
+    if let Some(tint) = object_for(coder, "UITintColor").filter(|&tint| tint != 0) {
+        send_with(this, "setTintColor:", tint);
+    }
+    // As -_takeContentFromArchivableContent:overrides:, the content goes
+    // into the button's table as it is: no setters, so no layout (a game's
+    // -layoutSubviews) inside its init; it is laid out once marked.
     if let Some(content) = object_for(coder, "UIButtonStatefulContent") {
         for (state, content) in collections::dictionary_pairs(content) {
             let state = collections::number_as_i64(state) as usize;
-            for (stored, setter) in [
-                ("title", "setTitle:forState:"),
-                ("titleColor", "setTitleColor:forState:"),
-                ("shadowColor", "setTitleShadowColor:forState:"),
-                ("image", "setImage:forState:"),
-                ("backgroundImage", "setBackgroundImage:forState:"),
-            ] {
+            for stored in ["title", "titleColor", "shadowColor", "image", "backgroundImage"] {
                 let value = get_id(content, stored);
                 if value != 0 {
-                    own_send(this, setter, &[value, state]);
+                    crate::fw::controls::button_take_content(this, stored, state, value);
                 }
             }
         }
+        own_send(this, "setNeedsLayout", &[]);
     }
     this
 }
@@ -636,6 +898,8 @@ pub extern "C" fn controller_set_modal_transition_style(this: Id, _: Sel, style:
 pub extern "C" fn controller_load_view(this: Id, _: Sel) {
     let nib_name = get_text(this, "nibName");
     if nib_name.is_empty() {
+        // No nib: UIKit's plain view (a game's -loadView calling super gets it too).
+        crate::fw::uikit::load_default_view(this);
         return;
     }
     let storyboard = get_id(this, "storyboard");
@@ -1090,6 +1354,16 @@ pub fn register(_r: &mut Registry) {
     );
     methods(runtime::class_named("UIControl"), &[("initWithCoder:", control_init_with_coder as usize)]);
     methods(runtime::class_named("UIButton"), &[("initWithCoder:", button_init_with_coder as usize)]);
+    for (class, decoder) in [
+        ("UIScrollView", scroll_init_with_coder as usize),
+        ("UITextField", text_field_init_with_coder as usize),
+        ("UITextView", text_view_init_with_coder as usize),
+        ("UIActivityIndicatorView", spinner_init_with_coder as usize),
+        ("UISlider", slider_init_with_coder as usize),
+        ("UIWebView", web_view_init_with_coder as usize),
+    ] {
+        methods(runtime::class_named(class), &[("initWithCoder:", decoder)]);
+    }
     let button_content = define_class("UIButtonContent", "NSObject", 8);
     methods(button_content, &[("initWithCoder:", button_content_init_with_coder as usize)]);
     methods(runtime::class_named("UIColor"), &[("initWithCoder:", color_init_with_coder as usize)]);

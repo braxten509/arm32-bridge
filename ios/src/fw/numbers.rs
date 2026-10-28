@@ -311,35 +311,61 @@ fn amount_text(amount: Amount, places: usize, mode: i64) -> String {
 }
 
 /// |value| rounded to `places` fraction digits, as decimal text "123.4500".
+/// Like ICU, the rounding works on the number's 15-significant-digit
+/// decimal form, not its exact binary value (2.675 is 2.67499999... in
+/// binary, yet rounds half-even to 2.68 on iOS).
 fn rounded_text(value: f64, places: usize, mode: i64) -> String {
-    let value = value.abs();
-    if mode == 4 {
-        // Rust prints the exact binary value rounded half to even.
-        return format!("{value:.places$}");
-    }
-    let scale = 10f64.powi(places as i32);
-    let scaled = value * scale;
-    let floor = scaled.floor();
-    let fraction = scaled - floor;
-    let whole = match mode {
-        0 | 3 => scaled.ceil(), // ceiling and up (the value is positive here; sign handled by caller)
-        1 | 2 => floor,
-        5 => {
-            if fraction > 0.5 {
-                floor + 1.0
-            } else {
-                floor
-            }
+    let scientific = format!("{:.14e}", value.abs());
+    let (mantissa, exponent) = scientific.split_once('e').unwrap_or((&scientific, "0"));
+    let digits: Vec<u8> = mantissa.bytes().filter(u8::is_ascii_digit).map(|d| d - b'0').collect();
+    let exponent: i64 = exponent.parse().unwrap_or(0);
+    // The digits at or above the last fraction place kept; the rest drop.
+    let kept_length = exponent + 1 + places as i64;
+    let (mut kept, dropped): (Vec<u8>, &[u8]) = match usize::try_from(kept_length) {
+        Ok(length) if length >= digits.len() => {
+            let mut all = digits.clone();
+            all.resize(length, 0);
+            (all, &[])
         }
-        _ => {
-            if fraction >= 0.5 {
-                floor + 1.0
-            } else {
-                floor
-            }
-        }
+        Ok(length) => (digits[..length].to_vec(), &digits[length..]),
+        // Everything drops, below a tenth of the last place.
+        Err(_) => (Vec::new(), &[]),
     };
-    format!("{:.places$}", whole / scale)
+    let below_tenth = kept_length < 0 && digits.iter().any(|&d| d != 0);
+    let any_dropped = below_tenth || dropped.iter().any(|&d| d != 0);
+    let first = dropped.first().copied().unwrap_or(0);
+    let past_half = first > 5 || (first == 5 && dropped[1..].iter().any(|&d| d != 0));
+    let half = first == 5 && !past_half;
+    let odd = kept.last().is_some_and(|d| d % 2 == 1);
+    let up = match mode {
+        0 | 3 => any_dropped, // ceiling and up (the value is positive here; sign handled by caller)
+        1 | 2 => false,
+        4 => past_half || (half && odd),
+        5 => past_half,
+        _ => past_half || half,
+    };
+    if up {
+        let mut carry = true;
+        for digit in kept.iter_mut().rev() {
+            *digit += 1;
+            carry = *digit == 10;
+            if !carry {
+                break;
+            }
+            *digit = 0;
+        }
+        if carry {
+            kept.insert(0, 1);
+        }
+    }
+    let mut text: String = kept.iter().map(|d| (b'0' + d) as char).collect();
+    while text.len() < places + 1 {
+        text.insert(0, '0');
+    }
+    let whole = text.len() - places;
+    let whole_part = text[..whole].trim_start_matches('0');
+    let whole_part = if whole_part.is_empty() { "0" } else { whole_part };
+    if places == 0 { whole_part.to_string() } else { format!("{whole_part}.{}", &text[whole..]) }
 }
 
 fn group_digits(digits: &str, separator: &str, size: usize) -> String {
@@ -753,14 +779,20 @@ extern "C" fn nf_init(this: Id, _: Sel) -> Id {
     this
 }
 
+/// As in Foundation, through -stringForObjectValue:, so a subclass's own
+/// text is used (SpellCraft's gold prices).
 extern "C" fn nf_string_from_number(this: Id, _: Sel, number: Id) -> Id {
     if number == 0 {
         return 0;
     }
+    runtime::send(this, "stringForObjectValue:", &[number])
+}
+
+fn formatted(this: Id, number: Id) -> Id {
     string::make(&format_amount(number_value(number), &settings(formatter(this))))
 }
 
-extern "C" fn nf_string_for_object(this: Id, s: Sel, object: Id) -> Id {
+extern "C" fn nf_string_for_object(this: Id, _: Sel, object: Id) -> Id {
     if object == 0 {
         return match &formatter(this).nil_symbol {
             Some(text) => string::make(text),
@@ -770,7 +802,7 @@ extern "C" fn nf_string_for_object(this: Id, s: Sel, object: Id) -> Id {
     if !collections::is_number(object) && !runtime::responds(object, "doubleValue") {
         return 0;
     }
-    nf_string_from_number(this, s, object)
+    formatted(this, object)
 }
 
 extern "C" fn nf_number_from_string(this: Id, _: Sel, text: Id) -> Id {
@@ -1065,6 +1097,38 @@ mod tests {
         let mut pattern = us(STYLE_DECIMAL);
         apply_pattern("#,##0.00", &mut pattern, false);
         assert_eq!(format_number(1234.0, &pattern), "1,234.00");
+    }
+
+    /// -stringFromNumber: goes through -stringForObjectValue:, as Foundation's
+    /// does, so a subclass's own text is used: SpellCraft's AECurrencyFormatter
+    /// shows gold prices as plain numbers (they showed as "$30.00").
+    #[test]
+    fn string_from_number_asks_string_for_object_value() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        extern "C" fn own_text(_: Id, _: Sel, _: Id) -> Id {
+            string::make("30 gold")
+        }
+        let class = crate::fw::object::define_class("G32VirtualCurrencyFormatter", "NSNumberFormatter", 8);
+        methods(class, &[("stringForObjectValue:", own_text as usize)]);
+        let formatter = runtime::send(runtime::send(class, "alloc", &[]), "init", &[]);
+        let text = runtime::send(formatter, "stringFromNumber:", &[collections::number_int(30)]);
+        assert_eq!(string::get(text), "30 gold");
+    }
+
+    /// Rounding works on the number's 15-digit decimal form, as ICU's does,
+    /// not on its exact binary value (2.675 is 2.67499999... in binary).
+    #[test]
+    fn apple_rounding_uses_the_decimal_form() {
+        assert_eq!(rounded_text(2.675, 2, 4), "2.68", "half even, 7 is odd");
+        assert_eq!(rounded_text(0.125, 2, 4), "0.12", "half even, a true half");
+        assert_eq!(rounded_text(1.005, 2, 6), "1.01", "half up");
+        assert_eq!(rounded_text(1.115, 2, 5), "1.11", "half down");
+        assert_eq!(rounded_text(0.29, 2, 1), "0.29", "floor of a number already at two places");
+        assert_eq!(rounded_text(0.281, 2, 0), "0.29", "ceiling");
+        assert_eq!(rounded_text(999.995, 2, 6), "1000.00", "carries into a new digit");
+        assert_eq!(rounded_text(0.0004, 2, 6), "0.00");
+        assert_eq!(rounded_text(1.5e20, 0, 4), "150000000000000000000");
     }
 
     #[test]

@@ -1,13 +1,14 @@
 //! Dispatch groups: a count of work not finished yet, waits for it to reach
 //! zero, and blocks sent to their queues when it does (dispatch_group_notify).
 //! dispatch_group_async counts its block in and out around running it on
-//! the queue.
+//! the queue. Their copies of the game's blocks are released once run.
 
 use crate::libsystem::mach::{self, BlockHeader};
 use crate::symbols::{leak, Registry};
 use std::sync::{Condvar, Mutex};
 
-const BLOCK_IS_GLOBAL: i32 = 1 << 28;
+const BLOCK_NEEDS_FREE: i32 = 1 << 24;
+const BLOCK_HAS_COPY_DISPOSE: i32 = 1 << 25;
 
 struct Group {
     state: Mutex<GroupState>,
@@ -29,7 +30,7 @@ fn group(group: usize) -> &'static Group {
 }
 
 /// Groups are never freed (dispatch_release does nothing here).
-extern "C" fn dispatch_group_create() -> usize {
+pub(crate) extern "C" fn dispatch_group_create() -> usize {
     Box::leak(Box::new(Group { state: Mutex::new(GroupState::default()), empty: Condvar::new() })) as *const Group as usize
 }
 
@@ -54,12 +55,12 @@ extern "C" fn dispatch_group_leave(handle: usize) {
     };
     group.empty.notify_all();
     for (queue, block) in ready {
-        mach::dispatch_async(queue, block);
+        mach::send_copied(queue, block);
     }
 }
 
-/// 0 once the group is (or has been, since the call) empty, non-zero if `timeout` passed first.
-extern "C" fn dispatch_group_wait(handle: usize, timeout: u64) -> isize {
+/// 0 once the group is (or has been, since the call) empty, KERN_OPERATION_TIMED_OUT if `timeout` passed first.
+pub(crate) extern "C" fn dispatch_group_wait(handle: usize, timeout: u64) -> isize {
     let group = group(handle);
     let deadline = mach::deadline_nanos(timeout);
     let mut state = group.state.lock().unwrap();
@@ -73,7 +74,7 @@ extern "C" fn dispatch_group_wait(handle: usize, timeout: u64) -> isize {
             Some(at) => {
                 let now = mach::now_nanos();
                 if now >= at {
-                    return 1;
+                    return mach::TIMED_OUT as isize;
                 }
                 state = group.empty.wait_timeout(state, std::time::Duration::from_nanos(at - now)).unwrap().0;
             }
@@ -82,43 +83,58 @@ extern "C" fn dispatch_group_wait(handle: usize, timeout: u64) -> isize {
     0
 }
 
-extern "C" fn dispatch_group_notify(handle: usize, queue: usize, block: usize) {
+pub(crate) extern "C" fn dispatch_group_notify(handle: usize, queue: usize, block: usize) {
     let copy = mach::block_copy(block as *mut BlockHeader) as usize;
     let mut state = group(handle).state.lock().unwrap();
     if state.count == 0 {
         drop(state);
-        mach::dispatch_async(queue, copy);
+        mach::send_copied(queue, copy);
     } else {
         state.notify.push((queue, copy));
     }
 }
 
-/// The block dispatch_group_async sends: runs the work, then leaves the group.
+/// The block dispatch_group_async sends (a heap block the queue releases
+/// once run): runs the work, releases it, then leaves the group, in
+/// libdispatch's order.
 #[repr(C)]
 struct GroupBlock {
     header: BlockHeader,
     group: usize,
+    /// The copied game block, 0 once it ran.
     work: usize,
 }
 
 extern "C" fn run_group_block(block: usize) {
-    let block = unsafe { Box::from_raw(block as *mut GroupBlock) };
-    unsafe { mach::call_block(block.work) };
-    dispatch_group_leave(block.group);
+    let block = block as *mut GroupBlock;
+    let (work, group) = unsafe { (std::mem::replace(&mut (*block).work, 0), (*block).group) };
+    unsafe { mach::call_block(work) };
+    mach::block_release(work as *mut BlockHeader);
+    dispatch_group_leave(group);
 }
 
-extern "C" fn dispatch_group_async(handle: usize, queue: usize, block: usize) {
+extern "C" fn copy_group_block(_destination: usize, _source: usize) {}
+
+/// Its last release: the work, if it never ran, goes too.
+extern "C" fn dispose_group_block(block: usize) {
+    mach::block_release(unsafe { (*(block as *const GroupBlock)).work } as *mut BlockHeader);
+}
+
+pub(crate) extern "C" fn dispatch_group_async(handle: usize, queue: usize, block: usize) {
     static DESCRIPTOR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let descriptor = *DESCRIPTOR.get_or_init(|| leak([0usize, std::mem::size_of::<GroupBlock>(), 0, 0])) as *const [usize; 4];
-    let isa = crate::symbols::lookup("__NSConcreteGlobalBlock").map_or(0, |(address, _)| address);
+    let descriptor = *DESCRIPTOR.get_or_init(|| {
+        leak([0usize, std::mem::size_of::<GroupBlock>(), copy_group_block as usize, dispose_group_block as usize])
+    }) as *const [usize; 4];
+    let isa = mach::MALLOC_BLOCK_CLASS.load(std::sync::atomic::Ordering::Relaxed);
     dispatch_group_enter(handle);
-    // Global, so the queue doesn't copy it; it frees itself once it has run.
-    let runner = Box::new(GroupBlock {
-        header: BlockHeader { isa, flags: BLOCK_IS_GLOBAL, reserved: 0, invoke: run_group_block as usize, descriptor },
+    let runner = GroupBlock {
+        header: BlockHeader { isa, flags: BLOCK_NEEDS_FREE | BLOCK_HAS_COPY_DISPOSE | 2, reserved: 0, invoke: run_group_block as usize, descriptor },
         group: handle,
         work: mach::block_copy(block as *mut BlockHeader) as usize,
-    });
-    mach::dispatch_async(queue, Box::into_raw(runner) as usize);
+    };
+    let copy = unsafe { libc::malloc(std::mem::size_of::<GroupBlock>()) as *mut GroupBlock };
+    unsafe { copy.write(runner) };
+    mach::send_copied(queue, copy as usize);
 }
 
 #[cfg(test)]
@@ -139,6 +155,15 @@ mod tests {
         let answer = finished.recv_timeout(Duration::from_millis(500));
         dispatch_group_leave(group);
         assert_eq!(answer, Ok(0), "the wait ends: the group was empty after it began");
+    }
+
+    /// A wait that times out answers KERN_OPERATION_TIMED_OUT (49), as Apple's.
+    #[test]
+    fn a_timed_out_wait_answers_49() {
+        let group = dispatch_group_create();
+        dispatch_group_enter(group);
+        assert_eq!(dispatch_group_wait(group, mach::now_nanos() + 1_000_000), 49);
+        dispatch_group_leave(group);
     }
 }
 

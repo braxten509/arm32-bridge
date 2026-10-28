@@ -28,12 +28,34 @@
 //! AlarmService.SafeParseInt, run at every start once the game has saved
 //! reminders). The call becomes Java's own parser for that number type
 //! (Integer.parseInt and so on), when the dex already refers to it.
+//!
+//! Fix 6 - old Play services' blocking ad-ID wait: the class behind
+//! AdvertisingIdClient and GoogleAuthUtil (com.google.android.gms.common.a)
+//! waits in BlockingQueue.take() for a ServiceConnection callback that Android
+//! delivers on the main thread. When the main thread is itself stuck waiting
+//! on a thread that waits here (Facebook's AppEventsLogger holds its lock while
+//! the game resumes), the two deadlock and the game freezes on a black screen.
+//! Offline old games don't need the ad ID, so the wait becomes the library's
+//! own failure: the branch that skips `throw new IllegalStateException()` is
+//! noped, and the method always throws. When the dex has `new
+//! RemoteException()` that is thrown instead, which old Play services report
+//! as IOException, the "not available" every caller handles.
 
 use std::collections::HashMap;
 
 const FLAG_HW_AV_SYNC: i32 = 0x10;
 const DOWNLOADER_CLIENT: &str = "Lcom/google/android/vending/expansion/downloader/IDownloaderClient;";
 const INTENT_FOR_CLASS: &str = "Landroid/content/Intent;.<init>:(Landroid/content/Context;Ljava/lang/Class;)V";
+/// Play services' package, where the blocking service connection lives (fix 6).
+const PLAY_SERVICES: &str = "Lcom/google/android/gms/";
+/// The interface the blocking service connection implements (fix 6).
+const SERVICE_CONNECTION: &str = "Landroid/content/ServiceConnection;";
+/// The exception the blocked ad-ID wait throws once the branch is noped, and the one it throws
+/// instead when the dex has its constructor (fix 6).
+const ILLEGAL_STATE: &str = "Ljava/lang/IllegalStateException;";
+const ILLEGAL_STATE_INIT: &str = "Ljava/lang/IllegalStateException;.<init>:()V";
+const REMOTE_EXCEPTION: &str = "Landroid/os/RemoteException;";
+const REMOTE_EXCEPTION_INIT: &str = "Landroid/os/RemoteException;.<init>:()V";
 /// Google Play's size limit for an APK that comes with expansion files.
 pub const PLAY_EXPANSION_APK_LIMIT: u64 = 100 * 1024 * 1024;
 const SHORT_LOAD_WAIT: i32 = 1;
@@ -269,12 +291,18 @@ pub fn find_fixes(data: &[u8], carries_game_data: bool) -> Vec<Fix> {
     for class in 0..class_count {
         let class_def = class_defs + class * 32;
         let own_type = dex.u32(class_def);
+        // Fix 6 only in Play services' own classes: a game's own connection may wait on purpose.
+        let service_connection = dex.type_name(own_type).starts_with(PLAY_SERVICES)
+            && dex.interfaces(class_def).iter().any(|&index| dex.type_name(index) == SERVICE_CONNECTION);
         for (method_index, code) in methods(&dex, class_def) {
             if seen_code.insert(code) {
                 let (_, name, signature) = dex.method(method_index);
                 scan_code(&dex, code, &name, &signature, &mut fixes);
                 if let Some(fix) = self_calling_parser(&dex, code, method_index, &signature) {
                     fixes.push(fix);
+                }
+                if service_connection && signature == "()Landroid/os/IBinder;" {
+                    fixes.extend(blocking_ad_id_wait(&dex, code));
                 }
                 for (offset, units) in instructions(&dex, code) {
                     let Some(&target) = skipped_screens.get(&u32::from(units.get(1).copied().unwrap_or(0))) else { continue };
@@ -338,6 +366,50 @@ fn self_calling_parser(dex: &Dex, code: usize, method_index: u32, signature: &st
         });
     }
     None
+}
+
+/// True when `method` is `BlockingQueue.take()` or `LinkedBlockingQueue.take()`, the wait that
+/// a blocking service connection uses (fix 6).
+fn is_blocking_take(method: &str) -> bool {
+    method == "Ljava/util/concurrent/BlockingQueue;.take:()Ljava/lang/Object;"
+        || method == "Ljava/util/concurrent/LinkedBlockingQueue;.take:()Ljava/lang/Object;"
+}
+
+/// Fix 6: a no-argument method returning IBinder that waits in `BlockingQueue.take()` for a
+/// ServiceConnection callback. The `if-eqz`/`if-nez` that skips `throw new IllegalStateException()`
+/// (when the connection was already used) is noped, so the method always throws instead of
+/// waiting. When the dex also refers to `new RemoteException()`, that is thrown instead: old Play
+/// services turn it into IOException ("not available"), which every caller handles; an
+/// IllegalStateException only callers that expect one (it is what a main-thread call gets).
+fn blocking_ad_id_wait(dex: &Dex, code: usize) -> Vec<Fix> {
+    let list = instructions(dex, code);
+    let takes = list.iter().any(|(_, units)| {
+        matches!(units[0] & 0xFF, 0x6E..=0x72 | 0x74..=0x78)
+            && units.len() > 1
+            && is_blocking_take(&dex.method(units[1].into()).0)
+    });
+    if !takes {
+        return Vec::new();
+    }
+    let Some(at) = list.windows(2).position(|pair| {
+        matches!(pair[0].1[0] & 0xFF, 0x38 | 0x39) && pair[1].1[0] & 0xFF == 0x22 && dex.type_name(pair[1].1[1].into()) == ILLEGAL_STATE
+    }) else {
+        return Vec::new();
+    };
+    let reason = "old Play services' blocking ad-ID wait always fails (offline game, no deadlock)";
+    let branch = &list[at];
+    let mut fixes = vec![Fix {
+        offset: branch.0,
+        reason,
+        old: if branch.1[0] & 0xFF == 0x38 { "if-eqz".into() } else { "if-nez".into() },
+        new: "nop".into(),
+    }];
+    let constructor = list.get(at + 2).filter(|(_, units)| units[0] & 0xFF == 0x70 && dex.method(units[1].into()).0 == ILLEGAL_STATE_INIT);
+    if let Some(constructor) = constructor.filter(|_| dex.type_index(REMOTE_EXCEPTION).is_some() && dex.method_index(REMOTE_EXCEPTION_INIT).is_some()) {
+        fixes.push(Fix { offset: list[at + 1].0, reason, old: ILLEGAL_STATE.into(), new: REMOTE_EXCEPTION.into() });
+        fixes.push(Fix { offset: constructor.0, reason, old: ILLEGAL_STATE_INIT.into(), new: REMOTE_EXCEPTION_INIT.into() });
+    }
+    fixes
 }
 
 fn scan_code(dex: &Dex, code: usize, method_name: &str, method_signature: &str, fixes: &mut Vec<Fix>) {
@@ -434,6 +506,15 @@ pub fn patch(data: &mut [u8], carries_game_data: bool) -> Vec<Fix> {
                 let index = new_type.expect("the new class is a type in this dex") as u16;
                 data[at + 2..at + 4].copy_from_slice(&index.to_le_bytes());
             }
+            0x38 | 0x39 => data[at..at + 4].fill(0), // if-eqz/if-nez -> two nops (fix 6)
+            0x22 => {
+                let index = new_type.expect("the new exception is a type in this dex") as u16;
+                data[at + 2..at + 4].copy_from_slice(&index.to_le_bytes());
+            }
+            0x70 => {
+                let index = Dex { data }.method_index(&fix.new).expect("the new constructor is a method in this dex") as u16;
+                data[at + 2..at + 4].copy_from_slice(&index.to_le_bytes());
+            }
             other => panic!("unexpected opcode {other:#x} at {at:#x}"),
         }
     }
@@ -495,5 +576,225 @@ mod tests {
     #[test]
     fn adler32_known_value() {
         assert_eq!(super::adler32(b"Wikipedia"), 0x11E6_0398);
+    }
+
+    /// Old Play services' blocking service connection.
+    const PLAY_CLASS: &str = "Lcom/google/android/gms/common/a;";
+
+    fn uleb(mut value: u32, out: &mut Vec<u8>) {
+        loop {
+            let byte = (value & 0x7F) as u8;
+            value >>= 7;
+            if value == 0 {
+                out.push(byte);
+                break;
+            }
+            out.push(byte | 0x80);
+        }
+    }
+
+    /// A one-class dex holding `Ltest/Blocker;` (implementing `interfaces`) with the old Play
+    /// services blocking service-connection method `er()Landroid/os/IBinder;` that waits in
+    /// `BlockingQueue.take()` after the `if-eqz` guarded `throw new IllegalStateException()`.
+    /// With `remote`, the dex also refers to `new RemoteException()` (as games with old Play
+    /// services' ad code do), so the wait can fail the way the library reports "not available".
+    fn build_dex(class: &str, interfaces: &[&str], remote: bool) -> Vec<u8> {
+        let strings = [
+            "V", "L", "Ljava/lang/Object;", "Landroid/content/ServiceConnection;",
+            "Ljava/lang/IllegalStateException;", "Landroid/os/IBinder;",
+            "Ljava/util/concurrent/BlockingQueue;", "Z", class,
+            "CN", "CO", "er", "<init>", "take", "Landroid/os/RemoteException;",
+        ];
+        let types = [
+            "V", "Ljava/lang/Object;", "Landroid/content/ServiceConnection;",
+            "Ljava/lang/IllegalStateException;", "Landroid/os/IBinder;",
+            "Ljava/util/concurrent/BlockingQueue;", "Z", class, "Landroid/os/RemoteException;",
+        ];
+        let s = |name: &str| strings.iter().position(|x| *x == name).unwrap() as u32;
+        let t = |name: &str| types.iter().position(|x| *x == name).unwrap() as u32;
+        let mut d = vec![0u8; 0x70];
+        d[..8].copy_from_slice(b"dex\n035\0");
+        d[0x24..0x28].copy_from_slice(&0x70u32.to_le_bytes());
+        d[0x28..0x2C].copy_from_slice(&0x12345678u32.to_le_bytes());
+
+        // string_ids
+        let string_ids_off = d.len();
+        d.resize(d.len() + strings.len() * 4, 0);
+        // type_ids
+        let type_ids_off = d.len();
+        for name in &types {
+            d.extend_from_slice(&s(name).to_le_bytes());
+        }
+        // proto_ids: ()V, ()Landroid/os/IBinder;, ()Ljava/lang/Object;
+        let proto_ids_off = d.len();
+        for (shorty, ret) in [("V", "V"), ("L", "Landroid/os/IBinder;"), ("L", "Ljava/lang/Object;")] {
+            d.extend_from_slice(&s(shorty).to_le_bytes());
+            d.extend_from_slice(&t(ret).to_le_bytes());
+            d.extend_from_slice(&0u32.to_le_bytes());
+        }
+        // field_ids: CN:Z, CO:BlockingQueue
+        let field_ids_off = d.len();
+        for (class, ftype, name) in [(class, "Z", "CN"), (class, "Ljava/util/concurrent/BlockingQueue;", "CO")] {
+            d.extend_from_slice(&(t(class) as u16).to_le_bytes());
+            d.extend_from_slice(&(t(ftype) as u16).to_le_bytes());
+            d.extend_from_slice(&s(name).to_le_bytes());
+        }
+        // method_ids: er, IllegalStateException.<init>, BlockingQueue.take (, RemoteException.<init>)
+        let method_ids_off = d.len();
+        let mut method_ids = vec![
+            (class, 1u16, "er"),
+            ("Ljava/lang/IllegalStateException;", 0u16, "<init>"),
+            ("Ljava/util/concurrent/BlockingQueue;", 2u16, "take"),
+        ];
+        if remote {
+            method_ids.push(("Landroid/os/RemoteException;", 0u16, "<init>"));
+        }
+        for &(class, proto, name) in &method_ids {
+            d.extend_from_slice(&(t(class) as u16).to_le_bytes());
+            d.extend_from_slice(&proto.to_le_bytes());
+            d.extend_from_slice(&s(name).to_le_bytes());
+        }
+        // class_defs: one class
+        let class_defs_off = d.len();
+        d.extend_from_slice(&t(class).to_le_bytes());
+        d.extend_from_slice(&1u32.to_le_bytes());
+        d.extend_from_slice(&t("Ljava/lang/Object;").to_le_bytes());
+        let interfaces_at = d.len();
+        d.extend_from_slice(&0u32.to_le_bytes());
+        d.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        d.extend_from_slice(&0u32.to_le_bytes());
+        let class_data_at = d.len();
+        d.extend_from_slice(&0u32.to_le_bytes());
+        d.extend_from_slice(&0u32.to_le_bytes());
+
+        // type_list for the interfaces
+        let interfaces_off = if interfaces.is_empty() {
+            0
+        } else {
+            let off = d.len();
+            d.extend_from_slice(&(interfaces.len() as u32).to_le_bytes());
+            for name in interfaces {
+                d.extend_from_slice(&(t(name) as u16).to_le_bytes());
+            }
+            if interfaces.len() % 2 == 1 {
+                d.extend_from_slice(&0u16.to_le_bytes());
+            }
+            off
+        };
+
+        // class_data: no fields, one direct method (er) with code.
+        while d.len() % 4 != 0 {
+            d.push(0);
+        }
+        let class_data_off = d.len();
+        for count in [0, 0, 1, 0] {
+            uleb(count, &mut d);
+        }
+        uleb(0, &mut d); // method index difference
+        uleb(1, &mut d); // access flags
+        let code_at = d.len();
+        d.push(0);
+        d.push(0); // code offset, two bytes (this dex stays under 16 KiB)
+
+        // code_item for er().
+        while d.len() % 4 != 0 {
+            d.push(0);
+        }
+        let code_off = d.len() as u32;
+        let insns: [u16; 22] = [
+            0x1052, 0x0000, // iget-boolean v0, p0 (v1), CN
+            0x0038, 0x0008, // if-eqz v0, +8
+            0x0022, 0x0003, // new-instance v0, IllegalStateException
+            0x1070, 0x0001, 0x0000, // invoke-direct {v0}, <init>()V
+            0x0027, // throw v0
+            0x1012, // const/4 v0, 1
+            0x1059, 0x0000, // iput-boolean v0, p0, CN
+            0x1054, 0x0001, // iget-object v0, p0, CO
+            0x1072, 0x0002, 0x0000, // invoke-interface {v0}, take()Object
+            0x000C, // move-result-object v0
+            0x001F, 0x0004, // check-cast v0, IBinder
+            0x0011, // return-object v0
+        ];
+        d.extend_from_slice(&2u16.to_le_bytes()); // registers (v0, p0 = v1)
+        d.extend_from_slice(&1u16.to_le_bytes()); // ins
+        d.extend_from_slice(&1u16.to_le_bytes()); // outs
+        d.extend_from_slice(&0u16.to_le_bytes()); // tries
+        d.extend_from_slice(&0u32.to_le_bytes()); // debug info
+        d.extend_from_slice(&(insns.len() as u32).to_le_bytes()); // insns size
+        for unit in insns {
+            d.extend_from_slice(&unit.to_le_bytes());
+        }
+
+        // string data
+        let mut string_offsets = vec![0u32; strings.len()];
+        for (index, text) in strings.iter().enumerate() {
+            string_offsets[index] = d.len() as u32;
+            let mut body = Vec::new();
+            uleb(text.len() as u32, &mut body);
+            d.extend_from_slice(&body);
+            d.extend_from_slice(text.as_bytes());
+            d.push(0);
+        }
+
+        // patch forward references
+        for (index, off) in string_offsets.iter().enumerate() {
+            let at = string_ids_off + index * 4;
+            d[at..at + 4].copy_from_slice(&off.to_le_bytes());
+        }
+        d[interfaces_at..interfaces_at + 4].copy_from_slice(&(interfaces_off as u32).to_le_bytes());
+        d[class_data_at..class_data_at + 4].copy_from_slice(&(class_data_off as u32).to_le_bytes());
+        assert!(code_off < 0x4000, "the code offset needs two uleb bytes");
+        d[code_at] = (code_off & 0x7F) as u8 | 0x80;
+        d[code_at + 1] = (code_off >> 7) as u8;
+
+        // header sizes and offsets
+        let file_size = d.len() as u32;
+        d[0x20..0x24].copy_from_slice(&file_size.to_le_bytes());
+        d[0x38..0x3C].copy_from_slice(&(strings.len() as u32).to_le_bytes());
+        d[0x3C..0x40].copy_from_slice(&(string_ids_off as u32).to_le_bytes());
+        d[0x40..0x44].copy_from_slice(&(types.len() as u32).to_le_bytes());
+        d[0x44..0x48].copy_from_slice(&(type_ids_off as u32).to_le_bytes());
+        d[0x48..0x4C].copy_from_slice(&3u32.to_le_bytes());
+        d[0x4C..0x50].copy_from_slice(&(proto_ids_off as u32).to_le_bytes());
+        d[0x50..0x54].copy_from_slice(&2u32.to_le_bytes());
+        d[0x54..0x58].copy_from_slice(&(field_ids_off as u32).to_le_bytes());
+        d[0x58..0x5C].copy_from_slice(&(method_ids.len() as u32).to_le_bytes());
+        d[0x5C..0x60].copy_from_slice(&(method_ids_off as u32).to_le_bytes());
+        d[0x60..0x64].copy_from_slice(&1u32.to_le_bytes());
+        d[0x64..0x68].copy_from_slice(&(class_defs_off as u32).to_le_bytes());
+        d
+    }
+
+    #[test]
+    fn fix_6_blocks_the_ad_id_wait() {
+        let mut dex = build_dex(PLAY_CLASS, &["Landroid/content/ServiceConnection;"], false);
+        let fixes = super::patch(&mut dex, false);
+        assert_eq!(fixes.len(), 1, "exactly one fix: the blocking ad-ID wait");
+        let fix = &fixes[0];
+        assert_eq!(fix.old, "if-eqz");
+        assert_eq!(fix.new, "nop");
+        assert_eq!(&dex[fix.offset..fix.offset + 4], &[0, 0, 0, 0], "the branch became nops");
+    }
+
+    #[test]
+    fn fix_6_leaves_non_service_connections_alone() {
+        let mut dex = build_dex(PLAY_CLASS, &[], true);
+        let fixes = super::patch(&mut dex, false);
+        assert!(fixes.is_empty(), "a class that is no ServiceConnection keeps its method");
+        let mut dex = build_dex("Lcom/example/game/Connection;", &["Landroid/content/ServiceConnection;"], true);
+        assert!(super::patch(&mut dex, false).is_empty(), "the game's own connection keeps its wait");
+    }
+
+    /// With `new RemoteException()` in the dex, the wait throws that instead: old Play services
+    /// turn it into IOException ("not available"), which every caller handles.
+    #[test]
+    fn fix_6_fails_the_wait_the_way_play_services_reports_it() {
+        let mut dex = build_dex(PLAY_CLASS, &["Landroid/content/ServiceConnection;"], true);
+        let fixes = super::patch(&mut dex, false);
+        assert_eq!(fixes.len(), 3, "branch, new-instance and constructor");
+        let new_instance = fixes[1].offset;
+        assert_eq!(&dex[new_instance..new_instance + 4], &[0x22, 0x00, 8, 0], "new-instance v0, RemoteException");
+        let constructor = fixes[2].offset;
+        assert_eq!(&dex[constructor..constructor + 4], &[0x70, 0x10, 3, 0], "invoke-direct {{v0}}, RemoteException.<init>()V");
     }
 }

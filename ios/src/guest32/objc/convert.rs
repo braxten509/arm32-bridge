@@ -267,7 +267,16 @@ fn to_guest(ty: &Ty, hty: &HostTy, host: &[u8], out: &mut [u8], b: &mut dyn Boun
         }
         (Ty::Float, HostTy::F32) | (Ty::Double, HostTy::F64) => out.copy_from_slice(&host[..out.len()]),
         (Ty::Object | Ty::Block | Ty::Class, HostTy::Ptr) => {
-            out.copy_from_slice(&b.id_to_guest(host_u64(host) as usize)?.to_le_bytes())
+            let h = host_u64(host) as usize;
+            // A pointer into guest memory (a void * the game gave, such as
+            // +beginAnimations:context:'s, handed back where the game's
+            // method says id) is the game's own word: Apple passes the same
+            // pointer on. Host objects never live there.
+            let g = match b.guest_address(h) {
+                Some(g) if h != 0 && matches!(ty, Ty::Object) => g,
+                _ => b.id_to_guest(h)?,
+            };
+            out.copy_from_slice(&g.to_le_bytes())
         }
         (Ty::Selector, HostTy::Ptr) => {
             let h = host_u64(host) as usize;
@@ -603,9 +612,12 @@ struct OutParam {
     guest: u32,
     pointee: Ty,
     hty: HostTy,
-    /// Elements (more than one for counted id arrays).
+    /// Elements (more than one for counted arrays).
     count: u32,
     write_back: bool,
+    /// A `counted-out` array: only as many elements go back as the host
+    /// wrote to the integer out-parameter.
+    counted: bool,
     temp: Box<[u64]>,
 }
 
@@ -691,10 +703,12 @@ impl Boundary for TempMap<'_> {
 
 /// Pointees that need a temporary: anything holding ids, pointers or
 /// integers that may be NSInteger.
-fn out_param_type(pointee: &Ty) -> Option<HostTy> {
+fn out_param_type(pointee: &Ty, real_float: bool) -> Option<HostTy> {
     match pointee {
         Ty::Object | Ty::Block | Ty::Class | Ty::Selector | Ty::CString | Ty::Pointer(_) => Some(HostTy::Ptr),
         Ty::Int { signed } => Some(HostTy::Int { size: 8, signed: *signed }),
+        // `CGFloat *` (a double on the host); a C `float *` (`float`) is the same.
+        Ty::Float if !real_float => Some(HostTy::F64),
         Ty::Struct { .. } => {
             let hty = host_ty_in(pointee, Ctx::default()).ok()?;
             let differs = hty.size() != pointee.guest_size() || contains_pointer(&hty);
@@ -738,6 +752,10 @@ pub struct HostCallOptions {
     pub not_found: bool,
 }
 
+/// Room the host gets for a `counted-out` array (the elements it may write;
+/// fw/bezier.rs keeps no longer dash).
+pub const COUNTED_OUT_MOST: u32 = 4096;
+
 /// The most ids one counted array may hold (a bad count fails, not the heap).
 const MAX_ID_ARRAY: u32 = 1 << 20;
 
@@ -765,7 +783,7 @@ impl CallPlan {
             words: sig.guest_arg_words(),
             total: sig.guest_total_words(),
             htys: sig.args.iter().map(|ty| host_ty(ty, options.real_float).ok()).collect(),
-            outs: sig.args.iter().map(|ty| if let Ty::Pointer(pointee) = ty { out_param_type(pointee) } else { None }).collect(),
+            outs: sig.args.iter().map(|ty| if let Ty::Pointer(pointee) = ty { out_param_type(pointee, options.real_float) } else { None }).collect(),
             ret: sig.ret.clone(),
             ret_hty: host_ty(&sig.ret, false)?,
         })
@@ -793,7 +811,13 @@ pub fn prepare_planned(
     let mut outs = Vec::new();
     let array_count = match options.arrays {
         IdArrays::None => None,
-        _ => sig.args.iter().zip(plan.words.iter().copied()).filter(|(t, _)| matches!(t, Ty::Int { .. })).last().map(|(_, at)| words(at)),
+        // The last integer argument, or else the length of the last NSRange
+        // (getObjects:range:).
+        _ => sig.args.iter().zip(plan.words.iter().copied()).filter_map(|(t, at)| match t {
+            Ty::Int { .. } => Some(words(at)),
+            Ty::Struct { name, .. } if name == "_NSRange" => Some(words(at + 1)),
+            _ => None,
+        }).last(),
     };
     let mut kept = Vec::new();
     let last_word = plan.words.last().copied();
@@ -816,9 +840,15 @@ pub fn prepare_planned(
         if let Ty::Pointer(pointee) = ty {
             let address = guest_u32(&guest);
             if let (Some(hty), true) = (plan.outs[index].clone(), address != 0) {
-                let (count, read, write_back) = match (array_count, **pointee == Ty::Object) {
-                    (Some(n), true) if n > MAX_ID_ARRAY => return Err(format!("an id array of {n} elements")),
+                // Counted arrays hold ids or CGFloats; other pointers, one value.
+                let element = matches!(**pointee, Ty::Object | Ty::Float);
+                let counted = options.arrays == IdArrays::CountedOut && element;
+                let (count, read, write_back) = match (array_count, element) {
+                    _ if counted => (COUNTED_OUT_MOST, false, true),
+                    (Some(n), true) if n > MAX_ID_ARRAY => return Err(format!("an array of {n} elements")),
                     (Some(n), true) => (n.max(1), options.arrays == IdArrays::In, options.arrays == IdArrays::Out),
+                    // A lone `CGFloat *` is read and written back.
+                    (None, true) if **pointee == Ty::Float => (1, true, true),
                     // `id *` (NSError **error and the like) is output-only: the
                     // guest's slot is often uninitialized, so the host starts at nil.
                     (None, true) => (1, false, true),
@@ -838,7 +868,7 @@ pub fn prepare_planned(
                     temp[0] = untouched_out();
                 }
                 args.push(&HostTy::Ptr, &(temp.as_ptr() as u64).to_le_bytes());
-                outs.push(OutParam { guest: address, pointee: (**pointee).clone(), hty, count, write_back, temp });
+                outs.push(OutParam { guest: address, pointee: (**pointee).clone(), hty, count, write_back, counted, temp });
                 continue;
             }
         }
@@ -864,6 +894,9 @@ pub fn prepare_planned(
     let next = plan.total;
     match options.varargs {
         Varargs::None | Varargs::VaList => {}
+        // The list's first object is the last named argument: when it is nil
+        // the list is over (the words after it are the caller's own stack).
+        Varargs::NilList if plan.words.last().is_some_and(|&at| words(at) == 0) => {}
         Varargs::NilList => {
             for i in next.. {
                 let object = words(i);
@@ -949,21 +982,31 @@ impl PreparedHostCall {
     pub fn first_out_value(&self) -> Option<u64> {
         self.outs.first().map(|out| out.temp[0])
     }
+
+    /// How many elements each out-parameter holds (tests check the sizes).
+    #[cfg(test)]
+    pub fn out_counts(&self) -> Vec<u32> {
+        self.outs.iter().map(|out| out.count).collect()
+    }
 }
 
 /// Converts the host's result (and out-parameters) back for the guest.
 pub fn finish_host_call(call: PreparedHostCall, ret: &HostRet, b: &mut dyn Boundary) -> Result<GuestRet, String> {
     let mut mapped = TempMap { b, outs: &call.outs };
+    // How many elements the host wrote to `counted-out` arrays: what it
+    // wrote to the integer out-parameter (none without one).
+    let written = call.outs.iter().find(|o| matches!(o.pointee, Ty::Int { .. })).map_or(0, |o| o.temp[0] as i64);
     for out in call.outs.iter().filter(|o| o.write_back) {
         if out.count == 1 && out.pointee == Ty::Object && out.temp[0] == untouched_out() {
             // The host didn't set it: the game's variable keeps its value,
             // as Apple's methods leave an out-parameter they don't set.
             continue;
         }
+        let count = if out.counted { written.clamp(0, out.count as i64) as usize } else { out.count as usize };
         let host: Vec<u8> = out.temp.iter().flat_map(|w| w.to_le_bytes()).collect();
         let (step, guest_step) = (out.hty.size() as usize, out.pointee.guest_size() as usize);
-        let mut guest = vec![0u8; guest_step * out.count as usize];
-        for i in 0..out.count as usize {
+        let mut guest = vec![0u8; guest_step * count];
+        for i in 0..count {
             let element = &host[i * step..(i + 1) * step];
             to_guest(&out.pointee, &out.hty, element, &mut guest[i * guest_step..(i + 1) * guest_step], &mut mapped)?;
         }
@@ -1104,6 +1147,8 @@ struct GuestOut {
     hty: HostTy,
     /// The host bytes before the call (8 for an int: it may be NSInteger).
     before: Vec<u8>,
+    /// The guest bytes the temporary started with.
+    guest_before: Vec<u8>,
 }
 
 /// Pointees with a known layout; others (void, opaque structs, functions)
@@ -1128,12 +1173,18 @@ impl GuestOut {
         }
         let temp = b.alloc(guest.len() as u32);
         b.write(temp, &guest);
-        Ok(GuestOut { host, temp, pointee: pointee.clone(), hty, before })
+        Ok(GuestOut { host, temp, pointee: pointee.clone(), hty, before, guest_before: guest })
     }
 
     fn copy_back(&self, b: &mut dyn Boundary) -> Result<(), String> {
         let guest = b.read(self.temp, self.pointee.guest_size());
         b.free(self.temp);
+        // Left as it was by the game: the host's own bytes stay, exactly (a
+        // CGFloat isn't rounded through a float). An id slot is still written
+        // back: it started nil, not as the host's (maybe uninitialized) slot.
+        if !self.pointee.is_object() && guest == self.guest_before {
+            return Ok(());
+        }
         let mut host = vec![0u8; (self.hty.size() as usize).max(8)];
         to_host(&self.pointee, &self.hty, &guest, &mut host[..self.hty.size() as usize], b)?;
         let mut out = host[..self.hty.size() as usize].to_vec();
@@ -1158,7 +1209,7 @@ pub fn prepare_guest_call(sig: &Signature, frame: &HostFrame, b: &mut dyn Bounda
     let mut words = vec![0u32; sig.guest_total_words() as usize];
     let mut reader = ArgReader { frame, ngrn: 0, nsrn: 0, slot: 0 };
     let mut outs = Vec::new();
-    for (ty, at) in sig.args.iter().zip(sig.guest_arg_words()) {
+    for (index, (ty, at)) in sig.args.iter().zip(sig.guest_arg_words()).enumerate() {
         let hty = host_ty(ty, false)?;
         let host = reader.take(&hty, is_float_scalar(ty));
         if let Ty::Pointer(pointee) = ty {
@@ -1172,7 +1223,8 @@ pub fn prepare_guest_call(sig: &Signature, frame: &HostFrame, b: &mut dyn Bounda
         }
         let mut guest = vec![0u8; (ty.guest_size() as usize).div_ceil(4).max(1) * 4];
         let size = ty.guest_size() as usize;
-        to_guest(ty, &hty, &host, &mut guest[..size], b)?;
+        // Which argument would not convert, for the log (0 is self).
+        to_guest(ty, &hty, &host, &mut guest[..size], b).map_err(|error| format!("{error} (argument {index}, {ty:?}, value {:#x})", host_u64(&host)))?;
         for (i, chunk) in guest.chunks(4).enumerate() {
             words[at as usize + i] = guest_u32(chunk);
         }

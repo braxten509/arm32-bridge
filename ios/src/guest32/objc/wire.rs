@@ -71,6 +71,12 @@ impl GuestSide for Translator {
     fn without_guest_lock(&self, wait: &mut dyn FnMut()) {
         runtime::without_gil(wait)
     }
+    fn nested_calls_left(&self) -> u32 {
+        let _gil = runtime::hold_gil();
+        let current = CURRENT_UC.with(|c| c.get());
+        let uc = if current.is_null() { runtime::engine() } else { unsafe { &mut *current } };
+        runtime::MAX_CALL_DEPTH.saturating_sub(runtime::call_depth(uc))
+    }
 }
 
 fn bridge() -> Option<&'static Mutex<Bridge>> {
@@ -413,6 +419,8 @@ pub fn install_program() -> Result<(), String> {
     let (bridge, md) = (bridge().ok_or("no Objective-C bridge")?, METADATA.get().ok_or("no metadata")?);
     install(bridge, &Translator, md)?;
     super::bridge::set_block_owner(&Translator);
+    // Game objects whose last reference goes are sent -dealloc (fw/counted.rs).
+    super::bridge::set_dealloc_bridge(bridge, &Translator);
     super::forward::set_invocation_hooks(bridge, &Translator);
     crate::fw::object::set_extra_method_types(game_method_types);
     crate::fw::object::set_extra_fields(game_field);
@@ -426,6 +434,13 @@ pub fn install_program() -> Result<(), String> {
     mirror::set_dispatch(Box::new(|frame| {
         let Some(bridge) = BRIDGE.get() else { return };
         if let Err(error) = dispatch_from_host(bridge, &Translator, frame) {
+            // Which host call into the game failed, for the log (blocks have no selector).
+            let name = if super::bridge::wrapper_guest(frame.x[0] as usize).is_some() || frame.x[1] == 0 {
+                "a block".to_string()
+            } else {
+                unsafe { crate::objc::runtime::cstr(frame.x[1] as usize) }
+            };
+            let error = format!("{error} (host sent {name} to {:#x})", frame.x[0]);
             crate::log!("32-bit Objective-C: {error}");
             let _gil = runtime::hold_gil();
             let current = CURRENT_UC.with(|c| c.get());

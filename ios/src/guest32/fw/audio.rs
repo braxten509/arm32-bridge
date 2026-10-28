@@ -90,6 +90,18 @@ pub(crate) fn guest_render_for(function: u32, refcon: u32) -> usize {
     render
 }
 
+/// The host's call of a game's AudioSession interruption listener(data,
+/// state), on the main loop (fw::media): the game's function and data are a
+/// `GuestRender` pair (from `guest_render_for`).
+extern "C" fn guest_interruption(data: usize, state: u32) {
+    let listener = unsafe { &*(data as *const GuestRender) };
+    let _gil = runtime::hold_gil();
+    let uc = runtime::engine();
+    if let Err(error) = runtime::call_guest(uc, listener.function, &[listener.refcon, state]) {
+        crate::log!("32-bit audio: the game's interruption listener {:#x} failed: {error}", listener.function);
+    }
+}
+
 thread_local! {
     /// This sound thread's guest block for one render call (address, size).
     static RENDER_BLOCK: Cell<(u32, u32)> = const { Cell::new((0, 0)) };
@@ -363,15 +375,18 @@ pub fn register() {
             Ret::U32(status.unwrap_or(-50) as u32)
         }),
     );
-    // AudioSessionInitialize(runLoop, mode, listener, data): the listener is
-    // guest code the host never calls; it isn't passed on.
+    // AudioSessionInitialize(runLoop, mode, listener, data): the game's
+    // interruption listener is handed to the host as `guest_interruption`
+    // with its own data, so an interruption (fw::media) runs the game's code.
     function(
         "AudioSessionInitialize",
         handler!(|uc, a| {
+            let (_run_loop, _mode, listener, data) = (a.u32(), a.u32(), a.u32(), a.u32());
             let Some(initialize) = host_fn!("AudioSessionInitialize": unsafe extern "C" fn(usize, usize, usize, usize) -> i32) else {
                 return super::no_host_function(uc, "AudioSessionInitialize");
             };
-            Ret::U32(unsafe { initialize(0, 0, 0, 0) } as u32)
+            let (host_listener, host_data) = if listener == 0 { (0, 0) } else { (guest_interruption as usize, guest_render_for(listener, data)) };
+            Ret::U32(unsafe { initialize(0, 0, host_listener, host_data) } as u32)
         }),
     );
     for name in ["AudioSessionAddPropertyListener", "AudioSessionRemovePropertyListenerWithUserData"] {

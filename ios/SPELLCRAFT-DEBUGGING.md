@@ -608,3 +608,410 @@ Work log and decisions (away mode):
 - Known gap (not in this change): the GL picture of a GL view placed
   straight in an upright window is not turned (Monster Life draws into a
   640x1136 buffer and looks sideways, before and after this change).
+
+## 2026-10-26 (evening): screen-switch flicker, faded drawer, Dungeon Plunder walk stutter
+
+- Flicker (owner video flicker2/flicker.mp4): during SpellCraft's 0.5 s
+  cross-dissolve two SCRenderers draw into the same GL view and each
+  presented; every eglSwapBuffers reached the screen, so it alternated
+  old/new frame by frame. iOS shows only the newest frame per refresh.
+  Fix: fw/frame_slots.rs: a main-thread frame waits half a refresh; a
+  newer one drawn meanwhile replaces it; the run loop swaps it when due.
+  Test: only_the_newest_of_close_frames_reaches_the_screen.
+- Faded drawer: disabled buttons (tutorial disables tabs) were drawn at
+  alpha 0.5. Apple draws them darker. Fix in pictures.rs `shaded`.
+  Test: pressed_and_disabled_buttons_darken.
+- DP walk stutter (owner video ~/Videos/bridge-recordings/
+  dp-walk-152452.mp4, measured with ~/.cache/ios-debug/dp-walk/tools/
+  shift.py, phase correlation per frame): while walking the map moves an
+  even ~4.9 px a frame, but about every 25 refreshes (~5 times a second)
+  one or two frames don't move and the next step is normal size: the game
+  made ~115 frames a second for a 120 Hz screen. Cause: CADisplayLink was
+  our own run loop timer at 1/120 s; a late call reset it to "now + 1/120"
+  (lost phase), and timestamp returned "now". Dungeon Plunder is cocos2d
+  (CCDirectorDisplayLink, calculateDeltaTime with gettimeofday).
+  Fix: fw/vsync.rs: a helper thread hears Android's Choreographer (each
+  refresh's time and the refresh period); display links fire on the next
+  refresh, timestamp is the refresh's time, targetTimestamp the next;
+  other repeating timers keep Apple's rule (stay on their own firing
+  grid, skip missed ones). PC: an even grid stands in.
+  Test: late_frames_stay_on_the_refreshes. Phone check pending: owner
+  records another walk; re-run shift.py, expect no still frames mid-walk.
+
+## 2026-10-26 (evening): whole GL picture on its side (SpellCraft hall, Dungeon Plunder map)
+
+- Owner screenshots after the 18:25 install: game pictures turned a quarter turn
+  and stretched, UIKit labels upright. Cause: the uncommitted "turned frames"
+  present (meant for GL views that draw a tall buffer in an upright iOS 6
+  window, Monster Life 640x1136) turned every old game's frame by the window
+  turn, but SpellCraft/DP already draw a wide buffer.
+- Fix: eagl.rs turn_for_picture: only a quarter turn, and only for a buffer
+  taller than wide. Test only_tall_pictures_are_turned (deliberate break caught).
+
+## 2026-10-26 (night): hall <-> garden flicker still there
+
+- Owner: flicker switching between the main hall and the garden. Phone
+  recording (~/.cache/ios-debug/spellcraft/flicker3/sc-flicker3.mp4, flash.py):
+  during each 0.5 s cross-fade the game picture alternates frame by frame
+  between the garden and the hall (strict one-on/one-off), with the new
+  screen's UIKit labels steady on top. The installed build already had
+  frame_slots (newest of close frames), so that was not enough.
+- Cause: each screen's renderer (SCGreenhouseRenderer, SCTowerRenderer, ...)
+  has its own renderbuffer (renderbufferStorage:fromDrawable: on its own
+  layer), all on one EAGLContext. On an iPhone each buffer belongs to its
+  own layer and the cross-fade blends the layers. Here every
+  presentRenderbuffer: goes to the one window. At 120 Hz the two renderers'
+  timers don't both fit in one refresh, so each got every other refresh and
+  both reached the screen: frame_slots' half-refresh hold never saw them
+  close together.
+- Fix (all games): frame_slots.rs FrameSources: the buffer (context,
+  bound renderbuffer) that began showing frames most recently has the
+  window; one that showed nothing for 0.25 s takes it back when it starts
+  again; an older buffer still drawing meanwhile is not shown (its layer
+  would be fading out behind the new one). eagl.rs present() asks it first.
+  The GL picture cuts to the new screen; UIKit still cross-fades.
+  Test: the_newest_drawing_buffer_has_the_window (failed first with the
+  same alternation as the phone).
+
+## 2026-10-26 (night): big "Offline" bar at the bottom
+
+- It is the game's news bar (AELiveBarView, run by AELiveBarManager):
+  pictures and web pages from the game's server, which is gone, so it only
+  says "Offline". Owner's choice: remove the whole bar, always.
+- Fix (game_fixes.rs hide_news_bar): after -[AELiveBarView
+  willMoveToWindow:] with a window, the bar is set hidden (its own code
+  never shows or hides itself: Ghidra read of willMoveToWindow:,
+  didMoveToWindow, setupLiveBarView, layoutLiveBarFrame). Hidden views get
+  no touches; the manager still hears of the bar as before.
+  Test: spellcrafts_news_bar_is_hidden_when_it_joins_a_window (failed first;
+  deliberate break caught).
+- Review (GPT-6.1 Sol, high, read-only) of the flicker fix, the news bar
+  and the converter's Fix 6:
+  - P1 a newer buffer that failed to take the window (eglMakeCurrent busy
+    on another thread) kept it, hiding the shown one: it now lets go
+    (FrameSources::let_go).
+  - P2 our UIKit sends willMoveToWindow: through the host path, which ran
+    no game fixes: dispatch_from_host now runs after_message too (test
+    sends from the host as well; it failed first).
+  - P2 an old screen still drawing after its layer left the window could
+    take the window back when the new one paused: frames from a layer not
+    in a window are never shown (frame_source, as on an iPhone); sources are
+    keyed by layer when known (two buffers on one layer stay one source).
+    Test only_buffers_on_screen_and_shown_keep_the_window (break caught).
+  - P2 Fix 6 matched any ServiceConnection with that shape: now only classes
+    under com/google/android/gms/ (test: a game's own class is left alone;
+    break caught). Test dex made valid (p0 no longer v0). The patched Rule the
+    Kingdom passes Android's own verifier (cmd package compile -m verify).
+
+## 2026-10-26 (late): Dungeon Plunder walk still uneven after the vsync fix
+
+- Owner video ~/.cache/ios-debug/dp-walk/brief/dp-walk3.mp4 (after the
+  display-link fix), counted with dp-walk/tools/count.py (shift3.json):
+  7.9 s of walking, 82 refreshes missed (gaps of ~17 ms, the next frame a
+  double step), 22 still frames. The first video (shift.json, before the
+  fix): 14.7 s, 13 missed, 110 still. So the fix cut the stills, but missed
+  refreshes went from ~1 to ~10 a second. The game still presented 120 a
+  second (its log), so frames were made but reached the screen too late.
+  The video's own times jitter ±1.5 ms, so a double step often sits one
+  frame from its 17 ms gap; "no dropped frames" in the first look missed
+  that a 17 ms gap is one lost refresh at 120 Hz.
+- Cause 1 (ours): frame_slots.rs held every main-thread frame half a
+  refresh (4.2 ms) before eglSwapBuffers, to keep only the newest of two
+  drawers (SpellCraft's cross-fade). With the display link now on the
+  refreshes, a frame drawn in ~3-5 ms was swapped at ~7-9 ms after the
+  refresh, right at Android's deadline, so about one in twelve missed it.
+  An iPhone does not hold a lone drawer's frame: presentRenderbuffer: shows
+  it at the next refresh. Fix: a lone drawer's frames go at once; frames
+  wait only once main-thread frames have met within half a refresh in two
+  refreshes running (two drawers), for 0.25 s after the last meeting. One
+  late frame meeting the next on-time one does not count. The first
+  frames of a cross-fade may show both screens once or twice; FrameSources
+  (newest buffer has the window) still covers separate buffers.
+  Tests: a_lone_drawers_frames_are_not_held (failed before: "frame 0 goes at
+  once"); only_the_newest_of_close_frames_reaches_the_screen updated (only
+  the newest from the second meeting on). Deliberate break (wait on any one
+  meeting) caught by the first.
+- Cause 2 (the game's own, not changed): the map moves one tile per
+  CCMoveTo of 0.2 s (-[TileMapLayer centerTileMapOnTileCoord:tileMap:]
+  0x1afec, 0x3e4ccccd); -[TileMapLayer update:] (0x1c16c) starts the next
+  only when the map has no running action. cocos2d's -[CCActionInterval
+  step:] (0xa183c) sets elapsed to 0 on a new action's first tick, so every
+  tile starts with one frame that does not move: 24 moving frames + 1 still
+  = 25 refreshes (0.208 s), the still frames seen every ~0.2 s. A real
+  iPhone does the same (at 60 Hz one held frame in 13). Possible game fix
+  if the owner wants it: a game_fixes entry that gives the first tick of a
+  CCMoveTo started from TileMapLayer the frame's dt (or carries the time
+  the last move ran over) instead of 0.
+- Not checked on the PC: Android's frame deadline (needs the phone). Phone
+  check: record a walk, run count.py; expect missed refreshes back near the
+  first video's ~1 a second, and one still frame per tile (~4.8 a second).
+
+## 2026-10-26 (late): Dungeon Plunder walk without the still frame per tile
+
+- Owner: "Yes, smooth it out" (cause 2 above). Fix in game_fixes.rs, only
+  when the game has TileMapLayer with centerTileMapOnTileCoord:tileMap:
+  (checked once at start): the bridge follows -[CCNode runAction:] on a
+  CCTMXTiledMap (runs it nested, not jumped into); after it, a CCMoveTo just
+  started goes on from the last one (walk_on): its first tick, which only
+  stands still, is used up at once (step: 0), then it is stepped by the time
+  the last move ran past its end (cocos2d holds a move at its end and drops
+  that time). Not after a move that was stopped part way. Everything goes
+  through the game's own cocos2d methods (step:, elapsed, duration, isDone);
+  the last move is kept (retained) so its time can be read after cocos2d
+  lets it go. Speed: exactly 0.2 s a tile (before: 0.2 s + a frame).
+- Why this hook: runAction: hands over the new move itself, right after
+  cocos2d set it up; no game code or memory is patched, and other games
+  (no TileMapLayer) are not followed.
+- Test: dungeon_plunder_walks_on_without_a_still_frame_per_tile (a model of
+  the game's step: at 120 Hz, frames up to 0.8 ms late). Failed before
+  (a frame moving 0), passes; deliberate break (no carried time) caught
+  (a frame moving 0.00002 of a tile). Phone check: record a walk, count.py:
+  expect no still frames mid-walk.
+
+## 2026-10-26 (late): tapping another iPhone game opened the last one
+
+- Seen on the phone: after the game process was closed (by Android, or a
+  game switch, which restarts the process), tapping Dungeon Plunder opened
+  SpellCraft again. IosGameActivity is singleTask: Android brings the closed
+  screen back with the request it first opened with, then hands the new one
+  to onNewIntent. No game had started yet, so switchingGames ignored it and
+  the screen started the old game.
+- Fix: in onNewIntent, before a game starts, a request for another game
+  becomes the screen's request and the screen is rebuilt (recreate), so its
+  orientation rules come from the new game's Info.plist too.
+- Check (phone): close the :ios process, tap Dungeon Plunder's Play: it must
+  open Dungeon Plunder (before: SpellCraft).
+
+## 2026-10-26 (night): garden drawer cards half hidden
+
+- Owner: the cards in the bottom-right drawer (garden Inventory tab) are cut
+  off at the bottom. Phone screenshot: cards start ~50 pt too low.
+- Cause: -[SCCardHandView dynamicScrollView:contentViewForObject:atIndex:]
+  makes a 160x200 SCCardView and gives it a 0.5 scale transform;
+  -[AEDynamicScrollView layoutSubviews] then sets frame (i*w + border, 0,
+  frame.size). Our view frame ignored the transform (stayed 0,0,160,200), so
+  the card was placed 160x200 at y 0 and shown at half size around its
+  center: y 50-150 in a 100 pt tall list.
+- Fix (uikit.rs view_frame/view_set_frame, layers.rs place_in_frame): a
+  transformed view's frame is its transformed box; setFrame: keeps the
+  transform and picks bounds + center (Core Animation's way, same math as
+  plain layers already used). A view's layer frame follows it.
+  Test: a_transformed_views_frame_is_its_transformed_box (failed before).
+
+## 2026-10-26 (night): Dueling / Social offline froze the hall
+
+- Owner: tapped Dueling and Social (online only), then nothing could be
+  tapped. Phone log: 14853x "objc_msgSend: guest object 0x24d1fe (isa
+  0x69647561) is not known to the bridge (message initWithTitle:message:
+  delegate:cancelButtonTitle:otherButtonTitles:)".
+- -[SCBaseViewController actionQuad] (no network) makes a UIAlertView with
+  otherButtonTitles:nil. 0x24d1fe is the selector string "audioController"
+  that actionQuad keeps in its own stack frame two words further up.
+- Cause: convert.rs Varargs::NilList read words after the last named
+  argument even when that argument (the list's first object) was nil, so
+  the caller's stack (the alert itself, then a selector) became buttons.
+- Fix: a nil last named argument ends the list. Test: the nil-first case in
+  variadic_arguments_go_to_stack_slots (failed before).
+
+## 2026-10-26 (night): top bars never fill; real-money shop items
+
+- Owner: the bars by the heart, the yellow circle and the level never move.
+  PC trace (owner save copy, runs/bars2): SCProgressView gets setProgress:
+  0.2 / 0.79 / 1 but -drawRect: is never called. Our UIKit never called
+  drawRect: at all; setNeedsDisplay was a no-op. SCProgressView draws its
+  fill there (clip to a UIBezierPath, CGContextDrawLinearGradient).
+- Fix (uikit.rs display_tree/display_pass, graphics.rs draw_picture): a
+  shown view marked for display (every view at first, setNeedsDisplay(InRect:),
+  a resize with contentMode Redraw) whose class has its own drawRect: is
+  drawn into its layer's contents (bounds at screen scale) before each
+  picture tick (pictures.rs) and before renderInContext:. UIView gets a
+  no-op drawRect: (for super calls). Test:
+  views_with_their_own_draw_rect_draw_into_their_layer (failed first).
+- Real-money items (owner chose: hide them): buying froze the game (store
+  answered 'cannot connect', then 7055x "host object ... has unknown class
+  (message objectForKey:)"; cause not found yet). game_fixes.rs: after
+  -[SCStoreSectionView refreshContent], AEStoreKitItem items leave
+  sectionContent, then the shop's scroll list refreshes. Test:
+  real_money_items_leave_the_shop_list (failed first).
+- Recipe List doesn't scroll: our UIScrollView has no drag scrolling at
+  all. Sub-agent (DeepSeek, worktree sc-scroll, branch ios/sc-scroll) adds it.
+
+## 2026-10-26: shop coin icon, drag scrolling
+- Shop prices: NSNumberFormatter stringFromNumber: now goes through
+  stringForObjectValue: (the game's currency formatter overrides that), so gold
+  prices no longer show "$30.00".
+- Coin icon: AEPriceLabel draws its coin in -drawTextInRect: and then calls super.
+  Our UILabel now has drawRect: (calls drawTextInRect: on the bounds) and
+  drawTextInRect: (draws the label's text into the current context). A label whose
+  class replaces either one draws itself through the display pass, and its own text
+  picture is left out. Plain labels still use the text picture. setText:/setFont:
+  mark the label for redrawing. Test: labels_that_draw_their_own_text_draw_into_their_layer.
+- Drag scrolling (Recipe List, clothing shop row): UIScrollView follows the finger
+  once a drag passes 10 pt on an axis it can move. The content gets touchesCancelled,
+  short taps still reach it, it keeps sliding after a flick, paging works, and the
+  delegate hears scrollViewDidScroll: and the drag/slow-down calls. Code in
+  controls.rs scroll_touch plus the touch.rs hook. Written by a sub-agent in
+  worktree sc-scroll; its patch is ~/.cache/ios-debug/spellcraft/sc-scroll.patch.
+- Full suite: 512 passed. Installed on the Pixel; owner to check the coin and scrolling.
+- Not found: why the game froze after a failed real-money purchase ("host object
+  ... has unknown class ... (message objectForKey:)"). It can't happen now because
+  paid items are hidden.
+- Follow-up (owner: "still can't scroll"): a phone trace showed the shop row
+  (AEDynamicScrollView 320x100, content 1680x100) was found, but the finger was
+  measured in window points. Old games turn their root view a quarter turn inside a
+  portrait window, so a sideways swipe looked like an up-down one. The row only
+  scrolls sideways, so it ignored the drag. Fixes in controls.rs:
+  finger_motion measures each scroll view's drag in its superview's points, and
+  setContentOffset: marks the scroll view for layout (AEDynamicScrollView adds the
+  cards coming into view in -layoutSubviews). Tests:
+  a_scroll_view_in_a_turned_view_follows_the_finger_on_screen (fails with window
+  points: break-checked), scrolling_lays_the_scroll_view_out_again. 514 pass.
+  Checked on the Pixel: the clothing shop row scrolls with new cards, the Recipe
+  List scrolls and Hex of Chaos shows in full, the gold coin shows on gold prices.
+- Hall taps: the Spell Library opens from the cauldron (1018,560 phone pixels),
+  not the label. The Dormitory door is 532,400 and the Clothing Shop tab 2000,656.
+- Smoothness (owner: "sideways scroll is not 120 Hz, a bit stuttery"). Phone
+  measurements before: each picture list took ~14 ms to write and went out ~25 ms
+  apart. Fixes in pictures.rs and controls.rs:
+  - encode_lines writes numbers itself (push_number: millionths, trailing zeros
+    cut) instead of format!: list write 14 ms -> ~3 ms. Test: list_numbers_are_short.
+  - The tick gap is counted from when the last list was started, not finished.
+  - No "coming frames" sampling while a scroll view is dragged or coasting
+    (controls::scrolling()), so each list is one frame.
+  - Coasting steps on the vsync grid (coast_delay) and asks for a draw at once
+    (pictures::draw_soon).
+  After: drag lists median 8.7 ms apart, coast median 9.7 ms (p90 18.7 ms before
+  the draw_soon change). 515 tests pass; installed on the Pixel.
+  Next if it still stutters: the phone reads the list on the UI thread with
+  split/toFloatOrNull (IosPictureList.parse); move that off the UI thread or
+  write a faster reader.
+
+## 2026-10-27: monster heart hangs below the heart on the card
+
+- Owner (screenshot): the red heart fill on the monster card sits on the
+  paper under the heart frame instead of staying inside it.
+- The heart is SCIconProgressView (CardHealthProgressIcon.uispec): base icon,
+  fill icon, border icon. createSubviews gives the fill UIImageView
+  contentMode 6 (bottom) and clipsToBounds YES; layoutSubviews sizes it to
+  the health part at the base's bottom, so the full-size heart picture is
+  shown bottom-aligned and cut by the short view.
+- The fight card is a picture made with -renderInContext: (render.rs). Two
+  faults there: content modes 3-12 were all drawn centred at own size, and a
+  masking layer clipped only its sublayers, not its own contents. So the
+  heart was centred in the short view and hung out of it. Same centring in
+  compose.rs.
+- Fix: one content_rect (render.rs, used by compose.rs too) matching the
+  phone's ContentMode.place (0/3 stretch, 1 fit, 2 fill, 4-12 edges and
+  corners); the mask clip is set before draw_own.
+  Test: a_picture_of_a_view_keeps_a_clipped_bottom_picture_inside (failed
+  before: rows 3-6 red instead of 4-5).
+
+## 2026-10-27: matching Apple iOS 6.1 in every framework area (9-area fix round)
+
+- Owner: fix SpellCraft by making every framework function behave like Apple's
+  iOS 6.1 (freezes: stuck dungeon room, after-purchase freeze; dorm flash,
+  sudden card reveal, bat coming back; general mismatches).
+- Nine read-only agents compared our code with Apple's binaries, one area each
+  (views, controls, coreanimation, graphics, objects, foundation, nibs, media,
+  libsystem). Their reports, fixes and decisions are in
+  ~/.cache/ios-debug/spellcraft/apple-compare/<area>/{REPORT,FIXES}.md, the
+  open choices in apple-compare/DECISIONS.md, and the merge in
+  ~/.cache/ios-debug/spellcraft/merge/MERGE-NOTES.md.
+- Each area was fixed in its own worktree (fx-<area>), test first, then
+  reviewed (DeepSeek v4.1 flash) and bug-hunted (Kimi / GPT-6.1 Terra), and
+  the findings fixed. Then all nine were merged into one tree and copied here.
+- Causes found for the reported problems (see apple-compare/ARGON-FREEZE.md,
+  KIMI-TRANSITIONS.md):
+  - Stuck room: a host send with fewer words than the game method's
+    signature left a stale register; encounterCardSlidOff:finished:context:
+    never ran. Plus the UIView didStop context going through id conversion.
+  - Purchase freeze: game blocks kept by host collections were freed at the
+    end of one message (media: one lasting wrapper per guest block).
+  - Dorm flash / bat: the shared GL surface kept the last frame of a GL layer
+    that had left the window (media: a GL layer's frame shows only while its
+    layer is in the window, fades with it).
+  - Card reveal: direct layer.transform changes skipped the open UIView
+    animation and dropped 3D (coreanimation: full CATransform3D end to end).
+- Merge: 666 tests pass, twice in a row. Phone app picture-list check passes.
+- Not yet confirmed on the phone: all of the above.
+
+## 2026-10-27 (round 2, transitions): real CATransitions, flips, curls, stacked dismiss
+
+- The whole-screen `!\tfade` line is gone. A CATransition now takes only its
+  layer from what it showed on the last list to what it shows now: the list
+  carries `!\ttransition` (type, subtype, ms, begin, curve, progress range,
+  the layer's place and size), the old pictures, `!\tto`, the new ones,
+  `!\tend` (pictures.rs `pick_transitions`, `frames`). UIKit's view
+  transitions are UIKit's own CATransitions (popAnimationState 0x48e22:
+  oglFlip / pageCurl / pageUnCurl / fade, block duration and curve). The
+  phone draws dissolve (old·(1-p) + new·p), moveIn/push/reveal, a 3D flip and
+  our own page peel. Modal flip/dissolve/curl run on the window's layer.
+- Pictures with perspective inside a group (clipped, masked, shadowed,
+  rasterized) are drawn projectively in compose.rs.
+- Dismissing a stack: the top screen slides away over the dismissing
+  controller's view; the ones between go at once (Apple's documented rule).
+- Details: ~/.cache/ios-debug/spellcraft/apple-compare/round2/transitions/FIXES.md.
+
+## 2026-10-27 (round 3): button parts are real subviews; insertSubview off by one
+
+- UIButton's image, background and title label are now its own subviews,
+  placed by -layoutSubviews from the content/title/image rects, the way
+  Apple's UIButton does (controls.rs, render.rs no longer draws them by
+  hand). A title font, shrink or line-break setting a game makes now shows.
+  Default title font kept at 15 pt (Apple's is 18 pt; owner's choice).
+- insertSubview:aboveSubview: / belowSubview: with a view already in the
+  list looked for the sibling before taking the view out, so it landed one
+  place off. UIKit finds the sibling after the removal (uikit.rs
+  `sibling_place`; test `a_subview_moved_above_or_below_a_sibling_lands_next_to_it`).
+- Details: ~/.cache/ios-debug/spellcraft/apple-compare/round3/buttons/FIXES.md.
+- 711 tests pass. Not yet confirmed on the phone.
+
+## 2026-10-27: Play on the main screen did nothing (after round 2 real -dealloc)
+
+- Symptom: main screen shows; Play does nothing. Log: the first failing host->game
+  call `objc_msgSend: message handler to an object with unknown isa` (host sent a
+  block), then the same error for every later call (the first fault is sticky).
+- Cause: AERestRequest (AppyEngine networking) autoreleases itself and relies on
+  its NSURLConnection to keep it: Apple's NSURLConnectionInternal -initWithInfo:
+  retains the delegate (and CFRetains the connection); the block in
+  -_withConnectionDisconnectFromConnection: releases both after the last callback
+  (iOS 6.1 sim Foundation 0x1111ac, 0x111497). Ours never retained it, so with real
+  -dealloc on, the request was freed before its "offline" failure; the game's
+  invokeCompletionHandler block then read a freed object (`-handler`).
+- Fix (fw/web.rs): connections hold their delegate until the failure callback has
+  run (or -cancel, which now really cancels: no callback after it). Test
+  `a_connection_holds_its_delegate_until_its_last_callback`.
+- Also: long chains of game objects freeing each other (AEGameItemSlot /
+  AETimeMonitor, ~40 deep) hit the translator's 64-call nesting limit
+  ("-dealloc ... failed: guest calls nested too deeply", objects never freed).
+  Apple's -dealloc just nests on the stack. Now a -dealloc due with fewer than
+  16 nesting levels left waits for the safe point a level up (counted.rs ready
+  hook, GuestSide::nested_calls_left). Test `a_long_chain_of_deallocs_frees_every_link`
+  (failed at link 40 of 100 before).
+- Checked: Play opens the hall on the Pixel (before the chain fix); 713 tests pass;
+  emulator: SpellCraft menus clean (183 deallocs, no errors) until the known
+  emulator GLES1 glIsEnabled crash; Infinity Blade 1 HD reaches gameplay.
+
+## 2026-10-27 (evening): fade edges, fight strips, hall <-> greenhouse pop
+
+- White line on the left during fades: the pictures layer is now drawn on a
+  RenderNode of whole pixels (IosPicturesView `screen`), placed on the same
+  whole pixels as GL (`IosPictureList.place`), as Apple draws each frame on a
+  whole-pixel framebuffer. Owner confirmed fixed.
+- Dark 18 px strips in fights: SpellCraft gets a 557-point-wide screen
+  (uikit.rs `narrower`, by bundle id). Owner confirmed gone.
+- Bright first column on the left: not in the pixels (screenshot is even up
+  to the edge), stays with HW overlays off, and YouTube's black bars show the
+  same line, so it is the OLED panel. Left as is.
+- Greenhouse pop: a phone recording (screenrecord, frame by frame) showed the
+  new screen in full for ~60 ms, then the old one back and the fade. Cause: a
+  new GL view's frames showed as soon as the bridge sent the fade's list,
+  while the phone was still decoding the fade's snapshot. Apple shows a
+  CAEAGLLayer's frames from the commit that adds it. Fix in two steps:
+  1. eagl `frames_show` follows the GL layers of the list up on the screen
+     (pictures.rs `GlCommit`), not of the window;
+  2. the phone says when a list is up (`nativePicturesUp`, sent from a frame
+     commit callback after the frame that draws it), with a 250 ms fallback.
+  A second recording after step 1 alone still showed one 8 ms frame; after
+  the frame commit callback the owner saw none. Test:
+  `gl_layers_count_from_when_the_phone_puts_their_list_up`.

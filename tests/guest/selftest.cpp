@@ -2555,9 +2555,23 @@ static int print_through_vprintf(const char *format, ...) {
     return written;
 }
 
+// The bridge wraps these two (src/wraps.rs, its test entries): a caller gets
+// 10 times what the function itself returns, in ARM and in Thumb code.
+extern "C" __attribute__((noinline, target("arm"))) int bridge_wrap_test_arm(int a, int b) {
+    volatile int sum = a;
+    for (int i = 0; i < b; i++) sum = sum + 1;
+    return sum;
+}
+extern "C" __attribute__((noinline, target("thumb"))) int bridge_wrap_test_thumb(int a, int b) {
+    volatile int sum = a;
+    for (int i = 0; i < b; i++) sum = sum + 1;
+    return sum;
+}
+
 extern "C" int run_all() {
     check(constructor_ran == 42, "constructor ran at load");
     check(built_at_load == "made at load", "C++ static object built at load");
+    check(bridge_wrap_test_arm(2, 3) == 50 && bridge_wrap_test_thumb(2, 3) == 50, "wrapped game functions (ARM, Thumb)");
 
     char *text = (char *)malloc(64);
     strcpy(text, "hello");

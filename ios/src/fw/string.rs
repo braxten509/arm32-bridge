@@ -50,7 +50,8 @@ pub fn is_string(object: Id) -> bool {
 
 /// The text behind any string object (ours or compiled-in).
 pub fn text(object: Id) -> *mut Text {
-    let class = lock().class_of(object);
+    // The class pointer is the object's first word (no runtime lock needed).
+    let class = if object == 0 { 0 } else { unsafe { *(object as *const usize) } };
     if class == constant_class() {
         let mut cache = CONSTANT_TEXT.lock().unwrap();
         let cache = cache.get_or_insert_with(HashMap::new);
@@ -158,6 +159,24 @@ pub fn plain_units(object: Id) -> Option<*const [u16]> {
     };
     // Through imp_for, so a subclass's +initialize has run (it may add its own -isEqual:).
     let plain = string && runtime::imp_for(object, sel) == Some(is_equal as usize);
+    plain.then(|| unsafe { (*text(object)).units.as_slice() as *const [u16] })
+}
+
+/// `plain_units` for many objects in a row (a dictionary's keys): whether
+/// a class is a plain string is worked out once per class in `memo`.
+pub fn plain_units_memo(object: Id, memo: &mut Vec<(usize, bool)>) -> Option<*const [u16]> {
+    if object == 0 || CLASSES.get().is_none() {
+        return None;
+    }
+    let class = unsafe { *(object as *const usize) };
+    let plain = match memo.iter().find(|(c, _)| *c == class) {
+        Some(&(_, plain)) => plain,
+        None => {
+            let plain = plain_units(object).is_some();
+            memo.push((class, plain));
+            plain
+        }
+    };
     plain.then(|| unsafe { (*text(object)).units.as_slice() as *const [u16] })
 }
 
@@ -517,12 +536,45 @@ extern "C" fn is_equal(this: Id, s: Sel, other: Id) -> bool {
 }
 
 extern "C" fn hash(this: Id, _: Sel) -> usize {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for unit in units(this) {
-        h ^= unit as u64;
-        h = h.wrapping_mul(0x100000001b3);
+    cf_hash(this) as usize
+}
+
+/// Apple's __CFStringHash (CoreFoundation 6.1, 0xa7c0): the length, then
+/// four characters at a time with fixed multipliers (16974593, 66049, 257,
+/// 1), then the rest one at a time, and finally the hash shifted by the
+/// length added back. A string over 96 characters hashes only its first 32,
+/// 32 around its middle and last 32 (Apple's 0xa8eb..0xaa22), so a long
+/// string's cost and hash stay bounded. NSString's -hash and CFString's hash
+/// use it, so a dictionary's order (fw/collections.rs) is Apple's.
+pub fn cf_hash(object: Id) -> u32 {
+    let units = units(object);
+    let length = units.len();
+    let mut hash = length as u32;
+    if length > 96 {
+        let middle = length / 2;
+        for part in [&units[..32], &units[middle - 16..middle + 16], &units[length - 32..]] {
+            hash = fours(hash, part);
+        }
+    } else {
+        hash = fours(hash, &units[..length - length % 4]);
+        for &unit in &units[length - length % 4..] {
+            hash = hash.wrapping_mul(257).wrapping_add(unit as u32);
+        }
     }
-    h as usize
+    hash.wrapping_add(hash << (length & 31))
+}
+
+/// The hash of groups of four characters, continuing from `hash`.
+fn fours(mut hash: u32, units: &[u16]) -> u32 {
+    for group in units.chunks_exact(4) {
+        hash = hash
+            .wrapping_mul(67_503_105)
+            .wrapping_add((group[0] as u32).wrapping_mul(16_974_593))
+            .wrapping_add((group[1] as u32).wrapping_mul(66_049))
+            .wrapping_add((group[2] as u32).wrapping_mul(257))
+            .wrapping_add(group[3] as u32);
+    }
+    hash
 }
 
 extern "C" fn copy_with_zone(this: Id, _: Sel, _zone: usize) -> Id {
@@ -619,27 +671,38 @@ extern "C" fn capitalized(this: Id, _: Sel) -> Id {
     make(&out)
 }
 
-extern "C" fn substring_from(this: Id, _: Sel, index: usize) -> Id {
-    let value = units(this);
-    let object = make("");
-    set(object, value.get(index..).unwrap_or(&[]).to_vec());
-    object
+/// NSRangeException for a range past the end of a string, worded as Apple's.
+fn out_of_bounds(method: &str, location: usize, length: usize, count: usize) {
+    crate::fw::collections::raise_named(
+        "NSRangeException",
+        format!("-[__NSCFString {method}]: Range {{{location}, {length}}} out of bounds; string length {count}"),
+    );
 }
 
-extern "C" fn substring_to(this: Id, _: Sel, index: usize) -> Id {
+/// The units from `start` to `end`; past the end raises NSRangeException
+/// (a game's @catch can take it) and gives nil.
+fn substring(this: Id, method: &str, start: usize, end: usize) -> Id {
     let value = units(this);
-    let object = make("");
-    set(object, value[..index.min(value.len())].to_vec());
-    object
-}
-
-extern "C" fn substring_with_range(this: Id, _: Sel, range: Range) -> Id {
-    let value = units(this);
-    let start = range.location.min(value.len());
-    let end = (range.location + range.length).min(value.len());
+    if start > end || end > value.len() {
+        out_of_bounds(method, start, end.saturating_sub(start), value.len());
+        return 0;
+    }
     let object = make("");
     set(object, value[start..end].to_vec());
     object
+}
+
+extern "C" fn substring_from(this: Id, _: Sel, index: usize) -> Id {
+    let length = units(this).len();
+    substring(this, "substringFromIndex:", index, length.max(index))
+}
+
+extern "C" fn substring_to(this: Id, _: Sel, index: usize) -> Id {
+    substring(this, "substringToIndex:", 0, index)
+}
+
+extern "C" fn substring_with_range(this: Id, _: Sel, range: Range) -> Id {
+    substring(this, "substringWithRange:", range.location, range.location.saturating_add(range.length))
 }
 
 /// Cut to `length`, or filled up with `pad` repeated from `start` in it.
@@ -757,9 +820,12 @@ extern "C" fn double_value(this: Id, _: Sel) -> f64 {
     leading_float(&get(this))
 }
 
+/// YES at Y, y, T, t or a digit 1-9, after whitespace, one + or - and
+/// leading zeros ("-1" and "01" are YES), as Apple documents.
 extern "C" fn bool_value(this: Id, _: Sel) -> bool {
     let text = get(this);
     let text = text.trim_start();
+    let text = text.strip_prefix(['+', '-']).unwrap_or(text).trim_start_matches('0');
     matches!(text.chars().next(), Some('Y' | 'y' | 'T' | 't' | '1'..='9'))
 }
 
@@ -930,8 +996,12 @@ extern "C" fn by_replacing_occurrences(this: Id, _: Sel, target: Id, replacement
     make(&get(this).replace(target.as_str(), &get(replacement)))
 }
 
-extern "C" fn by_trimming(this: Id, _: Sel, _set: Id) -> Id {
-    make(get(this).trim())
+/// Takes the set's characters off both ends (only those: whitespace alone
+/// keeps line ends).
+extern "C" fn by_trimming(this: Id, _: Sel, characters: Id) -> Id {
+    let object = make("");
+    set(object, crate::fw::scanner::trim(&units(this), &crate::fw::scanner::set(characters)));
+    object
 }
 
 pub fn register(r: &mut Registry) {
@@ -1058,6 +1128,36 @@ mod tests {
         assert_eq!(encode(&"cé€✓".encode_utf16().collect::<Vec<_>>(), 30), [b'c', 0x8E, 0xDB, b'?']);
         assert_eq!(decode(&[0x80, 0xE9], 12), Some("€é".encode_utf16().collect()));
         assert_eq!(encode(&"€é".encode_utf16().collect::<Vec<_>>(), 12), [0x80, 0xE9]);
+    }
+
+    /// Trimming takes off exactly the given set's characters; boolValue skips
+    /// a sign and leading zeros ("-1" and "01" are YES).
+    #[test]
+    fn apple_trimming_uses_the_set_and_bool_value_skips_sign_and_zeros() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        use crate::objc::runtime::{class_named, send};
+        let set = class_named("NSCharacterSet");
+        let quotes = send(set, "characterSetWithCharactersInString:", &[make("\"")]);
+        assert_eq!(get(send(make("\"a\" "), "stringByTrimmingCharactersInSet:", &[quotes])), "a\" ");
+        let spaces = send(set, "whitespaceCharacterSet", &[]);
+        assert_eq!(get(send(make(" a\n"), "stringByTrimmingCharactersInSet:", &[spaces])), "a\n", "whitespace keeps line ends");
+        let truth = |text: &str| send(make(text), "boolValue", &[]) & 0xFF;
+        assert_eq!([truth("-1"), truth("01"), truth(" +7"), truth("00"), truth("no"), truth("yes")], [1, 1, 1, 0, 0, 1]);
+        // The string's own UTF-16 units stay, a lone surrogate too.
+        let lone = make("");
+        super::set(lone, vec![0x20, 0xd800, 0x78, 0x20]);
+        assert_eq!(units(send(lone, "stringByTrimmingCharactersInSet:", &[spaces])), [0xd800, 0x78]);
+    }
+
+    /// NSString formats take %C as a unichar and %S as a unichar (UTF-16) string.
+    #[test]
+    fn apple_format_reads_unichar_text() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let units: Vec<u16> = "hé✓\0".encode_utf16().collect();
+        let slots = [0xE9u64, units.as_ptr() as u64];
+        assert_eq!(format_object(make("[%C][%S]"), slots.as_ptr()), "[é][hé✓]");
     }
 
     /// Each word (split by spaces, tabs or line ends) starts upper case, the rest lower case.

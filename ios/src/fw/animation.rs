@@ -8,13 +8,16 @@
 //! (YES when it ran to its end, NO when it was removed or replaced first),
 //! and with removedOnCompletion (the default) it leaves the layer at its
 //! end. Held there (fillMode forwards or both, removedOnCompletion NO), its
-//! last value stays. What a view's layer animates (opacity, position,
-//! transform and their parts) is read by fw/pictures.rs each time it lists
-//! the screen (`presented`), so views move and fade on screen as on iOS;
-//! other key paths keep only the timing and the delegate calls. Transforms
-//! are taken apart into move, turn and scale (no shear) to animate.
+//! last value stays. What a layer animates (opacity, position, transform
+//! and their parts, background colour) is read by fw/pictures.rs each time
+//! it lists the screen (`presented`), so views move and fade on screen as on
+//! iOS; other key paths keep only the timing and the delegate calls.
+//! Transforms are taken apart (fw/geometry.rs `decompose`: scale, skew, a 3D
+//! turn, move, perspective) to animate, as Core Animation does. A
+//! CATransition takes its layer (and what is inside it) from what it showed
+//! to what it shows now, by its type (fw/pictures.rs, `transitions`).
 
-use crate::fw::geometry::{Point, Transform, Transform3D};
+use crate::fw::geometry::{decompose, recompose, Point, Transform, Transform3D};
 use crate::fw::layers::{self, unboxed, Kind};
 use crate::fw::object::{class_methods, define_class, methods};
 use crate::fw::uikit::{property_get, property_set, property_set_object};
@@ -70,6 +73,11 @@ fn make_curve(class: Class, curve: Curve) -> Id {
     let object = runtime::alloc_instance(class);
     unsafe { *((object + 8) as *mut [f64; 4]) = curve.0 };
     object
+}
+
+/// A new CAMediaTimingFunction with `curve`'s control points.
+pub fn timing_function(curve: Curve) -> Id {
+    make_curve(runtime::class_named("CAMediaTimingFunction"), curve)
 }
 
 pub fn curve_of(function: Id) -> Option<Curve> {
@@ -305,6 +313,13 @@ extern "C" fn anim_copy(this: Id, _: Sel, _zone: usize) -> Id {
     copy_animation(this)
 }
 
+/// CAAction: an animation as a layer's action is added to it for the key.
+extern "C" fn anim_run_action(this: Id, _: Sel, key: Id, object: Id, _arguments: Id) {
+    if object != 0 && runtime::responds(object, "addAnimation:forKey:") {
+        runtime::send(object, "addAnimation:forKey:", &[this, key]);
+    }
+}
+
 extern "C" fn anim_should_archive(_: Class, _: Sel, _key: Id) -> bool {
     true
 }
@@ -418,16 +433,28 @@ impl Timing {
         }
     }
 
+    /// Its own time at the parent's time `t` (inside its active time): the
+    /// timeOffset only shifts the phase, wrapping round the active time
+    /// (Apple's map_parent_to_active).
+    fn local(&self, t: f64) -> f64 {
+        let (local, active) = ((t - self.begin) * self.speed + self.offset, self.active());
+        if active.is_finite() && active > 0.0 && local >= active { local.rem_euclid(active) } else { local.max(0.0) }
+    }
+
+    /// Whether it has run its active time at the parent's time `t`.
+    fn over(&self, t: f64) -> bool {
+        (t - self.begin) * self.speed >= self.active()
+    }
+
     /// Where it is at the parent's time `t`.
     pub fn state(&self, t: f64) -> State {
         if t < self.begin {
             return State { started: false, ended: false, progress: self.backwards.then(|| self.progress_at(self.offset.max(0.0))) };
         }
-        let local = (t - self.begin) * self.speed + self.offset;
-        if local >= self.active() {
+        if self.over(t) {
             return State { started: true, ended: true, progress: self.forwards.then(|| self.end_progress()) };
         }
-        State { started: true, ended: false, progress: Some(self.progress_at(local.max(0.0))) }
+        State { started: true, ended: false, progress: Some(self.progress_at(self.local(t))) }
     }
 
     /// How many whole cycles (repeats) are behind it at the parent's time
@@ -437,20 +464,20 @@ impl Timing {
         if t < self.begin || cycle <= 0.0 {
             return 0.0;
         }
-        let (local, active) = ((t - self.begin) * self.speed + self.offset, self.active());
-        if local >= active {
-            ((active / cycle).ceil() - 1.0).max(0.0)
+        if self.over(t) {
+            ((self.active() / cycle).ceil() - 1.0).max(0.0)
         } else {
-            (local.max(0.0) / cycle).floor()
+            (self.local(t) / cycle).floor()
         }
     }
 
-    /// When it ends, in its parent's time (never at speed 0 or repeating forever).
+    /// When it ends, in its parent's time (never at speed 0 or repeating
+    /// forever): begin + active / speed, whatever its timeOffset.
     pub fn end(&self) -> f64 {
         if self.speed <= 0.0 {
             return f64::INFINITY;
         }
-        self.begin + (self.active() - self.offset).max(0.0) / self.speed
+        self.begin + self.active() / self.speed
     }
 }
 
@@ -478,6 +505,18 @@ pub enum Value {
     Number(f64),
     Point(Point),
     Transform(Transform3D),
+    /// A colour (straight red, green, blue, alpha).
+    Color([f64; 4]),
+    Rect(crate::fw::geometry::Rect),
+}
+
+/// A rect's numbers (x, y, width, height) and back.
+fn rect_numbers(r: crate::fw::geometry::Rect) -> [f64; 4] {
+    [r.origin.x, r.origin.y, r.size.width, r.size.height]
+}
+
+fn numbers_rect([x, y, w, h]: [f64; 4]) -> crate::fw::geometry::Rect {
+    crate::fw::geometry::Rect::new(x, y, w, h)
 }
 
 impl Value {
@@ -487,10 +526,17 @@ impl Value {
             (Value::Number(x), Value::Number(y)) => Value::Number(mix(x, y)),
             (Value::Point(p), Value::Point(q)) => Value::Point(Point { x: mix(p.x, q.x), y: mix(p.y, q.y) }),
             (Value::Transform(m), Value::Transform(n)) => {
-                // Taken apart and put back together, so turns turn.
-                let (pm, pn) = (Parts::of(layers::affine_of(m)), Parts::of(layers::affine_of(n)));
-                let parts = Parts { tx: mix(pm.tx, pn.tx), ty: mix(pm.ty, pn.ty), sx: mix(pm.sx, pn.sx), sy: mix(pm.sy, pn.sy), angle: mix(pm.angle, pn.angle) };
-                Value::Transform(layers::affine_to_3d(parts.transform()))
+                // Taken apart and put back together, so turns turn (in 3D,
+                // the short way round); one that can't be taken apart jumps half way.
+                match (decompose(m), decompose(n)) {
+                    (Some(dm), Some(dn)) => Value::Transform(recompose(&dm.lerp(&dn, f))),
+                    _ => Value::Transform(if f < 0.5 { m } else { n }),
+                }
+            }
+            (Value::Color(c), Value::Color(d)) => Value::Color(std::array::from_fn(|i| mix(c[i], d[i]))),
+            (Value::Rect(r), Value::Rect(q)) => {
+                let (r, q) = (rect_numbers(r), rect_numbers(q));
+                Value::Rect(numbers_rect(std::array::from_fn(|i| mix(r[i], q[i]))))
             }
             _ => return None,
         })
@@ -501,6 +547,11 @@ impl Value {
             (Value::Number(x), Value::Number(y)) => Value::Number(x + y),
             (Value::Point(p), Value::Point(q)) => Value::Point(Point { x: p.x + q.x, y: p.y + q.y }),
             (Value::Transform(m), Value::Transform(n)) => Value::Transform(crate::fw::geometry::concat_3d(n, m)),
+            (Value::Color(c), Value::Color(d)) => Value::Color(std::array::from_fn(|i| c[i] + d[i])),
+            (Value::Rect(r), Value::Rect(q)) => {
+                let (r, q) = (rect_numbers(r), rect_numbers(q));
+                Value::Rect(numbers_rect(std::array::from_fn(|i| r[i] + q[i])))
+            }
             _ => return None,
         })
     }
@@ -509,6 +560,11 @@ impl Value {
         Some(match (a, b) {
             (Value::Number(x), Value::Number(y)) => Value::Number(x - y),
             (Value::Point(p), Value::Point(q)) => Value::Point(Point { x: p.x - q.x, y: p.y - q.y }),
+            (Value::Color(c), Value::Color(d)) => Value::Color(std::array::from_fn(|i| c[i] - d[i])),
+            (Value::Rect(r), Value::Rect(q)) => {
+                let (r, q) = (rect_numbers(r), rect_numbers(q));
+                Value::Rect(numbers_rect(std::array::from_fn(|i| r[i] - q[i])))
+            }
             _ => return None,
         })
     }
@@ -518,11 +574,9 @@ impl Value {
         match v {
             Value::Number(x) => Value::Number(x * n),
             Value::Point(p) => Value::Point(Point { x: p.x * n, y: p.y * n }),
-            Value::Transform(m) => {
-                let p = Parts::of(layers::affine_of(m));
-                let parts = Parts { tx: p.tx * n, ty: p.ty * n, sx: p.sx.powf(n), sy: p.sy.powf(n), angle: p.angle * n };
-                Value::Transform(layers::affine_to_3d(parts.transform()))
-            }
+            Value::Transform(m) => Value::Transform(decompose(m).map_or(m, |d| recompose(&d.times(n)))),
+            Value::Color(c) => Value::Color(c.map(|v| v * n)),
+            Value::Rect(r) => Value::Rect(numbers_rect(rect_numbers(r).map(|v| v * n))),
         }
     }
 
@@ -531,19 +585,24 @@ impl Value {
         match (a, b) {
             (Value::Number(x), Value::Number(y)) => (y - x).abs(),
             (Value::Point(p), Value::Point(q)) => (q.x - p.x).hypot(q.y - p.y),
+            (Value::Color(c), Value::Color(d)) => (0..4).map(|i| (d[i] - c[i]).powi(2)).sum::<f64>().sqrt(),
+            (Value::Rect(r), Value::Rect(q)) => (0..4).map(|i| (rect_numbers(q)[i] - rect_numbers(r)[i]).powi(2)).sum::<f64>().sqrt(),
             _ => 1.0,
         }
     }
 }
 
-/// A value object as an animation reads it: a number, or an NSValue
-/// holding a point, size (as a point) or transform.
+/// A value object as an animation reads it: a number, a colour, or an
+/// NSValue holding a point, size (as a point) or transform.
 pub fn read_value(object: Id) -> Option<Value> {
     if object == 0 {
         return None;
     }
     if collections::is_number(object) {
         return Some(Value::Number(collections::number_as_f64(object)));
+    }
+    if layers::is_kind(object, "UIColor") {
+        return crate::fw::graphics::color_rgba(object).map(Value::Color);
     }
     let kind = runtime::sel("objCType");
     let imp = runtime::imp_for(object, kind)?;
@@ -555,6 +614,8 @@ pub fn read_value(object: Id) -> Option<Value> {
     let text = unsafe { std::ffi::CStr::from_ptr(pointer) }.to_string_lossy().into_owned();
     if text.starts_with("{CGPoint") {
         unboxed::<Point>(object, "CGPointValue").map(Value::Point)
+    } else if text.starts_with("{CGRect") {
+        unboxed::<crate::fw::geometry::Rect>(object, "CGRectValue").map(Value::Rect)
     } else if text.starts_with("{CGSize") {
         unboxed::<crate::fw::geometry::Size>(object, "CGSizeValue").map(|s| Value::Point(Point { x: s.width, y: s.height }))
     } else if text.starts_with("{CATransform3D") {
@@ -568,77 +629,90 @@ pub fn read_value(object: Id) -> Option<Value> {
     }
 }
 
-/// A 2D transform as move, turn and scale.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Parts {
-    tx: f64,
-    ty: f64,
-    sx: f64,
-    sy: f64,
-    angle: f64,
-}
-
-impl Parts {
-    fn of(t: Transform) -> Parts {
-        let sx = t.a.hypot(t.b);
-        let angle = t.b.atan2(t.a);
-        let sy = if sx != 0.0 { (t.a * t.d - t.b * t.c) / sx } else { t.c.hypot(t.d) };
-        Parts { tx: t.tx, ty: t.ty, sx, sy, angle }
-    }
-
-    /// Scaled, then turned, then moved.
-    fn transform(&self) -> Transform {
-        let (s, c) = self.angle.sin_cos();
-        Transform { a: self.sx * c, b: self.sx * s, c: -self.sy * s, d: self.sy * c, tx: self.tx, ty: self.ty }
-    }
-}
-
 /// What a layer shows of the parts animations can change.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Shown {
     pub opacity: f64,
     pub position: Point,
-    pub transform: Transform,
+    pub transform: Transform3D,
+    /// Its background colour (None: none).
+    pub background: Option<[f64; 4]>,
+    /// Its bounds, when they can animate (a layer of its own's; None: as they are).
+    pub bounds: Option<crate::fw::geometry::Rect>,
 }
 
 impl Shown {
+    /// What shows with no animation: the layer's own values.
+    pub fn new(opacity: f64, position: Point, transform: Transform3D, background: Option<[f64; 4]>) -> Shown {
+        Shown { opacity, position, transform, background, bounds: None }
+    }
+
     fn get(&self, path: &str) -> Option<Value> {
-        let parts = Parts::of(self.transform);
+        if let Some(part) = path.strip_prefix("transform.") {
+            let d = decompose(self.transform)?;
+            let [ax, ay, az] = d.angles();
+            let [sx, sy, sz] = d.scale;
+            let [tx, ty, tz] = d.translate;
+            return Some(match part {
+                "scale" => Value::Number((sx + sy + sz) / 3.0),
+                "scale.x" => Value::Number(sx),
+                "scale.y" => Value::Number(sy),
+                "scale.z" => Value::Number(sz),
+                "rotation" | "rotation.z" => Value::Number(az),
+                "rotation.x" => Value::Number(ax),
+                "rotation.y" => Value::Number(ay),
+                "translation" => Value::Point(Point { x: tx, y: ty }),
+                "translation.x" => Value::Number(tx),
+                "translation.y" => Value::Number(ty),
+                "translation.z" => Value::Number(tz),
+                _ => return None,
+            });
+        }
         Some(match path {
             "opacity" => Value::Number(self.opacity),
             "position" => Value::Point(self.position),
             "position.x" => Value::Number(self.position.x),
             "position.y" => Value::Number(self.position.y),
-            "transform" => Value::Transform(layers::affine_to_3d(self.transform)),
-            "transform.scale" | "transform.scale.x" => Value::Number(parts.sx),
-            "transform.scale.y" => Value::Number(parts.sy),
-            "transform.rotation" | "transform.rotation.z" => Value::Number(parts.angle),
-            "transform.translation" => Value::Point(Point { x: parts.tx, y: parts.ty }),
-            "transform.translation.x" => Value::Number(parts.tx),
-            "transform.translation.y" => Value::Number(parts.ty),
+            "transform" => Value::Transform(self.transform),
+            "backgroundColor" => Value::Color(self.background.unwrap_or([0.0; 4])),
+            "bounds" => Value::Rect(self.bounds?),
             _ => return None,
         })
     }
 
     fn set(&mut self, path: &str, value: Value) {
-        let mut parts = Parts::of(self.transform);
+        if let (Some(part), Value::Number(v)) | (Some(part), Value::Point(Point { x: v, .. })) = (path.strip_prefix("transform."), value) {
+            let Some(mut d) = decompose(self.transform) else { return };
+            let mut angles = d.angles();
+            match (part, value) {
+                ("scale", _) => d.scale = [v; 3],
+                ("scale.x", _) => d.scale[0] = v,
+                ("scale.y", _) => d.scale[1] = v,
+                ("scale.z", _) => d.scale[2] = v,
+                ("rotation" | "rotation.z", _) => angles[2] = v,
+                ("rotation.x", _) => angles[0] = v,
+                ("rotation.y", _) => angles[1] = v,
+                ("translation", Value::Point(p)) => (d.translate[0], d.translate[1]) = (p.x, p.y),
+                ("translation.x", _) => d.translate[0] = v,
+                ("translation.y", _) => d.translate[1] = v,
+                ("translation.z", _) => d.translate[2] = v,
+                _ => return,
+            }
+            if part.starts_with("rotation") {
+                d.set_angles(angles);
+            }
+            self.transform = recompose(&d);
+            return;
+        }
         match (path, value) {
             ("opacity", Value::Number(v)) => self.opacity = v.clamp(0.0, 1.0),
             ("position", Value::Point(p)) => self.position = p,
             ("position.x", Value::Number(v)) => self.position.x = v,
             ("position.y", Value::Number(v)) => self.position.y = v,
-            ("transform", Value::Transform(m)) => self.transform = layers::affine_of(m),
-            ("transform.scale", Value::Number(v)) => (parts.sx, parts.sy) = (v, v),
-            ("transform.scale.x", Value::Number(v)) => parts.sx = v,
-            ("transform.scale.y", Value::Number(v)) => parts.sy = v,
-            ("transform.rotation" | "transform.rotation.z", Value::Number(v)) => parts.angle = v,
-            ("transform.translation", Value::Point(p)) => (parts.tx, parts.ty) = (p.x, p.y),
-            ("transform.translation.x", Value::Number(v)) => parts.tx = v,
-            ("transform.translation.y", Value::Number(v)) => parts.ty = v,
-            _ => return,
-        }
-        if path.starts_with("transform.") {
-            self.transform = parts.transform();
+            ("transform", Value::Transform(m)) => self.transform = m,
+            ("backgroundColor", Value::Color(c)) => self.background = Some(c.map(|v| v.clamp(0.0, 1.0))),
+            ("bounds", Value::Rect(r)) if self.bounds.is_some() => self.bounds = Some(r),
+            _ => {}
         }
     }
 }
@@ -654,6 +728,11 @@ fn eased(animation: Id, progress: f64) -> f64 {
 fn value_at(animation: Id, progress: f64, lap: f64, under: &Shown) -> Option<(String, Value)> {
     let path = string::get(object(animation, "keyPath"));
     let model = under.get(&path)?;
+    Some((path, value_over(animation, progress, lap, model)?))
+}
+
+/// The animation's value at `progress` (see `value_at`) over the model value.
+fn value_over(animation: Id, progress: f64, lap: f64, model: Value) -> Option<Value> {
     let eased = eased(animation, progress);
     let (values, curve_path) = (object(animation, "values"), object(animation, "path"));
     let (value, last) = if curve_path != 0 && matches!(model, Value::Point(_)) {
@@ -676,7 +755,7 @@ fn value_at(animation: Id, progress: f64, lap: f64, under: &Shown) -> Option<(St
     let cumulative = lap > 0.0 && number(animation, "cumulative", 0.0) != 0.0;
     let value = if cumulative { Value::add(Value::times(last, lap), value)? } else { value };
     let value = if number(animation, "additive", 0.0) != 0.0 { Value::add(model, value)? } else { value };
-    Some((path, value))
+    Some(value)
 }
 
 /// The point `f` (0 to 1) of the way along a CGPath at even speed, and the
@@ -800,6 +879,10 @@ struct Running {
     /// Begun "now" when added (media time, on this thread): moved to when
     /// that thread's main-loop turn is done (`commit_at`).
     begun_on_add: Option<(f64, std::thread::ThreadId)>,
+    /// Whether its delegate answers animationDidStart: and
+    /// animationDidStop:finished:, looked up when it was added (as Apple's
+    /// lookup_delegate_methods).
+    tells: (bool, bool),
 }
 
 static RUNNING: Mutex<Vec<Running>> = Mutex::new(Vec::new());
@@ -809,16 +892,18 @@ fn running() -> std::sync::MutexGuard<'static, Vec<Running>> {
 }
 
 /// What the layer shows now, over `model` (its own values), with its
-/// animations: later ones over earlier ones, as Core Animation stacks them.
+/// animations: in beginTime order (then the order they were added), later
+/// ones over earlier ones, as Core Animation stacks them.
 pub fn presented(layer: Id, model: Shown) -> Shown {
     presented_at(layer, model, runloop::media_time())
 }
 
 pub fn presented_at(layer: Id, model: Shown, now: f64) -> Shown {
-    let list: Vec<Id> = running().iter().filter(|r| r.layer == layer).map(|r| r.animation).collect();
+    let mut list: Vec<Id> = running().iter().filter(|r| r.layer == layer).map(|r| r.animation).collect();
     if list.is_empty() {
         return model;
     }
+    list.sort_by(|&a, &b| number(a, "beginTime", 0.0).total_cmp(&number(b, "beginTime", 0.0)));
     let t = layers::local_time(layer, now);
     let mut shown = model;
     for animation in list {
@@ -827,21 +912,148 @@ pub fn presented_at(layer: Id, model: Shown, now: f64) -> Shown {
     shown
 }
 
+/// What the layer shows of a key `Shown` doesn't carry ("bounds",
+/// "backgroundColor": a UIView block's size and colour changes) over its
+/// own `model` value, with its plain animations of that key path.
+pub fn presented_value_at(layer: Id, key: &str, model: Value, now: f64) -> Value {
+    let list: Vec<Id> = running().iter().filter(|r| r.layer == layer).map(|r| r.animation).collect();
+    let t = layers::local_time(layer, now);
+    let mut shown = model;
+    for animation in list {
+        if is_group(animation) || string::get(object(animation, "keyPath")) != key {
+            continue;
+        }
+        let timing = timing_of(animation, DEFAULT_DURATION);
+        if let Some(progress) = timing.state(t).progress {
+            if let Some(value) = value_over(animation, progress, timing.lap(t), shown) {
+                shown = value;
+            }
+        }
+    }
+    shown
+}
+
+/// The layer's running animations of "contents" (not in groups).
+fn contents_animations(layer: Id) -> Vec<Id> {
+    let mut list: Vec<Id> = running().iter().filter(|r| r.layer == layer).map(|r| r.animation).collect();
+    if !list.is_empty() {
+        list.retain(|&a| !is_group(a) && string::get(object(a, "keyPath")) == "contents");
+    }
+    list
+}
+
+/// Whether the layer has a running "contents" animation (its pictures change
+/// from frame to frame).
+pub fn animates_contents(layer: Id) -> bool {
+    !contents_animations(layer).is_empty()
+}
+
+/// The picture a layer's running "contents" animations show at `now` (None
+/// while none runs), later ones over earlier ones: key frames step from
+/// picture to picture at their key times (UIImageView's are discrete); a
+/// basic one shows its toValue from halfway.
+pub fn presented_contents_at(layer: Id, now: f64) -> Option<Id> {
+    let mut list = contents_animations(layer);
+    if list.is_empty() {
+        return None;
+    }
+    list.sort_by(|&a, &b| number(a, "beginTime", 0.0).total_cmp(&number(b, "beginTime", 0.0)));
+    let t = layers::local_time(layer, now);
+    let mut shown = None;
+    for animation in list {
+        let timing = timing_of(animation, DEFAULT_DURATION);
+        let Some(progress) = timing.state(t).progress else { continue };
+        let progress = eased(animation, progress);
+        let values = object(animation, "values");
+        let picture = if values != 0 {
+            let pictures = collections::array_items(values);
+            let n = pictures.len();
+            let given = object(animation, "keyTimes");
+            let given: Vec<f64> = if given == 0 { Vec::new() } else { collections::array_items(given).into_iter().map(layers::number_value).collect() };
+            let times: Vec<f64> = if given.len() >= n { given } else { (0..n).map(|i| i as f64 / n as f64).collect() };
+            times.iter().take(n).rposition(|&at| at <= progress).and_then(|at| pictures.get(at).copied()).unwrap_or(0)
+        } else {
+            object(animation, if progress < 0.5 { "fromValue" } else { "toValue" })
+        };
+        if picture != 0 {
+            shown = Some(picture);
+        }
+    }
+    shown
+}
+
+/// The layers with running animations (for a log line).
+pub fn running_layers() -> Vec<Id> {
+    running().iter().filter(|r| !r.stopped).map(|r| r.layer).collect()
+}
+
 /// Whether a layer has animations on it now.
 pub fn animating(layer: Id) -> bool {
     running().iter().any(|r| r.layer == layer)
 }
 
-fn tell_started(animation: Id) {
+/// A CATransition running on a layer, as the screen draws it (fw/pictures.rs).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TransitionLook {
+    /// Its type ("fade", "moveIn", "push", "reveal", or UIKit's "oglFlip",
+    /// "pageCurl", "pageUnCurl") and subtype ("fromLeft" ...; "" for none).
+    pub kind: String,
+    pub subtype: String,
+    /// Its timing function (linear without one, as Core Animation's).
+    pub curve: Curve,
+    /// startProgress and endProgress.
+    pub progress: (f64, f64),
+    /// When it begins (media time) and how long it runs (seconds).
+    pub begin: f64,
+    pub duration: f64,
+}
+
+/// The CATransitions running now, with their layers and our copies.
+pub fn transitions() -> Vec<(Id, Id, TransitionLook)> {
+    let list: Vec<(Id, Id)> = running().iter().filter(|r| !r.stopped).map(|r| (r.layer, r.animation)).collect();
+    list.into_iter()
+        .filter(|&(_, animation)| layers::is_kind(animation, "CATransition"))
+        .map(|(layer, animation)| {
+            let timing = timing_of(animation, DEFAULT_DURATION);
+            let begin = layers::global_time(layer, timing.begin).unwrap_or(timing.begin);
+            let end = layers::global_time(layer, timing.begin + timing.duration).unwrap_or(begin + timing.duration);
+            let text = |key| match object(animation, key) {
+                0 => String::new(),
+                value => string::get(value),
+            };
+            let kind = match text("type") {
+                kind if kind.is_empty() => "fade".to_string(),
+                kind => kind,
+            };
+            let look = TransitionLook {
+                kind,
+                subtype: text("subtype"),
+                curve: curve_of(object(animation, "timingFunction")).unwrap_or(Curve::LINEAR),
+                progress: (number(animation, "startProgress", 0.0), number(animation, "endProgress", 1.0)),
+                begin,
+                duration: (end - begin).max(0.0),
+            };
+            (layer, animation, look)
+        })
+        .collect()
+}
+
+/// Whether the animation's delegate answers the start and stop calls.
+fn delegate_tells(animation: Id) -> (bool, bool) {
     let delegate = object(animation, "delegate");
-    if delegate != 0 && runtime::responds(delegate, "animationDidStart:") {
+    (delegate != 0 && runtime::responds(delegate, "animationDidStart:"), delegate != 0 && runtime::responds(delegate, "animationDidStop:finished:"))
+}
+
+fn tell_started(animation: Id, tells: (bool, bool)) {
+    let delegate = object(animation, "delegate");
+    if delegate != 0 && tells.0 {
         runtime::send(delegate, "animationDidStart:", &[animation]);
     }
 }
 
-fn tell_stopped(animation: Id, finished: bool) {
+fn tell_stopped(animation: Id, finished: bool, tells: (bool, bool)) {
     let delegate = object(animation, "delegate");
-    if delegate != 0 && runtime::responds(delegate, "animationDidStop:finished:") {
+    if delegate != 0 && tells.1 {
         runtime::send(delegate, "animationDidStop:finished:", &[animation, finished as usize]);
     }
 }
@@ -858,6 +1070,7 @@ pub(crate) fn tick_at(only: Option<Id>, now: f64) {
     let mut started = Vec::new();
     let mut stopped = Vec::new();
     let mut next = f64::INFINITY;
+    let mut changed = Vec::new();
     {
         let mut list = running();
         list.retain_mut(|r| {
@@ -869,12 +1082,14 @@ pub(crate) fn tick_at(only: Option<Id>, now: f64) {
             let state = timing.state(t);
             if state.started && !r.started {
                 r.started = true;
-                started.push(r.animation);
+                changed.push(r.layer);
+                started.push((r.animation, r.tells));
             }
             if state.ended && !r.stopped {
                 r.stopped = true;
+                changed.push(r.layer);
                 let removed = number(r.animation, "removedOnCompletion", 1.0) != 0.0;
-                stopped.push((r.animation, removed));
+                stopped.push((r.animation, removed, r.tells));
                 if removed {
                     return false;
                 }
@@ -888,11 +1103,15 @@ pub(crate) fn tick_at(only: Option<Id>, now: f64) {
             true
         });
     }
-    for animation in started {
-        tell_started(animation);
+    for layer in changed {
+        crate::fw::changes::changed(layer);
     }
-    for (animation, removed) in stopped {
-        tell_stopped(animation, true);
+    // As Apple's run_animation_callbacks: the starts due, then the stops.
+    for (animation, tells) in started {
+        tell_started(animation, tells);
+    }
+    for (animation, removed, tells) in stopped {
+        tell_stopped(animation, true, tells);
         crate::fw::smallclasses::animation_finished(animation);
         stopped_now(animation, true);
         if removed {
@@ -902,11 +1121,6 @@ pub(crate) fn tick_at(only: Option<Id>, now: f64) {
     if next.is_finite() {
         wake_at(next);
     }
-}
-
-/// Whether an animation (a layer's copy) is on a layer and hasn't ended.
-pub fn in_progress(animation: Id) -> bool {
-    running().iter().any(|r| r.animation == animation && !r.stopped)
 }
 
 /// The layer let go of its copy: the copy lets go of its delegate, as its
@@ -939,29 +1153,60 @@ pub fn reschedule() {
 }
 
 /// -addAnimation:forKey:. As on Apple: the animation is copied, one with
-/// the same key is removed first, a duration of 0 becomes the transaction's
-/// animationDuration, and it starts now unless it has a beginTime; its
-/// start is told on the next turn of the main run loop.
+/// the same key is removed first (a CATransition's key is "transition"), a
+/// duration of 0 becomes the transaction's animationDuration (still 0: it
+/// starts and stops at once and isn't added), a property animation without
+/// a keyPath takes the key, one without a timing function takes the
+/// transaction's, and it starts now unless it has a beginTime; its start is
+/// told on the next turn of the main run loop. A CATransition takes the
+/// layer from what it showed to what it shows next (fw/pictures.rs draws it).
 pub fn add(layer: Id, animation: Id, key: Id) -> Id {
     if animation == 0 {
         return 0;
     }
-    let key = if key == 0 { None } else { Some(string::get(key)) };
+    let transition = layers::is_kind(animation, "CATransition");
+    let key = if transition { Some("transition".to_string()) } else if key == 0 { None } else { Some(string::get(key)) };
     if key.is_some() {
         remove_where(|r| r.layer == layer && r.key == key);
     }
     let copy = runtime::send(animation, "copy", &[]);
+    if number(copy, "duration", 0.0) <= 0.0 {
+        set_number(copy, "duration", crate::fw::smallclasses::animation_duration());
+    }
+    if number(copy, "duration", 0.0) <= 0.0 {
+        let tells = delegate_tells(copy);
+        tell_started(copy, tells);
+        tell_stopped(copy, true, tells);
+        let_go(copy);
+        return copy;
+    }
+    if let Some(key) = &key {
+        if object(copy, "keyPath") == 0 && layers::is_kind(copy, "CAPropertyAnimation") {
+            hold(copy, "keyPath", string::make(key));
+        }
+    }
+    if object(copy, "delegate") == 0 {
+        let delegate = crate::fw::smallclasses::animation_delegate();
+        if delegate != 0 {
+            anim_set_delegate(copy, 0, delegate);
+        }
+    }
+    let tells = delegate_tells(copy);
+    if object(copy, "timingFunction") == 0 {
+        let curve = crate::fw::smallclasses::animation_timing();
+        if curve != 0 {
+            hold(copy, "timingFunction", curve);
+        }
+    }
     let now = runloop::media_time();
     let begun_on_add = (number(copy, "beginTime", 0.0) == 0.0).then_some((now, std::thread::current().id()));
     if begun_on_add.is_some() {
         set_number(copy, "beginTime", layers::local_time(layer, now));
     }
-    if number(copy, "duration", 0.0) <= 0.0 {
-        set_number(copy, "duration", crate::fw::smallclasses::animation_duration());
-    }
     crate::fw::smallclasses::animation_added(copy);
-    running().push(Running { layer, key, animation: copy, started: false, stopped: false, begun_on_add });
+    running().push(Running { layer, key, animation: copy, started: false, stopped: false, begun_on_add, tells });
     wake_at(now);
+    crate::fw::changes::changed(layer);
     crate::fw::pictures::draw_soon();
     copy
 }
@@ -969,8 +1214,10 @@ pub fn add(layer: Id, animation: Id, key: Id) -> Id {
 /// The main loop's turn is done (Apple's transaction commit): animations
 /// added during it without a begin time begin now, as on Apple, so the work
 /// the game did after adding them doesn't use up their first part before a
-/// frame of them is drawn (SpellCraft's 0.2 s spell panel slide).
+/// frame of them is drawn (SpellCraft's 0.2 s spell panel slide). Layers
+/// made in it are committed (their later changes run implicit actions).
 pub fn commit() {
+    layers::commit_new();
     commit_at(None, runloop::media_time());
 }
 
@@ -982,6 +1229,7 @@ pub fn uncommitted() -> bool {
 
 pub(crate) fn commit_at(only: Option<Id>, now: f64) {
     let mut late = 0.0f64;
+    let mut shifted = Vec::new();
     let me = std::thread::current().id();
     for r in running().iter_mut().filter(|r| only.is_none_or(|layer| layer == r.layer)) {
         let Some((added, _)) = r.begun_on_add.take_if(|(_, thread)| *thread == me) else { continue };
@@ -989,7 +1237,11 @@ pub(crate) fn commit_at(only: Option<Id>, now: f64) {
         if shift > 0.0 {
             set_number(r.animation, "beginTime", number(r.animation, "beginTime", 0.0) + shift);
             late = late.max(now - added);
+            shifted.push(r.layer);
         }
+    }
+    for layer in shifted {
+        crate::fw::changes::changed(layer);
     }
     if late > 0.03 {
         static LOGGED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1074,16 +1326,19 @@ fn remove_where(matches: impl Fn(&Running) -> bool) {
     let mut gone = Vec::new();
     running().retain(|r| {
         if matches(r) {
-            gone.push((r.animation, r.stopped));
+            gone.push((r.layer, r.animation, r.stopped, r.tells));
             false
         } else {
             true
         }
     });
-    for (animation, stopped) in gone {
+    for &(layer, _, _, _) in &gone {
+        crate::fw::changes::changed(layer);
+    }
+    for (_, animation, stopped, tells) in gone {
         runloop::post(runloop::Work::Native(Box::new(move || {
             if !stopped {
-                tell_stopped(animation, false);
+                tell_stopped(animation, false, tells);
                 crate::fw::smallclasses::animation_finished(animation);
                 stopped_now(animation, false);
             }
@@ -1121,18 +1376,28 @@ extern "C" fn layer_animation_keys(this: Id, _: Sel) -> Id {
 
 // ----- key paths on layers -----
 
-/// The layer's own values of what animations change.
-fn model_of(layer: Id) -> Shown {
-    Shown { opacity: layers::opacity(layer), position: layers::position(layer), transform: layers::affine_of(layers::transform(layer)) }
+/// The layer's own values of what animations change (a view's layer's
+/// bounds are its view's, which don't animate here).
+pub fn model_of(layer: Id) -> Shown {
+    let model = Shown::new(layers::opacity(layer), layers::position(layer), layers::transform(layer), crate::fw::graphics::color_rgba(layers::background(layer)));
+    Shown { bounds: (layers::view_of(layer) == 0).then(|| layers::bounds(layer)), ..model }
 }
 
 /// A value as an object of the kind valueForKeyPath: hands back.
-fn boxed_value(value: Value) -> Id {
+pub fn boxed_value(value: Value) -> Id {
     match value {
         Value::Number(v) => collections::number_float(v),
         Value::Point(p) => layers::boxed("valueWithCGPoint:", p),
         Value::Transform(m) => layers::boxed("valueWithCATransform3D:", m),
+        Value::Color(c) => crate::fw::graphics::make_color(c),
+        Value::Rect(r) => layers::boxed("valueWithCGRect:", r),
     }
+}
+
+/// What a layer shows now of `key` (opacity, position, transform,
+/// backgroundColor), its animations included.
+pub fn shown_value(layer: Id, key: &str) -> Option<Value> {
+    presented(layer, model_of(layer)).get(key)
 }
 
 /// valueForKeyPath: on a layer: Core Animation's own sub-paths
@@ -1163,7 +1428,7 @@ extern "C" fn layer_set_value_for_key_path(this: Id, _: Sel, value: Id, path: Id
             if name.starts_with("position") {
                 layers::send_struct(this, "setPosition:", shown.position);
             } else {
-                layers::send_struct(this, "setTransform:", layers::affine_to_3d(shown.transform));
+                layers::send_struct(this, "setTransform:", shown.transform);
             }
             return;
         }
@@ -1217,6 +1482,7 @@ pub fn register(r: &mut Registry) {
             ("timingFunction", anim_timing as usize),
             ("setTimingFunction:", anim_set_timing as usize),
             ("copyWithZone:", anim_copy as usize),
+            ("runActionForKey:object:arguments:", anim_run_action as usize),
             ("valueForKey:", anim_value_for_key as usize),
             ("setValue:forKey:", anim_set_value_for_key as usize),
         ],
@@ -1361,7 +1627,7 @@ extern "C" fn no_class_with(_: Class, _: Sel, _key: Id) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fw::geometry::IDENTITY;
+    use crate::fw::geometry::IDENTITY_3D;
 
     fn setup() {
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1470,7 +1736,7 @@ mod tests {
         anim_set_duration(fade, 0, 1.0);
         anim_set_delegate(fade, 0, delegate);
         anim_set_value_for_key(fade, 0, string::make("intro"), string::make("name"));
-        let model = Shown { opacity: 0.2, position: Point::default(), transform: IDENTITY };
+        let model = Shown::new(0.2, Point::default(), IDENTITY_3D, None);
         add(layer, fade, string::make("fade"));
         let copy = layer_animation_for_key(layer, 0, string::make("fade"));
         assert!(copy != 0 && copy != fade, "the layer holds a copy");
@@ -1537,7 +1803,7 @@ mod tests {
         let hop = anim_with_key_path(class, 0, string::make("transform.scale"));
         let numbers = |list: &[f64]| collections::array_from(&list.iter().map(|&v| collections::number_float(v)).collect::<Vec<_>>());
         anim_set_values(hop, 0, numbers(&[1.0, 2.0, 1.0]));
-        let model = Shown { opacity: 1.0, position: Point::default(), transform: IDENTITY };
+        let model = Shown::new(1.0, Point::default(), IDENTITY_3D, None);
         assert!(close(value_at(hop, 0.25, 0.0, &model).map(|(_, v)| match v { Value::Number(n) => n, _ => 0.0 }).unwrap(), 1.5));
         anim_set_key_times(hop, 0, numbers(&[0.0, 0.8, 1.0]));
         assert!(close(match value_at(hop, 0.4, 0.0, &model).unwrap().1 { Value::Number(n) => n, _ => 0.0 }, 1.5));
@@ -1546,12 +1812,20 @@ mod tests {
         let mut shown = model;
         shown.set("transform.scale", Value::Number(2.0));
         shown.set("transform.rotation.z", Value::Number(std::f64::consts::FRAC_PI_2));
-        let parts = Parts::of(shown.transform);
-        assert!(close(parts.sx, 2.0) && close(parts.sy, 2.0) && close(parts.angle, std::f64::consts::FRAC_PI_2));
+        let (sx, sy, angle) = scale_and_turn(shown.transform);
+        assert!(close(sx, 2.0) && close(sy, 2.0) && close(angle, std::f64::consts::FRAC_PI_2));
         // Half way from no turn to a half turn is a quarter turn, not a squash.
-        let half = Value::lerp(Value::Transform(layers::affine_to_3d(IDENTITY)), Value::Transform(layers::affine_to_3d(Parts { tx: 0.0, ty: 0.0, sx: 1.0, sy: 1.0, angle: 3.0 }.transform())), 0.5).unwrap();
+        let turn = crate::fw::geometry::transform_3d_make_rotation(3.0, 0.0, 0.0, 1.0);
+        let half = Value::lerp(Value::Transform(IDENTITY_3D), Value::Transform(turn), 0.5).unwrap();
         let Value::Transform(m) = half else { panic!() };
-        assert!(close(Parts::of(layers::affine_of(m)).sx, 1.0) && close(Parts::of(layers::affine_of(m)).angle, 1.5));
+        let (sx, _, angle) = scale_and_turn(m);
+        assert!(close(sx, 1.0) && close(angle, 1.5));
+    }
+
+    /// A transform's x and y scale and its turn about z.
+    fn scale_and_turn(m: Transform3D) -> (f64, f64, f64) {
+        let d = decompose(m).unwrap();
+        (d.scale[0], d.scale[1], d.angles()[2])
     }
 
     fn number_of(found: Option<(String, Value)>) -> f64 {
@@ -1568,7 +1842,7 @@ mod tests {
     fn cumulative_paced_and_path_animations() {
         setup();
         let layer = runtime::send(runtime::send(runtime::class_named("CALayer"), "alloc", &[]), "init", &[]);
-        let model = Shown { opacity: 1.0, position: Point::default(), transform: IDENTITY };
+        let model = Shown::new(1.0, Point::default(), IDENTITY_3D, None);
         let step = basic("position.x", collections::number_float(0.0), collections::number_float(10.0));
         anim_set_duration(step, 0, 100.0); // long: other tests running the main loop end nothing early
         anim_set_repeat_count(step, 0, 2.0);
@@ -1605,7 +1879,7 @@ mod tests {
         assert!(close(quarter.position.x, 50.0) && close(quarter.position.y, 0.0), "{quarter:?}");
         let late = presented_at(layer, model, begin + 75.0);
         assert!(close(late.position.x, 100.0) && close(late.position.y, 50.0), "{late:?}");
-        assert!(close(Parts::of(late.transform).angle, std::f64::consts::FRAC_PI_2), "turned down the path");
+        assert!(close(scale_and_turn(late.transform).2, std::f64::consts::FRAC_PI_2), "turned down the path");
         layer_remove_all_animations(layer, 0);
     }
 
@@ -1671,5 +1945,136 @@ mod tests {
         assert!(!run_until(done(2)), "an endless animation holds the completion");
         layer_remove_all_animations(layer, 0);
         assert!(run_until(done(2)));
+    }
+
+    /// addAnimation:forKey: as Apple's: a duration still 0 after the
+    /// transaction's is not added (and takes the key's old animation off);
+    /// a nil keyPath takes the key; the transaction's timing function is
+    /// given to one without its own; animations apply in beginTime order.
+    #[test]
+    fn adding_follows_apples_rules_for_duration_key_and_order() {
+        setup();
+        let transaction = runtime::class_named("CATransaction");
+        let layer = runtime::send(runtime::send(runtime::class_named("CALayer"), "alloc", &[]), "init", &[]);
+        let model = Shown::new(1.0, Point::default(), IDENTITY_3D, None);
+        let old = basic("opacity", collections::number_float(0.0), collections::number_float(1.0));
+        anim_set_duration(old, 0, 100.0);
+        add(layer, old, string::make("k"));
+        runtime::send(transaction, "begin", &[]);
+        layers::send_struct(transaction, "setAnimationDuration:", 0.0f64);
+        add(layer, basic("opacity", 0, collections::number_float(0.5)), string::make("k"));
+        runtime::send(transaction, "commit", &[]);
+        assert_eq!(layer_animation_for_key(layer, 0, string::make("k")), 0, "no time: not added, the old one gone");
+
+        let unnamed = anim_class_animation(runtime::class_named("CABasicAnimation"), 0);
+        anim_set_from(unnamed, 0, collections::number_float(0.0));
+        anim_set_to(unnamed, 0, collections::number_float(1.0));
+        anim_set_duration(unnamed, 0, 100.0);
+        runtime::send(transaction, "begin", &[]);
+        let ease_in = function_with_name(runtime::class_named("CAMediaTimingFunction"), 0, string::make("easeIn"));
+        runtime::send(transaction, "setAnimationTimingFunction:", &[ease_in]);
+        add(layer, unnamed, string::make("opacity"));
+        runtime::send(transaction, "commit", &[]);
+        let copy = layer_animation_for_key(layer, 0, string::make("opacity"));
+        assert!(curve_of(object(copy, "timingFunction")).is_some(), "the transaction's timing function");
+        anim_set_timing(copy, 0, 0);
+        let begin = number(copy, "beginTime", 0.0);
+        assert!(close(presented_at(layer, model, begin + 50.0).opacity, 0.5), "the key is the key path");
+        layer_remove_all_animations(layer, 0);
+
+        // Added later but beginning earlier: applied first, under the other.
+        let now = layers::local_time(layer, runloop::media_time());
+        let late = basic("opacity", collections::number_float(0.1), collections::number_float(0.1));
+        anim_set_duration(late, 0, 100.0);
+        anim_set_begin(late, 0, now + 1.0);
+        add(layer, late, string::make("late"));
+        let early = basic("opacity", collections::number_float(0.9), collections::number_float(0.9));
+        anim_set_duration(early, 0, 100.0);
+        anim_set_begin(early, 0, now);
+        add(layer, early, string::make("early"));
+        assert!(close(presented_at(layer, model, layers::global_time(layer, now + 2.0).unwrap()).opacity, 0.1));
+        layer_remove_all_animations(layer, 0);
+    }
+
+    /// A timeOffset shifts where an animation starts, not when it ends
+    /// (Apple's end = begin + active / speed; the phase wraps).
+    #[test]
+    fn time_offset_shifts_the_phase_only() {
+        let shifted = Timing { begin: 10.0, duration: 2.0, offset: 1.0, ..Default::default() };
+        assert_eq!(shifted.end(), 12.0);
+        assert_eq!(shifted.state(11.5), State { started: true, ended: false, progress: Some(0.25) });
+    }
+
+    /// A 3D turn past a quarter (a card flipped about y) turns about y the
+    /// whole way, not about z: half way to 170° is 85° about y.
+    #[test]
+    fn transforms_turn_in_3d() {
+        // CATransform3DMakeRotation(170°, 0, 1, 0).
+        let (s, c) = 170f64.to_radians().sin_cos();
+        let mut flip = IDENTITY_3D;
+        (flip.0[0], flip.0[2], flip.0[8], flip.0[10]) = (c, -s, s, c);
+        let Some(Value::Transform(half)) = Value::lerp(Value::Transform(IDENTITY_3D), Value::Transform(flip), 0.5) else { panic!() };
+        assert!(close(half.0[0], 85f64.to_radians().cos()) && close(half.0[1], 0.0) && close(half.0[2], -(85f64.to_radians().sin())), "{half:?}");
+    }
+
+    static INNER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static OUTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static REPLACED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    extern "C" fn inner_done(_block: usize) {
+        INNER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    extern "C" fn outer_done(_block: usize) {
+        OUTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    extern "C" fn replaced_done(_block: usize) {
+        REPLACED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Core Animation's continuations: a nested transaction's completion
+    /// waits only for the animations added after it was set (not for the
+    /// outer transaction's, even one that repeats forever, with an implicit
+    /// transaction open under both); the outer one waits for the inner one;
+    /// a replaced completion block still runs.
+    #[test]
+    fn inner_completions_wait_only_for_their_own_animations() {
+        use std::sync::atomic::Ordering::SeqCst;
+        setup();
+        let transaction = runtime::class_named("CATransaction");
+        let new_layer = || runtime::send(runtime::send(runtime::class_named("CALayer"), "alloc", &[]), "init", &[]);
+        let (a, b) = (new_layer(), new_layer());
+        let descriptor: [usize; 4] = [0, std::mem::size_of::<crate::libsystem::mach::BlockHeader>(), 0, 0];
+        let block = |invoke: extern "C" fn(usize)| crate::libsystem::mach::BlockHeader { isa: 0, flags: 1 << 28, reserved: 0, invoke: invoke as usize, descriptor: &descriptor };
+        let (inner, outer, replaced) = (block(inner_done), block(outer_done), block(replaced_done));
+
+        // A setting outside begin/commit opens the implicit transaction.
+        runtime::send(transaction, "setDisableActions:", &[0]);
+        runtime::send(transaction, "begin", &[]);
+        runtime::send(transaction, "setCompletionBlock:", &[&outer as *const _ as usize]);
+        runtime::send(transaction, "begin", &[]);
+        runtime::send(transaction, "setCompletionBlock:", &[&inner as *const _ as usize]);
+        let short = basic("opacity", collections::number_float(0.0), collections::number_float(1.0));
+        anim_set_duration(short, 0, 0.1);
+        add(a, short, string::make("short"));
+        let begin = number(layer_animation_for_key(a, 0, string::make("short")), "beginTime", 0.0);
+        runtime::send(transaction, "commit", &[]);
+        let forever = basic("opacity", collections::number_float(0.0), collections::number_float(1.0));
+        anim_set_repeat_count(forever, 0, f32::INFINITY);
+        add(b, forever, 0);
+        runtime::send(transaction, "commit", &[]);
+        tick_at(Some(a), begin + 0.2);
+        assert!(run_until(|| INNER.load(SeqCst) == 1), "the inner completion runs when its own animation ends");
+        assert!(!run_until(|| OUTER.load(SeqCst) == 1), "the outer one waits for its endless animation");
+        layer_remove_all_animations(b, 0);
+        assert!(run_until(|| OUTER.load(SeqCst) == 1));
+
+        runtime::send(transaction, "begin", &[]);
+        runtime::send(transaction, "setCompletionBlock:", &[&replaced as *const _ as usize]);
+        runtime::send(transaction, "setCompletionBlock:", &[&inner as *const _ as usize]);
+        runtime::send(transaction, "commit", &[]);
+        assert!(run_until(|| REPLACED.load(SeqCst) == 1 && INNER.load(SeqCst) == 2), "a replaced block still runs");
+        runtime::send(transaction, "flush", &[]);
     }
 }

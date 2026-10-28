@@ -86,7 +86,7 @@ pub unsafe extern "C" fn Java_dev_braxten_gamebridge_IosGameActivity_nativeStart
         let activity = (functions.NewGlobalRef.unwrap())(env, this);
         *JAVA.lock().unwrap() = Some((vm as usize, activity as usize));
         crate::fw::media::set_video_screen(crate::fw::media::VideoScreen { show: show_video, pause: pause_video, resume: resume_video, stop: stop_video });
-        crate::fw::pictures::set_picture_screen(crate::fw::pictures::PictureScreen { show: show_pictures });
+        crate::fw::pictures::set_picture_screen(crate::fw::pictures::PictureScreen { show: show_pictures, says_when_up: true });
         crate::fw::typing::set_keyboard_screen(show_keyboard);
     }
     crate::log!("phone app: starting {app} ({width}x{height} window)");
@@ -109,6 +109,13 @@ pub unsafe extern "C" fn Java_dev_braxten_gamebridge_IosGameActivity_nativeSetRe
     std::env::set_var("IOS_REPORT_DIR", text(env, folder));
 }
 
+/// nativePicturesUp(number): the phone put picture list `number` up on its
+/// screen (fw/pictures.rs `phone_put_up`).
+#[no_mangle]
+pub unsafe extern "C" fn Java_dev_braxten_gamebridge_IosGameActivity_nativePicturesUp(_env: *mut JNIEnv, _this: jobject, number: jlong) {
+    crate::fw::pictures::phone_put_up(number as u64);
+}
+
 /// nativeSetScreenRate(hz): the screen's top refresh rate (IOS_SCREEN_HZ),
 /// so games with their own frame limit can be let up to it (fw::paths).
 #[no_mangle]
@@ -116,6 +123,14 @@ pub unsafe extern "C" fn Java_dev_braxten_gamebridge_IosGameActivity_nativeSetSc
     if hz > 0 {
         std::env::set_var("IOS_SCREEN_HZ", hz.to_string());
     }
+}
+
+/// nativeAudioInterruption(began, shouldResume): Android's audio focus went
+/// (a call, another app's sound) or came back: an iOS sound session
+/// interruption (fw::media::audio_interruption).
+#[no_mangle]
+pub extern "C" fn Java_dev_braxten_gamebridge_IosGameActivity_nativeAudioInterruption(_env: *mut JNIEnv, _this: jobject, began: jboolean, should_resume: jboolean) {
+    crate::fw::media::audio_interruption(began != 0, should_resume != 0);
 }
 
 /// nativeNoticeFd(): the end of the "game stopped" pipe the screen watches
@@ -283,14 +298,15 @@ fn show_video(path: &str, token: u64) -> bool {
     }
 }
 
-/// The game's UIKit pictures to draw over it (fw/pictures.rs `encode`).
-fn show_pictures(list: &str) {
+/// The game's UIKit pictures to draw over it (fw/pictures.rs `encode`), list
+/// `number` (the phone says when it is up: nativePicturesUp).
+fn show_pictures(list: &str, number: u64) {
     unsafe {
         let Some((env, _)) = java_env() else { return };
         let Ok(text) = std::ffi::CString::new(list) else { return };
         let functions = &**env;
         let string = (functions.NewStringUTF.unwrap())(env, text.as_ptr());
-        call_activity(c"showPictures", c"(Ljava/lang/String;)V", &[jvalue { l: string }]);
+        call_activity(c"showPictures", c"(Ljava/lang/String;J)V", &[jvalue { l: string }, jvalue { j: number as jlong }]);
         (functions.DeleteLocalRef.unwrap())(env, string);
     }
 }

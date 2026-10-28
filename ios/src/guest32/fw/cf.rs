@@ -248,7 +248,7 @@ const OBJECT_CONSTANTS: &[&str] = &[
     "kSecAttrAccessibleAfterFirstUnlock", "kSecAttrAccessibleAlways", "kSecAttrGeneric", "kSecAttrLabel",
     "kSecAttrApplicationTag", "kSecAttrApplicationLabel", "kSecAttrKeyClass", "kSecAttrKeyClassPublic",
     "kSecAttrKeyClassPrivate", "kSecAttrKeyType", "kSecAttrKeyTypeRSA", "kSecAttrKeySizeInBits", "kSecValueData",
-    "kSecReturnData", "kSecReturnAttributes", "kSecReturnRef", "kSecReturnPersistentRef", "kSecMatchLimit",
+    "kSecValuePersistentRef", "kSecReturnData", "kSecReturnAttributes", "kSecReturnRef", "kSecReturnPersistentRef", "kSecMatchLimit",
     "kSecMatchLimitOne", "kSecMatchLimitAll",
     // StoreKit, MediaPlayer, Core Animation
     "SKErrorDomain", "MPMovieDurationAvailableNotification", "MPMoviePlayerContentPreloadDidFinishNotification",
@@ -281,7 +281,8 @@ const OBJECT_CONSTANTS: &[&str] = &[
     "UIKeyboardAnimationDurationUserInfoKey", "UIKeyboardAnimationCurveUserInfoKey",
     // AVFoundation, OpenGL ES (EAGL), Accounts
     "AVAudioSessionCategoryAmbient", "AVAudioSessionCategorySoloAmbient", "AVAudioSessionCategoryPlayback",
-    "AVAudioSessionCategoryRecord", "AVAudioSessionCategoryPlayAndRecord", "kEAGLDrawablePropertyColorFormat",
+    "AVAudioSessionCategoryRecord", "AVAudioSessionCategoryPlayAndRecord", "AVAudioSessionInterruptionNotification",
+    "AVAudioSessionInterruptionTypeKey", "AVAudioSessionInterruptionOptionKey", "kEAGLDrawablePropertyColorFormat",
     "kEAGLDrawablePropertyRetainedBacking", "kEAGLColorFormatRGBA8", "kEAGLColorFormatRGB565",
     "ACAccountTypeIdentifierTwitter", "ACAccountTypeIdentifierFacebook",
 ];
