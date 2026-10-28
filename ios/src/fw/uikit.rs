@@ -5716,6 +5716,7 @@ mod tests {
     /// initWithFrame:) takes no new touches until the slide is done.
     #[test]
     fn a_running_modal_transition_refuses_more_and_takes_no_touches() {
+        let _turn = crate::fw::typing::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(crate::run::setup);
         static HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

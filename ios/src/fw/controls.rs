@@ -5021,6 +5021,7 @@ mod tests {
     /// didSelect), and the selected cell is drawn selected.
     #[test]
     fn tables_show_their_rows_and_take_taps() {
+        let _turn = crate::fw::typing::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use crate::fw::geometry::Point;
         use crate::fw::object::define_class;
         use crate::fw::touch::{deliver_in, origin_in_window, Phase};
@@ -5473,6 +5474,7 @@ mod tests {
     /// while the finger is down. A short tap still reaches the content view.
     #[test]
     fn a_drag_scrolls_and_a_short_tap_still_reaches_the_content() {
+        let _turn = crate::fw::typing::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(crate::run::setup);
         crate::fw::runloop::as_main(drag_scrolls_and_tap_reaches);
@@ -5551,6 +5553,7 @@ mod tests {
     /// off, the button hears the touch at once.
     #[test]
     fn a_pressed_button_keeps_its_finger_in_a_scroll_view() {
+        let _turn = crate::fw::typing::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(crate::run::setup);
         crate::fw::runloop::as_main(pressed_button_keeps_finger);
@@ -5601,6 +5604,7 @@ mod tests {
     /// half speed and slides back when let go; paging slides to its page.
     #[test]
     fn scroll_views_slide_bounce_and_page() {
+        let _turn = crate::fw::typing::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(crate::run::setup);
         crate::fw::runloop::as_main(slide_bounce_and_page);
@@ -5917,6 +5921,7 @@ mod tests {
     /// the target, as UIKit's -_endPanWithEvent: does.
     #[test]
     fn the_delegate_chooses_where_a_drag_stops() {
+        let _turn = crate::fw::typing::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(crate::run::setup);
         crate::fw::runloop::as_main(delegate_chooses_stop);
@@ -5990,6 +5995,7 @@ mod tests {
     /// the touch once both have let it go.
     #[test]
     fn a_touch_waits_for_every_hold() {
+        let _turn = crate::fw::typing::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(crate::run::setup);
         crate::fw::runloop::as_main(every_hold);
@@ -6035,6 +6041,7 @@ mod tests {
     /// doesn't let the old touch's 0.15 s run out early for the new one.
     #[test]
     fn content_hears_a_held_touch_as_it_was() {
+        let _turn = crate::fw::typing::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(crate::run::setup);
         crate::fw::runloop::as_main(held_touch_as_it_was);
@@ -6116,6 +6123,7 @@ mod tests {
     /// its own frame, so SpellCraft's sideways shop row scrolls.
     #[test]
     fn a_scroll_view_in_a_turned_view_follows_the_finger_on_screen() {
+        let _turn = crate::fw::typing::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(crate::run::setup);
         crate::fw::runloop::as_main(turned_scroll);
@@ -6157,6 +6165,7 @@ mod tests {
     /// axis scrolls; an outer one takes over on the axis the inner one can't.
     #[test]
     fn nested_scroll_views_scroll_the_innermost_that_moves_on_the_axis() {
+        let _turn = crate::fw::typing::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(crate::run::setup);
         crate::fw::runloop::as_main(nested_scrolls);

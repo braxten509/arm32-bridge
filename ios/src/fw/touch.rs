@@ -1177,6 +1177,7 @@ mod tests {
     /// could still come.
     #[test]
     fn recognizers_hold_back_and_cancel_the_views_touches() {
+        let _turn = crate::fw::typing::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(crate::run::setup);
         // All of it as one piece of main-loop work: no other test's main loop
@@ -1249,6 +1250,7 @@ mod tests {
     /// and places beside them leave the touch to the game's view.
     #[test]
     fn controls_track_the_finger_and_send_their_actions() {
+        let _turn = crate::fw::typing::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use crate::fw::geometry::Rect;
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(crate::run::setup);
@@ -1422,6 +1424,7 @@ mod tests {
     /// tapCount 2; one far away starts again at 1) and names the window it is in.
     #[test]
     fn touches_count_their_taps_and_know_their_window() {
+        let _turn = crate::fw::typing::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use crate::fw::geometry::Rect;
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(crate::run::setup);
@@ -1494,6 +1497,7 @@ mod tests {
     /// multipleTouchEnabled on (UIKit's default is off).
     #[test]
     fn a_single_touch_view_hears_only_its_first_finger() {
+        let _turn = crate::fw::typing::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use crate::fw::geometry::Rect;
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(crate::run::setup);
@@ -1615,6 +1619,7 @@ mod tests {
     /// A new touch is hit-tested with its event, as UIKit's window does.
     #[test]
     fn new_touches_are_hit_tested_with_their_event() {
+        let _turn = crate::fw::typing::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(crate::run::setup);
         static EVENT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1779,6 +1784,7 @@ mod tests {
     /// (as UIKit's UIResponder default does).
     #[test]
     fn touches_reach_a_view_controllers_touches_began() {
+        let _turn = crate::fw::typing::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use crate::fw::geometry::Rect;
         use crate::fw::object::define_class;
         use crate::objc::runtime::Class;

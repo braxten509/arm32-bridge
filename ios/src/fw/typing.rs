@@ -17,7 +17,9 @@ use std::sync::Mutex;
 /// Placeholder text is light grey (UITextField's own colour).
 pub const PLACEHOLDER: [f64; 4] = [0.7, 0.7, 0.7, 1.0];
 
-/// Tests that edit text take turns (there is one first responder).
+/// Tests that edit text or deliver touches take turns (there is one first
+/// responder, and the touches held, the drags and the app-wide "ignoring
+/// touches" switch are shared).
 #[cfg(test)]
 pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
 
