@@ -411,7 +411,12 @@ fn make_instance(coder: Id, archive: &Archive, index: usize, class_name: &str) -
     // A reference back to this object while it reads its values gets this one.
     remember(coder, index, object);
     let Some(outer) = with_state(coder, |s| std::mem::replace(&mut s.current, index)) else { return 0 };
-    let result = if runtime::responds(object, "initWithCoder:") {
+    // A custom object (Interface Builder's plain "Object", UICustomObject)
+    // is made with -init, as UIClassSwapper does: its class needn't read nibs.
+    let custom = class_name == "UIClassSwapper" && archive.text_at(index, "UIOriginalClassName").as_deref() == Some("UICustomObject");
+    let result = if custom {
+        runtime::send(object, "init", &[])
+    } else if runtime::responds(object, "initWithCoder:") {
         runtime::send(object, "initWithCoder:", &[coder])
     } else {
         log_once(format!("UINib: {name} can't be read from a nib (no -initWithCoder:); made with -init"));
@@ -502,6 +507,14 @@ extern "C" fn decode_rect(this: Id, _: Sel, key: Id) -> Rect {
     }
 }
 
+/// UIEdgeInsets: top, left, bottom, right.
+extern "C" fn decode_insets(this: Id, _: Sel, key: Id) -> crate::fw::controls::Insets {
+    match fields_for(this, key)[..] {
+        [top, left, bottom, right, ..] => crate::fw::controls::Insets { top, left, bottom, right },
+        _ => crate::fw::controls::Insets::default(),
+    }
+}
+
 extern "C" fn contains_value(this: Id, _: Sel, key: Id) -> bool {
     value_for(this, key).is_some()
 }
@@ -564,7 +577,15 @@ fn set_outlet(object: Id, key: &str, value: Id) {
         return;
     }
     if runtime::responds(object, "setValue:forKey:") {
-        runtime::send(object, "setValue:forKey:", &[value, string::make(key)]);
+        // Apple raises for an outlet the object doesn't have; it is skipped here.
+        let (_, raised) = crate::fw::exception::catching(|| runtime::send(object, "setValue:forKey:", &[value, string::make(key)]));
+        if raised.is_some() {
+            let class_name = {
+                let rt = runtime::lock();
+                rt.class_name(rt.class_of(object))
+            };
+            log_once(format!("UINib: outlet {key} of {class_name} has no setter or field; not set"));
+        }
         return;
     }
     let mut letters = key.chars();
@@ -610,15 +631,100 @@ extern "C" fn event_connect(this: Id, _: Sel) {
     }
 }
 
+// ----- user-defined attributes: UINibKeyValuePair { isa, object, key path, value } -----
+
+fn pair_fields(this: Id) -> &'static mut [usize; 3] {
+    unsafe { &mut *((this + 8) as *mut [usize; 3]) }
+}
+
+extern "C" fn pair_init_with_coder(this: Id, _: Sel, coder: Id) -> Id {
+    let fields = ["UIObject", "UIKeyPath", "UIValue"].map(|key| runtime::send(coder, "decodeObjectForKey:", &[string::make(key)]));
+    *pair_fields(this) = fields;
+    this
+}
+
+/// [object setValue:value forKeyPath:keyPath]; Apple raises for a key the
+/// object doesn't have, which is noted here instead.
+extern "C" fn pair_apply(this: Id, _: Sel) {
+    let [object, key_path, value] = *pair_fields(this);
+    if object == 0 || key_path == 0 {
+        return;
+    }
+    let (_, raised) = crate::fw::exception::catching(|| runtime::send(object, "setValue:forKeyPath:", &[value, key_path]));
+    if raised.is_some() {
+        log_once(format!("UINib: attribute {} of {} can't be set", string::get(key_path), string::describe_class_of(object)));
+    }
+}
+
+// ----- accessibility settings: UIRuntimeAccessibilityConfiguration -----
+// { isa, object, label, hint, traits (an NSNumber), element (an NSNumber) }
+
+fn access_fields(this: Id) -> &'static mut [usize; 5] {
+    unsafe { &mut *((this + 8) as *mut [usize; 5]) }
+}
+
+extern "C" fn access_init_with_coder(this: Id, _: Sel, coder: Id) -> Id {
+    let keys = ["UIAccessibileObject", "UIAccessibilityLabel", "UIAccessibilityHint", "UIAccessibilityTraits", "UIAccessibilityElement"];
+    *access_fields(this) = keys.map(|key| runtime::send(coder, "decodeObjectForKey:", &[string::make(key)]));
+    this
+}
+
+extern "C" fn access_apply(this: Id, _: Sel) {
+    let [object, label, hint, traits, element] = *access_fields(this);
+    if object == 0 {
+        return;
+    }
+    for (value, setter) in [(label, "setAccessibilityLabel:"), (hint, "setAccessibilityHint:")] {
+        if value != 0 && runtime::responds(object, setter) {
+            runtime::send(object, setter, &[value]);
+        }
+    }
+    for (value, setter) in [(traits, "setAccessibilityTraits:"), (element, "setIsAccessibilityElement:")] {
+        if value != 0 && runtime::responds(object, setter) {
+            runtime::send(object, setter, &[collections::number_as_i64(value) as usize]);
+        }
+    }
+}
+
 // ----- UIImageNibPlaceholder: a picture named in the nib -----
 
 /// Gives the UIImage itself: from the app (as +imageNamed:) or the nib's
-/// own bundle.
+/// own bundle; a picture that isn't there is a blank one of the size the
+/// nib gives it (UIImageWidth x UIImageHeight), as UIKit's.
 extern "C" fn image_placeholder_init_with_coder(_this: Id, _: Sel, coder: Id) -> Id {
     let name = runtime::send(coder, "decodeObjectForKey:", &[string::make("UIResourceName")]);
     if name == 0 {
         return 0;
     }
+    match named_picture(coder, name) {
+        0 => {
+            let sel = runtime::sel("decodeFloatForKey:");
+            let side = |key: &str| match runtime::imp_for(coder, sel) {
+                Some(imp) => unsafe { std::mem::transmute::<usize, extern "C" fn(Id, Sel, Id) -> f32>(imp)(coder, sel, string::make(key)) as f64 },
+                None => 0.0,
+            };
+            blank_picture(Size { width: side("UIImageWidth"), height: side("UIImageHeight") })
+        }
+        picture => picture,
+    }
+}
+
+/// A see-through picture of `size` points (nil for an empty size).
+fn blank_picture(size: Size) -> Id {
+    if size.width < 1.0 || size.height < 1.0 {
+        return 0;
+    }
+    let cg = crate::fw::graphics::draw_picture(size, 1.0, Point::default(), || {});
+    if cg == 0 {
+        return 0;
+    }
+    let image = runtime::send(runtime::send(runtime::class_named("UIImage"), "alloc", &[]), "initWithCGImage:", &[cg]);
+    crate::fw::counted::release(cg);
+    image
+}
+
+/// The picture a nib names, from the app or the nib's bundle; nil if missing.
+fn named_picture(coder: Id, name: Id) -> Id {
     let bundle = with_state(coder, |s| s.bundle).unwrap_or(0);
     let folder = if bundle == 0 { String::new() } else { string::get(runtime::send(bundle, "bundlePath", &[])) };
     let image_class = runtime::class_named("UIImage");
@@ -656,9 +762,18 @@ fn nib_file(nib: Id) -> Option<&'static NibFile> {
 }
 
 fn set_nib_file(nib: Id, archive: Archive, bundle: Id) -> Id {
-    unsafe { *((nib + 8) as *mut *const NibFile) = Box::into_raw(Box::new(NibFile { archive: Arc::new(archive), bundle })) };
+    set_shared_nib_file(nib, Arc::new(archive), bundle)
+}
+
+fn set_shared_nib_file(nib: Id, archive: Arc<Archive>, bundle: Id) -> Id {
+    unsafe { *((nib + 8) as *mut *const NibFile) = Box::into_raw(Box::new(NibFile { archive, bundle })) };
     nib
 }
+
+/// The nib files read so far (bundle folder, name -> the archive): an app's
+/// files don't change, and a game may load the same nib for every card on
+/// screen, so each is read from the disk and parsed once.
+static READ_NIBS: Mutex<Option<std::collections::HashMap<(String, String), Arc<Archive>>>> = Mutex::new(None);
 
 fn nib_from_bytes(bytes: &[u8], bundle: Id, place: &str) -> Id {
     match parse(bytes) {
@@ -712,10 +827,23 @@ extern "C" fn nib_with_name(_: Class, _: Sel, name: Id, bundle: Id) -> Id {
     let bundle = if bundle == 0 { runtime::send(runtime::class_named("NSBundle"), "mainBundle", &[]) } else { bundle };
     let folder = string::get(runtime::send(bundle, "bundlePath", &[]));
     let name = string::get(name);
-    match find_nib(&folder, &name) {
-        Some((path, bytes)) => nib_from_bytes(&bytes, bundle, &path),
-        None => {
-            crate::log!("UINib: no nib named {name} in {folder}");
+    let key = (folder.clone(), name.clone());
+    let known = READ_NIBS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).get(&key).cloned();
+    if let Some(archive) = known {
+        return set_shared_nib_file(runtime::alloc_instance(runtime::class_named("UINib")), archive, bundle);
+    }
+    let Some((path, bytes)) = find_nib(&folder, &name) else {
+        crate::log!("UINib: no nib named {name} in {folder}");
+        return 0;
+    };
+    match parse(&bytes) {
+        Ok(archive) => {
+            let archive = Arc::new(archive);
+            READ_NIBS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(key, archive.clone());
+            set_shared_nib_file(runtime::alloc_instance(runtime::class_named("UINib")), archive, bundle)
+        }
+        Err(error) => {
+            crate::log!("UINib: {path} can't be read: {error}");
             0
         }
     }
@@ -738,19 +866,27 @@ extern "C" fn nib_init_with_coder(this: Id, _: Sel, coder: Id) -> Id {
     }
 }
 
-/// Makes the nib's objects: placeholders resolved, outlets and actions
-/// connected, then -awakeFromNib to each object; gives the top-level objects.
+/// Makes the nib's objects in UIKit's order (the connections' first, then
+/// the top-level ones, the visible windows, the rest, the accessibility
+/// settings and the user-defined attributes), placeholders resolved; then
+/// the accessibility settings and attributes are applied, outlets and
+/// actions connected, and -awakeFromNib sent to each object; gives the
+/// top-level objects.
 fn instantiate(file: &NibFile, owner: Id, options: Id) -> Id {
     let externals = if options == 0 { 0 } else { runtime::send(options, "objectForKey:", &[string::make("UINibExternalObjects")]) };
     let coder = new_coder(file.archive.clone(), file.bundle, owner, externals);
     let root = |key: &str| collections::array_items(decode_object(coder, 0, string::make(key)));
-    let objects = root("UINibObjectsKey");
-    let top = root("UINibTopLevelObjectsKey");
     let connections = root("UINibConnectionsKey");
+    let top = root("UINibTopLevelObjectsKey");
     let windows = root("UINibVisibleWindowsKey");
-    for connection in connections {
-        if runtime::responds(connection, "connect") {
-            runtime::send(connection, "connect", &[]);
+    let objects = root("UINibObjectsKey");
+    let accessibility = root("UINibAccessibilityConfigurationsKey");
+    let attributes = root("UINibKeyValuePairsKey");
+    for (list, message) in [(&accessibility, "applyConfiguration"), (&attributes, "apply"), (&connections, "connect")] {
+        for &item in list.iter() {
+            if item != 0 && runtime::responds(item, message) {
+                runtime::send(item, message, &[]);
+            }
         }
     }
     let placeholders = with_state(coder, |s| s.placeholders.clone()).unwrap_or_default();
@@ -797,6 +933,43 @@ extern "C" fn bundle_load_nib(this: Id, _: Sel, name: Id, owner: Id, options: Id
     nib_instantiate(nib, 0, owner, options)
 }
 
+// ----- the main nib (UIApplicationMain) -----
+
+/// The nib an app starts from: Info.plist NSMainNibFile, its variant for
+/// this kind of device first.
+pub fn main_nib_name(info: &crate::fw::plist::Value, tablet: bool) -> Option<String> {
+    let variant = if tablet { "NSMainNibFile~ipad" } else { "NSMainNibFile~iphone" };
+    [variant, "NSMainNibFile"].into_iter().find_map(|key| match info.get(key) {
+        Some(crate::fw::plist::Value::String(name)) if !name.is_empty() => Some(name.clone()),
+        _ => None,
+    })
+}
+
+/// What UIApplicationMain does with the main nib before the app's launch
+/// code: loads it with the app object as its owner, so its outlets set the
+/// app's delegate (and the delegate's window). Its top-level objects are
+/// kept for the whole run, as UIKit keeps them; 0 when there is none.
+pub fn load_main_nib_from(info: &crate::fw::plist::Value, bundle: Id, app: Id, tablet: bool) -> Id {
+    let Some(name) = main_nib_name(info, tablet) else { return 0 };
+    let top = runtime::send(bundle, "loadNibNamed:owner:options:", &[string::make(&name), app, 0]);
+    if top == 0 {
+        crate::log!("main nib {name}: can't be opened");
+        return 0;
+    }
+    crate::log!("main nib {name}: {} objects", collections::array_items(top).len());
+    runtime::send(top, "retain", &[])
+}
+
+/// The main nib of the running app (its Info.plist).
+pub fn load_main_nib(app: Id) -> Id {
+    let Some(app_dir) = crate::loader::try_app_dir() else { return 0 };
+    let Some(info) = std::fs::read(format!("{app_dir}/Info.plist")).ok().and_then(|bytes| crate::fw::plist::parse(&bytes)) else {
+        return 0;
+    };
+    let tablet = crate::libsystem::io::device_model().starts_with("iPad");
+    load_main_nib_from(&info, runtime::send(runtime::class_named("NSBundle"), "mainBundle", &[]), app, tablet)
+}
+
 pub fn register(_: &mut Registry) {
     if runtime::class_named("NSCoder") == 0 {
         define_class("NSCoder", "NSObject", 8);
@@ -816,6 +989,7 @@ pub fn register(_: &mut Registry) {
             ("decodeCGPointForKey:", decode_point as usize),
             ("decodeCGSizeForKey:", decode_size as usize),
             ("decodeCGRectForKey:", decode_rect as usize),
+            ("decodeUIEdgeInsetsForKey:", decode_insets as usize),
             ("containsValueForKey:", contains_value as usize),
             ("decodeBytesForKey:returnedLength:", decode_bytes as usize),
             ("allowsKeyedCoding", allows_keyed_coding as usize),
@@ -836,8 +1010,12 @@ pub fn register(_: &mut Registry) {
     methods(outlet, &[("connect", outlet_connect as usize)]);
     let event = define_class("UIRuntimeEventConnection", "UIRuntimeConnection", 40);
     methods(event, &[("connect", event_connect as usize), ("eventMask", connection_event_mask as usize)]);
+    let pair = define_class("UINibKeyValuePair", "NSObject", 32);
+    methods(pair, &[("initWithCoder:", pair_init_with_coder as usize), ("apply", pair_apply as usize)]);
+    let access = define_class("UIRuntimeAccessibilityConfiguration", "NSObject", 48);
+    methods(access, &[("initWithCoder:", access_init_with_coder as usize), ("applyConfiguration", access_apply as usize)]);
 
-    let image_placeholder = define_class("UIImageNibPlaceholder", "NSObject", 8);
+    let image_placeholder = define_class("UIImageNibPlaceholder", "UIImage", 16);
     methods(image_placeholder, &[("initWithCoder:", image_placeholder_init_with_coder as usize)]);
 
     let nib = define_class("UINib", "NSObject", 16);
@@ -1103,47 +1281,229 @@ mod tests {
         assert!(parse(&b.bytes()).is_err(), "a reference past the last object is refused");
     }
 
-    const VIEW_CONTROLLER_NIB: &[u8] = include_bytes!("../../tests/data/UIViewController-cD2-js-hwE.nib");
-    const VIEW_NIB: &[u8] = include_bytes!("../../tests/data/cD2-js-hwE-view-QKQ-Dp-xpW.nib");
-
     fn text_of(archive: &Archive, value: Option<&Value>) -> String {
         let Some(&Value::Object(index)) = value else { panic!("not an object: {value:?}") };
         let Some(Value::Data(bytes)) = archive.value(index, "NS.bytes") else { panic!("not a string") };
         String::from_utf8(bytes.clone()).unwrap()
     }
 
-    /// A storyboard's view controller nib from Dungeon Plunder.
+    /// A made-up storyboard scene nib shaped like the ones Xcode writes: the
+    /// controller as a UIClassSwapper (with its view nib's name and the
+    /// table of objects the view nib may refer to), placeholders for the
+    /// scene, the first responder and the storyboard, and two outlets.
+    fn scene_controller_nib() -> Vec<u8> {
+        let mut b = Builder::new();
+        let class_name = b.string("NibTestSceneController");
+        let original = b.string("UIViewController");
+        let view_nib = b.string("Scene-1-view-2");
+        let upstream = b.string("UpstreamPlaceholder-1");
+        let controller = b.objects.len() + 1;
+        let table = b.list("NSDictionary", &[upstream, controller]);
+        let swapped = b.object(
+            "UIClassSwapper",
+            vec![
+                ("UIExternalObjectsTableForViewLoading", Put::Ref(table)),
+                ("UINibName", Put::Ref(view_nib)),
+                ("UIWantsFullScreenLayout", Put::True),
+                ("UIClassName", Put::Ref(class_name)),
+                ("UIOriginalClassName", Put::Ref(original)),
+            ],
+        );
+        assert_eq!(swapped, controller);
+        let owner = b.proxy("IBFilesOwner");
+        let responder = b.proxy("IBFirstResponder");
+        let storyboard = b.proxy("UIStoryboardPlaceholder");
+        let storyboard_label = b.string("storyboard");
+        let scene_label = b.string("sceneViewController");
+        let outlet = |b: &mut Builder, label: usize, source: usize, destination: usize| {
+            b.object(
+                "UIRuntimeOutletConnection",
+                vec![("UILabel", Put::Ref(label)), ("UISource", Put::Ref(source)), ("UIDestination", Put::Ref(destination))],
+            )
+        };
+        let to_storyboard = outlet(&mut b, storyboard_label, controller, storyboard);
+        let to_scene = outlet(&mut b, scene_label, owner, controller);
+        b.standard_root(&[controller, responder, owner, storyboard], &[controller, responder, owner, storyboard], &[to_storyboard, to_scene]);
+        b.bytes()
+    }
+
+    /// A made-up view nib shaped like a storyboard scene's view: a view with
+    /// subviews (a label, a picture, a button whose per-state content is a
+    /// nested dictionary), fonts, colors, struct values, outlets and an action.
+    fn scene_view_nib() -> Vec<u8> {
+        let mut b = Builder::new();
+        let owner = b.proxy("IBFilesOwner");
+        let responder = b.proxy("IBFirstResponder");
+        let helvetica = b.string("Helvetica-Bold");
+        let font = b.object(
+            "UIFont",
+            vec![
+                ("UIFontName", Put::Ref(helvetica)),
+                ("UIFontPointSize", Put::F64(15.0)),
+                ("UIFontTraits", Put::I8(2)),
+                ("UISystemFont", Put::True),
+            ],
+        );
+        let white = b.object(
+            "UIColor",
+            vec![
+                ("UIColorComponentCount", Put::I8(4)),
+                ("UIRed", Put::F32(1.0)),
+                ("UIGreen", Put::F32(1.0)),
+                ("UIBlue", Put::F32(1.0)),
+                ("UIAlpha", Put::F32(1.0)),
+                ("NSRGB", Put::Data(b"1 1 1".to_vec())),
+                ("NSColorSpace", Put::I8(2)),
+            ],
+        );
+        let text = b.object("NSMutableString", vec![("NS.bytes", Put::Data(b"Some words".to_vec()))]);
+        let label = b.object(
+            "UILabel",
+            vec![
+                ("UIBounds", Put::Data(floats(6, &[0.0, 0.0, 440.0, 236.0]))),
+                ("UICenter", Put::Data(floats(6, &[240.0, 118.0]))),
+                ("UIAutoresizingMask", Put::I8(39)),
+                ("UIText", Put::Ref(text)),
+                ("UIFont", Put::Ref(font)),
+                ("UITextColor", Put::Ref(white)),
+                ("UIShadowOffset", Put::Data(floats(6, &[0.0, -1.0]))),
+                ("UINumberOfLines", Put::I8(0)),
+                ("UIMinimumScaleFactor", Put::F32(0.5)),
+            ],
+        );
+        let picture_name = b.string("made-up-picture.png");
+        let picture = b.object(
+            "UIImageNibPlaceholder",
+            vec![("UIImageWidth", Put::F32(1.0)), ("UIImageHeight", Put::F32(1.0)), ("UIResourceName", Put::Ref(picture_name))],
+        );
+        let image_view = b.object(
+            "UIImageView",
+            vec![
+                ("UIBounds", Put::Data(floats(6, &[0.0, 0.0, 26.0, 23.0]))),
+                ("UICenter", Put::Data(floats(6, &[183.0, 215.5]))),
+                ("UIAlpha", Put::F32(0.8)),
+                ("UIImage", Put::Ref(picture)),
+            ],
+        );
+        let normal_state = b.object("NSNumber", vec![("NS.intval", Put::I8(0))]);
+        let title = b.string("Done");
+        let content = b.object("UIButtonContent", vec![("UITitle", Put::Ref(title)), ("UITitleColor", Put::Ref(white))]);
+        let states = b.list("NSMutableDictionary", &[normal_state, content]);
+        let button = b.object(
+            "UIButton",
+            vec![
+                ("UIBounds", Put::Data(floats(6, &[0.0, 0.0, 83.0, 38.0]))),
+                ("UICenter", Put::Data(floats(6, &[240.5, 295.0]))),
+                ("UIButtonStatefulContent", Put::Ref(states)),
+                ("UIFont", Put::Ref(font)),
+                ("UITitleShadowOffset", Put::Data(floats(6, &[1.0, 1.0]))),
+            ],
+        );
+        let subviews = b.list("NSMutableArray", &[label, image_view, button]);
+        let view = b.object(
+            "UIView",
+            vec![
+                ("UIBounds", Put::Data(floats(6, &[0.0, 0.0, 480.0, 320.0]))),
+                ("UICenter", Put::Data(floats(6, &[240.0, 160.0]))),
+                ("UISubviews", Put::Ref(subviews)),
+                ("UIBackgroundColor", Put::Ref(white)),
+                ("UIOpaque", Put::True),
+                ("UIAutoresizingMask", Put::I8(36)),
+            ],
+        );
+        let view_label = b.string("view");
+        let text_label = b.string("textLabel");
+        let done = b.string("done:");
+        let mut connections = Vec::new();
+        for (label_name, destination) in [(view_label, view), (text_label, label)] {
+            connections.push(b.object(
+                "UIRuntimeOutletConnection",
+                vec![("UILabel", Put::Ref(label_name)), ("UISource", Put::Ref(owner)), ("UIDestination", Put::Ref(destination))],
+            ));
+        }
+        connections.push(b.object(
+            "UIRuntimeEventConnection",
+            vec![
+                ("UILabel", Put::Ref(done)),
+                ("UISource", Put::Ref(button)),
+                ("UIDestination", Put::Ref(owner)),
+                ("UIEventMask", Put::I8(64)),
+            ],
+        ));
+        b.standard_root(&[view, owner, responder, label, image_view, button], &[view, owner, responder], &connections);
+        b.bytes()
+    }
+
     #[test]
-    fn nib_reader_reads_a_real_view_controller_nib() {
-        let archive = parse(VIEW_CONTROLLER_NIB).expect("real nib reads");
-        assert_eq!(archive.objects.len(), 22);
-        assert_eq!(archive.classes.len(), 7);
+    fn nib_reader_reads_a_scene_controller_nib() {
+        let archive = parse(&scene_controller_nib()).expect("scene nib reads");
         for key in ["UINibTopLevelObjectsKey", "UINibObjectsKey", "UINibConnectionsKey", "UINibVisibleWindowsKey"] {
             assert!(matches!(archive.value(0, key), Some(Value::Object(_))), "root has {key}");
         }
-        assert_eq!(archive.class_name(2), "UIClassSwapper");
-        assert_eq!(text_of(&archive, archive.value(2, "UIClassName")), "HardcoreDeathViewController");
-        assert_eq!(text_of(&archive, archive.value(2, "UIOriginalClassName")), "UIViewController");
-        assert_eq!(text_of(&archive, archive.value(2, "UINibName")), "cD2-js-hwE-view-QKQ-Dp-xpW");
+        let Some(&Value::Object(top)) = archive.value(0, "UINibTopLevelObjectsKey") else { unreachable!() };
+        let controller = archive.items(top)[0];
+        assert_eq!(archive.class_name(controller), "UIClassSwapper");
+        assert_eq!(text_of(&archive, archive.value(controller, "UIClassName")), "NibTestSceneController");
+        assert_eq!(text_of(&archive, archive.value(controller, "UIOriginalClassName")), "UIViewController");
+        assert_eq!(text_of(&archive, archive.value(controller, "UINibName")), "Scene-1-view-2");
+        assert_eq!(archive.value(controller, "UIWantsFullScreenLayout"), Some(&Value::Bool(true)));
+        // The table refers back to the controller itself.
+        let Some(&Value::Object(table)) = archive.value(controller, "UIExternalObjectsTableForViewLoading") else { unreachable!() };
+        assert_eq!(archive.items(table)[1], controller);
     }
 
-    /// Its view nib: positions and sizes are data with 32-bit floats.
+    /// Positions and sizes are data with 32-bit floats.
     #[test]
-    fn nib_reader_reads_a_real_view_nib() {
-        let archive = parse(VIEW_NIB).expect("real nib reads");
-        assert_eq!(archive.objects.len(), 94);
-        assert_eq!(archive.class_name(71), "UIView");
+    fn nib_reader_reads_a_scene_view_nib() {
+        let archive = parse(&scene_view_nib()).expect("view nib reads");
+        let Some(&Value::Object(top)) = archive.value(0, "UINibTopLevelObjectsKey") else { unreachable!() };
+        let view = archive.items(top)[0];
+        assert_eq!(archive.class_name(view), "UIView");
         let fields = |object: usize, key: &str| match archive.value(object, key) {
             Some(Value::Data(bytes)) => struct_fields(bytes).unwrap(),
             other => panic!("{key} is {other:?}"),
         };
-        assert_eq!(fields(71, "UIBounds"), [0.0, 0.0, 480.0, 320.0]);
-        assert_eq!(fields(71, "UICenter"), [240.0, 160.0]);
-        assert_eq!(archive.class_name(52), "UILabel");
-        assert_eq!(fields(52, "UIShadowOffset"), [0.0, -1.0]);
-        assert_eq!(archive.value(50, "UIAlpha"), Some(&Value::Float(0.8)));
-        assert_eq!(archive.value(71, "UIAutoresizingMask"), Some(&Value::Integer(36)));
-        assert_eq!(archive.value(28, "UIFontPointSize"), Some(&Value::Double(15.0)));
+        assert_eq!(fields(view, "UIBounds"), [0.0, 0.0, 480.0, 320.0]);
+        assert_eq!(fields(view, "UICenter"), [240.0, 160.0]);
+        assert_eq!(archive.value(view, "UIAutoresizingMask"), Some(&Value::Integer(36)));
+        let Some(&Value::Object(subviews)) = archive.value(view, "UISubviews") else { unreachable!() };
+        let [label, image_view, button] = archive.items(subviews)[..] else { panic!("three subviews") };
+        assert_eq!(archive.class_name(label), "UILabel");
+        assert_eq!(fields(label, "UIShadowOffset"), [0.0, -1.0]);
+        assert_eq!(text_of(&archive, archive.value(label, "UIText")), "Some words");
+        let Some(&Value::Object(font)) = archive.value(label, "UIFont") else { unreachable!() };
+        assert_eq!(archive.value(font, "UIFontPointSize"), Some(&Value::Double(15.0)));
+        assert_eq!(archive.value(image_view, "UIAlpha"), Some(&Value::Float(0.8)));
+        let Some(&Value::Object(picture)) = archive.value(image_view, "UIImage") else { unreachable!() };
+        assert_eq!(archive.class_name(picture), "UIImageNibPlaceholder");
+        let Some(&Value::Object(states)) = archive.value(button, "UIButtonStatefulContent") else { unreachable!() };
+        let [state, content] = archive.items(states)[..] else { panic!("one state and its content") };
+        assert_eq!(archive.value(state, "NS.intval"), Some(&Value::Integer(0)));
+        assert_eq!(text_of(&archive, archive.value(content, "UITitle")), "Done");
+    }
+
+    /// The game's own storyboard nibs, when a copy of the game is on this
+    /// computer (nothing from it is kept in the repository): every one reads,
+    /// with the root keys, and every struct value has whole fields.
+    #[test]
+    fn nib_reader_reads_the_local_game_nibs_when_present() {
+        let folder = "/home/braxtenchenay/.cache/ipa-inspect/dungeon-plunder/Payload/Dungeon Plunder.app/en.lproj/MainStoryboard_iPhone.storyboardc";
+        let Ok(entries) = std::fs::read_dir(folder) else {
+            eprintln!("skipped: no game folder at {folder}");
+            return;
+        };
+        let mut read = 0;
+        for path in entries.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|e| e == "nib")) {
+            let archive = parse(&std::fs::read(&path).unwrap()).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            assert!(matches!(archive.value(0, "UINibObjectsKey"), Some(Value::Object(_))), "{}", path.display());
+            for (key, value) in (0..archive.objects.len()).flat_map(|o| archive.entries(o).collect::<Vec<_>>()) {
+                if let (true, Value::Data(bytes)) = (["UIBounds", "UICenter", "UIShadowOffset"].contains(&key), value) {
+                    assert!(struct_fields(bytes).is_some(), "{}: {key}", path.display());
+                }
+            }
+            read += 1;
+        }
+        assert!(read > 0, "the game folder has nibs");
     }
 
     // ----- test classes that record what they decoded -----
@@ -1250,6 +1610,19 @@ mod tests {
         change(this, |r| r.targets.push((target, name, events)));
     }
 
+    /// How the NibTestOrdered objects were made, in order.
+    static MADE: Mutex<Vec<(Id, &'static str)>> = Mutex::new(Vec::new());
+
+    extern "C" fn ordered_init_with_coder(this: Id, _: Sel, _coder: Id) -> Id {
+        MADE.lock().unwrap().push((this, "initWithCoder:"));
+        this
+    }
+
+    extern "C" fn ordered_init(this: Id, _: Sel) -> Id {
+        MADE.lock().unwrap().push((this, "init"));
+        this
+    }
+
     /// An object with a field named `_extra` and no setter for it.
     fn fielded_class() -> Class {
         let class = object::define_class("NibTestFielded", "NSObject", 24);
@@ -1280,14 +1653,26 @@ mod tests {
                 ],
             );
             object::define_class("NibTestRecorderChild", "NibTestRecorder", 16);
-            // The real nib's controller class, made here as a recorder.
-            object::define_class("HardcoreDeathViewController", "NibTestRecorder", 16);
+            // The app object a main nib is loaded with: its delegate is the partner.
+            let app = object::define_class("NibTestApp", "NSObject", 16);
+            object::methods(app, &[("setDelegate:", recorder_set_partner as usize)]);
+            // The scene nib's controller class, made here as a recorder.
+            object::define_class("NibTestSceneController", "NibTestRecorder", 16);
             let owner = object::define_class("NibTestOwner", "NSObject", 16);
             object::methods(
                 owner,
                 &[("setThing:", recorder_set_thing as usize), ("setSceneViewController:", recorder_set_partner as usize)],
             );
-            object::methods(runtime::class_named("HardcoreDeathViewController"), &[("setStoryboard:", recorder_set_thing as usize)]);
+            object::methods(runtime::class_named("NibTestSceneController"), &[("setStoryboard:", recorder_set_thing as usize)]);
+            let ordered = object::define_class("NibTestOrdered", "NSObject", 16);
+            object::methods(
+                ordered,
+                &[
+                    ("initWithCoder:", ordered_init_with_coder as usize),
+                    ("init", ordered_init as usize),
+                    ("setPartner:", recorder_set_partner as usize),
+                ],
+            );
             fielded_class();
         });
     }
@@ -1453,6 +1838,96 @@ mod tests {
         assert_eq!(record(outside).awake_order, 0);
     }
 
+    /// As UIKit reads a nib: the connections' objects are made first, then
+    /// the top-level ones, then the rest; a custom object (a UIClassSwapper
+    /// of UICustomObject) is made with -init; then the accessibility settings
+    /// and the user-defined attributes (UINibKeyValuePair) are applied.
+    #[test]
+    fn nib_objects_are_made_in_uikits_order_and_get_their_settings() {
+        test_classes();
+        let mut b = Builder::new();
+        let owner = b.proxy("IBFilesOwner");
+        let plain = b.object("NibTestOrdered", vec![]);
+        let connected = b.object("NibTestOrdered", vec![]);
+        let class_name = b.string("NibTestOrdered");
+        let original = b.string("UICustomObject");
+        let custom = b.object("UIClassSwapper", vec![("UIClassName", Put::Ref(class_name)), ("UIOriginalClassName", Put::Ref(original))]);
+        let thing = b.string("thing");
+        let outlet = b.object(
+            "UIRuntimeOutletConnection",
+            vec![("UILabel", Put::Ref(thing)), ("UISource", Put::Ref(owner)), ("UIDestination", Put::Ref(connected))],
+        );
+        let (path, value) = (b.string("partner"), b.string("hello"));
+        let pair = b.object("UINibKeyValuePair", vec![("UIObject", Put::Ref(plain)), ("UIKeyPath", Put::Ref(path)), ("UIValue", Put::Ref(value))]);
+        let label = b.string("Close");
+        let access = b.object("UIRuntimeAccessibilityConfiguration", vec![("UIAccessibileObject", Put::Ref(plain)), ("UIAccessibilityLabel", Put::Ref(label))]);
+        let lists = [
+            ("UINibObjectsKey", b.list("NSArray", &[owner, plain, connected, custom])),
+            ("UINibTopLevelObjectsKey", b.list("NSArray", &[plain, custom])),
+            ("UINibConnectionsKey", b.list("NSArray", &[outlet])),
+            ("UINibVisibleWindowsKey", b.list("NSArray", &[])),
+            ("UINibKeyValuePairsKey", b.list("NSArray", &[pair])),
+            ("UINibAccessibilityConfigurationsKey", b.list("NSArray", &[access])),
+        ];
+        b.root(lists.iter().map(|&(key, list)| (key, Put::Ref(list))).collect());
+        MADE.lock().unwrap().clear();
+        let nib_owner = new_object("NibTestOwner");
+        let top = collections::array_items(runtime::send(nib_from(&b.bytes()), "instantiateWithOwner:options:", &[nib_owner, 0]));
+        assert_eq!(top.len(), 2);
+        let made_connected = record(nib_owner).thing;
+        let made: Vec<(Id, &str)> = MADE.lock().unwrap().clone();
+        assert_eq!(made, [(made_connected, "initWithCoder:"), (top[0], "initWithCoder:"), (top[1], "init")]);
+        let set = record(top[0]).partner;
+        assert_eq!(if set == 0 { String::new() } else { string::get(set) }, "hello", "the user-defined attribute was set");
+        assert_eq!(string::get(runtime::send(top[0], "accessibilityLabel", &[])), "Close");
+    }
+
+    /// A button's edge insets as the nib file keeps them (a struct of four
+    /// 32-bit floats: top, left, bottom, right; the values are SpellCraft's
+    /// SCSlotMachineView and SCCardView ones) reach the button through the
+    /// real coder's -decodeUIEdgeInsetsForKey:.
+    #[test]
+    fn nib_button_insets_are_read_from_the_archive() {
+        test_classes();
+        use crate::fw::controls::Insets;
+        let mut b = Builder::new();
+        let button = b.object(
+            "UIButton",
+            vec![
+                ("UIContentEdgeInsets", Put::Data(floats(6, &[15.0, 0.0, 0.0, 0.0]))),
+                ("UIImageEdgeInsets", Put::Data(floats(6, &[11.0, 13.0, 91.0, 13.0]))),
+            ],
+        );
+        b.standard_root(&[button], &[button], &[]);
+        let top = collections::array_items(runtime::send(nib_from(&b.bytes()), "instantiateWithOwner:options:", &[0, 0]));
+        let insets = |name: &str| {
+            let sel = runtime::sel(name);
+            let imp = runtime::imp_for(top[0], sel).unwrap();
+            unsafe { std::mem::transmute::<usize, extern "C" fn(Id, Sel) -> Insets>(imp)(top[0], sel) }
+        };
+        assert_eq!(insets("contentEdgeInsets"), Insets { top: 15.0, left: 0.0, bottom: 0.0, right: 0.0 });
+        assert_eq!(insets("imageEdgeInsets"), Insets { top: 11.0, left: 13.0, bottom: 91.0, right: 13.0 });
+    }
+
+    /// The nib files of an app don't change: one is read and parsed once,
+    /// however often it is loaded (a game loads a card's nib for every card).
+    #[test]
+    fn nib_files_are_read_once() {
+        test_classes();
+        let folder = std::env::temp_dir().join(format!("gamebridge-nib-once-{}", std::process::id()));
+        let app = folder.join("Game.app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("Card.nib"), small_nib(7)).unwrap();
+        let bundle = runtime::send(runtime::class_named("NSBundle"), "bundleWithPath:", &[string::make(&app.to_string_lossy())]);
+        let load = || runtime::send(runtime::class_named("UINib"), "nibWithNibName:bundle:", &[string::make("Card"), bundle]);
+        assert_ne!(load(), 0);
+        std::fs::remove_dir_all(&folder).unwrap();
+        let again = load();
+        assert_ne!(again, 0, "the second load is not read from the disk");
+        let top = collections::array_items(runtime::send(again, "instantiateWithOwner:options:", &[0, 0]));
+        assert_eq!(record(top[0]).count, 7);
+    }
+
     /// An outlet with no setter writes the object's field `_name`.
     #[test]
     fn nib_outlet_without_a_setter_sets_the_field() {
@@ -1471,22 +1946,209 @@ mod tests {
         assert_eq!(unsafe { *((top[0] + 16) as *const Id) }, top[1]);
     }
 
-    /// The real view controller nib, with its placeholders given as a
+    /// A storyboard scene's controller nib, with its placeholders given as a
     /// storyboard gives them.
     #[test]
-    fn nib_instantiates_the_real_view_controller_nib() {
+    fn nib_instantiates_a_scene_controller_nib() {
         test_classes();
         let scene = new_object("NibTestOwner");
         let storyboard = new_object("NibTestRecorder");
         let externals = collections::dictionary_from(&[(string::make("UIStoryboardPlaceholder"), storyboard)]);
         let options = collections::dictionary_from(&[(string::make("UINibExternalObjects"), externals)]);
-        let top = collections::array_items(runtime::send(nib_from(VIEW_CONTROLLER_NIB), "instantiateWithOwner:options:", &[scene, options]));
+        let top = collections::array_items(runtime::send(nib_from(&scene_controller_nib()), "instantiateWithOwner:options:", &[scene, options]));
         assert_eq!(top.len(), 1, "one controller; the placeholders are left out");
         let controller = top[0];
-        assert_eq!(class_of(controller), "HardcoreDeathViewController");
+        assert_eq!(class_of(controller), "NibTestSceneController");
         assert_eq!(record(controller).thing, storyboard, "-setStoryboard: got the placeholder's object");
         assert_eq!(record(scene).partner, controller, "-setSceneViewController: on the owner");
         assert_ne!(record(controller).awake_order, 0);
+    }
+
+    // ----- a whole storyboard, through UIStoryboard (fw/storyboard.rs) and this reader -----
+
+    /// A scene's controller nib: a UIClassSwapper of `class` with its view
+    /// nib's name and segue templates, as Xcode writes one.
+    fn storyboard_scene(class: &str, view_nib: &str, segues: &[(&str, &str)]) -> Vec<u8> {
+        let mut b = Builder::new();
+        let owner = b.proxy("IBFilesOwner");
+        let storyboard = b.proxy("UIStoryboardPlaceholder");
+        let class_name = b.string(class);
+        let original = b.string("UIViewController");
+        let view_name = b.string(view_nib);
+        let mut templates = Vec::new();
+        for (identifier, destination) in segues {
+            let identifier = b.string(identifier);
+            let destination = b.string(destination);
+            templates.push(b.object(
+                "UIStoryboardModalSegueTemplate",
+                vec![("UIIdentifier", Put::Ref(identifier)), ("UIDestinationViewControllerIdentifier", Put::Ref(destination))],
+            ));
+        }
+        let template_list = b.list("NSArray", &templates);
+        let controller = b.object(
+            "UIClassSwapper",
+            vec![
+                ("UINibName", Put::Ref(view_name)),
+                ("UIStoryboardSegueTemplates", Put::Ref(template_list)),
+                ("UIClassName", Put::Ref(class_name)),
+                ("UIOriginalClassName", Put::Ref(original)),
+            ],
+        );
+        let outlet = |b: &mut Builder, label: &str, source: usize, destination: usize| {
+            let label = b.string(label);
+            b.object(
+                "UIRuntimeOutletConnection",
+                vec![("UILabel", Put::Ref(label)), ("UISource", Put::Ref(source)), ("UIDestination", Put::Ref(destination))],
+            )
+        };
+        let mut connections = vec![outlet(&mut b, "storyboard", controller, storyboard), outlet(&mut b, "sceneViewController", owner, controller)];
+        for &template in &templates {
+            connections.push(outlet(&mut b, "viewController", template, controller));
+        }
+        let mut objects = vec![controller, owner, storyboard];
+        objects.extend(&templates);
+        b.standard_root(&objects, &[controller, owner, storyboard], &connections);
+        b.bytes()
+    }
+
+    /// A scene's view nib: a view holding a label and a button; outlets for
+    /// the view and the label, the button's action to the controller.
+    fn storyboard_view() -> Vec<u8> {
+        let mut b = Builder::new();
+        let owner = b.proxy("IBFilesOwner");
+        let red = b.object(
+            "UIColor",
+            vec![
+                ("UIColorComponentCount", Put::I8(4)),
+                ("UIRed", Put::F32(1.0)),
+                ("UIGreen", Put::F32(0.25)),
+                ("UIBlue", Put::F32(0.0)),
+                ("UIAlpha", Put::F32(1.0)),
+            ],
+        );
+        let font_name = b.string("Helvetica");
+        let font = b.object("UIFont", vec![("UIFontName", Put::Ref(font_name)), ("UIFontPointSize", Put::F64(17.0))]);
+        let text = b.object("NSMutableString", vec![("NS.bytes", Put::Data(b"Select your hero".to_vec()))]);
+        let label = b.object(
+            "UILabel",
+            vec![
+                ("UIBounds", Put::Data(floats(6, &[0.0, 0.0, 200.0, 30.0]))),
+                ("UICenter", Put::Data(floats(6, &[240.0, 40.0]))),
+                ("UIText", Put::Ref(text)),
+                ("UIFont", Put::Ref(font)),
+                ("UITextColor", Put::Ref(red)),
+                ("UIShadowOffset", Put::Data(floats(6, &[0.0, -1.0]))),
+            ],
+        );
+        let normal = b.object("NSNumber", vec![("NS.intval", Put::I8(0))]);
+        let title = b.string("Play");
+        let content = b.object("UIButtonContent", vec![("UITitle", Put::Ref(title))]);
+        let states = b.list("NSMutableDictionary", &[normal, content]);
+        let button = b.object(
+            "UIButton",
+            vec![
+                ("UIBounds", Put::Data(floats(6, &[0.0, 0.0, 100.0, 40.0]))),
+                ("UICenter", Put::Data(floats(6, &[240.0, 280.0]))),
+                ("UIButtonStatefulContent", Put::Ref(states)),
+                ("UITitleShadowOffset", Put::Data(floats(6, &[1.0, 1.0]))),
+            ],
+        );
+        let subviews = b.list("NSMutableArray", &[label, button]);
+        let view = b.object(
+            "UIView",
+            vec![
+                ("UIBounds", Put::Data(floats(6, &[0.0, 0.0, 480.0, 320.0]))),
+                ("UICenter", Put::Data(floats(6, &[240.0, 160.0]))),
+                ("UISubviews", Put::Ref(subviews)),
+                ("UIBackgroundColor", Put::Ref(red)),
+            ],
+        );
+        let mut connections = Vec::new();
+        for (name, destination) in [("view", view), ("titleLabel", label)] {
+            let name = b.string(name);
+            connections.push(b.object(
+                "UIRuntimeOutletConnection",
+                vec![("UILabel", Put::Ref(name)), ("UISource", Put::Ref(owner)), ("UIDestination", Put::Ref(destination))],
+            ));
+        }
+        let action = b.string("play:");
+        connections.push(b.object(
+            "UIRuntimeEventConnection",
+            vec![("UILabel", Put::Ref(action)), ("UISource", Put::Ref(button)), ("UIDestination", Put::Ref(owner)), ("UIEventMask", Put::I8(64))],
+        ));
+        b.standard_root(&[view, owner, label, button], &[view, owner], &connections);
+        b.bytes()
+    }
+
+    /// Main.storyboard compiled the way Xcode does, in en.lproj: a menu scene
+    /// (the game's own controller class) with a segue to a second scene.
+    fn write_storyboard(app: &std::path::Path) {
+        let folder = app.join("en.lproj/Main.storyboardc");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            folder.join("Info.plist"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>UIStoryboardDesignatedEntryPointIdentifier</key><string>UIViewController-1</string>
+<key>UIStoryboardVersion</key><integer>1</integer>
+<key>UIViewControllerIdentifiersToNibNames</key><dict>
+<key>UIViewController-1</key><string>UIViewController-1</string>
+<key>UIViewController-2</key><string>UIViewController-2</string>
+</dict></dict></plist>"#,
+        )
+        .unwrap();
+        std::fs::write(folder.join("UIViewController-1.nib"), storyboard_scene("NibTestMenuController", "1-view-1", &[("ShowNext", "UIViewController-2")])).unwrap();
+        std::fs::write(folder.join("1-view-1.nib"), storyboard_view()).unwrap();
+        std::fs::write(folder.join("UIViewController-2.nib"), storyboard_scene("UIViewController", "2-view-2", &[])).unwrap();
+        std::fs::write(folder.join("2-view-2.nib"), storyboard_view()).unwrap();
+    }
+
+    fn rect_of(object: Id, selector: &str) -> Rect {
+        let sel = runtime::sel(selector);
+        let imp = runtime::imp_for(object, sel).unwrap_or_else(|| panic!("no {selector}"));
+        let f: extern "C" fn(Id, Sel) -> Rect = unsafe { std::mem::transmute(imp) };
+        f(object, sel)
+    }
+
+    #[test]
+    fn storyboard_scenes_load_through_the_nib_reader() {
+        test_classes();
+        let menu = runtime::existing_class("NibTestMenuController", false)
+            .unwrap_or_else(|| object::define_class("NibTestMenuController", "UIViewController", 16));
+        object::methods(menu, &[("setTitleLabel:", recorder_set_thing as usize)]);
+        let folder = std::env::temp_dir().join(format!("gamebridge-nib-storyboard-{}", std::process::id()));
+        let app = folder.join("Game.app");
+        write_storyboard(&app);
+        let bundle = runtime::send(runtime::class_named("NSBundle"), "bundleWithPath:", &[string::make(&app.to_string_lossy())]);
+        let storyboard = runtime::send(runtime::class_named("UIStoryboard"), "storyboardWithName:bundle:", &[string::make("Main"), bundle]);
+        assert_ne!(storyboard, 0, "the storyboard opens");
+        let controller = runtime::send(storyboard, "instantiateInitialViewController", &[]);
+        assert_ne!(controller, 0, "the first scene makes its controller");
+        assert_eq!(class_of(controller), "NibTestMenuController", "the game's own class, through UIClassSwapper");
+        assert_eq!(runtime::send(controller, "storyboard", &[]), storyboard, "the storyboard outlet reached -setStoryboard:");
+        // The view comes from the scene's view nib, its outlets and action set.
+        let view = runtime::send(controller, "view", &[]);
+        assert_ne!(view, 0);
+        assert_eq!(class_of(view), "UIView");
+        assert_eq!(rect_of(view, "frame"), Rect::new(0.0, 0.0, 480.0, 320.0));
+        let subviews = collections::array_items(runtime::send(view, "subviews", &[]));
+        assert_eq!(subviews.len(), 2);
+        let (label, button) = (subviews[0], subviews[1]);
+        assert_eq!(record(controller).thing, label, "the titleLabel outlet reached the game's setter");
+        assert_eq!(rect_of(label, "frame"), Rect::new(140.0, 25.0, 200.0, 30.0));
+        assert_eq!(string::get(runtime::send(label, "text", &[])), "Select your hero");
+        let sel = runtime::sel("shadowOffset");
+        let shadow: extern "C" fn(Id, Sel) -> Size = unsafe { std::mem::transmute(runtime::imp_for(label, sel).unwrap()) };
+        assert_eq!(shadow(label, sel), Size { width: 0.0, height: -1.0 });
+        let targets = collections::array_items(runtime::send(runtime::send(button, "allTargets", &[]), "allObjects", &[]));
+        assert_eq!(targets, [controller], "the button's action goes to the controller");
+        // The segue's template knows its controller; performing it shows scene 2.
+        runtime::send(controller, "performSegueWithIdentifier:sender:", &[string::make("ShowNext"), 0]);
+        let shown = runtime::send(controller, "presentedViewController", &[]);
+        assert_ne!(shown, 0, "the segue presented the second scene");
+        assert_eq!(class_of(shown), "UIViewController");
+        assert_eq!(runtime::send(shown, "storyboard", &[]), storyboard);
+        std::fs::remove_dir_all(&folder).unwrap();
     }
 
     /// A nib inside a nib (a table's cell nib) becomes a UINib.
@@ -1556,6 +2218,56 @@ mod tests {
         std::fs::remove_dir_all(&folder).unwrap();
     }
 
+    /// The main nib (Info.plist NSMainNibFile, the device's variant first) is
+    /// loaded with the app as its owner, as UIApplicationMain does: its
+    /// outlets give the app its delegate and the delegate its window.
+    #[test]
+    fn the_main_nib_gives_the_app_its_delegate() {
+        test_classes();
+        use crate::fw::plist::Value as Plist;
+        let info = Plist::Dict(vec![
+            ("NSMainNibFile".into(), Plist::String("Launch".into())),
+            ("NSMainNibFile~ipad".into(), Plist::String("Launch-Tablet".into())),
+        ]);
+        assert_eq!(main_nib_name(&info, false).as_deref(), Some("Launch"));
+        assert_eq!(main_nib_name(&info, true).as_deref(), Some("Launch-Tablet"));
+        assert_eq!(main_nib_name(&Plist::Dict(vec![]), false), None);
+
+        let mut b = Builder::new();
+        let owner = b.proxy("IBFilesOwner");
+        let responder = b.proxy("IBFirstResponder");
+        let class_name = b.string("NibTestRecorder");
+        let original = b.string("UICustomObject");
+        let delegate = b.object("UIClassSwapper", vec![("UIClassName", Put::Ref(class_name)), ("UIOriginalClassName", Put::Ref(original))]);
+        let window = b.object("UIWindow", vec![]);
+        let outlet = |b: &mut Builder, label: &str, source: usize, destination: usize| {
+            let label = b.string(label);
+            b.object(
+                "UIRuntimeOutletConnection",
+                vec![("UILabel", Put::Ref(label)), ("UISource", Put::Ref(source)), ("UIDestination", Put::Ref(destination))],
+            )
+        };
+        let to_delegate = outlet(&mut b, "delegate", owner, delegate);
+        let to_window = outlet(&mut b, "thing", delegate, window);
+        b.standard_root(&[owner, responder, delegate, window], &[owner, responder, delegate, window], &[to_delegate, to_window]);
+        let folder = std::env::temp_dir().join(format!("gamebridge-main-nib-{}", std::process::id()));
+        let app_dir = folder.join("Game.app");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(app_dir.join("Launch.nib"), b.bytes()).unwrap();
+        let bundle = runtime::send(runtime::class_named("NSBundle"), "bundleWithPath:", &[string::make(&app_dir.to_string_lossy())]);
+
+        let app = runtime::send(runtime::send(runtime::class_named("NibTestApp"), "alloc", &[]), "init", &[]);
+        let top = load_main_nib_from(&info, bundle, app, false);
+        assert_eq!(collections::array_items(top).len(), 2, "the delegate and the window (placeholders left out)");
+        let made = record(app).partner;
+        assert_ne!(made, 0, "the nib set the app's delegate");
+        assert_eq!(string::describe_class_of(made), "NibTestRecorder");
+        assert_eq!(string::describe_class_of(record(made).thing), "UIWindow", "the delegate got its window");
+        let none = Plist::Dict(vec![]);
+        assert_eq!(load_main_nib_from(&none, bundle, app, false), 0, "no main nib named");
+        std::fs::remove_dir_all(&folder).unwrap();
+    }
+
     /// A picture named in a nib becomes a UIImage from the nib's bundle.
     #[test]
     fn nib_image_placeholders_become_images() {
@@ -1572,9 +2284,14 @@ mod tests {
             vec![("UIImageWidth", Put::F32(2.0)), ("UIImageHeight", Put::F32(3.0)), ("UIResourceName", Put::Ref(name))],
         );
         let lost = b.object("UIImageNibPlaceholder", vec![("UIResourceName", Put::Ref(missing))]);
+        let sized = b.object(
+            "UIImageNibPlaceholder",
+            vec![("UIImageWidth", Put::F32(4.0)), ("UIImageHeight", Put::F32(5.0)), ("UIResourceName", Put::Ref(missing))],
+        );
         let with_picture = b.object("NibTestRecorder", vec![("image", Put::Ref(picture))]);
         let without = b.object("NibTestRecorder", vec![("image", Put::Ref(lost))]);
-        b.standard_root(&[with_picture, without], &[with_picture, without], &[]);
+        let blank = b.object("NibTestRecorder", vec![("image", Put::Ref(sized))]);
+        b.standard_root(&[with_picture, without, blank], &[with_picture, without, blank], &[]);
         let bytes = data::make(&b.bytes());
         let bundle = runtime::send(runtime::class_named("NSBundle"), "bundleWithPath:", &[string::make(&app.to_string_lossy())]);
         let nib = runtime::send(runtime::class_named("UINib"), "nibWithData:bundle:", &[bytes, bundle]);
@@ -1583,7 +2300,11 @@ mod tests {
         assert_ne!(image, 0);
         assert_eq!(class_of(image), "UIImage");
         assert_eq!(crate::fw::uikit::image_points(image), Size { width: 2.0, height: 3.0 });
-        assert_eq!(record(top[1]).image, 0, "a missing picture is nil");
+        assert_eq!(record(top[1]).image, 0, "a missing picture of no size is nil");
+        // One the nib gives a size is a blank picture of that size, as UIKit's.
+        let blank = record(top[2]).image;
+        assert_ne!(blank, 0, "a missing picture with a size is a blank picture");
+        assert_eq!(crate::fw::uikit::image_points(blank), Size { width: 4.0, height: 5.0 });
         std::fs::remove_dir_all(&folder).unwrap();
     }
 

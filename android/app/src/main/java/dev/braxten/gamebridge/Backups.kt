@@ -874,7 +874,7 @@ object Backups {
     }
 
     /** Stops the iPhone game screen's process (it runs apart from Game Bridge), so no game writes its saves during a restore. */
-    private fun closeIphoneGame(context: Context) {
+    fun closeIphoneGame(context: Context) {
         val processes = context.getSystemService(android.app.ActivityManager::class.java)?.runningAppProcesses.orEmpty()
         val game = processes.firstOrNull { it.processName == "${context.packageName}:ios" } ?: return
         android.os.Process.killProcess(game.pid)

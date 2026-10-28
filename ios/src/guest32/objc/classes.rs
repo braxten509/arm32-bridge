@@ -4,14 +4,35 @@
 //! game adds at run time. Lookup walks the game's superclass chain until a
 //! method is found or the chain reaches a framework (host) class.
 
-use guest32_image::{ClassTarget, Ivar32, Method32, ObjcMetadata32};
-use std::collections::HashMap;
+use guest32_image::{ClassTarget, Ivar32, Method32, ObjcMetadata32, Property32};
+// FxHash: the bridge's tables are keyed by addresses and short names
+// looked up on every message; the default (DoS-proof) hash cost several
+// times more there.
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GuestMethod {
     /// Code address, Thumb bit as stored.
     pub imp: u32,
     pub types: String,
+}
+
+/// A message a game method answered: that method and how many argument
+/// words it takes (receiver and selector included).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CachedSend {
+    pub imp: u32,
+    pub words: u32,
+}
+
+/// A message the host answered: its selector there and the call's shape
+/// (types and options), so a repeat skips the lookups by name.
+#[derive(Clone, Debug)]
+pub struct HostSend {
+    pub sel: usize,
+    pub signature: std::sync::Arc<super::encoding::Signature>,
+    pub options: super::convert::HostCallOptions,
+    pub plan: std::sync::Arc<super::convert::CallPlan>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,6 +64,8 @@ pub struct GuestClass {
     pub instance_size: u32,
     pub ivars: Vec<Ivar32>,
     pub methods: HashMap<String, GuestMethod>,
+    /// Declared properties, its categories' first (as Apple's runtime attaches them).
+    pub properties: Vec<Property32>,
 }
 
 #[derive(Default)]
@@ -53,6 +76,14 @@ pub struct GuestClasses {
     framework_categories: HashMap<(String, bool), HashMap<String, GuestMethod>>,
     /// Some game method's type encoding per selector name.
     selector_types: HashMap<String, String>,
+    /// (class, selector) whose resolver was asked and added nothing: it is
+    /// not asked again until the class's method table changes.
+    refused_resolutions: HashSet<(u32, String)>,
+    /// Messages a game method answered, by (receiver's class, selector
+    /// address); forgotten whenever a method is added.
+    sends: HashMap<(u32, u32), CachedSend>,
+    /// Messages the host answered, kept and forgotten like `sends`.
+    host_sends: HashMap<(u32, u32), HostSend>,
 }
 
 fn method_map(list: &[Method32]) -> HashMap<String, GuestMethod> {
@@ -85,6 +116,7 @@ impl GuestClasses {
                     instance_size: c.instance.instance_size,
                     ivars: c.instance.ivars.clone(),
                     methods: method_map(&c.instance.methods),
+                    properties: c.instance.properties.clone(),
                 },
             );
             table.classes.insert(
@@ -100,6 +132,7 @@ impl GuestClasses {
                     instance_size: c.meta.instance_size,
                     ivars: Vec::new(),
                     methods: method_map(&c.meta.methods),
+                    properties: c.meta.properties.clone(),
                 },
             );
             table.by_name.insert(c.name.clone(), c.address);
@@ -115,6 +148,8 @@ impl GuestClasses {
                     for (target, list) in [(*address, &category.instance_methods), (meta, &category.class_methods)] {
                         table.classes.get_mut(&target).unwrap().methods.extend(method_map(list));
                     }
+                    let class = table.classes.get_mut(address).unwrap();
+                    class.properties.splice(0..0, category.instance_properties.iter().cloned());
                 }
                 ClassTarget::External(name) => {
                     for (meta, list) in [(false, &category.instance_methods), (true, &category.class_methods)] {
@@ -125,7 +160,7 @@ impl GuestClasses {
             }
         }
         let all = table.classes.values().map(|c| &c.methods).chain(table.framework_categories.values());
-        let mut types = HashMap::new();
+        let mut types = HashMap::default();
         for methods in all {
             for (name, m) in methods {
                 types.entry(name.clone()).or_insert_with(|| m.types.clone());
@@ -154,6 +189,27 @@ impl GuestClasses {
             }
         }
         Lookup::Missing
+    }
+
+    /// The game method an earlier message to `class` with the selector at
+    /// `sel` reached, while no method has been added since.
+    pub fn cached_send(&self, class: u32, sel: u32) -> Option<CachedSend> {
+        self.sends.get(&(class, sel)).copied()
+    }
+
+    /// Remembers the game method a message reached (see `cached_send`).
+    pub fn remember_send(&mut self, class: u32, sel: u32, send: CachedSend) {
+        self.sends.insert((class, sel), send);
+    }
+
+    /// The host method an earlier message to `class` with the selector at
+    /// `sel` reached, while no method has been added since.
+    pub fn cached_host_send(&self, class: u32, sel: u32) -> Option<HostSend> {
+        self.host_sends.get(&(class, sel)).cloned()
+    }
+
+    pub fn remember_host_send(&mut self, class: u32, sel: u32, send: HostSend) {
+        self.host_sends.insert((class, sel), send);
     }
 
     pub fn class_named(&self, name: &str) -> Option<&GuestClass> {
@@ -192,6 +248,36 @@ impl GuestClasses {
         out
     }
 
+    /// Apple's ivar sliding (moveIvars): a class compiled when its game
+    /// superclass was smaller (ivars declared in the superclass's
+    /// @implementation are not seen by subclasses) starts where the
+    /// superclass now ends, its ivars moved by one amount that keeps their
+    /// largest alignment. Parents first, so slides add up. Returns each moved
+    /// ivar offset variable and how far it moved, for guest memory.
+    pub fn slide_ivars(&mut self) -> Vec<(u32, u32)> {
+        let order: Vec<u32> = self.classes_parents_first().iter().map(|c| c.address).collect();
+        let mut moved = Vec::new();
+        for address in order {
+            let Super::Game(parent) = self.classes[&address].superclass else { continue };
+            let super_size = self.classes.get(&parent).map_or(0, |p| p.instance_size);
+            let class = self.classes.get_mut(&address).unwrap();
+            if class.instance_start >= super_size {
+                continue;
+            }
+            let align = class.ivars.iter().map(|i| 1u32 << i.alignment.min(4)).max().unwrap_or(1);
+            let diff = (super_size - class.instance_start).div_ceil(align) * align;
+            for ivar in &mut class.ivars {
+                ivar.offset += diff;
+                if ivar.offset_address != 0 {
+                    moved.push((ivar.offset_address, diff));
+                }
+            }
+            class.instance_start += diff;
+            class.instance_size += diff;
+        }
+        moved
+    }
+
     pub fn framework_category_method(&self, class: &str, meta: bool, sel: &str) -> Option<&GuestMethod> {
         self.framework_categories.get(&(class.to_string(), meta))?.get(sel)
     }
@@ -209,6 +295,16 @@ impl GuestClasses {
         self.classes.get(&class).map(|c| c.methods.keys().map(String::as_str).collect()).unwrap_or_default()
     }
 
+    /// Whether this class's resolver already said no for `sel` and added nothing.
+    pub fn resolution_refused(&self, class: u32, sel: &str) -> bool {
+        self.refused_resolutions.contains(&(class, sel.to_string()))
+    }
+
+    /// Remembers that this class's resolver said no for `sel`.
+    pub fn refuse_resolution(&mut self, class: u32, sel: &str) {
+        self.refused_resolutions.insert((class, sel.to_string()));
+    }
+
     /// class_addMethod on a framework class: kept like a category method.
     pub fn add_framework_method(&mut self, class: &str, meta: bool, sel: &str, imp: u32, types: &str) -> bool {
         let methods = self.framework_categories.entry((class.to_string(), meta)).or_default();
@@ -216,7 +312,19 @@ impl GuestClasses {
             return false;
         }
         methods.insert(sel.to_string(), GuestMethod { imp, types: types.to_string() });
+        self.refused_resolutions.clear();
+        self.sends.clear();
+        self.host_sends.clear();
         true
+    }
+
+    /// A game method's code replaced (game_fixes.rs): answers the old code.
+    pub fn replace_method(&mut self, class: u32, sel: &str, imp: u32) -> Option<u32> {
+        let method = self.classes.get_mut(&class)?.methods.get_mut(sel)?;
+        let old = std::mem::replace(&mut method.imp, imp);
+        self.sends.clear();
+        self.host_sends.clear();
+        Some(old)
     }
 
     /// class_addMethod: adds unless the class itself already has the selector.
@@ -226,6 +334,9 @@ impl GuestClasses {
             return false;
         }
         c.methods.insert(sel.to_string(), GuestMethod { imp, types: types.to_string() });
+        self.refused_resolutions.retain(|(owner, _)| *owner != class);
+        self.sends.clear();
+        self.host_sends.clear();
         true
     }
 }

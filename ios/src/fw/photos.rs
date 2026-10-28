@@ -36,6 +36,8 @@ fn fail_later(block: usize, with_url: bool) {
             let f: extern "C" fn(usize, Id) = unsafe { std::mem::transmute(invoke) };
             f(block, error);
         }
+        // The copy goes once the block has run.
+        crate::libsystem::mach::block_release(block as *mut _);
     })));
 }
 

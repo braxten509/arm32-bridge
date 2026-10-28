@@ -31,11 +31,12 @@ const ALIASES: [(&str, &str); 5] = [
 ];
 
 /// Engine-level functions wire.rs registers: throw, the vtable's two
-/// answers and the terminate handler.
+/// answers, the terminate handler and the barrier's personality.
 pub const THROW: &str = "objc_exception_throw";
 pub const ANSWER_FALSE: &str = "gamebridge_objc_ehtype_false";
 pub const DO_CATCH: &str = "gamebridge_objc_ehtype_do_catch";
 pub const TERMINATE: &str = "gamebridge_objc_terminate";
+pub const BARRIER: &str = "gamebridge_sjlj_barrier";
 
 /// The game's uncaught exception handler (a guest function; 0: none).
 static UNCAUGHT: AtomicU32 = AtomicU32::new(0);
@@ -164,6 +165,96 @@ pub fn do_catch(c: &Ctx, catch_type: u32, thrown_type: u32, adjusted: u32) -> bo
         class = superclass(c, class);
     }
     false
+}
+
+/// A context on the guest's SjLj list for one host→guest call: unwinding
+/// stops there, so a game exception never longjmps past host frames into
+/// the game code that called the host (that code's call into the host
+/// would never return). Its personality catches everything; the context's
+/// jump buffer lands on the call's return trap, ending the call.
+pub struct Barrier {
+    at: u32,
+    top: u32,
+    prev: u32,
+}
+
+thread_local! {
+    /// Barrier contexts free for reuse (guest memory, never freed).
+    static FREE_BARRIERS: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// _Unwind_FunctionContext: prev, resumeLocation, resumeParameters[4],
+/// personality, lsda, then the jump buffer (r7, pc, sp).
+const CONTEXT_SIZE: u32 = 48;
+const ESCAPED: u32 = 8;
+const PERSONALITY: u32 = 24;
+const JUMP_BUFFER: u32 = 32;
+
+impl Barrier {
+    /// Registers a barrier for the guest call about to be made on `uc`.
+    pub fn push(uc: &Uc) -> Barrier {
+        let at = FREE_BARRIERS.with(|f| f.borrow_mut().pop()).unwrap_or_else(|| super::super::alloc_permanent(CONTEXT_SIZE, 8));
+        // Slot 18 of the thread block: the top of the thread's SjLj list.
+        let top = uc.get_data().tls_block + 18 * 4;
+        let memory = mem();
+        let prev = memory.read_u32(top);
+        unsafe { std::ptr::write_bytes(memory.host(at), 0, CONTEXT_SIZE as usize) };
+        memory.write_u32(at, prev);
+        // Stub addresses live for the process. Only the context and its
+        // return trap change between calls, not the barrier's personality.
+        static PERSONALITY_STUB: OnceLock<u32> = OnceLock::new();
+        memory.write_u32(at + PERSONALITY, *PERSONALITY_STUB.get_or_init(|| runtime::stub_for(BARRIER)));
+        memory.write_u32(at + JUMP_BUFFER + 4, runtime::next_return_trap(uc));
+        memory.write_u32(at + JUMP_BUFFER + 8, uc.get_data().stack_top - 64);
+        memory.write_u32(top, at);
+        Barrier { at, top, prev }
+    }
+
+    /// Unregisters it after the call: the exception that escaped the call
+    /// (its _Unwind_Exception), if one did.
+    pub fn pop(self) -> Option<u32> {
+        let memory = mem();
+        let escaped = memory.read_u32(self.at + ESCAPED);
+        memory.write_u32(self.top, self.prev);
+        FREE_BARRIERS.with(|f| f.borrow_mut().push(self.at));
+        (escaped != 0).then_some(escaped)
+    }
+}
+
+/// The barrier's personality(version, actions, class, exception, context):
+/// found as the handler in the search phase; in the unwind phase it keeps
+/// the exception and has the unwinder jump to the context (_URC_INSTALL_CONTEXT).
+pub fn barrier_personality(actions: u32, exception: u32, context: u32) -> u32 {
+    const SEARCH_PHASE: u32 = 1;
+    if actions & SEARCH_PHASE != 0 {
+        return 6; // _URC_HANDLER_FOUND
+    }
+    mem().write_u32(context + ESCAPED, exception);
+    7
+}
+
+/// An exception that escaped a host→guest call (`exception`, from
+/// [`Barrier::pop`]): the Objective-C object it carries, after which it is
+/// finished with (caught and ended, as a catch block would). Anything else
+/// (a C++ exception), or one no host code will carry on (`carried`: the
+/// call isn't answering a game message), ends the program as an uncaught
+/// exception does.
+pub fn take_escaped(uc: &mut Uc, c: &Ctx, exception: u32, carried: bool) -> Result<u32, String> {
+    let (Some(begin), Some(current_type), Some(end)) = (export("__cxa_begin_catch"), export("__cxa_current_exception_type"), export("__cxa_end_catch"))
+    else {
+        return Err("a game exception escaped, with no C++ runtime".into());
+    };
+    runtime::call_guest(uc, begin, &[exception])?;
+    let thrown_type = runtime::call_guest(uc, current_type, &[])? as u32;
+    // objc_exception_throw's record { object, type_info... }: the type_info is the record plus 4.
+    let objc = thrown_type != 0 && c.word(thrown_type) == vtable() + 8;
+    if !objc || !carried {
+        terminate(uc, c);
+        return Err(uc.get_data().fault.clone().unwrap_or_else(|| "an uncaught game exception".into()));
+    }
+    let object = c.word(thrown_type - 4);
+    runtime::call_guest(uc, end, &[])?;
+    Ok(object)
 }
 
 /// The terminate handler: an Objective-C exception nobody caught goes to

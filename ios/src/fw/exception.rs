@@ -67,7 +67,55 @@ extern "C" fn exception_copy(this: Id, _: Sel, _zone: usize) -> Id {
 
 /// Throws the exception the way the game's own `@throw` does.
 extern "C" fn exception_raise(this: Id, _: Sel) {
-    throw(this);
+    raise(this);
+}
+
+thread_local! {
+    /// How many 32-bit game messages this thread's host code is answering.
+    static GAME_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The exception host code raised for the innermost of them.
+    static RAISED: std::cell::Cell<Id> = const { std::cell::Cell::new(0) };
+}
+
+/// Runs host work, handing back an exception it raised (see [`raise`])
+/// instead of throwing it: the bridge throws it in the 32-bit game whose
+/// message the work answered, where the game's @catch can take it.
+pub fn catching<R>(work: impl FnOnce() -> R) -> (R, Option<Id>) {
+    let outer = RAISED.with(|r| r.replace(0));
+    GAME_CALLS.with(|c| c.set(c.get() + 1));
+    let result = work();
+    GAME_CALLS.with(|c| c.set(c.get() - 1));
+    let raised = RAISED.with(|r| r.replace(outer));
+    (result, (raised != 0).then_some(raised))
+}
+
+/// Whether this thread's host code is answering a 32-bit game's message
+/// (an exception it raises then goes to the game; see [`catching`]).
+pub fn answering_game() -> bool {
+    GAME_CALLS.with(|c| c.get()) > 0
+}
+
+/// Whether host code answering a 32-bit game's message has raised. Rust
+/// frames can't be unwound like the game's, so from then on messages host
+/// code sends do nothing (and give 0) until the bridge throws the
+/// exception in the game: as on Apple, the work after a raise isn't done.
+pub fn pending() -> bool {
+    answering_game() && RAISED.with(|r| r.get()) != 0
+}
+
+/// Raises `exception` from host code: for a 32-bit game's message it is kept
+/// (the first one) and the host method returns as it can (see [`pending`]);
+/// otherwise it is thrown at once.
+pub fn raise(exception: Id) {
+    if answering_game() {
+        RAISED.with(|r| {
+            if r.get() == 0 {
+                r.set(exception);
+            }
+        });
+        return;
+    }
+    throw(exception)
 }
 
 pub fn throw(exception: Id) -> ! {
@@ -95,11 +143,11 @@ extern "C" fn exception_raise_format_arguments(class: Class, _: Sel, name: Id, f
     raise_new(class, name, reason);
 }
 
-fn raise_new(class: Class, name: Id, reason: Id) -> ! {
+fn raise_new(class: Class, name: Id, reason: Id) {
     let exception = runtime::send(class, "exceptionWithName:reason:userInfo:", &[name, reason, 0]);
     runtime::send(exception, "raise", &[]);
     // A subclass's -raise that returns: Apple throws it anyway.
-    throw(exception)
+    raise(exception)
 }
 
 /// The text a STOP line gives for an exception: "Name: reason".
@@ -107,9 +155,11 @@ pub fn summary(exception: Id) -> String {
     if exception == 0 {
         return "nil".into();
     }
+    // class_named takes the runtime lock itself, so it comes first.
+    let exception_class = runtime::class_named("NSException");
     let is_exception = {
         let rt = runtime::lock();
-        rt.is_subclass(rt.class_of(exception), runtime::class_named("NSException"))
+        rt.is_subclass(rt.class_of(exception), exception_class)
     };
     if !is_exception {
         return format!("{} ({})", string::describe(exception), string::describe_class_of(exception));
@@ -134,7 +184,8 @@ pub fn uncaught(exception: Id) -> ! {
         })
         .unwrap_or(0);
     if handler != 0 {
-        crate::log!("uncaught Objective-C exception: calling the game's uncaught exception handler");
+        // Named first: the game's handler often ends the app itself.
+        crate::log!("uncaught Objective-C exception: {}; calling the game's uncaught exception handler", summary(exception));
         let handler: extern "C" fn(Id) = unsafe { std::mem::transmute(handler) };
         handler(exception);
     }
@@ -142,8 +193,12 @@ pub fn uncaught(exception: Id) -> ! {
     crate::report::finish(1);
 }
 
-/// Foundation's exception names; each is a string with its own name.
-const NAMES: [&str; 18] = [
+/// The value of Foundation's NSUndefinedKeyException (key-value coding's).
+pub const UNDEFINED_KEY: &str = "NSUnknownKeyException";
+
+/// Foundation's exception names; each is a string with its own name (but
+/// NSUndefinedKeyException, which is [`UNDEFINED_KEY`]).
+const NAMES: [&str; 17] = [
     "NSGenericException",
     "NSRangeException",
     "NSInvalidArgumentException",
@@ -161,13 +216,13 @@ const NAMES: [&str; 18] = [
     "NSFileHandleOperationException",
     "NSParseErrorException",
     "NSInconsistentArchiveException",
-    "NSUndefinedKeyException",
 ];
 
 pub fn register(r: &mut Registry) {
     for name in NAMES {
         r.data(name, leak(string::make(name)));
     }
+    r.data("NSUndefinedKeyException", leak(string::make(UNDEFINED_KEY)));
     let class = define_class("NSException", "NSObject", 32);
     class_methods(
         class,
@@ -191,4 +246,23 @@ pub fn register(r: &mut Registry) {
             ("raise", exception_raise as usize),
         ],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// summary() must not hold the runtime lock while it looks up
+    /// NSException (that lock is not re-entrant): an uncaught exception
+    /// froze the game in summary() instead of ending it with a STOP line.
+    #[test]
+    fn an_exception_summary_does_not_lock_itself() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let s = string::make;
+        let exception = runtime::send(runtime::class_named("NSException"), "exceptionWithName:reason:userInfo:", &[s("Name"), s("why"), 0]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(summary(exception)).unwrap());
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_millis(500)).as_deref(), Ok("Name: why"));
+    }
 }

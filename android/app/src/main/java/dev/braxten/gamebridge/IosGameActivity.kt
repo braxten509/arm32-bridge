@@ -2,6 +2,8 @@ package dev.braxten.gamebridge
 
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.pm.ActivityInfo
+import android.media.AudioManager
 import android.os.Environment
 import android.os.Looper
 import android.os.MessageQueue
@@ -34,6 +36,9 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
         private var away = false
         /** Game screens open in this process (a new one may open as an old one closes). */
         private var screens = 0
+        /** The game was told a call interrupted its sound and not yet that it ended (kept with
+         * the game, not the screen: a new screen squares it with the phone's mode on resume). */
+        private var callInterrupted = false
     }
     private val started get() = startedApp != null
     private lateinit var root: FrameLayout
@@ -48,21 +53,39 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
     private var videoLeftAt = -1
     /** The game's UIKit pictures, drawn over the game and its video. */
     private lateinit var pictures: IosPicturesView
+    /** Takes the phone keyboard's letters while the game edits text. */
+    private lateinit var keyboard: KeyboardInput
     /** The pipe the "game stopped" byte comes down, kept so it stays open. */
     private var stopPipe: ParcelFileDescriptor? = null
+    private lateinit var screenRules: IphoneScreen.Rules
 
     override fun onCreate(savedInstanceState: Bundle?) {
         screens++
         super.onCreate(savedInstanceState)
         if (switchingGames(intent)) return
+        val info = appFolder(intent)?.let { runCatching { Plist.read(File(it, "Info.plist")) as? Map<*, *> }.getOrNull() }
+        @Suppress("UNCHECKED_CAST")
+        screenRules = IphoneScreen.rules(info as? Map<String, Any?> ?: emptyMap())
+        requestedOrientation = when (screenRules.request) {
+            IphoneScreen.Request.FIXED_PORTRAIT -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            IphoneScreen.Request.FIXED_PORTRAIT_UPSIDE_DOWN -> ActivityInfo.SCREEN_ORIENTATION_REVERSE_PORTRAIT
+            IphoneScreen.Request.SENSOR_PORTRAIT -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+            IphoneScreen.Request.FIXED_LANDSCAPE -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+            IphoneScreen.Request.FIXED_REVERSE_LANDSCAPE -> ActivityInfo.SCREEN_ORIENTATION_REVERSE_LANDSCAPE
+            IphoneScreen.Request.SENSOR_LANDSCAPE -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        }
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         val view = SurfaceView(this)
         view.holder.addCallback(this)
         root = FrameLayout(this)
         root.addView(view)
-        pictures = IosPicturesView(this)
+        pictures = IosPicturesView(this).apply { onUp = { nativePicturesUp(it) } }
         root.addView(pictures)
+        keyboard = KeyboardInput(this) { if (started) nativeType(it) }
+        root.addView(keyboard, FrameLayout.LayoutParams(1, 1))
         setContentView(root)
+        // The keyboard covers the game's lower part; the game's window keeps its size.
+        window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING)
         useTopRefreshRate()
         window.insetsController?.let {
             it.hide(WindowInsets.Type.systemBars())
@@ -72,6 +95,12 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
 
     override fun onNewIntent(intent: android.content.Intent) {
         super.onNewIntent(intent)
+        // Android brings a closed game screen back with the request it first opened with; the newest one says which game.
+        if (!started && appFolder(intent) != appFolder(this.intent)) {
+            setIntent(intent)
+            recreate()
+            return
+        }
         switchingGames(intent)
     }
 
@@ -99,6 +128,7 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
             }
             return
         }
+        if (!screenRules.surfaceReady(width, height)) return
         val app = appFolder(intent) ?: run { finish(); return }
         val home = File(filesDir, "ios/" + File(app).nameWithoutExtension).path
         val name = gameName(File(app))
@@ -201,14 +231,42 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
     override fun onPause() {
         super.onPause()
         videoPlayer?.let { videoLeftAt = it.currentPosition }
+        stopWatchingCalls()
     }
 
     override fun onResume() {
         super.onResume()
+        watchCalls()
         val player = videoPlayer ?: return
         if (videoLeftAt > 0) player.seekTo(videoLeftAt)
         videoLeftAt = -1
         if (!videoHeld) player.start()
+    }
+
+    // A phone call (ringing, or in a call or voice chat) interrupts the game's
+    // sound as it does on an iPhone: the game hears the interruption begin
+    // and, once the call is over, end with "may resume". Watched only while
+    // the game is on screen (leaving the game is not an interruption on iOS);
+    // a call that ended while away is told on return.
+    private val modeListener = AudioManager.OnModeChangedListener { mode -> callModeChanged(mode) }
+
+    private fun watchCalls() {
+        val audio = getSystemService(AudioManager::class.java) ?: return
+        audio.addOnModeChangedListener(mainExecutor, modeListener)
+        callModeChanged(audio.mode)
+    }
+
+    private fun stopWatchingCalls() {
+        getSystemService(AudioManager::class.java)?.removeOnModeChangedListener(modeListener)
+    }
+
+    private fun callModeChanged(mode: Int) {
+        if (!started) return
+        val inCall = mode == AudioManager.MODE_RINGTONE || mode == AudioManager.MODE_IN_CALL ||
+            mode == AudioManager.MODE_IN_COMMUNICATION || mode == AudioManager.MODE_CALL_SCREENING
+        if (inCall == callInterrupted) return
+        callInterrupted = inCall
+        nativeAudioInterruption(inCall, !inCall)
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
@@ -278,8 +336,14 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
 
     /** Called by the game (any thread): the UIKit pictures to draw (IosPicturesView.show). */
     @Suppress("unused")
-    fun showPictures(list: String) {
-        runOnUiThread { pictures.show(list) }
+    fun showPictures(list: String, number: Long) {
+        runOnUiThread { pictures.show(list, number) }
+    }
+
+    /** Called by the game (any thread): it started (true) or stopped (false) editing text. */
+    @Suppress("unused")
+    fun showKeyboard(up: Boolean) {
+        runOnUiThread { keyboard.show(up) }
     }
 
     /** Called by the game (any thread): hold the video where it is. */
@@ -322,13 +386,16 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
 
     private external fun nativeVideoEnded(token: Long)
     private external fun nativeSettled(): Boolean
+    private external fun nativeAudioInterruption(began: Boolean, shouldResume: Boolean)
 
     private external fun nativeStart(surface: android.view.Surface, app: String, home: String, width: Int, height: Int): Boolean
     private external fun nativeTouch(finger: Int, phase: Int, x: Float, y: Float)
+    private external fun nativeType(text: String)
     private external fun nativeResize(width: Int, height: Int)
     private external fun nativePause()
     private external fun nativeNoticeFd(): Int
     private external fun nativeSetReport(name: String, folder: String)
     private external fun nativeSetScreenRate(hz: Int)
+    private external fun nativePicturesUp(number: Long)
     private external fun nativeResume(surface: android.view.Surface, width: Int, height: Int)
 }

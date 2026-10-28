@@ -64,7 +64,7 @@ fn ns_encoding(cf: u32) -> Option<u64> {
 
 /// The characters of bytes 0x80-0xFF in Mac Roman (Apple's mapping, with
 /// the euro sign at 0xDB) and Windows Latin-1 (cp1252; 0 = no character).
-const MAC_ROMAN_HIGH: [u16; 128] = [
+pub(crate) const MAC_ROMAN_HIGH: [u16; 128] = [
     0x00C4, 0x00C5, 0x00C7, 0x00C9, 0x00D1, 0x00D6, 0x00DC, 0x00E1, 0x00E0, 0x00E2, 0x00E4, 0x00E3, 0x00E5, 0x00E7, 0x00E9, 0x00E8,
     0x00EA, 0x00EB, 0x00ED, 0x00EC, 0x00EE, 0x00EF, 0x00F1, 0x00F3, 0x00F2, 0x00F4, 0x00F6, 0x00F5, 0x00FA, 0x00F9, 0x00FB, 0x00FC,
     0x2020, 0x00B0, 0x00A2, 0x00A3, 0x00A7, 0x2022, 0x00B6, 0x00DF, 0x00AE, 0x00A9, 0x2122, 0x00B4, 0x00A8, 0x2260, 0x00C6, 0x00D8,
@@ -74,7 +74,7 @@ const MAC_ROMAN_HIGH: [u16; 128] = [
     0x2021, 0x00B7, 0x201A, 0x201E, 0x2030, 0x00C2, 0x00CA, 0x00C1, 0x00CB, 0x00C8, 0x00CD, 0x00CE, 0x00CF, 0x00CC, 0x00D3, 0x00D4,
     0xF8FF, 0x00D2, 0x00DA, 0x00DB, 0x00D9, 0x0131, 0x02C6, 0x02DC, 0x00AF, 0x02D8, 0x02D9, 0x02DA, 0x00B8, 0x02DD, 0x02DB, 0x02C7,
 ];
-const WINDOWS_LATIN1_HIGH: [u16; 128] = [
+pub(crate) const WINDOWS_LATIN1_HIGH: [u16; 128] = [
     0x20AC, 0, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0, 0x017D, 0,
     0, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014, 0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0, 0x017E, 0x0178,
     0x00A0, 0x00A1, 0x00A2, 0x00A3, 0x00A4, 0x00A5, 0x00A6, 0x00A7, 0x00A8, 0x00A9, 0x00AA, 0x00AB, 0x00AC, 0x00AD, 0x00AE, 0x00AF,
@@ -256,6 +256,396 @@ extern "C" fn cf_number_get_value(number: Id, kind: isize, out: *mut u8) -> bool
     unsafe { number_get_value(integer, float, kind, out) }
 }
 
+/// CFRange { location, length }.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct CFRange {
+    pub location: isize,
+    pub length: isize,
+}
+
+// ----- CFArray, CFDictionary, CFData, CFNumber and any CF type -----
+
+extern "C" fn count(object: Id) -> isize {
+    if object == 0 {
+        return 0;
+    }
+    crate::objc::runtime::send(object, "count", &[]) as isize
+}
+
+extern "C" fn cf_array_get_values(array: Id, range: CFRange, values: *mut Id) {
+    if array == 0 || values.is_null() || range.location < 0 || range.length <= 0 {
+        return;
+    }
+    for i in 0..range.length {
+        let item = crate::objc::runtime::send(array, "objectAtIndex:", &[(range.location + i) as usize]);
+        unsafe { *values.add(i as usize) = item };
+    }
+}
+
+/// CFArrayGetValueAtIndex: the item itself (no retain); NULL past the end.
+extern "C" fn cf_array_get_value_at_index(array: Id, index: isize) -> Id {
+    if array == 0 || index < 0 || index >= count(array) {
+        return 0;
+    }
+    crate::objc::runtime::send(array, "objectAtIndex:", &[index as usize])
+}
+
+/// Keys and values in the same order; either list may be NULL.
+extern "C" fn cf_dictionary_get_keys_and_values(dictionary: Id, keys: *mut Id, values: *mut Id) {
+    if dictionary == 0 || !collections::is_dictionary(dictionary) {
+        return;
+    }
+    for (i, (key, value)) in collections::dictionary_pairs(dictionary).into_iter().enumerate() {
+        unsafe {
+            if !keys.is_null() {
+                *keys.add(i) = key;
+            }
+            if !values.is_null() {
+                *values.add(i) = value;
+            }
+        }
+    }
+}
+
+extern "C" fn cf_data_create(_allocator: usize, bytes: *const u8, length: isize) -> Id {
+    let bytes = if bytes.is_null() || length <= 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(bytes, length as usize) } };
+    crate::fw::data::make(bytes)
+}
+
+/// The capacity is the most it may hold (0: no limit); its bytes stay put up to it.
+extern "C" fn cf_data_create_mutable(_allocator: usize, capacity: isize) -> Id {
+    crate::fw::data::make_mutable(capacity.max(0) as usize)
+}
+
+/// The allocators a game can name besides kCFAllocatorDefault (NULL):
+/// kCFAllocatorNull, kCFAllocatorMalloc, kCFAllocatorSystemDefault.
+static ALLOCATORS: std::sync::OnceLock<[Id; 3]> = std::sync::OnceLock::new();
+
+/// Whether a contents deallocator frees with malloc's free: kCFAllocatorDefault
+/// (NULL), Malloc and SystemDefault do; kCFAllocatorNull leaves the bytes the
+/// caller's. CFAllocatorCreate isn't offered, so no allocator of the game's
+/// can exist and any other value is left alone too.
+fn allocator_frees(deallocator: Id, function: &str) -> bool {
+    let [null, malloc, system] = *ALLOCATORS.get().unwrap();
+    let frees = deallocator == 0 || deallocator == malloc || deallocator == system;
+    if deallocator != null && !frees {
+        crate::log!("{function}: deallocator {deallocator:#x} isn't an allocator; the bytes stay the caller's");
+    }
+    frees
+}
+
+/// Reads the caller's bytes in place; the data frees them with
+/// `deallocator` when it goes (see `allocator_frees`).
+extern "C" fn cf_data_create_with_bytes_no_copy(_allocator: usize, bytes: *const u8, length: isize, deallocator: Id) -> Id {
+    let frees = allocator_frees(deallocator, "CFDataCreateWithBytesNoCopy");
+    crate::fw::data::make_over(bytes, length.max(0) as usize, frees.then(crate::fw::data::game_free))
+}
+
+/// The word a message with no arguments answers (0 for nil).
+fn send_word(object: Id, selector: &str) -> usize {
+    if object == 0 {
+        return 0;
+    }
+    crate::objc::runtime::send(object, selector, &[])
+}
+
+extern "C" fn cf_data_get_byte_ptr(data: Id) -> usize {
+    send_word(data, "bytes")
+}
+
+extern "C" fn cf_data_get_mutable_byte_ptr(data: Id) -> usize {
+    send_word(data, "mutableBytes")
+}
+
+extern "C" fn cf_data_get_length(data: Id) -> isize {
+    send_word(data, "length") as isize
+}
+
+extern "C" fn cf_data_set_length(data: Id, length: isize) {
+    if data != 0 {
+        crate::objc::runtime::send(data, "setLength:", &[length.max(0) as usize]);
+    }
+}
+
+extern "C" fn cf_equal(a: Id, b: Id) -> bool {
+    a == b || (a != 0 && b != 0 && crate::objc::runtime::send(a, "isEqual:", &[b]) as u8 != 0)
+}
+
+extern "C" fn cf_hash(object: Id) -> usize {
+    send_word(object, "hash")
+}
+
+/// Garbage collection never came to iOS: the object itself.
+extern "C" fn cf_make_collectable(object: Id) -> Id {
+    object
+}
+
+extern "C" fn cf_locale_get_system() -> Id {
+    crate::objc::runtime::send(crate::objc::runtime::class_named("NSLocale"), "systemLocale", &[])
+}
+
+/// CFNumberCreate(allocator, type, &value): read in the type's own size.
+extern "C" fn cf_number_create(_allocator: usize, kind: isize, value: *const u8) -> Id {
+    if value.is_null() {
+        return 0;
+    }
+    unsafe {
+        match kind {
+            1 | 7 => collections::number_int((value as *const i8).read_unaligned() as i64),
+            2 | 8 => collections::number_int((value as *const i16).read_unaligned() as i64),
+            3 | 9 => collections::number_int((value as *const i32).read_unaligned() as i64),
+            4 | 10 | 11 | 14 | 15 => collections::number_int((value as *const i64).read_unaligned()),
+            5 | 12 => collections::number_float((value as *const f32).read_unaligned() as f64),
+            6 | 13 | 16 => collections::number_float((value as *const f64).read_unaligned()),
+            _ => {
+                crate::log!("CFNumberCreate type {kind} not known");
+                0
+            }
+        }
+    }
+}
+
+// ----- CFString -----
+
+extern "C" fn cf_string_get_length(text: Id) -> isize {
+    send_word(text, "length") as isize
+}
+
+/// An empty CFMutableString (the most length is only a hint).
+extern "C" fn cf_string_create_mutable(_allocator: usize, _max_length: isize) -> Id {
+    crate::objc::runtime::send(crate::objc::runtime::class_named("NSMutableString"), "string", &[])
+}
+
+extern "C" fn cf_string_lowercase(text: Id, _locale: Id) {
+    if text != 0 {
+        let lower = crate::objc::runtime::send(text, "lowercaseString", &[]);
+        crate::objc::runtime::send(text, "setString:", &[lower]);
+    }
+}
+
+// CFStringAppendFormat(string, format options, format, ...)
+crate::libsystem::libc::variadic!(ios_cf_string_append_format, 3, ios_cf_string_append_format_impl);
+
+#[no_mangle]
+extern "C" fn ios_cf_string_append_format_impl(text: Id, _options: Id, format: Id, va: *const u64) {
+    if text != 0 && format != 0 {
+        let more = string::make(&string::format_object(format, va));
+        crate::objc::runtime::send(text, "appendString:", &[more]);
+    }
+}
+
+/// The IANA character set names Apple knows, in CF encodings.
+extern "C" fn cf_string_convert_iana_char_set_name_to_encoding(name: Id) -> u32 {
+    match string::get(name).to_ascii_lowercase().as_str() {
+        "utf-8" | "utf8" => CF_UTF8,
+        "us-ascii" | "ascii" | "ansi_x3.4-1968" => CF_ASCII,
+        "iso-8859-1" | "iso_8859-1" | "latin1" | "l1" => CF_ISO_LATIN1,
+        "macintosh" | "x-mac-roman" | "mac" => CF_MAC_ROMAN,
+        "windows-1252" | "cp1252" => CF_WINDOWS_LATIN1,
+        "utf-16" => CF_UTF16,
+        "utf-16be" => CF_UTF16_BE,
+        "utf-16le" => CF_UTF16_LE,
+        "utf-32" => CF_UTF32,
+        "utf-32be" => CF_UTF32_BE,
+        "utf-32le" => CF_UTF32_LE,
+        "iso-8859-2" => 0x0202,
+        "windows-1250" => 0x0501,
+        "windows-1251" => 0x0502,
+        "shift_jis" => 0x0A01,
+        "euc-jp" => 0x0920,
+        "iso-2022-jp" => 0x0820,
+        _ => CF_INVALID,
+    }
+}
+
+/// ASCII for strings that are all ASCII (Apple's 8-bit form on iOS), else UTF-16.
+extern "C" fn cf_string_get_fastest_encoding(text: Id) -> u32 {
+    if string::get(text).is_ascii() {
+        CF_ASCII
+    } else {
+        CF_UTF16
+    }
+}
+
+/// The most bytes `length` UTF-16 units take in `encoding` (kCFNotFound if unknown).
+extern "C" fn cf_string_get_maximum_size_for_encoding(length: isize, encoding: u32) -> isize {
+    let per_unit = match encoding {
+        CF_INVALID => return -1,
+        CF_UTF8 => 3,
+        CF_UTF16 | CF_UTF16_BE | CF_UTF16_LE => 2,
+        CF_UTF32 | CF_UTF32_BE | CF_UTF32_LE => 4,
+        CF_NON_LOSSY_ASCII => 6,
+        CF_ASCII | CF_ISO_LATIN1 | CF_MAC_ROMAN | CF_WINDOWS_LATIN1 => 1,
+        // Other byte encodings: no character takes more than 4.
+        _ => 4,
+    };
+    length.checked_mul(per_unit).unwrap_or(-1)
+}
+
+/// One character (one UTF-16 unit, or a surrogate pair) in a CF encoding;
+/// None when the encoding has no bytes for it.
+fn encode_character(units: &[u16], encoding: u32) -> Option<Vec<u8>> {
+    let character = char::decode_utf16(units.iter().copied()).next()?.ok();
+    let single = |high: &[u16; 128]| -> Option<Vec<u8>> {
+        let code = character? as u32;
+        match code {
+            0..=0x7F => Some(vec![code as u8]),
+            _ => high.iter().position(|&h| h != 0 && h as u32 == code).map(|i| vec![0x80 + i as u8]),
+        }
+    };
+    Some(match encoding {
+        CF_UTF8 => character?.to_string().into_bytes(),
+        CF_UTF16 | CF_UTF16_LE => units.iter().flat_map(|u| u.to_le_bytes()).collect(),
+        CF_UTF16_BE => units.iter().flat_map(|u| u.to_be_bytes()).collect(),
+        CF_UTF32 | CF_UTF32_LE => (character? as u32).to_le_bytes().to_vec(),
+        CF_UTF32_BE => (character? as u32).to_be_bytes().to_vec(),
+        CF_ASCII => vec![u8::try_from(character? as u32).ok().filter(|b| *b < 0x80)?],
+        CF_ISO_LATIN1 => vec![u8::try_from(character? as u32).ok()?],
+        CF_MAC_ROMAN => single(&MAC_ROMAN_HIGH)?,
+        CF_WINDOWS_LATIN1 => single(&WINDOWS_LATIN1_HIGH)?,
+        _ => return None,
+    })
+}
+
+/// CFStringGetBytes: converts the range character by character; stops at
+/// one that doesn't fit the buffer whole, or that the encoding lacks when
+/// there is no loss byte. Returns the UTF-16 units converted; `used` gets
+/// the bytes (counted only, when `buffer` is NULL).
+#[allow(clippy::too_many_arguments)]
+extern "C" fn cf_string_get_bytes(
+    text: Id,
+    range: CFRange,
+    encoding: u32,
+    loss_byte: u8,
+    external: bool,
+    buffer: *mut u8,
+    room: isize,
+    used: *mut isize,
+) -> isize {
+    let units: Vec<u16> =
+        if string::is_string(text) { unsafe { (*string::text(text)).units.clone() } } else { string::get(text).encode_utf16().collect() };
+    let start = (range.location.max(0) as usize).min(units.len());
+    let end = (start + range.length.max(0) as usize).min(units.len());
+    let room = if buffer.is_null() { usize::MAX } else { room.max(0) as usize };
+    let mut out = Vec::new();
+    // An external representation starts with its byte-order mark; with no
+    // room for it, nothing is converted (as Apple's UTF-32 path does).
+    if external && matches!(encoding, CF_UTF16 | CF_UTF32) {
+        out.extend(if encoding == CF_UTF16 { vec![0xFF, 0xFE] } else { vec![0xFF, 0xFE, 0, 0] });
+        if out.len() > room {
+            if !used.is_null() {
+                unsafe { *used = 0 };
+            }
+            return 0;
+        }
+    }
+    let mut at = start;
+    while at < end {
+        let pair = (0xD800..0xDC00).contains(&units[at]) && at + 1 < end && (0xDC00..0xE000).contains(&units[at + 1]);
+        let take = if pair { 2 } else { 1 };
+        let bytes = match encode_character(&units[at..at + take], encoding) {
+            Some(bytes) => bytes,
+            None if loss_byte != 0 => vec![loss_byte],
+            None => break,
+        };
+        if out.len() + bytes.len() > room {
+            break;
+        }
+        out.extend(bytes);
+        at += take;
+    }
+    if !buffer.is_null() {
+        unsafe { std::ptr::copy_nonoverlapping(out.as_ptr(), buffer, out.len()) };
+    }
+    if !used.is_null() {
+        unsafe { *used = out.len() as isize };
+    }
+    (at - start) as isize
+}
+
+/// Bytes in a CF encoding as UTF-16 units; None when they aren't valid in
+/// it. As Apple's: plain UTF-16 that isn't an external representation is
+/// host-order units as they are (U+FEFF stays a character); external
+/// UTF-16 and plain UTF-32 read a leading byte-order mark (dropped), else
+/// are big-endian; fixed-order encodings keep U+FEFF; UTF-8 drops its
+/// mark; an odd byte or two at the end is left out.
+fn decoded(bytes: &[u8], encoding: u32, external: bool) -> Option<Vec<u16>> {
+    let from_table = |high: &[u16; 128]| bytes.iter().map(|&b| if b < 0x80 { b as u16 } else { high[b as usize - 0x80] }).collect();
+    let utf16 = |bytes: &[u8], big: bool| -> Vec<u16> {
+        bytes.chunks_exact(2).map(|c| if big { u16::from_be_bytes([c[0], c[1]]) } else { u16::from_le_bytes([c[0], c[1]]) }).collect()
+    };
+    let utf32 = |bytes: &[u8], big: bool| -> Option<Vec<u16>> {
+        let text: Option<String> = bytes
+            .chunks_exact(4)
+            .map(|c| char::from_u32(if big { u32::from_be_bytes([c[0], c[1], c[2], c[3]]) } else { u32::from_le_bytes([c[0], c[1], c[2], c[3]]) }))
+            .collect();
+        Some(text?.encode_utf16().collect())
+    };
+    Some(match encoding {
+        CF_UTF8 => std::str::from_utf8(bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes)).ok()?.encode_utf16().collect(),
+        CF_ASCII if bytes.is_ascii() => bytes.iter().map(|&b| b as u16).collect(),
+        CF_ASCII => return None,
+        CF_ISO_LATIN1 => bytes.iter().map(|&b| b as u16).collect(),
+        CF_MAC_ROMAN => from_table(&MAC_ROMAN_HIGH),
+        // cp1252's five unused bytes keep their own value, as Windows does.
+        CF_WINDOWS_LATIN1 => bytes.iter().map(|&b| match b {
+            0..=0x7F => b as u16,
+            _ => match WINDOWS_LATIN1_HIGH[b as usize - 0x80] {
+                0 => b as u16,
+                c => c,
+            },
+        }).collect(),
+        CF_UTF16 if !external => utf16(bytes, false),
+        CF_UTF16 => match bytes {
+            [0xFE, 0xFF, rest @ ..] => utf16(rest, true),
+            [0xFF, 0xFE, rest @ ..] => utf16(rest, false),
+            _ => utf16(bytes, true),
+        },
+        CF_UTF16_BE => utf16(bytes, true),
+        CF_UTF16_LE => utf16(bytes, false),
+        CF_UTF32 => match bytes {
+            [0, 0, 0xFE, 0xFF, rest @ ..] => utf32(rest, true)?,
+            [0xFF, 0xFE, 0, 0, rest @ ..] => utf32(rest, false)?,
+            _ => utf32(bytes, true)?,
+        },
+        CF_UTF32_BE => utf32(bytes, true)?,
+        CF_UTF32_LE => utf32(bytes, false)?,
+        _ => {
+            crate::log!("CFString encoding {encoding:#x} not known");
+            return None;
+        }
+    })
+}
+
+/// A new string from bytes in a CF encoding, or NULL when they aren't valid
+/// in it (see `decoded` for the byte-order mark).
+extern "C" fn cf_string_create_with_bytes(_allocator: usize, bytes: *const u8, length: isize, encoding: u32, external: bool) -> Id {
+    let bytes = if bytes.is_null() || length <= 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(bytes, length as usize) } };
+    match decoded(bytes, encoding, external) {
+        Some(units) => string::make(&String::from_utf16_lossy(&units)),
+        None => 0,
+    }
+}
+
+/// The bytes belong to the string now. It keeps a copy, so they are freed
+/// with the deallocator at once; not when the string can't be made (as on
+/// Apple), nor with kCFAllocatorNull.
+extern "C" fn cf_string_create_with_bytes_no_copy(
+    allocator: usize,
+    bytes: *const u8,
+    length: isize,
+    encoding: u32,
+    external: bool,
+    deallocator: Id,
+) -> Id {
+    let made = cf_string_create_with_bytes(allocator, bytes, length, encoding, external);
+    if made != 0 && !bytes.is_null() && allocator_frees(deallocator, "CFStringCreateWithBytesNoCopy") {
+        crate::fw::data::game_free()(bytes as *mut u8);
+    }
+    made
+}
+
 /// Core Foundation and Foundation of iOS 8.2, the version UIDevice reports.
 const CF_VERSION: f64 = 1142.16;
 const FOUNDATION_VERSION: f64 = 1142.14;
@@ -272,6 +662,22 @@ extern "C" fn cf_url_copy_path_extension(url: Id) -> Id {
         return 0;
     }
     string::make(&string::get(extension))
+}
+
+/// CFURLCopyFileSystemPath(url, style): the path of a file URL in POSIX (0),
+/// HFS (1, colon-separated) or Windows (2, backslashes) form; NULL for a URL
+/// that isn't a file URL, or an unknown style.
+extern "C" fn cf_url_copy_file_system_path(url: Id, style: i32) -> Id {
+    if url == 0 || crate::objc::runtime::send(url, "isFileURL", &[]) as u8 == 0 {
+        return 0;
+    }
+    let path = string::get(crate::objc::runtime::send(url, "path", &[]));
+    match style {
+        0 => string::make(&path),
+        1 => string::make(&path.trim_start_matches('/').replace('/', ":")),
+        2 => string::make(&path.replace('/', "\\")),
+        _ => 0,
+    }
 }
 
 extern "C" fn cf_string_append_characters(text: Id, characters: *const u16, count: isize) {
@@ -353,8 +759,14 @@ extern "C" fn cf_bit_vector_set_bit_at_index(vector: Id, index: isize, value: u3
 pub fn register(r: &mut Registry) {
     let class = crate::fw::object::define_class("__CFBitVector", "NSObject", 16);
     let _ = BIT_VECTOR.set(class);
+    let allocator = crate::fw::object::define_class("__NSCFAllocator", "NSObject", 8);
+    let allocators = *ALLOCATORS.get_or_init(|| [(); 3].map(|_| crate::objc::runtime::alloc_instance(allocator)));
+    for (name, object) in ["kCFAllocatorNull", "kCFAllocatorMalloc", "kCFAllocatorSystemDefault"].into_iter().zip(allocators) {
+        r.data(name, leak(object));
+    }
     r.function("CFStringCompare", cf_string_compare as usize);
     r.function("CFURLCopyPathExtension", cf_url_copy_path_extension as usize);
+    r.function("CFURLCopyFileSystemPath", cf_url_copy_file_system_path as usize);
     r.function("CFStringAppendCharacters", cf_string_append_characters as usize);
     r.function("CFPropertyListCreateFromXMLData", cf_property_list_create_from_xml_data as usize);
     r.function("CFBitVectorCreate", cf_bit_vector_create as usize);
@@ -372,11 +784,40 @@ pub fn register(r: &mut Registry) {
     r.function("CFStringConvertEncodingToNSStringEncoding", cf_string_convert_encoding_to_ns as usize);
     r.function("CFDictionaryGetValue", cf_dictionary_get_value as usize);
     r.function("CFNumberGetValue", cf_number_get_value as usize);
+    r.function("CFNumberCreate", cf_number_create as usize);
+    r.function("CFArrayGetCount", count as usize);
+    r.function("CFArrayGetValues", cf_array_get_values as usize);
+    r.function("CFArrayGetValueAtIndex", cf_array_get_value_at_index as usize);
+    r.function("CFDictionaryGetCount", count as usize);
+    r.function("CFDictionaryGetKeysAndValues", cf_dictionary_get_keys_and_values as usize);
+    r.function("CFDataCreate", cf_data_create as usize);
+    r.function("CFDataCreateMutable", cf_data_create_mutable as usize);
+    r.function("CFDataCreateWithBytesNoCopy", cf_data_create_with_bytes_no_copy as usize);
+    r.function("CFDataGetBytePtr", cf_data_get_byte_ptr as usize);
+    r.function("CFDataGetMutableBytePtr", cf_data_get_mutable_byte_ptr as usize);
+    r.function("CFDataGetLength", cf_data_get_length as usize);
+    r.function("CFDataSetLength", cf_data_set_length as usize);
+    r.function("CFEqual", cf_equal as usize);
+    r.function("CFHash", cf_hash as usize);
+    r.function("CFMakeCollectable", cf_make_collectable as usize);
+    r.function("CFLocaleGetSystem", cf_locale_get_system as usize);
+    r.function("CFStringGetLength", cf_string_get_length as usize);
+    r.function("CFStringCreateMutable", cf_string_create_mutable as usize);
+    r.function("CFStringLowercase", cf_string_lowercase as usize);
+    r.function("CFStringAppendFormat", ios_cf_string_append_format as usize);
+    r.function("CFStringConvertIANACharSetNameToEncoding", cf_string_convert_iana_char_set_name_to_encoding as usize);
+    r.function("CFStringGetFastestEncoding", cf_string_get_fastest_encoding as usize);
+    r.function("CFStringGetMaximumSizeForEncoding", cf_string_get_maximum_size_for_encoding as usize);
+    r.function("CFStringGetBytes", cf_string_get_bytes as usize);
+    r.function("CFStringCreateWithBytes", cf_string_create_with_bytes as usize);
+    r.function("CFStringCreateWithBytesNoCopy", cf_string_create_with_bytes_no_copy as usize);
     r.data("kCFCoreFoundationVersionNumber", leak(CF_VERSION));
     r.data("NSFoundationVersionNumber", leak(FOUNDATION_VERSION));
+    r.data("kCFNumberNaN", leak(collections::number_float(f64::NAN)));
+    r.data("kCFNumberPositiveInfinity", leak(collections::number_float(f64::INFINITY)));
+    r.data("kCFNumberNegativeInfinity", leak(collections::number_float(f64::NEG_INFINITY)));
 
-    // The run loop runs every mode alike, so the common modes are simply a
-    // name of their own.
+    // The common modes: the default and tracking modes (runloop.rs).
     let common = leak(string::make("kCFRunLoopCommonModes"));
     r.data("NSRunLoopCommonModes", common);
     r.data("kCFRunLoopCommonModes", common);
@@ -442,5 +883,98 @@ mod tests {
         assert_eq!(cf_encoding(0x9400_0100), CF_UTF16_LE);
         assert_eq!(cf_encoding(30), CF_MAC_ROMAN);
         assert_eq!(cf_string_convert_encoding_to_ns(CF_UTF8), 4);
+    }
+
+    /// Byte-order marks as Apple's CFStringEncodings.c handles them: an
+    /// external conversion that has no room for its mark converts nothing;
+    /// plain kCFStringEncodingUTF16 bytes that aren't external keep U+FEFF,
+    /// external ones (and UTF-32 always) read the mark, else big-endian; an
+    /// odd byte at the end is dropped (`len / sizeof(UTF16Char)`).
+    #[test]
+    fn byte_order_marks_follow_apple() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let text = string::make("hi");
+        let all = CFRange { location: 0, length: 2 };
+        let mut out = [0xAAu8; 16];
+        let mut get = |encoding, room| {
+            let mut used = -1isize;
+            let converted = cf_string_get_bytes(text, all, encoding, 0, true, out.as_mut_ptr(), room, &mut used);
+            (converted, used)
+        };
+        assert_eq!(get(CF_UTF16, 1), (0, 0), "no room for the mark: nothing");
+        assert_eq!(get(CF_UTF32, 3), (0, 0));
+        assert_eq!(get(CF_UTF16, 2), (0, 2), "the mark alone");
+        assert_eq!(get(CF_UTF16, 5), (1, 4));
+        assert_eq!(&out[..4], &[0xFF, 0xFE, b'h', 0]);
+
+        let make = |bytes: &[u8], encoding: u32, external: bool| {
+            let made = cf_string_create_with_bytes(0, bytes.as_ptr(), bytes.len() as isize, encoding, external);
+            (made != 0).then(|| string::get(made))
+        };
+        assert_eq!(make(&[0xFF, 0xFE, b'h', 0], CF_UTF16, false).as_deref(), Some("\u{feff}h"), "not external: kept");
+        assert_eq!(make(&[0xFF, 0xFE, b'h', 0], CF_UTF16, true).as_deref(), Some("h"));
+        assert_eq!(make(&[0, b'h'], CF_UTF16, true).as_deref(), Some("h"), "external, no mark: big-endian");
+        assert_eq!(make(&[0xFF, 0xFE, b'h', 0], CF_UTF16_LE, true).as_deref(), Some("\u{feff}h"), "a fixed order keeps it");
+        assert_eq!(make(&[0xFF, 0xFE, 0, 0, b'h', 0, 0, 0], CF_UTF32, false).as_deref(), Some("h"));
+        assert_eq!(make(&[0, 0, 0, b'h'], CF_UTF32, false).as_deref(), Some("h"), "UTF-32, no mark: big-endian");
+        assert_eq!(make(&[b'h', 0, b'i'], CF_UTF16, false).as_deref(), Some("h"), "the odd byte is dropped");
+    }
+
+    /// CFStringGetBytes counts UTF-16 units in and bytes out, stops before a
+    /// character that doesn't fit whole or that the encoding lacks (unless a
+    /// loss byte stands in), and only counts when there is no buffer.
+    #[test]
+    fn cf_string_bytes_convert_like_apple() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        // a, e acute, an emoji (two UTF-16 units), b: five units.
+        let text = string::make("a\u{e9}\u{1F600}b");
+        let all = CFRange { location: 0, length: 5 };
+        let mut out = [0u8; 16];
+        let mut used = 0isize;
+        let mut get = |range, encoding, loss, external, out: *mut u8, room| {
+            let converted = cf_string_get_bytes(text, range, encoding, loss, external, out, room, &mut used);
+            (converted, used)
+        };
+        assert_eq!(get(all, CF_UTF8, 0, false, out.as_mut_ptr(), 16), (5, 8));
+        assert_eq!(&out[..8], "a\u{e9}\u{1F600}b".as_bytes());
+        assert_eq!(get(all, CF_UTF8, 0, false, out.as_mut_ptr(), 4), (2, 3), "the emoji doesn't fit whole");
+        assert_eq!(get(all, CF_UTF8, 0, false, std::ptr::null_mut(), 0), (5, 8), "no buffer: counted only");
+        assert_eq!(get(all, CF_ISO_LATIN1, 0, false, out.as_mut_ptr(), 16), (2, 2), "stops at the emoji");
+        assert_eq!(get(all, CF_ISO_LATIN1, b'?', false, out.as_mut_ptr(), 16), (5, 4));
+        assert_eq!(&out[..4], b"a\xe9?b");
+        assert_eq!(get(CFRange { location: 1, length: 1 }, CF_MAC_ROMAN, 0, false, out.as_mut_ptr(), 16), (1, 1));
+        assert_eq!(out[0], 0x8E);
+        assert_eq!(get(CFRange { location: 0, length: 1 }, CF_UTF16, 0, true, out.as_mut_ptr(), 16), (1, 4), "a byte-order mark first");
+        assert_eq!(&out[..4], &[0xFF, 0xFE, b'a', 0]);
+        assert_eq!(get(CFRange { location: 4, length: 1 }, CF_UTF16_BE, 0, false, out.as_mut_ptr(), 16), (1, 2));
+        assert_eq!(&out[..2], &[0, b'b']);
+
+        let make = |bytes: &[u8], encoding: u32, external: bool| {
+            let made = cf_string_create_with_bytes(0, bytes.as_ptr(), bytes.len() as isize, encoding, external);
+            (made != 0).then(|| string::get(made))
+        };
+        assert_eq!(make(&[0xFE, 0xFF, 0, b'h', 0, b'i'], CF_UTF16, true).as_deref(), Some("hi"), "a big-endian mark");
+        assert_eq!(make(&[b'h', 0, b'i', 0], CF_UTF16_LE, false).as_deref(), Some("hi"));
+        assert_eq!(make(&[0x8E], CF_MAC_ROMAN, false).as_deref(), Some("\u{e9}"));
+        assert_eq!(make(&[0x80], CF_WINDOWS_LATIN1, false).as_deref(), Some("\u{20ac}"));
+        assert_eq!(make(&[0xC3, 0x28], CF_UTF8, false), None, "broken UTF-8 gives NULL");
+        assert_eq!(make(&[0xE9], CF_ASCII, false), None, "ASCII has no 0xE9");
+        assert_eq!(make(&[], CF_UTF8, false).as_deref(), Some(""));
+
+        let max = |encoding| cf_string_get_maximum_size_for_encoding(5, encoding);
+        assert_eq!([max(CF_UTF8), max(CF_UTF16), max(CF_UTF32), max(CF_ASCII)], [15, 10, 20, 5]);
+        let iana = |name: &str| cf_string_convert_iana_char_set_name_to_encoding(string::make(name));
+        assert_eq!([iana("UTF-8"), iana("utf-16be"), iana("ISO-8859-1"), iana("macintosh"), iana("windows-1252")], [
+            CF_UTF8,
+            CF_UTF16_BE,
+            CF_ISO_LATIN1,
+            CF_MAC_ROMAN,
+            CF_WINDOWS_LATIN1
+        ]);
+        assert_eq!(iana("no-such-set"), CF_INVALID);
+        assert_eq!(cf_string_get_fastest_encoding(string::make("plain")), CF_ASCII);
+        assert_eq!(cf_string_get_fastest_encoding(text), CF_UTF16);
     }
 }

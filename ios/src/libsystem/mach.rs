@@ -231,6 +231,7 @@ extern "C" fn thread_policy_set() -> i32 {
 
 // ----- blocks -----
 
+const BLOCK_REFCOUNT_MASK: i32 = 0xfffe;
 const BLOCK_NEEDS_FREE: i32 = 1 << 24;
 const BLOCK_HAS_COPY_DISPOSE: i32 = 1 << 25;
 const BLOCK_IS_GLOBAL: i32 = 1 << 28;
@@ -246,13 +247,41 @@ pub struct BlockHeader {
 
 pub static MALLOC_BLOCK_CLASS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// The flags word of a heap block or __block variable, as an atomic (its
+/// count changes from any thread).
+unsafe fn flags_word<'a>(flags: *mut i32) -> &'a std::sync::atomic::AtomicI32 {
+    &*(flags as *const std::sync::atomic::AtomicI32)
+}
+
+/// One more reference (libclosure's latching increment): a saturated count stays.
+unsafe fn count_retain(flags: *mut i32) {
+    let _ = flags_word(flags).fetch_update(Ordering::AcqRel, Ordering::Acquire, |flags| {
+        (flags & BLOCK_REFCOUNT_MASK != BLOCK_REFCOUNT_MASK).then_some(flags + 2)
+    });
+}
+
+/// One reference less; true when it was the last. Saturated and zero counts stay.
+unsafe fn count_release(flags: *mut i32) -> bool {
+    let before = flags_word(flags).fetch_update(Ordering::AcqRel, Ordering::Acquire, |flags| {
+        let count = flags & BLOCK_REFCOUNT_MASK;
+        (count != BLOCK_REFCOUNT_MASK && count != 0).then_some(flags - 2)
+    });
+    before.is_ok_and(|flags| flags & BLOCK_REFCOUNT_MASK == 2)
+}
+
+/// _Block_copy: a stack block is copied to the heap, a heap block gains a
+/// reference, a global block stays as it is.
 pub extern "C" fn block_copy(block: *mut BlockHeader) -> *mut BlockHeader {
     if block.is_null() {
         return block;
     }
     unsafe {
         let flags = (*block).flags;
-        if flags & BLOCK_IS_GLOBAL != 0 || flags & BLOCK_NEEDS_FREE != 0 {
+        if flags & BLOCK_IS_GLOBAL != 0 {
+            return block;
+        }
+        if flags & BLOCK_NEEDS_FREE != 0 {
+            count_retain(std::ptr::addr_of_mut!((*block).flags));
             return block;
         }
         let descriptor = &*(*block).descriptor;
@@ -269,7 +298,24 @@ pub extern "C" fn block_copy(block: *mut BlockHeader) -> *mut BlockHeader {
     }
 }
 
-extern "C" fn block_release(_block: *mut BlockHeader) {}
+/// _Block_release: a heap block's last reference runs its dispose helper
+/// (letting go of what it captured) and frees it; other blocks stay.
+pub extern "C" fn block_release(block: *mut BlockHeader) {
+    if block.is_null() {
+        return;
+    }
+    unsafe {
+        let flags = (*block).flags;
+        if flags & BLOCK_NEEDS_FREE == 0 || !count_release(std::ptr::addr_of_mut!((*block).flags)) {
+            return;
+        }
+        if flags & BLOCK_HAS_COPY_DISPOSE != 0 {
+            let dispose: extern "C" fn(*mut BlockHeader) = std::mem::transmute((*(*block).descriptor)[3]);
+            dispose(block);
+        }
+        libc::free(block as *mut libc::c_void);
+    }
+}
 
 #[repr(C)]
 struct Byref {
@@ -285,6 +331,7 @@ struct Byref {
 unsafe fn byref_copy(source: *mut Byref) -> *mut Byref {
     let source = (*source).forwarding;
     if (*source).flags & BLOCK_NEEDS_FREE != 0 {
+        count_retain(std::ptr::addr_of_mut!((*source).flags));
         return source;
     }
     let size = ((*source).size as usize).max(24);
@@ -301,6 +348,20 @@ unsafe fn byref_copy(source: *mut Byref) -> *mut Byref {
     copy
 }
 
+/// A __block variable's last reference runs its destroy helper and frees it.
+unsafe fn byref_release(byref: *mut Byref) {
+    let byref = (*byref).forwarding;
+    let flags = (*byref).flags;
+    if flags & BLOCK_NEEDS_FREE == 0 || !count_release(std::ptr::addr_of_mut!((*byref).flags)) {
+        return;
+    }
+    if flags & BLOCK_HAS_COPY_DISPOSE != 0 {
+        let destroy: extern "C" fn(*mut Byref) = std::mem::transmute((*byref).destroy);
+        destroy(byref);
+    }
+    libc::free(byref as *mut libc::c_void);
+}
+
 extern "C" fn block_object_assign(destination: *mut usize, object: usize, flags: i32) {
     unsafe {
         match flags & 0xFF {
@@ -308,14 +369,20 @@ extern "C" fn block_object_assign(destination: *mut usize, object: usize, flags:
             8 | 24 => *destination = byref_copy(object as *mut Byref) as usize,
             // A captured object: copying the block retains it (counted objects only).
             3 => *destination = crate::fw::counted::retain(object),
+            // Also BLOCK_BYREF_CALLER (0x80: 131, 135): a __block variable's
+            // own value, assigned as it is.
             _ => *destination = object,
         }
     }
 }
 
 extern "C" fn block_object_dispose(object: usize, flags: i32) {
-    if flags & 0xFF == 3 {
-        crate::fw::counted::release(object);
+    match flags & 0xFF {
+        3 => crate::fw::counted::release(object),
+        7 => block_release(object as *mut BlockHeader),
+        8 | 24 => unsafe { byref_release(object as *mut Byref) },
+        // BLOCK_BYREF_CALLER: a __block variable's own value, never held.
+        _ => {}
     }
 }
 
@@ -362,20 +429,38 @@ extern "C" fn dispatch_once_f(predicate: *mut i64, context: usize, function: usi
 }
 
 static MAIN_QUEUE_OBJECT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-static GLOBAL_QUEUE_OBJECT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+/// The global queues: HIGH, DEFAULT, LOW, BACKGROUND, each plain and overcommit.
+static GLOBAL_QUEUE_OBJECTS: std::sync::OnceLock<[usize; 8]> = std::sync::OnceLock::new();
 
 fn main_queue() -> usize {
     *MAIN_QUEUE_OBJECT.get_or_init(|| leak([0usize; 16]))
 }
 
-pub(crate) extern "C" fn dispatch_get_global_queue(_priority: i64, _flags: u64) -> usize {
-    *GLOBAL_QUEUE_OBJECT.get_or_init(|| leak([0usize; 16]))
+/// A queue per priority and DISPATCH_QUEUE_OVERCOMMIT (2); NULL for other
+/// priorities or flags, as libdispatch answers.
+pub(crate) extern "C" fn dispatch_get_global_queue(priority: i64, flags: u64) -> usize {
+    const OVERCOMMIT: u64 = 2;
+    let index = match priority {
+        2 => 0,
+        0 => 1,
+        -2 => 2,
+        -32768 => 3,
+        _ => return 0,
+    };
+    if flags & !OVERCOMMIT != 0 {
+        return 0;
+    }
+    let queues = GLOBAL_QUEUE_OBJECTS.get_or_init(|| std::array::from_fn(|_| leak([0usize; 16])));
+    queues[index * 2 + usize::from(flags & OVERCOMMIT != 0)]
 }
 
 // ----- queues -----
 // The main queue runs on the main thread's run loop. Queues the game makes
 // are serial (Apple's default): their blocks run one at a time, in order, on
-// a worker thread. Global queues run each block on its own thread. A queue
+// a worker thread. Global queues run each block on its own thread. The queue
+// releases its copy of an async block once it has run (libdispatch's
+// _dispatch_call_block_and_release), so its dispose helper lets go of what it
+// captured. A queue
 // whose target (dispatch_set_target_queue) is serial or the main queue runs
 // its blocks there, taking turns with that queue's own blocks.
 // dispatch_suspend works on every queue the game made (serial or concurrent):
@@ -401,16 +486,13 @@ fn job(block: usize, sent_to: usize, done: Option<Done>) -> Job {
     Job { block, sent_to, done, order: NEXT_ORDER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) }
 }
 
+/// Runs a job: a sync job's block is its caller's; an async job's is the
+/// queue's copy, released once it has run.
 fn run(job: Job) {
-    // Blocks sent with dispatch_async get a pool each, as GCD's worker
-    // threads drain theirs (sync blocks use the caller's).
-    let pool = job.done.is_none().then(crate::fw::counted::pool_mark);
     run_as(job.sent_to, job.block);
-    if let Some(pool) = pool {
-        crate::fw::counted::pool_drain(pool);
-    }
-    if let Some(done) = job.done {
-        mark_done(&done);
+    match job.done {
+        Some(done) => mark_done(&done),
+        None => block_release(job.block as *mut BlockHeader),
     }
 }
 
@@ -519,13 +601,91 @@ fn enqueue(queue: usize, state: &'static SerialQueue, job: Job) {
 }
 
 /// Starts the queue's worker unless one runs, the queue is suspended or empty.
+/// Threads kept for background jobs, as Apple's GCD keeps its workers: a job
+/// goes to an idle one, and a new thread starts only when all are busy.
+/// One idle for `WORKER_IDLE` ends.
+pub(crate) struct Workers {
+    state: Mutex<WorkerState>,
+    wake: Condvar,
+    started: AtomicUsize,
+}
+
+struct WorkerState {
+    jobs: std::collections::VecDeque<Box<dyn FnOnce() + Send>>,
+    /// Threads waiting for a job.
+    idle: usize,
+}
+
+/// How long a pool thread waits for another job before it ends.
+const WORKER_IDLE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The pool GCD's queues run their jobs on.
+static WORKERS: Workers = Workers::new();
+
+impl Workers {
+    pub(crate) const fn new() -> Self {
+        Workers {
+            state: Mutex::new(WorkerState { jobs: std::collections::VecDeque::new(), idle: 0 }),
+            wake: Condvar::new(),
+            started: AtomicUsize::new(0),
+        }
+    }
+
+    /// Runs `job` on one of the pool's threads.
+    pub(crate) fn run(&'static self, job: Box<dyn FnOnce() + Send>) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.jobs.push_back(job);
+        if state.jobs.len() <= state.idle {
+            self.wake.notify_one();
+            return;
+        }
+        drop(state);
+        self.started.fetch_add(1, Ordering::SeqCst);
+        std::thread::Builder::new().name("dispatch".into()).spawn(move || self.serve()).expect("a dispatch thread");
+    }
+
+    /// One autorelease pool around all a thread runs until it runs dry, as
+    /// libdispatch's _dispatch_root_queue_drain.
+    fn serve(&self) {
+        let pool = crate::fw::counted::pool_mark();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(job) = state.jobs.pop_front() {
+                drop(state);
+                job();
+                state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                continue;
+            }
+            drop(state);
+            crate::fw::counted::pool_drain(pool);
+            state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if !state.jobs.is_empty() {
+                continue;
+            }
+            state.idle += 1;
+            let (back, waited) = self.wake.wait_timeout(state, WORKER_IDLE).unwrap_or_else(|e| e.into_inner());
+            state = back;
+            state.idle -= 1;
+            if waited.timed_out() && state.jobs.is_empty() {
+                return;
+            }
+        }
+    }
+
+    /// How many threads the pool has started so far.
+    #[cfg(test)]
+    pub(crate) fn started(&self) -> usize {
+        self.started.load(Ordering::SeqCst)
+    }
+}
+
 fn start_worker(queue: usize, state: &'static SerialQueue, mut jobs: std::sync::MutexGuard<'_, Jobs>) {
     if jobs.running || jobs.suspended > 0 || jobs.waiting.is_empty() {
         return;
     }
     jobs.running = true;
     drop(jobs);
-    std::thread::spawn(move || {
+    WORKERS.run(Box::new(move || {
         CURRENT_RUNNER.with(|c| c.set(queue));
         loop {
             let job = {
@@ -535,7 +695,7 @@ fn start_worker(queue: usize, state: &'static SerialQueue, mut jobs: std::sync::
                     Some(job) => job,
                     None => {
                         jobs.running = false;
-                        return;
+                        break;
                     }
                 }
             };
@@ -543,7 +703,9 @@ fn start_worker(queue: usize, state: &'static SerialQueue, mut jobs: std::sync::
                 run(job);
             }
         }
-    });
+        // The pool thread may serve another queue next.
+        CURRENT_RUNNER.with(|c| c.set(0));
+    }));
 }
 
 fn is_suspended(suspensions: &Suspensions, queue: usize) -> bool {
@@ -659,10 +821,8 @@ fn submit_with(locked: Option<&mut Suspensions>, job: Job) {
         None => try_hold(job, runner),
     };
     let Some(job) = job else { return };
-    if queue == main_queue() && job.done.is_none() {
-        crate::fw::runloop::post(crate::fw::runloop::Work::Block(job.block));
-    } else if runner == main_queue() {
-        crate::fw::runloop::post(crate::fw::runloop::Work::Native(Box::new(move || {
+    if runner == main_queue() {
+        crate::fw::runloop::post(crate::fw::runloop::Work::Queue(Box::new(move || {
             if let Some(job) = try_hold(job, runner) {
                 run(job);
             }
@@ -670,22 +830,21 @@ fn submit_with(locked: Option<&mut Suspensions>, job: Job) {
     } else if let Some(state) = serial_queue(runner) {
         enqueue(runner, state, job);
     } else {
-        std::thread::spawn(move || {
+        WORKERS.run(Box::new(move || {
             if let Some(job) = try_hold(job, runner) {
-                CURRENT_QUEUE.with(|c| c.set(queue));
-                let pool = crate::fw::counted::pool_mark();
-                unsafe { call_block(job.block) };
-                crate::fw::counted::pool_drain(pool);
-                if let Some(done) = job.done {
-                    mark_done(&done);
-                }
+                run(job);
             }
-        });
+        }));
     }
 }
 
 pub(crate) extern "C" fn dispatch_async(queue: usize, block: usize) {
-    let copy = block_copy(block as *mut BlockHeader) as usize;
+    send_copied(queue, block_copy(block as *mut BlockHeader) as usize);
+}
+
+/// dispatch_async of a block already copied for the queue: the queue takes
+/// over that reference and releases it once the block has run.
+pub(crate) fn send_copied(queue: usize, copy: usize) {
     submit(job(copy, queue, None));
 }
 
@@ -700,12 +859,31 @@ extern "C" fn dispatch_sync(queue: usize, block: usize) {
         }
         submit(job(block, queue, Some(done.clone())));
         wait_for(&done);
-    } else if serial_queue(runner).is_some() {
+    } else if let Some(state) = serial_queue(runner) {
         if CURRENT_RUNNER.with(|c| c.get()) == runner {
             // On Apple this waits forever; running it here keeps the game going.
             crate::log!("dispatch_sync onto the queue already running; ran it directly");
             return inline();
         }
+        // An idle queue runs it on the caller's thread, as Apple's GCD does,
+        // holding the queue meanwhile so later blocks wait their turn. Checked
+        // under SUSPENSIONS, so no queue on the way gets suspended in between.
+        let suspensions = SUSPENSIONS.lock().unwrap();
+        if ANY_SUSPENDED.load(Ordering::SeqCst) == 0 {
+            let mut jobs = state.jobs.lock().unwrap();
+            if !jobs.running && jobs.suspended == 0 && jobs.waiting.is_empty() {
+                jobs.running = true;
+                drop(jobs);
+                drop(suspensions);
+                let before = CURRENT_RUNNER.with(|c| c.replace(runner));
+                inline();
+                CURRENT_RUNNER.with(|c| c.set(before));
+                let mut jobs = state.jobs.lock().unwrap();
+                jobs.running = false;
+                return start_worker(runner, state, jobs);
+            }
+        }
+        drop(suspensions);
         submit(job(block, queue, Some(done.clone())));
         wait_for(&done);
     } else {
@@ -716,17 +894,45 @@ extern "C" fn dispatch_sync(queue: usize, block: usize) {
     }
 }
 
+/// dispatch_after blocks waiting for their time: (time, sending order,
+/// queue, copied block), soonest first, sent on by one thread.
+static AFTER: (Mutex<std::collections::BinaryHeap<std::cmp::Reverse<(u64, u64, usize, usize)>>>, Condvar) =
+    (Mutex::new(std::collections::BinaryHeap::new()), Condvar::new());
+
+/// As libdispatch's _dispatch_after_f: a time already come is
+/// dispatch_async at once (so blocks sent after it run after it), a later one
+/// waits for its time, and DISPATCH_TIME_FOREVER never runs.
 extern "C" fn dispatch_after(when: u64, queue: usize, block: usize) {
+    let Some(at) = deadline_nanos(when) else { return };
     let copy = block_copy(block as *mut BlockHeader) as usize;
-    std::thread::spawn(move || {
-        let now = now_nanos();
-        match deadline_nanos(when) {
-            Some(at) if at > now => std::thread::sleep(std::time::Duration::from_nanos(at - now)),
-            Some(_) => {}
-            None => return,
-        }
-        dispatch_async(queue, copy);
+    if at <= now_nanos() {
+        return send_copied(queue, copy);
+    }
+    static THREAD: std::sync::Once = std::sync::Once::new();
+    THREAD.call_once(|| {
+        std::thread::Builder::new().name("dispatch after".into()).spawn(send_when_due).expect("the dispatch_after thread");
     });
+    let order = NEXT_ORDER.fetch_add(1, Ordering::Relaxed);
+    AFTER.0.lock().unwrap().push(std::cmp::Reverse((at, order, queue, copy)));
+    AFTER.1.notify_all();
+}
+
+/// The dispatch_after thread: sends each block to its queue once its time has come.
+fn send_when_due() {
+    let mut waiting = AFTER.0.lock().unwrap();
+    loop {
+        let now = now_nanos();
+        match waiting.peek().map(|next| next.0 .0) {
+            Some(at) if at <= now => {
+                let std::cmp::Reverse((_, _, queue, copy)) = waiting.pop().unwrap();
+                drop(waiting);
+                send_copied(queue, copy);
+                waiting = AFTER.0.lock().unwrap();
+            }
+            Some(at) => waiting = AFTER.1.wait_timeout(waiting, std::time::Duration::from_nanos(at - now)).unwrap().0,
+            None => waiting = AFTER.1.wait(waiting).unwrap(),
+        }
+    }
 }
 
 extern "C" fn dispatch_noop(_object: usize) {}
@@ -748,39 +954,50 @@ extern "C" fn dispatch_set_target_queue(object: usize, queue: usize) {
     }
 }
 
+/// What a timed-out dispatch wait answers (Apple's KERN_OPERATION_TIMED_OUT).
+pub(crate) const TIMED_OUT: i64 = 49;
+
 struct Semaphore {
-    count: Mutex<i64>,
+    /// (signals not taken yet, threads waiting)
+    count: Mutex<(i64, i64)>,
     wake: Condvar,
 }
 
 extern "C" fn dispatch_semaphore_create(value: i64) -> usize {
-    leak(Semaphore { count: Mutex::new(value), wake: Condvar::new() })
+    leak(Semaphore { count: Mutex::new((value, 0)), wake: Condvar::new() })
 }
 
+/// Non-zero when the signal wakes a waiting thread, as Apple's.
 extern "C" fn dispatch_semaphore_signal(semaphore: usize) -> i64 {
     let semaphore = unsafe { &*(semaphore as *const Semaphore) };
-    *semaphore.count.lock().unwrap() += 1;
+    let mut count = semaphore.count.lock().unwrap();
+    let wakes = count.1 > count.0;
+    count.0 += 1;
+    drop(count);
     semaphore.wake.notify_one();
-    0
+    i64::from(wakes)
 }
 
 extern "C" fn dispatch_semaphore_wait(semaphore: usize, timeout: u64) -> i64 {
     let semaphore = unsafe { &*(semaphore as *const Semaphore) };
     let mut count = semaphore.count.lock().unwrap();
     let deadline = deadline_nanos(timeout);
-    while *count <= 0 {
+    count.1 += 1;
+    while count.0 <= 0 {
         match deadline {
             None => count = semaphore.wake.wait(count).unwrap(),
             Some(at) => {
                 let now = now_nanos();
                 if now >= at {
-                    return 1;
+                    count.1 -= 1;
+                    return TIMED_OUT;
                 }
                 count = semaphore.wake.wait_timeout(count, std::time::Duration::from_nanos(at - now)).unwrap().0;
             }
         }
     }
-    *count -= 1;
+    count.1 -= 1;
+    count.0 -= 1;
     0
 }
 
@@ -916,10 +1133,189 @@ pub fn register(r: &mut Registry) {
     r.function("NSVersionOfLinkTimeLibrary", ns_version_of_link_time_library as usize);
 }
 
+/// Blocks for tests: ones that count their copies and disposals, and ones
+/// that run a closure.
+#[cfg(test)]
+pub(crate) mod test_blocks {
+    use super::*;
+
+    /// How often a counting block was copied to the heap and disposed.
+    #[derive(Default)]
+    pub struct Counts {
+        pub copies: AtomicUsize,
+        pub disposes: AtomicUsize,
+    }
+
+    impl Counts {
+        pub fn get(&self) -> (usize, usize) {
+            (self.copies.load(Ordering::SeqCst), self.disposes.load(Ordering::SeqCst))
+        }
+    }
+
+    #[repr(C)]
+    struct Counting {
+        header: BlockHeader,
+        counts: &'static Counts,
+    }
+
+    extern "C" fn nothing(_block: usize) {}
+
+    extern "C" fn copied(_destination: *mut Counting, source: *const Counting) {
+        unsafe { (*source).counts.copies.fetch_add(1, Ordering::SeqCst) };
+    }
+
+    extern "C" fn disposed(block: *mut Counting) {
+        unsafe { (*block).counts.disposes.fetch_add(1, Ordering::SeqCst) };
+    }
+
+    /// A stack block, as the compiler makes them, whose copy and dispose
+    /// helpers count into `counts`.
+    pub fn counting(counts: &'static Counts) -> usize {
+        static DESCRIPTOR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let descriptor = *DESCRIPTOR.get_or_init(|| leak([0, std::mem::size_of::<Counting>(), copied as usize, disposed as usize]));
+        let header = BlockHeader { isa: 0, flags: BLOCK_HAS_COPY_DISPOSE, reserved: 0, invoke: nothing as usize, descriptor: descriptor as *const _ };
+        leak(Counting { header, counts })
+    }
+
+    #[repr(C)]
+    struct Running {
+        header: BlockHeader,
+        work: Box<dyn Fn() + Send + Sync>,
+    }
+
+    extern "C" fn run(block: usize) {
+        unsafe { ((*(block as *const Running)).work)() };
+    }
+
+    /// A global block that runs `work`.
+    pub fn running(work: impl Fn() + Send + Sync + 'static) -> usize {
+        let header = BlockHeader { isa: 0, flags: BLOCK_IS_GLOBAL, reserved: 0, invoke: run as usize, descriptor: std::ptr::null() };
+        leak(Running { header, work: Box::new(work) })
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_blocks::{counting, running, Counts};
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use crate::libsystem::groups;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// As libdispatch's dispatch_async (copy, then _dispatch_call_block_and_release):
+    /// every copy the dispatch calls make is released once its block ran, so
+    /// the block's dispose helper lets go of what it captured. _Block_copy of
+    /// a heap block adds a reference that _Block_release gives back.
+    #[test]
+    fn dispatched_blocks_are_disposed_after_they_ran() {
+        let counts: &'static Counts = Box::leak(Box::default());
+        let queue = dispatch_queue_create(0, 0);
+        let group = groups::dispatch_group_create();
+        dispatch_async(queue, counting(counts));
+        groups::dispatch_group_async(group, queue, counting(counts));
+        groups::dispatch_group_notify(group, queue, counting(counts));
+        dispatch_after(0, queue, counting(counts));
+        dispatch_sync(queue, running(|| {}));
+        // The group's notify block was sent when the group emptied: behind the first wait.
+        dispatch_sync(queue, running(|| {}));
+        assert_eq!(counts.get(), (4, 4), "(copies, disposals) after the queue ran its blocks");
+        let heap = block_copy(counting(counts) as *mut BlockHeader);
+        assert_eq!(block_copy(heap), heap);
+        block_release(heap);
+        assert_eq!(counts.get(), (5, 4), "a reference is still held");
+        block_release(heap);
+        assert_eq!(counts.get(), (5, 5));
+    }
+
+    /// dispatch_after with a time already come is dispatch_async at once
+    /// (libdispatch's _dispatch_after_f), so a block sent after it runs after it.
+    #[test]
+    fn dispatch_after_now_keeps_order_with_later_blocks() {
+        let queue = dispatch_queue_create(0, 0);
+        static STARTED: AtomicBool = AtomicBool::new(false);
+        static GATE: AtomicBool = AtomicBool::new(false);
+        static RAN: Mutex<Vec<&str>> = Mutex::new(Vec::new());
+        dispatch_async(queue, running(|| {
+            STARTED.store(true, Ordering::SeqCst);
+            while !GATE.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }));
+        // The gate block has left the queue's waiting list: it holds the worker.
+        let end = now_nanos() + 500_000_000;
+        while !STARTED.load(Ordering::SeqCst) && now_nanos() < end {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        dispatch_after(0, queue, running(|| RAN.lock().unwrap().push("after")));
+        let queued = serial_queue(queue).unwrap().jobs.lock().unwrap().waiting.len();
+        dispatch_async(queue, running(|| RAN.lock().unwrap().push("async")));
+        GATE.store(true, Ordering::SeqCst);
+        dispatch_sync(queue, running(|| {}));
+        assert_eq!(queued, 1, "the due block was queued by dispatch_after itself");
+        assert_eq!(*RAN.lock().unwrap(), ["after", "async"]);
+    }
+
+    /// One autorelease pool around everything a worker thread runs before it
+    /// runs dry (libdispatch's _dispatch_root_queue_drain), not one per block.
+    #[test]
+    fn a_worker_drains_its_pool_when_it_runs_dry() {
+        const ISA: usize = 0x7000_0000;
+        crate::fw::counted::count_class(ISA);
+        let object = leak([ISA, 0]);
+        crate::fw::counted::track(object, |_| {});
+        static SEEN_ALIVE: AtomicBool = AtomicBool::new(false);
+        let queue = dispatch_queue_create(0, 0);
+        assert!(suspend_queue(queue));
+        dispatch_async(queue, running(move || {
+            crate::fw::counted::autorelease(object);
+        }));
+        dispatch_async(queue, running(move || SEEN_ALIVE.store(crate::fw::counted::count(object).is_some(), Ordering::SeqCst)));
+        assert!(resume_queue(queue));
+        dispatch_sync(queue, running(|| {}));
+        assert!(SEEN_ALIVE.load(Ordering::SeqCst), "the next block on the same worker saw the object freed");
+        let end = now_nanos() + 500_000_000;
+        while crate::fw::counted::count(object).is_some() && now_nanos() < end {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(crate::fw::counted::count(object), None, "the pool was drained once the worker ran dry");
+    }
+
+    /// A global queue per priority, and an overcommit one each; unknown
+    /// priorities or flags answer NULL (libdispatch's dispatch_get_global_queue).
+    #[test]
+    fn each_priority_has_its_own_global_queue() {
+        let queues: Vec<usize> = [2, 0, -2, -32768].iter().flat_map(|&p| [dispatch_get_global_queue(p, 0), dispatch_get_global_queue(p, 2)]).collect();
+        let mut distinct = queues.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), 8);
+        assert!(!queues.contains(&0));
+        assert_eq!(dispatch_get_global_queue(2, 0), queues[0], "the same queue every time");
+        assert_eq!((dispatch_get_global_queue(5, 0), dispatch_get_global_queue(0, 1)), (0, 0));
+        let high = queues[0];
+        static CURRENT: AtomicUsize = AtomicUsize::new(0);
+        let group = groups::dispatch_group_create();
+        groups::dispatch_group_async(group, high, running(|| CURRENT.store(dispatch_get_current_queue(), Ordering::SeqCst)));
+        assert_eq!(groups::dispatch_group_wait(group, !0), 0);
+        assert_eq!(CURRENT.load(Ordering::SeqCst), high);
+    }
+
+    /// A wait that times out answers KERN_OPERATION_TIMED_OUT (49); a signal
+    /// that woke a waiter answers non-zero.
+    #[test]
+    fn semaphore_answers_match_apples() {
+        let semaphore = dispatch_semaphore_create(0);
+        assert_eq!(dispatch_semaphore_wait(semaphore, dispatch_time(0, 1_000_000)), 49);
+        assert_eq!(dispatch_semaphore_signal(semaphore), 0, "nobody waited");
+        assert_eq!(dispatch_semaphore_wait(semaphore, 0), 0);
+        let waiter = std::thread::spawn(move || dispatch_semaphore_wait(semaphore, !0));
+        let waiting = || unsafe { &*(semaphore as *const Semaphore) }.count.lock().unwrap().1;
+        let end = now_nanos() + 500_000_000;
+        while waiting() == 0 && now_nanos() < end {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(dispatch_semaphore_signal(semaphore), 1, "the signal woke a waiter");
+        assert_eq!(waiter.join().unwrap(), 0);
+    }
 
     /// Giving back the send right mach_thread_self (or the task or host) handed out works,
     /// as on Apple, where each call adds a reference the caller drops later.
@@ -970,6 +1366,63 @@ mod tests {
     fn block(id: usize, queue: usize) -> usize {
         let header = BlockHeader { isa: 0, flags: BLOCK_IS_GLOBAL, reserved: 0, invoke: record as usize, descriptor: std::ptr::null() };
         Box::leak(Box::new(TestBlock { header, id, queue })) as *mut TestBlock as usize
+    }
+
+    static SYNC_RUNS: Mutex<Vec<(usize, std::thread::ThreadId, bool)>> = Mutex::new(Vec::new());
+    static SYNC_GATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    extern "C" fn note_sync_run(block: usize) {
+        let block = unsafe { &*(block as *const TestBlock) };
+        // Block 1 holds the queue until the test lets it go.
+        while block.id == 1 && !SYNC_GATE.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let right_queue = dispatch_get_current_queue() == block.queue;
+        SYNC_RUNS.lock().unwrap().push((block.id, std::thread::current().id(), right_queue));
+    }
+
+    /// dispatch_sync onto an idle serial queue runs the block on the caller's
+    /// thread, as Apple's GCD does (SpellCraft's screen changes waited ~40 ms
+    /// for worker threads to wake); onto a busy one it still waits its turn.
+    #[test]
+    fn sync_onto_an_idle_serial_queue_runs_on_the_callers_thread() {
+        let queue = dispatch_queue_create(0, 0);
+        let noting = |id: usize| {
+            let header = BlockHeader { isa: 0, flags: BLOCK_IS_GLOBAL, reserved: 0, invoke: note_sync_run as usize, descriptor: std::ptr::null() };
+            Box::leak(Box::new(TestBlock { header, id, queue })) as *mut TestBlock as usize
+        };
+        let me = std::thread::current().id();
+        dispatch_sync(queue, noting(0));
+        assert_eq!(SYNC_RUNS.lock().unwrap().clone(), [(0, me, true)], "ran here, as the queue");
+        dispatch_async(queue, noting(1));
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            SYNC_GATE.store(true, Ordering::SeqCst);
+        });
+        dispatch_sync(queue, noting(2));
+        let runs = SYNC_RUNS.lock().unwrap().clone();
+        assert_eq!(runs.iter().map(|r| (r.0, r.2)).collect::<Vec<_>>(), [(0, true), (1, true), (2, true)], "the busy queue's block went first");
+    }
+
+    #[test]
+    fn background_jobs_reuse_an_idle_thread() {
+        // SpellCraft froze ~1 s on each screen change: every queued job
+        // started a new thread (~113 in that second).
+        static POOL: Workers = Workers::new();
+        let threads: &'static Mutex<Vec<std::thread::ThreadId>> = Box::leak(Box::new(Mutex::new(Vec::new())));
+        for round in 1..=6 {
+            POOL.run(Box::new(move || threads.lock().unwrap().push(std::thread::current().id())));
+            let started = std::time::Instant::now();
+            while threads.lock().unwrap().len() < round && started.elapsed() < std::time::Duration::from_secs(5) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            // Let the thread finish its job and wait for the next one.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let mut ids = threads.lock().unwrap().clone();
+        assert_eq!(ids.len(), 6);
+        ids.dedup();
+        assert_eq!((ids.len(), POOL.started()), (1, 1), "jobs one after another share one thread");
     }
 
     #[test]

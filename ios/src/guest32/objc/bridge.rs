@@ -19,14 +19,17 @@
 //! Locking: the bridge state is behind a mutex that is never held while
 //! guest or host code runs (both may send messages back).
 
-use super::classes::{GuestClasses, Lookup};
+use super::classes::{CachedSend, GuestClasses, Lookup};
 use super::convert::{self, Boundary, GuestRet, HostCallOptions, HostFrame};
 use super::encoding::Signature;
 use super::mirror;
-use super::selectors::FrameworkSelectors;
+use super::selectors::{FrameworkSelector, FrameworkSelectors};
 use crate::objc::runtime;
 use guest32_image::ObjcMetadata32;
-use std::collections::{HashMap, HashSet};
+// FxHash: the bridge's tables are keyed by addresses and short names
+// looked up on every message; the default (DoS-proof) hash cost several
+// times more there.
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::sync::Mutex;
 
 /// Guest memory and guest code, as the bridge needs them.
@@ -40,6 +43,8 @@ pub trait GuestSide: Sync {
     fn alloc_permanent(&self, size: u32) -> u32;
     fn host_address(&self, addr: u32) -> usize;
     fn guest_address(&self, host: usize) -> Option<u32>;
+    /// The guest address of the runtime function `name` (objc_msgSend, ...).
+    fn function_address(&self, name: &str) -> u32;
     /// Runs guest code at `imp` (bit 0 = Thumb) with argument words; r0 | r1 << 32.
     fn call(&self, imp: u32, words: &[u32]) -> Result<u64, String>;
     /// Runs `wait` without this thread holding the guest lock (so other
@@ -47,9 +52,21 @@ pub trait GuestSide: Sync {
     fn without_guest_lock(&self, wait: &mut dyn FnMut()) {
         wait()
     }
+    /// How many more guest calls may nest on this thread now.
+    fn nested_calls_left(&self) -> u32 {
+        u32::MAX
+    }
 }
 
-fn u32_at(g: &dyn GuestSide, addr: u32) -> u32 {
+/// The function a framework method's guest IMP is: objc_msgSend's stand-in,
+/// or objc_msgSend_stret's when its result (by `types`, the method's
+/// encoding) comes back through a hidden first pointer.
+pub fn message_stub(g: &dyn GuestSide, types: Option<&str>) -> u32 {
+    let in_memory = types.and_then(|t| Signature::parse_method(t).ok()).is_some_and(|sig| sig.ret.guest_returns_in_memory());
+    g.function_address(if in_memory { "objc_msgSend_stret" } else { "objc_msgSend" })
+}
+
+pub(super) fn u32_at(g: &dyn GuestSide, addr: u32) -> u32 {
     u32::from_le_bytes(g.read(addr, 4).try_into().unwrap())
 }
 
@@ -107,6 +124,8 @@ struct HostBlock {
     invoke: usize,
     descriptor: *const WrapperDescriptor,
     guest: usize,
+    /// The bridge that made it (Bridge::id): kept blocks are per bridge.
+    owner: usize,
 }
 
 #[repr(C)]
@@ -137,6 +156,26 @@ thread_local! {
     /// An exception game code raised (-raise, +raise:format:) for the
     /// runtime function handler to throw in the guest (it has the engine).
     static PENDING_THROW: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    /// Set by the objc_msgSend stand-ins (wire.rs) for the message they send;
+    /// the first send on this thread takes it, so nested sends never see it.
+    static MAY_JUMP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The game method that message goes to, and its r0-r3, for the stand-in
+    /// to jump into (see allow_jump).
+    static JUMP: std::cell::Cell<Option<(u32, [u32; 4])>> = const { std::cell::Cell::new(None) };
+}
+
+/// Lets the next message sent on this thread (or not) leave a plain game
+/// method to the caller instead of calling it: the objc_msgSend stand-in
+/// then jumps into it with the caller's stack as it is, as Apple's
+/// objc_msgSend does, so arguments past the method's own types (a variable
+/// argument list) reach it too.
+pub fn allow_jump(on: bool) {
+    MAY_JUMP.with(|m| m.set(on));
+}
+
+/// The game method to jump into (imp, r0-r3), when the message left one.
+pub fn take_jump() -> Option<(u32, [u32; 4])> {
+    JUMP.with(|j| j.take())
 }
 
 /// The exception a message just raised on this thread, to be thrown.
@@ -157,7 +196,7 @@ const CXX_DESTRUCT: &str = ".cxx_destruct";
 /// Apple's object_cxxConstructFromClass for the game objects made since the
 /// last call: each game class's own .cxx_construct, superclass first. Runs
 /// before guest code next sees them (the bridge lock is not held then).
-fn construct_pending(bridge: &Mutex<Bridge>, g: &dyn GuestSide) -> Result<(), String> {
+pub(super) fn construct_pending(bridge: &Mutex<Bridge>, g: &dyn GuestSide) -> Result<(), String> {
     loop {
         let Some(object) = UNCONSTRUCTED.with(|u| u.borrow_mut().pop()) else { return Ok(()) };
         let (sel, constructors) = {
@@ -187,11 +226,11 @@ fn destruct(bridge: &Mutex<Bridge>, g: &dyn GuestSide, object: u32) -> Result<()
 }
 
 fn live_wrappers<R>(f: impl FnOnce(&mut HashSet<usize>) -> R) -> R {
-    f(LIVE_WRAPPERS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashSet::new))
+    f(LIVE_WRAPPERS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashSet::default))
 }
 
 /// The guest block a host block runs, if it is one of the bridge's.
-fn wrapper_guest(host: usize) -> Option<u32> {
+pub(crate) fn wrapper_guest(host: usize) -> Option<u32> {
     live_wrappers(|live| live.contains(&host)).then(|| unsafe { (*(host as *const HostBlock)).guest as u32 })
 }
 
@@ -211,11 +250,82 @@ extern "C" fn wrapper_copy(destination: *mut HostBlock, source: *const HostBlock
 }
 
 extern "C" fn wrapper_dispose(block: *mut HostBlock) {
+    // The bridge's own wrappers (not heap copies: no BLOCK_NEEDS_FREE) are
+    // given back by the bridge: at the end of their call, or never once a
+    // holder keeps one (keep_wrapper). A release of one by a queue that
+    // ran it must not take the reference a collection still counts on.
+    if unsafe { (*block).flags } as u32 & BLOCK_NEEDS_FREE == 0 {
+        return;
+    }
     live_wrappers(|live| live.remove(&(block as usize)));
     let guest = unsafe { (*block).guest as u32 };
     if let Some(g) = *BLOCK_OWNER.read().unwrap_or_else(|e| e.into_inner()) {
         if let Err(error) = super::functions::release_guest_block(g, guest) {
             crate::log!("32-bit Objective-C: releasing block {guest:#x}: {error}");
+        }
+    }
+}
+
+/// (bridge, guest block) a host holder kept (a collection, a queued
+/// message) -> the one wrapper that now lives on with its guest reference
+/// (Apple's holder retains the heap block itself). The game passing the
+/// block again gets the same wrapper, so the holder finds it
+/// (containsObject:, removeObject:).
+static KEPT_WRAPPERS: Mutex<Option<HashMap<(usize, u32), usize>>> = Mutex::new(None);
+
+/// The bridge's own wrappers a holder on another thread kept: they live on
+/// when the call that made them ends (end_wrapper_scope).
+static KEEP_AT_END: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+
+fn kept_wrappers<R>(f: impl FnOnce(&mut HashMap<(usize, u32), usize>) -> R) -> R {
+    f(KEPT_WRAPPERS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::default))
+}
+
+fn keep_at_end<R>(f: impl FnOnce(&mut HashSet<usize>) -> R) -> R {
+    f(KEEP_AT_END.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashSet::default))
+}
+
+/// A wrapper that lives on from now: the block's lasting one, unless it
+/// already has one (then this one is simply never let go).
+fn keep_forever(wrapper: Box<HostBlock>) {
+    let key = (wrapper.owner, wrapper.guest as u32);
+    let host = Box::into_raw(wrapper) as usize;
+    kept_wrappers(|kept| {
+        kept.entry(key).or_insert(host);
+    });
+}
+
+/// counted::keep's hook: a game block a host holder keeps lives on.
+/// - one of this thread's call wrappers leaves the call's list now;
+/// - one of another thread's goes when its call ends (KEEP_AT_END);
+/// - a host copy (_Block_copy'd) gets a saturated count, which no
+///   _Block_release takes down, so it is never freed under the holder.
+fn keep_wrapper(object: runtime::Id) {
+    if !live_wrappers(|live| live.contains(&object)) {
+        return;
+    }
+    let block = object as *mut HostBlock;
+    if unsafe { (*block).flags } as u32 & BLOCK_NEEDS_FREE != 0 {
+        let flags = unsafe { &*(std::ptr::addr_of_mut!((*block).flags) as *const std::sync::atomic::AtomicI32) };
+        flags.fetch_or(BLOCK_REFCOUNT_MASK as i32, std::sync::atomic::Ordering::AcqRel);
+        let key = unsafe { ((*block).owner, (*block).guest as u32) };
+        kept_wrappers(|kept| {
+            kept.entry(key).or_insert(object);
+        });
+        return;
+    }
+    if kept_wrappers(|kept| kept.values().any(|&host| host == object)) {
+        return;
+    }
+    let mine = SCOPED_WRAPPERS.with(|w| {
+        let mut w = w.borrow_mut();
+        let at = w.iter().position(|b| &**b as *const HostBlock as usize == object)?;
+        Some(w.remove(at))
+    });
+    match mine {
+        Some(wrapper) => keep_forever(wrapper),
+        None => {
+            keep_at_end(|keep| keep.insert(object));
         }
     }
 }
@@ -234,7 +344,12 @@ fn end_wrapper_scope(g: &dyn GuestSide, mark: usize) -> Result<(), String> {
         w.split_off(at)
     });
     for wrapper in ended {
-        live_wrappers(|live| live.remove(&(&*wrapper as *const HostBlock as usize)));
+        let host = &*wrapper as *const HostBlock as usize;
+        if keep_at_end(|keep| keep.remove(&host)) {
+            keep_forever(wrapper);
+            continue;
+        }
+        live_wrappers(|live| live.remove(&host));
         super::functions::release_guest_block(g, wrapper.guest as u32)?;
     }
     Ok(())
@@ -250,57 +365,77 @@ pub fn in_wrapper_scope<R>(g: &dyn GuestSide, work: impl FnOnce() -> Result<R, S
 }
 
 pub struct Bridge {
+    /// Tells this bridge's kept block wrappers from another's (a second
+    /// bridge in the process may have a block at the same guest address).
+    id: usize,
     pub classes: GuestClasses,
     to_host: HashMap<u32, usize>,
     to_guest: HashMap<usize, u32>,
     /// Game instances whose guest memory the bridge allocated.
     game_instances: HashMap<u32, ()>,
+    /// Host forms of game objects that were deallocated: nil to the game.
+    dead: HashSet<usize>,
     framework: HashMap<String, (u32, u32)>,
     framework_by_guest: HashMap<u32, (String, bool)>,
+    /// Host framework class -> its guest class (from `framework`, by name).
+    framework_isa: HashMap<usize, u32>,
     /// Game class (not metaclass) -> host mirror class.
     mirrors: HashMap<u32, usize>,
+    /// Host protocol -> the game's protocol_t (see protocols.rs).
+    protocols: HashMap<usize, u32>,
     sel_names: HashMap<u32, String>,
     sel_guest: HashMap<String, u32>,
+    /// Guest selector -> host selector.
+    host_sels: HashMap<u32, usize>,
     specials: HashMap<u32, Special>,
     /// Host object -> guest copy of its -bytes (address, capacity).
     buffers: HashMap<usize, (u32, u32)>,
     /// Host object -> guest copies of its `host-bytes` results.
     kept_copies: HashMap<usize, Vec<u32>>,
-    /// Guest address of the objc_msgSend stand-in (imp of framework Methods).
-    pub msg_send_stub: u32,
     /// Classes whose +initialize is running (on which thread) or done.
     init_state: HashMap<u32, InitState>,
     /// The game has a category +initialize on a framework class, so
     /// framework classes (their guest copies) are initialized too.
     framework_initializers: bool,
+    /// Bytes the next game instance gets past its ivars (NSAllocateObject).
+    extra_bytes: u32,
 }
 
 /// Where a message goes.
 enum Target {
     Guest { imp: u32, types: String },
     Host { class: String, meta: bool, via_super: bool },
+    /// No method in the game's class chain (the error if not forwarded).
+    Missing(String),
 }
 
 impl Bridge {
     pub fn new(md: &ObjcMetadata32) -> Result<Bridge, String> {
         let classes = GuestClasses::from_metadata(md)?;
         let framework_initializers = classes.framework_category_entries().iter().any(|(_, meta, sel)| *meta && sel == "initialize");
+        crate::fw::counted::set_keep_hook(keep_wrapper);
+        static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
         Ok(Bridge {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             framework_initializers,
             classes,
-            to_host: HashMap::new(),
-            to_guest: HashMap::new(),
-            game_instances: HashMap::new(),
-            framework: HashMap::new(),
-            framework_by_guest: HashMap::new(),
-            mirrors: HashMap::new(),
-            sel_names: HashMap::new(),
-            sel_guest: HashMap::new(),
-            specials: HashMap::new(),
-            buffers: HashMap::new(),
-            kept_copies: HashMap::new(),
-            msg_send_stub: 0,
-            init_state: HashMap::new(),
+            to_host: HashMap::default(),
+            to_guest: HashMap::default(),
+            game_instances: HashMap::default(),
+            dead: HashSet::default(),
+            framework: HashMap::default(),
+            framework_by_guest: HashMap::default(),
+            framework_isa: HashMap::default(),
+            mirrors: HashMap::default(),
+            protocols: HashMap::default(),
+            sel_names: HashMap::default(),
+            sel_guest: HashMap::default(),
+            host_sels: HashMap::default(),
+            specials: HashMap::default(),
+            buffers: HashMap::default(),
+            kept_copies: HashMap::default(),
+            init_state: HashMap::default(),
+            extra_bytes: 0,
         })
     }
 
@@ -356,8 +491,12 @@ impl Bridge {
     /// A host block that runs guest block `block` (which must already be a
     /// heap or global block; see functions::block_copy). It holds a
     /// reference to the guest block until the bridge call that made it ends;
-    /// a host that keeps it copies it and holds its own.
+    /// a host that keeps it copies it and holds its own, or keeps the wrapper
+    /// (keep_wrapper), which then lives on as the block's one wrapper.
     fn host_block(&mut self, g: &dyn GuestSide, block: u32) -> usize {
+        if let Some(kept) = kept_wrappers(|kept| kept.get(&(self.id, block)).copied()) {
+            return kept;
+        }
         retain_guest_block(g, block);
         let isa = crate::symbols::lookup("__NSConcreteStackBlock").map(|s| s.0).unwrap_or(0);
         let wrapper = Box::new(HostBlock {
@@ -367,6 +506,7 @@ impl Bridge {
             invoke: mirror::trampoline_address(),
             descriptor: &WRAPPER_DESCRIPTOR,
             guest: block as usize,
+            owner: self.id,
         });
         let host = &*wrapper as *const HostBlock as usize;
         live_wrappers(|live| live.insert(host));
@@ -375,13 +515,29 @@ impl Bridge {
     }
 
     pub fn selector_name(&mut self, g: &dyn GuestSide, sel: u32) -> String {
-        if let Some(name) = self.sel_names.get(&sel) {
-            return name.clone();
+        self.selector_str(g, sel).to_string()
+    }
+
+    /// The selector's name without a copy.
+    pub fn selector_str(&mut self, g: &dyn GuestSide, sel: u32) -> &str {
+        match self.sel_names.entry(sel) {
+            std::collections::hash_map::Entry::Occupied(known) => known.into_mut(),
+            std::collections::hash_map::Entry::Vacant(new) => {
+                let name = guest_cstr(g, sel);
+                self.sel_guest.entry(name.clone()).or_insert(sel);
+                new.insert(name)
+            }
         }
-        let name = guest_cstr(g, sel);
-        self.sel_names.insert(sel, name.clone());
-        self.sel_guest.entry(name.clone()).or_insert(sel);
-        name
+    }
+
+    /// The host selector for a guest one (found by name once).
+    pub fn host_sel(&mut self, g: &dyn GuestSide, sel: u32) -> usize {
+        if let Some(&host) = self.host_sels.get(&sel) {
+            return host;
+        }
+        let host = runtime::sel(self.selector_str(g, sel));
+        self.host_sels.insert(sel, host);
+        host
     }
 
     /// The one guest selector for `name` (the game's own string if it has one).
@@ -419,10 +575,15 @@ impl Bridge {
         found
     }
 
-    /// Forgets a game object whose host form was deallocated; frees its guest memory.
+    /// Forgets a game object whose host form was deallocated; frees its guest
+    /// memory. The host form (never freed) is nil to the game from now on.
     pub fn forget(&mut self, g: &dyn GuestSide, guest: u32) {
         if let Some(host) = self.to_host.remove(&guest) {
             self.to_guest.remove(&host);
+            crate::fw::counted::forget_game_object(host);
+            if self.game_instances.contains_key(&guest) {
+                self.dead.insert(host);
+            }
         }
         if self.game_instances.remove(&guest).is_some() {
             g.free(guest);
@@ -475,18 +636,22 @@ impl Bridge {
 
     /// The guest object for a host object (made on first sight).
     pub fn guest_object(&mut self, g: &dyn GuestSide, host: usize) -> Result<u32, String> {
-        if host == 0 {
+        if host == 0 || self.dead.contains(&host) {
             return Ok(0);
         }
         if let Some(block) = wrapper_guest(host) {
             return Ok(block);
         }
-        let (class, is_class, name, meta, partner) = {
+        // A protocol (no class to read) goes back as the game's own.
+        if let Some(&protocol) = self.protocols.get(&host) {
+            return Ok(protocol);
+        }
+        let (class, is_class, meta, partner) = {
             let rt = runtime::lock();
             let is_class = rt.classes.contains_key(&host);
             let class = if is_class { host } else { rt.class_of(host) };
             let rec = rt.classes.get(&class).ok_or_else(|| format!("host object {host:#x} has unknown class {class:#x}"))?;
-            (class, is_class, rec.name.clone(), rec.meta, rec.partner)
+            (class, is_class, rec.meta, rec.partner)
         };
         if let Some(&guest) = self.to_guest.get(&host) {
             // A host address can be reused after its object is freed: keep the
@@ -497,6 +662,7 @@ impl Bridge {
             self.to_guest.remove(&host);
             self.to_host.remove(&guest);
         }
+        let name = runtime::lock().class_name(class);
         if is_class {
             let mirror_of = mirror::mirror_guest_class(if meta { partner } else { class });
             return Ok(match mirror_of {
@@ -514,11 +680,12 @@ impl Bridge {
         }
         let guest = match mirror::mirror_guest_class(class) {
             Some(guest_class) => {
-                let size = self.classes.class(guest_class).map(|c| c.instance_size).unwrap_or(4).max(4);
+                let size = self.classes.class(guest_class).map(|c| c.instance_size).unwrap_or(4).max(4) + std::mem::take(&mut self.extra_bytes);
                 let object = g.alloc(size);
                 g.write(object, &vec![0u8; size as usize]);
                 g.write(object, &guest_class.to_le_bytes());
                 self.game_instances.insert(object, ());
+                crate::fw::counted::watch_game_object(host);
                 if !self.own_methods_up(guest_class, CXX_CONSTRUCT).is_empty() {
                     UNCONSTRUCTED.with(|u| u.borrow_mut().push(object));
                 }
@@ -540,10 +707,29 @@ impl Bridge {
         match mirror::mirror_guest_class(host_class) {
             Some(guest_class) => isa == guest_class,
             None => {
+                if let Some(&known) = self.framework_isa.get(&host_class) {
+                    return isa == known;
+                }
                 let name = runtime::lock().class_name(host_class);
-                self.framework.get(&name).map(|p| p.0) == Some(isa)
+                let known = self.framework.get(&name).map(|p| p.0);
+                if let Some(known) = known {
+                    self.framework_isa.insert(host_class, known);
+                }
+                known == Some(isa)
             }
         }
+    }
+
+    /// NSAllocateObject: a new zeroed instance of guest class `class`, the
+    /// root allocator's way (no +alloc runs), with `extra` more bytes after a
+    /// game class's ivars (a framework object is its usual proxy). Its C++
+    /// constructors wait for construct_pending.
+    pub fn allocate(&mut self, g: &dyn GuestSide, class: u32, extra: u32) -> Result<u32, String> {
+        let host = runtime::alloc_instance(self.host_object_for(g, class)?);
+        self.extra_bytes = extra;
+        let object = self.guest_object(g, host);
+        self.extra_bytes = 0;
+        object
     }
 
     /// The host object for a guest object (a host form is made for game
@@ -599,7 +785,7 @@ impl Bridge {
             return match self.classes.lookup(isa, sel) {
                 Lookup::Guest(m) => Ok(Target::Guest { imp: m.imp, types: m.types.clone() }),
                 Lookup::Framework { class, meta } => self.framework_target(&class, meta, sel, false),
-                Lookup::Missing => Err(format!("{}{sel}: no method in the game's class chain", self.describe(isa))),
+                Lookup::Missing => Ok(Target::Missing(format!("{MISSING_METHOD}{}{sel}]: no method in the game's class chain", self.describe(isa)))),
             };
         }
         match self.framework_by_guest.get(&isa) {
@@ -645,9 +831,74 @@ impl Bridge {
         }
     }
 
+    /// Whether a receiver whose isa is `isa` answers `sel`: a game method, a
+    /// game category on a framework class, or the host class's own method.
+    pub(super) fn answers(&self, isa: u32, sel: &str) -> bool {
+        let host_sel = runtime::sel(sel);
+        let framework = |class: &str, meta: bool| {
+            self.framework_category(class, meta, sel).is_some()
+                || runtime::existing_class(class, meta).is_some_and(|host| runtime::lock().lookup(host, host_sel).is_some())
+        };
+        if self.classes.class(isa).is_some() {
+            return match self.classes.lookup(isa, sel) {
+                Lookup::Guest(_) => true,
+                Lookup::Framework { class, meta } => framework(&class, meta),
+                Lookup::Missing => false,
+            };
+        }
+        self.framework_by_guest.get(&isa).is_some_and(|(class, meta)| framework(class, *meta))
+    }
+
+    /// Whether the game itself answers `sel` for a receiver whose isa is
+    /// `isa` (its own method or a category method, not the host's).
+    pub(super) fn game_answers(&self, isa: u32, sel: &str) -> bool {
+        if self.classes.class(isa).is_some() {
+            return match self.classes.lookup(isa, sel) {
+                Lookup::Guest(_) => true,
+                Lookup::Framework { class, meta } => self.framework_category(&class, meta, sel).is_some(),
+                Lookup::Missing => false,
+            };
+        }
+        self.framework_by_guest.get(&isa).is_some_and(|(class, meta)| self.framework_category(class, *meta, sel).is_some())
+    }
+
+    /// The armv7 type encoding of the method a receiver whose isa is `isa`
+    /// answers `sel` with (the game's own, else the framework table's for a
+    /// method the host has); None when it has no such method.
+    pub(super) fn armv7_method_types(&self, isa: u32, sel: &str) -> Option<String> {
+        let framework = |class: &str, meta: bool| -> Option<String> {
+            if let Some((_, types)) = self.framework_category(class, meta, sel) {
+                return Some(types);
+            }
+            let (host, host_sel) = (runtime::existing_class(class, meta)?, runtime::sel(sel));
+            runtime::lock().lookup(host, host_sel)?;
+            framework_row(class, sel).map(|row| row.encoding.to_string())
+        };
+        if self.classes.class(isa).is_some() {
+            return match self.classes.lookup(isa, sel) {
+                Lookup::Guest(m) => Some(m.types.clone()),
+                Lookup::Framework { class, meta } => framework(&class, meta),
+                Lookup::Missing => None,
+            };
+        }
+        let (class, meta) = self.framework_by_guest.get(&isa)?;
+        framework(class, *meta)
+    }
+
+    /// A guest class (or framework class's guest copy): whether it is a
+    /// metaclass and its partner (the class for a metaclass, the metaclass
+    /// for a class).
+    pub(super) fn class_pair(&self, class: u32) -> Option<(bool, u32)> {
+        if let Some(c) = self.classes.class(class) {
+            return Some((c.meta, c.partner));
+        }
+        let (name, meta) = self.framework_by_guest.get(&class)?;
+        self.framework.get(name).map(|&(c, m)| (*meta, if *meta { c } else { m }))
+    }
+
     /// The name of the class the guest sees for a receiver's isa, and whether
     /// that isa is a metaclass (the receiver is the class itself).
-    fn class_display(&self, isa: u32) -> (String, bool) {
+    pub(super) fn class_display(&self, isa: u32) -> (String, bool) {
         if let Some(c) = self.classes.class(isa) {
             return (c.name.clone(), c.meta);
         }
@@ -697,8 +948,7 @@ impl Boundary for Session<'_> {
         self.bridge.guest_object(self.g, host)
     }
     fn sel_to_host(&mut self, guest: u32) -> Result<usize, String> {
-        let name = self.bridge.selector_name(self.g, guest);
-        Ok(runtime::sel(&name))
+        Ok(self.bridge.host_sel(self.g, guest))
     }
     fn sel_to_guest(&mut self, host: usize) -> Result<u32, String> {
         let name = unsafe { runtime::cstr(host) };
@@ -728,18 +978,25 @@ pub fn is_host_object(value: usize) -> bool {
     if value < 0x10000 || value >= 1 << 48 || value % 8 != 0 {
         return false;
     }
-    let rt = runtime::lock();
-    rt.classes.contains_key(&rt.class_of(value))
+    // Data that only looks like a pointer (NDR_record, handles) may point at
+    // nothing, so the class word is read without faulting.
+    let Some(isa) = crate::report::read_word(value) else { return false };
+    runtime::lock().classes.contains_key(&isa)
 }
 
 fn lock(bridge: &Mutex<Bridge>) -> std::sync::MutexGuard<'_, Bridge> {
     bridge.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Defines the host mirror of every game class (parents first) and makes
-/// every selector reference point at one string per selector name.
+/// Slides game ivars past grown superclasses, defines the host mirror of
+/// every game class (parents first) and makes every selector reference
+/// point at one string per selector name.
 pub fn install(bridge: &Mutex<Bridge>, g: &dyn GuestSide, md: &ObjcMetadata32) -> Result<(), String> {
     let mut b = lock(bridge);
+    // The game's code reads the offset variables: they move with the ivars.
+    for (variable, diff) in b.classes.slide_ivars() {
+        g.write(variable, &(u32_at(g, variable) + diff).to_le_bytes());
+    }
     let order: Vec<(u32, String, super::classes::Super, u32)> = b
         .classes
         .classes_parents_first()
@@ -762,6 +1019,27 @@ pub fn install(bridge: &Mutex<Bridge>, g: &dyn GuestSide, md: &ObjcMetadata32) -
         let mirror = mirror::define_mirror_class(&name, host_super, address, &instance, &class)?;
         b.mirrors.insert(address, mirror);
     }
+    // Game protocols: a host form each way, and the classes adopt theirs
+    // (categories' too, on game and framework classes).
+    let protocols = super::protocols::host_protocols(md);
+    for (&guest, &host) in &protocols {
+        b.pair(guest, host);
+        b.protocols.insert(host, guest);
+    }
+    let hosts_of = |list: &[u32]| -> Vec<usize> { list.iter().filter_map(|p| protocols.get(p).copied()).collect() };
+    for c in &md.classes {
+        if let Some(&mirror) = b.mirrors.get(&c.address) {
+            runtime::add_protocols(mirror, &hosts_of(&c.instance.protocols));
+        }
+    }
+    for category in &md.categories {
+        let class = match &category.class {
+            guest32_image::ClassTarget::Local(address) => b.mirrors.get(address).copied().unwrap_or(0),
+            guest32_image::ClassTarget::External(name) => Bridge::host_class_named(name, false),
+            _ => 0,
+        };
+        runtime::add_protocols(class, &hosts_of(&category.protocols));
+    }
     // Game category methods on framework classes answer host messages too.
     for (class, meta, sel) in b.classes.framework_category_entries() {
         // +initialize too: the host runtime's own +initialize of a host class
@@ -774,6 +1052,7 @@ pub fn install(bridge: &Mutex<Bridge>, g: &dyn GuestSide, md: &ObjcMetadata32) -
         let current = u32_at(g, r.slot);
         let canonical = *b.sel_guest.entry(r.name.clone()).or_insert(current);
         b.sel_names.insert(canonical, r.name.clone());
+        b.host_sels.remove(&canonical);
         if canonical != current {
             g.write(r.slot, &canonical.to_le_bytes());
         }
@@ -804,7 +1083,7 @@ pub fn run_loads(bridge: &Mutex<Bridge>, g: &dyn GuestSide, md: &ObjcMetadata32)
         }
     }
     let by_address: HashMap<u32, &guest32_image::ObjcClass32> = md.classes.iter().map(|c| (c.address, c)).collect();
-    let (mut done, mut order) = (HashSet::new(), Vec::new());
+    let (mut done, mut order) = (HashSet::default(), Vec::new());
     for class in &md.classes {
         visit(class, &by_address, &mut done, &mut order);
     }
@@ -934,19 +1213,47 @@ pub fn set_block_owner(g: &'static dyn GuestSide) {
     *BLOCK_OWNER.write().unwrap_or_else(|e| e.into_inner()) = Some(g);
 }
 
+/// How every "the game asked for a method nobody has" error starts, so a
+/// run that keeps going can skip just that message (`functions::skip_missing`).
+pub const MISSING_METHOD: &str = "missing method ";
+
+/// The framework table's row for a message to an instance of the host class
+/// `class`: that class's own row (`class:Name`), else the general one.
+pub fn framework_row(class: &str, sel: &str) -> Option<&'static FrameworkSelector> {
+    let is_kind = |name: &str| {
+        let (receiver, named) = (runtime::class_named(class), runtime::class_named(name));
+        let rt = runtime::lock();
+        receiver != 0 && named != 0 && rt.is_subclass(receiver, named)
+    };
+    FrameworkSelectors::builtin().get_for(sel, is_kind)
+}
+
+/// Throws `exception` (a host NSException) in the guest, as -raise does.
+pub(super) fn throw_in_guest(b: &mut Bridge, g: &dyn GuestSide, exception: usize) -> Result<GuestRet, String> {
+    let exception = b.guest_object(g, exception)?;
+    PENDING_THROW.with(|p| p.set(Some(exception)));
+    Ok(GuestRet { r0: 0, r1: 0 })
+}
+
 /// Type encoding for a message the host answers: the framework table, else
 /// the game's own method of the same name (an override has the same types).
 fn host_signature(b: &Bridge, class: &str, meta: bool, sel: &str) -> Result<(Signature, HostCallOptions), String> {
-    if let Some(entry) = FrameworkSelectors::builtin().get(sel) {
+    if let Some(entry) = framework_row(class, sel) {
         let options =
-            HostCallOptions { real_float: entry.real_float, varargs: entry.varargs, arrays: entry.arrays, host_bytes: entry.host_bytes };
+            HostCallOptions {
+                real_float: entry.real_float,
+                varargs: entry.varargs,
+                arrays: entry.arrays,
+                host_bytes: entry.host_bytes,
+                not_found: entry.not_found,
+            };
         return Ok((entry.signature.clone(), options));
     }
     if let Some(types) = b.classes.types_for_selector(sel) {
         return Ok((Signature::parse_method(types)?, HostCallOptions::default()));
     }
     Err(format!(
-        "{}[{class} {sel}]: no type encoding for this framework selector (add it to framework_selectors.tsv)",
+        "{MISSING_METHOD}{}[{class} {sel}]: no type encoding for this framework selector (add it to framework_selectors.tsv)",
         if meta { "+" } else { "-" }
     ))
 }
@@ -959,11 +1266,78 @@ pub fn send_from_guest(
     kind: SendKind,
     words: &dyn Fn(u32) -> u32,
 ) -> Result<GuestRet, String> {
+    let may_jump = MAY_JUMP.with(|m| m.take());
+    // A setter of a key something observes on the receiver: announced
+    // around the call, as Apple's KVO does (fw/object.rs). Not for super
+    // calls: the setter the game sent already announces it.
+    if kind == SendKind::Normal && crate::fw::object::kvo_active() {
+        if let Some((object, key)) = observed_setter(bridge, g, words) {
+            crate::fw::object::will_change(object, &key);
+            let result = send_unobserved(bridge, g, kind, words, false);
+            crate::fw::object::did_change(object, &key);
+            return result;
+        }
+    }
+    send_unobserved(bridge, g, kind, words, may_jump)
+}
+
+/// The receiver (as the host knows it) and key, when this message is the
+/// setter of an observed key.
+fn observed_setter(bridge: &Mutex<Bridge>, g: &dyn GuestSide, words: &dyn Fn(u32) -> u32) -> Option<(runtime::Id, String)> {
+    let (object, name) = {
+        let mut b = lock(bridge);
+        let receiver = words(0);
+        if receiver == 0 {
+            return None;
+        }
+        let name = b.selector_str(g, words(1));
+        if !(name.starts_with("set") || name.starts_with("_set")) {
+            return None;
+        }
+        let name = name.to_string();
+        (b.host_object(receiver)?, name)
+    };
+    let key = crate::fw::object::observed_setter_key(object, &name)?;
+    Some((object, key))
+}
+
+fn send_unobserved(
+    bridge: &Mutex<Bridge>,
+    g: &dyn GuestSide,
+    kind: SendKind,
+    words: &dyn Fn(u32) -> u32,
+    may_jump: bool,
+) -> Result<GuestRet, String> {
     let stret = matches!(kind, SendKind::Stret | SendKind::Super2Stret);
     let first = u32::from(stret);
     let mut b = lock(bridge);
     let sel = words(first + 1);
+    // A message a game method answered before: straight to it, without the
+    // lookups by name below (most of a busy game's message time).
+    if matches!(kind, SendKind::Normal | SendKind::Stret) && !runtime::message_trace_on() {
+        let receiver = words(first);
+        if receiver != 0 {
+            let isa = u32_at(g, receiver);
+            if let Some(send) = b.classes.cached_send(isa, sel) {
+                drop(b);
+                return call_game_method(g, send, words, may_jump);
+            }
+            if let Some(host) = b.classes.cached_host_send(isa, sel) {
+                let host_receiver = b.host_object_for(g, receiver)?;
+                drop(b);
+                if let Some(imp) = runtime::imp_for(host_receiver, host.sel) {
+                    return call_remembered_host(bridge, g, words, &host, imp);
+                }
+                b = lock(bridge);
+            }
+        }
+    }
     let name = b.selector_name(g, sel);
+    // The class the lookup starts at (a super call's starting superclass).
+    let start;
+    // (class, selector) when the answer may be remembered: a game method
+    // found in the game's own class chain, for a class whose +initialize is done.
+    let mut cacheable = None;
     let (receiver, target) = match kind {
         SendKind::Normal | SendKind::Stret => {
             let receiver = words(first);
@@ -971,6 +1345,7 @@ pub fn send_from_guest(
                 return Ok(GuestRet { r0: if stret { words(0) } else { 0 }, r1: 0 });
             }
             let isa = u32_at(g, receiver);
+            start = isa;
             if b.special(isa).is_some_and(Special::is_block) {
                 drop(b);
                 let ctx = super::functions::Ctx { bridge, g };
@@ -990,14 +1365,26 @@ pub fn send_from_guest(
                 initialize(bridge, g, class)?;
                 b = lock(bridge);
             }
-            (receiver, b.resolve(isa, &name)?)
+            let target = b.resolve(isa, &name)?;
+            if matches!(target, Target::Guest { .. }) && matches!(b.classes.lookup(isa, &name), Lookup::Guest(_)) && class_to_initialize(&b, isa).is_none() {
+                cacheable = Some(isa);
+            }
+            (receiver, target)
         }
         SendKind::Super2 | SendKind::Super2Stret => {
             let pair = words(first);
             let (receiver, current) = (u32_at(g, pair), u32_at(g, pair + 4));
             let c = b.classes.class(current).ok_or_else(|| format!("super call {name} from unknown class {current:#x}"))?;
-            let meta = c.meta;
-            let target = match c.superclass.clone() {
+            let (meta, superclass) = (c.meta, c.superclass.clone());
+            start = match &superclass {
+                super::classes::Super::Game(parent) => *parent,
+                super::classes::Super::Framework(class) => {
+                    let (class, metaclass) = b.framework_class(g, class);
+                    if meta { metaclass } else { class }
+                }
+                super::classes::Super::None => return Err(format!("super call {name} from a root class")),
+            };
+            let target = match superclass {
                 super::classes::Super::Game(parent) => b.resolve_super(parent, &name)?,
                 super::classes::Super::Framework(class) => b.framework_target(&class, meta, &name, true)?,
                 super::classes::Super::None => return Err(format!("super call {name} from a root class")),
@@ -1006,24 +1393,58 @@ pub fn send_from_guest(
         }
     };
     // Test switch IOS_TRACE_MESSAGES: the same "-[Class selector]" lines the
-    // host's messages get, with the guest's class names.
+    // host's messages get, with the guest's class names, and the first two
+    // argument words (as numbers and as floats); a traced game method's
+    // answer is logged too (it runs nested, not jumped into, for that).
+    let mut traced = None;
     if runtime::message_trace_on() {
         let (class_name, class_is_meta) = b.class_display(u32_at(g, receiver));
         if let Some(text) = runtime::traced_message_text(&class_name, class_is_meta, &name) {
-            crate::log!("32-bit message {text}");
+            let (a, c) = (words(first + 2), words(first + 3));
+            crate::log!("32-bit message {text} ({a:#x} {}, {c:#x} {})", f32::from_bits(a), f32::from_bits(c));
+            traced = Some(text);
         }
     }
     let receiver_word = first;
     let get = |i: u32| if i == receiver_word { receiver } else { words(i) };
     match target {
-        Target::Guest { imp, types } => {
+        Target::Missing(error) => {
             drop(b);
-            let sig = Signature::parse_method(&types)?;
-            let call_words: Vec<u32> = (0..sig.guest_total_words()).map(get).collect();
-            let r = g.call(imp, &call_words)?;
-            Ok(GuestRet { r0: r as u32, r1: (r >> 32) as u32 })
+            super::forward::forward_message(bridge, g, kind, words, receiver, start, &error)
+        }
+        Target::Guest { imp, types } => {
+            let send = CachedSend { imp, words: Signature::parse_method(&types)?.guest_total_words() };
+            // A game method a fix follows (game_fixes.rs) is not remembered,
+            // so each call comes back here.
+            let fixed = super::game_fixes::follows(&name, || b.class_display(u32_at(g, receiver)).0);
+            if let Some(isa) = cacheable.filter(|_| !fixed) {
+                b.classes.remember_send(isa, sel, send);
+            }
+            drop(b);
+            let result = call_game_method(g, send, &get, may_jump && !fixed && traced.is_none())?;
+            if let Some(text) = &traced {
+                crate::log!("32-bit message {text} answered {:#x} {}", result.r0, f32::from_bits(result.r0));
+            }
+            if fixed {
+                super::game_fixes::after_message(bridge, g, receiver, get(first + 2))?;
+            }
+            Ok(result)
         }
         Target::Host { class, meta, via_super } => {
+            // +instanceMethodForSelector: / -methodForSelector:: the game calls
+            // the answer itself, so it is guest code: a game method's own
+            // function, else objc_msgSend's stub (stret's for struct results),
+            // which reaches the method alike. (The host's answer is host code.)
+            if matches!(name.as_str(), "instanceMethodForSelector:" | "methodForSelector:") {
+                let owner = if name == "instanceMethodForSelector:" { receiver } else { u32_at(g, receiver) };
+                let asked = b.selector_name(g, get(first + 2));
+                let imp = match b.classes.lookup(owner, &asked) {
+                    Lookup::Guest(m) => m.imp,
+                    Lookup::Framework { class, .. } => message_stub(g, framework_row(&class, &asked).map(|e| e.encoding)),
+                    Lookup::Missing => message_stub(g, FrameworkSelectors::builtin().get(&asked).map(|e| e.encoding)),
+                };
+                return Ok(GuestRet { r0: imp, r1: 0 });
+            }
             // NSException's -raise and +raise:format: from game code: thrown in
             // the guest, as objc_exception_throw throws (the host's own raise
             // would unwind host code).
@@ -1050,6 +1471,71 @@ pub fn send_from_guest(
                 PENDING_THROW.with(|p| p.set(Some(exception)));
                 return Ok(GuestRet { r0: 0, r1: 0 });
             }
+            // -doesNotRecognizeSelector: from game code: Apple's exception,
+            // thrown in the guest like -raise.
+            if name == "doesNotRecognizeSelector:" && !meta {
+                let asked = b.selector_name(g, get(first + 2));
+                let host = b.host_object_for(g, receiver)?;
+                drop(b);
+                let exception = crate::fw::object::unrecognized_selector_exception(host, &asked);
+                let exception = lock(bridge).guest_object(g, exception)?;
+                PENDING_THROW.with(|p| p.set(Some(exception)));
+                return Ok(GuestRet { r0: 0, r1: 0 });
+            }
+            // Method signatures for game code have the armv7 layout, and the
+            // root classes' -forwardInvocation: (see forward.rs).
+            match name.as_str() {
+                "signatureWithObjCTypes:" if meta => {
+                    let types = guest_cstr(g, get(first + 2));
+                    let signature = crate::fw::invocation::make_signature_in(&types, crate::fw::invocation::Layout::Armv7);
+                    return Ok(GuestRet { r0: b.guest_object(g, signature)?, r1: 0 });
+                }
+                "methodSignatureForSelector:" | "instanceMethodSignatureForSelector:" => {
+                    let asked = b.selector_name(g, get(first + 2));
+                    let host_receiver = b.host_object_for(g, receiver)?;
+                    if name == "methodSignatureForSelector:" && !meta && crate::objc::forward::is_proxy_object(host_receiver) {
+                        drop(b);
+                        let exception = crate::fw::object::proxy_abstract_exception("methodSignatureForSelector:");
+                        return throw_in_guest(&mut lock(bridge), g, exception);
+                    }
+                    // Of the receiver's own class, also from a super call (as Apple's).
+                    let owner = if name == "instanceMethodSignatureForSelector:" { receiver } else { u32_at(g, receiver) };
+                    let signature = match b.armv7_method_types(owner, &asked) {
+                        Some(types) => crate::fw::invocation::make_signature_in(&types, crate::fw::invocation::Layout::Armv7),
+                        None => 0,
+                    };
+                    return Ok(GuestRet { r0: b.guest_object(g, signature)?, r1: 0 });
+                }
+                "forwardInvocation:" if !meta => {
+                    drop(b);
+                    return super::forward::root_forward_invocation(bridge, g, receiver, get(first + 2));
+                }
+                "sortUsingFunction:context:" | "sortedArrayUsingFunction:context:" if !meta => {
+                    drop(b);
+                    let in_place = name == "sortUsingFunction:context:";
+                    return sort_with_game_function(bridge, g, receiver, get(first + 2), get(first + 3), in_place);
+                }
+                "getObjects:andKeys:" if !meta => {
+                    drop(b);
+                    return dictionary_objects_and_keys(bridge, g, receiver, get(first + 2), get(first + 3));
+                }
+                _ => {}
+            }
+            // No host method: Apple's forwarding (forward.rs).
+            let host_receiver = b.host_object_for(g, receiver)?;
+            let host_sel = b.host_sel(g, sel);
+            drop(b);
+            let imp = if via_super {
+                let host_class = Bridge::host_class_named(&class, meta);
+                runtime::lock().lookup(host_class, host_sel)
+            } else {
+                runtime::imp_for(host_receiver, host_sel)
+            };
+            let Some(imp) = imp else {
+                let error = format!("{MISSING_METHOD}{}[{class} {name}]: not implemented by the host layer", if meta { "+" } else { "-" });
+                return super::forward::forward_message(bridge, g, kind, words, receiver, start, &error);
+            };
+            b = lock(bridge);
             // The framework's -dealloc of a game object: its C++ ivars go first.
             let game_dealloc = name == "dealloc" && b.classes.class(u32_at(g, receiver)).is_some_and(|c| !c.meta);
             if game_dealloc {
@@ -1060,6 +1546,21 @@ pub fn send_from_guest(
             }
             let mark = wrapper_mark();
             let (sig, options) = host_signature(&b, &class, meta, &name)?;
+            // A plain message (no block to move, no bytes to copy, not a
+            // dealloc or super call): remembered for `call_remembered_host`.
+            let plain = !via_super
+                && !game_dealloc
+                && !options.host_bytes
+                && !matches!(name.as_str(), "bytes" | "mutableBytes")
+                && !sig.args.contains(&super::encoding::Ty::Block);
+            if plain && matches!(kind, SendKind::Normal | SendKind::Stret) {
+                let isa = u32_at(g, receiver);
+                if let (None, Ok(plan)) = (class_to_initialize(&b, isa), convert::CallPlan::new(&sig, options)) {
+                    let plan = std::sync::Arc::new(plan);
+                    let send = super::classes::HostSend { sel: host_sel, signature: std::sync::Arc::new(sig.clone()), options, plan };
+                    b.classes.remember_host_send(isa, sel, send);
+                }
+            }
             // The host may keep a block argument: stack blocks move to the heap first.
             let mut replaced: Vec<(u32, u32)> = Vec::new();
             let block_words: Vec<u32> = sig
@@ -1084,18 +1585,14 @@ pub fn send_from_guest(
             let get = |i: u32| replaced.iter().find(|r| r.0 == i).map(|r| r.1).unwrap_or_else(|| get(i));
             let call = convert::prepare_host_call(&sig, options, &get, &mut Session { bridge: &mut b, g })?;
             let host_receiver = call.args.x[0] as usize;
-            let host_sel = runtime::sel(&name);
             drop(b);
-            let imp = if via_super {
-                let host_class = Bridge::host_class_named(&class, meta);
-                runtime::lock().lookup(host_class, host_sel)
-            } else {
-                runtime::imp_for(host_receiver, host_sel)
-            };
-            let imp = imp.ok_or_else(|| format!("{}[{class} {name}] is not implemented by the host layer", if meta { "+" } else { "-" }))?;
-            let mut ret = mirror::call_host(imp, &call.args);
-            // -bytes / -mutableBytes point into host memory: hand the guest a copy
-            // (writes through a mutableBytes copy do not reach the host object).
+            // An exception the host method raises is thrown in the game once it returns.
+            let (mut ret, raised) = crate::fw::exception::catching(|| mirror::call_host(imp, &call.args));
+            // What the call let go of for the last time deallocs before the game goes on.
+            crate::fw::counted::dealloc_pending();
+            // -bytes / -mutableBytes: data bytes live in guest memory (fw::data)
+            // and pass as they are; bytes in host memory get a guest copy
+            // (writes through a mutableBytes copy would not reach the host object).
             // -length first, unlocked: a game subclass may answer it in guest code.
             let pointer = ret.x[0] as usize;
             let in_host = pointer != 0 && g.guest_address(pointer).is_none();
@@ -1121,6 +1618,10 @@ pub fn send_from_guest(
             if game_dealloc {
                 b.forget(g, receiver);
             }
+            if let Some(exception) = raised {
+                let exception = b.guest_object(g, exception)?;
+                PENDING_THROW.with(|p| p.set(Some(exception)));
+            }
             drop(b);
             construct_pending(bridge, g)?;
             // The heap copies made above: a host wrapper holds its own reference.
@@ -1132,6 +1633,117 @@ pub fn send_from_guest(
             Ok(result)
         }
     }
+}
+
+/// A message `remember_host_send` kept, to the host method `imp`: the
+/// plain part of the host call in `send_unobserved`.
+fn call_remembered_host(
+    bridge: &Mutex<Bridge>,
+    g: &dyn GuestSide,
+    words: &dyn Fn(u32) -> u32,
+    host: &super::classes::HostSend,
+    imp: usize,
+) -> Result<GuestRet, String> {
+    let mark = wrapper_mark();
+    let mut b = lock(bridge);
+    let call = convert::prepare_planned(&host.signature, &host.plan, host.options, words, &mut Session { bridge: &mut b, g })?;
+    drop(b);
+    let (ret, raised) = crate::fw::exception::catching(|| mirror::call_host(imp, &call.args));
+    // What the call let go of for the last time deallocs before the game goes on.
+    crate::fw::counted::dealloc_pending();
+    let mut b = lock(bridge);
+    let result = convert::finish_host_call(call, &ret, &mut Session { bridge: &mut b, g })?;
+    if let Some(exception) = raised {
+        let exception = b.guest_object(g, exception)?;
+        PENDING_THROW.with(|p| p.set(Some(exception)));
+    }
+    drop(b);
+    construct_pending(bridge, g)?;
+    end_wrapper_scope(g, mark)?;
+    Ok(result)
+}
+
+/// Runs a game method with the message's argument words, or leaves it to
+/// the caller to jump into when it may (see allow_jump).
+fn call_game_method(g: &dyn GuestSide, send: CachedSend, words: &dyn Fn(u32) -> u32, may_jump: bool) -> Result<GuestRet, String> {
+    if may_jump {
+        JUMP.with(|j| j.set(Some((send.imp, [0, 1, 2, 3].map(words)))));
+        return Ok(GuestRet { r0: 0, r1: 0 });
+    }
+    let call_words: Vec<u32> = (0..send.words).map(words).collect();
+    let r = g.call(send.imp, &call_words)?;
+    Ok(GuestRet { r0: r as u32, r1: (r >> 32) as u32 })
+}
+
+/// -sortUsingFunction:context: and -sortedArrayUsingFunction:context: on a
+/// framework array: the comparator is game code, so the sort runs here and
+/// calls it with the elements' guest ids (a stable merge sort, which any
+/// comparator answer leaves whole).
+fn sort_with_game_function(
+    bridge: &Mutex<Bridge>,
+    g: &dyn GuestSide,
+    receiver: u32,
+    function: u32,
+    context: u32,
+    in_place: bool,
+) -> Result<GuestRet, String> {
+    let array = lock(bridge).host_object_for(g, receiver)?;
+    let count = runtime::send(array, "count", &[]);
+    let hosts: Vec<usize> = (0..count).map(|i| runtime::send(array, "objectAtIndex:", &[i])).collect();
+    let guests = {
+        let mut b = lock(bridge);
+        hosts.iter().map(|&host| b.guest_object(g, host)).collect::<Result<Vec<u32>, String>>()?
+    };
+    // NSComparisonResult: NSOrderedDescending (1) puts the first after the second.
+    let after = |x: usize, y: usize| -> Result<bool, String> { Ok(g.call(function, &[guests[x], guests[y], context])? as u32 as i32 > 0) };
+    let mut order: Vec<usize> = (0..hosts.len()).collect();
+    let mut width = 1;
+    while width < order.len() {
+        let mut merged = Vec::with_capacity(order.len());
+        for run in order.chunks(width * 2) {
+            let (left, right) = run.split_at(width.min(run.len()));
+            let (mut i, mut j) = (0, 0);
+            while i < left.len() && j < right.len() {
+                if after(left[i], right[j])? {
+                    merged.push(right[j]);
+                    j += 1;
+                } else {
+                    merged.push(left[i]);
+                    i += 1;
+                }
+            }
+            merged.extend_from_slice(&left[i..]);
+            merged.extend_from_slice(&right[j..]);
+        }
+        order = merged;
+        width *= 2;
+    }
+    let sorted = crate::fw::collections::array_from(&order.iter().map(|&i| hosts[i]).collect::<Vec<_>>());
+    if in_place {
+        runtime::send(array, "setArray:", &[sorted]);
+        runtime::send(sorted, "release", &[]);
+        return Ok(GuestRet { r0: 0, r1: 0 });
+    }
+    Ok(GuestRet { r0: lock(bridge).guest_object(g, sorted)?, r1: 0 })
+}
+
+/// -getObjects:andKeys: on a framework dictionary: the game's two arrays get
+/// as many guest ids as the dictionary holds (a row could only size them by
+/// an integer argument, which this selector has none of). Either may be NULL.
+fn dictionary_objects_and_keys(bridge: &Mutex<Bridge>, g: &dyn GuestSide, receiver: u32, objects: u32, keys: u32) -> Result<GuestRet, String> {
+    let dictionary = lock(bridge).host_object_for(g, receiver)?;
+    let count = runtime::send(dictionary, "count", &[]);
+    let (mut values, mut names) = (vec![0usize; count], vec![0usize; count]);
+    runtime::send(dictionary, "getObjects:andKeys:", &[values.as_mut_ptr() as usize, names.as_mut_ptr() as usize]);
+    let mut b = lock(bridge);
+    for (out, hosts) in [(objects, &values), (keys, &names)] {
+        if out == 0 {
+            continue;
+        }
+        let guests = hosts.iter().map(|&host| b.guest_object(g, host)).collect::<Result<Vec<u32>, String>>()?;
+        g.write(out, &guests.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>());
+    }
+    Ok(GuestRet { r0: 0, r1: 0 })
 }
 
 /// A guest call to a C function the host layer implements (`address`),
@@ -1162,13 +1774,64 @@ impl Bridge {
         match self.classes.lookup(parent, sel) {
             Lookup::Guest(m) => Ok(Target::Guest { imp: m.imp, types: m.types.clone() }),
             Lookup::Framework { class, meta } => self.framework_target(&class, meta, sel, true),
-            Lookup::Missing => Err(format!("{}{sel}]: super call finds no method", self.describe(parent))),
+            Lookup::Missing => Ok(Target::Missing(format!("{MISSING_METHOD}{}{sel}]: super call finds no method", self.describe(parent)))),
         }
     }
 }
 
+/// A host message the game object `frame.x[0]` has no method for and
+/// forwards by `signature` (an armv7 NSMethodSignature): the registers as
+/// guest words, the invocation's result back in the host's registers.
+pub fn forward_host_message(bridge: &Mutex<Bridge>, g: &dyn GuestSide, frame: &mut HostFrame, signature: usize) -> Result<(), String> {
+    let types = crate::fw::invocation::signature_of(signature).ok_or("forwarding without a method signature")?;
+    let sig = Signature::parse_method(&types.text)?;
+    let mut b = lock(bridge);
+    let receiver = b.guest_object(g, frame.x[0] as usize)?;
+    let call = convert::prepare_guest_call(&sig, frame, &mut Session { bridge: &mut b, g })?;
+    drop(b);
+    let words = call.words.clone();
+    let get = |i: u32| words.get(i as usize).copied().unwrap_or(0);
+    let ret = super::forward::forward_invocation(bridge, g, receiver, signature, sig.ret.guest_returns_in_memory(), &get)?;
+    let mut b = lock(bridge);
+    convert::finish_guest_call(call, ret.r0, ret.r1, frame, &mut Session { bridge: &mut b, g })
+}
+
 /// The mirror trampoline's hook: a host message to a game object runs the
 /// game's method by its own type encoding.
+/// The bridge that game objects whose last reference went are sent -dealloc
+/// through (counted.rs).
+pub fn set_dealloc_bridge(bridge: &'static Mutex<Bridge>, g: &'static dyn GuestSide) {
+    crate::fw::counted::set_dealloc_hook(
+        std::sync::Arc::new(move |host| {
+            if let Err(error) = dealloc_game_object(bridge, g, host) {
+                crate::log!("32-bit Objective-C: -dealloc of {host:#x} failed: {error}");
+            }
+        }),
+        // Room for the -dealloc's own calls ([super dealloc], C++ destructors, releases).
+        std::sync::Arc::new(move || g.nested_calls_left() > DEALLOC_CALL_ROOM),
+    );
+}
+
+/// Nested guest calls a -dealloc is given room for before it waits for a
+/// safe point further out.
+const DEALLOC_CALL_ROOM: u32 = 16;
+
+/// Sends -dealloc to a game object as the game would: its own -dealloc (whose
+/// [super dealloc] frees it), or the framework's for a class without one.
+/// An object this bridge doesn't know (another bridge's) is left alone.
+fn dealloc_game_object(bridge: &Mutex<Bridge>, g: &dyn GuestSide, host: usize) -> Result<(), String> {
+    let words = {
+        let mut b = lock(bridge);
+        let Some(&guest) = b.to_guest.get(&host) else { return Ok(()) };
+        if !b.game_instances.contains_key(&guest) {
+            return Ok(());
+        }
+        [guest, b.guest_selector(g, "dealloc")]
+    };
+    send_from_guest(bridge, g, SendKind::Normal, &|i| words.get(i as usize).copied().unwrap_or(0))?;
+    Ok(())
+}
+
 pub fn dispatch_from_host(bridge: &Mutex<Bridge>, g: &dyn GuestSide, frame: &mut HostFrame) -> Result<(), String> {
     let mut b = lock(bridge);
     let host_self = frame.x[0] as usize;
@@ -1191,7 +1854,21 @@ pub fn dispatch_from_host(bridge: &Mutex<Bridge>, g: &dyn GuestSide, frame: &mut
     }
     let name = unsafe { runtime::cstr(frame.x[1] as usize) };
     let guest_self = b.guest_object(g, host_self)?;
+    // A deallocated game object: a message to nil (a holder that didn't
+    // retain it, as Apple's delegates and observers don't, sends late).
+    if guest_self == 0 {
+        frame.ret = Default::default();
+        return Ok(());
+    }
     let isa = u32_at(g, guest_self);
+    // IOS_TRACE_MESSAGES also names the host's calls into game methods
+    // (control actions, timers, delegate calls).
+    if runtime::message_trace_on() {
+        let (class_name, class_is_meta) = b.class_display(isa);
+        if let Some(text) = runtime::traced_message_text(&class_name, class_is_meta, &name) {
+            crate::log!("32-bit message from the host {text}");
+        }
+    }
     if let Some(class) = class_to_initialize(&b, isa) {
         drop(b);
         initialize(bridge, g, class)?;
@@ -1215,10 +1892,15 @@ pub fn dispatch_from_host(bridge: &Mutex<Bridge>, g: &dyn GuestSide, frame: &mut
     };
     let sig = Signature::parse_method(&types)?;
     let call = convert::prepare_guest_call(&sig, frame, &mut Session { bridge: &mut b, g })?;
+    // A game method a fix follows (game_fixes.rs), sent by our frameworks.
+    let fixed = super::game_fixes::follows(&name, || b.class_display(isa).0);
     drop(b);
     // Constructed before its first method runs (-init sent by the host's +new).
     construct_pending(bridge, g)?;
     let r = g.call(imp, &call.words)?;
+    if fixed {
+        super::game_fixes::after_message(bridge, g, guest_self, call.words.get(2).copied().unwrap_or(0))?;
+    }
     let mut b = lock(bridge);
     convert::finish_guest_call(call, r as u32, (r >> 32) as u32, frame, &mut Session { bridge: &mut b, g })
 }

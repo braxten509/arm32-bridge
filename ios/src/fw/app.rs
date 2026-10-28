@@ -37,23 +37,91 @@ fn class_for_name(name: Id, fallback: &str) -> Class {
 /// UIApplicationMain(argc, argv, principal class name, delegate class name).
 extern "C" fn ui_application_main(_argc: i32, _argv: usize, principal: Id, delegate_name: Id) -> i32 {
     crate::fw::runloop::mark_main_thread();
-    let app_class = class_for_name(principal, "UIApplication");
-    let app = runtime::send(runtime::send(app_class, "alloc", &[]), "init", &[]);
+    // Before anything is shown: the first screen's line must find its tap.
+    crate::fw::touch::schedule_test_taps();
+    crate::report::stop_when_line_appears();
+    let app = make_app(class_for_name(principal, "UIApplication"));
     APPLICATION.store(app, Ordering::Relaxed);
-    if delegate_name == 0 {
-        crate::log!("STOP: UIApplicationMain without a delegate class (reading it from a storyboard is not supported)");
+    if delegate_name != 0 {
+        let delegate_class = class_for_name(delegate_name, "");
+        let delegate_object = runtime::send(runtime::send(delegate_class, "alloc", &[]), "init", &[]);
+        DELEGATE.store(delegate_object, Ordering::Relaxed);
+    }
+    // Older apps name their delegate in the main nib (owner: the app), not here.
+    crate::fw::nib::load_main_nib(app);
+    let delegate_object = DELEGATE.load(Ordering::Relaxed);
+    if delegate_object == 0 {
+        crate::log!("STOP: UIApplicationMain without a delegate (no delegate class, and no main nib gave one)");
         crate::report::finish(1);
     }
-    let delegate_class = class_for_name(delegate_name, "");
-    let delegate_object = runtime::send(runtime::send(delegate_class, "alloc", &[]), "init", &[]);
-    DELEGATE.store(delegate_object, Ordering::Relaxed);
-    let class_name = lock().class_name(delegate_class);
+    let class_name = {
+        let rt = lock();
+        rt.class_name(rt.class_of(delegate_object))
+    };
     crate::log!("UIApplicationMain: app {app:#x}, delegate {class_name} {delegate_object:#x}");
 
+    // Apple's launch order: the main storyboard (window, root view
+    // controller) first, then willFinish..., didFinish..., and the window
+    // is shown after them unless the app showed one.
+    let storyboard_window = crate::fw::storyboard::load_main_interface(delegate_object);
+    finish_launching(app, delegate_object, &class_name, storyboard_window);
+    let seconds: f64 = std::env::var("IOS_RUN_SECONDS").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    crate::report::reached_run_loop();
+    crate::fw::typing::schedule_test_typing();
+    if seconds > 0.0 {
+        crate::log!("run loop running for {seconds} s");
+        let end = {
+            let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
+            t.tv_sec as f64 + t.tv_nsec as f64 / 1e9 + seconds
+        };
+        crate::fw::runloop::run_main_loop(Some(end));
+        crate::log!("run loop time is up ({} timer calls)", crate::fw::runloop::timers_fired());
+        // Test switch IOS_HOME_AT_END: leave as through the Home button first
+        // (games save then), so a later run can start from the saved game.
+        if std::env::var_os("IOS_HOME_AT_END").is_some() {
+            crate::log!("going to the background (IOS_HOME_AT_END)");
+            std::thread::spawn(|| change_state(true));
+            let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
+            let start = t.tv_sec as f64 + t.tv_nsec as f64 / 1e9;
+            // Until the game has answered (or 30 s on a slow PC run), and at
+            // least 10 s: games often save on their next update, not in the call.
+            for step in 1..=60 {
+                crate::fw::runloop::run_main_loop(Some(start + step as f64 * 0.5));
+                if step >= 20 && settled() {
+                    break;
+                }
+            }
+            crate::log!("in the background; the game {}", if settled() { "has answered" } else { "is still answering" });
+        }
+        crate::report::finish(0);
+    }
+    crate::log!("run loop running");
+    crate::fw::runloop::run_main_loop(None);
+    crate::report::finish(0);
+}
+
+/// The app object. As on iOS it is inactive from the start: while the main
+/// nib or storyboard loads and the app finishes launching (finish_launching
+/// makes it active).
+fn make_app(app_class: Class) -> Id {
+    STATE.store(1, Ordering::SeqCst);
+    runtime::send(runtime::send(app_class, "alloc", &[]), "init", &[])
+}
+
+/// The delegate's launch messages after the main nib or storyboard:
+/// willFinish..., didFinish... (or the older applicationDidFinishLaunching:),
+/// the window shown, then becoming active. As on iOS the app is inactive
+/// until then, and active just before -applicationDidBecomeActive:.
+fn finish_launching(app: Id, delegate_object: Id, class_name: &str, storyboard_window: Id) {
+    STATE.store(1, Ordering::SeqCst);
     for name in ["application:willFinishLaunchingWithOptions:", "application:didFinishLaunchingWithOptions:"] {
         if let Some(imp) = runtime::imp_for(delegate_object, runtime::sel(name)) {
             let place = crate::loader::describe_address(imp);
-            let in_game = crate::loader::try_loaded().map(|l| imp >= l.start && imp < l.end).unwrap_or(false);
+            // A 32-bit game's methods all start at the mirror trampoline.
+            let in_game = crate::loader::try_loaded().map(|l| imp >= l.start && imp < l.end).unwrap_or(false)
+                || imp == crate::guest32::objc::mirror::trampoline_address();
             crate::log!("calling -[{class_name} {name}] at {place}");
             if name.starts_with("application:didFinish") {
                 crate::report::reached_did_finish(in_game, &place);
@@ -70,29 +138,14 @@ extern "C" fn ui_application_main(_argc: i32, _argv: usize, principal: Id, deleg
             runtime::send(delegate_object, "applicationDidFinishLaunching:", &[app]);
         }
     }
+    crate::fw::storyboard::show_main_window(delegate_object, storyboard_window);
     crate::fw::foundation::post("UIApplicationDidFinishLaunchingNotification", app, 0);
+    STATE.store(0, Ordering::SeqCst);
     if runtime::responds(delegate_object, "applicationDidBecomeActive:") {
         crate::log!("calling -[{class_name} applicationDidBecomeActive:]");
         runtime::send(delegate_object, "applicationDidBecomeActive:", &[app]);
     }
     crate::fw::foundation::post("UIApplicationDidBecomeActiveNotification", app, 0);
-    let seconds: f64 = std::env::var("IOS_RUN_SECONDS").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
-    crate::report::reached_run_loop();
-    crate::fw::touch::schedule_test_taps();
-    if seconds > 0.0 {
-        crate::log!("run loop running for {seconds} s");
-        let end = {
-            let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
-            t.tv_sec as f64 + t.tv_nsec as f64 / 1e9 + seconds
-        };
-        crate::fw::runloop::run_main_loop(Some(end));
-        crate::log!("run loop time is up ({} timer calls)", crate::fw::runloop::timers_fired());
-        crate::report::finish(0);
-    }
-    crate::log!("run loop running");
-    crate::fw::runloop::run_main_loop(None);
-    crate::report::finish(0);
 }
 
 /// UIApplicationState: 0 active, 1 inactive, 2 background.
@@ -141,6 +194,11 @@ pub fn change_state(to_background: bool) {
             crate::fw::foundation::post(notification, app, 0);
             STATE.store(state, Ordering::SeqCst);
         }
+        if !to_background {
+            // Game Center asks its sign-in handler again, queued after these
+            // messages and whatever work they queued.
+            crate::fw::gamekit::ask_authenticate_handler_again();
+        }
         UNANSWERED.fetch_sub(1, Ordering::SeqCst);
         *signal.0.lock().unwrap() = true;
         signal.1.notify_all();
@@ -177,4 +235,56 @@ pub fn register(r: &mut Registry) {
     r.data("_NSConcreteStackBlock", stack);
     r.data("_NSConcreteMallocBlock", malloc);
     r.data("_NSConcreteGlobalBlock", global);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// The app's state each launch message saw.
+    static SEEN: Mutex<Vec<(&'static str, usize)>> = Mutex::new(Vec::new());
+
+    fn note(message: &'static str) {
+        // What -[UIApplication applicationState] answers (fw/uikit.rs).
+        SEEN.lock().unwrap().push((message, STATE.load(Ordering::SeqCst)));
+    }
+
+    extern "C" fn will_finish(_this: Id, _: Sel, _app: Id, _options: Id) -> bool {
+        note("willFinish");
+        true
+    }
+    extern "C" fn did_finish(_this: Id, _: Sel, _app: Id, _options: Id) -> bool {
+        note("didFinish");
+        true
+    }
+    extern "C" fn did_become_active(_this: Id, _: Sel, _app: Id) {
+        note("didBecomeActive");
+    }
+
+    /// As iOS launches an app: inactive (1) from when the app object is made
+    /// (the main nib or storyboard loads then), through finishing launching;
+    /// active (0) from -applicationDidBecomeActive: on.
+    #[test]
+    fn an_app_is_inactive_until_it_becomes_active() {
+        crate::run::setup();
+        let delegate_class = define_class("AppTestLaunchDelegate", "NSObject", 8);
+        methods(
+            delegate_class,
+            &[
+                ("application:willFinishLaunchingWithOptions:", will_finish as usize),
+                ("application:didFinishLaunchingWithOptions:", did_finish as usize),
+                ("applicationDidBecomeActive:", did_become_active as usize),
+            ],
+        );
+        let delegate_object = runtime::send(runtime::send(delegate_class, "alloc", &[]), "init", &[]);
+        // The shared app object (+sharedApplication) is left alone: other
+        // tests running at the same time follow the responder chain to it.
+        // The state is read only by this test.
+        let app = make_app(runtime::class_named("UIApplication"));
+        assert_eq!(STATE.load(Ordering::SeqCst), 1, "inactive while the main nib or storyboard loads");
+        finish_launching(app, delegate_object, "AppTestLaunchDelegate", 0);
+        assert_eq!(*SEEN.lock().unwrap(), [("willFinish", 1), ("didFinish", 1), ("didBecomeActive", 0)]);
+        assert_eq!(STATE.load(Ordering::SeqCst), 0);
+    }
 }

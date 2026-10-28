@@ -293,16 +293,20 @@ extern "C" fn ios_setlocale(category: i32, asked: *const libc::c_char) -> usize 
 
 // ----- system names -----
 
-/// uname: the same iPhone the rest of the layer describes (sysctl).
-extern "C" fn ios_uname(out: *mut [u8; 256]) -> i32 {
-    let fields = [
+/// uname's sysname, nodename, release, version and machine: the same iPhone
+/// the rest of the layer describes (sysctl).
+pub fn uname_fields() -> [String; 5] {
+    [
         "Darwin".to_string(),
         "iPhone".to_string(),
         "14.0.0".to_string(),
         "Darwin Kernel Version 14.0.0: Sun Mar 29 19:47:37 PDT 2015; root:xnu-2784.20.34~2/RELEASE_ARM64_S5L8960X".to_string(),
         crate::libsystem::io::device_model(),
-    ];
-    for (index, text) in fields.iter().enumerate() {
+    ]
+}
+
+extern "C" fn ios_uname(out: *mut [u8; 256]) -> i32 {
+    for (index, text) in uname_fields().iter().enumerate() {
         unsafe {
             let field = &mut *out.add(index);
             field.fill(0);

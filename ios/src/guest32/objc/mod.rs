@@ -17,10 +17,15 @@ pub mod dispatch;
 mod convert_tests;
 pub mod encoding;
 pub mod exceptions;
+pub mod forward;
+#[cfg(test)]
+mod forward_tests;
 pub mod functions;
+mod game_fixes;
 #[cfg(test)]
 mod functions_tests;
 pub mod mirror;
+pub mod protocols;
 pub mod selectors;
 pub mod wire;
 #[cfg(test)]

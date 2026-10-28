@@ -1754,6 +1754,12 @@ impl Translator {
                 0b0001 => self.a.uxth_w(T2, T2),
                 0b0100 => self.a.sxtb_w(T2, T2),
                 0b0101 => self.a.uxtb_w(T2, T2),
+                // SXTB16/UXTB16, SXTAB16/UXTAB16: two halfwords
+                0b0010 | 0b0011 => {
+                    let add = if rn == PC { None } else { Some(rn) };
+                    self.a.extend_bytes16(rd, add, T2, op1 == 0b0010, T3, T4);
+                    return Ok(Flow::Next);
+                }
                 _ => return Err(()),
             }
             if rn == PC {

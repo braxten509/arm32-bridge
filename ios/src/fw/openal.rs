@@ -80,6 +80,7 @@ const ALC_DEVICE_SPECIFIER: i32 = 0x1005;
 const ALC_EXTENSIONS: i32 = 0x1006;
 const ALC_FREQUENCY: i32 = 0x1007;
 const ALC_INVALID_DEVICE: i32 = 0xA001;
+const ALC_INVALID_CONTEXT: i32 = 0xA002;
 const ALC_INVALID_ENUM: i32 = 0xA003;
 
 /// Samples of one buffer, as floats (interleaved when stereo).
@@ -934,7 +935,22 @@ extern "C" fn alc_open_device(_name: *const libc::c_char) -> usize {
 }
 
 extern "C" fn alc_close_device(device_handle: usize) -> u8 {
-    (device_handle == device()) as u8
+    if device_handle != device() {
+        return 0;
+    }
+    forget_context();
+    1
+}
+
+/// The context's sources and buffers go (a playing source goes quiet), as
+/// when its last context is destroyed or its device closed; names given
+/// out before stay unused.
+fn forget_context() {
+    with(|state| {
+        state.sources.clear();
+        state.buffers.clear();
+        state.error = AL_NO_ERROR;
+    });
 }
 
 extern "C" fn alc_create_context(device_handle: usize, _attributes: *const i32) -> usize {
@@ -954,9 +970,14 @@ extern "C" fn alc_make_context_current(context: usize) -> u8 {
 }
 
 extern "C" fn alc_destroy_context(context: usize) {
+    if context == 0 || CONTEXT.get() != Some(&context) {
+        ALC_ERROR.store(ALC_INVALID_CONTEXT, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
     if CURRENT.load(std::sync::atomic::Ordering::Relaxed) == context {
         CURRENT.store(0, std::sync::atomic::Ordering::Relaxed);
     }
+    forget_context();
 }
 
 extern "C" fn alc_nothing(_context: usize) {}
@@ -1239,6 +1260,20 @@ fn functions() -> Vec<(&'static str, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Destroying the context deletes its sources and buffers (a playing
+    /// one goes quiet); a new context starts empty.
+    #[test]
+    fn a_destroyed_context_takes_its_sources_and_buffers() {
+        let context = alc_create_context(device(), std::ptr::null());
+        let (mut buffer, mut source) = (0u32, 0u32);
+        al_gen_buffers(1, &mut buffer);
+        al_gen_sources(1, &mut source);
+        assert_eq!((al_is_buffer(buffer), al_is_source(source)), (1, 1));
+        alc_destroy_context(context);
+        assert_ne!(alc_create_context(device(), std::ptr::null()), 0);
+        assert_eq!((al_is_buffer(buffer), al_is_source(source)), (0, 0));
+    }
 
     #[test]
     fn inverse_clamped_distance_halves_at_twice_the_reference() {

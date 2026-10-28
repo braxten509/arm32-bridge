@@ -1,6 +1,7 @@
 package dev.braxten.gamebridge
 
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.nio.ByteBuffer
 import java.util.zip.CRC32
 import java.util.zip.Deflater
@@ -13,6 +14,9 @@ import java.util.zip.Inflater
  */
 object ApplePng {
     private val SIGNATURE = byteArrayOf(0x89.toByte(), 'P'.code.toByte(), 'N'.code.toByte(), 'G'.code.toByte(), 13, 10, 26, 10)
+
+    /** A game's picture file as Android can read it: crushed PNGs uncrushed, other files as they are. */
+    fun readable(file: File): ByteArray = file.readBytes().let { uncrush(it) ?: it }
 
     /** A normal PNG made from a crushed one; null when it isn't crushed or isn't the 8-bit RGBA kind Xcode makes. */
     fun uncrush(png: ByteArray): ByteArray? = runCatching {

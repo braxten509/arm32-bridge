@@ -42,5 +42,15 @@ int isxdigit(int);
 int tolower(int);
 int toupper(int);
 int isascii(int);
+int __maskrune(__darwin_ct_rune_t, unsigned long);
 __END_DECLS
+
+/* Apple's inline class tests, which GCC's <bits/ctype_inline.h> uses:
+ * the table below 128, __maskrune above (and for negative chars). */
+static __inline int __istype(__darwin_ct_rune_t _c, unsigned long _f) {
+    return (_c & ~0x7F) == 0 ? !!(_DefaultRuneLocale.__runetype[_c] & _f) : !!__maskrune(_c, _f);
+}
+static __inline __darwin_ct_rune_t __isctype(__darwin_ct_rune_t _c, unsigned long _f) {
+    return (_c < 0 || _c >= _CACHED_RUNES) ? 0 : !!(_DefaultRuneLocale.__runetype[_c] & _f);
+}
 #endif

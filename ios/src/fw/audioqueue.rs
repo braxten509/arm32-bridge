@@ -346,6 +346,12 @@ impl Decoder {
         Ok(Decoder { kind, format: *f, rate: f.rate })
     }
 
+    /// Whether several fixed-size packets may be handed over as one (formats
+    /// decoded here; a codec takes one packet at a time).
+    pub fn joins_packets(&self) -> bool {
+        !matches!(self.kind, Kind::Other(_))
+    }
+
     /// Appends one packet's sound (`frames` is how many it should hold;
     /// a packet that won't decode becomes that much silence).
     pub fn decode(&mut self, packet: &[u8], frames: u32, out: &mut Vec<f32>) {
@@ -448,8 +454,12 @@ struct State {
 }
 
 /// How long Stop, Reset and Dispose wait for a callback another thread is
-/// running before giving up (it may be waiting on their caller).
+/// running before giving up (it may be waiting on their caller). Tests
+/// use a short one so the give-up case doesn't sit out two seconds.
+#[cfg(not(test))]
 const CALLBACK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+#[cfg(test)]
+const CALLBACK_WAIT: std::time::Duration = std::time::Duration::from_millis(300);
 
 /// Which thread is running one of the queue's callbacks, and how deeply.
 #[derive(Default)]
@@ -1434,7 +1444,7 @@ mod tests {
         let thread = std::thread::spawn(move || {
             deliver(&queue_ref, None, || {
                 s.store(true, std::sync::atomic::Ordering::SeqCst);
-                std::thread::sleep(CALLBACK_WAIT + std::time::Duration::from_millis(300));
+                std::thread::sleep(CALLBACK_WAIT + std::time::Duration::from_millis(100));
                 d.store(true, std::sync::atomic::Ordering::SeqCst);
             })
         });

@@ -189,6 +189,8 @@ pub fn define_mirror_class(
     let map = mirrors.get_or_insert_with(HashMap::new);
     map.insert(class, (guest_class, false));
     map.insert(meta, (guest_class, true));
+    // Its objects' retains and releases are counted (counted.rs, "would dealloc").
+    crate::fw::counted::count_game_class(class);
     Ok(class)
 }
 

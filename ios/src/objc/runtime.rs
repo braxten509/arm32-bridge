@@ -3,10 +3,13 @@
 
 use crate::loader::Loaded;
 use crate::symbols::{leak, leak_cstr};
-use std::collections::{HashMap, HashSet};
+// FxHash: the bridge's tables are keyed by addresses and short names
+// looked up on every message; the default (DoS-proof) hash cost several
+// times more there.
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::ffi::CStr;
 use std::sync::atomic::Ordering;
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
 
 pub type Id = usize;
 pub type Sel = usize;
@@ -73,6 +76,12 @@ pub struct Runtime {
     selectors: HashMap<String, Sel>,
     selector_names: HashMap<Sel, String>,
     cache: HashMap<(Class, Sel), Imp>,
+    /// Classes whose +initialize has finished all the way up their chain
+    /// (it never goes back, and a class's superclass never changes).
+    chain_done: std::collections::HashSet<Class>,
+    /// (lookup class, selector) whose resolver was called and added nothing:
+    /// it is not asked again until the class's method table changes.
+    resolutions_refused: HashSet<(Class, Sel)>,
     protocols: HashMap<String, usize>,
     missing_methods: HashMap<String, u64>,
     /// Method handles given out, one per (defining class, selector).
@@ -116,6 +125,11 @@ impl Runtime {
         sel
     }
 
+    /// The selector named `name`, if any code registered it.
+    pub fn selector(&self, name: &str) -> Option<Sel> {
+        self.selectors.get(name).copied()
+    }
+
     pub fn sel_name(&self, sel: Sel) -> String {
         self.selector_names
             .get(&sel)
@@ -153,6 +167,20 @@ impl Runtime {
             unsafe { (*(method as *mut MethodObject)).imp = imp };
         }
         self.cache.clear();
+        // A class that gains a method may now answer selectors whose resolver
+        // said no: forget its refusals with its methods (Apple clears the
+        // class's method cache, refusals included).
+        self.resolutions_refused.retain(|&(owner, _)| owner != class);
+    }
+
+    /// Whether `class`'s resolver already said no for `sel` and added nothing.
+    pub fn resolution_refused(&self, class: Class, sel: Sel) -> bool {
+        self.resolutions_refused.contains(&(class, sel))
+    }
+
+    /// Remembers that `class`'s resolver said no for `sel`.
+    pub fn refuse_resolution(&mut self, class: Class, sel: Sel) {
+        self.resolutions_refused.insert((class, sel));
     }
 
     /// The class in `class`'s parent chain that defines `sel` itself.
@@ -221,14 +249,32 @@ impl Runtime {
             .unwrap_or_else(|| format!("<unknown class {class:#x}>"))
     }
 
-    pub fn is_subclass(&self, mut class: Class, of: Class) -> bool {
-        while class != 0 {
-            if class == of {
-                return true;
-            }
-            class = self.classes.get(&class).map(|r| r.superclass).unwrap_or(0);
+    pub fn is_subclass(&self, class: Class, of: Class) -> bool {
+        if of == 0 {
+            return false;
         }
-        false
+        if let Some(hit) = cached_subclass(class, of) {
+            return hit;
+        }
+        let mut current = class;
+        // `known` means the walk reached a definite answer: it found `of`, or
+        // it hit a real root (superclass 0). A walk that stops at a class we
+        // have not registered yet is not definite — that class's chain may
+        // still grow — so its result is not cached.
+        let (result, known) = loop {
+            if current == of {
+                break (true, true);
+            }
+            match self.classes.get(&current) {
+                Some(rec) if rec.superclass == 0 => break (false, true),
+                Some(rec) => current = rec.superclass,
+                None => break (false, false),
+            }
+        };
+        if known {
+            subclass_cache().write().unwrap_or_else(|e| e.into_inner()).insert((class, of), result);
+        }
+        result
     }
 
     /// Makes a class and its metaclass; the class pointer is returned.
@@ -300,7 +346,7 @@ impl Runtime {
                 superclass,
                 meta: false,
                 partner: meta,
-                methods: HashMap::new(),
+                methods: HashMap::default(),
                 instance_size: size,
                 protocols: Vec::new(),
                 from_game: false,
@@ -315,7 +361,7 @@ impl Runtime {
                 superclass: meta_super,
                 meta: true,
                 partner: class,
-                methods: HashMap::new(),
+                methods: HashMap::default(),
                 instance_size: meta_size,
                 protocols: Vec::new(),
                 from_game: false,
@@ -336,6 +382,38 @@ impl Runtime {
         let isa = self.class_of(object);
         self.classes.get(&isa).map(|r| r.meta).unwrap_or(false)
     }
+}
+
+/// Cached `(class, of)` subclass results. A class's superclass chain is fixed
+/// once the class is registered (see `realize`/`build_class_pair`), so an
+/// entry never goes stale. It is keyed by the class pointer, not the name, so
+/// classes made at run time get their own entry, and a class that is not yet
+/// registered is never cached (its chain may still grow).
+fn subclass_cache() -> &'static RwLock<HashMap<(Class, Class), bool>> {
+    static CACHE: OnceLock<RwLock<HashMap<(Class, Class), bool>>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(HashMap::default()))
+}
+
+fn cached_subclass(class: Class, of: Class) -> Option<bool> {
+    subclass_cache().read().unwrap_or_else(|e| e.into_inner()).get(&(class, of)).copied()
+}
+
+/// Whether `object` is an instance of `of` (or one of its subclasses), read
+/// without taking the runtime lock when the answer is already cached. Used on
+/// the picture hot path so repeated checks of the same class stay cheap.
+pub fn is_kind_of(object: Id, of: Class) -> bool {
+    if object == 0 || of == 0 {
+        return false;
+    }
+    // The object's isa is a plain word: reading it needs no lock.
+    let class = unsafe { *(object as *const usize) };
+    if class == of {
+        return true;
+    }
+    if let Some(hit) = cached_subclass(class, of) {
+        return hit;
+    }
+    lock().is_subclass(class, of)
 }
 
 pub fn sel(name: &str) -> Sel {
@@ -402,6 +480,8 @@ std::arch::global_asm!(
     "stp q4, q5, [sp, #160]",
     "stp q6, q7, [sp, #192]",
     "mov x2, x30",
+    // The saved receiver: forwarding may replace it (see forward.rs).
+    "add x3, sp, #16",
     "bl ios_objc_lookup",
     "mov x16, x0",
     "ldp q6, q7, [sp, #192]",
@@ -446,6 +526,8 @@ std::arch::global_asm!(
     "stp q6, q7, [sp, #192]",
     "mov x2, x9",
     "mov x3, x30",
+    // The saved x0 (the pair) becomes the receiver the method gets.
+    "add x4, sp, #16",
     "bl ios_objc_lookup_super",
     "mov x16, x0",
     "ldp q6, q7, [sp, #192]",
@@ -458,11 +540,49 @@ std::arch::global_asm!(
     "ldp x2, x3, [sp, #32]",
     "ldp x0, x1, [sp, #16]",
     "ldp x29, x30, [sp], #224",
-    "ldr x0, [x0]",
     "br x16",
+    // A setter of an observed key, sent by objc_msgSend (see observed_setter
+    // below): -willChangeValueForKey:, the setter with the caller's
+    // registers, -didChangeValueForKey:, the setter's result registers back.
+    ".globl ios_kvo_setter",
+    ".p2align 2",
+    "ios_kvo_setter:",
+    "stp x29, x30, [sp, #-224]!",
+    "mov x29, sp",
+    "stp x0, x1, [sp, #16]",
+    "stp x2, x3, [sp, #32]",
+    "stp x4, x5, [sp, #48]",
+    "stp x6, x7, [sp, #64]",
+    "str x8, [sp, #80]",
+    "stp q0, q1, [sp, #96]",
+    "stp q2, q3, [sp, #128]",
+    "stp q4, q5, [sp, #160]",
+    "stp q6, q7, [sp, #192]",
+    "bl ios_kvo_will",
+    "mov x16, x0",
+    "ldp q6, q7, [sp, #192]",
+    "ldp q4, q5, [sp, #160]",
+    "ldp q2, q3, [sp, #128]",
+    "ldp q0, q1, [sp, #96]",
+    "ldr x8, [sp, #80]",
+    "ldp x6, x7, [sp, #64]",
+    "ldp x4, x5, [sp, #48]",
+    "ldp x2, x3, [sp, #32]",
+    "ldp x0, x1, [sp, #16]",
+    "blr x16",
+    "stp x0, x1, [sp, #16]",
+    "stp q0, q1, [sp, #96]",
+    "stp q2, q3, [sp, #128]",
+    "bl ios_kvo_did",
+    "ldp q2, q3, [sp, #128]",
+    "ldp q0, q1, [sp, #96]",
+    "ldp x0, x1, [sp, #16]",
+    "ldp x29, x30, [sp], #224",
+    "ret",
 );
 
 extern "C" {
+    fn ios_kvo_setter();
     pub fn ios_objc_msgSend();
     pub fn ios_objc_msgSendSuper2();
     pub fn ios_objc_msgSendSuper();
@@ -495,6 +615,15 @@ fn missing_method(class: Class, receiver_is_class: bool, sel: Sel, caller: usize
     }
     crate::log!("STOP: missing method {text} (called from {place})");
     crate::report::finish(1);
+}
+
+/// Counts a call to a method nobody has (named like "-[Class selector");
+/// says whether it is the first.
+pub fn note_missing_method(text: &str) -> bool {
+    let mut rt = lock();
+    let count = rt.missing_methods.entry(text.to_string()).or_default();
+    *count += 1;
+    *count == 1
 }
 
 /// Methods asked for that don't exist. Gives nothing if the runtime is busy
@@ -565,7 +694,60 @@ fn ensure_initialized(class: Class) {
 }
 
 #[no_mangle]
-extern "C" fn ios_objc_lookup(receiver: Id, sel: Sel, caller: usize) -> Imp {
+extern "C" fn ios_objc_lookup(receiver: Id, sel: Sel, caller: usize, saved_receiver: *mut Id) -> Imp {
+    let mut receiver = receiver;
+    let imp = find_method(&mut receiver, sel, caller);
+    unsafe { *saved_receiver = receiver };
+    observed_setter(receiver, sel, imp).unwrap_or(imp)
+}
+
+thread_local! {
+    /// Observed setters under way on this thread (innermost last): the
+    /// object, the key, and the setter's own code.
+    static KVO_SETTERS: std::cell::RefCell<Vec<(Id, String, Imp)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// objc_msgSend's code for a setter of a key someone observes on
+/// `receiver`: ios_kvo_setter, which announces the change around `imp`, as
+/// Apple's KVO subclass does (see fw/object.rs).
+fn observed_setter(receiver: Id, sel: Sel, imp: Imp) -> Option<Imp> {
+    if !crate::fw::object::is_observed_setter(sel) {
+        return None;
+    }
+    let name = lock().sel_name(sel);
+    let key = crate::fw::object::observed_setter_key(receiver, &name)?;
+    KVO_SETTERS.with(|s| s.borrow_mut().push((receiver, key, imp)));
+    Some(ios_kvo_setter as Imp)
+}
+
+#[no_mangle]
+extern "C" fn ios_kvo_will() -> Imp {
+    let (object, key, imp) = KVO_SETTERS.with(|s| s.borrow().last().cloned()).expect("a KVO setter was looked up");
+    crate::fw::object::will_change(object, &key);
+    imp
+}
+
+#[no_mangle]
+extern "C" fn ios_kvo_did() {
+    if let Some((object, key, _)) = KVO_SETTERS.with(|s| s.borrow_mut().pop()) {
+        crate::fw::object::did_change(object, &key);
+    }
+}
+
+/// objc_msgSend's search: the method `*receiver` runs for `sel`, forwarded
+/// when there is none (which may name another receiver; see forward.rs).
+pub(crate) fn find_method(receiver: &mut Id, sel: Sel, caller: usize) -> Imp {
+    let receiver_now = *receiver;
+    let (isa, is_class) = class_for_message(receiver_now, sel, caller);
+    let found = lock().lookup(isa, sel);
+    match found {
+        Some(imp) => imp,
+        None => super::forward::after_miss(receiver, isa, sel, caller).unwrap_or_else(|| missing_method(isa, is_class, sel, caller)),
+    }
+}
+
+/// The receiver's class (initialized) and whether the receiver is a class.
+fn class_for_message(receiver: Id, sel: Sel, caller: usize) -> (Class, bool) {
     let (isa, is_class, known) = {
         let rt = lock();
         let isa = rt.class_of(receiver);
@@ -581,11 +763,7 @@ extern "C" fn ios_objc_lookup(receiver: Id, sel: Sel, caller: usize) -> Imp {
     if let Some(pattern) = message_trace() {
         trace_message(pattern, isa, is_class, sel, caller);
     }
-    let found = lock().lookup(isa, sel);
-    match found {
-        Some(imp) => imp,
-        None => missing_method(isa, is_class, sel, caller),
-    }
+    (isa, is_class)
 }
 
 /// Test switch IOS_TRACE_MESSAGES=<pattern>: logs the game's messages whose
@@ -618,7 +796,7 @@ fn trace_wants(pattern: &regex::Regex, limit: u32, text: &str) -> bool {
         return false;
     }
     let mut counts = COUNTS.lock().unwrap_or_else(|e| e.into_inner());
-    let count = counts.get_or_insert_with(HashMap::new).entry(text.to_string()).or_default();
+    let count = counts.get_or_insert_with(HashMap::default).entry(text.to_string()).or_default();
     *count += 1;
     *count <= limit
 }
@@ -664,8 +842,8 @@ mod trace_tests {
 }
 
 #[no_mangle]
-extern "C" fn ios_objc_lookup_super(pair: *const [usize; 2], sel: Sel, second_form: usize, caller: usize) -> Imp {
-    let [receiver, current] = unsafe { *pair };
+extern "C" fn ios_objc_lookup_super(pair: *const [usize; 2], sel: Sel, second_form: usize, caller: usize, saved_x0: *mut Id) -> Imp {
+    let [mut receiver, current] = unsafe { *pair };
     let start = if second_form != 0 {
         lock().classes.get(&current).map(|r| r.superclass).unwrap_or(0)
     } else {
@@ -673,10 +851,12 @@ extern "C" fn ios_objc_lookup_super(pair: *const [usize; 2], sel: Sel, second_fo
     };
     let is_class = lock().is_class_object(receiver);
     let found = lock().lookup(start, sel);
-    match found {
+    let imp = match found {
         Some(imp) => imp,
-        None => missing_method(start, is_class, sel, caller),
-    }
+        None => super::forward::after_miss(&mut receiver, start, sel, caller).unwrap_or_else(|| missing_method(start, is_class, sel, caller)),
+    };
+    unsafe { *saved_x0 = receiver };
+    imp
 }
 
 /// Finds the code for a message, for calls from our own Rust code.
@@ -685,8 +865,28 @@ pub fn imp_for(receiver: Id, sel: Sel) -> Option<Imp> {
         return None;
     }
     let (isa, is_class) = {
-        let rt = lock();
-        (rt.class_of(receiver), rt.is_class_object(receiver))
+        let mut rt = lock();
+        let (isa, is_class) = (rt.class_of(receiver), rt.is_class_object(receiver));
+        // A parent's +initialize may finish its child first, so every class
+        // up the chain must be Done.
+        let start = if is_class { receiver } else { isa };
+        let mut at = start;
+        let known = rt.chain_done.contains(&start);
+        let all_done = known
+            || loop {
+                match rt.classes.get(&at) {
+                    Some(rec) if rec.init == Init::Done => at = rec.superclass,
+                    Some(_) => break false,
+                    None => break at == 0,
+                }
+            };
+        if all_done {
+            if !known {
+                rt.chain_done.insert(start);
+            }
+            return rt.lookup(isa, sel);
+        }
+        (isa, is_class)
     };
     ensure_initialized(if is_class { receiver } else { isa });
     lock().lookup(isa, sel)
@@ -699,9 +899,10 @@ pub fn responds(receiver: Id, sel_name: &str) -> bool {
 /// Sends a message from Rust with up to four pointer-sized arguments.
 pub fn send(receiver: Id, sel_name: &str, args: &[usize]) -> usize {
     let s = sel(sel_name);
-    if receiver == 0 {
+    if receiver == 0 || crate::fw::exception::pending() {
         return 0;
     }
+    let mut receiver = receiver;
     let imp = match imp_for(receiver, s) {
         Some(imp) => imp,
         None => {
@@ -709,20 +910,36 @@ pub fn send(receiver: Id, sel_name: &str, args: &[usize]) -> usize {
                 let rt = lock();
                 (rt.class_of(receiver), rt.is_class_object(receiver))
             };
-            missing_method(isa, is_class, s, 0)
+            // Forwarded like objc_msgSend's (the arguments are in registers alike).
+            super::forward::after_miss(&mut receiver, isa, s, 0).unwrap_or_else(|| missing_method(isa, is_class, s, 0))
         }
     };
-    unsafe {
-        match args {
-            [] => std::mem::transmute::<Imp, extern "C" fn(Id, Sel) -> usize>(imp)(receiver, s),
-            [a] => std::mem::transmute::<Imp, extern "C" fn(Id, Sel, usize) -> usize>(imp)(receiver, s, *a),
-            [a, b] => std::mem::transmute::<Imp, extern "C" fn(Id, Sel, usize, usize) -> usize>(imp)(receiver, s, *a, *b),
-            [a, b, c] => std::mem::transmute::<Imp, extern "C" fn(Id, Sel, usize, usize, usize) -> usize>(imp)(receiver, s, *a, *b, *c),
-            [a, b, c, d] => std::mem::transmute::<Imp, extern "C" fn(Id, Sel, usize, usize, usize, usize) -> usize>(imp)(
-                receiver, s, *a, *b, *c, *d,
-            ),
-            _ => panic!("send: too many arguments"),
+    // A setter of an observed key: announced around the call (fw/object.rs).
+    if crate::fw::object::is_observed_setter(s) {
+        if let Some(key) = crate::fw::object::observed_setter_key(receiver, sel_name) {
+            crate::fw::object::will_change(receiver, &key);
+            let result = call_with_words(imp, receiver, s, args);
+            crate::fw::object::did_change(receiver, &key);
+            return result;
         }
+    }
+    call_with_words(imp, receiver, s, args)
+}
+
+/// Calls `imp` with every argument register x2-x7 set: the words sent, then
+/// zeros. A method that takes more arguments than were sent (a 32-bit game
+/// method typed with three objects, sent performSelector:withObject:) reads
+/// nil for the rest, never what the registers last held (the 32-bit bridge
+/// converts every argument its types name). Extra registers are harmless to
+/// a method that takes fewer.
+fn call_with_words(imp: Imp, receiver: Id, s: Sel, args: &[usize]) -> usize {
+    assert!(args.len() <= 6, "send: too many arguments");
+    let mut w = [0usize; 6];
+    w[..args.len()].copy_from_slice(args);
+    unsafe {
+        std::mem::transmute::<Imp, extern "C" fn(Id, Sel, usize, usize, usize, usize, usize, usize) -> usize>(imp)(
+            receiver, s, w[0], w[1], w[2], w[3], w[4], w[5],
+        )
     }
 }
 
@@ -817,7 +1034,7 @@ fn realize(rt: &mut Runtime, class: Class, game_classes: &HashSet<Class>) -> Res
         let class_methods = method_list(rt, read::<usize>(meta_ro + 32));
         let load = rt.sel("load");
         if let Some(&(_, imp)) = class_methods.iter().find(|(s, _)| *s == load) {
-            BASE_LOAD.lock().unwrap().get_or_insert_with(HashMap::new).insert(class, imp);
+            BASE_LOAD.lock().unwrap().get_or_insert_with(HashMap::default).insert(class, imp);
         }
         let protocols = protocol_list(read::<usize>(ro + 40));
         let meta_super = (*(meta as *const ClassObject)).superclass;
@@ -881,7 +1098,7 @@ pub fn read_class_pair(class: Class) -> Class {
         crate::log!("objc_readClassPair: class at {class:#x} has an unknown parent {superclass:#x}");
         return 0;
     }
-    match realize(&mut rt, class, &HashSet::new()) {
+    match realize(&mut rt, class, &HashSet::default()) {
         Ok(()) => class,
         Err(error) => {
             crate::log!("objc_readClassPair: {error}");
@@ -1020,6 +1237,24 @@ pub fn game_method_names() -> Vec<(usize, String)> {
 
 pub fn protocol_named(name: &str) -> usize {
     lock().protocols.get(name).copied().unwrap_or(0)
+}
+
+/// Makes `protocol` (a protocol_t) known by its name, unless one of that
+/// name is known already; the one kept.
+pub fn register_protocol(name: &str, protocol: usize) -> usize {
+    *lock().protocols.entry(name.to_string()).or_insert(protocol)
+}
+
+/// Adds protocols to the ones `class` adopts (a protocol already there is not repeated).
+pub fn add_protocols(class: Class, protocols: &[usize]) {
+    let mut rt = lock();
+    if let Some(rec) = rt.classes.get_mut(&class) {
+        for &protocol in protocols {
+            if protocol != 0 && !rec.protocols.contains(&protocol) {
+                rec.protocols.push(protocol);
+            }
+        }
+    }
 }
 
 pub fn conforms(class: Class, protocol: usize) -> bool {

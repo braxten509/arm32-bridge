@@ -11,13 +11,13 @@
 //! __block variables: { isa, forwarding, flags, size, [keep, destroy], ... }.
 
 use super::bridge::{
-    call_host_function, send_from_guest, Bridge, GuestSide, SendKind, Special, BLOCK_HAS_COPY_DISPOSE, BLOCK_IS_GLOBAL, BLOCK_NEEDS_FREE,
+    call_host_function, framework_row, send_from_guest, Bridge, GuestSide, SendKind, Special, BLOCK_HAS_COPY_DISPOSE, BLOCK_IS_GLOBAL, BLOCK_NEEDS_FREE,
     BLOCK_REFCOUNT_MASK,
 };
 use super::classes::{Lookup, Super};
-use super::convert::HostCallOptions;
+use super::convert::{GuestRet, HostCallOptions};
 use super::encoding::Signature;
-use super::selectors::{FrameworkSelectors, Varargs};
+use super::selectors::Varargs;
 use crate::objc::runtime;
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
@@ -139,6 +139,20 @@ pub fn functions() -> &'static [(&'static str, ObjcFn)] {
         ("dispatch_queue_create", super::dispatch::queue_create),
         ("dispatch_release", |_, _| ok(0)),
         ("dispatch_retain", |_, _| ok(0)),
+        ("dispatch_get_current_queue", super::dispatch::current_queue),
+        ("dispatch_time", super::dispatch::time),
+        ("dispatch_after", super::dispatch::after),
+        ("dispatch_suspend", super::dispatch::suspend),
+        ("dispatch_resume", super::dispatch::resume),
+        ("dispatch_source_create", super::dispatch::source_create),
+        ("dispatch_source_set_event_handler", super::dispatch::source_set_event_handler),
+        ("dispatch_source_set_timer", super::dispatch::source_set_timer),
+        ("dispatch_group_create", super::dispatch::group_create),
+        ("dispatch_group_enter", super::dispatch::group_enter),
+        ("dispatch_group_leave", super::dispatch::group_leave),
+        ("dispatch_group_wait", super::dispatch::group_wait),
+        ("dispatch_group_notify", super::dispatch::group_notify),
+        ("dispatch_group_async", super::dispatch::group_async),
         ("objc_getAssociatedObject", |_, w| ok(with_associated(|m| m.get(&(w(0), w(1))).map_or(0, |v| v.0)))),
         ("objc_setAssociatedObject", set_associated),
         ("objc_removeAssociatedObjects", |c, w| remove_associated(c, w(0)).map(|_| 0)),
@@ -200,6 +214,28 @@ pub fn functions() -> &'static [(&'static str, ObjcFn)] {
         ("method_getTypeEncoding", |c, w| ok(c.word(w(0) + 4))),
         ("method_getName", |c, w| ok(c.word(w(0)))),
         ("protocol_getMethodDescription", method_description),
+        ("class_copyPropertyList", copy_property_list),
+        ("class_getProperty", class_property),
+        ("property_getName", |c, w| ok(if w(0) == 0 { 0 } else { c.word(w(0)) })),
+        ("property_getAttributes", |c, w| ok(if w(0) == 0 { 0 } else { c.word(w(0) + 4) })),
+        ("NSAllocateObject", |c, w| {
+            if w(0) == 0 {
+                return ok(0);
+            }
+            let object = c.lock().allocate(c.g, w(0), w(1))?;
+            super::bridge::construct_pending(c.bridge, c.g)?;
+            ok(object)
+        }),
+        // Zones are only names (every allocation uses the one heap): a fixed block.
+        ("NSDefaultMallocZone", |c, _| {
+            static ZONE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+            ok(*ZONE.get_or_init(|| {
+                let zone = c.g.alloc_permanent(16);
+                c.g.write(zone, &[0; 16]);
+                zone
+            }))
+        }),
+        ("NSGetSizeAndAlignment", get_size_and_alignment),
         ("_Block_copy", |c, w| ok(block_copy(c, w(0))?)),
         ("_Block_release", |c, w| block_release(c, w(0)).map(|_| 0)),
         ("_Block_object_assign", block_object_assign),
@@ -215,7 +251,34 @@ pub fn functions() -> &'static [(&'static str, ObjcFn)] {
 /// framework_selectors.tsv, without self/_cmd), variadic arguments.
 pub const HOST_FUNCTIONS: &[(&str, &str, Varargs)] = &[
     ("NSLog", "v@", Varargs::Format),
+    // class_respondsToSelector(Class, SEL): BOOL
+    ("class_respondsToSelector", "c#::", Varargs::None),
+    // CFStringAppendFormat(string, format options, format, ...)
+    ("CFStringAppendFormat", "v@@@", Varargs::Format),
+    // The keychain: CFTypeRef results come back through `id *`.
+    ("SecItemAdd", "i@^@", Varargs::None),
+    ("SecItemCopyMatching", "i@^@", Varargs::None),
+    ("SecItemUpdate", "i@@", Varargs::None),
+    ("SecItemDelete", "i@", Varargs::None),
 ];
+
+/// NSGetSizeAndAlignment(type, &size, &alignment): armv7 sizes; returns
+/// the type after it, past its offset digits.
+fn get_size_and_alignment(c: &Ctx, w: Words) -> Result<u64, String> {
+    let (types, size, align) = (w(0), w(1), w(2));
+    if types == 0 {
+        return ok(0);
+    }
+    let text = c.cstr(types);
+    let (ty, used) = super::encoding::parse_one(&text)?;
+    if size != 0 {
+        c.set_word(size, ty.guest_size());
+    }
+    if align != 0 {
+        c.set_word(align, ty.guest_align());
+    }
+    ok(types + used as u32)
+}
 
 pub fn call_function(ctx: &Ctx, name: &str, words: Words) -> Result<u64, String> {
     static TABLE: std::sync::OnceLock<HashMap<&'static str, ObjcFn>> = std::sync::OnceLock::new();
@@ -233,8 +296,34 @@ pub fn call_function(ctx: &Ctx, name: &str, words: Words) -> Result<u64, String>
 }
 
 fn send(c: &Ctx, w: Words, kind: SendKind) -> Result<u64, String> {
-    let r = send_from_guest(c.bridge, c.g, kind, w)?;
+    let keep_going = crate::trap::KEEP_GOING.load(std::sync::atomic::Ordering::Relaxed);
+    let r = skip_missing(send_from_guest(c.bridge, c.g, kind, w), keep_going).map_err(|error| {
+        // Which message failed, for the log.
+        let stret = matches!(kind, SendKind::Stret | SendKind::Super2Stret);
+        let name = c.lock().selector_name(c.g, w(u32::from(stret) + 1));
+        format!("{error} (message {name})")
+    })?;
     Ok(u64::from(r.r0) | u64::from(r.r1) << 32)
+}
+
+/// A message to a method nobody has: when the run keeps going (always on the
+/// phone), only that message is skipped and the game gets 0 back, with an
+/// error in the log (once per method) and the method in the missing list;
+/// otherwise, and for every other failure, the game's call stops as before.
+pub(super) fn skip_missing(result: Result<GuestRet, String>, keep_going: bool) -> Result<GuestRet, String> {
+    match result {
+        Err(error) if keep_going && error.starts_with(super::bridge::MISSING_METHOD) => {
+            // "-[Class selector:]", from "missing method -[Class selector:]: why".
+            let rest = &error[super::bridge::MISSING_METHOD.len()..];
+            let name = rest.split(": ").next().unwrap_or(rest);
+            let name = if name.ends_with(']') { name.to_string() } else { format!("{name}]") };
+            if crate::objc::runtime::note_missing_method(&name) {
+                crate::log!("ERROR: {error}; skipped, the game got 0");
+            }
+            Ok(GuestRet { r0: 0, r1: 0 })
+        }
+        other => other,
+    }
 }
 
 fn store_strong(c: &Ctx, w: Words) -> Result<u64, String> {
@@ -502,6 +591,62 @@ fn instance_variable(c: &Ctx, w: Words) -> Result<u64, String> {
     ok(entry)
 }
 
+/// The guest property_t { name, attributes } of a declaration: the image's
+/// own entry, so each declaration (a category may redeclare a property with
+/// other attributes) is its own, as on Apple. Metadata without an address
+/// gets an entry made once per declaration.
+fn property_entry(c: &Ctx, class: u32, property: &guest32_image::Property32) -> u32 {
+    static ENTRIES: Mutex<Option<HashMap<(u32, String, String), u32>>> = Mutex::new(None);
+    if property.address != 0 {
+        return property.address;
+    }
+    let key = (class, property.name.clone(), property.attributes.clone());
+    if let Some(&entry) = ENTRIES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).get(&key) {
+        return entry;
+    }
+    let (name, attributes) = (c.name(&property.name), c.name(&property.attributes));
+    let entry = c.g.alloc_permanent(8);
+    c.g.write(entry, &[name.to_le_bytes(), attributes.to_le_bytes()].concat());
+    *ENTRIES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).entry(key).or_insert(entry)
+}
+
+/// class_copyPropertyList(class, *count): the class's own properties (not
+/// its superclasses') in a NULL-ended list from the game's heap, which the
+/// game frees; NULL when there are none. Framework classes list none: the
+/// host layer keeps no property declarations.
+fn copy_property_list(c: &Ctx, w: Words) -> Result<u64, String> {
+    let (class, count) = (w(0), w(1));
+    let properties = c.lock().classes.class(class).map(|k| k.properties.clone()).unwrap_or_default();
+    if count != 0 {
+        c.set_word(count, properties.len() as u32);
+    }
+    if properties.is_empty() {
+        return ok(0);
+    }
+    let entries: Vec<u32> = properties.iter().map(|p| property_entry(c, class, p)).chain([0]).collect();
+    let list = c.g.alloc(4 * entries.len() as u32);
+    c.g.write(list, &entries.iter().flat_map(|e| e.to_le_bytes()).collect::<Vec<_>>());
+    ok(list)
+}
+
+/// class_getProperty(class, name): searches the superclasses too.
+fn class_property(c: &Ctx, w: Words) -> Result<u64, String> {
+    let (mut class, name) = (w(0), c.cstr(w(1)));
+    for _ in 0..256 {
+        let (found, parent) = {
+            let b = c.lock();
+            let Some(k) = b.classes.class(class) else { return ok(0) };
+            (k.properties.iter().find(|p| p.name == name).cloned(), k.superclass.clone())
+        };
+        match (found, parent) {
+            (Some(property), _) => return ok(property_entry(c, class, &property)),
+            (None, Super::Game(next)) => class = next,
+            _ => break,
+        }
+    }
+    ok(0)
+}
+
 /// class_addMethod(class, sel, imp, types)
 fn add_method(c: &Ctx, w: Words) -> Result<u64, String> {
     let (class, sel, imp) = (w(0), w(1), w(2));
@@ -542,11 +687,13 @@ fn method(c: &Ctx, class: u32, sel: u32) -> Result<u64, String> {
     let found = if b.classes.class(class).is_some() {
         match b.classes.lookup(class, &name) {
             Lookup::Guest(m) => Some((m.imp, m.types.clone())),
-            Lookup::Framework { .. } => FrameworkSelectors::builtin().get(&name).map(|e| (b.msg_send_stub, e.encoding.to_string())),
+            Lookup::Framework { class, .. } => framework_row(&class, &name).map(|e| (super::bridge::message_stub(c.g, Some(e.encoding)), e.encoding.to_string())),
             Lookup::Missing => None,
         }
     } else {
-        FrameworkSelectors::builtin().get(&name).map(|e| (b.msg_send_stub, e.encoding.to_string()))
+        // A framework class: its own row, as its messages use.
+        let (class, _) = b.class_display(class);
+        framework_row(&class, &name).map(|e| (super::bridge::message_stub(c.g, Some(e.encoding)), e.encoding.to_string()))
     };
     let Some((imp, types)) = found else { return ok(0) };
     let mut cache = METHODS.lock().unwrap_or_else(|e| e.into_inner());
@@ -715,11 +862,13 @@ const FIELD_IS_BYREF: u32 = 8;
 const BYREF_CALLER: u32 = 128;
 
 /// _Block_object_assign(destination, object, flags): what a block's copy
-/// helper does for each captured object, block or __block variable.
+/// helper does for each captured object, block or __block variable. A
+/// __block variable's own value (BLOCK_BYREF_CALLER) is assigned as it is.
 fn block_object_assign(c: &Ctx, w: Words) -> Result<u64, String> {
     let (destination, object, flags) = (w(0), w(1), w(2));
     let value = match flags & 0x1f {
-        FIELD_IS_OBJECT if flags & BYREF_CALLER == 0 => c.retain(object)?,
+        _ if flags & BYREF_CALLER != 0 => object,
+        FIELD_IS_OBJECT => c.retain(object)?,
         FIELD_IS_BLOCK => block_copy(c, object)?,
         FIELD_IS_BYREF => byref_copy(c, object)?,
         _ => object,
@@ -732,7 +881,8 @@ fn block_object_assign(c: &Ctx, w: Words) -> Result<u64, String> {
 fn block_object_dispose(c: &Ctx, w: Words) -> Result<u64, String> {
     let (object, flags) = (w(0), w(1));
     match flags & 0x1f {
-        FIELD_IS_OBJECT if flags & BYREF_CALLER == 0 => c.release(object)?,
+        _ if flags & BYREF_CALLER != 0 => {}
+        FIELD_IS_OBJECT => c.release(object)?,
         FIELD_IS_BLOCK => block_release(c, object)?,
         FIELD_IS_BYREF => byref_release(c, object)?,
         _ => {}

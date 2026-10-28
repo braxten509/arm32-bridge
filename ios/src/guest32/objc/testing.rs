@@ -3,9 +3,12 @@
 
 use super::bridge::GuestSide;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub const BASE: u32 = 0x10_0000;
+/// Where the made-up runtime functions' addresses start (no memory there).
+const FUNCTIONS: u32 = 0x9000_0000;
 const SIZE: usize = 0x10_0000;
 
 type Code = Arc<dyn Fn(&[u32]) -> u64 + Send + Sync>;
@@ -14,7 +17,11 @@ pub struct Fake {
     memory: *mut u8,
     next: Mutex<u32>,
     code: Mutex<HashMap<u32, Code>>,
+    functions: Mutex<Vec<String>>,
     pub freed: Mutex<Vec<u32>>,
+    /// How deeply calls may nest (as the translator's return traps limit them).
+    pub depth_limit: AtomicU32,
+    depth: AtomicU32,
 }
 
 unsafe impl Sync for Fake {}
@@ -27,7 +34,10 @@ impl Fake {
             memory,
             next: Mutex::new(BASE + 0x1000),
             code: Mutex::new(HashMap::new()),
+            functions: Mutex::new(Vec::new()),
             freed: Mutex::new(Vec::new()),
+            depth_limit: AtomicU32::new(u32::MAX),
+            depth: AtomicU32::new(0),
         }))
     }
     pub fn code(&self, imp: u32, f: impl Fn(&[u32]) -> u64 + Send + Sync + 'static) {
@@ -43,6 +53,11 @@ impl Fake {
         let at = self.alloc_permanent(words.len() as u32 * 4);
         self.put_words(at, words);
         at
+    }
+    /// The runtime function a `function_address` answer stands for.
+    pub fn function_at(&self, addr: u32) -> Option<String> {
+        let index = addr.checked_sub(FUNCTIONS)? / 8;
+        (addr % 8 == 0).then(|| self.functions.lock().unwrap().get(index as usize).cloned()).flatten()
     }
     pub fn text(&self, s: &str) -> u32 {
         let at = self.alloc_permanent(s.len() as u32 + 1);
@@ -79,8 +94,25 @@ impl GuestSide for Fake {
         let start = self.memory as usize;
         (host >= start && host < start + SIZE).then(|| BASE + (host - start) as u32)
     }
+    fn function_address(&self, name: &str) -> u32 {
+        let mut functions = self.functions.lock().unwrap();
+        let index = functions.iter().position(|f| f == name).unwrap_or_else(|| {
+            functions.push(name.to_string());
+            functions.len() - 1
+        });
+        FUNCTIONS + index as u32 * 8
+    }
     fn call(&self, imp: u32, words: &[u32]) -> Result<u64, String> {
         let code = self.code.lock().unwrap().get(&imp).cloned().ok_or(format!("no fake code at {imp:#x}"))?;
-        Ok(code(words))
+        if self.depth.load(Ordering::SeqCst) >= self.depth_limit.load(Ordering::SeqCst) {
+            return Err("guest calls nested too deeply".into());
+        }
+        self.depth.fetch_add(1, Ordering::SeqCst);
+        let result = code(words);
+        self.depth.fetch_sub(1, Ordering::SeqCst);
+        Ok(result)
+    }
+    fn nested_calls_left(&self) -> u32 {
+        self.depth_limit.load(Ordering::SeqCst).saturating_sub(self.depth.load(Ordering::SeqCst))
     }
 }

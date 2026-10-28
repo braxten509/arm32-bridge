@@ -3,8 +3,8 @@
 //! CGFloats, structs, CGFloat arrays and transform pointers converted.
 
 use super::{
-    host_fn, host_functions, object_to_guest, object_to_host, register_all, AffinePtr, Bool, ColorPtr, Float, Obj, Ptr,
-    Word, I32, U32,
+    host_fn, host_functions, object_to_guest, object_to_host, register_all, AffinePtr, Bool, ColorPtr, Float, Obj, Ptr, Sel,
+    Word, F64, I32, U32,
 };
 use crate::fw::geometry::{Point, Rect, Size, Transform, Transform3D};
 use arm32_bridge::handler;
@@ -54,6 +54,15 @@ pub fn register() {
         "CGAffineTransformInvert" => fn(t: Transform) -> Transform;
         "CATransform3DMakeScale" => fn(sx: Float, sy: Float, sz: Float) -> Transform3D;
         "CATransform3DMakeTranslation" => fn(tx: Float, ty: Float, tz: Float) -> Transform3D;
+        "CATransform3DMakeRotation" => fn(angle: Float, x: Float, y: Float, z: Float) -> Transform3D;
+        "CATransform3DMakeAffineTransform" => fn(t: Transform) -> Transform3D;
+        "CATransform3DRotate" => fn(t: Transform3D, angle: Float, x: Float, y: Float, z: Float) -> Transform3D;
+        "CATransform3DScale" => fn(t: Transform3D, sx: Float, sy: Float, sz: Float) -> Transform3D;
+        "CATransform3DTranslate" => fn(t: Transform3D, tx: Float, ty: Float, tz: Float) -> Transform3D;
+        "CATransform3DConcat" => fn(a: Transform3D, b: Transform3D) -> Transform3D;
+        "CATransform3DIsIdentity" => fn(t: Transform3D) -> Bool;
+        "CACurrentMediaTime" => fn() -> F64;
+        "CGRectIntersectsRect" => fn(a: Rect, b: Rect) -> Bool;
         "CGPointFromString" => fn(text: Obj) -> Point;
         "CGSizeFromString" => fn(text: Obj) -> Size;
         "CGRectFromString" => fn(text: Obj) -> Rect;
@@ -72,9 +81,15 @@ pub fn register() {
         "CGImageRetain" => fn(image: Obj) -> Obj;
         "CGImageRelease" => fn(image: Obj);
         "CGImageCreate" => fn(width: Word, height: Word, bpc: Word, bpp: Word, bpr: Word, space: Obj, info: U32, provider: Obj, decode: Ptr, interpolate: Bool, intent: I32) -> Obj;
+        "CGImageGetDataProvider" => fn(image: Obj) -> Obj;
+        "CGImageIsMask" => fn(image: Obj) -> Bool;
+        "CGImageCreateWithMask" => fn(image: Obj, mask: Obj) -> Obj;
+        "CGDataProviderCreateWithCFData" => fn(data: Obj) -> Obj;
+        "CGDataProviderCopyData" => fn(provider: Obj) -> Obj;
         "CGContextRetain" => fn(context: Obj) -> Obj;
         "CGColorSpaceCreateDeviceRGB" => fn() -> Obj;
         "CGColorSpaceCreateDeviceGray" => fn() -> Obj;
+        "CGColorSpaceCreateIndexed" => fn(base: Obj, last: Word, table: Ptr) -> Obj;
         "CGColorSpaceGetNumberOfComponents" => fn(space: Obj) -> Word;
         "CGColorSpaceRelease" => fn(space: Obj);
         "CGColorCreate" => fn(space: Obj, components: ColorPtr) -> Obj;
@@ -111,6 +126,9 @@ pub fn register() {
         "CGContextSetStrokeColorSpace" => fn(context: Obj, space: Obj);
         "CGContextSetAlpha" => fn(context: Obj, alpha: Float);
         "CGContextSetLineWidth" => fn(context: Obj, width: Float);
+        "CGContextSetLineCap" => fn(context: Obj, cap: I32);
+        "CGContextSetLineJoin" => fn(context: Obj, join: I32);
+        "CGContextSetMiterLimit" => fn(context: Obj, limit: Float);
         "CGContextSetBlendMode" => fn(context: Obj, mode: I32);
         "CGContextSetShadow" => fn(context: Obj, offset: Size, blur: Float);
         "CGContextSetShadowWithColor" => fn(context: Obj, offset: Size, blur: Float, color: Obj);
@@ -163,6 +181,8 @@ pub fn register() {
         "UIGraphicsEndImageContext" => fn();
         "UIImagePNGRepresentation" => fn(image: Obj) -> Obj;
         "UIImageJPEGRepresentation" => fn(image: Obj, quality: Float) -> Obj;
+        "UIImageWriteToSavedPhotosAlbum" => fn(image: Obj, target: Obj, selector: Sel, context: Ptr);
+        "UIRectFill" => fn(rect: Rect);
     });
     special();
     for name in ["CGRectZero", "CGRectNull"] {
@@ -170,6 +190,7 @@ pub fn register() {
     }
     super::struct_constant::<Point>("CGPointZero");
     super::struct_constant::<Size>("CGSizeZero");
+    super::struct_constant::<[f64; 4]>("UIEdgeInsetsZero");
     super::struct_constant::<Transform>("CGAffineTransformIdentity");
     super::struct_constant::<Transform3D>("CATransform3DIdentity");
 }
@@ -178,6 +199,8 @@ pub fn register() {
 static OWN_PIXELS: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
 /// Guest copies of colours' components (CGColorGetComponents), per host colour.
 static COMPONENTS: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
+/// Guest copies of image masks' decode arrays (CGImageGetDecode), per host image.
+static DECODES: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
 /// Guest release callbacks of data providers by key: (callback, info, data, size).
 static RELEASES: Mutex<Option<HashMap<usize, (u32, u32, u32, u32)>>> = Mutex::new(None);
 static NEXT_KEY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
@@ -281,6 +304,65 @@ fn special() {
             Ret::U32(object_to_guest(gradient))
         }),
     );
+    // CGGradientCreateWithColors(space, colors, locations): one location per colour.
+    function(
+        "CGGradientCreateWithColors",
+        handler!(|uc, a| {
+            let (space, colors, locations) = (object_to_host(a.u32()), object_to_host(a.u32()), a.u32());
+            type Create = unsafe extern "C" fn(usize, usize, *const f64) -> usize;
+            let Some(create) = host_fn!("CGGradientCreateWithColors": Create) else { return super::no_host_function(uc, "CGGradientCreateWithColors") };
+            let stops = (locations != 0 && crate::fw::collections::is_array(colors))
+                .then(|| guest_floats(locations, crate::fw::collections::array_items(colors).len()));
+            Ret::U32(object_to_guest(unsafe { create(space, colors, stops.as_ref().map_or(std::ptr::null(), |s| s.as_ptr())) }))
+        }),
+    );
+    // CGImageMaskCreate(width, height, bpc, bpp, bytesPerRow, provider, decode, interpolate):
+    // the decode array is two CGFloats.
+    function(
+        "CGImageMaskCreate",
+        handler!(|uc, a| {
+            let (width, height, bpc, bpp, bpr) = (a.u32() as usize, a.u32() as usize, a.u32() as usize, a.u32() as usize, a.u32() as usize);
+            let (provider, decode, interpolate) = (object_to_host(a.u32()), a.u32(), a.u32() & 0xff != 0);
+            type Create = unsafe extern "C" fn(usize, usize, usize, usize, usize, usize, *const f64, bool) -> usize;
+            let Some(create) = host_fn!("CGImageMaskCreate": Create) else { return super::no_host_function(uc, "CGImageMaskCreate") };
+            let range = (decode != 0).then(|| guest_floats(decode, 2));
+            let mask = unsafe { create(width, height, bpc, bpp, bpr, provider, range.as_ref().map_or(std::ptr::null(), |r| r.as_ptr()), interpolate) };
+            Ret::U32(object_to_guest(mask))
+        }),
+    );
+    // CGImageGetDecode: a guest copy of a mask's two decode values as floats, kept per image.
+    function(
+        "CGImageGetDecode",
+        handler!(|uc, a| {
+            let image = object_to_host(a.u32());
+            let values = host_fn!("CGImageGetDecode": unsafe extern "C" fn(usize) -> *const f64).map_or(std::ptr::null(), |get| unsafe { get(image) });
+            if values.is_null() {
+                return Ret::U32(0);
+            }
+            let guest = *DECODES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).entry(image).or_insert_with(|| crate::guest32::alloc_permanent(8, 4));
+            for i in 0..2 {
+                mem().write_u32(guest + i as u32 * 4, (unsafe { *values.add(i) } as f32).to_bits());
+            }
+            Ret::U32(guest)
+        }),
+    );
+    // CGPointMakeWithDictionaryRepresentation(dict, *point): the point as guest floats.
+    function(
+        "CGPointMakeWithDictionaryRepresentation",
+        handler!(|uc, a| {
+            let (dictionary, out) = (object_to_host(a.u32()), a.u32());
+            type Make = unsafe extern "C" fn(usize, *mut Point) -> bool;
+            let Some(make) = host_fn!("CGPointMakeWithDictionaryRepresentation": Make) else {
+                return super::no_host_function(uc, "CGPointMakeWithDictionaryRepresentation");
+            };
+            let mut point = Point::default();
+            let made = out != 0 && unsafe { make(dictionary, &mut point) };
+            if made {
+                super::GuestStruct::write_guest(&point, out);
+            }
+            Ret::U32(made as u32)
+        }),
+    );
     // CGColorGetComponents: a guest copy as floats, kept per colour.
     function(
         "CGColorGetComponents",
@@ -311,6 +393,19 @@ fn special() {
             let values = guest_floats(points, count * 2);
             let host: Vec<Point> = values.chunks_exact(2).map(|p| Point { x: p[0], y: p[1] }).collect();
             unsafe { stroke(context, host.as_ptr(), host.len()) };
+            Ret::Void
+        }),
+    );
+    // CGContextSetLineDash(context, phase, lengths, count): CGFloat lengths.
+    function(
+        "CGContextSetLineDash",
+        handler!(|uc, a| {
+            let (context, phase, lengths, count) = (object_to_host(a.u32()), f32::from_bits(a.u32()) as f64, a.u32(), a.u32() as usize);
+            let Some(set) = host_fn!("CGContextSetLineDash": unsafe extern "C" fn(usize, f64, *const f64, usize)) else {
+                return super::no_host_function(uc, "CGContextSetLineDash");
+            };
+            let values = if lengths == 0 { Vec::new() } else { guest_floats(lengths, count.min(64)) };
+            unsafe { set(context, phase, if values.is_empty() { std::ptr::null() } else { values.as_ptr() }, values.len()) };
             Ret::Void
         }),
     );

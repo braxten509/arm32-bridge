@@ -890,6 +890,8 @@ fn call_later(block: usize, call: fn(usize, usize)) {
     crate::fw::runloop::post(crate::fw::runloop::Work::Native(Box::new(move || {
         let invoke = unsafe { *((block + 16) as *const usize) };
         call(invoke, block);
+        // The copy goes once the handler has run.
+        crate::libsystem::mach::block_release(block as *mut _);
     })));
 }
 

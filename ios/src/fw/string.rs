@@ -50,7 +50,8 @@ pub fn is_string(object: Id) -> bool {
 
 /// The text behind any string object (ours or compiled-in).
 pub fn text(object: Id) -> *mut Text {
-    let class = lock().class_of(object);
+    // The class pointer is the object's first word (no runtime lock needed).
+    let class = if object == 0 { 0 } else { unsafe { *(object as *const usize) } };
     if class == constant_class() {
         let mut cache = CONSTANT_TEXT.lock().unwrap();
         let cache = cache.get_or_insert_with(HashMap::new);
@@ -143,6 +144,42 @@ fn set(object: Id, value: Vec<u16>) {
     }
 }
 
+/// A string's text read in place, when the string is ours and answers
+/// -isEqual: with ours (comparing text); None for anything else, including
+/// a subclass with its own -isEqual:, which must be asked.
+pub fn plain_units(object: Id) -> Option<*const [u16]> {
+    if object == 0 || CLASSES.get().is_none() {
+        return None;
+    }
+    static IS_EQUAL: OnceLock<Sel> = OnceLock::new();
+    let sel = *IS_EQUAL.get_or_init(|| runtime::sel("isEqual:"));
+    let string = {
+        let rt = lock();
+        rt.is_subclass(rt.class_of(object), string_class())
+    };
+    // Through imp_for, so a subclass's +initialize has run (it may add its own -isEqual:).
+    let plain = string && runtime::imp_for(object, sel) == Some(is_equal as usize);
+    plain.then(|| unsafe { (*text(object)).units.as_slice() as *const [u16] })
+}
+
+/// `plain_units` for many objects in a row (a dictionary's keys): whether
+/// a class is a plain string is worked out once per class in `memo`.
+pub fn plain_units_memo(object: Id, memo: &mut Vec<(usize, bool)>) -> Option<*const [u16]> {
+    if object == 0 || CLASSES.get().is_none() {
+        return None;
+    }
+    let class = unsafe { *(object as *const usize) };
+    let plain = match memo.iter().find(|(c, _)| *c == class) {
+        Some(&(_, plain)) => plain,
+        None => {
+            let plain = plain_units(object).is_some();
+            memo.push((class, plain));
+            plain
+        }
+    };
+    plain.then(|| unsafe { (*text(object)).units.as_slice() as *const [u16] })
+}
+
 fn units(object: Id) -> Vec<u16> {
     if object == 0 {
         return Vec::new();
@@ -207,11 +244,13 @@ extern "C" fn string_with_capacity(class: Class, s: Sel, _capacity: usize) -> Id
     empty_string(class, s)
 }
 
-/// Takes the bytes over: copies them, then frees them if asked (as Apple would when done).
+/// Takes the bytes over: copies them, then frees them with the game's free
+/// if asked (as Apple would when done); not when the string can't be made,
+/// as Apple documents.
 extern "C" fn init_with_bytes_no_copy(this: Id, s: Sel, bytes: *mut u8, length: usize, encoding: usize, free_when_done: u8) -> Id {
     let result = init_with_bytes(this, s, bytes, length, encoding);
-    if free_when_done != 0 && !bytes.is_null() {
-        crate::libsystem::heap::free(bytes as *mut _);
+    if result != 0 && free_when_done != 0 && !bytes.is_null() {
+        crate::fw::data::game_free()(bytes);
     }
     result
 }
@@ -234,8 +273,28 @@ const NS_UTF16: usize = 10;
 const NS_UTF16_LE: usize = 0x9400_0100;
 const NS_UTF32_LE: usize = 0x9C00_0100;
 const NS_UTF32: usize = 0x8C00_0100;
+const NS_WINDOWS_LATIN1: usize = 12;
+/// NSMacOSRomanStringEncoding: iOS's +defaultCStringEncoding.
+const NS_MAC_ROMAN: usize = 30;
+
+/// The table for bytes 0x80-0xFF of a one-byte encoding.
+fn high_table(encoding: usize) -> Option<&'static [u16; 128]> {
+    match encoding {
+        NS_MAC_ROMAN => Some(&crate::fw::cfbridge::MAC_ROMAN_HIGH),
+        NS_WINDOWS_LATIN1 => Some(&crate::fw::cfbridge::WINDOWS_LATIN1_HIGH),
+        _ => None,
+    }
+}
+
+extern "C" fn default_c_string_encoding(_class: Class, _: Sel) -> usize {
+    NS_MAC_ROMAN
+}
 
 fn decode(bytes: &[u8], encoding: usize) -> Option<Vec<u16>> {
+    if let Some(high) = high_table(encoding) {
+        // cp1252's five unused bytes keep their own value, as Windows does.
+        return Some(bytes.iter().map(|&b| if b < 0x80 || high[b as usize - 0x80] == 0 { b as u16 } else { high[b as usize - 0x80] }).collect());
+    }
     Some(match encoding {
         NS_ASCII | NS_UTF8 => std::str::from_utf8(bytes).ok()?.encode_utf16().collect(),
         NS_ISO_LATIN1 => bytes.iter().map(|&b| b as u16).collect(),
@@ -262,6 +321,15 @@ fn decode(bytes: &[u8], encoding: usize) -> Option<Vec<u16>> {
 }
 
 pub fn encode(units: &[u16], encoding: usize) -> Vec<u8> {
+    if let Some(high) = high_table(encoding) {
+        return String::from_utf16_lossy(units)
+            .chars()
+            .map(|c| match c as u32 {
+                ascii @ 0..=0x7F => ascii as u8,
+                code => high.iter().position(|&h| h != 0 && h as u32 == code).map_or(b'?', |i| 0x80 + i as u8),
+            })
+            .collect();
+    }
     match encoding {
         NS_UTF16 | NS_UTF16_LE => units.iter().flat_map(|u| u.to_le_bytes()).collect(),
         NS_UTF32 | NS_UTF32_LE => String::from_utf16_lossy(units).chars().flat_map(|c| (c as u32).to_le_bytes()).collect(),
@@ -417,7 +485,7 @@ extern "C" fn get_c_string(this: Id, _: Sel, buffer: *mut u8, size: usize, encod
 }
 
 extern "C" fn data_using_encoding(this: Id, _: Sel, encoding: usize) -> Id {
-    crate::fw::data::make(&encode(&units(this), encoding))
+    crate::fw::counted::autorelease(crate::fw::data::make(&encode(&units(this), encoding)))
 }
 
 extern "C" fn data_using_encoding_lossy(this: Id, s: Sel, encoding: usize, _lossy: u8) -> Id {
@@ -468,12 +536,45 @@ extern "C" fn is_equal(this: Id, s: Sel, other: Id) -> bool {
 }
 
 extern "C" fn hash(this: Id, _: Sel) -> usize {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for unit in units(this) {
-        h ^= unit as u64;
-        h = h.wrapping_mul(0x100000001b3);
+    cf_hash(this) as usize
+}
+
+/// Apple's __CFStringHash (CoreFoundation 6.1, 0xa7c0): the length, then
+/// four characters at a time with fixed multipliers (16974593, 66049, 257,
+/// 1), then the rest one at a time, and finally the hash shifted by the
+/// length added back. A string over 96 characters hashes only its first 32,
+/// 32 around its middle and last 32 (Apple's 0xa8eb..0xaa22), so a long
+/// string's cost and hash stay bounded. NSString's -hash and CFString's hash
+/// use it, so a dictionary's order (fw/collections.rs) is Apple's.
+pub fn cf_hash(object: Id) -> u32 {
+    let units = units(object);
+    let length = units.len();
+    let mut hash = length as u32;
+    if length > 96 {
+        let middle = length / 2;
+        for part in [&units[..32], &units[middle - 16..middle + 16], &units[length - 32..]] {
+            hash = fours(hash, part);
+        }
+    } else {
+        hash = fours(hash, &units[..length - length % 4]);
+        for &unit in &units[length - length % 4..] {
+            hash = hash.wrapping_mul(257).wrapping_add(unit as u32);
+        }
     }
-    h as usize
+    hash.wrapping_add(hash << (length & 31))
+}
+
+/// The hash of groups of four characters, continuing from `hash`.
+fn fours(mut hash: u32, units: &[u16]) -> u32 {
+    for group in units.chunks_exact(4) {
+        hash = hash
+            .wrapping_mul(67_503_105)
+            .wrapping_add((group[0] as u32).wrapping_mul(16_974_593))
+            .wrapping_add((group[1] as u32).wrapping_mul(66_049))
+            .wrapping_add((group[2] as u32).wrapping_mul(257))
+            .wrapping_add(group[3] as u32);
+    }
+    hash
 }
 
 extern "C" fn copy_with_zone(this: Id, _: Sel, _zone: usize) -> Id {
@@ -570,40 +671,137 @@ extern "C" fn capitalized(this: Id, _: Sel) -> Id {
     make(&out)
 }
 
-extern "C" fn substring_from(this: Id, _: Sel, index: usize) -> Id {
-    let value = units(this);
-    let object = make("");
-    set(object, value.get(index..).unwrap_or(&[]).to_vec());
-    object
+/// NSRangeException for a range past the end of a string, worded as Apple's.
+fn out_of_bounds(method: &str, location: usize, length: usize, count: usize) {
+    crate::fw::collections::raise_named(
+        "NSRangeException",
+        format!("-[__NSCFString {method}]: Range {{{location}, {length}}} out of bounds; string length {count}"),
+    );
 }
 
-extern "C" fn substring_to(this: Id, _: Sel, index: usize) -> Id {
+/// The units from `start` to `end`; past the end raises NSRangeException
+/// (a game's @catch can take it) and gives nil.
+fn substring(this: Id, method: &str, start: usize, end: usize) -> Id {
     let value = units(this);
-    let object = make("");
-    set(object, value[..index.min(value.len())].to_vec());
-    object
-}
-
-extern "C" fn substring_with_range(this: Id, _: Sel, range: Range) -> Id {
-    let value = units(this);
-    let start = range.location.min(value.len());
-    let end = (range.location + range.length).min(value.len());
+    if start > end || end > value.len() {
+        out_of_bounds(method, start, end.saturating_sub(start), value.len());
+        return 0;
+    }
     let object = make("");
     set(object, value[start..end].to_vec());
     object
 }
 
-extern "C" fn range_of_string(this: Id, _: Sel, other: Id) -> Range {
-    let haystack = units(this);
-    let needle = units(other);
-    if !needle.is_empty() && needle.len() <= haystack.len() {
-        for start in 0..=haystack.len() - needle.len() {
-            if haystack[start..start + needle.len()] == needle[..] {
-                return Range { location: start, length: needle.len() };
-            }
+extern "C" fn substring_from(this: Id, _: Sel, index: usize) -> Id {
+    let length = units(this).len();
+    substring(this, "substringFromIndex:", index, length.max(index))
+}
+
+extern "C" fn substring_to(this: Id, _: Sel, index: usize) -> Id {
+    substring(this, "substringToIndex:", 0, index)
+}
+
+extern "C" fn substring_with_range(this: Id, _: Sel, range: Range) -> Id {
+    substring(this, "substringWithRange:", range.location, range.location.saturating_add(range.length))
+}
+
+/// Cut to `length`, or filled up with `pad` repeated from `start` in it.
+extern "C" fn padding(this: Id, _: Sel, length: usize, pad: Id, start: usize) -> Id {
+    let mut value = units(this);
+    let pad = units(pad);
+    if value.len() >= length || pad.is_empty() {
+        value.truncate(length);
+    } else {
+        let mut at = start % pad.len();
+        while value.len() < length {
+            value.push(pad[at]);
+            at = (at + 1) % pad.len();
         }
     }
-    Range { location: isize::MAX as usize, length: 0 }
+    let object = make("");
+    set(object, value);
+    object
+}
+
+extern "C" fn replacing_range(this: Id, _: Sel, range: Range, with: Id) -> Id {
+    let mut value = units(this);
+    let start = range.location.min(value.len());
+    let end = range.location.saturating_add(range.length).min(value.len());
+    value.splice(start..end, units(with));
+    let object = make("");
+    set(object, value);
+    object
+}
+
+/// block(line, &stop) for each line; \n, \r, \r\n, U+0085, U+2028 and
+/// U+2029 end lines, and an ending at the very end starts no empty line.
+extern "C" fn enumerate_lines(this: Id, _: Sel, block: usize) {
+    let value = units(this);
+    let header = block as *const crate::libsystem::mach::BlockHeader;
+    let invoke: extern "C" fn(usize, Id, *mut u8) = unsafe { std::mem::transmute((*header).invoke) };
+    let mut stop = 0u8;
+    let mut start = 0;
+    let mut i = 0;
+    while i < value.len() {
+        let ending = match value[i] {
+            0x0D if value.get(i + 1) == Some(&0x0A) => 2,
+            0x0A | 0x0D | 0x85 | 0x2028 | 0x2029 => 1,
+            _ => 0,
+        };
+        if ending == 0 {
+            i += 1;
+            continue;
+        }
+        let line = make("");
+        set(line, value[start..i].to_vec());
+        invoke(block, line, &mut stop);
+        if stop != 0 {
+            return;
+        }
+        i += ending;
+        start = i;
+    }
+    if start < value.len() {
+        let line = make("");
+        set(line, value[start..].to_vec());
+        invoke(block, line, &mut stop);
+    }
+}
+
+extern "C" fn range_of_string(this: Id, s: Sel, other: Id) -> Range {
+    range_of_string_options(this, s, other, 0)
+}
+
+extern "C" fn range_of_string_options(this: Id, s: Sel, other: Id, options: usize) -> Range {
+    range_of_string_in(this, s, other, options, Range { location: 0, length: units(this).len() })
+}
+
+/// NSStringCompareOptions: 1 case-insensitive (ASCII letters, as -compare:
+/// here), 4 backwards (the last match), 8 anchored (only at the start, or at
+/// the end when backwards); 2 (literal) changes nothing for plain units.
+extern "C" fn range_of_string_in(this: Id, _: Sel, other: Id, options: usize, range: Range) -> Range {
+    let (case_insensitive, backwards, anchored) = (options & 1 != 0, options & 4 != 0, options & 8 != 0);
+    let fold = |u: u16| if case_insensitive && (b'A' as u16..=b'Z' as u16).contains(&u) { u + 32 } else { u };
+    let haystack: Vec<u16> = units(this).into_iter().map(fold).collect();
+    let needle: Vec<u16> = units(other).into_iter().map(fold).collect();
+    let end = range.location.saturating_add(range.length).min(haystack.len());
+    let begin = range.location.min(end);
+    let not_found = Range { location: isize::MAX as usize, length: 0 };
+    if needle.is_empty() || needle.len() > end - begin {
+        return not_found;
+    }
+    let last = end - needle.len();
+    let starts: Vec<usize> = match (backwards, anchored) {
+        (false, false) => (begin..=last).collect(),
+        (true, false) => (begin..=last).rev().collect(),
+        (false, true) => vec![begin],
+        (true, true) => vec![last],
+    };
+    starts
+        .into_iter()
+        .find(|&start| haystack[start..start + needle.len()] == needle[..])
+        .map(|location| Range { location, length: needle.len() })
+        .unwrap_or(not_found)
 }
 
 extern "C" fn int_value(this: Id, _: Sel) -> i32 {
@@ -622,9 +820,12 @@ extern "C" fn double_value(this: Id, _: Sel) -> f64 {
     leading_float(&get(this))
 }
 
+/// YES at Y, y, T, t or a digit 1-9, after whitespace, one + or - and
+/// leading zeros ("-1" and "01" are YES), as Apple documents.
 extern "C" fn bool_value(this: Id, _: Sel) -> bool {
     let text = get(this);
     let text = text.trim_start();
+    let text = text.strip_prefix(['+', '-']).unwrap_or(text).trim_start_matches('0');
     matches!(text.chars().next(), Some('Y' | 'y' | 'T' | 't' | '1'..='9'))
 }
 
@@ -707,6 +908,15 @@ extern "C" fn path_components(this: Id, _: Sel) -> Id {
     crate::fw::collections::array_from(&parts)
 }
 
+/// +pathWithComponents: the parts joined by "/"; a leading "/" part makes
+/// the path absolute, empty parts and doubled or trailing slashes go away.
+extern "C" fn path_with_components(_: Class, _: Sel, components: Id) -> Id {
+    let parts: Vec<String> = crate::fw::collections::array_items(components).into_iter().map(get).collect();
+    let absolute = parts.first().is_some_and(|p| p.starts_with('/'));
+    let inner: Vec<&str> = parts.iter().flat_map(|p| p.split('/')).filter(|p| !p.is_empty()).collect();
+    make(&format!("{}{}", if absolute { "/" } else { "" }, inner.join("/")))
+}
+
 extern "C" fn by_appending_path_component(this: Id, _: Sel, other: Id) -> Id {
     let base = get(this);
     let other = get(other);
@@ -759,6 +969,10 @@ extern "C" fn file_system_representation(this: Id, s: Sel) -> usize {
     utf8_string(this, s)
 }
 
+extern "C" fn is_absolute_path(this: Id, _: Sel) -> bool {
+    get(this).starts_with(['/', '~'])
+}
+
 extern "C" fn by_standardizing_path(this: Id, _: Sel) -> Id {
     this
 }
@@ -782,8 +996,12 @@ extern "C" fn by_replacing_occurrences(this: Id, _: Sel, target: Id, replacement
     make(&get(this).replace(target.as_str(), &get(replacement)))
 }
 
-extern "C" fn by_trimming(this: Id, _: Sel, _set: Id) -> Id {
-    make(get(this).trim())
+/// Takes the set's characters off both ends (only those: whitespace alone
+/// keeps line ends).
+extern "C" fn by_trimming(this: Id, _: Sel, characters: Id) -> Id {
+    let object = make("");
+    set(object, crate::fw::scanner::trim(&units(this), &crate::fw::scanner::set(characters)));
+    object
 }
 
 pub fn register(r: &mut Registry) {
@@ -840,6 +1058,11 @@ pub fn register(r: &mut Registry) {
             ("substringToIndex:", substring_to as usize),
             ("substringWithRange:", substring_with_range as usize),
             ("rangeOfString:", range_of_string as usize),
+            ("rangeOfString:options:", range_of_string_options as usize),
+            ("rangeOfString:options:range:", range_of_string_in as usize),
+            ("stringByPaddingToLength:withString:startingAtIndex:", padding as usize),
+            ("stringByReplacingCharactersInRange:withString:", replacing_range as usize),
+            ("enumerateLinesUsingBlock:", enumerate_lines as usize),
             ("intValue", int_value as usize),
             ("integerValue", integer_value as usize),
             ("longLongValue", integer_value as usize),
@@ -853,6 +1076,7 @@ pub fn register(r: &mut Registry) {
             ("stringByDeletingLastPathComponent", by_deleting_last_path_component as usize),
             ("pathExtension", path_extension as usize),
             ("stringByDeletingPathExtension", by_deleting_path_extension as usize),
+            ("isAbsolutePath", is_absolute_path as usize),
             ("stringByStandardizingPath", by_standardizing_path as usize),
             ("stringByExpandingTildeInPath", by_standardizing_path as usize),
             ("componentsSeparatedByString:", components_separated_by_string as usize),
@@ -864,8 +1088,10 @@ pub fn register(r: &mut Registry) {
         string,
         &[
             ("string", empty_string as usize),
+            ("defaultCStringEncoding", default_c_string_encoding as usize),
             ("stringWithUTF8String:", string_with_utf8 as usize),
             ("stringWithString:", string_with_string as usize),
+            ("pathWithComponents:", path_with_components as usize),
             ("stringWithCharacters:length:", string_with_characters as usize),
             ("stringWithCString:encoding:", string_with_c_string as usize),
             ("stringWithFormat:", ios_string_with_format as usize),
@@ -890,6 +1116,50 @@ pub fn register(r: &mut Registry) {
 mod tests {
     use super::*;
 
+    /// iOS's C string encoding is Mac Roman (NSMacOSRomanStringEncoding, 30);
+    /// it and Windows Latin-1 (12) read and write one byte per character.
+    #[test]
+    fn mac_roman_is_the_default_c_string_encoding() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let class = crate::objc::runtime::class_named("NSString");
+        assert_eq!(crate::objc::runtime::send(class, "defaultCStringEncoding", &[]), 30);
+        assert_eq!(decode(&[b'c', 0x8E, 0xDB], 30), Some("cé€".encode_utf16().collect()));
+        assert_eq!(encode(&"cé€✓".encode_utf16().collect::<Vec<_>>(), 30), [b'c', 0x8E, 0xDB, b'?']);
+        assert_eq!(decode(&[0x80, 0xE9], 12), Some("€é".encode_utf16().collect()));
+        assert_eq!(encode(&"€é".encode_utf16().collect::<Vec<_>>(), 12), [0x80, 0xE9]);
+    }
+
+    /// Trimming takes off exactly the given set's characters; boolValue skips
+    /// a sign and leading zeros ("-1" and "01" are YES).
+    #[test]
+    fn apple_trimming_uses_the_set_and_bool_value_skips_sign_and_zeros() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        use crate::objc::runtime::{class_named, send};
+        let set = class_named("NSCharacterSet");
+        let quotes = send(set, "characterSetWithCharactersInString:", &[make("\"")]);
+        assert_eq!(get(send(make("\"a\" "), "stringByTrimmingCharactersInSet:", &[quotes])), "a\" ");
+        let spaces = send(set, "whitespaceCharacterSet", &[]);
+        assert_eq!(get(send(make(" a\n"), "stringByTrimmingCharactersInSet:", &[spaces])), "a\n", "whitespace keeps line ends");
+        let truth = |text: &str| send(make(text), "boolValue", &[]) & 0xFF;
+        assert_eq!([truth("-1"), truth("01"), truth(" +7"), truth("00"), truth("no"), truth("yes")], [1, 1, 1, 0, 0, 1]);
+        // The string's own UTF-16 units stay, a lone surrogate too.
+        let lone = make("");
+        super::set(lone, vec![0x20, 0xd800, 0x78, 0x20]);
+        assert_eq!(units(send(lone, "stringByTrimmingCharactersInSet:", &[spaces])), [0xd800, 0x78]);
+    }
+
+    /// NSString formats take %C as a unichar and %S as a unichar (UTF-16) string.
+    #[test]
+    fn apple_format_reads_unichar_text() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let units: Vec<u16> = "hé✓\0".encode_utf16().collect();
+        let slots = [0xE9u64, units.as_ptr() as u64];
+        assert_eq!(format_object(make("[%C][%S]"), slots.as_ptr()), "[é][hé✓]");
+    }
+
     /// Each word (split by spaces, tabs or line ends) starts upper case, the rest lower case.
     #[test]
     fn capitalized_string_starts_each_word_upper_case() {
@@ -899,5 +1169,87 @@ mod tests {
         assert!(crate::objc::runtime::responds(text, "capitalizedString"), "-[NSString capitalizedString] is missing");
         let result = crate::objc::runtime::send(text, "capitalizedString", &[]);
         assert_eq!(get(result), "Hello World\tFoo-bar\nSuccess 1st");
+    }
+
+    /// -rangeOfString:options:(range:) honours case-insensitive, backwards and
+    /// anchored searches and stays inside the range it is given.
+    #[test]
+    fn range_of_string_with_options_and_a_range() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        type Find = extern "C" fn(Id, Sel, Id, usize) -> Range;
+        type FindIn = extern "C" fn(Id, Sel, Id, usize, Range) -> Range;
+        let imp = |name: &str| crate::objc::runtime::imp_for(make("x"), crate::objc::runtime::sel(name)).unwrap_or_else(|| panic!("-[NSString {name}] is missing"));
+        let find: Find = unsafe { std::mem::transmute(imp("rangeOfString:options:")) };
+        let find_in: FindIn = unsafe { std::mem::transmute(imp("rangeOfString:options:range:")) };
+        let at = |r: Range| (r.location as isize, r.length);
+        let (text, sel) = (make("Spell=spell=SPELL"), crate::objc::runtime::sel("rangeOfString:options:"));
+        let not_found = (isize::MAX, 0);
+        assert_eq!(at(find(text, sel, make("spell"), 0)), (6, 5), "plain search is case-sensitive");
+        assert_eq!(at(find(text, sel, make("spell"), 1)), (0, 5), "case-insensitive");
+        assert_eq!(at(find(text, sel, make("spell"), 1 | 4)), (12, 5), "backwards finds the last one");
+        assert_eq!(at(find(text, sel, make("spell"), 8)), not_found, "anchored: only at the start");
+        assert_eq!(at(find(text, sel, make("SPELL"), 4 | 8)), (12, 5), "anchored backwards: only at the end");
+        assert_eq!(at(find(text, sel, make(""), 0)), not_found, "an empty string is never found");
+        assert_eq!(at(find_in(text, sel, make("spell"), 1, Range { location: 1, length: 9 })), not_found, "the match must fit the range");
+        assert_eq!(at(find_in(text, sel, make("spell"), 1, Range { location: 1, length: 10 })), (6, 5));
+    }
+
+    /// Paths from the root or the home folder (~) are absolute.
+    #[test]
+    fn paths_from_the_root_or_home_are_absolute() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let absolute = |path: &str| crate::objc::runtime::send(make(path), "isAbsolutePath", &[]) as u8 != 0;
+        assert_eq!([absolute("/a/b.tmx"), absolute("~/a"), absolute("a/b.tmx"), absolute("")], [true, true, false, false]);
+    }
+
+    /// +pathWithComponents: undoes -pathComponents (CocosDenshion finds its
+    /// sound files this way; a file with no folder gives no components).
+    #[test]
+    fn path_with_components_joins_what_path_components_splits() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let class = crate::objc::runtime::class_named("NSString");
+        let join = |parts: &[&str]| {
+            let items: Vec<Id> = parts.iter().map(|p| make(p)).collect();
+            get(crate::objc::runtime::send(class, "pathWithComponents:", &[crate::fw::collections::array_from(&items)]))
+        };
+        assert_eq!(join(&["/", "tmp", "scratch.tiff"]), "/tmp/scratch.tiff");
+        assert_eq!(join(&["Sounds", "hit.caf"]), "Sounds/hit.caf");
+        assert_eq!(join(&["a", "", "b/"]), "a/b");
+        assert_eq!(join(&[]), "");
+        assert_eq!(join(&["/"]), "/");
+        let split = crate::objc::runtime::send(make("/x/y.png"), "pathComponents", &[]);
+        assert_eq!(get(crate::objc::runtime::send(class, "pathWithComponents:", &[split])), "/x/y.png");
+    }
+
+    /// Padding (repeating the pad from an index), replacing a range, and
+    /// one call per line whatever ends it (\n, \r\n, \r).
+    #[test]
+    fn padding_replacing_and_lines() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let send = crate::objc::runtime::send;
+        assert_eq!(get(send(make("ab"), "stringByPaddingToLength:withString:startingAtIndex:", &[7, make("123"), 1])), "ab23123");
+        assert_eq!(get(send(make("abcdef"), "stringByPaddingToLength:withString:startingAtIndex:", &[3, make("."), 0])), "abc");
+        let imp = crate::objc::runtime::imp_for(make("x"), crate::objc::runtime::sel("stringByReplacingCharactersInRange:withString:")).expect("replacing is missing");
+        let replace: extern "C" fn(Id, Sel, Range, Id) -> Id = unsafe { std::mem::transmute(imp) };
+        assert_eq!(get(replace(make("Spellcraft"), 0, Range { location: 5, length: 5 }, make("book"))), "Spellbook");
+        extern "C" fn note(block: usize, line: Id, _stop: *mut u8) {
+            unsafe { (*((block + 32) as *const Mutex<Vec<String>>)).lock().unwrap().push(get(line)) };
+        }
+        #[repr(C)]
+        struct Block {
+            header: crate::libsystem::mach::BlockHeader,
+            lines: Mutex<Vec<String>>,
+        }
+        let descriptor: [usize; 4] = [0, std::mem::size_of::<Block>(), 0, 0];
+        let block = Block {
+            header: crate::libsystem::mach::BlockHeader { isa: 0, flags: 1 << 28, reserved: 0, invoke: note as usize, descriptor: &descriptor },
+            lines: Mutex::new(Vec::new()),
+        };
+        send(make("one\r\ntwo\n\nthree\rfour\n"), "enumerateLinesUsingBlock:", &[&block as *const Block as usize]);
+        assert_eq!(*block.lines.lock().unwrap(), ["one", "two", "", "three", "four"]);
     }
 }

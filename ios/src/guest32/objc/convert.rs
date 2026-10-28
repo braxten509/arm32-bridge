@@ -53,7 +53,7 @@ pub enum HostTy {
 }
 
 /// Struct names whose float fields are CGFloat (double on the host).
-const CGFLOAT_STRUCTS: &[&str] = &["CGPoint", "CGSize", "CGRect", "CGAffineTransform", "UIEdgeInsets", "CGVector"];
+const CGFLOAT_STRUCTS: &[&str] = &["CGPoint", "CGSize", "CGRect", "CGAffineTransform", "UIEdgeInsets", "CGVector", "CATransform3D"];
 /// Struct names whose int fields are NSInteger/NSUInteger (8 bytes on the host).
 const WIDE_INT_STRUCTS: &[&str] = &["_NSRange", "NSFastEnumerationState"];
 
@@ -188,6 +188,21 @@ fn host_u64(bytes: &[u8]) -> u64 {
     u64::from_le_bytes(bytes[..8].try_into().unwrap())
 }
 
+/// NSNotFound is NSIntegerMax, 0x7fffffff in a 32-bit game. It is only
+/// turned into the host's where it means "not found": NSRange locations and
+/// index results (`not-found` rows); other numbers convert as they are.
+fn not_found_to_host(host: &mut [u8]) {
+    if host_u64(host) == i32::MAX as u64 {
+        put(host, i64::MAX as u64)
+    }
+}
+
+fn not_found_to_guest(host: &[u8], guest: &mut [u8]) {
+    if host_u64(host) == i64::MAX as u64 {
+        guest[..4].copy_from_slice(&(i32::MAX as u32).to_le_bytes())
+    }
+}
+
 /// Guest bytes of `ty` -> host bytes of `hty`.
 fn to_host(ty: &Ty, hty: &HostTy, guest: &[u8], out: &mut [u8], b: &mut dyn Boundary) -> Result<(), String> {
     match (ty, hty) {
@@ -216,13 +231,16 @@ fn to_host(ty: &Ty, hty: &HostTy, guest: &[u8], out: &mut [u8], b: &mut dyn Boun
             };
             put(out, host as u64)
         }
-        (Ty::Struct { fields, .. }, HostTy::Struct { fields: host_fields, .. }) => {
+        (Ty::Struct { name, fields }, HostTy::Struct { fields: host_fields, .. }) => {
             let mut offset = 0;
-            for (f, (host_offset, hf)) in fields.iter().zip(host_fields) {
+            for (i, (f, (host_offset, hf))) in fields.iter().zip(host_fields).enumerate() {
                 offset = align_up(offset, f.guest_align());
                 let size = f.guest_size() as usize;
                 let o = *host_offset as usize;
                 to_host(f, hf, &guest[offset as usize..offset as usize + size], &mut out[o..o + hf.size() as usize], b)?;
+                if i == 0 && name == "_NSRange" {
+                    not_found_to_host(&mut out[o..o + 8]);
+                }
                 offset += size as u32;
             }
         }
@@ -249,7 +267,16 @@ fn to_guest(ty: &Ty, hty: &HostTy, host: &[u8], out: &mut [u8], b: &mut dyn Boun
         }
         (Ty::Float, HostTy::F32) | (Ty::Double, HostTy::F64) => out.copy_from_slice(&host[..out.len()]),
         (Ty::Object | Ty::Block | Ty::Class, HostTy::Ptr) => {
-            out.copy_from_slice(&b.id_to_guest(host_u64(host) as usize)?.to_le_bytes())
+            let h = host_u64(host) as usize;
+            // A pointer into guest memory (a void * the game gave, such as
+            // +beginAnimations:context:'s, handed back where the game's
+            // method says id) is the game's own word: Apple passes the same
+            // pointer on. Host objects never live there.
+            let g = match b.guest_address(h) {
+                Some(g) if h != 0 && matches!(ty, Ty::Object) => g,
+                _ => b.id_to_guest(h)?,
+            };
+            out.copy_from_slice(&g.to_le_bytes())
         }
         (Ty::Selector, HostTy::Ptr) => {
             let h = host_u64(host) as usize;
@@ -279,13 +306,17 @@ fn to_guest(ty: &Ty, hty: &HostTy, host: &[u8], out: &mut [u8], b: &mut dyn Boun
             };
             out.copy_from_slice(&g.to_le_bytes())
         }
-        (Ty::Struct { fields, .. }, HostTy::Struct { fields: host_fields, .. }) => {
+        (Ty::Struct { name, fields }, HostTy::Struct { fields: host_fields, .. }) => {
             let mut offset = 0;
-            for (f, (host_offset, hf)) in fields.iter().zip(host_fields) {
+            for (i, (f, (host_offset, hf))) in fields.iter().zip(host_fields).enumerate() {
                 offset = align_up(offset, f.guest_align());
                 let size = f.guest_size() as usize;
                 let o = *host_offset as usize;
-                to_guest(f, hf, &host[o..o + hf.size() as usize], &mut out[offset as usize..offset as usize + size], b)?;
+                let guest = &mut out[offset as usize..offset as usize + size];
+                to_guest(f, hf, &host[o..o + hf.size() as usize], guest, b)?;
+                if i == 0 && name == "_NSRange" {
+                    not_found_to_guest(&host[o..o + 8], guest);
+                }
                 offset += size as u32;
             }
         }
@@ -534,7 +565,7 @@ fn set_host_result(hty: &HostTy, bytes: &[u8], frame: &mut HostFrame) {
 
 // ---------- guest words ----------
 
-fn guest_bytes(words: &dyn Fn(u32) -> u32, first: u32, size: u32) -> Vec<u8> {
+pub(super) fn guest_bytes(words: &dyn Fn(u32) -> u32, first: u32, size: u32) -> Vec<u8> {
     let mut out: Vec<u8> = (0..size.div_ceil(4).max(1)).flat_map(|i| words(first + i).to_le_bytes()).collect();
     out.truncate(size.max(1) as usize);
     out
@@ -551,7 +582,7 @@ pub struct GuestRet {
     pub r1: u32,
 }
 
-fn guest_ret_from_bytes(ty: &Ty, bytes: &[u8]) -> GuestRet {
+pub(super) fn guest_ret_from_bytes(ty: &Ty, bytes: &[u8]) -> GuestRet {
     let mut raw = [0u8; 8];
     let n = bytes.len().min(8);
     raw[..n].copy_from_slice(&bytes[..n]);
@@ -568,15 +599,25 @@ fn guest_ret_from_bytes(ty: &Ty, bytes: &[u8]) -> GuestRet {
 
 // ---------- guest -> host ----------
 
+/// What an `id *` out-parameter's host temporary holds before the call: an
+/// address no object has, so the result tells whether the host set it.
+fn untouched_out() -> u64 {
+    static MARK: u64 = 0;
+    &MARK as *const u64 as u64
+}
+
 /// A pointer argument whose pointee has a different host layout: the host
 /// gets a temporary, copied back into guest memory after the call.
 struct OutParam {
     guest: u32,
     pointee: Ty,
     hty: HostTy,
-    /// Elements (more than one for counted id arrays).
+    /// Elements (more than one for counted arrays).
     count: u32,
     write_back: bool,
+    /// A `counted-out` array: only as many elements go back as the host
+    /// wrote to the integer out-parameter.
+    counted: bool,
     temp: Box<[u64]>,
 }
 
@@ -662,10 +703,12 @@ impl Boundary for TempMap<'_> {
 
 /// Pointees that need a temporary: anything holding ids, pointers or
 /// integers that may be NSInteger.
-fn out_param_type(pointee: &Ty) -> Option<HostTy> {
+fn out_param_type(pointee: &Ty, real_float: bool) -> Option<HostTy> {
     match pointee {
         Ty::Object | Ty::Block | Ty::Class | Ty::Selector | Ty::CString | Ty::Pointer(_) => Some(HostTy::Ptr),
         Ty::Int { signed } => Some(HostTy::Int { size: 8, signed: *signed }),
+        // `CGFloat *` (a double on the host); a C `float *` (`float`) is the same.
+        Ty::Float if !real_float => Some(HostTy::F64),
         Ty::Struct { .. } => {
             let hty = host_ty_in(pointee, Ctx::default()).ok()?;
             let differs = hty.size() != pointee.guest_size() || contains_pointer(&hty);
@@ -686,11 +729,13 @@ fn contains_pointer(hty: &HostTy) -> bool {
 /// A guest message turned into a host call, ready to run.
 pub struct PreparedHostCall {
     pub args: HostArgs,
-    ret: Ty,
-    ret_hty: HostTy,
+    plan: std::sync::Arc<CallPlan>,
     indirect: Option<Box<[u64]>>,
     stret: Option<u32>,
     outs: Vec<OutParam>,
+    not_found: bool,
+    /// Host memory the call's arguments point at (va_lists), kept until it ran.
+    _kept: Vec<Box<[u64]>>,
 }
 
 /// What the framework selector table says about a message beyond its types.
@@ -703,15 +748,61 @@ pub struct HostCallOptions {
     /// The result points to host bytes, as many as the integer out-parameter
     /// says (the bridge copies them into guest memory).
     pub host_bytes: bool,
+    /// The integer result is an index that may be NSNotFound (`not-found`).
+    pub not_found: bool,
 }
+
+/// Room the host gets for a `counted-out` array (the elements it may write;
+/// fw/bezier.rs keeps no longer dash).
+pub const COUNTED_OUT_MOST: u32 = 4096;
 
 /// The most ids one counted array may hold (a bad count fails, not the heap).
 const MAX_ID_ARRAY: u32 = 1 << 20;
 
 /// Converts a guest message (`words`: r0-r3 then the guest stack, by word
 /// index) into host registers.
+/// What a signature's host call needs that its argument values don't
+/// change: each argument's guest word and host type, the result's types.
+/// Worked out once for a remembered message (classes::HostSend).
+#[derive(Debug)]
+pub struct CallPlan {
+    words: Vec<u32>,
+    total: u32,
+    /// Each argument's host type (None: worked out per call, as for the
+    /// pointer an out-parameter gets).
+    htys: Vec<Option<HostTy>>,
+    /// Each pointer argument's out-parameter type.
+    outs: Vec<Option<HostTy>>,
+    ret: Ty,
+    ret_hty: HostTy,
+}
+
+impl CallPlan {
+    pub fn new(sig: &Signature, options: HostCallOptions) -> Result<CallPlan, String> {
+        Ok(CallPlan {
+            words: sig.guest_arg_words(),
+            total: sig.guest_total_words(),
+            htys: sig.args.iter().map(|ty| host_ty(ty, options.real_float).ok()).collect(),
+            outs: sig.args.iter().map(|ty| if let Ty::Pointer(pointee) = ty { out_param_type(pointee, options.real_float) } else { None }).collect(),
+            ret: sig.ret.clone(),
+            ret_hty: host_ty(&sig.ret, false)?,
+        })
+    }
+}
+
 pub fn prepare_host_call(
     sig: &Signature,
+    options: HostCallOptions,
+    words: &dyn Fn(u32) -> u32,
+    b: &mut dyn Boundary,
+) -> Result<PreparedHostCall, String> {
+    prepare_planned(sig, &std::sync::Arc::new(CallPlan::new(sig, options)?), options, words, b)
+}
+
+/// prepare_host_call with `plan` (made from `sig` and `options`).
+pub fn prepare_planned(
+    sig: &Signature,
+    plan: &std::sync::Arc<CallPlan>,
     options: HostCallOptions,
     words: &dyn Fn(u32) -> u32,
     b: &mut dyn Boundary,
@@ -720,16 +811,44 @@ pub fn prepare_host_call(
     let mut outs = Vec::new();
     let array_count = match options.arrays {
         IdArrays::None => None,
-        _ => sig.args.iter().zip(sig.guest_arg_words()).filter(|(t, _)| matches!(t, Ty::Int { .. })).last().map(|(_, at)| words(at)),
+        // The last integer argument, or else the length of the last NSRange
+        // (getObjects:range:).
+        _ => sig.args.iter().zip(plan.words.iter().copied()).filter_map(|(t, at)| match t {
+            Ty::Int { .. } => Some(words(at)),
+            Ty::Struct { name, .. } if name == "_NSRange" => Some(words(at + 1)),
+            _ => None,
+        }).last(),
     };
-    for (ty, at) in sig.args.iter().zip(sig.guest_arg_words()) {
+    let mut kept = Vec::new();
+    let last_word = plan.words.last().copied();
+    for (index, (ty, at)) in sig.args.iter().zip(plan.words.iter().copied()).enumerate() {
+        if options.varargs == Varargs::VaList && Some(at) == last_word && index >= 1 {
+            // The guest's va_list: the format's arguments, one word after
+            // another; the host gets an arm64 va_list (8-byte slots) of them.
+            let format_at = plan.words[index - 1];
+            let text = format_text(&sig.args[index - 1], words(format_at), b)?;
+            let needed: u32 = format_kinds(&text).iter().map(|kind| if matches!(kind, FormatArg::Long) { 2 } else { 1 }).sum();
+            let place = words(at);
+            let raw = if place == 0 || needed == 0 { Vec::new() } else { b.read(place, needed * 4) };
+            let mut next = raw.chunks_exact(4).map(|w| u32::from_le_bytes(w.try_into().unwrap()));
+            let slots = format_slots(&text, || next.next().unwrap_or(0), b)?.into_boxed_slice();
+            args.push(&HostTy::Ptr, &(slots.as_ptr() as u64).to_le_bytes());
+            kept.push(slots);
+            continue;
+        }
         let guest = guest_bytes(words, at, ty.guest_size());
         if let Ty::Pointer(pointee) = ty {
             let address = guest_u32(&guest);
-            if let (Some(hty), true) = (out_param_type(pointee), address != 0) {
-                let (count, read, write_back) = match (array_count, **pointee == Ty::Object) {
-                    (Some(n), true) if n > MAX_ID_ARRAY => return Err(format!("an id array of {n} elements")),
+            if let (Some(hty), true) = (plan.outs[index].clone(), address != 0) {
+                // Counted arrays hold ids or CGFloats; other pointers, one value.
+                let element = matches!(**pointee, Ty::Object | Ty::Float);
+                let counted = options.arrays == IdArrays::CountedOut && element;
+                let (count, read, write_back) = match (array_count, element) {
+                    _ if counted => (COUNTED_OUT_MOST, false, true),
+                    (Some(n), true) if n > MAX_ID_ARRAY => return Err(format!("an array of {n} elements")),
                     (Some(n), true) => (n.max(1), options.arrays == IdArrays::In, options.arrays == IdArrays::Out),
+                    // A lone `CGFloat *` is read and written back.
+                    (None, true) if **pointee == Ty::Float => (1, true, true),
                     // `id *` (NSError **error and the like) is output-only: the
                     // guest's slot is often uninitialized, so the host starts at nil.
                     (None, true) => (1, false, true),
@@ -744,20 +863,40 @@ pub fn prepare_host_call(
                         to_host(pointee, &hty, element, &mut host[i * step..(i + 1) * step], b)?;
                     }
                 }
-                let temp = words_of(&host).into_boxed_slice();
+                let mut temp = words_of(&host).into_boxed_slice();
+                if (array_count, **pointee == Ty::Object) == (None, true) {
+                    temp[0] = untouched_out();
+                }
                 args.push(&HostTy::Ptr, &(temp.as_ptr() as u64).to_le_bytes());
-                outs.push(OutParam { guest: address, pointee: (**pointee).clone(), hty, count, write_back, temp });
+                outs.push(OutParam { guest: address, pointee: (**pointee).clone(), hty, count, write_back, counted, temp });
                 continue;
             }
         }
-        let hty = host_ty(ty, options.real_float)?;
-        let mut host = vec![0u8; (hty.size() as usize).max(8)];
-        to_host(ty, &hty, &guest, &mut host[..hty.size() as usize], b)?;
-        args.push(&hty, &host);
+        let worked_out;
+        let hty = match &plan.htys[index] {
+            Some(hty) => hty,
+            None => {
+                worked_out = host_ty(ty, options.real_float)?;
+                &worked_out
+            }
+        };
+        let size = hty.size() as usize;
+        let (mut small, mut large) = ([0u8; 64], Vec::new());
+        let host: &mut [u8] = if size <= 64 {
+            &mut small[..size.max(8)]
+        } else {
+            large.resize(size, 0);
+            &mut large
+        };
+        to_host(ty, hty, &guest, &mut host[..size], b)?;
+        args.push(hty, host);
     }
-    let next = sig.guest_total_words();
+    let next = plan.total;
     match options.varargs {
-        Varargs::None => {}
+        Varargs::None | Varargs::VaList => {}
+        // The list's first object is the last named argument: when it is nil
+        // the list is over (the words after it are the caller's own stack).
+        Varargs::NilList if plan.words.last().is_some_and(|&at| words(at) == 0) => {}
         Varargs::NilList => {
             for i in next.. {
                 let object = words(i);
@@ -768,47 +907,73 @@ pub fn prepare_host_call(
             }
         }
         Varargs::Format => {
-            let at = *sig.guest_arg_words().last().unwrap();
-            let format_arg = words(at);
-            let text = match sig.args.last() {
-                Some(Ty::CString) => {
-                    let host = b.host_address(format_arg) as *const libc::c_char;
-                    unsafe { std::ffi::CStr::from_ptr(host) }.to_string_lossy().into_owned()
-                }
-                _ => b.object_text(format_arg).ok_or("format string is not a string object")?,
-            };
+            let at = *plan.words.last().unwrap();
+            let text = format_text(sig.args.last().unwrap(), words(at), b)?;
             let mut word = next;
-            for kind in format_kinds(&text) {
-                let slot = match kind {
-                    FormatArg::Int => {
-                        word += 1;
-                        words(word - 1) as i32 as i64 as u64
-                    }
-                    FormatArg::Long => {
-                        word += 2;
-                        u64::from(words(word - 2)) | u64::from(words(word - 1)) << 32
-                    }
-                    FormatArg::Object => {
-                        word += 1;
-                        b.id_to_host(words(word - 1))? as u64
-                    }
-                    FormatArg::Pointer => {
-                        word += 1;
-                        let g = words(word - 1);
-                        if g == 0 { 0 } else { b.host_address(g) as u64 }
-                    }
-                };
-                args.stack.push(slot);
-            }
+            let slots = format_slots(
+                &text,
+                || {
+                    word += 1;
+                    words(word - 1)
+                },
+                b,
+            )?;
+            args.stack.extend(slots);
         }
     }
-    let ret_hty = host_ty(&sig.ret, false)?;
-    let indirect = needs_indirect_result(&ret_hty).then(|| vec![0u64; (ret_hty.size() as usize).div_ceil(8)].into_boxed_slice());
+    let indirect = needs_indirect_result(&plan.ret_hty).then(|| vec![0u64; (plan.ret_hty.size() as usize).div_ceil(8)].into_boxed_slice());
     if let Some(buffer) = &indirect {
         args.x[8] = buffer.as_ptr() as u64;
     }
     let stret = sig.ret.guest_returns_in_memory().then(|| words(0));
-    Ok(PreparedHostCall { args, ret: sig.ret.clone(), ret_hty, indirect, stret, outs })
+    Ok(PreparedHostCall { args, plan: plan.clone(), indirect, stret, outs, not_found: options.not_found, _kept: kept })
+}
+
+/// The text of a printf-style format argument (a C string or a string object).
+fn format_text(ty: &Ty, format: u32, b: &mut dyn Boundary) -> Result<String, String> {
+    match ty {
+        Ty::CString => {
+            let host = b.host_address(format) as *const libc::c_char;
+            Ok(unsafe { std::ffi::CStr::from_ptr(host) }.to_string_lossy().into_owned())
+        }
+        _ => b.object_text(format).ok_or_else(|| "format string is not a string object".to_string()),
+    }
+}
+
+/// The arguments a format reads, as arm64 passes variadic ones (8-byte
+/// slots, which an arm64 va_list points at too), taken a guest word at a
+/// time from `next` (64-bit values: two words, low first).
+fn format_slots(text: &str, mut next: impl FnMut() -> u32, b: &mut dyn Boundary) -> Result<Vec<u64>, String> {
+    let mut slots = Vec::new();
+    for kind in format_kinds(text) {
+        slots.push(match kind {
+            FormatArg::Int => next() as i32 as i64 as u64,
+            FormatArg::Long => {
+                let low = next();
+                u64::from(low) | u64::from(next()) << 32
+            }
+            // A word that is no object shows as (null), as nil does: failing
+            // the message would stop the game's code there (SpellCraft's shop
+            // tutorial did that every frame and its buttons went dead).
+            FormatArg::Object => match b.id_to_host(next()) {
+                Ok(host) => host as u64,
+                Err(error) => {
+                    static TOLD: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+                    let mut told = TOLD.lock().unwrap_or_else(|e| e.into_inner());
+                    if told.len() < 20 && !told.iter().any(|t| t == text) {
+                        told.push(text.to_string());
+                        crate::log!("format \"{text}\": a %@ argument is no object ({error}); shown as (null)");
+                    }
+                    0
+                }
+            },
+            FormatArg::Pointer => match next() {
+                0 => 0,
+                g => b.host_address(g) as u64,
+            },
+        });
+    }
+    Ok(slots)
 }
 
 impl PreparedHostCall {
@@ -817,41 +982,59 @@ impl PreparedHostCall {
     pub fn first_out_value(&self) -> Option<u64> {
         self.outs.first().map(|out| out.temp[0])
     }
+
+    /// How many elements each out-parameter holds (tests check the sizes).
+    #[cfg(test)]
+    pub fn out_counts(&self) -> Vec<u32> {
+        self.outs.iter().map(|out| out.count).collect()
+    }
 }
 
 /// Converts the host's result (and out-parameters) back for the guest.
 pub fn finish_host_call(call: PreparedHostCall, ret: &HostRet, b: &mut dyn Boundary) -> Result<GuestRet, String> {
     let mut mapped = TempMap { b, outs: &call.outs };
+    // How many elements the host wrote to `counted-out` arrays: what it
+    // wrote to the integer out-parameter (none without one).
+    let written = call.outs.iter().find(|o| matches!(o.pointee, Ty::Int { .. })).map_or(0, |o| o.temp[0] as i64);
     for out in call.outs.iter().filter(|o| o.write_back) {
+        if out.count == 1 && out.pointee == Ty::Object && out.temp[0] == untouched_out() {
+            // The host didn't set it: the game's variable keeps its value,
+            // as Apple's methods leave an out-parameter they don't set.
+            continue;
+        }
+        let count = if out.counted { written.clamp(0, out.count as i64) as usize } else { out.count as usize };
         let host: Vec<u8> = out.temp.iter().flat_map(|w| w.to_le_bytes()).collect();
         let (step, guest_step) = (out.hty.size() as usize, out.pointee.guest_size() as usize);
-        let mut guest = vec![0u8; guest_step * out.count as usize];
-        for i in 0..out.count as usize {
+        let mut guest = vec![0u8; guest_step * count];
+        for i in 0..count {
             let element = &host[i * step..(i + 1) * step];
             to_guest(&out.pointee, &out.hty, element, &mut guest[i * guest_step..(i + 1) * guest_step], &mut mapped)?;
         }
         mapped.write(out.guest, &guest);
     }
     let b = mapped.b;
-    if call.ret == Ty::Void {
+    if call.plan.ret == Ty::Void {
         return Ok(GuestRet { r0: 0, r1: 0 });
     }
-    let host = host_result_bytes(&call.ret_hty, ret, is_float_scalar(&call.ret), call.indirect.as_deref());
+    let host = host_result_bytes(&call.plan.ret_hty, ret, is_float_scalar(&call.plan.ret), call.indirect.as_deref());
     // A scalar float came back as f64 bits (see float_register_as_double).
-    let hty = if is_float_scalar(&call.ret) { HostTy::F64 } else { call.ret_hty.clone() };
-    let mut guest = vec![0u8; call.ret.guest_size() as usize];
-    to_guest(&call.ret, &hty, &host, &mut guest, b)?;
+    let hty = if is_float_scalar(&call.plan.ret) { &HostTy::F64 } else { &call.plan.ret_hty };
+    let mut guest = vec![0u8; call.plan.ret.guest_size() as usize];
+    to_guest(&call.plan.ret, hty, &host, &mut guest, b)?;
+    if call.not_found && matches!(call.plan.ret, Ty::Int { .. }) {
+        not_found_to_guest(&host, &mut guest);
+    }
     match call.stret {
         Some(address) => {
             b.write(address, &guest);
             Ok(GuestRet { r0: address, r1: 0 })
         }
-        None => Ok(guest_ret_from_bytes(&call.ret, &guest)),
+        None => Ok(guest_ret_from_bytes(&call.plan.ret, &guest)),
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FormatArg {
+pub(super) enum FormatArg {
     /// 4 guest bytes, sign-extended into a slot (%d %u %x %c %ld %zu %hd ...)
     Int,
     /// 8 guest bytes (%lld %qd %jd, doubles)
@@ -863,9 +1046,11 @@ enum FormatArg {
 }
 
 /// The variadic arguments a printf-style format reads, in order.
-fn format_kinds(format: &str) -> Vec<FormatArg> {
+pub(super) fn format_kinds(format: &str) -> Vec<FormatArg> {
     let f = format.as_bytes();
     let mut out = Vec::new();
+    // `%2$@` names the second argument: kinds are kept by place instead.
+    let mut positional: Vec<Option<FormatArg>> = Vec::new();
     let mut i = 0;
     while i < f.len() {
         if f[i] != b'%' {
@@ -877,6 +1062,18 @@ fn format_kinds(format: &str) -> Vec<FormatArg> {
             i += 1;
             continue;
         }
+        // A place number is digits right after the %, followed by '$'.
+        let digits = i;
+        while i < f.len() && f[i].is_ascii_digit() {
+            i += 1;
+        }
+        let place = if i > digits && f.get(i) == Some(&b'$') {
+            i += 1;
+            Some(f[digits..i - 1].iter().fold(0usize, |n, &d| n.saturating_mul(10).saturating_add((d - b'0') as usize)))
+        } else {
+            i = digits;
+            None
+        };
         while i < f.len() && b"-+ #0'".contains(&f[i]) {
             i += 1;
         }
@@ -903,15 +1100,30 @@ fn format_kinds(format: &str) -> Vec<FormatArg> {
         }
         let Some(&conversion) = f.get(i) else { break };
         i += 1;
-        out.push(match conversion {
-            b'@' => FormatArg::Object,
+        let kind = match conversion {
+            // %K: a key path name in a predicate format.
+            b'@' | b'K' => FormatArg::Object,
             b's' | b'S' | b'p' => FormatArg::Pointer,
             b'f' | b'F' | b'e' | b'E' | b'g' | b'G' | b'a' | b'A' => FormatArg::Long,
             _ if longs >= 2 => FormatArg::Long,
             _ => FormatArg::Int,
-        });
+        };
+        match place {
+            Some(place) if place > 0 => {
+                if positional.len() < place {
+                    positional.resize(place, None);
+                }
+                positional[place - 1] = Some(kind);
+            }
+            _ => out.push(kind),
+        }
     }
-    out
+    if positional.is_empty() {
+        return out;
+    }
+    let mut kinds: Vec<FormatArg> = positional.into_iter().map(|kind| kind.unwrap_or(FormatArg::Int)).collect();
+    kinds.extend(out);
+    kinds
 }
 
 // ---------- host -> guest ----------
@@ -935,6 +1147,8 @@ struct GuestOut {
     hty: HostTy,
     /// The host bytes before the call (8 for an int: it may be NSInteger).
     before: Vec<u8>,
+    /// The guest bytes the temporary started with.
+    guest_before: Vec<u8>,
 }
 
 /// Pointees with a known layout; others (void, opaque structs, functions)
@@ -959,12 +1173,18 @@ impl GuestOut {
         }
         let temp = b.alloc(guest.len() as u32);
         b.write(temp, &guest);
-        Ok(GuestOut { host, temp, pointee: pointee.clone(), hty, before })
+        Ok(GuestOut { host, temp, pointee: pointee.clone(), hty, before, guest_before: guest })
     }
 
     fn copy_back(&self, b: &mut dyn Boundary) -> Result<(), String> {
         let guest = b.read(self.temp, self.pointee.guest_size());
         b.free(self.temp);
+        // Left as it was by the game: the host's own bytes stay, exactly (a
+        // CGFloat isn't rounded through a float). An id slot is still written
+        // back: it started nil, not as the host's (maybe uninitialized) slot.
+        if !self.pointee.is_object() && guest == self.guest_before {
+            return Ok(());
+        }
         let mut host = vec![0u8; (self.hty.size() as usize).max(8)];
         to_host(&self.pointee, &self.hty, &guest, &mut host[..self.hty.size() as usize], b)?;
         let mut out = host[..self.hty.size() as usize].to_vec();
@@ -989,7 +1209,7 @@ pub fn prepare_guest_call(sig: &Signature, frame: &HostFrame, b: &mut dyn Bounda
     let mut words = vec![0u32; sig.guest_total_words() as usize];
     let mut reader = ArgReader { frame, ngrn: 0, nsrn: 0, slot: 0 };
     let mut outs = Vec::new();
-    for (ty, at) in sig.args.iter().zip(sig.guest_arg_words()) {
+    for (index, (ty, at)) in sig.args.iter().zip(sig.guest_arg_words()).enumerate() {
         let hty = host_ty(ty, false)?;
         let host = reader.take(&hty, is_float_scalar(ty));
         if let Ty::Pointer(pointee) = ty {
@@ -1003,7 +1223,8 @@ pub fn prepare_guest_call(sig: &Signature, frame: &HostFrame, b: &mut dyn Bounda
         }
         let mut guest = vec![0u8; (ty.guest_size() as usize).div_ceil(4).max(1) * 4];
         let size = ty.guest_size() as usize;
-        to_guest(ty, &hty, &host, &mut guest[..size], b)?;
+        // Which argument would not convert, for the log (0 is self).
+        to_guest(ty, &hty, &host, &mut guest[..size], b).map_err(|error| format!("{error} (argument {index}, {ty:?}, value {:#x})", host_u64(&host)))?;
         for (i, chunk) in guest.chunks(4).enumerate() {
             words[at as usize + i] = guest_u32(chunk);
         }

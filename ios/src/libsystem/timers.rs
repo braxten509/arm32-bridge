@@ -8,7 +8,8 @@
 //! when the source is suspended waits for dispatch_resume; and after
 //! dispatch_source_cancel the event handler never starts again and the
 //! cancel handler is sent once, when no event handler is running and the
-//! source isn't suspended.
+//! source isn't suspended. A replaced handler is released, and both are once
+//! the cancel handler has run (a running handler holds its own reference).
 
 use crate::libsystem::mach::{self, BlockHeader};
 use crate::symbols::{leak, Registry};
@@ -99,11 +100,14 @@ extern "C" fn run_cancel_handler(block: usize) {
             return;
         }
         state.cancel_sent = true;
-        state.cancel_handler
+        // Neither handler runs again: the source lets go of both.
+        (std::mem::take(&mut state.cancel_handler), std::mem::take(&mut state.handler))
     };
-    if handler != 0 {
-        unsafe { mach::call_block(handler) };
+    if handler.0 != 0 {
+        unsafe { mach::call_block(handler.0) };
     }
+    mach::block_release(handler.0 as *mut BlockHeader);
+    mach::block_release(handler.1 as *mut BlockHeader);
 }
 
 extern "C" fn run_handler(block: usize) {
@@ -118,9 +122,10 @@ extern "C" fn run_handler(block: usize) {
         }
         state.running = true;
         state.data = std::mem::take(&mut state.fired);
-        state.handler
+        mach::block_copy(state.handler as *mut BlockHeader) as usize
     };
     unsafe { mach::call_block(handler) };
+    mach::block_release(handler as *mut BlockHeader);
     let mut state = timer.state.lock().unwrap();
     state.running = false;
     send_handler(timer, &mut state);
@@ -216,7 +221,8 @@ extern "C" fn dispatch_source_set_event_handler(source: usize, handler: usize) {
         crate::log!("dispatch_source_set_event_handler: not one of our sources");
         return;
     };
-    timer.state.lock().unwrap().handler = copied(handler);
+    let old = std::mem::replace(&mut timer.state.lock().unwrap().handler, copied(handler));
+    mach::block_release(old as *mut BlockHeader);
 }
 
 extern "C" fn dispatch_source_set_cancel_handler(source: usize, handler: usize) {
@@ -224,7 +230,8 @@ extern "C" fn dispatch_source_set_cancel_handler(source: usize, handler: usize) 
         crate::log!("dispatch_source_set_cancel_handler: not one of our sources");
         return;
     };
-    timer.state.lock().unwrap().cancel_handler = copied(handler);
+    let old = std::mem::replace(&mut timer.state.lock().unwrap().cancel_handler, copied(handler));
+    mach::block_release(old as *mut BlockHeader);
 }
 
 /// After this the event handler never starts again; the cancel handler follows.
@@ -467,5 +474,18 @@ mod tests {
         let after_cancel = FIRED.load(Ordering::SeqCst);
         sleep(60);
         assert_eq!(FIRED.load(Ordering::SeqCst), after_cancel, "fired after cancel");
+    }
+
+    /// Setting a new handler lets go of the old one (libdispatch releases it).
+    #[test]
+    fn a_replaced_handler_is_released() {
+        use crate::libsystem::mach::test_blocks::{counting, Counts};
+        let counts: &'static Counts = Box::leak(Box::default());
+        let source = dispatch_source_create(timer_type(), 0, 0, mach::dispatch_queue_create(0, 0));
+        dispatch_source_set_event_handler(source, counting(counts));
+        dispatch_source_set_cancel_handler(source, counting(counts));
+        dispatch_source_set_event_handler(source, global_block(tick as usize));
+        dispatch_source_set_cancel_handler(source, 0);
+        assert_eq!(counts.get(), (2, 2));
     }
 }

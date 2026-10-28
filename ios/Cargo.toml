@@ -28,6 +28,8 @@ libc = "0.2.190"
 miniz_oxide = "0.8"
 libsqlite3-sys = { version = "0.38.2", features = ["bundled"] }
 regex = "1.13.1"
+# A fast hash for the bridge's lookup tables (objc/runtime.rs, guest32/objc).
+rustc-hash = "2.1"
 # Font files: glyph outlines and measures for NSString drawing.
 ttf-parser = { version = "0.25", default-features = false, features = ["std"] }
 symphonia = { version = "0.5", default-features = false, features = ["mp3", "wav", "pcm", "aac", "alac", "isomp4"] }
@@ -37,3 +39,9 @@ cc = "1"
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni-sys = "0.3"
+
+[dev-dependencies]
+# Tests drive the phone app's way in (java_text.rs) with a stand-in JNI table.
+jni-sys = "0.3"
+# Checks that the bridge's memory comes from mimalloc (src/lib.rs).
+libmimalloc-sys = { version = "0.1.49", features = ["extended"] }

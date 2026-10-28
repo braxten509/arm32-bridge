@@ -275,6 +275,19 @@ fn offset_or_guest(buffer: u32, pointer: u32) -> *mut c_void {
     }
 }
 
+/// The guest's view of a pointer GL hands back: guest memory as a guest
+/// address, a buffer offset as itself, anything else as NULL.
+fn guest_pointer_or_offset(pointer: *mut c_void) -> u32 {
+    let in_guest = (pointer as usize).wrapping_sub(mem().host(0) as usize);
+    if !pointer.is_null() && in_guest < (1usize << 32) {
+        in_guest as u32
+    } else if (pointer as usize) < (1usize << 32) {
+        pointer as usize as u32
+    } else {
+        0
+    }
+}
+
 /// A vertex array pointer.
 pub fn array_pointer(pointer: u32) -> *mut c_void {
     offset_or_guest(bound(GL_ARRAY_BUFFER), pointer)
@@ -513,6 +526,136 @@ fn decode_upload(format: u32, width: i32, height: i32, size: i32, data: u32) -> 
     s3tc::decode(format, bytes, width as u32, height as u32)
 }
 
+// ---- 2x pictures (texture_pack.rs) ----
+
+const GL_TEXTURE_2D: u32 = 0x0DE1;
+const GL_TEXTURE_BINDING_2D: u32 = 0x8069;
+const GL_UNPACK_ALIGNMENT: u32 = 0x0CF5;
+const GL_MAX_TEXTURE_SIZE: u32 = 0x0D33;
+
+fn integer(name: u32) -> i32 {
+    let mut value = 0i32;
+    unsafe { host!("glGetIntegerv", fn(u32, *mut i32))(name, &mut value) };
+    value
+}
+
+/// GL's largest texture side, asked once.
+fn max_texture_size() -> u32 {
+    static SIZE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let known = SIZE.load(Ordering::Relaxed);
+    if known != 0 {
+        return known;
+    }
+    let size = integer(GL_MAX_TEXTURE_SIZE).max(0) as u32;
+    SIZE.store(size, Ordering::Relaxed);
+    size
+}
+
+/// Whether an upload to `target` might go through the picture pack (not when
+/// its pixels come from a pixel unpack buffer: those are offsets, not game memory).
+fn pack_upload(target: u32) -> bool {
+    target == GL_TEXTURE_2D && crate::texture_pack::active() && bound(GL_PIXEL_UNPACK_BUFFER) == 0
+}
+
+/// Runs an upload of the bridge's own pixels (rows packed tight), keeping the game's row alignment.
+fn upload_packed(upload: impl FnOnce()) {
+    let alignment = integer(GL_UNPACK_ALIGNMENT);
+    if alignment != 1 {
+        unsafe { host!("glPixelStorei", fn(u32, i32))(GL_UNPACK_ALIGNMENT, 1) };
+    }
+    upload();
+    if alignment != 1 {
+        unsafe { host!("glPixelStorei", fn(u32, i32))(GL_UNPACK_ALIGNMENT, alignment) };
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tex_image_2d(target: u32, level: i32, internal: i32, width: i32, height: i32, border: i32, format: u32, kind: u32, data: u32) {
+    use crate::texture_pack::{Call, Image, GL_UNSIGNED_BYTE};
+    let image = |internal: i32, width: i32, height: i32, format: u32, kind: u32, pixels: *const c_void| unsafe {
+        host!("glTexImage2D", fn(u32, i32, i32, i32, i32, i32, u32, u32, *const c_void))(
+            target, level, internal, width, height, border, format, kind, pixels,
+        )
+    };
+    if !pack_upload(target) {
+        return image(internal, width, height, format, kind, unpack_pointer(data));
+    }
+    let texture = integer(GL_TEXTURE_BINDING_2D) as u32;
+    let call = Call { level, width, height, format, kind, data, ..Call::default() };
+    match crate::texture_pack::image(texture, call, max_texture_size()) {
+        Image::AsAsked => image(internal, width, height, format, kind, unpack_pointer(data)),
+        // Made from zeros, it stays zeros (GL leaves a texture made from nothing undefined).
+        Image::Allocate { width, height, format } if data != 0 => {
+            let zeros = vec![0u8; (width * height * crate::texture_pack::channels(format).unwrap_or(4)) as usize];
+            upload_packed(|| image(format as i32, width as i32, height as i32, format, GL_UNSIGNED_BYTE, zeros.as_ptr() as *const c_void));
+        }
+        Image::Allocate { width, height, format } => {
+            image(format as i32, width as i32, height as i32, format, GL_UNSIGNED_BYTE, std::ptr::null())
+        }
+        Image::Replace { path, width: w, height: h, channels } => match crate::texture_pack::picture(&path, false) {
+            Some(pixels) => {
+                let format = if channels == 4 { crate::texture_pack::GL_RGBA } else { crate::texture_pack::GL_RGB };
+                upload_packed(|| {
+                    image(format as i32, w as i32 * 2, h as i32 * 2, format, GL_UNSIGNED_BYTE, pixels.as_ptr() as *const c_void)
+                });
+            }
+            None => {
+                crate::texture_pack::forget(texture);
+                image(internal, width, height, format, kind, unpack_pointer(data));
+            }
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tex_sub_image_2d(target: u32, level: i32, x: i32, y: i32, width: i32, height: i32, format: u32, kind: u32, data: u32) {
+    use crate::texture_pack::{pixel_size, row_stride, Call, SubImage};
+    let pass = || unsafe {
+        host!("glTexSubImage2D", fn(u32, i32, i32, i32, i32, i32, u32, u32, *mut c_void))(
+            target, level, x, y, width, height, format, kind, unpack_pointer(data),
+        )
+    };
+    if !pack_upload(target) {
+        return pass();
+    }
+    let texture = integer(GL_TEXTURE_BINDING_2D) as u32;
+    let alignment = integer(GL_UNPACK_ALIGNMENT).max(1) as u32;
+    let stride = pixel_size(format, kind).map_or(0, |size| row_stride(width.max(0) as u32, size, alignment));
+    let call = Call { level, x, y, width, height, format, kind, data };
+    match crate::texture_pack::sub_image(texture, call, stride) {
+        SubImage::AsAsked => pass(),
+        SubImage::Upscale { x, y } => upscale_piece(target, level, x, y, call, stride),
+        SubImage::Rows { path, width: w, channels, first_row, rows, x, y, last } => {
+            let row_bytes = (w * 2 * channels as u32) as usize;
+            let (start, end) = (first_row as usize * row_bytes, (first_row + rows) as usize * row_bytes);
+            match crate::texture_pack::picture(&path, !last) {
+                Some(pixels) if end <= pixels.len() => upload_packed(|| unsafe {
+                    let format = if channels == 4 { crate::texture_pack::GL_RGBA } else { crate::texture_pack::GL_RGB };
+                    host!("glTexSubImage2D", fn(u32, i32, i32, i32, i32, i32, u32, u32, *const u8))(
+                        target, level, x, y, w as i32 * 2, rows as i32, format, crate::texture_pack::GL_UNSIGNED_BYTE, pixels[start..].as_ptr(),
+                    )
+                }),
+                _ => upscale_piece(target, level, x, y, call, stride),
+            }
+        }
+    }
+}
+
+/// A game piece put into a 2x texture, made 2x on the CPU and put at (x, y) (already doubled).
+fn upscale_piece(target: u32, level: i32, x: i32, y: i32, call: crate::texture_pack::Call, stride: u32) {
+    use crate::texture_pack::{channels, pixel_size, to_bytes, upscale, GL_UNSIGNED_BYTE};
+    let (width, height) = (call.width as u32, call.height as u32);
+    let (Some(size), Some(count)) = (pixel_size(call.format, call.kind), channels(call.format)) else { return };
+    let length = stride as usize * (height as usize - 1) + (width * size) as usize;
+    let Some(pixels) = to_bytes(mem().bytes(call.data, length), width, height, stride, call.format, call.kind) else { return };
+    let doubled = upscale(&pixels, width, height, count);
+    upload_packed(|| unsafe {
+        host!("glTexSubImage2D", fn(u32, i32, i32, i32, i32, i32, u32, u32, *const u8))(
+            target, level, x, y, width as i32 * 2, height as i32 * 2, call.format, GL_UNSIGNED_BYTE, doubled.as_ptr(),
+        )
+    });
+}
+
 pub fn handler(name: &str) -> Option<Handler> {
     if let Some(found) = special(name) {
         return Some(found);
@@ -679,6 +822,41 @@ fn special(name: &str) -> Option<Handler> {
             }
             Ret::Void
         }),
+        // Through the picture pack (texture_pack.rs) when the game has one.
+        "glTexImage2D" => handler!(|uc, a| {
+            let (target, level, internal, width, height, border, format, kind, data) =
+                (a.u32(), a.i32(), a.i32(), a.i32(), a.i32(), a.i32(), a.u32(), a.u32(), a.u32());
+            tex_image_2d(target, level, internal, width, height, border, format, kind, data);
+            Ret::Void
+        }),
+        "glTexSubImage2D" => handler!(|uc, a| {
+            let (target, level, x, y, width, height, format, kind, data) =
+                (a.u32(), a.i32(), a.i32(), a.i32(), a.i32(), a.i32(), a.u32(), a.u32(), a.u32());
+            tex_sub_image_2d(target, level, x, y, width, height, format, kind, data);
+            Ret::Void
+        }),
+        // A copy of the screen is 1x.
+        "glCopyTexImage2D" => handler!(|uc, a| {
+            let (target, level, internal, x, y, width, height, border) =
+                (a.u32(), a.i32(), a.u32(), a.i32(), a.i32(), a.i32(), a.i32(), a.i32());
+            if level == 0 && target == GL_TEXTURE_2D && crate::texture_pack::active() {
+                crate::texture_pack::forget(integer(GL_TEXTURE_BINDING_2D) as u32);
+            }
+            unsafe {
+                host!("glCopyTexImage2D", fn(u32, i32, u32, i32, i32, i32, i32, i32))(target, level, internal, x, y, width, height, border)
+            };
+            Ret::Void
+        }),
+        "glDeleteTextures" => handler!(|uc, a| {
+            let (count, textures) = (a.i32(), a.u32());
+            if crate::texture_pack::active() {
+                for i in 0..count.max(0) as u32 {
+                    crate::texture_pack::forget(mem().read_u32(textures + i * 4));
+                }
+            }
+            unsafe { host!("glDeleteTextures", fn(i32, *mut c_void))(count, guest_pointer(textures)) };
+            Ret::Void
+        }),
         "glTexStorage2D" | "glTexStorage2DEXT" => {
             fn storage(name: &'static str, a: &mut crate::runtime::Args) {
                 let (target, levels, mut format, width, height) = (a.u32(), a.i32(), a.u32(), a.i32(), a.i32());
@@ -712,17 +890,19 @@ fn special(name: &str) -> Option<Handler> {
             };
             Ret::Void
         }),
+        // One guest copy per text: contexts of different kinds (OpenGL ES 1
+        // and 2 in one game) give different versions and extension lists.
         "glGetString" => handler!(|uc, a| {
             let which = a.u32();
-            let key = format!("glGetString:{which:#x}");
-            if let Some(&address) = shared().state.data_imports.get(&key) {
-                return Ret::U32(address);
-            }
             let text = unsafe { host!("glGetString", fn(u32) -> *const libc::c_char)(which) };
             if text.is_null() {
                 return Ret::U32(0);
             }
             let text = unsafe { std::ffi::CStr::from_ptr(text) }.to_string_lossy().into_owned();
+            let key = format!("glGetString:{which:#x}:{text}");
+            if let Some(&address) = shared().state.data_imports.get(&key) {
+                return Ret::U32(address);
+            }
             Ret::U32(shared().cached_cstr(key, &text))
         }),
         // OES_texture_3D: the extension's names for GLES3's own 3D texture
@@ -876,11 +1056,15 @@ fn special(name: &str) -> Option<Handler> {
             crate::log::line("[bridge] the game set a GL debug callback; ignored");
             Ret::Void
         }),
+        // The array pointers the game set: a guest pointer (it was made a host
+        // one) or a buffer offset. Anything else (the debug callback, which is
+        // never passed on) reads as NULL.
         "glGetPointerv" => handler!(|uc, a| {
-            crate::log::line("[bridge] the game asked GL for a pointer; returning NULL");
-            let (_name, out) = (a.u32(), a.u32());
+            let (name, out) = (a.u32(), a.u32());
+            let mut pointer: *mut c_void = std::ptr::null_mut();
+            unsafe { host!("glGetPointerv", fn(u32, *mut *mut c_void))(name, &mut pointer) };
             if out != 0 {
-                mem().write_u32(out, 0);
+                mem().write_u32(out, guest_pointer_or_offset(pointer));
             }
             Ret::Void
         }),

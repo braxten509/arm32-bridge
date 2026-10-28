@@ -10,17 +10,22 @@ pub enum Varargs {
     None,
     Format,
     NilList,
+    /// The last argument is a va_list of the format before it (`va-list`).
+    VaList,
 }
 
-/// Pointer-to-id arguments of a counted message (`objects:count:`): they
-/// hold as many ids as the message's last integer argument says, read
-/// before the call (`in-array`) or filled by it (`out-array`).
+/// Pointer arguments of a counted message (`objects:count:`, CGFloat
+/// `pattern:count:`): they hold as many elements as the message's last
+/// integer argument says, read before the call (`in-array`) or filled by it
+/// (`out-array`); or as many as the host writes to the message's integer
+/// out-parameter, filled by it (`counted-out`, -getLineDash:count:phase:).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum IdArrays {
     #[default]
     None,
     In,
     Out,
+    CountedOut,
 }
 
 #[derive(Clone, Debug)]
@@ -33,10 +38,15 @@ pub struct FrameworkSelector {
     /// The result points to host bytes, as many as the integer
     /// out-parameter says (`host-bytes`).
     pub host_bytes: bool,
+    /// The integer result is an index that may be NSNotFound (`not-found`).
+    pub not_found: bool,
 }
 
 pub struct FrameworkSelectors {
     map: HashMap<&'static str, FrameworkSelector>,
+    /// Rows for receivers of one class and its subclasses (`class:Name`),
+    /// tried before the selector's general row.
+    by_class: HashMap<&'static str, Vec<(&'static str, FrameworkSelector)>>,
 }
 
 impl FrameworkSelectors {
@@ -49,6 +59,7 @@ impl FrameworkSelectors {
 
     pub fn parse(text: &'static str) -> Result<FrameworkSelectors, String> {
         let mut map = HashMap::new();
+        let mut by_class: HashMap<&'static str, Vec<(&'static str, FrameworkSelector)>> = HashMap::new();
         for (number, line) in text.lines().enumerate() {
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -67,6 +78,8 @@ impl FrameworkSelectors {
                 Varargs::Format
             } else if notes.contains(&"nil-list") {
                 Varargs::NilList
+            } else if notes.contains(&"va-list") {
+                Varargs::VaList
             } else {
                 Varargs::None
             };
@@ -74,16 +87,31 @@ impl FrameworkSelectors {
                 IdArrays::In
             } else if notes.contains(&"out-array") {
                 IdArrays::Out
+            } else if notes.contains(&"counted-out") {
+                IdArrays::CountedOut
             } else {
                 IdArrays::None
             };
             let (real_float, host_bytes) = (notes.contains(&"float"), notes.contains(&"host-bytes"));
-            let entry = FrameworkSelector { encoding, signature, varargs, real_float, arrays, host_bytes };
-            if map.insert(selector, entry).is_some() {
+            let not_found = notes.contains(&"not-found");
+            let entry = FrameworkSelector { encoding, signature, varargs, real_float, arrays, host_bytes, not_found };
+            if let Some(class) = notes.iter().find_map(|n| n.strip_prefix("class:")) {
+                let rows = by_class.entry(selector).or_default();
+                if rows.iter().any(|(c, _)| *c == class) {
+                    return Err(format!("line {}: {selector} is listed twice for {class}", number + 1));
+                }
+                rows.push((class, entry));
+            } else if map.insert(selector, entry).is_some() {
                 return Err(format!("line {}: {selector} is listed twice", number + 1));
             }
         }
-        Ok(FrameworkSelectors { map })
+        Ok(FrameworkSelectors { map, by_class })
+    }
+
+    /// The row for a message to a receiver: its class's own row (`is_kind`
+    /// tells whether the receiver is of a named class), else the general one.
+    pub fn get_for(&self, selector: &str, is_kind: impl Fn(&str) -> bool) -> Option<&FrameworkSelector> {
+        self.by_class.get(selector).and_then(|rows| rows.iter().find(|(class, _)| is_kind(class)).map(|(_, entry)| entry)).or_else(|| self.get(selector))
     }
 
     pub fn len(&self) -> usize {
@@ -92,5 +120,26 @@ impl FrameworkSelectors {
 
     pub fn get(&self, selector: &str) -> Option<&FrameworkSelector> {
         self.map.get(selector)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A selector whose types differ by class (CALayer's setTransform: takes
+    /// a CATransform3D, UIView's a CGAffineTransform) gets the row of the
+    /// receiver's class, else the general one; a class listed twice is a mistake.
+    #[test]
+    fn rows_for_one_class_win_for_its_receivers() {
+        let table = FrameworkSelectors::parse(
+            "setTransform:\tv@:{CGAffineTransform=ffffff}\nsetTransform:\tv@:{CATransform3D=ffffffffffffffff}\tclass:CALayer\n",
+        )
+        .unwrap();
+        let layer = |name: &str| name == "CALayer";
+        assert_eq!(table.get_for("setTransform:", layer).unwrap().encoding, "v@:{CATransform3D=ffffffffffffffff}");
+        assert_eq!(table.get_for("setTransform:", |_| false).unwrap().encoding, "v@:{CGAffineTransform=ffffff}");
+        assert!(table.get_for("frame", layer).is_none());
+        assert!(FrameworkSelectors::parse("a:\tv@:@\tclass:X\na:\tv@:i\tclass:X\n").is_err());
     }
 }

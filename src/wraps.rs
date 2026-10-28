@@ -30,6 +30,13 @@ const WRAPS: &[Wrap] = &[
     Wrap { symbol: crate::gameswf_menus::MENU_INPUT, library: Some("libMonsterLife"), handler: crate::gameswf_menus::menu_input },
     // ... and its currency store sells packs for Gold (monster_life_store.rs).
     Wrap { symbol: crate::monster_life_store::BUY_ITEM, library: Some("libMonsterLife"), handler: crate::monster_life_store::buy_item },
+    // Rule the Kingdom, zoomed in 50% (rtk_zoom.rs).
+    Wrap { symbol: crate::rtk_zoom::SETTERS[0], library: Some(crate::rtk_zoom::LIBRARY), handler: crate::rtk_zoom::set_world },
+    Wrap { symbol: crate::rtk_zoom::SETTERS[1], library: Some(crate::rtk_zoom::LIBRARY), handler: crate::rtk_zoom::set_menus },
+    Wrap { symbol: crate::rtk_zoom::SETTERS[2], library: Some(crate::rtk_zoom::LIBRARY), handler: crate::rtk_zoom::set_hover },
+    Wrap { symbol: crate::rtk_zoom::SETTERS[3], library: Some(crate::rtk_zoom::LIBRARY), handler: crate::rtk_zoom::set_top_bar },
+    // Rule the Kingdom's pictures, for the 2x picture pack (rtk_textures.rs).
+    Wrap { symbol: crate::rtk_textures::GET_IMAGE_DATA, library: Some(crate::rtk_zoom::LIBRARY), handler: crate::rtk_textures::get_image_data },
 ];
 
 fn applies(wrap: &Wrap, library: &str, symbol: &str) -> bool {
@@ -93,6 +100,8 @@ pub fn wrap(library: &str, symbol: &str, entry: u32, size: u32) {
 
 /// `ldr pc, [pc, #-4]`: jumps to the word after it.
 const ARM_JUMP: u32 = 0xE51F_F004;
+/// `mov r0, r0`.
+const ARM_NOP: u32 = 0xE1A0_0000;
 /// `ldr.w pc, [pc, #0]` as two halfwords: jumps to the word at the next 4-byte boundary after its own start + 4.
 const THUMB_JUMP: [u16; 2] = [0xF8DF, 0xF000];
 const THUMB_NOP: u16 = 0xBF00;
@@ -120,6 +129,9 @@ fn wrap_arm(entry: u32, size: u32, stand_in: u32) -> Result<u32, String> {
 /// (`ldr rN, [pc, #±n]`) read, which `read` gives by address; those loads
 /// read their copy instead.
 fn arm_trampoline(moved: [u32; 2], entry: u32, read: impl Fn(u32) -> u32) -> Result<Vec<u32>, String> {
+    if let Some(words) = arm_address_trampoline(moved, entry, &read) {
+        return Ok(words);
+    }
     let mut words = vec![moved[0], moved[1], ARM_JUMP, entry + 8];
     for (i, &instruction) in moved.iter().enumerate() {
         let number_load = instruction & 0x0F7F_0000 == 0x051F_0000 && (instruction >> 12) & 0xF != 15 && instruction >> 28 != 0xF;
@@ -136,6 +148,31 @@ fn arm_trampoline(moved: [u32; 2], entry: u32, read: impl Fn(u32) -> u32) -> Res
         }
     }
     Ok(words)
+}
+
+/// The trampoline for a position-independent address: `ldr rD, [pc, #±n]`
+/// (a distance), then `add rD, pc, rD` (the address) or `ldr rD, [pc, rD]`
+/// (the word there). The finished address is worked out now and loaded from
+/// beside the trampoline; the second form then reads through it
+/// (`ldr rD, [rD]`). None for anything else.
+fn arm_address_trampoline(moved: [u32; 2], entry: u32, read: &impl Fn(u32) -> u32) -> Option<Vec<u32>> {
+    let [load, second] = moved;
+    // An unconditional word load from near the pc into rD (not the pc).
+    if load & 0xFF7F_0000 != 0xE51F_0000 || (load >> 12) & 0xF == 15 {
+        return None;
+    }
+    let register = (load >> 12) & 0xF;
+    let then = match second {
+        _ if second == 0xE08F_0000 | register << 12 | register => ARM_NOP,
+        _ if second == 0xE79F_0000 | register << 12 | register => 0xE590_0000 | register << 16 | register << 12,
+        _ => return None,
+    };
+    let offset = load & 0xFFF;
+    let number_at = if load & (1 << 23) != 0 { entry + 8 + offset } else { entry + 8 - offset };
+    // The second instruction's pc reads 8 ahead of it.
+    let address = (entry + 4 + 8).wrapping_add(read(number_at));
+    // The load's new place is the trampoline's start; the address sits 4 words on.
+    Some(vec![(load & 0xFFFF_F000) | (1 << 23) | (4 * 4 - 8), then, ARM_JUMP, entry + 8, address])
 }
 
 /// Whether an ARM instruction reads, stores or writes the pc, or branches (so it can't run moved).
@@ -280,5 +317,23 @@ mod tests {
         for refused in [0xE59F_F004, 0xE5DF_0004] {
             assert!(arm_trampoline([refused, 0xE1A0_4000], 0x1000, numbers).is_err(), "{refused:#010x}");
         }
+    }
+
+    /// A position-independent address (`ldr r3,[pc,#n]` then `add r3,pc,r3`
+    /// or `ldr r3,[pc,r3]`, as Rule the Kingdom's setters start) is worked
+    /// out once: the trampoline loads the finished address (and reads
+    /// through it for the second form).
+    #[test]
+    fn moved_position_independent_addresses_stay_the_same() {
+        let numbers = |address: u32| if address == 0x1661A8 { 0x0049_8D94 } else { 0 };
+        let address = 0x16619C + 8 + 0x0049_8D94;
+        // ldr r3,[pc,#8]; add r3,pc,r3
+        let words = arm_trampoline([0xE59F_3008, 0xE08F_3003], 0x166198, numbers).unwrap();
+        assert_eq!(words, [0xE59F_3008, ARM_NOP, ARM_JUMP, 0x1661A0, address]);
+        // ldr r3,[pc,#8]; ldr r3,[pc,r3]: the trampoline reads through the address (ldr r3,[r3])
+        let words = arm_trampoline([0xE59F_3008, 0xE79F_3003], 0x166198, numbers).unwrap();
+        assert_eq!(words, [0xE59F_3008, 0xE593_3000, ARM_JUMP, 0x1661A0, address]);
+        // ... but not when the second adds the pc to another register than the one loaded
+        assert!(arm_trampoline([0xE59F_3008, 0xE08F_2003], 0x166198, numbers).is_err());
     }
 }

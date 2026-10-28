@@ -107,6 +107,23 @@ fn format_in_locale(fmt: &[u8], args: &mut Args, objects: bool) -> Vec<u8> {
         i += 1;
         let long = matches!(length.as_str(), "l" | "ll" | "q" | "j" | "z" | "t");
         match conversion {
+            // In NSString formats %C is a unichar and %S a unichar (UTF-16) string.
+            b'C' | b'S' if objects => {
+                let raw = args.next();
+                let text = if conversion == b'C' {
+                    char::decode_utf16([raw as u16]).map(|c| c.unwrap_or('\u{FFFD}')).collect::<String>()
+                } else if raw == 0 {
+                    "(null)".to_string()
+                } else {
+                    let pointer = raw as usize as *const u16;
+                    let length = (0..).take_while(|&i| unsafe { *pointer.add(i) } != 0).count();
+                    String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(pointer, length) })
+                };
+                let text = CString::new(text.replace('\0', "")).unwrap();
+                spec.push(b's');
+                let pointer = text.as_ptr() as usize;
+                out.extend(host_format(&spec, |b, n, f| unsafe { libc::snprintf(b, n, f, pointer) }));
+            }
             b'd' | b'i' => {
                 let raw = args.next();
                 let value: i64 = match length.as_str() {

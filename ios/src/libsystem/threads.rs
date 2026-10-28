@@ -513,6 +513,9 @@ extern "C" fn ios_pthread_testcancel() {
 /// nanosleep as a cancellation point; a retry after our wake sleeps only what was left.
 fn sleep_for(span: libc::timespec, left: *mut libc::timespec) -> i32 {
     let mut request = span;
+    // A sleep on the main thread must not freeze the animations: the pictures
+    // sent now carry coming frames through it (fw/pictures.rs).
+    crate::fw::pictures::sleep_starting(span.tv_sec as f64 + span.tv_nsec as f64 / 1e9);
     let result = blocking(|| {
         let mut rest = libc::timespec { tv_sec: 0, tv_nsec: 0 };
         let result = unsafe { libc::nanosleep(&request, &mut rest) };

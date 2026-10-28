@@ -48,7 +48,7 @@
             android:process=":ios"
             android:launchMode="singleTask"
             android:taskAffinity="dev.braxten.gamebridge.ios"
-            android:screenOrientation="sensorLandscape"
+            android:screenOrientation="unspecified"
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|navigation|uiMode|density"
             android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />
     </application>

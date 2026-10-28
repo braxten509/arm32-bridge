@@ -7,7 +7,7 @@ use super::bridge::{dispatch_from_host, install, is_host_object, run_loads as ru
 use super::functions::{call_function, functions, Ctx, HOST_FUNCTIONS};
 use super::{exceptions, mirror};
 use arm32_bridge::ios32::Program;
-use arm32_bridge::runtime::{self, ArgSource, Args, Ret, Uc};
+use arm32_bridge::runtime::{self, ArgSource, Args, GuestCpu, Ret, Uc};
 use guest32_image::{read_objc, ImageMemory, ObjcMetadata32, ObjcSections};
 use std::cell::{Cell, RefCell};
 use std::sync::{Mutex, OnceLock};
@@ -47,14 +47,35 @@ impl GuestSide for Translator {
         let base = memory.host(0) as usize;
         (host >= base && host - base < 1 << 32).then(|| memory.guest(host as *const u8))
     }
+    fn function_address(&self, name: &str) -> u32 {
+        runtime::stub_for(name)
+    }
+    /// A game exception escaping the call stops at it (see
+    /// exceptions::Barrier) and goes on as a raise of the host code that
+    /// made the call: the bridge throws it again in the game code that
+    /// called the host (64-bit games' exceptions unwind host frames as they are).
     fn call(&self, imp: u32, words: &[u32]) -> Result<u64, String> {
         let _gil = runtime::hold_gil();
         let current = CURRENT_UC.with(|c| c.get());
         let uc = if current.is_null() { runtime::engine() } else { unsafe { &mut *current } };
-        runtime::call_guest(uc, imp, words)
+        let barrier = exceptions::Barrier::push(uc);
+        let result = runtime::call_guest(uc, imp, words);
+        let Some(escaped) = barrier.pop() else { return result };
+        let bridge = bridge().ok_or("a game exception escaped before the Objective-C bridge was set up")?;
+        let c = Ctx { bridge, g: &Translator };
+        let object = exceptions::take_escaped(uc, &c, escaped, crate::fw::exception::answering_game())?;
+        let host = bridge.lock().unwrap_or_else(|e| e.into_inner()).host_object_for(&Translator, object)?;
+        crate::fw::exception::raise(host);
+        Ok(0)
     }
     fn without_guest_lock(&self, wait: &mut dyn FnMut()) {
         runtime::without_gil(wait)
+    }
+    fn nested_calls_left(&self) -> u32 {
+        let _gil = runtime::hold_gil();
+        let current = CURRENT_UC.with(|c| c.get());
+        let uc = if current.is_null() { runtime::engine() } else { unsafe { &mut *current } };
+        runtime::MAX_CALL_DEPTH.saturating_sub(runtime::call_depth(uc))
     }
 }
 
@@ -76,6 +97,9 @@ fn with_engine<R>(uc: &mut Uc, f: impl FnOnce() -> R) -> R {
     result
 }
 
+/// The stand-ins that send a message.
+const SENDS: [&str; 4] = ["objc_msgSend", "objc_msgSend_stret", "objc_msgSendSuper2", "objc_msgSendSuper2_stret"];
+
 /// The handler behind every Objective-C runtime function.
 fn objc_handler(uc: &mut Uc, args: &mut Args) -> Ret {
     let name = uc.get_data().current_call;
@@ -92,11 +116,36 @@ fn objc_handler(uc: &mut Uc, args: &mut Args) -> Ret {
         }
         state.1[i as usize]
     };
-    let result = with_engine(uc, || call_function(&Ctx { bridge, g: &Translator }, name, &words));
-    if let Some(exception) = super::bridge::take_pending_throw() {
+    // A message to a plain game method jumps into it from here (see
+    // allow_jump): no nested call, so it gets the caller's stack words too.
+    super::bridge::allow_jump(SENDS.contains(&name));
+    // An exception raised meanwhile (by host code, or a game exception that
+    // escaped a nested game call) is thrown here, in the game code that called.
+    let (result, raised) =
+        crate::fw::exception::catching(|| with_engine(uc, || call_function(&Ctx { bridge, g: &Translator }, name, &words)));
+    super::bridge::allow_jump(false);
+    let jump = super::bridge::take_jump();
+    let raised = match raised.map(|host| bridge.lock().unwrap_or_else(|e| e.into_inner()).guest_object(&Translator, host)) {
+        Some(Err(error)) => {
+            runtime::stop_with_fault(uc, format!("{name}: an exception for the game: {error}"));
+            return Ret::Void;
+        }
+        Some(Ok(exception)) => Some(exception),
+        None => None,
+    };
+    if let Some(exception) = super::bridge::take_pending_throw().or(raised) {
         return with_context(uc, |uc, c| exceptions::throw(uc, c, exception));
     }
     match result {
+        Ok(_) if jump.is_some() => {
+            let (imp, registers) = jump.unwrap();
+            for (i, word) in registers.into_iter().enumerate() {
+                uc.set_reg(i, word);
+            }
+            // lr and sp stay the caller's: the method returns straight to it.
+            uc.get_data_mut().jump_to = Some(imp);
+            Ret::Jumped
+        }
         Ok(value) => Ret::U64(value),
         Err(error) => {
             runtime::stop_with_fault(uc, format!("{name}: {error}"));
@@ -113,6 +162,7 @@ fn ui_application_main(uc: &mut Uc, args: &mut Args) -> Ret {
         runtime::stop_with_fault(uc, "UIApplicationMain before the Objective-C bridge was set up".into());
         return Ret::Void;
     };
+    super::game_fixes::install(uc, bridge);
     let host_strings = |guest: u32| -> Result<usize, String> {
         bridge.lock().unwrap_or_else(|e| e.into_inner()).host_object_for(&Translator, guest)
     };
@@ -173,12 +223,33 @@ pub fn register() {
     super::super::function(exceptions::ANSWER_FALSE, |_, _| Ret::U32(0));
     super::super::function(exceptions::DO_CATCH, exception_do_catch);
     super::super::function(exceptions::TERMINATE, exception_terminate);
+    super::super::function(super::game_fixes::RENDER_LOOP, |uc, args| {
+        let renderer = args.u32();
+        with_context(uc, |uc, c| {
+            if let Err(error) = super::game_fixes::render_loop(c, renderer) {
+                runtime::stop_with_fault(uc, format!("SpellCraft render loop: {error}"));
+            }
+            Ret::Void
+        })
+    });
+    super::super::function(super::game_fixes::NODE_TRANSFORM, |uc, args| {
+        let (animation, node, frame, out) = (args.u32(), args.u32(), args.u32(), args.u32());
+        if let Err(error) = super::game_fixes::node_transform(uc, animation, node, frame, out) {
+            runtime::stop_with_fault(uc, format!("SpellCraft nodeTransform: {error}"));
+        }
+        Ret::Void
+    });
+    super::super::function(exceptions::BARRIER, |_, args| {
+        let (_version, actions, _class_low, _class_high, exception, context) = (args.u32(), args.u32(), args.u32(), args.u32(), args.u32(), args.u32());
+        Ret::U32(exceptions::barrier_personality(actions, exception, context))
+    });
     super::super::data("objc_ehtype_vtable", exceptions::vtable);
     super::super::data("OBJC_EHTYPE_id", exceptions::id_type);
     super::super::data("OBJC_EHTYPE_$_NSException", || {
         exceptions::framework_type("NSException", with_bridge(|b| b.framework_class(&Translator, "NSException").0))
     });
     super::super::data("_dispatch_main_q", super::dispatch::main_queue);
+    super::super::data("_dispatch_source_type_timer", super::dispatch::timer_type);
 }
 
 /// Reads the program's Objective-C metadata and registers the data its
@@ -299,17 +370,77 @@ fn with_bridge<R>(f: impl FnOnce(&mut Bridge) -> R) -> R {
     f(&mut bridge().expect("bridge set up in register_program").lock().unwrap_or_else(|e| e.into_inner()))
 }
 
+/// A game method's encoding as the host passes its values (the bridge turns
+/// a float into a CGFloat-sized double), for key-value coding.
+fn game_method_types(class: crate::objc::runtime::Class, sel: crate::objc::runtime::Sel) -> Option<String> {
+    let (name, meta, sel_name) = {
+        let rt = crate::objc::runtime::lock();
+        (rt.class_name(class), rt.classes.get(&class)?.meta, rt.sel_name(sel))
+    };
+    let b = bridge()?.lock().unwrap_or_else(|e| e.into_inner());
+    let guest = b.classes.class_named(&name)?;
+    let address = if meta { guest.partner } else { guest.address };
+    match b.classes.lookup(address, &sel_name) {
+        super::classes::Lookup::Guest(m) => Some(crate::fw::object::float_as_double(&m.types)),
+        _ => None,
+    }
+}
+
+/// The field `name` of a game object, in the game's memory (its class's
+/// 32-bit layout), for key-value coding.
+fn game_field(object: crate::objc::runtime::Id, name: &str) -> Option<crate::fw::object::Field> {
+    let class_name = {
+        let rt = crate::objc::runtime::lock();
+        rt.class_name(rt.class_of(object))
+    };
+    let mut b = bridge()?.lock().unwrap_or_else(|e| e.into_inner());
+    b.classes.class_named(&class_name)?;
+    let guest = b.guest_object(&Translator, object).ok()?;
+    let word = |at: u32| u32::from_le_bytes(Translator.read(at, 4).try_into().unwrap());
+    let mut class = word(guest);
+    for _ in 0..256 {
+        let k = b.classes.class(class)?;
+        if let Some(ivar) = k.ivars.iter().find(|i| i.name == name) {
+            // The offset variable holds the offset the game's code uses.
+            let offset = if ivar.offset_address != 0 { word(ivar.offset_address) } else { ivar.offset };
+            return Some(crate::fw::object::Field { at: Translator.host_address(guest + offset), kind: ivar.type_encoding.clone(), guest: true });
+        }
+        match k.superclass {
+            super::classes::Super::Game(parent) => class = parent,
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// Defines the host mirrors of the game's classes and makes selector
 /// references unique. Runs after `load`.
 pub fn install_program() -> Result<(), String> {
     let (bridge, md) = (bridge().ok_or("no Objective-C bridge")?, METADATA.get().ok_or("no metadata")?);
     install(bridge, &Translator, md)?;
     super::bridge::set_block_owner(&Translator);
+    // Game objects whose last reference goes are sent -dealloc (fw/counted.rs).
+    super::bridge::set_dealloc_bridge(bridge, &Translator);
+    super::forward::set_invocation_hooks(bridge, &Translator);
+    crate::fw::object::set_extra_method_types(game_method_types);
+    crate::fw::object::set_extra_fields(game_field);
+    crate::fw::system::set_guest_memory(crate::fw::system::GuestMemory {
+        owns: |host| Translator.guest_address(host).is_some(),
+        object_to_host: |guest| with_bridge(|b| b.host_object_for(&Translator, guest)).unwrap_or(0),
+        object_to_guest: |host| with_bridge(|b| b.guest_object(&Translator, host)).unwrap_or(0),
+    });
     // Guest copies kept for a host object go when it is finished with.
     crate::objc::runtime::on_object_finished(|host| with_bridge(|b| b.release_host_copies(&Translator, host)));
     mirror::set_dispatch(Box::new(|frame| {
         let Some(bridge) = BRIDGE.get() else { return };
         if let Err(error) = dispatch_from_host(bridge, &Translator, frame) {
+            // Which host call into the game failed, for the log (blocks have no selector).
+            let name = if super::bridge::wrapper_guest(frame.x[0] as usize).is_some() || frame.x[1] == 0 {
+                "a block".to_string()
+            } else {
+                unsafe { crate::objc::runtime::cstr(frame.x[1] as usize) }
+            };
+            let error = format!("{error} (host sent {name} to {:#x})", frame.x[0]);
             crate::log!("32-bit Objective-C: {error}");
             let _gil = runtime::hold_gil();
             let current = CURRENT_UC.with(|c| c.get());

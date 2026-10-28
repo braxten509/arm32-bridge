@@ -1,6 +1,7 @@
 //! Apple's C library (libSystem) for the game.
 
 pub mod extra;
+pub mod groups;
 pub mod heap;
 pub mod io;
 pub mod libc;
@@ -23,6 +24,7 @@ pub fn register(r: &mut Registry) {
     extra::register(r);
     net::register(r);
     timers::register(r);
+    groups::register(r);
 }
 
 /// The system's own error number for this thread (named differently on Android).

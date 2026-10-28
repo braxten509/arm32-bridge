@@ -1,6 +1,7 @@
 //! OpenGL ES. The game's standard GL calls go straight to the system's
 //! library (same processor, same calling rules). Apple-only extensions are
-//! translated to standard OpenGL ES 3 here.
+//! translated to standard OpenGL ES 3 here. OpenGL ES 1 functions come from
+//! the system's OpenGL ES 1 library (or EGL's lookup where there is none).
 
 use crate::symbols::{leak_cstr, Registry};
 use std::sync::OnceLock;
@@ -23,6 +24,13 @@ pub fn gles_library() -> usize {
     *HANDLE.get_or_init(|| open_first(&["libGLESv3.so", "libGLESv2.so", "libGLESv2.so.2"]))
 }
 
+/// The OpenGL ES 1 library (0 where there is none, as on the PC's Mesa
+/// without glvnd's libGLESv1_CM: EGL's lookup serves those functions then).
+pub fn gles1_library() -> usize {
+    static HANDLE: OnceLock<usize> = OnceLock::new();
+    *HANDLE.get_or_init(|| open_first(&["libGLESv1_CM.so", "libGLESv1_CM.so.1"]))
+}
+
 pub fn egl_library() -> usize {
     static HANDLE: OnceLock<usize> = OnceLock::new();
     *HANDLE.get_or_init(|| open_first(&["libEGL.so", "libEGL.so.1"]))
@@ -38,7 +46,7 @@ fn symbol(library: usize, name: &str) -> usize {
 
 /// A GL or EGL function this layer itself needs; stops loudly if the system lacks it.
 pub fn required(name: &str) -> usize {
-    let found = if name.starts_with("egl") { symbol(egl_library(), name) } else { symbol(gles_library(), name) };
+    let found = if name.starts_with("egl") { symbol(egl_library(), name) } else { gles_symbol(name) };
     if found != 0 {
         return found;
     }
@@ -48,6 +56,87 @@ pub fn required(name: &str) -> usize {
     }
     crate::log!("STOP: graphics: the system has no {name}");
     crate::report::finish(1);
+}
+
+/// The system function a framebuffer call goes to in the current context:
+/// an OpenGL ES 1 context gets the OES_framebuffer_object name, as some
+/// drivers (the Pixel's PowerVR) have no standard name there and jump to 0.
+pub fn framebuffer_function(name: &'static str) -> usize {
+    pick_framebuffer_function(&OnceLock::new(), &OnceLock::new(), name)
+}
+
+fn pick_framebuffer_function(standard: &OnceLock<usize>, oes: &OnceLock<usize>, name: &'static str) -> usize {
+    if es1_current() {
+        *oes.get_or_init(|| required(&format!("{name}OES")))
+    } else {
+        *standard.get_or_init(|| required(name))
+    }
+}
+
+/// Whether this thread's current context is OpenGL ES 1 (asked once per context).
+fn es1_current() -> bool {
+    thread_local! {
+        static LAST: std::cell::Cell<(usize, bool)> = const { std::cell::Cell::new((0, false)) };
+    }
+    let context = unsafe { eglGetCurrentContext() };
+    if context == 0 {
+        return false;
+    }
+    LAST.with(|last| {
+        let (known, es1) = last.get();
+        if known == context {
+            return es1;
+        }
+        let mut version = 0;
+        unsafe { eglQueryContext(eglGetCurrentDisplay(), context, EGL_CONTEXT_CLIENT_VERSION, &mut version) };
+        let es1 = version == 1;
+        last.set((context, es1));
+        es1
+    })
+}
+
+const EGL_CONTEXT_CLIENT_VERSION: i32 = 0x3098;
+
+/// Like `system!`, for the framebuffer functions OpenGL ES 1 names with OES:
+/// each call goes to the name the current context has.
+macro_rules! framebuffer_system {
+    ($($name:ident ( $($arg:ident : $ty:ty),* ) $(-> $ret:ty)? ;)*) => {
+        $(
+            #[allow(non_snake_case, dead_code, clippy::too_many_arguments)]
+            pub unsafe extern "C" fn $name($($arg: $ty),*) $(-> $ret)? {
+                static STANDARD: OnceLock<usize> = OnceLock::new();
+                static OES: OnceLock<usize> = OnceLock::new();
+                let address = pick_framebuffer_function(&STANDARD, &OES, stringify!($name));
+                let f: unsafe extern "C" fn($($ty),*) $(-> $ret)? = unsafe { std::mem::transmute(address) };
+                unsafe { f($($arg),*) }
+            }
+        )*
+        /// Every function above with its standard name (for games' imports).
+        fn framebuffer_family() -> Vec<(&'static str, usize)> {
+            vec![$((stringify!($name), $name as usize)),*]
+        }
+    };
+}
+
+framebuffer_system! {
+    glBindFramebuffer(target: Enum, framebuffer: u32);
+    glGenFramebuffers(count: i32, out: *mut u32);
+    glDeleteFramebuffers(count: i32, names: *const u32);
+    glIsFramebuffer(framebuffer: u32) -> u8;
+    glFramebufferRenderbuffer(target: Enum, attachment: Enum, rb_target: Enum, renderbuffer: u32);
+    glFramebufferTexture2D(target: Enum, attachment: Enum, texture_target: Enum, texture: u32, level: i32);
+    glCheckFramebufferStatus(target: Enum) -> Enum;
+    glGetFramebufferAttachmentParameteriv(target: Enum, attachment: Enum, name: Enum, out: *mut i32);
+    glBindRenderbuffer(target: Enum, renderbuffer: u32);
+    glGenRenderbuffers(count: i32, out: *mut u32);
+    glDeleteRenderbuffers(count: i32, names: *const u32);
+    glIsRenderbuffer(renderbuffer: u32) -> u8;
+    glRenderbufferStorage(target: Enum, format: Enum, width: i32, height: i32);
+    glGetRenderbufferParameteriv(target: Enum, name: Enum, out: *mut i32);
+    glGenerateMipmap(target: Enum);
+    glBlendEquation(mode: Enum);
+    glBlendEquationSeparate(rgb: Enum, alpha: Enum);
+    glBlendFuncSeparate(src_rgb: Enum, dst_rgb: Enum, src_alpha: Enum, dst_alpha: Enum);
 }
 
 fn get_proc_address(name: &str) -> usize {
@@ -66,9 +155,39 @@ pub fn core_function(name: &str) -> Option<usize> {
     if !name.starts_with("gl") || has_vendor_ending(name) {
         return None;
     }
-    let found = symbol(gles_library(), name);
+    let found = gles_symbol(name);
+    // EGL's lookup answers any name (glvnd makes a stub for it), so only the
+    // OpenGL ES 1.1 functions are asked from it.
+    let found = if found == 0 && ES1_CORE.contains(&name) { get_proc_address(name) } else { found };
     (found != 0).then_some(found)
 }
+
+/// A GL function from the OpenGL ES 3/2 library, else the OpenGL ES 1 one.
+/// (Both serve whichever kind of context is current for the names they share.)
+fn gles_symbol(name: &str) -> usize {
+    match symbol(gles_library(), name) {
+        0 => symbol(gles1_library(), name),
+        found => found,
+    }
+}
+
+/// OpenGL ES 1.1 functions that OpenGL ES 2 and 3 don't have.
+const ES1_CORE: &[&str] = &[
+    "glAlphaFunc", "glAlphaFuncx", "glClearColorx", "glClearDepthx", "glClientActiveTexture", "glClipPlanef",
+    "glClipPlanex", "glColor4f", "glColor4ub", "glColor4x", "glColorPointer", "glDepthRangex",
+    "glDisableClientState", "glEnableClientState", "glFogf", "glFogfv", "glFogx", "glFogxv", "glFrustumf",
+    "glFrustumx", "glGetClipPlanef", "glGetClipPlanex", "glGetFixedv", "glGetLightfv", "glGetLightxv",
+    "glGetMaterialfv", "glGetMaterialxv", "glGetPointerv", "glGetTexEnvfv", "glGetTexEnviv", "glGetTexEnvxv",
+    "glGetTexParameterxv", "glLightModelf", "glLightModelfv", "glLightModelx", "glLightModelxv", "glLightf",
+    "glLightfv", "glLightx", "glLightxv", "glLineWidthx", "glLoadIdentity", "glLoadMatrixf", "glLoadMatrixx",
+    "glLogicOp", "glMaterialf", "glMaterialfv", "glMaterialx", "glMaterialxv", "glMatrixMode", "glMultMatrixf",
+    "glMultMatrixx", "glMultiTexCoord4f", "glMultiTexCoord4x", "glNormal3f", "glNormal3x", "glNormalPointer",
+    "glOrthof", "glOrthox", "glPointParameterf", "glPointParameterfv", "glPointParameterx", "glPointParameterxv",
+    "glPointSize", "glPointSizex", "glPolygonOffsetx", "glPopMatrix", "glPushMatrix", "glRotatef", "glRotatex",
+    "glSampleCoveragex", "glScalef", "glScalex", "glShadeModel", "glTexCoordPointer", "glTexEnvf", "glTexEnvfv",
+    "glTexEnvi", "glTexEnviv", "glTexEnvx", "glTexEnvxv", "glTexParameterx", "glTexParameterxv", "glTranslatef",
+    "glTranslatex", "glVertexPointer",
+];
 
 fn has_vendor_ending(name: &str) -> bool {
     ["EXT", "OES", "APPLE", "IMG", "ARB", "KHR", "NV", "AMD", "QCOM", "ARM", "ANGLE"].iter().any(|v| name.ends_with(v))
@@ -94,6 +213,8 @@ pub type Enum = u32;
 
 system! {
     eglGetCurrentContext() -> usize;
+    eglGetCurrentDisplay() -> usize;
+    eglQueryContext(display: usize, context: usize, attribute: i32, value: *mut i32) -> u32;
     glGetError() -> Enum;
     glGetIntegerv(name: Enum, out: *mut i32);
     glGetString(name: Enum) -> *const u8;
@@ -102,16 +223,7 @@ system! {
     glDisable(cap: Enum);
     glColorMask(r: u8, g: u8, b: u8, a: u8);
     glGetBooleanv(name: Enum, out: *mut u8);
-    glBindFramebuffer(target: Enum, framebuffer: u32);
-    glGenFramebuffers(count: i32, out: *mut u32);
-    glDeleteFramebuffers(count: i32, names: *const u32);
-    glFramebufferRenderbuffer(target: Enum, attachment: Enum, rb_target: Enum, renderbuffer: u32);
-    glCheckFramebufferStatus(target: Enum) -> Enum;
-    glBindRenderbuffer(target: Enum, renderbuffer: u32);
-    glRenderbufferStorage(target: Enum, format: Enum, width: i32, height: i32);
     glRenderbufferStorageMultisample(target: Enum, samples: i32, format: Enum, width: i32, height: i32);
-    glGetRenderbufferParameteriv(target: Enum, name: Enum, out: *mut i32);
-    glGetFramebufferAttachmentParameteriv(target: Enum, attachment: Enum, name: Enum, out: *mut i32);
     glGetTexLevelParameteriv(target: Enum, level: i32, name: Enum, out: *mut i32);
     glBindTexture(target: Enum, texture: u32);
     glBlitFramebuffer(sx0: i32, sy0: i32, sx1: i32, sy1: i32, dx0: i32, dy0: i32, dx1: i32, dy1: i32, mask: u32, filter: Enum);
@@ -134,7 +246,6 @@ system! {
     glGetProgramiv(program: u32, name: Enum, out: *mut i32);
     glGetProgramInfoLog(program: u32, size: i32, length: *mut i32, out: *mut u8);
     glFinish();
-    glFramebufferTexture2D(target: Enum, attachment: Enum, texture_target: Enum, texture: u32, level: i32);
     glClear(mask: u32);
     glClearColor(r: f32, g: f32, b: f32, a: f32);
     glGetFloatv(name: Enum, out: *mut f32);
@@ -142,9 +253,110 @@ system! {
     glTexParameterf(target: Enum, name: Enum, value: f32);
     glTexParameteriv(target: Enum, name: Enum, values: *const i32);
     glTexParameterfv(target: Enum, name: Enum, values: *const f32);
+    glViewport(x: i32, y: i32, width: i32, height: i32);
+    glScissor(x: i32, y: i32, width: i32, height: i32);
+    glCreateShader(kind: Enum) -> u32;
+    glCreateProgram() -> u32;
+    glAttachShader(program: u32, shader: u32);
+    glDeleteShader(shader: u32);
+    glUseProgram(program: u32);
+    glGetUniformLocation(program: u32, name: *const libc::c_char) -> i32;
+    glUniform1i(location: i32, value: i32);
+    glUniform4fv(location: i32, count: i32, values: *const f32);
+    glDrawArrays(mode: Enum, first: i32, count: i32);
+    glGenTextures(count: i32, out: *mut u32);
+    glActiveTexture(unit: Enum);
+    glBindSampler(unit: u32, sampler: u32);
+    glGenVertexArrays(count: i32, out: *mut u32);
+    glBindVertexArray(vao: u32);
+}
+
+pub const VIEWPORT: Enum = 0x0BA2;
+pub const SCISSOR_BOX: Enum = 0x0C10;
+
+/// OpenGL ES 1 functions and numbers this layer itself uses (to show an
+/// OpenGL ES 1 game's frames).
+pub mod es1 {
+    use super::Enum;
+
+    system! {
+        glActiveTexture(unit: Enum);
+        glClientActiveTexture(unit: Enum);
+        glMatrixMode(mode: Enum);
+        glLoadIdentity();
+        glLoadMatrixf(matrix: *const f32);
+        glTexEnvi(target: Enum, name: Enum, value: i32);
+        glGetTexEnviv(target: Enum, name: Enum, out: *mut i32);
+        glEnableClientState(array: Enum);
+        glDisableClientState(array: Enum);
+        glVertexPointer(size: i32, kind: Enum, stride: i32, pointer: usize);
+        glTexCoordPointer(size: i32, kind: Enum, stride: i32, pointer: usize);
+        glGetPointerv(name: Enum, out: *mut usize);
+        glDrawArrays(mode: Enum, first: i32, count: i32);
+        glGenTextures(count: i32, out: *mut u32);
+        glCopyTexSubImage2D(target: Enum, level: i32, x_offset: i32, y_offset: i32, x: i32, y: i32, width: i32, height: i32);
+    }
+
+    pub const FRAMEBUFFER_BINDING: Enum = 0x8CA6;
+    pub const LIGHTING: Enum = 0x0B50;
+    pub const ALPHA_TEST: Enum = 0x0BC0;
+    pub const DEPTH_TEST: Enum = 0x0B71;
+    pub const STENCIL_TEST: Enum = 0x0B90;
+    pub const CULL_FACE: Enum = 0x0B44;
+    pub const FOG: Enum = 0x0B60;
+    pub const COLOR_LOGIC_OP: Enum = 0x0BF2;
+    pub const CLIP_PLANE0: Enum = 0x3000;
+    pub const MAX_CLIP_PLANES: Enum = 0x0D32;
+    pub const MAX_TEXTURE_UNITS: Enum = 0x84E2;
+    pub const MATRIX_PALETTE: Enum = 0x8840;
+    pub const MATRIX_INDEX_ARRAY: Enum = 0x8844;
+    pub const WEIGHT_ARRAY: Enum = 0x86AD;
+    pub const POINT_SIZE_ARRAY: Enum = 0x8B9C;
+    pub const TEXTURE_CUBE_MAP: Enum = 0x8513;
+    pub const TEXTURE_GEN_STR: Enum = 0x8D60;
+    pub const ACTIVE_TEXTURE: Enum = 0x84E0;
+    pub const CLIENT_ACTIVE_TEXTURE: Enum = 0x84E1;
+    pub const TEXTURE0: Enum = 0x84C0;
+    pub const TEXTURE_2D: Enum = 0x0DE1;
+    pub const TEXTURE_BINDING_2D: Enum = 0x8069;
+    pub const TEXTURE_ENV: Enum = 0x2300;
+    pub const TEXTURE_ENV_MODE: Enum = 0x2200;
+    pub const REPLACE: Enum = 0x1E01;
+    pub const MATRIX_MODE: Enum = 0x0BA0;
+    pub const MODELVIEW: Enum = 0x1700;
+    pub const PROJECTION: Enum = 0x1701;
+    pub const TEXTURE: Enum = 0x1702;
+    pub const MODELVIEW_MATRIX: Enum = 0x0BA6;
+    pub const PROJECTION_MATRIX: Enum = 0x0BA7;
+    pub const TEXTURE_MATRIX: Enum = 0x0BA8;
+    pub const ARRAY_BUFFER: Enum = 0x8892;
+    pub const ARRAY_BUFFER_BINDING: Enum = 0x8894;
+    pub const VERTEX_ARRAY: Enum = 0x8074;
+    pub const NORMAL_ARRAY: Enum = 0x8075;
+    pub const COLOR_ARRAY: Enum = 0x8076;
+    pub const TEXTURE_COORD_ARRAY: Enum = 0x8078;
+    pub const VERTEX_ARRAY_SIZE: Enum = 0x807A;
+    pub const VERTEX_ARRAY_TYPE: Enum = 0x807B;
+    pub const VERTEX_ARRAY_STRIDE: Enum = 0x807C;
+    pub const VERTEX_ARRAY_POINTER: Enum = 0x808E;
+    pub const VERTEX_ARRAY_BUFFER_BINDING: Enum = 0x8896;
+    pub const TEXTURE_COORD_ARRAY_SIZE: Enum = 0x8088;
+    pub const TEXTURE_COORD_ARRAY_TYPE: Enum = 0x8089;
+    pub const TEXTURE_COORD_ARRAY_STRIDE: Enum = 0x808A;
+    pub const TEXTURE_COORD_ARRAY_POINTER: Enum = 0x8092;
+    pub const TEXTURE_COORD_ARRAY_BUFFER_BINDING: Enum = 0x889A;
+    pub const RGB: Enum = 0x1907;
+    pub const FLOAT: Enum = 0x1406;
+    pub const TRIANGLE_STRIP: Enum = 0x0005;
+    pub const TEXTURE_MIN_FILTER: Enum = 0x2801;
+    pub const TEXTURE_MAG_FILTER: Enum = 0x2800;
+    pub const TEXTURE_WRAP_S: Enum = 0x2802;
+    pub const TEXTURE_WRAP_T: Enum = 0x2803;
+    pub const CLAMP_TO_EDGE: Enum = 0x812F;
 }
 
 pub const COLOR_CLEAR_VALUE: Enum = 0x0C22;
+pub const BLEND: Enum = 0x0BE2;
 
 pub const RENDERBUFFER: Enum = 0x8D41;
 pub const RENDERBUFFER_BINDING: Enum = 0x8CA7;
@@ -174,8 +386,28 @@ const ATTACHMENT_OBJECT_TYPE: Enum = 0x8CD0;
 const ATTACHMENT_OBJECT_NAME: Enum = 0x8CD1;
 const ATTACHMENT_TEXTURE_LEVEL: Enum = 0x8CD2;
 const TEXTURE: Enum = 0x1702;
-const TEXTURE_2D: Enum = 0x0DE1;
-const TEXTURE_BINDING_2D: Enum = 0x8069;
+pub const TEXTURE_2D: Enum = 0x0DE1;
+pub const TEXTURE_BINDING_2D: Enum = 0x8069;
+pub const TEXTURE0: Enum = 0x84C0;
+pub const ACTIVE_TEXTURE: Enum = 0x84E0;
+pub const SAMPLER_BINDING: Enum = 0x8919;
+pub const CURRENT_PROGRAM: Enum = 0x8B8D;
+pub const VERTEX_ARRAY_BINDING: Enum = 0x85B5;
+pub const VERTEX_SHADER: Enum = 0x8B31;
+pub const FRAGMENT_SHADER: Enum = 0x8B30;
+pub const DEPTH_TEST: Enum = 0x0B71;
+pub const STENCIL_TEST: Enum = 0x0B90;
+pub const CULL_FACE: Enum = 0x0B44;
+pub const POLYGON_OFFSET_FILL: Enum = 0x8037;
+pub const SAMPLE_ALPHA_TO_COVERAGE: Enum = 0x809E;
+pub const SAMPLE_COVERAGE: Enum = 0x80A0;
+pub const DITHER: Enum = 0x0BD0;
+pub const TRANSFORM_FEEDBACK_ACTIVE: Enum = 0x8E24;
+pub const TRIANGLE_STRIP: Enum = 0x0005;
+pub const TEXTURE_MAG_FILTER: Enum = 0x2800;
+pub const TEXTURE_WRAP_S: Enum = 0x2802;
+pub const TEXTURE_WRAP_T: Enum = 0x2803;
+pub const CLAMP_TO_EDGE: Enum = 0x812F;
 const TEXTURE_WIDTH: Enum = 0x1000;
 const TEXTURE_HEIGHT: Enum = 0x1001;
 const BUFFER_SIZE: Enum = 0x8764;
@@ -194,15 +426,17 @@ const EXTENSIONS: Enum = 0x1F03;
 const BGRA: Enum = 0x80E1;
 const HALF_FLOAT_OES: Enum = 0x8D61;
 const HALF_FLOAT: Enum = 0x140B;
-const COMPILE_STATUS: Enum = 0x8B81;
-const LINK_STATUS: Enum = 0x8B82;
+pub const COMPILE_STATUS: Enum = 0x8B81;
+pub const LINK_STATUS: Enum = 0x8B82;
 const MAX_SAMPLES: Enum = 0x8D57;
 
 // ----- Apple extensions that are the same as a standard function -----
 
 /// Extension name → standard OpenGL ES 3 function with the same arguments and meaning.
+/// (OpenGL ES 1's OES framebuffer and blending functions are the standard
+/// ones under another name: the system's libraries serve them for ES 1
+/// contexts under the standard name too.)
 const SAME_AS_STANDARD: &[(&str, &str)] = &[
-    ("glDiscardFramebufferEXT", "glInvalidateFramebuffer"),
     ("glGenQueriesEXT", "glGenQueries"),
     ("glDeleteQueriesEXT", "glDeleteQueries"),
     ("glIsQueryEXT", "glIsQuery"),
@@ -230,10 +464,45 @@ const SAME_AS_STANDARD: &[(&str, &str)] = &[
     ("glWaitSyncAPPLE", "glWaitSync"),
     ("glGetInteger64vAPPLE", "glGetInteger64v"),
     ("glGetSyncivAPPLE", "glGetSynciv"),
+    // OES_framebuffer_object, OpenGL ES 1's names for framebuffers: iOS
+    // answers them in ES 2 contexts too, and older engines use them there.
+    ("glGenFramebuffersOES", "glGenFramebuffers"),
+    ("glDeleteFramebuffersOES", "glDeleteFramebuffers"),
+    ("glBindFramebufferOES", "glBindFramebuffer"),
+    ("glIsFramebufferOES", "glIsFramebuffer"),
+    ("glCheckFramebufferStatusOES", "glCheckFramebufferStatus"),
+    ("glFramebufferRenderbufferOES", "glFramebufferRenderbuffer"),
+    ("glFramebufferTexture2DOES", "glFramebufferTexture2D"),
+    ("glGetFramebufferAttachmentParameterivOES", "glGetFramebufferAttachmentParameteriv"),
+    ("glGenRenderbuffersOES", "glGenRenderbuffers"),
+    ("glDeleteRenderbuffersOES", "glDeleteRenderbuffers"),
+    ("glBindRenderbufferOES", "glBindRenderbuffer"),
+    ("glIsRenderbufferOES", "glIsRenderbuffer"),
+    ("glRenderbufferStorageOES", "glRenderbufferStorage"),
+    ("glGetRenderbufferParameterivOES", "glGetRenderbufferParameteriv"),
+    ("glGenerateMipmapOES", "glGenerateMipmap"),
+    ("glBlendEquationOES", "glBlendEquation"),
+    ("glBlendEquationSeparateOES", "glBlendEquationSeparate"),
+    ("glBlendFuncSeparateOES", "glBlendFuncSeparate"),
+];
+
+/// OpenGL ES 1 extension functions with no standard twin: the system's own.
+const ES1_EXTENSION_FUNCTIONS: &[&str] = &[
+    // OES_draw_texture
+    "glDrawTexsOES", "glDrawTexiOES", "glDrawTexxOES", "glDrawTexfOES",
+    "glDrawTexsvOES", "glDrawTexivOES", "glDrawTexxvOES", "glDrawTexfvOES",
+    // OES_point_size_array
+    "glPointSizePointerOES",
+    // OES_matrix_palette
+    "glCurrentPaletteMatrixOES", "glLoadPaletteFromModelViewMatrixOES", "glMatrixIndexPointerOES", "glWeightPointerOES",
+    // OES_texture_cube_map
+    "glTexGenfOES", "glTexGenfvOES", "glTexGeniOES", "glTexGenivOES",
+    "glGetTexGenfvOES", "glGetTexGenivOES",
 ];
 
 /// Extension functions translated in this file (beyond `SAME_AS_STANDARD`).
 const TRANSLATED_EXTENSIONS: &[&str] = &[
+    "glDiscardFramebufferEXT",
     "glRenderbufferStorageMultisampleAPPLE",
     "glResolveMultisampleFramebufferAPPLE",
     "glMapBufferOES",
@@ -246,7 +515,7 @@ const TRANSLATED_EXTENSIONS: &[&str] = &[
 
 /// Every Apple/EXT/OES function this layer gives games for the extensions it advertises.
 pub fn extension_names() -> Vec<&'static str> {
-    SAME_AS_STANDARD.iter().map(|(apple, _)| *apple).chain(TRANSLATED_EXTENSIONS.iter().copied()).collect()
+    SAME_AS_STANDARD.iter().map(|(apple, _)| *apple).chain(TRANSLATED_EXTENSIONS.iter().copied()).chain(ES1_EXTENSION_FUNCTIONS.iter().copied()).collect()
 }
 
 /// The standard OpenGL ES 3 function an extension function is the same as.
@@ -285,6 +554,36 @@ const ALWAYS_AVAILABLE: &[&str] = &[
     "GL_IMG_texture_compression_pvrtc",
 ];
 
+/// What an iPhone (PowerVR SGX, iOS 6) reports in an OpenGL ES 1 context.
+const IPHONE_ES1_EXTENSIONS: &[&str] = &[
+    "GL_APPLE_texture_2D_limited_npot", "GL_APPLE_texture_format_BGRA8888", "GL_APPLE_texture_max_level",
+    "GL_EXT_blend_minmax", "GL_EXT_debug_label", "GL_EXT_debug_marker", "GL_EXT_discard_framebuffer",
+    "GL_EXT_map_buffer_range", "GL_EXT_read_format_bgra", "GL_EXT_texture_filter_anisotropic",
+    "GL_EXT_texture_lod_bias", "GL_IMG_read_format", "GL_IMG_texture_compression_pvrtc",
+    "GL_OES_blend_equation_separate", "GL_OES_blend_func_separate", "GL_OES_blend_subtract",
+    "GL_OES_compressed_paletted_texture", "GL_OES_depth24", "GL_OES_draw_texture", "GL_OES_fbo_render_mipmap",
+    "GL_OES_framebuffer_object", "GL_OES_mapbuffer", "GL_OES_matrix_palette", "GL_OES_packed_depth_stencil",
+    "GL_OES_point_size_array", "GL_OES_point_sprite", "GL_OES_read_format", "GL_OES_rgb8_rgba8",
+    "GL_OES_stencil_wrap", "GL_OES_stencil8", "GL_OES_texture_mirrored_repeat", "GL_OES_vertex_array_object",
+];
+
+/// Provided here whatever the chip has, in an OpenGL ES 1 context.
+const ALWAYS_AVAILABLE_ES1: &[&str] = &[
+    "GL_EXT_discard_framebuffer", "GL_APPLE_texture_format_BGRA8888", "GL_EXT_debug_label", "GL_EXT_debug_marker",
+    "GL_IMG_texture_compression_pvrtc",
+];
+
+/// iPhone extensions the chip offers under another name.
+fn chip_has(name: &str) -> bool {
+    match name {
+        // Any sides (Apple's limits: no mipmaps or repeat, which every other kind allows too).
+        "GL_APPLE_texture_2D_limited_npot" => ["GL_APPLE_texture_2D_limited_npot", "GL_OES_texture_npot", "GL_ARB_texture_non_power_of_two", "GL_IMG_texture_npot"]
+            .iter()
+            .any(|n| system_has_extension(n)),
+        _ => system_has_extension(name),
+    }
+}
+
 // ----- translated functions -----
 
 extern "C" fn get_string(name: Enum) -> *const u8 {
@@ -292,17 +591,23 @@ extern "C" fn get_string(name: Enum) -> *const u8 {
         return unsafe { glGetString(name) };
     }
     static TEXT: OnceLock<usize> = OnceLock::new();
-    *TEXT.get_or_init(|| {
+    static TEXT_ES1: OnceLock<usize> = OnceLock::new();
+    let (slot, iphone, always, kind) = if crate::fw::eagl::current_is_es1() {
+        (&TEXT_ES1, IPHONE_ES1_EXTENSIONS, ALWAYS_AVAILABLE_ES1, "OpenGL ES 1 ")
+    } else {
+        (&TEXT, IPHONE_EXTENSIONS, ALWAYS_AVAILABLE, "")
+    };
+    *slot.get_or_init(|| {
         // Test switch: IOS_GL_HIDE="GL_EXT_a,GL_EXT_b" keeps those from the game.
         let hidden = std::env::var("IOS_GL_HIDE").unwrap_or_default();
-        let list: Vec<&str> = IPHONE_EXTENSIONS
+        let list: Vec<&str> = iphone
             .iter()
             .copied()
-            .filter(|name| ALWAYS_AVAILABLE.contains(name) || system_has_extension(name))
+            .filter(|name| always.contains(name) || chip_has(name))
             .filter(|name| !hidden.split(',').any(|h| h.trim() == *name))
             .collect();
-        crate::log!("graphics: telling the game it has {} of the iPhone's {} extensions", list.len(), IPHONE_EXTENSIONS.len());
-        let from_chip: Vec<&str> = list.iter().copied().filter(|name| !ALWAYS_AVAILABLE.contains(name)).collect();
+        crate::log!("graphics: telling the game it has {} of the iPhone's {} {kind}extensions", list.len(), iphone.len());
+        let from_chip: Vec<&str> = list.iter().copied().filter(|name| !always.contains(name)).collect();
         crate::log!("graphics: from the chip: {}", from_chip.join(" "));
         leak_cstr(&list.join(" "))
     }) as *const u8
@@ -478,8 +783,46 @@ extern "C" fn resolve_multisample_apple() {
     }
 }
 
+/// The system's own function for an extension name (0 if it has none).
+fn system_extension_function(slot: &OnceLock<usize>, name: &str) -> usize {
+    *slot.get_or_init(|| match symbol(gles1_library(), name) {
+        0 => get_proc_address(name),
+        found => found,
+    })
+}
+
+/// glDiscardFramebufferEXT is glInvalidateFramebuffer in OpenGL ES 3; an
+/// OpenGL ES 1 context has only the extension (or nothing: discarding is a
+/// hint, so leaving the contents is right too).
+extern "C" fn discard_framebuffer(target: Enum, count: i32, attachments: *const Enum) {
+    if !crate::fw::eagl::current_is_es1() {
+        unsafe { glInvalidateFramebuffer(target, count, attachments) };
+        return;
+    }
+    static SYSTEM: OnceLock<usize> = OnceLock::new();
+    static OFFERED: OnceLock<bool> = OnceLock::new();
+    let address = system_extension_function(&SYSTEM, "glDiscardFramebufferEXT");
+    if address != 0 && *OFFERED.get_or_init(|| system_has_extension("GL_EXT_discard_framebuffer")) {
+        // Apple's ES 1 takes its multisample extension's read and draw
+        // names too; an ES 1 context has one binding, which both mean.
+        let target = if target == READ_FRAMEBUFFER || target == DRAW_FRAMEBUFFER { FRAMEBUFFER } else { target };
+        let f: unsafe extern "C" fn(Enum, i32, *const Enum) = unsafe { std::mem::transmute(address) };
+        unsafe { f(target, count, attachments) };
+    }
+}
+
 /// glMapBufferOES(target, access): Apple only allows writing (WRITE_ONLY_OES).
-extern "C" fn map_buffer_oes(target: Enum, _access: Enum) -> usize {
+extern "C" fn map_buffer_oes(target: Enum, access: Enum) -> usize {
+    if crate::fw::eagl::current_is_es1() {
+        // OpenGL ES 1 has no glMapBufferRange: the system's own glMapBufferOES.
+        static SYSTEM: OnceLock<usize> = OnceLock::new();
+        let address = system_extension_function(&SYSTEM, "glMapBufferOES");
+        if address == 0 {
+            return 0;
+        }
+        let f: unsafe extern "C" fn(Enum, Enum) -> usize = unsafe { std::mem::transmute(address) };
+        return unsafe { f(target, access) };
+    }
     unsafe {
         let mut size = 0;
         glGetBufferParameteriv(target, BUFFER_SIZE, &mut size);
@@ -506,6 +849,10 @@ fn unpack_state() -> Unpack {
         unsafe { glGetIntegerv(name, &mut value) };
         value
     };
+    if crate::fw::eagl::current_is_es1() {
+        // OpenGL ES 1 has only the row alignment: no pixel buffers, row lengths or skips.
+        return Unpack { buffer: 0, row_length: 0, skip_rows: 0, skip_pixels: 0, alignment: get(UNPACK_ALIGNMENT).max(1) };
+    }
     Unpack {
         buffer: get(PIXEL_UNPACK_BUFFER_BINDING),
         row_length: get(UNPACK_ROW_LENGTH),
@@ -544,6 +891,14 @@ fn read_source(unpack: &Unpack, data: *const u8, length: usize) -> Option<Vec<u8
 /// Runs an upload from our own tightly packed memory: no bound pixel
 /// buffer, no row length or skips; the game's settings come back after.
 fn upload_plain(unpack: &Unpack, upload: impl FnOnce()) {
+    if crate::fw::eagl::current_is_es1() {
+        unsafe {
+            glPixelStorei(UNPACK_ALIGNMENT, 4);
+            upload();
+            glPixelStorei(UNPACK_ALIGNMENT, unpack.alignment);
+        }
+        return;
+    }
     unsafe {
         glBindBuffer(PIXEL_UNPACK_BUFFER, 0);
         glPixelStorei(UNPACK_ROW_LENGTH, 0);
@@ -830,7 +1185,7 @@ extern "C" fn compressed_tex_image_2d(target: Enum, level: i32, internal: Enum, 
 // driver's override, every mipmapped texture gets the chip's most (up to
 // 16x) instead, whatever the game asks for.
 
-const TEXTURE_MIN_FILTER: Enum = 0x2801;
+pub const TEXTURE_MIN_FILTER: Enum = 0x2801;
 const TEXTURE_MAX_ANISOTROPY: Enum = 0x84FE;
 const MAX_TEXTURE_MAX_ANISOTROPY: Enum = 0x84FF;
 
@@ -913,7 +1268,8 @@ fn pvrtc_on_chip() -> bool {
     })
 }
 
-fn system_has_extension(name: &str) -> bool {
+/// Whether the current context's own extension list has `name`.
+pub fn system_has_extension(name: &str) -> bool {
     let text = unsafe { glGetString(EXTENSIONS) };
     !text.is_null() && unsafe { std::ffi::CStr::from_ptr(text as *const libc::c_char) }.to_string_lossy().split_whitespace().any(|e| e == name)
 }
@@ -1119,11 +1475,48 @@ pub fn register(r: &mut Registry) {
     r.function("glInsertEventMarkerEXT", debug_marker as usize);
     r.function("glPushGroupMarkerEXT", debug_marker as usize);
     r.function("glPopGroupMarkerEXT", debug_pop as usize);
+    r.function("glDiscardFramebufferEXT", discard_framebuffer as usize);
+    // Framebuffer functions go to the name the current context has (ES 1: OES).
+    for (name, address) in framebuffer_family() {
+        if r.get(name).is_none() {
+            r.function(name, address);
+        }
+    }
+    // An extension name of a standard function translated here takes the translation too.
+    for (apple, standard) in SAME_AS_STANDARD {
+        if let Some((address, crate::symbols::Kind::Function)) = r.get(standard) {
+            r.function(apple, address);
+        }
+    }
+    for name in ES1_EXTENSION_FUNCTIONS {
+        let found = symbol(gles1_library(), name);
+        let found = if found != 0 { found } else { get_proc_address(name) };
+        if found != 0 {
+            r.function(name, found);
+        }
+    }
 }
 
 #[cfg(test)]
 mod merged_tests {
     use super::*;
+
+    #[test]
+    fn extension_names_reach_this_layers_own_version_of_their_function() {
+        // glBindFramebufferOES must bind the drawable's framebuffer as
+        // glBindFramebuffer does here, not go straight to the system's.
+        let mut r = Registry::default();
+        register(&mut r);
+        let function = |name: &str| r.get(name).map(|(address, _)| address);
+        assert_eq!(function("glBindFramebufferOES"), Some(bind_framebuffer as usize));
+        assert_eq!(function("glRenderbufferStorageOES"), Some(renderbuffer_storage as usize));
+        assert_eq!(function("glGenRenderbuffersOES"), Some(glGenRenderbuffers as usize), "picks ES 1's name in ES 1 contexts");
+        for (extension, standard) in SAME_AS_STANDARD {
+            if function(standard).is_some() {
+                assert_eq!(function(extension), function(standard), "{extension}");
+            }
+        }
+    }
 
     #[test]
     fn no_saved_shader_programs_like_the_iphone() {

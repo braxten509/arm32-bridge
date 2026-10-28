@@ -1,40 +1,52 @@
-//! CommonCrypto: hashing (CC_MD5, CC_SHA1, CC_SHA256, CCHmac) and
+//! CommonCrypto: hashing (CC_MD5, CC_SHA1, CC_SHA256, also in pieces; CCHmac) and
 //! encryption (CCCrypt).
 
 use crate::symbols::Registry;
 use cipher::generic_array::GenericArray;
 use cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 
-pub fn md5(data: &[u8]) -> [u8; 16] {
+fn md5_block(state: &mut [u32; 4], block: &[u8]) {
     const SHIFT: [u32; 64] = [
         7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
         4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
     ];
-    let table: Vec<u32> = (0..64).map(|i| ((i as f64 + 1.0).sin().abs() * 4294967296.0) as u32).collect();
-    let mut state = [0x67452301u32, 0xefcdab89, 0x98badcfe, 0x10325476];
-    for block in padded(data, false).chunks(64) {
-        let words: Vec<u32> = block.chunks(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect();
-        let [mut a, mut b, mut c, mut d] = state;
-        for i in 0..64 {
-            let (f, g) = match i / 16 {
-                0 => ((b & c) | (!b & d), i),
-                1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
-                2 => (b ^ c ^ d, (3 * i + 5) % 16),
-                _ => (c ^ (b | !d), (7 * i) % 16),
-            };
-            let rotated = a.wrapping_add(f).wrapping_add(table[i]).wrapping_add(words[g]).rotate_left(SHIFT[i]);
-            a = d;
-            d = c;
-            c = b;
-            b = b.wrapping_add(rotated);
-        }
-        for (s, v) in state.iter_mut().zip([a, b, c, d]) {
-            *s = s.wrapping_add(v);
-        }
+    static TABLE: std::sync::OnceLock<[u32; 64]> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| std::array::from_fn(|i| ((i as f64 + 1.0).sin().abs() * 4294967296.0) as u32));
+    let words: Vec<u32> = block.chunks(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect();
+    let [mut a, mut b, mut c, mut d] = *state;
+    for i in 0..64 {
+        let (f, g) = match i / 16 {
+            0 => ((b & c) | (!b & d), i),
+            1 => ((d & b) | (!d & c), (5 * i + 1) % 16),
+            2 => (b ^ c ^ d, (3 * i + 5) % 16),
+            _ => (c ^ (b | !d), (7 * i) % 16),
+        };
+        let rotated = a.wrapping_add(f).wrapping_add(table[i]).wrapping_add(words[g]).rotate_left(SHIFT[i]);
+        a = d;
+        d = c;
+        c = b;
+        b = b.wrapping_add(rotated);
     }
-    let mut out = [0u8; 16];
+    for (s, v) in state.iter_mut().zip([a, b, c, d]) {
+        *s = s.wrapping_add(v);
+    }
+}
+
+const MD5_START: [u32; 4] = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476];
+
+pub fn md5(data: &[u8]) -> [u8; 16] {
+    let mut state = MD5_START;
+    for block in padded(data, false).chunks(64) {
+        md5_block(&mut state, block);
+    }
+    words_out(&state, false)
+}
+
+/// The state words as digest bytes (little-endian for MD5, else big-endian).
+fn words_out<const N: usize, const BYTES: usize>(state: &[u32; N], big_endian: bool) -> [u8; BYTES] {
+    let mut out = [0u8; BYTES];
     for (i, s) in state.iter().enumerate() {
-        out[i * 4..i * 4 + 4].copy_from_slice(&s.to_le_bytes());
+        out[i * 4..i * 4 + 4].copy_from_slice(&if big_endian { s.to_be_bytes() } else { s.to_le_bytes() });
     }
     out
 }
@@ -58,15 +70,7 @@ pub fn sha1(data: &[u8]) -> [u8; 20] {
     for block in padded(data, true).chunks(64) {
         sha1_block(&mut state, block);
     }
-    sha1_digest(&state)
-}
-
-fn sha1_digest(state: &[u32; 5]) -> [u8; 20] {
-    let mut out = [0u8; 20];
-    for (i, s) in state.iter().enumerate() {
-        out[i * 4..i * 4 + 4].copy_from_slice(&s.to_be_bytes());
-    }
-    out
+    words_out(&state, true)
 }
 
 fn sha1_block(state: &mut [u32; 5], block: &[u8]) {
@@ -97,9 +101,65 @@ fn sha1_block(state: &mut [u32; 5], block: &[u8]) {
     }
 }
 
-// ----- CC_SHA1_Init / Update / Final -----
-// Apple's CC_SHA1_CTX (96 bytes): h0..h4, Nl, Nh (bit count, low and high
-// words), 64 bytes of waiting data, and how many of them are used.
+const SHA256_START: [u32; 8] = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+
+fn sha256_block(state: &mut [u32; 8], block: &[u8]) {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01,
+        0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+        0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
+        0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08,
+        0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ];
+    let mut w = [0u32; 64];
+    for i in 0..16 {
+        w[i] = u32::from_be_bytes([block[i * 4], block[i * 4 + 1], block[i * 4 + 2], block[i * 4 + 3]]);
+    }
+    for i in 16..64 {
+        let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+        let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+    }
+    let mut v = *state;
+    for i in 0..64 {
+        let s1 = v[4].rotate_right(6) ^ v[4].rotate_right(11) ^ v[4].rotate_right(25);
+        let choose = (v[4] & v[5]) ^ (!v[4] & v[6]);
+        let t1 = v[7].wrapping_add(s1).wrapping_add(choose).wrapping_add(K[i]).wrapping_add(w[i]);
+        let s0 = v[0].rotate_right(2) ^ v[0].rotate_right(13) ^ v[0].rotate_right(22);
+        let majority = (v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]);
+        let t2 = s0.wrapping_add(majority);
+        v = [t1.wrapping_add(t2), v[0], v[1], v[2], v[3].wrapping_add(t1), v[4], v[5], v[6]];
+    }
+    for (s, x) in state.iter_mut().zip(v) {
+        *s = s.wrapping_add(x);
+    }
+}
+
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    let mut state = SHA256_START;
+    for block in padded(data, true).chunks(64) {
+        sha256_block(&mut state, block);
+    }
+    words_out(&state, true)
+}
+
+// ----- CC_MD5 / CC_SHA1 / CC_SHA256 _Init / _Update / _Final -----
+// The contexts are Apple's (CC_LONG words, so the same on 32- and 64-bit):
+// CC_MD5_CTX (92 bytes) A..D, Nl, Nh (bit count, low and high words), 64
+// bytes of waiting data and how many are used; CC_SHA1_CTX (96) the same
+// with h0..h4; CC_SHA256_CTX (104) the bit count, the 8 hash words and the
+// waiting data (how much of it is used follows from the count).
+
+#[repr(C)]
+struct Md5Context {
+    state: [u32; 4],
+    bits_low: u32,
+    bits_high: u32,
+    waiting: [u8; 64],
+    used: u32,
+}
 
 #[repr(C)]
 struct Sha1Context {
@@ -110,101 +170,153 @@ struct Sha1Context {
     used: u32,
 }
 
+#[repr(C)]
+struct Sha256Context {
+    bits_low: u32,
+    bits_high: u32,
+    state: [u32; 8],
+    waiting: [u8; 64],
+}
+
+/// A hash fed in pieces: its block function, how its length is written at
+/// the end, and its state in the caller's context.
+struct Stream<'a, const N: usize> {
+    block: fn(&mut [u32; N], &[u8]),
+    big_endian: bool,
+    state: &'a mut [u32; N],
+    bits_low: &'a mut u32,
+    bits_high: &'a mut u32,
+    waiting: &'a mut [u8; 64],
+}
+
+impl<const N: usize> Stream<'_, N> {
+    fn bits(&self) -> u64 {
+        (u64::from(*self.bits_high) << 32) | u64::from(*self.bits_low)
+    }
+
+    /// The waiting bytes of an unfinished block (from the bit count).
+    fn used(&self) -> usize {
+        (self.bits() / 8 % 64) as usize
+    }
+
+    fn update(&mut self, mut data: &[u8]) {
+        let used = self.used();
+        let bits = self.bits().wrapping_add((data.len() as u64).wrapping_mul(8));
+        (*self.bits_low, *self.bits_high) = (bits as u32, (bits >> 32) as u32);
+        if used > 0 {
+            let take = data.len().min(64 - used);
+            self.waiting[used..used + take].copy_from_slice(&data[..take]);
+            data = &data[take..];
+            if used + take < 64 {
+                return;
+            }
+            let block = *self.waiting;
+            (self.block)(self.state, &block);
+        }
+        let mut blocks = data.chunks_exact(64);
+        for block in &mut blocks {
+            (self.block)(self.state, block);
+        }
+        let rest = blocks.remainder();
+        self.waiting[..rest.len()].copy_from_slice(rest);
+    }
+
+    /// The end marker and the bit length.
+    fn finish(&mut self) {
+        let bits = self.bits();
+        let used = self.used();
+        let mut tail = vec![0x80u8];
+        tail.resize(if used < 56 { 56 - used } else { 120 - used }, 0);
+        tail.extend_from_slice(&if self.big_endian { bits.to_be_bytes() } else { bits.to_le_bytes() });
+        self.update(&tail);
+    }
+}
+
+unsafe fn input<'a>(data: *const u8, length: u32) -> &'a [u8] {
+    if data.is_null() || length == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(data, length as usize)
+    }
+}
+
+/// Writes the digest and clears the context (as Apple's do).
+unsafe fn hand_out_digest<T, const N: usize>(digest: *mut u8, context: *mut T, state: &[u32; N], big_endian: bool) {
+    let out: [u8; 32] = words_out(state, big_endian);
+    if !digest.is_null() {
+        std::ptr::copy_nonoverlapping(out.as_ptr(), digest, N * 4);
+    }
+    std::ptr::write_bytes(context as *mut u8, 0, std::mem::size_of::<T>());
+}
+
+fn md5_stream(c: &mut Md5Context) -> Stream<'_, 4> {
+    Stream { block: md5_block, big_endian: false, state: &mut c.state, bits_low: &mut c.bits_low, bits_high: &mut c.bits_high, waiting: &mut c.waiting }
+}
+
+fn sha1_stream(c: &mut Sha1Context) -> Stream<'_, 5> {
+    Stream { block: sha1_block, big_endian: true, state: &mut c.state, bits_low: &mut c.bits_low, bits_high: &mut c.bits_high, waiting: &mut c.waiting }
+}
+
+fn sha256_stream(c: &mut Sha256Context) -> Stream<'_, 8> {
+    Stream { block: sha256_block, big_endian: true, state: &mut c.state, bits_low: &mut c.bits_low, bits_high: &mut c.bits_high, waiting: &mut c.waiting }
+}
+
+extern "C" fn cc_md5_init(context: *mut Md5Context) -> i32 {
+    unsafe { *context = Md5Context { state: MD5_START, bits_low: 0, bits_high: 0, waiting: [0; 64], used: 0 } };
+    1
+}
+
+extern "C" fn cc_md5_update(context: *mut Md5Context, data: *const u8, length: u32) -> i32 {
+    let context = unsafe { &mut *context };
+    md5_stream(context).update(unsafe { input(data, length) });
+    context.used = md5_stream(context).used() as u32;
+    1
+}
+
+extern "C" fn cc_md5_final(digest: *mut u8, context: *mut Md5Context) -> i32 {
+    let c = unsafe { &mut *context };
+    md5_stream(c).finish();
+    let state = c.state;
+    unsafe { hand_out_digest(digest, context, &state, false) };
+    1
+}
+
 extern "C" fn cc_sha1_init(context: *mut Sha1Context) -> i32 {
     unsafe { *context = Sha1Context { state: SHA1_START, bits_low: 0, bits_high: 0, waiting: [0; 64], used: 0 } };
     1
 }
 
-fn sha1_update(context: &mut Sha1Context, mut data: &[u8]) {
-    let bits = ((u64::from(context.bits_high) << 32) | u64::from(context.bits_low)).wrapping_add((data.len() as u64).wrapping_mul(8));
-    (context.bits_low, context.bits_high) = (bits as u32, (bits >> 32) as u32);
-    let used = (context.used as usize).min(63);
-    if used > 0 {
-        let take = data.len().min(64 - used);
-        context.waiting[used..used + take].copy_from_slice(&data[..take]);
-        data = &data[take..];
-        context.used = (used + take) as u32;
-        if context.used < 64 {
-            return;
-        }
-        let block = context.waiting;
-        sha1_block(&mut context.state, &block);
-        context.used = 0;
-    }
-    let mut blocks = data.chunks_exact(64);
-    for block in &mut blocks {
-        sha1_block(&mut context.state, block);
-    }
-    let rest = blocks.remainder();
-    context.waiting[..rest.len()].copy_from_slice(rest);
-    context.used = rest.len() as u32;
-}
-
 extern "C" fn cc_sha1_update(context: *mut Sha1Context, data: *const u8, length: u32) -> i32 {
-    let bytes = if data.is_null() || length == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(data, length as usize) } };
-    sha1_update(unsafe { &mut *context }, bytes);
+    let context = unsafe { &mut *context };
+    sha1_stream(context).update(unsafe { input(data, length) });
+    context.used = sha1_stream(context).used() as u32;
     1
-}
-
-fn sha1_final(context: &mut Sha1Context) -> [u8; 20] {
-    let bits = (u64::from(context.bits_high) << 32) | u64::from(context.bits_low);
-    let used = context.used as usize % 64;
-    let mut tail = vec![0x80u8];
-    tail.resize(if used < 56 { 56 - used } else { 120 - used }, 0);
-    sha1_update(context, &tail);
-    sha1_update(context, &bits.to_be_bytes());
-    sha1_digest(&context.state)
 }
 
 extern "C" fn cc_sha1_final(digest: *mut u8, context: *mut Sha1Context) -> i32 {
-    let out = sha1_final(unsafe { &mut *context });
-    unsafe {
-        std::ptr::copy_nonoverlapping(out.as_ptr(), digest, 20);
-        std::ptr::write_bytes(context as *mut u8, 0, std::mem::size_of::<Sha1Context>());
-    }
+    let c = unsafe { &mut *context };
+    sha1_stream(c).finish();
+    let state = c.state;
+    unsafe { hand_out_digest(digest, context, &state, true) };
     1
 }
 
-pub fn sha256(data: &[u8]) -> [u8; 32] {
-    const K: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01,
-        0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
-        0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
-        0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08,
-        0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
-        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
-    ];
-    let mut state = [0x6a09e667u32, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
-    for block in padded(data, true).chunks(64) {
-        let mut w = [0u32; 64];
-        for i in 0..16 {
-            w[i] = u32::from_be_bytes([block[i * 4], block[i * 4 + 1], block[i * 4 + 2], block[i * 4 + 3]]);
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
-        }
-        let mut v = state;
-        for i in 0..64 {
-            let s1 = v[4].rotate_right(6) ^ v[4].rotate_right(11) ^ v[4].rotate_right(25);
-            let choose = (v[4] & v[5]) ^ (!v[4] & v[6]);
-            let t1 = v[7].wrapping_add(s1).wrapping_add(choose).wrapping_add(K[i]).wrapping_add(w[i]);
-            let s0 = v[0].rotate_right(2) ^ v[0].rotate_right(13) ^ v[0].rotate_right(22);
-            let majority = (v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]);
-            let t2 = s0.wrapping_add(majority);
-            v = [t1.wrapping_add(t2), v[0], v[1], v[2], v[3].wrapping_add(t1), v[4], v[5], v[6]];
-        }
-        for (s, x) in state.iter_mut().zip(v) {
-            *s = s.wrapping_add(x);
-        }
-    }
-    let mut out = [0u8; 32];
-    for (i, s) in state.iter().enumerate() {
-        out[i * 4..i * 4 + 4].copy_from_slice(&s.to_be_bytes());
-    }
-    out
+extern "C" fn cc_sha256_init(context: *mut Sha256Context) -> i32 {
+    unsafe { *context = Sha256Context { bits_low: 0, bits_high: 0, state: SHA256_START, waiting: [0; 64] } };
+    1
+}
+
+extern "C" fn cc_sha256_update(context: *mut Sha256Context, data: *const u8, length: u32) -> i32 {
+    sha256_stream(unsafe { &mut *context }).update(unsafe { input(data, length) });
+    1
+}
+
+extern "C" fn cc_sha256_final(digest: *mut u8, context: *mut Sha256Context) -> i32 {
+    let c = unsafe { &mut *context };
+    sha256_stream(c).finish();
+    let state = c.state;
+    unsafe { hand_out_digest(digest, context, &state, true) };
+    1
 }
 
 fn hmac(hash: fn(&[u8]) -> Vec<u8>, key: &[u8], data: &[u8]) -> Vec<u8> {
@@ -477,8 +589,21 @@ impl Cryptor {
         })
     }
 
-    fn block_size(&self) -> usize {
+    pub fn block_size(&self) -> usize {
         self.cipher.as_ref().map_or(1, BlockCipher::block_size)
+    }
+
+    /// CCCryptorReset: the chain starts again from `iv` (zeros when None)
+    /// and input not yet used is dropped; the key stays. A stream cipher
+    /// (RC4) can't be reset (kCCUnimplemented, as on Apple).
+    pub fn reset(&mut self, iv: Option<&[u8]>) -> Result<(), i32> {
+        if self.cipher.is_err() {
+            return Err(UNIMPLEMENTED);
+        }
+        let size = self.block_size();
+        self.previous = iv.map_or_else(|| vec![0; size], |iv| iv[..size].to_vec());
+        self.pending.clear();
+        Ok(())
     }
 
     /// How many pending bytes `update` turns into output now.
@@ -575,7 +700,7 @@ static CRYPT_KINDS: std::sync::Mutex<Vec<(u32, u32, u32, usize)>> = std::sync::M
 static CRYPT_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 #[allow(clippy::too_many_arguments)]
-extern "C" fn cc_crypt(
+pub(crate) extern "C" fn cc_crypt(
     operation: u32,
     algorithm: u32,
     options: u32,
@@ -649,6 +774,12 @@ pub fn register(r: &mut Registry) {
     r.function("CC_SHA1_Init", cc_sha1_init as usize);
     r.function("CC_SHA1_Update", cc_sha1_update as usize);
     r.function("CC_SHA1_Final", cc_sha1_final as usize);
+    r.function("CC_MD5_Init", cc_md5_init as usize);
+    r.function("CC_MD5_Update", cc_md5_update as usize);
+    r.function("CC_MD5_Final", cc_md5_final as usize);
+    r.function("CC_SHA256_Init", cc_sha256_init as usize);
+    r.function("CC_SHA256_Update", cc_sha256_update as usize);
+    r.function("CC_SHA256_Final", cc_sha256_final as usize);
     r.function("CC_SHA256", cc_sha256 as usize);
     r.function("CCHmac", cc_hmac as usize);
     r.function("CCCrypt", cc_crypt as usize);
@@ -662,26 +793,44 @@ mod tests {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    /// Fed in uneven pieces (crossing block edges), the streaming SHA-1
-    /// gives the one-shot answer, also when the end needs an extra block.
+    /// Fed in uneven pieces (crossing block edges), the streaming MD5, SHA-1
+    /// and SHA-256 give the one-shot answer, also when the end needs an extra
+    /// block; each context is Apple's size.
     #[test]
-    fn sha1_in_pieces_matches_one_shot() {
+    fn digests_in_pieces_match_one_shot() {
+        type Init = extern "C" fn(*mut u8) -> i32;
+        type Update = extern "C" fn(*mut u8, *const u8, u32) -> i32;
+        type Final = extern "C" fn(*mut u8, *mut u8) -> i32;
+        let kinds: [(&str, usize, Init, Update, Final, fn(&[u8]) -> Vec<u8>); 3] = unsafe {
+            [
+                ("MD5", 92, std::mem::transmute(cc_md5_init as usize), std::mem::transmute(cc_md5_update as usize), std::mem::transmute(cc_md5_final as usize), |d| md5(d).to_vec()),
+                ("SHA1", 96, std::mem::transmute(cc_sha1_init as usize), std::mem::transmute(cc_sha1_update as usize), std::mem::transmute(cc_sha1_final as usize), |d| sha1(d).to_vec()),
+                ("SHA256", 104, std::mem::transmute(cc_sha256_init as usize), std::mem::transmute(cc_sha256_update as usize), std::mem::transmute(cc_sha256_final as usize), |d| sha256(d).to_vec()),
+            ]
+        };
+        assert_eq!([std::mem::size_of::<Md5Context>(), std::mem::size_of::<Sha1Context>(), std::mem::size_of::<Sha256Context>()], [92, 96, 104]);
         let data: Vec<u8> = (0..1000u32).map(|i| (i * 7 + 3) as u8).collect();
-        for total in [0usize, 55, 56, 63, 64, 1000] {
-            let mut context: Sha1Context = unsafe { std::mem::zeroed() };
-            cc_sha1_init(&mut context);
-            let mut at = 0;
-            for piece in [1usize, 62, 3, 130].iter().cycle() {
-                if at >= total {
-                    break;
+        for (name, size, init, update, finish, one_shot) in kinds {
+            for total in [0usize, 55, 56, 63, 64, 1000] {
+                // Words, so the context is 4-byte aligned like the game's.
+                let mut words = vec![0xAAAA_AAAAu32; size / 4 + 1];
+                let context = words.as_mut_ptr() as *mut u8;
+                init(context);
+                let mut at = 0;
+                for piece in [1usize, 62, 3, 130].iter().cycle() {
+                    if at >= total {
+                        break;
+                    }
+                    let end = (at + piece).min(total);
+                    update(context, data[at..end].as_ptr(), (end - at) as u32);
+                    at = end;
                 }
-                let end = (at + piece).min(total);
-                cc_sha1_update(&mut context, data[at..end].as_ptr(), (end - at) as u32);
-                at = end;
+                let mut digest = [0u8; 32];
+                finish(digest.as_mut_ptr(), context);
+                let expected = one_shot(&data[..total]);
+                assert_eq!(&digest[..expected.len()], &expected[..], "{name}, {total} bytes");
+                assert_eq!(words[size / 4], 0xAAAA_AAAA, "{name} stayed inside its context");
             }
-            let mut digest = [0u8; 20];
-            cc_sha1_final(digest.as_mut_ptr(), &mut context);
-            assert_eq!(digest, sha1(&data[..total]), "{total} bytes");
         }
     }
 

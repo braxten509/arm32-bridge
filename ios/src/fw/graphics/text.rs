@@ -4,7 +4,9 @@
 //! The font file is the game's own when the UIFont's name matches one of
 //! its Info.plist UIAppFonts (by family, full or PostScript name, or file
 //! name), else the system's sans-serif font (its bold for bold names).
-//! Glyph outlines go through the CTM into the context's path filler
+//! A character the chosen file has no glyph for comes from the system's
+//! font at the same size, as iOS does, so a game's font without "&" still
+//! has one. Glyph outlines go through the CTM into the context's path filler
 //! (shapes.rs), so text is anti-aliased, clipped and transformed like any
 //! other shape, upright in UIKit's flipped coordinates, and cut at the
 //! rect's edges; the context's text drawing mode picks fill, stroke or
@@ -117,15 +119,18 @@ fn face_named(name: &str) -> Option<&'static Face<'static>> {
         return found;
     }
     let wanted = simple(name);
-    let found = app_fonts().iter().find(|(names, _)| names.contains(&wanted)).map(|(_, face)| *face).or_else(|| {
-        let lower = name.to_lowercase();
-        system_face(["bold", "medium", "heavy", "black"].iter().any(|w| lower.contains(w)))
-    });
+    let found = app_fonts().iter().find(|(names, _)| names.contains(&wanted)).map(|(_, face)| *face).or_else(|| system_face(bold_name(name)));
     if found.is_none() {
         crate::log!("font {name}: no font file found; text is measured but not drawn");
     }
     CACHE.lock().unwrap().get_or_insert_with(HashMap::new).insert(name.to_string(), found);
     found
+}
+
+/// Whether a UIFont name asks for a bold face.
+fn bold_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    ["bold", "medium", "heavy", "black"].iter().any(|w| lower.contains(w))
 }
 
 // ----- measuring and line breaking -----
@@ -134,12 +139,15 @@ fn face_named(name: &str) -> Option<&'static Face<'static>> {
 struct Font {
     face: Option<&'static Face<'static>>,
     size: f64,
+    /// The name asks for a bold face: letters the chosen file lacks come
+    /// from the system's bold font.
+    bold: bool,
 }
 
 impl Font {
     fn of(font: Id) -> Font {
         let (name, size) = controls::font_name_and_size(font);
-        Font { face: face_named(&name), size }
+        Font { face: face_named(&name), size, bold: bold_name(&name) }
     }
 
     /// Points per font unit.
@@ -147,13 +155,26 @@ impl Font {
         self.size / f64::from(face.units_per_em().max(1))
     }
 
-    fn glyph(face: &Face, c: char) -> GlyphId {
-        face.glyph_index(if c == '\t' { ' ' } else { c }).unwrap_or(GlyphId(0))
+    /// The font and glyph that draw `c`: the chosen face's own, else the
+    /// system font's (as iOS fills a game font's missing letter in), else
+    /// the chosen face's missing-glyph box. Tabs are spaces.
+    fn glyph(&self, c: char) -> Option<(&'static Face<'static>, GlyphId)> {
+        let c = if c == '\t' { ' ' } else { c };
+        let face = self.face?;
+        if let Some(id) = face.glyph_index(c) {
+            return Some((face, id));
+        }
+        if let Some(system) = system_face(self.bold) {
+            if let Some(id) = system.glyph_index(c) {
+                return Some((system, id));
+            }
+        }
+        Some((face, GlyphId(0)))
     }
 
     fn advance(&self, c: char) -> f64 {
-        match self.face {
-            Some(face) => f64::from(face.glyph_hor_advance(Font::glyph(face, c)).unwrap_or(0)) * self.scale(face),
+        match self.glyph(c) {
+            Some((face, id)) => f64::from(face.glyph_hor_advance(id).unwrap_or(0)) * self.scale(face),
             None => self.size * 11.0 / 20.0,
         }
     }
@@ -350,9 +371,10 @@ impl ttf_parser::OutlineBuilder for Pen<'_> {
 impl Canvas {
     /// Lines of text in `rect` (UIKit's coordinates: its top is the first
     /// line's top), aligned in its width and cut at its edges, filled
-    /// and/or stroked as the context's text drawing mode says; the clip
-    /// modes then add the glyphs' shapes to the context's clip.
-    fn draw_text(&mut self, face: &Face, font: &Font, lines: &[Vec<char>], rect: Rect, align: isize) {
+    /// and/or stroked as the context's text drawing mode says, casting the
+    /// context's shadow (on its own surface, as big as the glyphs and the
+    /// pen); the clip modes then add the glyphs' shapes to the context's clip.
+    fn draw_text(&mut self, font: &Font, lines: &[Vec<char>], rect: Rect, align: isize) {
         // CGTextDrawingMode: fill, stroke, fill+stroke, invisible, then the same four adding to the clip.
         let mode = self.state.text_mode;
         let (fill, stroke) = match mode & 3 {
@@ -376,30 +398,42 @@ impl Canvas {
                     _ => 0.0,
                 };
             let baseline = rect.origin.y + i as f64 * font.line_height() + font.ascender();
-            let mut pen = Pen { outline: &mut outline, ctm: self.state.ctm, x, baseline, scale: font.scale(face), last: (0.0, 0.0) };
+            let scale = font.face.map_or(0.0, |face| font.scale(face));
+            let mut pen = Pen { outline: &mut outline, ctm: self.state.ctm, x, baseline, scale, last: (0.0, 0.0) };
             for &c in line {
-                face.outline_glyph(Font::glyph(face, c), &mut pen);
+                if let Some((face, id)) = font.glyph(c) {
+                    pen.scale = font.scale(face);
+                    face.outline_glyph(id, &mut pen);
+                }
                 pen.x += font.advance(c);
             }
         }
         if fill || stroke {
             // Painted only inside the rect (an unbounded side stays open;
             // the one line always shown may be taller than the rect).
-            let saved = self.state.clip.clone();
             let open = |start: f64, length: f64| if length.is_finite() { (start, length) } else { (start - 1e6, 2e6) };
             let (x, width) = open(rect.origin.x, rect.size.width);
             let (y, height) = open(rect.origin.y, rect.size.height.max(lines.len() as f64 * font.line_height()));
-            let mut bounds = shapes::Outline::default();
-            let ctm = self.state.ctm;
-            bounds.rect(Rect::new(x, y, width, height), &|(x, y)| geometry::apply(ctm, x, y));
-            self.clip_to(&bounds, false);
-            if fill {
-                self.fill_outline(&outline, false);
-            }
-            if stroke {
-                self.stroke_outline(&outline);
-            }
-            self.state.clip = saved;
+            let inside = Rect::new(x, y, width, height);
+            // The glyphs move with a shadow's surface (`by`); its CTM already has.
+            self.shadowed(
+                |c| c.outline_area(&outline, stroke),
+                |c, by| {
+                    let saved = c.state.clip.clone();
+                    let mut bounds = shapes::Outline::default();
+                    let ctm = c.state.ctm;
+                    bounds.rect(inside, &|(x, y)| geometry::apply(ctm, x, y));
+                    c.clip_to(&bounds, false);
+                    let glyphs = outline.moved(by);
+                    if fill {
+                        c.fill_outline(&glyphs, false);
+                    }
+                    if stroke {
+                        c.stroke_outline(&glyphs);
+                    }
+                    c.state.clip = saved;
+                },
+            );
         }
         if clip {
             self.clip_to(&outline, false);
@@ -412,9 +446,9 @@ fn draw(text: Id, rect: Rect, font: Id, mode: isize, align: isize, single_line: 
     let font = Font::of(font);
     let text = string::get(text);
     let lines = lay_out(&font, &text, rect.size.width, single_line, lines_in(&font, rect.size.height), mode);
-    if let Some(face) = font.face {
+    if font.face.is_some() {
         if let Some(mut c) = canvas("-[NSString drawInRect:withFont:]", current_context()) {
-            c.draw_text(face, &font, &lines, rect, align);
+            c.draw_text(&font, &lines, rect, align);
         }
     }
     size_of(&font, &text, &lines, rect.size.width)
@@ -455,6 +489,266 @@ extern "C" fn draw_in_rect_mode(this: Id, _: Sel, rect: Rect, font: Id, mode: is
 }
 extern "C" fn draw_in_rect_mode_alignment(this: Id, _: Sel, rect: Rect, font: Id, mode: isize, align: isize) -> Size {
     draw(this, rect, font, mode, align, false)
+}
+
+// ----- labels -----
+
+/// What a UILabel shows (or a UIButton's title): its text drawn in its
+/// bounds as -[UILabel drawTextInRect:] does.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextLook {
+    pub text: String,
+    /// UIFont name and point size.
+    pub font: (String, f64),
+    /// Straight red, green, blue, alpha.
+    pub color: [f64; 4],
+    /// Shadow colour and offset in points (right, down).
+    pub shadow: Option<([f64; 4], (f64, f64))>,
+    /// NSTextAlignment (left, centre, right; others draw left).
+    pub alignment: isize,
+    /// NSLineBreakMode.
+    pub line_break: isize,
+    /// numberOfLines (0: as many as fit).
+    pub lines: isize,
+    /// The bounds' size in points.
+    pub size: (f64, f64),
+    /// Set when the font shrinks to fit a single line's width
+    /// (adjustsFontSizeToFitWidth): the smallest size it may take.
+    pub minimum_font_size: Option<f64>,
+}
+
+impl Font {
+    fn named(name: &str, size: f64) -> Font {
+        Font { face: face_named(name), size, bold: bold_name(name) }
+    }
+}
+
+/// The font a label draws with (smaller when it shrinks to fit) and the
+/// lines it shows: one cut as its line break mode says, or wrapped, no
+/// more than numberOfLines or than fit its height.
+fn label_lines(look: &TextLook) -> (Font, Vec<Vec<char>>) {
+    let (width, height) = look.size;
+    let single_line = look.lines == 1;
+    let mut font = Font::named(&look.font.0, look.font.1);
+    if let (true, Some(minimum)) = (single_line, look.minimum_font_size) {
+        let first: Vec<char> = look.text.split('\n').next().unwrap_or("").chars().collect();
+        let wide = font.width(&first);
+        if wide > width && width > 0.0 {
+            // Widths grow with the size; a hair under so it surely fits.
+            font.size = (font.size * width / wide * 0.999).max(minimum.max(1.0)).min(font.size);
+        }
+    }
+    let fit = lines_in(&font, height);
+    let max_lines = match (look.lines.max(0) as usize, fit) {
+        (0, fit) => fit,
+        (wanted, 0) => wanted,
+        (wanted, fit) => wanted.min(fit),
+    };
+    let lines = lay_out(&font, &look.text, width, single_line, max_lines, look.line_break);
+    (font, lines)
+}
+
+/// The size `text` takes in a font (name, points) no wider than `width`, on
+/// at most `lines` lines (1: one line cut by `mode`; 0: any number), as
+/// UILabel sizes it to fit.
+pub fn text_box(text: &str, font: &(String, f64), width: f64, lines: isize, mode: isize) -> (f64, f64) {
+    let font = Font::named(&font.0, font.1);
+    let laid = lay_out(&font, text, width, lines == 1, lines.max(0) as usize, mode);
+    let size = size_of(&font, text, &laid, width);
+    (size.width, size.height)
+}
+
+/// A look drawn at `scale` pixels per point: width, height and straight
+/// RGBA rows from the top. The lines sit in the middle of the bounds up and
+/// down, the shadow under the text; nothing is drawn outside the bounds.
+fn draw_look(look: &TextLook, scale: f64) -> Option<(usize, usize, Vec<u8>)> {
+    let bitmap = look_bitmap(look, scale)?;
+    let rgba = bitmap.straight_rgba()?;
+    Some((bitmap.width, bitmap.height, rgba))
+}
+
+/// The same as a picture (rows from the top) to draw into a context.
+pub(super) fn look_bitmap(look: &TextLook, scale: f64) -> Option<Bitmap> {
+    let (width, height) = ((look.size.0 * scale).ceil(), (look.size.1 * scale).ceil());
+    if !(width >= 1.0 && height >= 1.0 && width * height <= 16e6) {
+        return None;
+    }
+    let (font, lines) = label_lines(look);
+    font.face?;
+    let mut canvas = Canvas::new(std::ptr::null_mut(), width as usize, height as usize, 8, 0, Space::Rgb, PREMULTIPLIED_LAST).ok()?;
+    // UIKit's flip: (0, 0) at the top left, `scale` pixels per point.
+    canvas.state.ctm = Transform { a: scale, b: 0.0, c: 0.0, d: -scale, tx: 0.0, ty: height };
+    let block = lines.len() as f64 * font.line_height();
+    let rect = Rect::new(0.0, (look.size.1 - block) / 2.0, look.size.0, block);
+    if let Some((color, (right, down))) = look.shadow {
+        canvas.state.fill = color;
+        canvas.draw_text(&font, &lines, Rect::new(rect.origin.x + right, rect.origin.y + down, rect.size.width, rect.size.height), look.alignment);
+    }
+    canvas.state.fill = look.color;
+    canvas.draw_text(&font, &lines, rect, look.alignment);
+    Some(canvas.snapshot())
+}
+
+/// A look at a scale, as a key: its exact numbers spelled out (Debug prints
+/// each f64 so it reads back the same), so equal looks find one file.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+struct LookKey(String);
+
+impl LookKey {
+    fn of(look: &TextLook, scale: f64) -> LookKey {
+        LookKey(format!("{look:?}@{}", scale.to_bits()))
+    }
+}
+
+/// A text picture file and when it was last on a screen.
+struct TextFile {
+    file: Option<String>,
+    used: u64,
+}
+
+/// The text picture files made so far, by look (B3: found by key, not by a
+/// search through all of them), each with when it was last used.
+#[derive(Default)]
+struct TextFiles {
+    made: HashMap<LookKey, TextFile>,
+    clock: u64,
+}
+
+impl TextFiles {
+    /// The next use's time (a screen's looks take one each, in order).
+    fn tick(&mut self) -> u64 {
+        self.clock += 1;
+        self.clock
+    }
+
+    /// The files for one screen's looks (made by `make` the first time);
+    /// beyond `keep` files the least recently used ones not on this screen
+    /// are deleted.
+    fn files(&mut self, looks: &[&TextLook], scale: f64, keep: usize, make: impl Fn(&TextLook, f64) -> Option<String>) -> Vec<Option<String>> {
+        let keys: Vec<LookKey> = looks.iter().map(|look| LookKey::of(look, scale)).collect();
+        let files = looks
+            .iter()
+            .zip(&keys)
+            .map(|(&look, key)| {
+                let used = self.tick();
+                match self.made.get_mut(key) {
+                    Some(found) => {
+                        found.used = used;
+                        found.file.clone()
+                    }
+                    None => {
+                        let file = make(look, scale);
+                        self.made.insert(key.clone(), TextFile { file: file.clone(), used });
+                        file
+                    }
+                }
+            })
+            .collect();
+        self.trim(keep, &keys);
+        files
+    }
+
+    /// The files for one screen's looks with the not-yet-made ones drawn by
+    /// `draw` (in parallel, a few at a time); beyond `keep` files the least
+    /// recently used ones not on this screen are deleted.
+    fn files_parallel(&mut self, looks: &[&TextLook], scale: f64, keep: usize, draw: &(dyn Fn(&TextLook, f64) -> Option<String> + Sync)) -> Vec<Option<String>> {
+        // One slot per look: an already-made file, or the new look's index.
+        enum Slot {
+            Have(Option<String>),
+            New(usize),
+        }
+        let keys: Vec<LookKey> = looks.iter().map(|look| LookKey::of(look, scale)).collect();
+        let mut slots: Vec<Slot> = Vec::with_capacity(looks.len());
+        let mut new: Vec<(LookKey, TextLook)> = Vec::new();
+        for (&look, key) in looks.iter().zip(&keys) {
+            let used = self.tick();
+            // A look shown twice on the screen shares the one being drawn.
+            if let Some(at) = new.iter().position(|(pending, _)| pending == key) {
+                slots.push(Slot::New(at));
+                continue;
+            }
+            match self.made.get_mut(key) {
+                Some(found) => {
+                    found.used = used;
+                    slots.push(Slot::Have(found.file.clone()));
+                }
+                None => {
+                    slots.push(Slot::New(new.len()));
+                    new.push((key.clone(), look.clone()));
+                    self.made.insert(key.clone(), TextFile { file: None, used });
+                }
+            }
+        }
+        let pending: Vec<TextLook> = new.iter().map(|(_, look)| look.clone()).collect();
+        let drawn = draw_in_parallel(&pending, scale, draw);
+        // The new looks keep the picture they drew.
+        for ((key, _), file) in new.iter().zip(&drawn) {
+            if let Some(entry) = self.made.get_mut(key) {
+                entry.file = file.clone();
+            }
+        }
+        let files = slots
+            .into_iter()
+            .map(|slot| match slot {
+                Slot::Have(file) => file,
+                Slot::New(at) => drawn[at].clone(),
+            })
+            .collect();
+        self.trim(keep, &keys);
+        files
+    }
+
+    /// Deletes the least recently used files beyond `keep` that are not on
+    /// this screen (`shown`).
+    fn trim(&mut self, keep: usize, shown: &[LookKey]) {
+        let extra = self.made.len().saturating_sub(keep);
+        if extra == 0 {
+            return;
+        }
+        let mut old: Vec<(u64, LookKey)> = self.made.iter().filter(|(key, _)| !shown.contains(key)).map(|(key, entry)| (entry.used, key.clone())).collect();
+        old.sort_unstable_by_key(|(used, _)| *used);
+        for (_, key) in old.into_iter().take(extra) {
+            if let Some(TextFile { file: Some(file), .. }) = self.made.remove(&key) {
+                let _ = std::fs::remove_file(file);
+            }
+        }
+    }
+}
+
+/// Every look drawn, a few at a time on worker threads, in order.
+fn draw_in_parallel(looks: &[TextLook], scale: f64, draw: &(dyn Fn(&TextLook, f64) -> Option<String> + Sync)) -> Vec<Option<String>> {
+    if looks.is_empty() {
+        return Vec::new();
+    }
+    let workers = looks.len().min(4);
+    let chunk = looks.len().div_ceil(workers);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|worker| {
+                let start = (worker * chunk).min(looks.len());
+                let end = ((worker + 1) * chunk).min(looks.len());
+                scope.spawn(move || looks[start..end].iter().map(|look| draw(look, scale)).collect::<Vec<_>>())
+            })
+            .collect();
+        handles.into_iter().flat_map(|handle| handle.join().unwrap()).collect()
+    })
+}
+
+/// PNG files showing one screen's `looks` at `scale` pixels per point
+/// (fw/pictures.rs), each made once; None for a look there is nothing to
+/// draw with.
+pub fn text_pictures(looks: &[&TextLook], scale: f64) -> Vec<Option<String>> {
+    static MADE: Mutex<Option<TextFiles>> = Mutex::new(None);
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    let made = made.get_or_insert_with(TextFiles::default);
+    let draw = |look: &TextLook, scale: f64| {
+        draw_look(look, scale)
+            .and_then(|(width, height, rgba)| encode_png(width, height, &rgba, true))
+            .and_then(|bytes| write_png_file(&format!("text \"{}\"", look.text), &bytes))
+    };
+    // Tests keep every file: side by side, one test's screens would delete
+    // the files another is about to read (compose.rs KEPT_CHECKS).
+    made.files_parallel(looks, scale, if cfg!(test) { usize::MAX } else { 256 }, &draw)
 }
 
 /// The NSString methods this file adds (32-bit games reach them through
@@ -571,6 +865,218 @@ mod tests {
         assert_eq!((measured.width, measured.height), (two.width, two.height));
     }
 
+    /// Text drawn into a context with a shadow casts it, as every Quartz
+    /// drawing does (CGContextSetShadow then -drawInRect:withFont:).
+    #[test]
+    fn strings_cast_the_contexts_shadow() {
+        let all = Rect::new(0.0, 0.0, W as f64, H as f64);
+        let (_, plain) = draw("i", all, 0, 0);
+        let shadow = Some(Shadow { offset: (10.0, 0.0), blur: 0.0, color: [0.0, 0.0, 1.0, 1.0] });
+        let (_, shadowed) = render_with("i", all, |c| c.state.shadow = shadow);
+        let (plain, shadowed) = (columns(&plain), columns(&shadowed));
+        assert_eq!(shadowed.last(), Some(&(plain.last().unwrap() + 10)), "shadow 10 pixels right: {plain:?} {shadowed:?}");
+        // The shadow's drawing surface covers the letters, not the canvas.
+        let layer = LAST_LAYER.with(|last| last.get());
+        assert!(layer.pixels() < W * H / 4, "a {layer:?} layer for one small letter");
+    }
+
+    /// Text drawn with a clip mode and a shadow: the letters still clip the
+    /// context (not only the shadow's own drawing surface).
+    #[test]
+    fn shadowed_clip_text_clips_the_context() {
+        let all = Rect::new(0.0, 0.0, W as f64, H as f64);
+        let shadow = Some(Shadow { offset: (2.0, 0.0), blur: 0.0, color: [0.0, 0.0, 1.0, 1.0] });
+        let (_, after) = render_with_after("i", all, |c| {
+            c.state.shadow = shadow;
+            c.state.text_mode = 4;
+        });
+        assert!(!after[H - 1][W - 1], "a fill after clip text painted outside the letters");
+    }
+
+    /// `render_with`, then the whole canvas filled (shadow off) before the
+    /// pixels are read.
+    fn render_with_after(text: &str, rect: Rect, before: impl FnOnce(&mut Canvas)) -> (Size, Vec<Vec<bool>>) {
+        setup();
+        let context = bitmap_context_create(std::ptr::null_mut(), W, H, 8, 0, space_object(Space::Rgb), PREMULTIPLIED_LAST);
+        context_translate_ctm(context, 0.0, H as f64);
+        context_scale_ctm(context, 1.0, -1.0);
+        context_set_rgb_fill_color(context, 1.0, 0.0, 0.0, 1.0);
+        before(&mut locked(context).unwrap());
+        graphics_push_context(context);
+        let size = super::draw(string::make(text), rect, system_font(20.0), 0, 0, false);
+        graphics_pop_context();
+        let mut c = locked(context).unwrap();
+        c.state.shadow = None;
+        c.fill_rect(Rect::new(0.0, 0.0, W as f64, H as f64));
+        let (bytes_per_row, memory) = (c.bytes_per_row, c.memory().to_vec());
+        let painted = (0..H).map(|row| (0..W).map(|x| memory[row * bytes_per_row + x * 4 + 3] > 0).collect()).collect();
+        (size, painted)
+    }
+
+    /// `draw` with `before` run on the context first.
+    fn render_with(text: &str, rect: Rect, before: impl FnOnce(&mut Canvas)) -> (Size, Vec<Vec<bool>>) {
+        setup();
+        let context = bitmap_context_create(std::ptr::null_mut(), W, H, 8, 0, space_object(Space::Rgb), PREMULTIPLIED_LAST);
+        context_translate_ctm(context, 0.0, H as f64);
+        context_scale_ctm(context, 1.0, -1.0);
+        context_set_rgb_fill_color(context, 1.0, 0.0, 0.0, 1.0);
+        before(&mut locked(context).unwrap());
+        graphics_push_context(context);
+        let size = super::draw(string::make(text), rect, system_font(20.0), 0, 0, false);
+        graphics_pop_context();
+        let mut c = locked(context).unwrap();
+        let (bytes_per_row, memory) = (c.bytes_per_row, c.memory().to_vec());
+        let painted = (0..H).map(|row| (0..W).map(|x| memory[row * bytes_per_row + x * 4 + 3] > 0).collect()).collect();
+        (size, painted)
+    }
+
+    fn look(text: &str, size: (f64, f64)) -> TextLook {
+        TextLook {
+            text: text.into(),
+            font: ("Helvetica".into(), 20.0),
+            color: [1.0, 1.0, 1.0, 1.0],
+            shadow: None,
+            alignment: 0,
+            line_break: TAIL_TRUNCATION,
+            lines: 1,
+            size,
+            minimum_font_size: None,
+        }
+    }
+
+    /// Straight RGBA pixels of a look drawn at a scale.
+    fn drawn(look: &TextLook, scale: f64) -> (usize, usize, Vec<u8>) {
+        setup();
+        draw_look(look, scale).expect("drawn")
+    }
+
+    /// The painted pixels' bounds (left, top, right, bottom) for pixels `pick` chooses.
+    fn bounds(width: usize, pixels: &[u8], pick: impl Fn(&[u8]) -> bool) -> Option<(usize, usize, usize, usize)> {
+        let found: Vec<(usize, usize)> = pixels.chunks(4).enumerate().filter(|(_, p)| pick(p)).map(|(i, _)| (i % width, i / width)).collect();
+        let xs = found.iter().map(|p| p.0);
+        let ys = found.iter().map(|p| p.1);
+        Some((xs.clone().min()?, ys.clone().min()?, xs.max()?, ys.max()?))
+    }
+
+    /// UILabel's text: in the middle of its bounds up and down, aligned
+    /// across, in its colour, its shadow under it at the offset; at the
+    /// screen's scale.
+    #[test]
+    fn labels_draw_their_text_centred_with_its_colour_and_shadow() {
+        let mut centred = look("T", (64.0, 64.0));
+        centred.alignment = CENTER;
+        let (width, height, pixels) = drawn(&centred, 1.0);
+        assert_eq!((width, height), (64, 64));
+        let (left, top, right, bottom) = bounds(width, &pixels, |p| p[3] > 0).expect("text drawn");
+        assert!(top >= 18 && bottom <= 46, "not in the middle up and down: rows {top}-{bottom}");
+        assert!(((left + right) as f64 / 2.0 - 32.0).abs() <= 3.0, "not centred: columns {left}-{right}");
+        let solid = pixels.chunks(4).find(|p| p[3] == 255).expect("a solid pixel");
+        assert_eq!(&solid[..3], &[255, 255, 255], "white text");
+        // The shadow: red, 3 points right and down.
+        centred.shadow = Some(([1.0, 0.0, 0.0, 1.0], (3.0, 3.0)));
+        let (_, _, pixels) = drawn(&centred, 1.0);
+        let white = bounds(width, &pixels, |p| p[3] == 255 && p[1] > 200).unwrap();
+        let red = bounds(width, &pixels, |p| p[3] == 255 && p[0] > 200 && p[1] < 50).expect("shadow drawn");
+        assert!(red.2.abs_diff(white.2 + 3) <= 1 && red.3.abs_diff(white.3 + 3) <= 1, "shadow {red:?} text {white:?}");
+        // Twice the pixels at scale 2.
+        let (width, height, _) = drawn(&centred, 2.0);
+        assert_eq!((width, height), (128, 128));
+    }
+
+    /// Lines: one line is cut ("…"), any number wraps; a label that adjusts
+    /// its font to fit draws smaller instead of cutting.
+    #[test]
+    fn labels_wrap_cut_or_shrink_their_text() {
+        let rows = |look: &TextLook| {
+            let (width, _, pixels) = drawn(look, 1.0);
+            bounds(width, &pixels, |p| p[3] > 0).map(|(_, top, _, bottom)| bottom - top).unwrap()
+        };
+        let one = look("ab ab ab ab", (40.0, 100.0));
+        let mut many = one.clone();
+        many.lines = 0;
+        assert!(rows(&many) > rows(&one) * 2, "wrapped: {} rows, one line {}", rows(&many), rows(&one));
+        let mut shrinking = look("WWWWWWWW", (40.0, 64.0));
+        let cut = rows(&shrinking);
+        shrinking.minimum_font_size = Some(4.0);
+        assert!(rows(&shrinking) * 2 < cut, "shrunk to fit: {} rows, cut {cut}", rows(&shrinking));
+    }
+
+    /// Every look on screen keeps its file, however many there are, and is
+    /// drawn only once; files no longer shown go when there are too many.
+    #[test]
+    fn shown_text_keeps_its_picture_files() {
+        let folder = std::env::temp_dir().join(format!("text-files-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let drawn = std::cell::Cell::new(0);
+        let make = |look: &TextLook, _: f64| {
+            drawn.set(drawn.get() + 1);
+            let file = folder.join(&look.text).to_string_lossy().into_owned();
+            std::fs::write(&file, b"png").ok().map(|()| file)
+        };
+        let looks: Vec<TextLook> = (0..5).map(|n| look(&format!("label {n}"), (10.0, 10.0))).collect();
+        let shown: Vec<&TextLook> = looks.iter().collect();
+        let mut files = TextFiles::default();
+        let first = files.files(&shown, 2.0, 4, make);
+        assert!(first.iter().all(|f| f.as_ref().is_some_and(|f| std::path::Path::new(f).exists())), "a shown label's file was deleted: {first:?}");
+        assert_eq!(files.files(&shown, 2.0, 4, make), first, "the same screen again uses the same files");
+        assert_eq!(drawn.get(), 5, "each label drawn once");
+        // A new screen with one label: the old ones beyond 4 files go, oldest first.
+        let other = look("other", (10.0, 10.0));
+        files.files(&[&other], 2.0, 4, make);
+        let kept: Vec<bool> = first.iter().map(|f| std::path::Path::new(f.as_ref().unwrap()).exists()).collect();
+        assert_eq!(kept, [false, false, true, true, true]);
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// B3: files are found by their look (not a search through all of them),
+    /// and a file on the screen is never deleted however few are kept.
+    #[test]
+    fn a_text_file_is_found_by_its_look_and_kept_while_shown() {
+        let folder = std::env::temp_dir().join(format!("text-files-b3-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let make = |look: &TextLook, _: f64| {
+            let file = folder.join(&look.text).to_string_lossy().into_owned();
+            std::fs::write(&file, b"png").ok().map(|()| file)
+        };
+        let looks: Vec<TextLook> = (0..3).map(|n| look(&format!("shown {n}"), (10.0, 10.0))).collect();
+        let shown: Vec<&TextLook> = looks.iter().collect();
+        let mut files = TextFiles::default();
+        let first = files.files(&shown, 2.0, 0, make);
+        assert!(files.made.contains_key(&LookKey::of(&looks[1], 2.0)), "kept by its look");
+        assert_eq!(files.files(&shown, 2.0, 0, make), first);
+        assert!(first.iter().all(|f| std::path::Path::new(f.as_ref().unwrap()).exists()), "on the screen: never deleted");
+        assert!(!files.made.contains_key(&LookKey::of(&looks[1], 3.0)), "another scale is another file");
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// The PNG file a label draws (the serial and parallel paths both use it).
+    fn label_png(look: &TextLook, scale: f64) -> Option<String> {
+        draw_look(look, scale)
+            .and_then(|(width, height, rgba)| encode_png(width, height, &rgba, true))
+            .and_then(|bytes| write_png_file(&format!("text \"{}\"", look.text), &bytes))
+    }
+
+    /// A label drawn once in the serial order and once by the parallel
+    /// worker threads comes out byte for byte the same.
+    #[test]
+    fn parallel_and_serial_text_pictures_match() {
+        setup();
+        let looks: Vec<TextLook> = (0..5).map(|n| look(&format!("label {n}"), (48.0, 24.0))).collect();
+        // The first label is on the screen twice.
+        let shown: Vec<&TextLook> = looks.iter().chain(&looks[..1]).collect();
+        let mut serial = TextFiles::default();
+        let serial_files = serial.files(&shown, 2.0, 256, label_png);
+        let mut parallel = TextFiles::default();
+        let parallel_files = parallel.files_parallel(&shown, 2.0, 256, &label_png);
+        assert_eq!(serial_files.len(), parallel_files.len());
+        for (serial, parallel) in serial_files.iter().zip(&parallel_files) {
+            match (serial, parallel) {
+                (Some(a), Some(b)) => assert_eq!(std::fs::read(a).unwrap(), std::fs::read(b).unwrap(), "the same label drew different pictures"),
+                _ => assert_eq!(serial, parallel, "serial and parallel presence differ"),
+            }
+        }
+    }
+
     /// 32-bit games reach these methods only through a framework_selectors.tsv row.
     #[test]
     fn every_string_drawing_selector_has_a_32_bit_type_encoding() {
@@ -591,6 +1097,28 @@ mod tests {
         let (_, painted) = draw("W", Rect::new(0.0, 0.0, 6.0, H as f64), 0, 0);
         let x = columns(&painted);
         assert!(!x.is_empty() && *x.last().unwrap() < 6, "painted past the rect: columns {x:?}");
+    }
+
+    /// A letter the game's own font has no glyph for is measured with the
+    /// system font at the same point size, the way iOS draws it, not as the
+    /// game font's missing-glyph box.
+    #[test]
+    fn a_letter_the_game_font_lacks_is_measured_with_the_system_font() {
+        let path = "/usr/share/tessdata/pdf.ttf";
+        if !std::path::Path::new(path).is_file() {
+            eprintln!("skipped: {path} (a nearly glyphless font) is not installed");
+            return;
+        }
+        let face = load(path).expect("pdf.ttf parses as a font");
+        assert!(face.glyph_index('&').is_none(), "pdf.ttf unexpectedly has an &");
+        let font = Font { face: Some(face), size: 20.0, bold: false };
+        let system = system_face(false).expect("a system font file");
+        let id = system.glyph_index('&').expect("the system font's &");
+        let expected = f64::from(system.glyph_hor_advance(id).unwrap_or(0)) * font.scale(system);
+        assert!(expected > 1.0, "the system font gives & no width");
+        let measured = font.width(&['&']);
+        let boxed = f64::from(face.glyph_hor_advance(GlyphId(0)).unwrap_or(0)) * font.scale(face);
+        assert!((measured - expected).abs() < 1e-9, "& measured {measured}, the system font's {expected} (the game font's box measures {boxed})");
     }
 
     /// The clip text modes (4-7) add the glyphs to the context's clip;

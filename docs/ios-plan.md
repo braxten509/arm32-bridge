@@ -39,7 +39,13 @@ qemu-aarch64 -L ~/.cache/aarch64-sysroot \
 
 `IOS_LIST_MISSING=1` prints every missing import at the end.
 `IOS_DEVICE` sets the reported model (default `iPhone6,1`, iPhone 5s).
-`IOS_SCREEN` sets the screen (default `568x320@2`, landscape).
+`IOS_SCREEN` sets the screen (default `568x320@2`, landscape). A game built
+with an iOS 7 or older SDK (`DTSDKName` in its Info.plist) gets old-iPhone
+screen rules: `UIScreen` and a full-screen `UIWindow` report portrait bounds
+even in a landscape game, while the picture and touches follow its interface
+orientation. A linked child controller's zero-origin, untransformed,
+exact portrait-sized view in a landscape-height parent is turned to that
+orientation when attached. Newer games are unchanged.
 `IOS_RUN_SECONDS` ends the run loop after that many seconds.
 
 Or build and run in one go (log in `~/.cache/ios-run.log`):
@@ -47,6 +53,27 @@ Or build and run in one go (log in `~/.cache/ios-run.log`):
 ```bash
 IOS_RUN_SECONDS=15 ios/tools/run-pc.sh <App>.app [--keep-going]
 ```
+
+A test never waits: each tap goes out the moment the log line of its
+screen is written (from inside that log call), and the run ends the moment
+the check passes (the run seconds are then only the cap for a broken test).
+Each game screen logs `screen shown: <controller class>` once it has
+appeared and been drawn, and every test tap logs `screen drawn after tap at
+x,y` once the screen it led to is drawn (both need a screen: the phone's, or
+`IOS_FRAMES_DIR` on the PC):
+
+```bash
+IOS_TAPS="on=screen shown: DungeonHeroViewController=>283,211;on=screen drawn after tap at 283,211=>389,297" \
+IOS_STOP_AFTER="graphics: frame 1 shown" \
+IOS_RUN_SECONDS=240 ios/tools/run-pc.sh <App>.app [--keep-going]
+```
+
+`on=` (or the older `after=`) takes a plain part of a line (not a pattern)
+and ends at `=>`; steps go in order. There are no fixed-time taps: a step
+whose line never comes is never tapped, and the run cap ends the test.
+A `jump=` step goes as soon as its line comes even while earlier steps
+still wait, dropping them (walks on random maps: repeat a walking step on
+a line that keeps coming, then `jump=segue ShowBattleIntroView=>...`).
 
 Check that our fix-up lists match Apple's tool exactly:
 
@@ -132,10 +159,15 @@ Bugs found on the way (details in `ios/DEBUGGING.md`):
 
 Test switches: `IOS_FRAMES_DIR` (save frames), `IOS_FRAME_EVERY` (default
 60), `IOS_FRAME_LIMIT` (stop after that many frames), `IOS_TAPS`
-(`"seconds:x,y;seconds:x,y>x2,y2"` in points: taps, or swipes from x,y to
-x2,y2), `IOS_STACKS_AT` (every thread's call chain
-at that time). On the phone: `ios/tools/run-phone.sh <App>.app` (no window;
-frames and log copied back).
+(`"on=screen shown: IntroViewController=>505,29;on=the menu=>389,297>400,300"`
+in points: a tap the moment a log line holds the text after `on=`; a swipe
+goes from x,y to x2,y2), `IOS_STOP_AFTER` (ends the run, code 0, as soon as a log line holds that
+text), `IOS_STACKS_AT` (every thread's call chain
+at that time). Tests wait for lines, not seconds: a tap waits for the
+screen it needs, so a slow start costs nothing and a happy run ends the
+moment its check passes; a fixed second is only a guess, and a wrong guess
+wastes the whole run. On the phone: `ios/tools/run-phone.sh <App>.app` (no
+window; frames and log copied back).
 
 A second-model review found 11 problems; all are fixed: texture uploads
 now follow the game's row layout and pixel buffers, frame saving can't

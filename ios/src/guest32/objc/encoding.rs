@@ -44,7 +44,7 @@ pub enum Ty {
 }
 
 /// Struct names whose `f` fields are CGFloat (double on the host).
-const CGFLOAT_STRUCTS: &[&str] = &["CGPoint", "CGSize", "CGRect", "CGAffineTransform", "UIEdgeInsets", "CGVector"];
+const CGFLOAT_STRUCTS: &[&str] = &["CGPoint", "CGSize", "CGRect", "CGAffineTransform", "UIEdgeInsets", "CGVector", "CATransform3D"];
 
 impl Ty {
     /// Size on armv7.
@@ -162,6 +162,14 @@ impl Signature {
             _ => u32::from(self.ret.guest_returns_in_memory()),
         }
     }
+}
+
+/// The first type of `text` and the bytes it takes, its offset digits included.
+pub fn parse_one(text: &str) -> Result<(Ty, usize), String> {
+    let mut p = Parser { s: text.as_bytes(), i: 0 };
+    let ty = p.ty()?;
+    p.skip_offset();
+    Ok((ty, p.i))
 }
 
 struct Parser<'a> {

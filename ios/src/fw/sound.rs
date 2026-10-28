@@ -8,7 +8,7 @@
 //! be saved as a WAV file (IOS_SOUND_FILE).
 
 use crate::fw::object::{define_class, methods};
-use crate::fw::uikit::{property_get, property_set};
+use crate::fw::uikit::{property_get, property_set, property_set_object};
 use crate::fw::string;
 use crate::objc::runtime::{self, Id, Sel};
 use crate::symbols::{leak, Registry};
@@ -279,8 +279,9 @@ extern "C" fn unit_render(unit: usize, flags: *mut u32, _stamp: *const u8, bus: 
             .filter(|&b| (*(list.add(8 + 16 * b + 8) as *const usize)) == 0)
             .map(|b| {
                 let entry = list.add(8 + 16 * b);
-                let channels = (*(entry as *const u32)).max(1) as usize;
-                (b, (frames as usize * channels * 4).max(*(entry.add(4) as *const u32) as usize))
+                let channels = (*(entry as *const u32)).max(1) as u64;
+                let asked = (u64::from(frames) * channels * 4).min(MAX_RENDER_BYTES);
+                (b, asked.max(u64::from(*(entry.add(4) as *const u32))).min(MAX_RENDER_BYTES) as usize)
             })
             .collect();
         if !wants.is_empty() {
@@ -576,6 +577,9 @@ type RenderCallback = extern "C" fn(usize, *mut u32, *const u8, u32, u32, *mut u
 
 const OUTPUT_IS_SILENCE: u32 = 1 << 4;
 const MAX_CHANNELS: usize = 8;
+/// Most bytes one AudioUnitRender buffer may be given: a game writes the
+/// byte counts, and no sane buffer comes near this.
+pub(crate) const MAX_RENDER_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Asks one input's callback for `frames` frames and appends them to `out`
 /// as stereo floats (left, right, ...). Anything the game doesn't give
@@ -656,6 +660,16 @@ fn pull(input: &Input, bus: u32, frames: usize, sample_time: f64, scratch: &mut 
         out[start + frame * 2] = left;
         out[start + frame * 2 + 1] = right;
     }
+}
+
+/// One render call of `unit`'s input `bus`, as the sound thread makes it:
+/// stereo floats (tests).
+#[cfg(test)]
+pub(crate) fn render_input(unit: usize, bus: u32, frames: usize) -> Vec<f32> {
+    let input = with_input(unit, bus, |i| i.clone()).unwrap_or_default();
+    let mut out = Vec::new();
+    pull(&input, bus, frames, 0.0, &mut Vec::new(), &mut out);
+    out
 }
 
 /// A source's samples waiting to be played, and where playback is in them.
@@ -796,13 +810,35 @@ enum Source {
     Bytes(Arc<Vec<u8>>),
 }
 
-struct Opened {
-    reader: Box<dyn FormatReader>,
-    decoder: Box<dyn Decoder>,
-    track: u32,
+enum Opened {
+    /// What Symphonia reads itself (MP3, WAV, MP4/M4A, ADTS).
+    Read { reader: Box<dyn FormatReader>, decoder: Box<dyn Decoder>, track: u32 },
+    /// Containers only AudioFile reads (CAF, AIFF), decoded as the audio
+    /// queue does: `next` packet, `skip` decoded frames still to drop
+    /// (an AAC file's priming).
+    Packets { file: crate::fw::audiofile::Parsed, decoder: crate::fw::audioqueue::Decoder, next: u64, skip: usize },
+}
+
+/// Sound files Symphonia doesn't read here: CAF and AIFF.
+fn audiofile_only(head: &[u8]) -> bool {
+    head.starts_with(b"caff") || (head.starts_with(b"FORM") && head.get(8..12).is_some_and(|kind| kind == b"AIFF" || kind == b"AIFC"))
 }
 
 fn open(source: &Source) -> Result<(Opened, f64), String> {
+    let mut head = [0u8; 12];
+    match source {
+        Source::File(path) => {
+            use std::io::Read;
+            let _ = std::fs::File::open(path).and_then(|mut file| file.read(&mut head));
+        }
+        Source::Bytes(bytes) => {
+            let n = bytes.len().min(12);
+            head[..n].copy_from_slice(&bytes[..n]);
+        }
+    }
+    if audiofile_only(&head) {
+        return open_packets(source, 0.0).map(|(opened, rate, _)| (opened, rate));
+    }
     let media: Box<dyn MediaSource> = match source {
         Source::File(path) => Box::new(std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?),
         Source::Bytes(bytes) => Box::new(std::io::Cursor::new(bytes.as_ref().clone())),
@@ -824,27 +860,111 @@ fn open(source: &Source) -> Result<(Opened, f64), String> {
         .make(&track.codec_params, &DecoderOptions::default())
         .map_err(|e| format!("can't decode it ({e})"))?;
     let track = track.id;
-    Ok((Opened { reader, decoder, track }, rate))
+    Ok((Opened::Read { reader, decoder, track }, rate))
 }
+
+/// A CAF or AIFF file through AudioFile, placed at `seconds` (at or just
+/// before it, on a packet's start): the opened file, the rate its sound
+/// decodes at, and the time it starts from.
+fn open_packets(source: &Source, seconds: f64) -> Result<(Opened, f64, f64), String> {
+    use crate::fw::audioqueue::Decoder as PacketDecoder;
+    let parsed = match source {
+        Source::File(path) => crate::fw::audiofile::parse_path(path),
+        Source::Bytes(bytes) => crate::fw::audiofile::parse(bytes),
+    };
+    let file = parsed.map_err(|status| format!("not a sound file this layer reads (AudioFile {})", four_cc(status as u32)))?;
+    let format = file.format;
+    if !PacketDecoder::supported(&format) {
+        return Err(format!("can't decode it (format {})", four_cc(format.format)));
+    }
+    // The rate sound comes out at (HE-AAC's core rate): seen on the first packet.
+    let mut first = PacketDecoder::new(&format, &file.cookie)?;
+    if let Some(packet) = file.packet(0) {
+        first.decode(file.data.get(packet.offset..packet.offset + packet.size as usize).unwrap_or(&[]), packet.frames, &mut Vec::new());
+    }
+    let rate = first.rate;
+    let decoder = PacketDecoder::new(&format, &file.cookie)?;
+    // File frames to skip: the priming, then the time asked for.
+    let wanted = file.priming as u64 + (seconds.max(0.0) * format.rate) as u64;
+    let (mut next, mut at) = (0u64, 0u64);
+    while let Some(packet) = file.packet(next) {
+        if at + packet.frames as u64 > wanted {
+            break;
+        }
+        at += packet.frames as u64;
+        next += 1;
+    }
+    let skip = (file.priming as u64).saturating_sub(at);
+    let actual = at.saturating_sub(file.priming as u64) as f64 / format.rate;
+    let skip = (skip as f64 * rate / format.rate) as usize;
+    Ok((Opened::Packets { file, decoder, next, skip }, rate, actual))
+}
+
+/// Frames decoded here at a time from a file of fixed-size packets.
+const JOINED_FRAMES: u64 = 4096;
 
 /// The next packet as stereo floats, or None at the end of the file.
 fn decode_packet(opened: &mut Opened) -> Option<Vec<f32>> {
-    loop {
-        let packet = opened.reader.next_packet().ok()?;
-        if packet.track_id() != opened.track {
-            continue;
+    match opened {
+        Opened::Read { reader, decoder, track } => loop {
+            let packet = reader.next_packet().ok()?;
+            if packet.track_id() != *track {
+                continue;
+            }
+            let Ok(decoded) = decoder.decode(&packet) else { continue };
+            let spec = *decoded.spec();
+            let mut samples = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
+            samples.copy_interleaved_ref(decoded);
+            return Some(stereo(samples.samples(), spec.channels.count()));
+        },
+        Opened::Packets { file, decoder, next, skip } => {
+            let first = file.packet(*next)?;
+            let mut count = 1;
+            if file.packets.is_empty() && decoder.joins_packets() {
+                count = (JOINED_FRAMES / first.frames.max(1) as u64).max(1).min(file.packet_count() - *next);
+            }
+            let size = first.size as usize * count as usize;
+            // The table may claim more than the file holds: decode what is
+            // there; only a missing packet is the end of the sound.
+            let bytes = file.data.get(first.offset..first.offset.saturating_add(size)).unwrap_or(&[]);
+            *next += count;
+            let mut samples = Vec::new();
+            decoder.decode(bytes, first.frames * count as u32, &mut samples);
+            let mut out = stereo(&samples, file.format.channels as usize);
+            let dropped = (*skip * 2).min(out.len());
+            out.drain(..dropped);
+            *skip -= dropped / 2;
+            Some(out)
         }
-        let Ok(decoded) = opened.decoder.decode(&packet) else { continue };
-        let spec = *decoded.spec();
-        let channels = spec.channels.count().max(1);
-        let mut samples = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
-        samples.copy_interleaved_ref(decoded);
-        let mut out = Vec::with_capacity(samples.samples().len() / channels * 2);
-        for frame in samples.samples().chunks_exact(channels) {
-            out.push(frame[0]);
-            out.push(if channels > 1 { frame[1] } else { frame[0] });
+    }
+}
+
+/// Interleaved samples of `channels` channels as stereo (mono doubled).
+fn stereo(samples: &[f32], channels: usize) -> Vec<f32> {
+    let channels = channels.max(1);
+    let mut out = Vec::with_capacity(samples.len() / channels * 2);
+    for frame in samples.chunks_exact(channels) {
+        out.push(frame[0]);
+        out.push(if channels > 1 { frame[1] } else { frame[0] });
+    }
+    out
+}
+
+/// `opened` moved to `seconds` (or just before it): the time it plays
+/// from, or None when it can't move (it is left as it was).
+fn seek_opened(opened: &mut Opened, source: &Source, seconds: f64, rate: f64) -> Option<f64> {
+    match opened {
+        Opened::Read { reader, decoder, track } => {
+            let to = SeekTo::Time { time: symphonia::core::units::Time::from(seconds), track_id: Some(*track) };
+            let seeked = reader.seek(SeekMode::Coarse, to).ok()?;
+            decoder.reset();
+            Some(seeked.actual_ts as f64 / rate)
         }
-        return Some(out);
+        Opened::Packets { .. } => {
+            let (fresh, _, actual) = open_packets(source, seconds).ok()?;
+            *opened = fresh;
+            Some(actual)
+        }
     }
 }
 
@@ -935,10 +1055,8 @@ impl Player {
                 let mut actual = 0.0;
                 if let Ok((mut fresh, rate)) = open(&self.source) {
                     if seconds > 0.0 {
-                        let to = SeekTo::Time { time: symphonia::core::units::Time::from(seconds), track_id: Some(fresh.track) };
-                        if let Ok(seeked) = fresh.reader.seek(SeekMode::Coarse, to) {
-                            fresh.decoder.reset();
-                            actual = seeked.actual_ts as f64 / rate;
+                        if let Some(at) = seek_opened(&mut fresh, &self.source, seconds, rate) {
+                            actual = at;
                             skip = ((seconds - actual).max(0.0) * rate) as usize;
                         }
                     }
@@ -1067,17 +1185,19 @@ impl Player {
         if let Some(seconds) = *known {
             return seconds;
         }
-        let mut total = 0u64;
-        let mut rate = 44100.0;
-        if let Ok((mut opened, r)) = open(&self.source) {
-            rate = r;
-            while let Ok(packet) = opened.reader.next_packet() {
-                if packet.track_id() == opened.track {
-                    total += packet.dur;
+        let seconds = match open(&self.source) {
+            Ok((Opened::Read { mut reader, track, .. }, rate)) => {
+                let mut total = 0u64;
+                while let Ok(packet) = reader.next_packet() {
+                    if packet.track_id() == track {
+                        total += packet.dur;
+                    }
                 }
+                total as f64 / rate
             }
-        }
-        let seconds = total as f64 / rate;
+            Ok((Opened::Packets { file, .. }, _)) => file.valid_frames() as f64 / file.format.rate,
+            Err(_) => 0.0,
+        };
         *known = Some(seconds);
         seconds
     }
@@ -1102,16 +1222,20 @@ fn add_player(player: Id, source: Source, error: *mut Id) -> Id {
     };
     let made = Player::new(source, rate);
     PLAYERS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(player, made);
+    if !crate::fw::counted::is_tracked(player) {
+        crate::fw::counted::track(player, player_gone);
+    }
     player
 }
 
 extern "C" fn player_init_with_url(this: Id, _: Sel, url: Id, error: *mut Id) -> Id {
     let path = string::get(runtime::send(url, "path", &[]));
-    property_set(this, "url", url as u64);
+    property_set_object(this, "url", url);
     add_player(this, Source::File(path), error)
 }
 
 extern "C" fn player_init_with_data(this: Id, _: Sel, data: Id, error: *mut Id) -> Id {
+    property_set_object(this, "data", data);
     add_player(this, Source::Bytes(Arc::new(crate::fw::data::bytes(data))), error)
 }
 
@@ -1215,7 +1339,34 @@ extern "C" fn player_url(this: Id, _: Sel) -> Id {
     property_get(this, "url").unwrap_or(0) as Id
 }
 
+extern "C" fn player_data(this: Id, _: Sel) -> Id {
+    property_get(this, "data").unwrap_or(0) as Id
+}
+
+extern "C" fn player_retain(this: Id, _: Sel) -> Id {
+    crate::fw::counted::retain(this)
+}
+
+extern "C" fn player_release(this: Id, _: Sel) {
+    crate::fw::counted::release(this)
+}
+
+extern "C" fn player_autorelease(this: Id, _: Sel) -> Id {
+    crate::fw::counted::autorelease(this)
+}
+
+extern "C" fn player_retain_count(this: Id, _: Sel) -> usize {
+    crate::fw::counted::count(this).unwrap_or(1)
+}
+
+/// A player's last reference went: it stops, as Apple's -dealloc does.
+fn player_gone(this: Id) {
+    player_dealloc(this, 0);
+}
+
 extern "C" fn player_dealloc(this: Id, _: Sel) {
+    property_set_object(this, "url", 0);
+    property_set_object(this, "data", 0);
     let removed = PLAYERS.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|players| players.remove(&this));
     if let Some(player) = removed {
         player.queue().quit = true;
@@ -1249,6 +1400,87 @@ fn mix_music(out: &mut [f32], frames: usize, out_rate: f64) {
     }
 }
 
+// ----- system sounds (AudioServices) -----
+// A sound made from a file plays once per AudioServicesPlaySystemSound.
+// System Sound Services plays one sound at a time: a new play stops the one
+// playing, whose decoding worker then ends. The phone's own sounds
+// (kSystemSoundID_Vibrate and the other built-in IDs) don't exist here:
+// they do nothing.
+
+/// Sounds made from files, by SystemSoundID.
+static SYSTEM_SOUNDS: Mutex<Option<HashMap<u32, Source>>> = Mutex::new(None);
+/// The system sound playing now.
+static SOUNDING: Mutex<Option<Arc<Player>>> = Mutex::new(None);
+/// The first ID handed out; Apple's start above the built-in ones too.
+const FIRST_SYSTEM_SOUND: u32 = 4097;
+/// kAudioServicesSystemSoundUnspecifiedError.
+const SYSTEM_SOUND_UNSPECIFIED_ERROR: i32 = -1500;
+
+extern "C" fn create_system_sound(url: Id, out: *mut u32) -> i32 {
+    if url == 0 || out.is_null() {
+        return SYSTEM_SOUND_UNSPECIFIED_ERROR;
+    }
+    let source = Source::File(string::get(runtime::send(url, "path", &[])));
+    if let Err(e) = open(&source) {
+        crate::log!("AudioServicesCreateSystemSoundID: {e}");
+        return SYSTEM_SOUND_UNSPECIFIED_ERROR;
+    }
+    let mut sounds = SYSTEM_SOUNDS.lock().unwrap_or_else(|e| e.into_inner());
+    let sounds = sounds.get_or_insert_with(HashMap::new);
+    let id = (FIRST_SYSTEM_SOUND..).find(|id| !sounds.contains_key(id)).unwrap_or(FIRST_SYSTEM_SOUND);
+    sounds.insert(id, source);
+    unsafe { *out = id };
+    0
+}
+
+extern "C" fn dispose_system_sound(id: u32) -> i32 {
+    let removed = SYSTEM_SOUNDS.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|s| s.remove(&id));
+    if removed.is_some() { 0 } else { SYSTEM_SOUND_UNSPECIFIED_ERROR }
+}
+
+extern "C" fn play_system_sound(id: u32) {
+    let source = SYSTEM_SOUNDS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|s| s.get(&id).cloned());
+    let Some(source) = source else { return };
+    start();
+    play_system_source(source);
+}
+
+/// Plays `source` as the system sound, stopping the one playing.
+fn play_system_source(source: Source) -> Option<Arc<Player>> {
+    let rate = match open(&source) {
+        Ok((_, rate)) => rate,
+        Err(e) => {
+            crate::log!("AudioServicesPlaySystemSound: {e}");
+            return None;
+        }
+    };
+    let player = Player::new(source, rate);
+    player.ensure_worker();
+    player.playing.store(true, Ordering::Relaxed);
+    let old = SOUNDING.lock().unwrap_or_else(|e| e.into_inner()).replace(player.clone());
+    if let Some(old) = old {
+        retire(&old);
+    }
+    Some(player)
+}
+
+/// Stops a system sound for good: its worker ends.
+fn retire(player: &Player) {
+    player.playing.store(false, Ordering::Relaxed);
+    player.queue().quit = true;
+    player.wake.notify_all();
+}
+
+fn mix_system_sounds(out: &mut [f32], frames: usize, out_rate: f64) {
+    let Ok(mut sounding) = SOUNDING.try_lock() else { return };
+    let Some(player) = sounding.as_ref() else { return };
+    if player.mix_into(out, frames, out_rate) {
+        // Played to its end.
+        retire(player);
+        *sounding = None;
+    }
+}
+
 // ----- the output: one stereo stream -----
 
 static OUT_RATE: AtomicU32 = AtomicU32::new(44100);
@@ -1273,6 +1505,7 @@ pub fn mix(out: &mut [f32], rate: u32) {
     let frames = out.len() / 2;
     mix_graph(out, frames, rate as f64);
     mix_music(out, frames, rate as f64);
+    mix_system_sounds(out, frames, rate as f64);
     {
         let _mixing = QUEUE_MIXING.lock().unwrap_or_else(|e| e.into_inner());
         crate::fw::audioqueue::mix(out, frames, rate as f64);
@@ -1550,6 +1783,11 @@ pub fn register(r: &mut Registry) {
     r.function("AudioOutputUnitStart", unit_start as usize);
     r.function("AudioOutputUnitStop", unit_stop as usize);
     r.function("CAShow", ok_1 as usize);
+    r.function("AudioServicesCreateSystemSoundID", create_system_sound as usize);
+    r.function("AudioServicesDisposeSystemSoundID", dispose_system_sound as usize);
+    r.function("AudioServicesPlaySystemSound", play_system_sound as usize);
+    // An alert sound also vibrates on iPhone; here it only plays.
+    r.function("AudioServicesPlayAlertSound", play_system_sound as usize);
 
     let player = define_class("AVAudioPlayer", "NSObject", 8);
     methods(
@@ -1575,11 +1813,18 @@ pub fn register(r: &mut Registry) {
             ("delegate", player_delegate as usize),
             ("setDelegate:", player_set_delegate as usize),
             ("url", player_url as usize),
+            ("data", player_data as usize),
             ("setMeteringEnabled:", player_ignore_bool as usize),
             ("setEnableRate:", player_ignore_bool as usize),
             ("dealloc", player_dealloc as usize),
+            ("retain", player_retain as usize),
+            ("release", player_release as usize),
+            ("autorelease", player_autorelease as usize),
+            ("retainCount", player_retain_count as usize),
         ],
     );
+    // Players count references: one let go of while playing goes quiet.
+    crate::fw::counted::count_class(player);
 }
 
 #[cfg(test)]
@@ -1626,7 +1871,13 @@ mod tests {
         unit_set_parameter(unit, 3, INPUT_SCOPE, 3, 0.0, 0);
         with_graph(|g| g.running.insert(0, true));
         let mut out = vec![0f32; 4410 * 2];
-        mix(&mut out, 44100);
+        // This graph's mixer only: the full mix also pulls in other
+        // subsystems' audio, which other tests run in parallel.
+        let render = |out: &mut [f32]| {
+            out.fill(0.0);
+            mix_graph(out, 4410, 44100.0);
+        };
+        render(&mut out);
         let (left, right) = (energy(&out, 0), energy(&out, 1));
         assert!(left > 100.0 && (left - right).abs() < left * 0.01, "centred tone: {left} {right}");
         // 0.1 s needs about 2200 source frames, but one call never asks for more than iOS's maximum.
@@ -1634,14 +1885,15 @@ mod tests {
         assert!(most > 0 && most <= DEFAULT_MAX_FRAMES, "{most} frames in one call");
         // Hard right: the left side goes quiet.
         unit_set_parameter(unit, 0, INPUT_SCOPE, 3, 90.0, 0);
-        mix(&mut out, 44100);
-        assert!(energy(&out, 0) < energy(&out, 1) * 0.01);
+        render(&mut out);
+        let (left, right) = (energy(&out, 0), energy(&out, 1));
+        assert!(left < right * 0.01, "hard right: {left} {right}");
         // 22050 Hz played at 44100: the tone keeps its pitch (441 Hz = 100 output frames a cycle).
         let crossings = out.chunks_exact(2).map(|f| f[1]).collect::<Vec<_>>().windows(2).filter(|w| w[0] < 0.0 && w[1] >= 0.0).count();
         assert!((43..=45).contains(&crossings), "{crossings} cycles in 0.1 s");
         // Disabled: silence.
         unit_set_parameter(unit, 5, INPUT_SCOPE, 3, 0.0, 0);
-        mix(&mut out, 44100);
+        render(&mut out);
         assert_eq!(energy(&out, 1), 0.0);
         // A callback that disposes of its own graph is not called again.
         let mut graph = 0;
@@ -1656,7 +1908,7 @@ mod tests {
         graph_node_info(graph, node, std::ptr::null_mut(), &mut own);
         unit_set_property(own, MAXIMUM_FRAMES_PER_SLICE, 0, 0, &slice as *const u32 as *const u8, 4);
         graph_start(graph);
-        mix(&mut out, 44100);
+        render(&mut out);
         assert_eq!(DISPOSING_CALLS.load(Ordering::Relaxed), 1, "called after its graph was disposed");
     }
 
@@ -1686,19 +1938,153 @@ mod tests {
     fn play_for(player: &Arc<Player>, seconds: f64) -> bool {
         let mut out = vec![0f32; 512 * 2];
         for _ in 0..(seconds * 44100.0 / 512.0).round() as usize {
-            for _ in 0..2000 {
-                let q = player.queue();
-                if q.ended || q.seek.is_none() && q.stream.frames() >= 1200 {
+            wait_for_decoded(player);
+            // A turn finding the decoder holding the queue plays nothing (a
+            // real sound card's does too): this test's turns all play.
+            for _ in 0..1000 {
+                let before = player.queue().played;
+                if player.mix_into(&mut out, 512, 44100.0) {
+                    return true;
+                }
+                if player.queue().played != before {
                     break;
                 }
-                drop(q);
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-            if player.mix_into(&mut out, 512, 44100.0) {
-                return true;
+                std::thread::sleep(std::time::Duration::from_micros(200));
             }
         }
         false
+    }
+
+    /// The decoder thread fills the queue; on a busy PC it can lag seconds
+    /// behind, so only a stuck one runs out this deadline.
+    fn wait_for_decoded(player: &Arc<Player>) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            let q = player.queue();
+            if q.ended || q.seek.is_none() && q.stream.frames() >= 1200 {
+                break;
+            }
+            drop(q);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// A CAF file in memory (games keep music in their own packs): the same
+    /// tone as `wav`, 16-bit big-endian stereo.
+    fn caf(rate: u32, seconds: f64) -> Vec<u8> {
+        let pcm: Vec<u8> = wav(rate, seconds)[44..].chunks_exact(2).flat_map(|s| [s[1], s[0]]).collect();
+        let mut file = b"caff\0\x01\0\0desc".to_vec();
+        file.extend_from_slice(&32u64.to_be_bytes());
+        file.extend_from_slice(&(rate as f64).to_be_bytes());
+        file.extend_from_slice(b"lpcm");
+        // Flags (integer, big-endian), bytes and frames a packet, channels, bits.
+        for value in [0u32, 4, 1, 2, 16] {
+            file.extend_from_slice(&value.to_be_bytes());
+        }
+        file.extend_from_slice(b"data");
+        file.extend_from_slice(&(pcm.len() as u64 + 4).to_be_bytes());
+        file.extend_from_slice(&[0; 4]);
+        file.extend_from_slice(&pcm);
+        file
+    }
+
+    /// A player tells what it was made from: -data for one made from data
+    /// (nil from a file), -url for one made from a file (nil from data).
+    #[test]
+    fn a_player_keeps_the_data_or_url_it_was_made_from() {
+        crate::run::setup();
+        let make = |selector: &str, from: Id| {
+            let player = runtime::send(runtime::class_named("AVAudioPlayer"), "alloc", &[]);
+            runtime::send(player, selector, &[from, 0])
+        };
+        let data = crate::fw::data::make(&wav(22050, 0.1));
+        let from_data = make("initWithData:error:", data);
+        assert_ne!(from_data, 0);
+        assert_eq!(runtime::send(from_data, "data", &[]), data);
+        assert_eq!(runtime::send(from_data, "url", &[]), 0);
+        let path = std::env::temp_dir().join(format!("gamebridge-player-{}.wav", std::process::id()));
+        std::fs::write(&path, wav(22050, 0.1)).unwrap();
+        let url = runtime::send(runtime::class_named("NSURL"), "fileURLWithPath:", &[string::make(&path.to_string_lossy())]);
+        let from_file = make("initWithContentsOfURL:error:", url);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(runtime::send(from_file, "url", &[]), url);
+        assert_eq!(runtime::send(from_file, "data", &[]), 0);
+    }
+
+    /// A player whose last reference goes stops playing, as Apple's
+    /// -dealloc does; one still held plays on.
+    #[test]
+    fn a_released_player_stops_playing() {
+        crate::run::setup();
+        let make = || {
+            let player = runtime::send(runtime::class_named("AVAudioPlayer"), "alloc", &[]);
+            runtime::send(player, "initWithData:error:", &[crate::fw::data::make(&wav(22050, 0.5)), 0])
+        };
+        let (released, held) = (make(), make());
+        runtime::send(released, "setNumberOfLoops:", &[usize::MAX]);
+        runtime::send(released, "play", &[]);
+        runtime::send(held, "retain", &[]);
+        runtime::send(held, "play", &[]);
+        assert_eq!(runtime::send(released, "isPlaying", &[]) & 0xFF, 1);
+        runtime::send(released, "release", &[]);
+        runtime::send(held, "release", &[]);
+        assert_eq!(runtime::send(released, "isPlaying", &[]) & 0xFF, 0, "released: stopped");
+        assert_eq!(runtime::send(held, "isPlaying", &[]) & 0xFF, 1, "still held: plays on");
+        runtime::send(held, "stop", &[]);
+    }
+
+    /// AVAudioPlayer reads what AudioFile reads: a CAF file plays its sound,
+    /// knows its length and seeks.
+    #[test]
+    fn music_in_a_caf_file_plays_and_seeks() {
+        let source = Source::Bytes(Arc::new(caf(22050, 1.0)));
+        let (_, rate) = open(&source).expect("a CAF file opens");
+        assert_eq!(rate, 22050.0);
+        let player = Player::new(source, rate);
+        assert!((player.duration() - 1.0).abs() < 0.01, "{}", player.duration());
+        player.ensure_worker();
+        player.playing.store(true, Ordering::Relaxed);
+        assert!(!play_for(&player, 0.5));
+        let time = player.current_time();
+        assert!((time - 0.5).abs() < 0.03, "half way: {time}");
+        let mut out = vec![0f32; 64 * 2];
+        // As play_for: decoded sound first, and a turn the decoder held the
+        // queue through (try_lock missed) mixes nothing, so it goes again.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !out.iter().any(|&v| v.abs() > 0.1) && std::time::Instant::now() < deadline {
+            wait_for_decoded(&player);
+            out.fill(0.0);
+            player.mix_into(&mut out, 64, 22050.0);
+        }
+        assert!(out.iter().any(|&v| v.abs() > 0.1), "the tone is heard");
+        player.seek(0.6);
+        assert!(!play_for(&player, 0.2));
+        let time = player.current_time();
+        assert!((time - 0.8).abs() < 0.03, "after a seek to 0.6 and 0.2 s: {time}");
+        assert!(play_for(&player, 0.5), "then it ends");
+        player.queue().quit = true;
+        player.wake.notify_all();
+    }
+
+    /// A packet whose table size runs past the data still decodes the bytes
+    /// there; the sound only ends when no packet is left.
+    #[test]
+    fn a_packet_running_past_the_data_is_not_the_end_of_the_sound() {
+        let format = crate::fw::audiofile::pcm(22050.0, 1, 16, false, false);
+        let file = crate::fw::audiofile::Parsed {
+            format,
+            data: vec![0u8; 4],
+            packets: vec![
+                crate::fw::audiofile::Packet { offset: 0, size: 8, frames: 4 },
+                crate::fw::audiofile::Packet { offset: 4, size: 2, frames: 1 },
+            ],
+            ..Default::default()
+        };
+        let decoder = crate::fw::audioqueue::Decoder::new(&format, &[]).expect("PCM decodes");
+        let mut opened = Opened::Packets { file, decoder, next: 0, skip: 0 };
+        assert!(decode_packet(&mut opened).is_some(), "the short first packet is still decoded");
+        assert!(decode_packet(&mut opened).is_some(), "the packet after it is decoded");
+        assert!(decode_packet(&mut opened).is_none(), "the end comes when no packet is left");
     }
 
     #[test]
@@ -1730,12 +2116,35 @@ mod tests {
         player.wake.notify_all();
     }
 
+    /// System Sound Services plays one sound at a time: a new play stops the
+    /// one playing, and that one's worker thread ends.
+    #[test]
+    fn a_new_system_sound_stops_the_one_playing() {
+        let first = play_system_source(Source::Bytes(Arc::new(wav(22050, 1.0)))).unwrap();
+        let second = play_system_source(Source::Bytes(Arc::new(wav(22050, 1.0)))).unwrap();
+        assert!(!first.playing.load(Ordering::Relaxed), "the first sound stopped");
+        assert!(second.playing.load(Ordering::Relaxed));
+        assert!(SOUNDING.lock().unwrap().as_ref().is_some_and(|p| Arc::ptr_eq(p, &second)), "only the new one is playing");
+        // The worker holds its own reference until it ends.
+        for _ in 0..250 {
+            if Arc::strong_count(&first) == 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(Arc::strong_count(&first), 1, "the first sound's worker ended");
+        retire(&second);
+        *SOUNDING.lock().unwrap() = None;
+    }
+
     #[test]
     fn mp3_music_decodes() {
         let Some(path) = std::env::var_os("IOS_TEST_MP3") else { return };
-        let (mut opened, rate) = open(&Source::File(path.to_string_lossy().into_owned())).unwrap();
+        let (Opened::Read { mut reader, mut decoder, .. }, rate) = open(&Source::File(path.to_string_lossy().into_owned())).unwrap() else {
+            panic!("an MP3 file is read by Symphonia")
+        };
         assert!(rate > 8000.0);
-        let packet = opened.reader.next_packet().unwrap();
-        assert!(opened.decoder.decode(&packet).is_ok());
+        let packet = reader.next_packet().unwrap();
+        assert!(decoder.decode(&packet).is_ok());
     }
 }

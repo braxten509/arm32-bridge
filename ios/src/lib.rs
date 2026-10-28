@@ -31,3 +31,5 @@ pub mod trap;
 pub mod varargs;
 #[cfg(all(target_arch = "aarch64", target_os = "android"))]
 pub mod android;
+#[cfg(any(test, all(target_arch = "aarch64", target_os = "android")))]
+pub mod java_text;

@@ -274,7 +274,7 @@ extern "C" fn cs_bitmap(this: Id, _: Sel) -> Id {
             bytes[(code / 8) as usize] |= 1 << (code % 8);
         }
     }
-    data::make(&bytes)
+    crate::fw::counted::autorelease(data::make(&bytes))
 }
 
 extern "C" fn cs_copy(this: Id, _: Sel, _zone: usize) -> Id {
@@ -359,11 +359,6 @@ pub fn trim(units: &[u16], s: &Set) -> Vec<u16> {
         end = begin;
     }
     units[start..end].to_vec()
-}
-
-extern "C" fn by_trimming(this: Id, _: Sel, characters: Id) -> Id {
-    let trimmed = trim(&units_of(this), &set(characters));
-    string::make(&String::from_utf16_lossy(&trimmed))
 }
 
 const BACKWARDS: usize = 4;
@@ -849,7 +844,6 @@ pub fn register(_: &mut Registry) {
     methods(
         string_class,
         &[
-            ("stringByTrimmingCharactersInSet:", by_trimming as usize),
             ("rangeOfCharacterFromSet:", range_of_character as usize),
             ("rangeOfCharacterFromSet:options:", range_of_character_options as usize),
             ("rangeOfCharacterFromSet:options:range:", range_of_character_in as usize),

@@ -379,6 +379,13 @@ static GL_CHECK: AtomicBool = AtomicBool::new(false);
 /// inside a handler stops at its own return address.
 const MAX_DEPTH: u32 = 64;
 pub const FIRST_STUB: u32 = MAX_DEPTH;
+/// How deeply host→guest calls may nest (call_guest refuses one more).
+pub const MAX_CALL_DEPTH: u32 = MAX_DEPTH;
+
+/// How deeply host→guest calls are nested on `uc` now.
+pub fn call_depth(uc: &Uc) -> u32 {
+    uc.get_data().depth
+}
 const SVC: u32 = 0xEF00_0000;
 const BX_LR: u32 = 0xE12F_FF1E;
 const UDF: u32 = 0xE7F0_00F0;
@@ -387,6 +394,9 @@ pub const MAIN_STACK_SIZE: u32 = 8 << 20;
 pub const THREAD_STACK_SIZE: u32 = 1 << 20;
 /// Phone-function calls at least this slow (in ms) are logged as "[slow]".
 const SLOW_CALL_MS: u64 = 5;
+
+/// A thread's h_errno sits right after its errno (`Thread::errno_slot`).
+pub const H_ERRNO_OFFSET: u32 = 4;
 
 /// A cheap timestamp: the CPU's own counter on ARM64 (a clock call costs far
 /// more, and every phone-function call is timed).
@@ -469,6 +479,7 @@ pub struct Thread {
     pub depth: u32,
     pub fault: Option<String>,
     pub exit_code: Option<i32>,
+    /// This thread's errno; its h_errno follows at H_ERRNO_OFFSET.
     pub errno_slot: u32,
     pub tls_block: u32,
     pub stack_top: u32,
@@ -490,6 +501,10 @@ pub struct Thread {
     /// time spent in outermost ones, in `ticks`.
     pub phone_depth: u32,
     pub phone_ticks: u64,
+    /// Where game code goes on after a phone function that returned
+    /// `Ret::Jumped`, instead of its return address (lr stays the caller's:
+    /// a tail call, as iOS's objc_msgSend jumps into the method).
+    pub jump_to: Option<u32>,
 }
 
 static SHARED: Mutex<Option<Shared>> = Mutex::new(None);
@@ -679,6 +694,8 @@ pub struct Runner {
     pub thread_id: u32,
     pub errno_slot: u32,
     pub tls_block: u32,
+    /// The top of the thread's guest stack (0 for an idle engine).
+    pub stack_top: u32,
 }
 
 /// Every runner, for stopping the world.
@@ -689,13 +706,13 @@ static STOPPER: Mutex<()> = Mutex::new(());
 /// Threads wait here for the world to start again.
 static RELEASED: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
-fn new_runner(thread_id: u32, errno_slot: u32, tls_block: u32) -> Arc<Runner> {
-    let runner = make_runner(thread_id, errno_slot, tls_block);
+fn new_runner(thread_id: u32, errno_slot: u32, tls_block: u32, stack_top: u32) -> Arc<Runner> {
+    let runner = make_runner(thread_id, errno_slot, tls_block, stack_top);
     RUNNERS.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::clone(&runner));
     runner
 }
 
-fn make_runner(thread_id: u32, errno_slot: u32, tls_block: u32) -> Arc<Runner> {
+fn make_runner(thread_id: u32, errno_slot: u32, tls_block: u32, stack_top: u32) -> Arc<Runner> {
     Arc::new(Runner {
         state: AtomicU32::new(OUTSIDE),
         attention: AtomicU32::new(0),
@@ -705,6 +722,7 @@ fn make_runner(thread_id: u32, errno_slot: u32, tls_block: u32) -> Arc<Runner> {
         thread_id,
         errno_slot,
         tls_block,
+        stack_top,
     })
 }
 
@@ -936,6 +954,24 @@ thread_local! {
     static CURRENT_RUNNER: RefCell<Option<Arc<Runner>>> = const { RefCell::new(None) };
     static HELD_SINCE: Cell<u64> = const { Cell::new(0) };
     static LOCK_WAIT_TICKS: Cell<u64> = const { Cell::new(0) };
+    /// Gives this thread's engine back when the thread ends (`EngineReturn`).
+    static ENGINE_RETURN: EngineReturn = const { EngineReturn(Cell::new(std::ptr::null_mut())) };
+}
+
+/// A thread the host made (a dispatch worker, a timer) that ran guest code
+/// ends without drop_engine: its engine, thread id and guest stack go back
+/// then, or every such thread would keep a stack and the guest's room for
+/// stacks would run out. (Guest threads drop theirs before this.)
+/// It keeps its own copy of the engine: on Android a thread's other slots
+/// (ENGINE included) may be cleared before this runs.
+struct EngineReturn(Cell<*mut Uc>);
+
+impl Drop for EngineReturn {
+    fn drop(&mut self) {
+        let mine = self.0.replace(std::ptr::null_mut());
+        let slot = ENGINE.try_with(|e| e.replace(std::ptr::null_mut())).unwrap_or(std::ptr::null_mut());
+        release_engine(if mine.is_null() { slot } else { mine });
+    }
 }
 
 pub fn lock_wait_time() -> std::time::Duration {
@@ -1039,6 +1075,11 @@ fn take_gil() {
             guard
         }
     };
+    install_gil(guard);
+}
+
+/// Makes `guard` this thread's hold on the guest lock.
+fn install_gil(guard: MutexGuard<'static, ()>) {
     LOCKS_TAKEN.fetch_add(1, Ordering::Relaxed);
     *GIL_HOLDER.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::thread::current().id());
     let now = ticks();
@@ -1121,6 +1162,37 @@ pub fn hold_gil() -> GilToken {
     }
     take_gil();
     GilToken(true)
+}
+
+/// Like [`hold_gil`], for a host thread with a deadline (the sound device
+/// asking for samples): None when the lock wasn't had within `limit`.
+pub fn try_hold_gil(limit: Duration) -> Option<GilToken> {
+    if parallel() || gil_held() {
+        return Some(GilToken(false));
+    }
+    let guard = match GIL.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            // Waiting counts as wanting: the holder hands over after its time slice.
+            start_preempt_ticker();
+            let (started, deadline) = (ticks(), Instant::now() + limit);
+            WANTING.fetch_add(1, Ordering::Relaxed);
+            let got = loop {
+                match GIL.try_lock() {
+                    Ok(guard) => break Some(guard),
+                    Err(std::sync::TryLockError::Poisoned(e)) => break Some(e.into_inner()),
+                    Err(std::sync::TryLockError::WouldBlock) if Instant::now() >= deadline => break None,
+                    // Spinning, not sleeping: a handover only waits ~100 us for a taker.
+                    Err(std::sync::TryLockError::WouldBlock) => std::thread::yield_now(),
+                }
+            };
+            WANTING.fetch_sub(1, Ordering::Relaxed);
+            LOCK_WAIT_TICKS.with(|t| t.set(t.get() + ticks().wrapping_sub(started)));
+            got?
+        }
+    };
+    install_gil(guard);
+    Some(GilToken(true))
 }
 
 /// Runs `work` with the guest lock released (for anything that may block).
@@ -1374,17 +1446,32 @@ pub fn engine() -> &'static mut Uc {
     adopt_engine(&mut uc);
     let engine = Box::into_raw(uc);
     ENGINE.with(|e| e.set(engine));
+    ENGINE_RETURN.with(|r| r.0.set(engine));
     unsafe { &mut *engine }
+}
+
+/// Test hook: forgets this thread's engine slot the way Android's thread
+/// end can (its thread-local slots may be cleared before `EngineReturn` runs).
+#[doc(hidden)]
+pub fn lose_engine_slot() {
+    ENGINE.with(|e| e.set(std::ptr::null_mut()));
 }
 
 /// Frees this thread's engine (guest threads call this when they finish).
 pub fn drop_engine() {
-    let existing = ENGINE.with(|e| e.replace(std::ptr::null_mut()));
+    let slot = ENGINE.with(|e| e.replace(std::ptr::null_mut()));
+    let kept = ENGINE_RETURN.try_with(|r| r.0.replace(std::ptr::null_mut())).unwrap_or(std::ptr::null_mut());
+    release_engine(if slot.is_null() { kept } else { slot });
+}
+
+/// Gives a finished thread's engine, thread id and guest stack back.
+fn release_engine(existing: *mut Uc) {
     if existing.is_null() {
         return;
     }
     let mut engine = unsafe { Box::from_raw(existing) };
-    CURRENT_RUNNER.with(|current| current.borrow_mut().take());
+    // At thread end this slot may be gone already (it went with the thread).
+    let _ = CURRENT_RUNNER.try_with(|current| current.borrow_mut().take());
     // The thread has finished: nothing runs on its stack any more (a helper
     // standing in for it is done before this). Thread 1 has the main stack.
     let thread = engine.get_data();
@@ -1457,12 +1544,13 @@ fn idle_thread(code_generation: u64, clean: Option<unicorn_engine::Context>) -> 
         current_call: "",
         native: None,
         recent: VecDeque::new(),
-        runner: make_runner(0, 0, 0),
+        runner: make_runner(0, 0, 0, 0),
         code_generation,
         clean,
         resume_at: None,
         phone_depth: 0,
         phone_ticks: 0,
+        jump_to: None,
     }
 }
 
@@ -1503,14 +1591,15 @@ fn adopt_engine(uc: &mut Uc) {
         let mut shared = shared();
         if let Some((id, stack_top, errno_slot, tls_block)) = shared.free_threads.pop() {
             unsafe { std::ptr::write_bytes(mem().host(tls_block), 0, 0x100) };
-            mem().write_u32(errno_slot, 0);
+            mem().write_u64(errno_slot, 0); // errno and h_errno
             (id, stack_top, errno_slot, tls_block)
         } else {
             let id = shared.next_thread_id;
             shared.next_thread_id += 1;
             let stack_size = if id == 1 { MAIN_STACK_SIZE } else { THREAD_STACK_SIZE };
             let stack_top = shared.alloc_stack(stack_size);
-            let errno_slot = shared.misc_alloc(4, 4);
+            // errno, then h_errno (H_ERRNO_OFFSET).
+            let errno_slot = shared.misc_alloc(8, 4);
             let tls_block = shared.misc_alloc(0x100, 8);
             (id, stack_top, errno_slot, tls_block)
         }
@@ -1534,12 +1623,13 @@ fn adopt_engine(uc: &mut Uc) {
         current_call: "",
         native: None,
         recent: VecDeque::with_capacity(32),
-        runner: new_runner(id, errno_slot, tls_block),
+        runner: new_runner(id, errno_slot, tls_block, stack_top),
         code_generation,
         clean,
         resume_at: None,
         phone_depth: 0,
         phone_ticks: 0,
+        jump_to: None,
     };
     // A helper's engine is made while it stands in for a thread: that
     // thread keeps its own runner.
@@ -1557,6 +1647,13 @@ fn adopt_engine(uc: &mut Uc) {
 
 fn trap_address(depth: u32) -> u32 {
     mem::stub_base() + depth * 8
+}
+
+/// The return trap of the next guest call made on this engine: guest code
+/// jumping there ends that call as its return does (the caller's registers
+/// are put back either way).
+pub fn next_return_trap(uc: &Uc) -> u32 {
+    trap_address(uc.get_data().depth)
 }
 
 /// The guest address of the stand-in for `name`, creating it on first use.
@@ -1690,6 +1787,10 @@ fn on_interrupt(uc: &mut Unicorn<'_, Thread>, interrupt: u32) {
     }
     let index = mem().read_u32(svc_address) & 0x00FF_FFFF;
     call_stub(uc, index);
+    if let Some(target) = uc.get_data_mut().jump_to.take() {
+        // Bit 0 picks Thumb, as for a `bx`.
+        uc.reg_write(RegisterARM::PC, u64::from(target)).unwrap();
+    }
     if uc.get_data().fault.is_some() || uc.get_data().exit_code.is_some() {
         uc.stop();
     }

@@ -1,6 +1,6 @@
 //! Plain-C framework functions for 32-bit games (OpenGL ES, OpenAL,
 //! Core Graphics, Core Foundation, AudioToolbox, UIKit's C functions,
-//! libxml2's text writer). Each one reads the guest's arguments by Apple's
+//! libxml2's text writer, SQLite). Each one reads the guest's arguments by Apple's
 //! armv7 rules and calls this layer's 64-bit implementation, found by name
 //! in the symbol table, so the framework logic exists once.
 //!
@@ -19,10 +19,12 @@
 //! aren't objects (OpenAL devices, AudioFileIDs) cross as handles.
 
 pub mod audio;
+mod addressbook;
 mod cf;
 mod gl;
 mod graphics;
 mod openal;
+mod sqlite;
 #[cfg(test)]
 mod tests;
 mod xml;
@@ -165,6 +167,9 @@ pub struct Obj;
 pub struct Handle;
 /// A C string result: a permanent guest copy (one per text).
 pub struct CStr;
+/// A selector: the guest's is its name (a C string), the host's own SEL is
+/// made from it (0 stays 0).
+pub struct Sel;
 
 impl Param for U32 {
     type Host = u32;
@@ -230,6 +235,15 @@ impl Param for Handle {
     type Host = usize;
     fn read(a: &mut Args) -> usize {
         handle_to_host(a.u32())
+    }
+}
+impl Param for Sel {
+    type Host = usize;
+    fn read(a: &mut Args) -> usize {
+        match a.u32() {
+            0 => 0,
+            name => crate::objc::runtime::sel(&mem().string(name)),
+        }
     }
 }
 
@@ -327,6 +341,27 @@ impl Return for CStr {
         Ret::U32(guest_text(value))
     }
 }
+/// A pointer into guest memory (data bytes the host keeps there).
+impl Return for Ptr {
+    type Host = usize;
+    fn give(value: usize, _: u32) -> Ret {
+        Ret::U32(guest_pointer(value))
+    }
+}
+
+/// The guest address of host pointer `host`, which must point into guest
+/// memory (0 for NULL, and for host memory the guest can't reach).
+pub fn guest_pointer(host: usize) -> u32 {
+    let base = mem().host(0) as usize;
+    match host.checked_sub(base) {
+        _ if host == 0 => 0,
+        Some(offset) if offset < 1 << 32 => offset as u32,
+        _ => {
+            crate::log!("32-bit: a host pointer {host:#x} outside guest memory was handed to the game as NULL");
+            0
+        }
+    }
+}
 
 /// A permanent guest copy of host C string `host` (0 for null).
 pub fn guest_text(host: usize) -> u32 {
@@ -383,6 +418,16 @@ impl GuestStruct for Rect {
     }
     fn fields(&self) -> Vec<f64> {
         vec![self.origin.x, self.origin.y, self.size.width, self.size.height]
+    }
+}
+/// UIEdgeInsets (top, left, bottom, right).
+impl GuestStruct for [f64; 4] {
+    const FIELDS: usize = 4;
+    fn from_fields(f: &[f64]) -> [f64; 4] {
+        f.try_into().unwrap()
+    }
+    fn fields(&self) -> Vec<f64> {
+        self.to_vec()
     }
 }
 impl GuestStruct for Transform {
@@ -566,6 +611,47 @@ pub fn struct_constant<T: GuestStruct + 'static>(name: &'static str) {
     });
 }
 
+/// A guest copy of the host's CGFloat constant `name` (a float here).
+pub fn float_constant(name: &'static str) {
+    super::data(name, move || {
+        let guest = super::alloc_permanent(4, 4);
+        let value = host_data(name).map_or(0.0, |address| unsafe { *(address as *const f64) });
+        mem().write_u32(guest, (value as f32).to_bits());
+        guest
+    });
+}
+
+/// Makes the host's data bytes (NSData, CFData) come from the guest heap,
+/// so the pointers to them the game is given are guest addresses, until the
+/// answer is dropped (the session's end). Call once guest memory is set up.
+pub fn keep_data_bytes_in_guest_memory() -> crate::fw::data::HeapHeld {
+    crate::fw::data::keep_bytes_in(crate::fw::data::ByteHeap {
+        alloc: |size| match u32::try_from(size) {
+            Ok(size) => match runtime::heap().malloc(size) {
+                0 => std::ptr::null_mut(),
+                guest => mem().host(guest),
+            },
+            Err(_) => std::ptr::null_mut(),
+        },
+        free: |pointer| runtime::heap().free(mem().guest(pointer)),
+        // Bytes a game handed over: a block of its malloc, else left alone.
+        free_malloced: |pointer| {
+            let guest = (pointer as usize).wrapping_sub(mem().host(0) as usize);
+            let why = match u32::try_from(guest) {
+                Ok(guest) => {
+                    let mut heap = runtime::heap();
+                    match heap.not_owned(guest) {
+                        None => return heap.free(guest),
+                        Some(why) => why,
+                    }
+                }
+                Err(_) => "not in guest memory",
+            };
+            crate::log!("data: bytes {pointer:p} handed over to be freed are not a block of the game's malloc ({why}); left alone");
+        },
+    })
+}
+
 /// A guest copy of the host's pointer-sized constant `name` (e.g. kCFAllocatorDefault, NULL).
 pub fn word_constant(name: &'static str) {
     super::data(name, move || {
@@ -580,6 +666,8 @@ pub fn register() {
     openal::register();
     graphics::register();
     cf::register();
+    addressbook::register();
     audio::register();
     xml::register();
+    sqlite::register();
 }

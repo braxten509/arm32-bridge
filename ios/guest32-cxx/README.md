@@ -3,14 +3,17 @@
 32-bit iPhone games call libc++ (`std::__1` strings, streams, locale,
 threads, containers' out-of-line parts), libc++abi (`operator new`/`delete`,
 `__cxa_*` exceptions, guards, `__dynamic_cast`, type_info) and the SjLj
-unwinder (`_Unwind_SjLj_Register/Unregister/Resume`). This folder builds
-LLVM's own libc++, libc++abi and libunwind for Apple's armv7 ABI as one
-32-bit ARM **ELF** library that the translator's loader (`src/elf.rs`) puts
-into guest memory, so this code runs translated like the game's own.
+unwinder (`_Unwind_SjLj_Register/Unregister/Resume`). Games built with
+Apple's GCC-era headers call GNU libstdc++ instead (`std::` without `__1`:
+copy-on-write strings, iostreams, locale; see "GNU libstdc++" below). This
+folder builds LLVM's own libc++, libc++abi and libunwind and Apple's own
+libstdc++ for Apple's armv7 ABI as one 32-bit ARM **ELF** library that the
+translator's loader (`src/elf.rs`) puts into guest memory, so this code runs
+translated like the game's own.
 
 | File | What |
 |---|---|
-| `fetch.sh` | fetches LLVM 19.1.7 (commit `cd708029e0b2…`), only `libcxx`, `libcxxabi`, `libunwind`, `compiler-rt/lib/builtins`, and checks each folder's git tree hash |
+| `fetch.sh` | fetches LLVM 19.1.7 (commit `cd708029e0b2…`), only `libcxx`, `libcxxabi`, `libunwind`, `compiler-rt/lib/builtins`, and checks each folder's git tree hash; `fetch.sh libstdcxx`: Apple's libstdcxx-53.4 (commit `b12878ae37c4…`, folders `src`, `include`, `exports`) the same way |
 | `build.sh [test]` | builds `libguest32cxx.so` (+ `.imports`, `.exports`) into `~/.cache/gamebridge/guest32-cxx/out` (`GUEST32_CXX_OUT`); `test` also builds the test libraries |
 | `check-library.sh` | refuses what `src/elf.rs` can't load (TLS, other relocation types, no DT_HASH, DT_NEEDED); writes the import/export lists |
 | `test.sh` | the test: builds, then runs `test/cxxtest.cpp` on the translator (qemu-aarch64 on the PC) |
@@ -18,9 +21,11 @@ into guest memory, so this code runs translated like the game's own.
 | `config/__config_site` | libc++ settings |
 | `darwin-include/` | Game Bridge's own minimal Darwin armv7 C headers (Apple's types, sizes and constants; not Apple's files) |
 | `glue/cxa_atexit.c` | `__cxa_atexit` / `__cxa_finalize` (libSystem's on iOS) |
-| `test/` | `cxxtest.cpp` (the checks) and `testc.c` (a tiny Darwin-ABI C library standing in for the runner's C table in the test) |
+| `glue/libstdcxx.cpp` | GNU libstdc++'s exception constructors from its `std::string` (`runtime_error(const string&)`, …) building libc++abi's classes, and `__gnu_cxx::__verbose_terminate_handler` |
+| `glue/gnu_kept.cc` | GNU inline functions Apple's libstdc++ exported (its -O0 build kept them), and Apple's spelling of two names |
+| `test/` | `cxxtest.cpp` (the checks), `testc.c` (a tiny Darwin-ABI C library standing in for the runner's C table in the test), `gnutest.cc` + `gnucatch.cpp` (the GNU libstdc++ checks) |
 
-The built library (1.2 MB) is not committed: it is a build output, rebuilt
+The built library (2.4 MB, half of it GNU libstdc++) is not committed: it is a build output, rebuilt
 exactly from the pinned sources in about a minute, and the repo keeps no
 other binaries. Needs clang, llc, ld.lld, llvm-objcopy/readelf/nm, git and
 network once. **Only the sources are pinned, not the tools**: the build uses
@@ -50,8 +55,11 @@ runner looks them up (`ios32::c_name`).
 Two things the toolchain doesn't do by itself, handled in `build.sh`:
 - with APCS, LLVM's ARM ELF backend always puts static constructors in
   `.ctors` (init_array only for AAPCS); `src/elf.rs` runs `.init_array`, so
-  each object's `.ctors[.N]` is renamed `.init_array[.65535-N]` (same order);
-  `.dtors` fails the build (destructors go through `__cxa_atexit`);
+  each object's `.ctors[.N]` is renamed `.init_array[.65535-N]` (same order;
+  within one object a section's entries turn around, so only one ordered
+  `_GLOBAL__sub_I_` entry is allowed beside unordered template-static ones,
+  such as GNU's `locale::id` instances); `.dtors` fails the build
+  (destructors go through `__cxa_atexit`);
 - compiler-rt's division and 64-bit conversion helpers (`__udivsi3`,
   `__divdi3`, …; armv7 has no divide instruction) are linked in, hidden.
 
@@ -108,6 +116,64 @@ armv7 slice; addresses are the file's).
    (same object, else same name by `strcmp`). A superset of pointer
    equality: right when a game carries its own copy of a type_info.
 
+## GNU libstdc++ (games built with GCC's headers)
+
+Older games (Monster Life: iPhone OS 5/6 era) were built against Apple's
+GCC 4.2.1 headers and import GNU libstdc++'s ABI (iPhone OS's
+`/usr/lib/libstdc++.6.dylib`): `_ZNSs*` copy-on-write strings,
+`_ZNSi`/`_ZNSo` streams, `basic_filebuf`/`basic_stringbuf`, `std::locale`
+(`locale::_Impl`, facet ids), `_List_node_base`/`_Rb_tree_*`, `__throw_*`,
+and data: vtables and VTTs (`_ZTVSo`, `_ZTTSt19basic_ostringstream…`),
+`_ZNSs4_Rep20_S_empty_rep_storageE`, `_ZSt4cout`, facet `id`s. Their
+inlined code reads these layouts directly (the string's
+`{length, capacity, refcount}` before the characters and the shared empty
+string, `ios_base` and `basic_ios` fields, the six `streambuf` pointers,
+`locale::_Impl`'s facet array, `ctype<char>` through `__istype`).
+
+**Decision: build Apple's own libstdc++ source, not a re-implementation.**
+`fetch.sh libstdcxx` fetches Apple's open-source `libstdcxx` project at tag
+libstdcxx-53.4 (the first with an armv7 export list; iPhone OS 5/6), checked
+by tree hash like LLVM, not kept in git. Apple's tree already holds the
+configured headers for Darwin (`bits/c++config.h`: atomic builtins, wchar_t,
+the generic C locale, stdio-based `__basic_file`, POSIX threads), so there is
+no configure step, and compiling the very headers and sources Apple shipped
+gives the layouts, vtables and names games expect by construction; a
+re-implementation in `glue/` would have to copy every one of them by hand.
+
+- **What is built**: every `src/*.cc` but libsupc++'s (`new_op*`,
+  `del_op*`, `new_handler`, `eh_*`, `tinfo`) and `stdexcept.cc`.
+  libc++abi provides operator new/delete, `__cxa_*`, type_info and the
+  `std::exception`/`logic_error`/`runtime_error` family, one definition
+  each, which GNU code throws and catches as its own (same mangled names in
+  `std::`). `glue/libstdcxx.cpp` adds GCC's constructors from a `std::string`
+  (`_ZNSt13runtime_errorC1ERKSs`, …): they copy the text into libc++'s
+  message, whose `__libcpp_refstring` has GCC's string layout, so GCC code
+  that copies or destroys the message inline still works. libc++'s
+  `new_helpers.cpp` is built with `-DLIBSTDCXX` (its libstdc++ mode), since
+  `std::__throw_bad_alloc()` is GNU's.
+- **How**: `.cc` files are GNU code: GCC's headers (not libc++'s),
+  `-std=gnu++98`, `BUILDING_LIBSTDCXX` as Apple's project sets, default
+  visibility and inline functions kept (Apple's `GCC_INLINES_ARE_PRIVATE_EXTERN
+  = NO`: games import the members GCC didn't inline, such as `_ZNKSs4sizeEv`).
+  GNU's `std::` and libc++'s `std::__1::` sit side by side; a game uses one.
+- **Export check**: every name in Apple's `exports/libstdcxx-armv7.exp`
+  (3294, without the `#` lines) is exported:
+  `grep -v '^#' exports/libstdcxx-armv7.exp | sed 's/^_//' | sort -u | comm -23 - libguest32cxx.so.exports`
+  prints nothing. What that took beyond the sources: `glue/gnu_kept.cc`
+  (inline functions Apple's -O0 build kept, like `ctype<char>::widen`),
+  Apple's struct tags for pthread types in `darwin-include` (GCC's
+  `__basic_file<char>(__c_lock*)` is `…EP23_opaque_pthread_mutex_t`), and
+  Apple's spelling of `num_get::_M_find` (this clang mangles its
+  `__is_char<_CharT2>::__value` return type by today's rule; an alias
+  carries the old name).
+- **C functions** the GNU code adds to the C table: `fopen`/`fread`-family
+  stdio, `read`/`write`/`writev`/`lseek`/`fstat`, `ioctl(FIONREAD)` and `poll`
+  (Darwin's request number and `POLLWRBAND` bit, translated), wide-character
+  calls (`btowc`, `wctob`, `mbrtowc`, `wcrtomb`, `wmem*`, `wcscoll`,
+  `wcsxfrm`, `wcsftime`, `putwc`, …), `strcoll`/`strxfrm`/`strftime`,
+  `__maskrune` (Apple's inline `__istype` for chars outside 0-127) and the
+  data `__mb_cur_max`.
+
 ## Interface with the 32-bit runner (the core helper's side)
 
 `ios/build.rs` runs `build.sh test` when the library or its test libraries
@@ -139,7 +205,7 @@ What the library needs from the core side:
   guest code (`darwin-include/unwind/System/pthread_machdep.h`). It must be
   zero when a thread starts (the runtime block is zeroed) and never used for a
   `pthread_key_create` key.
-- **The C table must provide the 125 names in `libguest32cxx.so.imports`**
+- **The C table must provide the 167 names in `libguest32cxx.so.imports`**
   with Darwin meaning. Only those actually called matter at run time; the
   test run reaches these (a game reaches at least as many): `malloc`, `calloc`, `realloc`, `free`, `posix_memalign`,
   `mem*`, `strlen`, `strcmp`, `abort`, `__error`, `pthread_once` (Apple's
@@ -166,24 +232,43 @@ What the library needs from the core side:
 
 `test.sh` (PC: needs the ARM64 cross build of arm32-bridge, `BIN=` to
 point elsewhere): loads `libtestc.so`, `libguest32cxx.so` and
-`libcxxtest.so` with the Android loader and calls `run_all`: 15 checks,
+`libcxxtest.so` with the Android loader and calls `run_all`: 17 checks,
 one bit each (string layout bytes, growth, exceptions thrown inside the
 library and caught across a frame with a cleanup, catch by base class,
 rethrow, `std::logic_error`, static guard, `dynamic_cast`/`typeid`,
 `ostringstream`/`istringstream`, the hand-made APCS call, `__cxa_atexit`,
-destructors run with the registration lock released). Passes when run_all
+destructors run with the registration lock released, GCC's red-black tree
+helpers on a 40-node tree, GCC's `__throw_length_error` caught as
+`std::length_error`). Passes when run_all
 = 0, the runner exits cleanly within the time limit, and there are 0
 translator fallbacks. Without the library it stops at `_Znwm`. This is a
 PC unit test (qemu-aarch64); game tests run on the Pixel only, never on
 Android emulators.
 
+`test/gnutest.cc` (`libgnutest.so`, with `gnucatch.cpp`), run by the unit
+test `cxx_runtime_gnu_checks_pass_on_this_c_library` on the runner's real C
+table: `gnu_run_all`, 13 checks compiled against GCC's headers as a game's
+code is: the string shared on copy and unshared on write (refcount 1, then
+0 and -1), every empty string on `_S_empty_rep_storage`, append, replace,
+substr, find, insert, erase, growth; `ostringstream` with int, double,
+string, `setw`/`setfill`, long long, float; `istringstream` to int, float,
+string, long and end-of-input; `getline`; a file written with `ofstream`,
+read with `ifstream` and changed in place with `fstream`; `locale::classic`,
+`use_facet<ctype<char>>` (widen, toupper, is); `runtime_error(string)` and
+`basic_string::at`'s `out_of_range` caught by libc++ code as
+`std::exception`, and by GNU code as `logic_error`; `cout`/`cin`/`cerr` set
+up by `ios_base::Init`; `std::list` (hook, reverse, sort, splice) and
+`std::map<std::string, int>`.
+
 `check-game-imports.sh` on TownCraft: all 114 C++ runtime imports exported;
-Dungeon Plunder: all 3.
+Dungeon Plunder: all 3; Monster Life: all 210; Crowntakers: all 104;
+SpellCraft: all 21.
 
 Not covered here: Objective-C exceptions (Dungeon Plunder's
 `objc_exception_throw`, `__objc_personality_v0`, `objc_begin_catch`) sit on
 this library's SjLj unwinder and `__cxa_*` but need the Objective-C runtime
 to match classes; they belong with the Objective-C work.
 
-Licenses: LLVM sources are Apache-2.0 with LLVM exceptions; the files here
-are Game Bridge's.
+Licenses: LLVM sources are Apache-2.0 with LLVM exceptions; Apple's
+libstdcxx (GCC's libstdc++) is GPL v2 with the libstdc++ runtime exception;
+the files here are Game Bridge's.

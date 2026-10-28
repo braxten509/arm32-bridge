@@ -6,7 +6,7 @@ use super::functions::{call_function, Ctx};
 use super::mirror;
 use super::testing::Fake;
 use crate::objc::runtime::{self, Class, Id, Sel};
-use guest32_image::{ClassRo32, ClassTarget, Ivar32, ObjcClass32, ObjcMetadata32};
+use guest32_image::{ClassRo32, ClassTarget, Ivar32, ObjcCategory32, ObjcClass32, ObjcMetadata32, Property32};
 use std::sync::Mutex;
 
 static COUNTS: Mutex<Vec<(Id, &'static str)>> = Mutex::new(Vec::new());
@@ -142,6 +142,31 @@ fn runtime_functions_retain_store_properties_classes_and_ivars() {
     assert_eq!(call("objc_getAssociatedObject", &[object, 0x78]), 0);
 }
 
+/// class_getInstanceMethod on a framework class reports the types its
+/// messages really use: a class's own row (CALayer's setTransform: takes a
+/// CATransform3D) before the general one (UIView's CGAffineTransform).
+#[test]
+fn framework_methods_report_their_classs_own_types() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(crate::run::setup);
+    let g = Fake::new();
+    let bridge: &'static Mutex<Bridge> = Box::leak(Box::new(Mutex::new(Bridge::new(&ObjcMetadata32::default()).unwrap())));
+    let ctx = Ctx { bridge, g };
+    let call = |name: &str, words: &[u32]| {
+        let w = |i: u32| words.get(i as usize).copied().unwrap_or(0);
+        call_function(&ctx, name, &w).unwrap() as u32
+    };
+    let sel = |name: &str| bridge.lock().unwrap().guest_selector(g, name);
+    let types = |class: &str| {
+        let class = call("objc_getClass", &[g.text(class)]);
+        let method = call("class_getInstanceMethod", &[class, sel("setTransform:")]);
+        let text = g.read(g.u32_at(method + 4), 64);
+        String::from_utf8_lossy(&text[..text.iter().position(|&b| b == 0).unwrap()]).into_owned()
+    };
+    assert_eq!(types("CALayer"), "v@:{CATransform3D=ffffffffffffffff}");
+    assert_eq!(types("UIView"), "v@:{CGAffineTransform=ffffff}");
+}
+
 #[test]
 fn blocks_copy_to_the_heap_and_run_when_the_host_calls_them() {
     let g = Fake::new();
@@ -192,6 +217,34 @@ fn blocks_copy_to_the_heap_and_run_when_the_host_calls_them() {
     let copy_sel = bridge.lock().unwrap().guest_selector(g, "copy");
     assert_eq!(call("objc_msgSend", &[heap, copy_sel]), heap);
     assert_eq!(g.u32_at(heap + 4) & 0xffff, 4);
+}
+
+/// A block held in a __block variable (its helpers pass BLOCK_BYREF_CALLER |
+/// BLOCK_FIELD_IS_BLOCK, 135): libclosure assigns it as it is, without a
+/// copy, and disposing it does nothing.
+#[test]
+fn a_block_in_a_byref_variable_is_neither_copied_nor_released() {
+    use super::bridge::BLOCK_NEEDS_FREE;
+    let g = Fake::new();
+    let bridge: &'static Mutex<Bridge> = Box::leak(Box::new(Mutex::new(Bridge::new(&ObjcMetadata32::default()).unwrap())));
+    let (stack_isa, malloc_isa) = (g.words(&[0; 5]), g.words(&[0; 5]));
+    {
+        let mut b = bridge.lock().unwrap();
+        b.set_special(stack_isa, Special::StackBlock);
+        b.set_special(malloc_isa, Special::MallocBlock);
+    }
+    let call = move |name: &str, words: &[u32]| {
+        let w = |i: u32| words.get(i as usize).copied().unwrap_or(0);
+        call_function(&Ctx { bridge, g }, name, &w).unwrap() as u32
+    };
+    let descriptor = g.words(&[0, 20]);
+    let block = g.words(&[stack_isa, 0, 0, 0x4301, descriptor]);
+    let slot = g.words(&[0]);
+    call("_Block_object_assign", &[slot, block, 135]);
+    assert_eq!(g.u32_at(slot), block, "the block was copied");
+    let heap = g.words(&[malloc_isa, BLOCK_NEEDS_FREE | 2, 0, 0x4301, descriptor]);
+    call("_Block_object_dispose", &[heap, 135]);
+    assert_eq!(g.u32_at(heap + 4) & 0xfffe, 2, "the block was released");
 }
 
 #[test]
@@ -398,4 +451,211 @@ fn a_game_objects_dealloc_releases_its_associated_objects_and_clears_weak_refere
     assert_eq!(call("objc_loadWeak", &[weak]), 0, "weak references to it read nil");
     assert_eq!(call("objc_loadWeak", &[moved_to]), 0, "including a moved one");
     assert_eq!(call("objc_loadWeak", &[other]), survivor, "a weak reference to another object stays");
+}
+
+/// +instanceMethodForSelector: and -methodForSelector: of a game class give
+/// the game's own function, which the game then calls itself (cocos2d's
+/// scheduler does); a framework method gives objc_msgSend's stub, which
+/// reaches it the same way.
+#[test]
+fn method_for_selector_gives_the_games_own_function() {
+    let host_class = {
+        let mut rt = runtime::lock();
+        let class = rt.define_class("G32PlainRoot", 0, 16);
+        let meta = rt.classes[&class].partner;
+        let sel = rt.sel("alloc");
+        rt.add_method(meta, sel, alloc as usize);
+        let sel = rt.sel("bounds");
+        rt.add_method(class, sel, plain_root_bounds as usize);
+        class
+    };
+    let _ = host_class;
+    let g = Fake::new();
+    let (class, meta) = (g.alloc_permanent(20), g.alloc_permanent(20));
+    g.put_words(class, &[meta]);
+    let md = ObjcMetadata32 {
+        classes: vec![ObjcClass32 {
+            address: class,
+            name: "G32Timer".into(),
+            superclass: ClassTarget::External("G32PlainRoot".into()),
+            meta_address: meta,
+            meta_isa: ClassTarget::External("G32PlainRoot".into()),
+            meta_superclass: ClassTarget::External("G32PlainRoot".into()),
+            instance: ClassRo32 { instance_start: 8, instance_size: 8, ..Default::default() },
+            meta: ClassRo32 { flags: 1, ..Default::default() },
+        }],
+        ..Default::default()
+    };
+    let bridge: &'static Mutex<Bridge> = Box::leak(Box::new(Mutex::new(Bridge::new(&md).unwrap())));
+    install(bridge, g, &md).unwrap();
+    let ctx = Ctx { bridge, g };
+    let call = |name: &str, words: &[u32]| {
+        let w = |i: u32| words.get(i as usize).copied().unwrap_or(0);
+        call_function(&ctx, name, &w).unwrap() as u32
+    };
+    let sel = |name: &str| bridge.lock().unwrap().guest_selector(g, name);
+    g.code(0x3101, |w| u64::from(w[2]) * 2);
+    assert_eq!(call("class_addMethod", &[class, sel("update:"), 0x3101, g.text("v12@0:4f8")]), 1);
+    let object = call("objc_msgSend", &[class, sel("alloc")]);
+    assert_eq!(call("objc_msgSend", &[class, sel("instanceMethodForSelector:"), sel("update:")]), 0x3101);
+    assert_eq!(call("objc_msgSend", &[object, sel("methodForSelector:"), sel("update:")]), 0x3101);
+    // A framework method: objc_msgSend's own stub, or for a struct result
+    // (CGRect, returned through a hidden first pointer) objc_msgSend_stret's.
+    let stub = call("objc_msgSend", &[class, sel("instanceMethodForSelector:"), sel("description")]);
+    assert_eq!((stub, g.function_at(stub).as_deref()), (g.function_address("objc_msgSend"), Some("objc_msgSend")));
+    let stret = call("objc_msgSend", &[object, sel("methodForSelector:"), sel("bounds")]);
+    assert_eq!(g.function_at(stret).as_deref(), Some("objc_msgSend_stret"), "a CGRect result");
+    // Called as the game calls it: result pointer, receiver, selector.
+    let result = g.alloc_permanent(16);
+    let w = |words: Vec<u32>| move |i: u32| words.get(i as usize).copied().unwrap_or(0);
+    call_function(&ctx, &g.function_at(stret).unwrap(), &w(vec![result, object, sel("bounds")])).unwrap();
+    let floats: Vec<f32> = (0..4).map(|i| f32::from_bits(g.u32_at(result + 4 * i))).collect();
+    assert_eq!(floats, [1.0, 2.0, 3.0, 4.0]);
+}
+
+/// class_copyPropertyList lists a game class's own properties (its
+/// categories' first, as Apple's runtime attaches them) in a list the game
+/// frees; property_getName/Attributes read each entry.
+#[test]
+fn property_lists_come_from_the_games_metadata() {
+    runtime::lock().define_class("G32PropertyRoot", 0, 16);
+    let g = Fake::new();
+    let (class, meta) = (g.alloc_permanent(20), g.alloc_permanent(20));
+    let (bare, bare_meta) = (g.alloc_permanent(20), g.alloc_permanent(20));
+    g.put_words(class, &[meta]);
+    g.put_words(bare, &[bare_meta]);
+    // Each declaration is a property_t { name, attributes } in the image.
+    let property = |name: &str, attributes: &str| Property32 {
+        address: g.words(&[g.text(name), g.text(attributes)]),
+        name: name.into(),
+        attributes: attributes.into(),
+    };
+    let level = property("level", "Ti,R,N");
+    // The category redeclares "volume" read-only.
+    let volume_again = property("volume", "Tf,R,N");
+    let class_record = |address: u32, meta_address: u32, name: &str, properties: Vec<Property32>| ObjcClass32 {
+        address,
+        name: name.into(),
+        superclass: ClassTarget::External("G32PropertyRoot".into()),
+        meta_address,
+        meta_isa: ClassTarget::External("G32PropertyRoot".into()),
+        meta_superclass: ClassTarget::External("G32PropertyRoot".into()),
+        instance: ClassRo32 { instance_start: 8, instance_size: 8, properties, ..Default::default() },
+        meta: ClassRo32 { flags: 1, ..Default::default() },
+    };
+    let md = ObjcMetadata32 {
+        classes: vec![
+            class_record(class, meta, "G32Settings", vec![property("volume", "Tf,N,V_volume"), property("name", "T@\"NSString\",C,N,V_name")]),
+            class_record(bare, bare_meta, "G32Bare", Vec::new()),
+        ],
+        categories: vec![ObjcCategory32 {
+            address: g.alloc_permanent(24),
+            name: "Extra".into(),
+            class: ClassTarget::Local(class),
+            instance_methods: Vec::new(),
+            class_methods: Vec::new(),
+            protocols: Vec::new(),
+            instance_properties: vec![level.clone(), volume_again.clone()],
+        }],
+        ..Default::default()
+    };
+    let bridge: &'static Mutex<Bridge> = Box::leak(Box::new(Mutex::new(Bridge::new(&md).unwrap())));
+    install(bridge, g, &md).unwrap();
+    let ctx = Ctx { bridge, g };
+    let call = |name: &str, words: &[u32]| {
+        let w = |i: u32| words.get(i as usize).copied().unwrap_or(0);
+        call_function(&ctx, name, &w).unwrap() as u32
+    };
+    let text = |address: u32| unsafe { runtime::cstr(g.host_address(address)) };
+    let count = g.words(&[99]);
+    let list = call("class_copyPropertyList", &[class, count]);
+    assert_eq!(g.u32_at(count), 4);
+    let pointers: Vec<u32> = (0..4).map(|i| g.u32_at(list + 4 * i)).collect();
+    let entries: Vec<(String, String)> =
+        pointers.iter().map(|&p| (text(call("property_getName", &[p])), text(call("property_getAttributes", &[p])))).collect();
+    assert_eq!(
+        entries,
+        [("level", "Ti,R,N"), ("volume", "Tf,R,N"), ("volume", "Tf,N,V_volume"), ("name", "T@\"NSString\",C,N,V_name")]
+            .map(|(n, a)| (n.to_string(), a.to_string()))
+    );
+    // Each declaration is its own entry: the image's.
+    assert_eq!((pointers[0], pointers[1]), (level.address, volume_again.address));
+    assert_ne!(pointers[1], pointers[2], "a redeclared property keeps both declarations");
+    assert_eq!(g.u32_at(list + 16), 0, "the list ends with NULL");
+    // The same property is the same entry every time; the list itself is new.
+    let again = call("class_copyPropertyList", &[class, 0]);
+    assert_ne!(again, list);
+    assert_eq!(g.u32_at(again), g.u32_at(list));
+    // No properties: NULL and a count of 0; the metaclass has none either.
+    assert_eq!(call("class_copyPropertyList", &[bare, count]), 0);
+    assert_eq!(g.u32_at(count), 0);
+    assert_eq!(call("class_copyPropertyList", &[meta, count]), 0);
+}
+
+extern "C" fn plain_root_bounds(_: Id, _: Sel) -> crate::fw::geometry::Rect {
+    crate::fw::geometry::Rect::new(1.0, 2.0, 3.0, 4.0)
+}
+
+/// NSAllocateObject makes a zeroed game instance with room for its extra
+/// bytes; NSGetSizeAndAlignment measures armv7 layouts; CFStringAppendFormat
+/// formats the game's variadic arguments, objects included.
+#[test]
+fn foundation_allocation_layout_and_format_functions() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(crate::run::setup);
+    {
+        let mut rt = runtime::lock();
+        let class = rt.define_class("G32AllocRoot", 0, 16);
+        let meta = rt.classes[&class].partner;
+        let sel = rt.sel("alloc");
+        rt.add_method(meta, sel, alloc as usize);
+    }
+    let g = Fake::new();
+    let (class, meta) = (g.alloc_permanent(20), g.alloc_permanent(20));
+    g.put_words(class, &[meta]);
+    let md = ObjcMetadata32 {
+        classes: vec![ObjcClass32 {
+            address: class,
+            name: "G32Allocated".into(),
+            superclass: ClassTarget::External("G32AllocRoot".into()),
+            meta_address: meta,
+            meta_isa: ClassTarget::External("G32AllocRoot".into()),
+            meta_superclass: ClassTarget::External("G32AllocRoot".into()),
+            instance: ClassRo32 { instance_start: 4, instance_size: 12, ..Default::default() },
+            meta: ClassRo32 { flags: 1, ..Default::default() },
+        }],
+        ..Default::default()
+    };
+    let bridge: &'static Mutex<Bridge> = Box::leak(Box::new(Mutex::new(Bridge::new(&md).unwrap())));
+    install(bridge, g, &md).unwrap();
+    let ctx = Ctx { bridge, g };
+    let call = |name: &str, words: &[u32]| {
+        let w = |i: u32| words.get(i as usize).copied().unwrap_or(0);
+        call_function(&ctx, name, &w).unwrap() as u32
+    };
+
+    let zone = call("NSDefaultMallocZone", &[]);
+    assert_ne!(zone, 0);
+    let object = call("NSAllocateObject", &[class, 40, zone]);
+    assert_eq!(g.u32_at(object), class, "an instance of the game class");
+    assert_eq!(g.read(object + 4, 48), [0; 48], "its own and extra bytes, zeroed");
+    let host = bridge.lock().unwrap().host_object(object).expect("a host side");
+    assert_eq!(bridge.lock().unwrap().guest_object(g, host).unwrap(), object);
+    let next = g.alloc(4);
+    assert!(next >= object + 52, "the extra bytes are the object's ({object:#x}, next {next:#x})");
+
+    // NSGetSizeAndAlignment(type, &size, &align) -> the type after it (offsets skipped).
+    let (size, align) = (g.words(&[0]), g.words(&[0]));
+    let types = g.text("{Pair=cd}12@0");
+    let rest = call("NSGetSizeAndAlignment", &[types, size, align]);
+    assert_eq!((g.u32_at(size), g.u32_at(align), rest), (12, 4, types + 11), "a double is 4-byte aligned on armv7");
+    assert_eq!(call("NSGetSizeAndAlignment", &[rest, 0, align]), rest + 2, "NULL outputs are skipped");
+    assert_eq!(g.u32_at(align), 4);
+
+    // CFStringAppendFormat(string, options, format, ...)
+    let mutable = runtime::send(runtime::class_named("NSMutableString"), "stringWithString:", &[crate::fw::string::make("x")]);
+    let guest = |host: usize| bridge.lock().unwrap().guest_object(g, host).unwrap();
+    let (target, format, word) = (guest(mutable), guest(crate::fw::string::make("%d-%@")), guest(crate::fw::string::make("hi")));
+    call("CFStringAppendFormat", &[target, 0, format, 42, word]);
+    assert_eq!(crate::fw::string::get(mutable), "x42-hi");
 }

@@ -308,8 +308,16 @@ pub fn handler(name: &str) -> Option<Handler> {
                 let result = host_call(uc, || unsafe {
                     libc::getsockopt(fd, level, option, (&mut timeout as *mut libc::timeval).cast(), &mut size)
                 } as i64);
-                write_timeval(value, &timeout);
-                mem().write_u32(length, 8);
+                // Only a whole timeval becomes the guest's 8-byte one; any other answer (qemu-user
+                // gives none: size 0) is passed on as it is instead of a made-up zero timeout.
+                if matches!(result, Ret::U32(0)) {
+                    if size == std::mem::size_of::<libc::timeval>() as libc::socklen_t {
+                        write_timeval(value, &timeout);
+                        mem().write_u32(length, 8);
+                    } else {
+                        mem().write_u32(length, size.min(8));
+                    }
+                }
                 return result;
             }
             host_call(uc, || unsafe { libc::getsockopt(fd, level, option, pointer(value).cast(), pointer(length).cast()) } as i64)
@@ -470,13 +478,14 @@ pub fn handler(name: &str) -> Option<Handler> {
         "gethostbyname" => handler!(|uc, a| {
             let name_pointer = a.u32();
             let name = mem().c_str(name_pointer).to_owned();
-            let addresses: Vec<[u8; 4]> = without_gil(move || {
+            let (addresses, error): (Vec<[u8; 4]>, i32) = without_gil(move || {
                 let mut hints: libc::addrinfo = unsafe { std::mem::zeroed() };
                 hints.ai_family = libc::AF_INET;
                 hints.ai_socktype = libc::SOCK_STREAM;
                 let mut list: *mut libc::addrinfo = std::ptr::null_mut();
                 let mut found = Vec::new();
-                if unsafe { libc::getaddrinfo(name.as_ptr(), std::ptr::null(), &hints, &mut list) } == 0 {
+                let error = unsafe { libc::getaddrinfo(name.as_ptr(), std::ptr::null(), &hints, &mut list) };
+                if error == 0 {
                     let mut node = list;
                     while !node.is_null() && found.len() < HOSTENT_ADDRESSES {
                         let address = unsafe { &*((*node).ai_addr as *const libc::sockaddr_in) };
@@ -485,9 +494,17 @@ pub fn handler(name: &str) -> Option<Handler> {
                     }
                     unsafe { libc::freeaddrinfo(list) };
                 }
-                found
+                (found, error)
             });
             if addresses.is_empty() {
+                // h_errno from the lookup's answer: 1 HOST_NOT_FOUND, 2 TRY_AGAIN, 3 NO_RECOVERY, 4 NO_DATA.
+                let reason = match error {
+                    libc::EAI_AGAIN => 2,
+                    libc::EAI_FAIL | libc::EAI_MEMORY | libc::EAI_SYSTEM => 3,
+                    libc::EAI_NODATA | 0 => 4,
+                    _ => 1,
+                };
+                mem().write_u32(uc.get_data().errno_slot + crate::runtime::H_ERRNO_OFFSET, reason);
                 return Ret::U32(0);
             }
             Ret::U32(write_hostent(&mem().c_str(name_pointer).to_bytes().to_vec(), &addresses))

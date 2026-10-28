@@ -596,7 +596,13 @@ impl Translator {
                 0b011 => self.a.sxth_w(T2, T2),
                 0b110 => self.a.uxtb_w(T2, T2),
                 0b111 => self.a.uxth_w(T2, T2),
-                _ => return Err(()), // the 16-bit pair forms
+                // SXTB16/UXTB16, SXTAB16/UXTAB16: two halfwords
+                op @ (0b000 | 0b100) => {
+                    let add = if rn == PC { None } else { Some(rn) };
+                    self.a.extend_bytes16(rd, add, T2, op == 0b000, T3, T4);
+                    return Ok(Flow::Next);
+                }
+                _ => return Err(()),
             }
             if rn == PC {
                 self.a.mov_w(rd, T2);

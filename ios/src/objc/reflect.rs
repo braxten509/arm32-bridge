@@ -114,6 +114,12 @@ extern "C" fn is_meta_class(class: Class) -> bool {
     }
 }
 
+/// class_respondsToSelector: whether instances of the class (class methods
+/// for a metaclass) answer the selector, inherited ones included.
+extern "C" fn class_responds_to_selector(class: Class, sel: Sel) -> bool {
+    class != 0 && sel != 0 && lock().lookup(class, sel).is_some()
+}
+
 extern "C" fn get_meta_class(name: *const libc::c_char) -> Class {
     let name = unsafe { cstr(name as usize) };
     let rt = lock();
@@ -270,6 +276,23 @@ extern "C" fn construct_instance(class: Class, bytes: usize) -> Id {
         }
     }
     bytes
+}
+
+/// NSAllocateObject(class, extra bytes, zone): the root allocator (no +alloc
+/// runs): a zeroed instance with `extra` more bytes, C++ constructors run.
+extern "C" fn allocate_object(class: Class, extra: usize, _zone: usize) -> Id {
+    if class == 0 {
+        return 0;
+    }
+    let size = lock().classes.get(&class).map(|r| r.instance_size).unwrap_or(16).max(16);
+    let bytes = unsafe { libc::calloc(1, size + extra) } as usize;
+    construct_instance(class, bytes)
+}
+
+/// NSDefaultMallocZone(): zones are only names here (every allocation uses malloc).
+extern "C" fn default_malloc_zone() -> usize {
+    static ZONE: [usize; 4] = [0; 4];
+    ZONE.as_ptr() as usize
 }
 
 // ----- instance variables -----
@@ -598,6 +621,7 @@ pub fn register(r: &mut Registry) {
     r.function("method_setImplementation", method_set_implementation as usize);
     r.function("class_getSuperclass", get_superclass as usize);
     r.function("class_isMetaClass", is_meta_class as usize);
+    r.function("class_respondsToSelector", class_responds_to_selector as usize);
     r.function("objc_getMetaClass", get_meta_class as usize);
     r.function("objc_getRequiredClass", get_required_class as usize);
     r.function("objc_copyClassNamesForImage", copy_class_names_for_image as usize);
@@ -606,6 +630,8 @@ pub fn register(r: &mut Registry) {
     r.function("objc_registerClassPair", register_class_pair as usize);
     r.function("objc_readClassPair", read_class_pair as usize);
     r.function("objc_constructInstance", construct_instance as usize);
+    r.function("NSAllocateObject", allocate_object as usize);
+    r.function("NSDefaultMallocZone", default_malloc_zone as usize);
     r.function("class_getInstanceVariable", get_instance_variable as usize);
     r.function("object_getIvar", object_get_ivar as usize);
     r.function("object_getIndexedIvars", object_get_indexed_ivars as usize);
