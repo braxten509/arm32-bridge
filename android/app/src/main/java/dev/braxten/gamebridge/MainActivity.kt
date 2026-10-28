@@ -286,6 +286,15 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        // The game whose "Reset progress…" (or for an iPhone game, "Undo reset") box is showing.
+        var resetting by remember { mutableStateOf<Pair<Game, Boolean>?>(null) }
+        resetting?.let { (game, undo) ->
+            ResetDialog(game, undo, onDismiss = { resetting = null }) {
+                resetting = null
+                if (game.action == Action.PlayIphone) resetIphoneGame(game, undo) else openAppInfo(game)
+            }
+        }
+
         /**
          * Moves the games' files into the Game Bridge folder (or as `how` moves them: to Originals
          * and back), then searches again. Not while a backup reads them, nor an iPhone game's folder
@@ -423,7 +432,7 @@ class MainActivity : ComponentActivity() {
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
                     items(games!!, key = { it.file?.path ?: it.packageName }) { game ->
-                        GameCard(game, states[game.packageName] ?: CardState.Ready, busy, onConvert = { if (game.action == Action.PlayIphone) IphoneGames.play(this@MainActivity, game) else convert(game) }, onReplace = { replacing = game }, onRemove = { removing = game }, onRename = { renaming = game }, onMove = { move(listOf(game)) }, onToOriginals = { move(listOf(game), Games::moveToOriginals) }, onOpen = {
+                        GameCard(game, states[game.packageName] ?: CardState.Ready, busy, onConvert = { if (game.action == Action.PlayIphone) IphoneGames.play(this@MainActivity, game) else convert(game) }, onReplace = { replacing = game }, onRemove = { removing = game }, onRename = { renaming = game }, onReset = { undo -> resetting = game to undo }, onMove = { move(listOf(game)) }, onToOriginals = { move(listOf(game), Games::moveToOriginals) }, onOpen = {
                             packageManager.getLaunchIntentForPackage(game.packageName)?.let(::startActivity)
                         })
                     }
@@ -552,7 +561,7 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun GameCard(game: Game, state: CardState, busy: Boolean, onConvert: () -> Unit, onReplace: () -> Unit, onRemove: () -> Unit, onRename: () -> Unit, onMove: () -> Unit, onToOriginals: () -> Unit, onOpen: () -> Unit) {
+    private fun GameCard(game: Game, state: CardState, busy: Boolean, onConvert: () -> Unit, onReplace: () -> Unit, onRemove: () -> Unit, onRename: () -> Unit, onReset: (undo: Boolean) -> Unit, onMove: () -> Unit, onToOriginals: () -> Unit, onOpen: () -> Unit) {
         // Outside the Game Bridge folder: Move comes before anything else (an installed game keeps Open).
         val outside = remember(game, Conversions.moved) { Games.needsMove(game) }
         // Press and hold a card for its menu; a running conversion can't be removed under itself.
@@ -598,6 +607,8 @@ class MainActivity : ComponentActivity() {
                 } else if (game.action == Action.PlayIphone) {
                     MenuItem("Play") { close(); onConvert() }
                     MenuItem("Rename") { close(); onRename() }
+                    MenuItem("Reset progress…") { close(); onReset(false) }
+                    if (GameResets.canUndo(filesDir, game.file!!.nameWithoutExtension)) MenuItem("Undo reset") { close(); onReset(true) }
                     if (!IphoneApps.isInstalled(this@MainActivity, game)) MenuItem("Install app") { close(); installIphoneApp(game) }
                 } else if (game.file != null && !busy) when (state) {
                     CardState.Ready -> MenuItem(if (game.action == Action.Install) "Install" else "Convert") { close(); onConvert() }
@@ -609,6 +620,7 @@ class MainActivity : ComponentActivity() {
                 // Only the card's file goes; it then shows under Originals.
                 if (game.file != null && !busy) MenuItem("Move to Originals") { close(); onToOriginals() }
                 val installed = Games.isInstalled(this@MainActivity, game.packageName)
+                if (game.action != Action.PlayIphone && installed) MenuItem("Reset progress…") { close(); onReset(false) }
                 if (game.action != Action.PlayIphone && (installed || game.file != null)) MenuItem(if (installed) "Remove" else "Delete file", ErrorText) { close(); onRemove() }
             }
         }
@@ -857,6 +869,51 @@ class MainActivity : ComponentActivity() {
             },
             confirmButton = { TextButton(onClick = onConfirm) { Text("Replace", color = ErrorText) } },
             dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel", color = AccentText) } },
+        )
+    }
+
+    /**
+     * An iPhone game's "Reset progress…" or "Undo reset", off the main thread: the game is closed
+     * first, then GameResets moves its saves (not while a backup reads them).
+     */
+    private fun resetIphoneGame(game: Game, undo: Boolean) {
+        if (Backups.status != null) {
+            Toast.makeText(this, "Wait for the backup to finish, then reset.", Toast.LENGTH_LONG).show()
+            return
+        }
+        val name = game.file!!.nameWithoutExtension
+        Thread {
+            Backups.closeIphoneGame(applicationContext)
+            val problem = if (undo) GameResets.undo(filesDir, name) else GameResets.reset(filesDir, name)
+            val done = if (undo) "${game.label} has its saves from before the reset back." else "${game.label} starts fresh. \"Undo reset\" in its menu brings the saves back."
+            runOnUiThread { Toast.makeText(this, problem ?: done, Toast.LENGTH_LONG).show() }
+        }.start()
+    }
+
+    /** An Android game's saves are its own app's data: only its App info page can clear them. */
+    private fun openAppInfo(game: Game) {
+        startActivity(Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", game.packageName, null)))
+    }
+
+    /** Asks before resetting a game's progress (or undoing an iPhone game's reset). */
+    @Composable
+    private fun ResetDialog(game: Game, undo: Boolean, onDismiss: () -> Unit, onConfirm: () -> Unit) {
+        val (title, text, button) = when {
+            undo -> Triple("Undo the reset of ${game.label}?", "The saves from before the reset come back. Progress made since then is lost.", "Undo reset")
+            game.action == Action.PlayIphone -> Triple("Reset ${game.label}?", "The game starts from the beginning. Its old saves are kept aside, so \"Undo reset\" can bring them back until the next reset.", "Reset")
+            else -> Triple("Reset ${game.label}?", "Android's App info page for the game opens. Tap Storage & cache, then Clear storage. This can't be undone.", "Open App info")
+        }
+        AlertDialog(
+            onDismissRequest = onDismiss,
+            containerColor = CardColor,
+            title = { Text(title, color = Color(0xFFE8E8EE)) },
+            text = { Text(text, color = Muted, fontSize = 14.sp) },
+            confirmButton = {
+                Row(Modifier.bleed(end = TextButtonInset), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(onClick = onDismiss) { Text("Cancel", color = AccentText) }
+                    TextButton(onClick = onConfirm) { Text(button, color = ErrorText) }
+                }
+            },
         )
     }
 
