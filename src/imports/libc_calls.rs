@@ -649,6 +649,19 @@ pub fn handler(name: &str) -> Option<Handler> {
             unsafe { libc::strncat(host_c(destination), host_c(source), n as usize) };
             Ret::U32(destination)
         }),
+        // Appends within a whole buffer of `size` bytes; answers the length it tried to make.
+        "strlcat" | "__strlcat_chk" => handler!(|uc, a| {
+            let (destination, source, size) = (a.u32(), a.u32(), a.u32());
+            let m = mem();
+            let start = m.c_str(destination).to_bytes().len().min(size as usize);
+            let text = m.c_str(source).to_bytes().to_vec();
+            if start < size as usize {
+                let copy = text.len().min(size as usize - start - 1);
+                m.write_bytes(destination + start as u32, &text[..copy]);
+                m.write_u8(destination + (start + copy) as u32, 0);
+            }
+            Ret::U32((start + text.len()) as u32)
+        }),
         // C locale: the transformed text is the text itself.
         "strxfrm" => handler!(|uc, a| {
             let (destination, source, size) = (a.u32(), a.u32(), a.u32());
@@ -775,6 +788,9 @@ pub fn handler(name: &str) -> Option<Handler> {
         "isxdigit" => handler!(|uc, a| Ret::U32((unsafe { libc::isxdigit(a.i32()) } != 0) as u32)),
         "isalpha" => handler!(|uc, a| Ret::U32((unsafe { libc::isalpha(a.i32()) } != 0) as u32)),
         "isalnum" => handler!(|uc, a| Ret::U32((unsafe { libc::isalnum(a.i32()) } != 0) as u32)),
+        "islower" => handler!(|uc, a| Ret::U32((unsafe { libc::islower(a.i32()) } != 0) as u32)),
+        "iscntrl" => handler!(|uc, a| Ret::U32((unsafe { libc::iscntrl(a.i32()) } != 0) as u32)),
+        "ispunct" => handler!(|uc, a| Ret::U32((unsafe { libc::ispunct(a.i32()) } != 0) as u32)),
         "isascii" => handler!(|uc, a| Ret::U32((a.u32() < 0x80) as u32)),
         "iswlower" => handler!(|uc, a| Ret::U32(char::from_u32(a.u32()).is_some_and(|c| c.is_lowercase()) as u32)),
         // wchar_t is 32 bits for the guest too; the C library is always UTF-8.
@@ -1807,6 +1823,17 @@ pub fn handler(name: &str) -> Option<Handler> {
             let tm = read_tm32(mem(), guest_tm);
             Ret::U32(unsafe { libc::strftime(host_c(buffer), size as usize, host_c(format), &tm) } as u32)
         }),
+        // Fills only the fields the format reads; answers where reading stopped (0: no match).
+        "strptime" => handler!(|uc, a| {
+            let (text, format, guest_tm) = (a.u32(), a.u32(), a.u32());
+            let mut tm = read_tm32(mem(), guest_tm);
+            let end = unsafe { libc::strptime(host_c(text), host_c(format), &mut tm) };
+            if end.is_null() {
+                return Ret::U32(0);
+            }
+            write_tm32(guest_tm, &tm);
+            Ret::U32(mem().guest(end as *const u8))
+        }),
 
         "wcsftime" => handler!(|uc, a| {
             let (buffer, size, format, guest_tm) = (a.u32(), a.u32(), a.u32(), a.u32());
@@ -1963,6 +1990,12 @@ pub fn handler(name: &str) -> Option<Handler> {
             Ret::U32(0)
         }),
         "__cxa_finalize" => handler!(|uc, a| Ret::Void),
+        // A plain atexit function takes no argument; it runs with the others at exit.
+        "atexit" => handler!(|uc, a| {
+            let function = a.u32();
+            shared().state.at_exit.push((function, 0));
+            Ret::U32(0)
+        }),
         "__cxa_pure_virtual" => handler!(|uc, a| {
             stop_with_fault(uc, "game called a pure virtual function (__cxa_pure_virtual)".into());
             Ret::Void

@@ -725,6 +725,48 @@ fn special(name: &str) -> Option<Handler> {
             let text = unsafe { std::ffi::CStr::from_ptr(text) }.to_string_lossy().into_owned();
             Ret::U32(shared().cached_cstr(key, &text))
         }),
+        // OES_texture_3D: the extension's names for GLES3's own 3D texture
+        // calls (same arguments), which every GLES3 phone has.
+        "glTexImage3DOES" => handler!(|uc, a| {
+            let (target, level, format, width, height, depth, border, layout, kind, pixels) =
+                (a.u32(), a.i32(), a.i32(), a.i32(), a.i32(), a.i32(), a.i32(), a.u32(), a.u32(), a.u32());
+            unsafe {
+                host!("glTexImage3D", fn(u32, i32, i32, i32, i32, i32, i32, u32, u32, *mut c_void))(
+                    target, level, format, width, height, depth, border, layout, kind, unpack_pointer(pixels),
+                )
+            };
+            Ret::Void
+        }),
+        "glTexSubImage3DOES" => handler!(|uc, a| {
+            let (target, level, x, y, z, width, height, depth, layout, kind, pixels) =
+                (a.u32(), a.i32(), a.i32(), a.i32(), a.i32(), a.i32(), a.i32(), a.i32(), a.u32(), a.u32(), a.u32());
+            unsafe {
+                host!("glTexSubImage3D", fn(u32, i32, i32, i32, i32, i32, i32, i32, u32, u32, *mut c_void))(
+                    target, level, x, y, z, width, height, depth, layout, kind, unpack_pointer(pixels),
+                )
+            };
+            Ret::Void
+        }),
+        "glCompressedTexImage3DOES" => handler!(|uc, a| {
+            let (target, level, format, width, height, depth, border, size, data) =
+                (a.u32(), a.i32(), a.u32(), a.i32(), a.i32(), a.i32(), a.i32(), a.i32(), a.u32());
+            unsafe {
+                host!("glCompressedTexImage3D", fn(u32, i32, u32, i32, i32, i32, i32, i32, *mut c_void))(
+                    target, level, format, width, height, depth, border, size, unpack_pointer(data),
+                )
+            };
+            Ret::Void
+        }),
+        "glCompressedTexSubImage3DOES" => handler!(|uc, a| {
+            let (target, level, x, y, z, width, height, depth, format, size, data) =
+                (a.u32(), a.i32(), a.i32(), a.i32(), a.i32(), a.i32(), a.i32(), a.i32(), a.u32(), a.i32(), a.u32());
+            unsafe {
+                host!("glCompressedTexSubImage3D", fn(u32, i32, i32, i32, i32, i32, i32, i32, u32, i32, *mut c_void))(
+                    target, level, x, y, z, width, height, depth, format, size, unpack_pointer(data),
+                )
+            };
+            Ret::Void
+        }),
         "glMapBufferOES" => handler!(|uc, a| {
             let (target, _access) = (a.u32(), a.u32());
             let mut size = 0i32;

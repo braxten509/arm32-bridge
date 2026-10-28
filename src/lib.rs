@@ -9,7 +9,11 @@ pub mod ios32;
 pub mod jni_names;
 pub mod log;
 pub mod mem;
+pub mod gameswf_blend;
+pub mod gameswf_menus;
+pub mod monster_life_store;
 pub mod runtime;
+pub mod wraps;
 
 #[cfg(target_os = "android")]
 pub mod app;

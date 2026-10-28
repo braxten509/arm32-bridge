@@ -27,6 +27,7 @@ const DT_INIT_ARRAYSZ: u32 = 27;
 
 const R_ARM_ABS32: u32 = 2;
 const STB_WEAK: u8 = 2;
+const STT_FUNC: u8 = 2;
 const R_ARM_GLOB_DAT: u32 = 21;
 const R_ARM_JUMP_SLOT: u32 = 22;
 const R_ARM_RELATIVE: u32 = 23;
@@ -255,6 +256,14 @@ impl Loader {
         };
         relocate(uc, tag(DT_REL), tag(DT_RELSZ))?;
         relocate(uc, tag(DT_JMPREL), tag(DT_PLTRELSZ))?;
+        // Functions the bridge steps into (wraps.rs), before any code here runs.
+        for index in 1..library.symbol_count {
+            let symbol = library.symbol(uc, index);
+            if symbol.defined && symbol.kind == STT_FUNC && crate::wraps::wanted(&library.name, &symbol.name) {
+                let size = memory.read_u32(library.symbol_table + index * 16 + 8);
+                crate::wraps::wrap(&library.name, &symbol.name, base + symbol.value, size);
+            }
+        }
 
         if let Some(init) = tag(DT_INIT) {
             library.init_functions.push(base + init);
