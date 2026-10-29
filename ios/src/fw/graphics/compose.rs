@@ -7,7 +7,7 @@
 //! it is used.
 
 use super::*;
-use crate::fw::pictures::{meet, screen_box, Corner, Group, Picture};
+use crate::fw::pictures::{meet, screen_box, Corner, Group, Picture, Shadow};
 use std::collections::HashMap;
 
 /// Most pixels a made picture has (it is made coarser past this), so a
@@ -81,7 +81,7 @@ fn made(key: String, make: impl FnOnce() -> Option<String>) -> Option<String> {
     kept.retain(|_, m| {
         let keep = check.saturating_sub(m.used) < KEPT_CHECKS;
         if let (false, Some(file)) = (keep, &m.file) {
-            let _ = std::fs::remove_file(file);
+            super::remove_picture_file(file);
         }
         keep
     });
@@ -364,24 +364,303 @@ fn region(group: &Group, clip: Rect, content: &[Picture], mask: &[Picture]) -> O
 /// and then the pictures as they were.
 pub fn group_pictures(start: &Picture, content: &[Picture], mask: &[Picture], scale: f64) -> Vec<Picture> {
     let Some(group) = start.group.as_deref() else { return content.to_vec() };
+    // A clip alone that cuts nothing: the pictures are shown as they are.
+    if group.clips && !group.masked && group.shadow.is_none() && group.opacity >= 1.0 && content.iter().all(|p| inside_bounds(group, p)) {
+        return content.to_vec();
+    }
     let only_shadow = !group.clips && !group.masked && group.opacity >= 1.0;
     let fallback = if only_shadow { content.to_vec() } else { Vec::new() };
     if only_shadow && group.shadow.is_none() {
         return fallback;
     }
+    // A shadow alone is drawn at full strength and faded as a picture, so
+    // one whose strength changes (a pulsing glow) is drawn once.
+    let mut fade = if only_shadow { group.shadow.as_ref().map_or(1.0, |shadow| shadow.color[3].clamp(0.0, 1.0)) } else { 1.0 };
+    // So is the shadow of one fading picture (a damage number floating
+    // away): it is just as much fainter. One cast from a set path doesn't
+    // change however faded the pictures are.
+    let whole: Vec<Picture>;
+    let content_shown = content;
+    let set_path = group.shadow.as_ref().is_some_and(|s| s.path.is_some());
+    let content = match content {
+        _ if only_shadow && set_path && content.iter().any(|p| p.alpha != 1.0) => {
+            whole = content.iter().map(|p| Picture { alpha: 1.0, ..p.clone() }).collect();
+            &whole[..]
+        }
+        [p] if only_shadow && !set_path && p.alpha > 0.0 && p.alpha < 1.0 => {
+            fade *= p.alpha;
+            whole = vec![Picture { alpha: 1.0, ..p.clone() }];
+            &whole[..]
+        }
+        _ => content,
+    };
+    if fade <= 0.0 {
+        return fallback;
+    }
+    let full;
+    let group = if fade < 1.0 {
+        full = Group { shadow: group.shadow.clone().map(|shadow| Shadow { color: [shadow.color[0], shadow.color[1], shadow.color[2], 1.0], ..shadow }), ..group.clone() };
+        &full
+    } else {
+        group
+    };
     let Some(area) = region(group, start.clip, content, mask) else { return fallback };
     let k = capped(scale, area.size.width, area.size.height);
-    let key = format!("group {k} {area:?} {group:?} {content:?} {mask:?}");
-    let Some(file) = made(key, || composite(group, area, k, content, mask, only_shadow, start.corner)) else { return fallback };
+    let (key, log) = group_key(k, area, group, content, mask);
+    let Some(file) = made(key, || {
+        let began = std::time::Instant::now();
+        let file = composite(group, area, k, content, mask, only_shadow, start.corner);
+        if let Some(key) = &log {
+            note_group_made(key, area, k, group, content.len(), began.elapsed());
+        }
+        file
+    }) else {
+        return fallback;
+    };
     let size = (pixels(area.size.width, k) as f64 / k, pixels(area.size.height, k) as f64 / k);
     let place = Transform { tx: area.origin.x, ty: area.origin.y, ..IDENTITY };
     // A rasterized layer's opacity fades the whole picture.
-    let picture = Picture { path: file, place, area: size, alpha: group.opacity, mode: 0, size, text: None, clip: start.clip, group: None, corner: start.corner, perspective: None };
+    let picture = Picture { path: file, place, area: size, alpha: group.opacity * fade, mode: 0, size, text: None, clip: start.clip, group: None, corner: start.corner, perspective: None };
     if only_shadow {
-        std::iter::once(picture).chain(content.iter().cloned()).collect()
+        std::iter::once(picture).chain(content_shown.iter().cloned()).collect()
     } else {
         vec![picture]
     }
+}
+
+/// What a group shows, wherever it is: its places counted from its area's
+/// corner, so a group that only moves (a floating, shadowed piece) keeps
+/// the picture made for it and is put where it now is. None for turned-in-3D
+/// pictures (their key stays as it was).
+fn moved(area: Rect, group: &Group, content: &[Picture], mask: &[Picture]) -> Option<Moved> {
+    if group.perspective.is_some() || content.iter().chain(mask).any(|p| p.perspective.is_some()) {
+        return None;
+    }
+    let (ox, oy) = (area.origin.x, area.origin.y);
+    // Rounded so the noise left after taking the corner off doesn't count.
+    let r = |v: f64| (v * 1000.0).round() / 1000.0;
+    let shift = |t: Transform| Transform { tx: r(t.tx - ox), ty: r(t.ty - oy), ..t };
+    let shift_rect = |q: Rect| Rect::new(r(q.origin.x - ox), r(q.origin.y - oy), q.size.width, q.size.height);
+    // A clip counts only where it cuts the area (a screen-wide one stays put while the group moves).
+    let picture = |p: &Picture| Picture { place: shift(p.place), clip: shift_rect(meet(p.clip, area)), corner: p.corner.map(|c| Corner { rect: shift_rect(c.rect), ..c }), ..p.clone() };
+    let group = Group { place: shift(group.place), ..group.clone() };
+    let content: Vec<Picture> = content.iter().map(picture).collect();
+    let mask: Vec<Picture> = mask.iter().map(picture).collect();
+    Some(((r(area.size.width), r(area.size.height)), group, content, mask))
+}
+
+/// A moved group's size and its contents counted from its area's corner.
+type Moved = ((f64, f64), Group, Vec<Picture>, Vec<Picture>);
+
+/// The key a group's made picture is kept under, and with IOS_GROUP_LOG
+/// the same as text (to show what changed when one is drawn anew).
+fn group_key(k: f64, area: Rect, group: &Group, content: &[Picture], mask: &[Picture]) -> (String, Option<String>) {
+    match moved(area, group, content, mask) {
+        Some((size, group, content, mask)) => (
+            format!("group moved {:032x}", fingerprint(&(k, size, &group, &content, &mask))),
+            group_log().then(|| format!("group moved {k} {size:?} {group:?} {content:?} {mask:?}")),
+        ),
+        None => (
+            format!("group {:032x}", fingerprint(&(k, area, group, content, mask))),
+            group_log().then(|| format!("group {k} {area:?} {group:?} {content:?} {mask:?}")),
+        ),
+    }
+}
+
+/// 128 bits of a value's exact contents (numbers by their bits): two
+/// differently started hashes of the same bytes.
+pub(super) fn fingerprint(value: &impl Print) -> u128 {
+    use std::hash::Hasher;
+    struct Both(std::collections::hash_map::DefaultHasher, std::collections::hash_map::DefaultHasher);
+    impl Hasher for Both {
+        fn write(&mut self, bytes: &[u8]) {
+            self.0.write(bytes);
+            self.1.write(bytes);
+        }
+        fn finish(&self) -> u64 {
+            self.0.finish()
+        }
+    }
+    let mut both = Both(Default::default(), Default::default());
+    both.1.write_u8(0x5a);
+    value.print(&mut both);
+    (u128::from(both.0.finish()) << 64) | u128::from(both.1.finish())
+}
+
+/// Feeds everything a value holds to a hasher, floats by their bits (as
+/// exact as their text, without the time it takes to write it). Structs
+/// name every field, so a new field can't be left out.
+pub(super) trait Print {
+    fn print(&self, h: &mut impl std::hash::Hasher);
+}
+
+impl Print for f64 {
+    fn print(&self, h: &mut impl std::hash::Hasher) {
+        h.write_u64(self.to_bits());
+    }
+}
+impl Print for bool {
+    fn print(&self, h: &mut impl std::hash::Hasher) {
+        h.write_u8(*self as u8);
+    }
+}
+impl Print for i64 {
+    fn print(&self, h: &mut impl std::hash::Hasher) {
+        h.write_i64(*self);
+    }
+}
+impl Print for isize {
+    fn print(&self, h: &mut impl std::hash::Hasher) {
+        h.write_isize(*self);
+    }
+}
+impl Print for String {
+    fn print(&self, h: &mut impl std::hash::Hasher) {
+        h.write_usize(self.len());
+        h.write(self.as_bytes());
+    }
+}
+impl<T: Print + ?Sized> Print for &T {
+    fn print(&self, h: &mut impl std::hash::Hasher) {
+        (**self).print(h);
+    }
+}
+impl<T: Print> Print for Box<T> {
+    fn print(&self, h: &mut impl std::hash::Hasher) {
+        (**self).print(h);
+    }
+}
+impl<T: Print> Print for [T] {
+    fn print(&self, h: &mut impl std::hash::Hasher) {
+        h.write_usize(self.len());
+        self.iter().for_each(|v| v.print(h));
+    }
+}
+impl<T: Print> Print for Vec<T> {
+    fn print(&self, h: &mut impl std::hash::Hasher) {
+        self[..].print(h);
+    }
+}
+impl<T: Print, const N: usize> Print for [T; N] {
+    fn print(&self, h: &mut impl std::hash::Hasher) {
+        self[..].print(h);
+    }
+}
+impl<T: Print> Print for Option<T> {
+    fn print(&self, h: &mut impl std::hash::Hasher) {
+        match self {
+            None => h.write_u8(0),
+            Some(v) => {
+                h.write_u8(1);
+                v.print(h);
+            }
+        }
+    }
+}
+macro_rules! print_tuple {
+    ($($name:ident)+) => {
+        impl<$($name: Print),+> Print for ($($name,)+) {
+            #[allow(non_snake_case)]
+            fn print(&self, h: &mut impl std::hash::Hasher) {
+                let ($($name,)+) = self;
+                $($name.print(h);)+
+            }
+        }
+    };
+}
+print_tuple!(A B);
+print_tuple!(A B C D E);
+macro_rules! print_struct {
+    ($ty:path { $($field:ident),+ }) => {
+        impl Print for $ty {
+            fn print(&self, h: &mut impl std::hash::Hasher) {
+                let $ty { $($field),+ } = self;
+                $($field.print(h);)+
+            }
+        }
+    };
+}
+print_struct!(Point { x, y });
+print_struct!(geometry::Size { width, height });
+print_struct!(Rect { origin, size });
+print_struct!(Transform { a, b, c, d, tx, ty });
+print_struct!(crate::fw::pictures::Corner { rect, radius });
+print_struct!(crate::fw::pictures::Shadow { color, radius, offset, path });
+print_struct!(Group { place, perspective, bounds, clips, radius, masked, shadow, opacity });
+print_struct!(super::text::TextLook { text, font, color, shadow, alignment, line_break, lines, size, minimum_font_size });
+print_struct!(Picture { path, place, area, alpha, mode, size, text, clip, group, corner, perspective });
+
+/// Whether all `p` draws lies inside the group's bounds (their corners
+/// rounded by its radius), so clipping to them changes nothing.
+fn inside_bounds(group: &Group, p: &Picture) -> bool {
+    // A little past the edge is still inside: places carry rounding noise.
+    const SLACK: f64 = 0.01;
+    if group.perspective.is_some() || p.perspective.is_some() || p.path.starts_with(crate::fw::pictures::TRANSITION_MARK) {
+        return false;
+    }
+    let Some(back) = geometry::invert(group.place) else { return false };
+    let area = Rect::new(0.0, 0.0, p.area.0, p.area.1);
+    // Mode 2 is cropped to its area; the others draw in their content rect.
+    let drawn = if p.mode == 2 { area } else { super::render::content_rect(area, p.size, p.mode) };
+    let b = group.bounds;
+    let (rx, ry) = (group.radius.min(b.size.width / 2.0), group.radius.min(b.size.height / 2.0));
+    let inside = |(x, y): (f64, f64)| {
+        let (left, top) = (b.origin.x - SLACK, b.origin.y - SLACK);
+        let (right, bottom) = (b.origin.x + b.size.width + SLACK, b.origin.y + b.size.height + SLACK);
+        if !(left..=right).contains(&x) || !(top..=bottom).contains(&y) {
+            return false;
+        }
+        // Inside a rounded corner's square: within its ellipse.
+        let cx = if x < b.origin.x + rx { b.origin.x + rx } else if x > b.origin.x + b.size.width - rx { b.origin.x + b.size.width - rx } else { return true };
+        let cy = if y < b.origin.y + ry { b.origin.y + ry } else if y > b.origin.y + b.size.height - ry { b.origin.y + b.size.height - ry } else { return true };
+        let (dx, dy) = ((x - cx) / (rx + SLACK), (y - cy) / (ry + SLACK));
+        dx * dx + dy * dy <= 1.0
+    };
+    let x = [drawn.origin.x, drawn.origin.x + drawn.size.width];
+    let y = [drawn.origin.y, drawn.origin.y + drawn.size.height];
+    // The bounds (round or not) are convex: corners inside means all inside.
+    x.iter().all(|&x| y.iter().all(|&y| {
+        let (sx, sy) = geometry::apply(p.place, x, y);
+        inside(geometry::apply(back, sx, sy))
+    }))
+}
+
+/// IOS_GROUP_LOG=1: each group drawn anew is logged with what changed
+/// since the last one of its size (finding groups redrawn every frame).
+fn group_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("IOS_GROUP_LOG").is_ok_and(|v| v == "1"))
+}
+
+fn note_group_made(key: &str, area: Rect, k: f64, group: &Group, pictures: usize, took: std::time::Duration) {
+    static LAST: Mutex<Option<HashMap<(i64, i64), String>>> = Mutex::new(None);
+    let size = ((area.size.width * k) as i64, (area.size.height * k) as i64);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let last = last.get_or_insert_with(HashMap::new);
+    let changed = match last.get(&size) {
+        None => "new".to_string(),
+        Some(before) => {
+            let at = before.bytes().zip(key.bytes()).position(|(a, b)| a != b).unwrap_or(before.len().min(key.len()));
+            let from = key[..at].rfind("Picture").unwrap_or(at.saturating_sub(120));
+            let to = (at + 160).min(key.len());
+            let was_to = (at + 160).min(before.len());
+            let part = |text: &str, from: usize, to: usize| String::from_utf8_lossy(&text.as_bytes()[from.min(to)..to]).into_owned();
+            format!("at {at}: now {:?} was {:?}", part(key, from, to), part(before, from, was_to))
+        }
+    };
+    crate::log!(
+        "group made {}x{} at {:.0},{:.0} in {:.1} ms (shadow {}, clips {}, masked {}, opacity {:.2}, {pictures} pictures): {changed}",
+        size.0,
+        size.1,
+        area.origin.x,
+        area.origin.y,
+        took.as_secs_f64() * 1000.0,
+        group.shadow.is_some(),
+        group.clips,
+        group.masked,
+        group.opacity
+    );
+    last.insert(size, key.to_string());
 }
 
 /// Draws resolved pictures as the phone app does: each over its area by its
@@ -553,17 +832,208 @@ fn composite(group: &Group, area: Rect, k: f64, content: &[Picture], mask: &[Pic
     if out.iter().all(|p| p[3] <= 0.0) {
         return None;
     }
-    let mut picture = Canvas::new(std::ptr::null_mut(), width, height, 8, width * 4, Space::Rgb, PREMULTIPLIED_LAST).ok()?;
-    let layout = picture.layout;
-    for (pixel, color) in picture.memory().chunks_exact_mut(4).zip(&out) {
-        layout.write(pixel, *color);
+    write_png_file("a layer drawn with its corners, mask or shadow", &encode_png(width, height, &straight_bytes(&out), true)?)
+}
+
+/// Premultiplied colours as a picture file's straight RGBA bytes: each
+/// rounded to a byte, then divided by the rounded alpha, as a premultiplied
+/// canvas holding them reads back (by table: one pass, no canvas).
+fn straight_bytes(colours: &[[f32; 4]]) -> Vec<u8> {
+    static TABLE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let mut table = vec![0u8; 256 * 256];
+        for alpha in 1..256 {
+            let a = alpha as f32 / 255.0;
+            for v in 0..256 {
+                table[alpha * 256 + v] = to_byte((v as f32 / 255.0) / a);
+            }
+        }
+        table
+    });
+    let mut out = Vec::with_capacity(colours.len() * 4);
+    for c in colours {
+        let alpha = to_byte(c[3]);
+        let row = &table[alpha as usize * 256..][..256];
+        out.extend([row[to_byte(c[0]) as usize], row[to_byte(c[1]) as usize], row[to_byte(c[2]) as usize], to_byte(alpha as f32 / 255.0)]);
     }
-    save(&mut picture, "a layer drawn with its corners, mask or shadow")
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A turned layer that clips to its bounds, holding one picture: the
+    /// clip changes nothing when the picture lies inside the bounds, so the
+    /// picture is shown as it is (no group drawn on the CPU each time the
+    /// layer turns, as fight icons do); one reaching past them is still cut.
+    #[test]
+    fn a_turned_clip_that_cuts_nothing_draws_no_group() {
+        let (sin, cos) = 0.3f64.sin_cos();
+        let place = Transform { a: cos, b: sin, c: -sin, d: cos, tx: 200.0, ty: 100.0 };
+        let group = Group { place, perspective: None, bounds: Rect::new(0.0, 0.0, 100.0, 50.0), clips: true, radius: 0.0, masked: false, shadow: None, opacity: 1.0 };
+        let start = Picture { group: Some(Box::new(group)), ..crate::fw::pictures::mark_picture(Rect::new(0.0, 0.0, 568.0, 320.0)) };
+        let picture = |area: (f64, f64), dx: f64| Picture {
+            path: "/nowhere/icon.png".into(),
+            place: geometry::concat(Transform { tx: dx, ..IDENTITY }, place),
+            area,
+            alpha: 1.0,
+            mode: 0,
+            size: area,
+            text: None,
+            clip: Rect::new(0.0, 0.0, 568.0, 320.0),
+            group: None,
+            corner: None,
+            perspective: None,
+        };
+        let inside = vec![picture((80.0, 50.0), 10.0)];
+        assert_eq!(group_pictures(&start, &inside, &[], 2.0), inside);
+        let past = vec![picture((80.0, 50.0), 30.0)];
+        assert_ne!(group_pictures(&start, &past, &[], 2.0), past);
+    }
+
+    /// A shadowed layer that only moves (a floating fight piece) keeps its
+    /// one drawn shadow, placed where the layer now is, instead of drawing
+    /// it again for every step of the move.
+    #[test]
+    fn a_moved_shadow_is_drawn_once() {
+        let file = box_picture((40.0, 30.0), 0.0, [1.0, 0.0, 0.0, 1.0], ([0.0; 4], 0.0), 2.0).unwrap();
+        let shown = |dx: f64, dy: f64| {
+            let place = Transform { tx: 100.0 + dx, ty: 100.0 + dy, ..IDENTITY };
+            let shadow = crate::fw::pictures::Shadow { color: [0.0, 0.0, 0.0, 0.5], radius: 3.0, offset: (0.0, 4.0), path: None };
+            let group = Group { place, perspective: None, bounds: Rect::new(0.0, 0.0, 40.0, 30.0), clips: false, radius: 0.0, masked: false, shadow: Some(shadow), opacity: 1.0 };
+            let start = Picture { group: Some(Box::new(group)), ..crate::fw::pictures::mark_picture(Rect::new(0.0, 0.0, 568.0, 320.0)) };
+            let content = vec![Picture { path: file.clone(), place, area: (40.0, 30.0), alpha: 1.0, mode: 0, size: (40.0, 30.0), text: None, clip: Rect::new(0.0, 0.0, 568.0, 320.0), group: None, corner: None, perspective: None }];
+            group_pictures(&start, &content, &[], 2.0)
+        };
+        let (before, after) = (shown(0.0, 0.0), shown(3.25, 7.483));
+        assert_eq!(before.len(), 2, "the shadow under the layer's own picture");
+        assert_eq!(after[0].path, before[0].path);
+        assert!((after[0].place.tx - before[0].place.tx - 3.25).abs() < 1e-6 && (after[0].place.ty - before[0].place.ty - 7.483).abs() < 1e-6);
+    }
+
+    /// A shadow whose strength pulses (a glow under a fight piece) is drawn
+    /// once at full strength and faded as a picture, the way the phone
+    /// fades any picture, instead of being drawn again for each strength.
+    #[test]
+    fn a_pulsing_shadow_is_drawn_once() {
+        let file = box_picture((40.0, 30.0), 0.0, [0.0, 0.0, 1.0, 1.0], ([0.0; 4], 0.0), 2.0).unwrap();
+        let shown = |strength: f64| {
+            let place = Transform { tx: 100.0, ty: 100.0, ..IDENTITY };
+            let shadow = crate::fw::pictures::Shadow { color: [0.0, 0.0, 0.0, strength], radius: 3.0, offset: (0.0, 4.0), path: None };
+            let group = Group { place, perspective: None, bounds: Rect::new(0.0, 0.0, 40.0, 30.0), clips: false, radius: 0.0, masked: false, shadow: Some(shadow), opacity: 1.0 };
+            let start = Picture { group: Some(Box::new(group)), ..crate::fw::pictures::mark_picture(Rect::new(0.0, 0.0, 568.0, 320.0)) };
+            let content = vec![Picture { path: file.clone(), place, area: (40.0, 30.0), alpha: 1.0, mode: 0, size: (40.0, 30.0), text: None, clip: Rect::new(0.0, 0.0, 568.0, 320.0), group: None, corner: None, perspective: None }];
+            group_pictures(&start, &content, &[], 2.0)
+        };
+        let (strong, weak) = (shown(0.99), shown(0.5));
+        assert_eq!(weak[0].path, strong[0].path);
+        assert!((strong[0].alpha - 0.99).abs() < 1e-9 && (weak[0].alpha - 0.5).abs() < 1e-9);
+        // Drawn at full strength: its darkest pixel is the shadow colour at (nearly) full cover.
+        let (_, _, rgba) = pixels_of(&strong[0].path);
+        assert!(rgba.chunks(4).map(|p| p[3]).max().unwrap() > 250);
+    }
+
+    /// A fading shadowed picture (a damage number floating away): its shadow
+    /// is drawn once and faded with it, as strong as drawing it faded; a
+    /// shadow cast from a set path doesn't fade with the picture.
+    #[test]
+    fn a_fading_shadowed_picture_draws_its_shadow_once() {
+        let file = box_picture((40.0, 30.0), 0.0, [0.0, 0.0, 1.0, 1.0], ([0.0; 4], 0.0), 2.0).unwrap();
+        let place = Transform { tx: 100.0, ty: 100.0, ..IDENTITY };
+        let shown = |alpha: f64, path: Option<Vec<Vec<Point>>>| {
+            let shadow = crate::fw::pictures::Shadow { color: [0.0, 0.0, 0.0, 0.8], radius: 3.0, offset: (0.0, 4.0), path };
+            let group = Group { place, perspective: None, bounds: Rect::new(0.0, 0.0, 40.0, 30.0), clips: false, radius: 0.0, masked: false, shadow: Some(shadow), opacity: 1.0 };
+            let start = Picture { group: Some(Box::new(group)), ..crate::fw::pictures::mark_picture(Rect::new(0.0, 0.0, 568.0, 320.0)) };
+            let content = vec![Picture { path: file.clone(), place, area: (40.0, 30.0), alpha, mode: 0, size: (40.0, 30.0), text: None, clip: Rect::new(0.0, 0.0, 568.0, 320.0), group: None, corner: None, perspective: None }];
+            group_pictures(&start, &content, &[], 2.0)
+        };
+        let (near, far) = (shown(0.9, None), shown(0.4, None));
+        assert_eq!(far[0].path, near[0].path);
+        assert!((near[0].alpha - 0.72).abs() < 1e-9 && (far[0].alpha - 0.32).abs() < 1e-9, "{} {}", near[0].alpha, far[0].alpha);
+        assert!((far[1].alpha - 0.4).abs() < 1e-9);
+        // As strong as the shadow of the faded picture drawn as it is.
+        let strongest = |path: &str| pixels_of(path).2.chunks(4).map(|p| p[3]).max().unwrap() as f64;
+        let faded = Group { place, perspective: None, bounds: Rect::new(0.0, 0.0, 40.0, 30.0), clips: false, radius: 0.0, masked: false, shadow: Some(crate::fw::pictures::Shadow { color: [0.0, 0.0, 0.0, 1.0], radius: 3.0, offset: (0.0, 4.0), path: None }), opacity: 1.0 };
+        let content = vec![Picture { path: file.clone(), place, area: (40.0, 30.0), alpha: 0.4, mode: 0, size: (40.0, 30.0), text: None, clip: Rect::new(0.0, 0.0, 568.0, 320.0), group: None, corner: None, perspective: None }];
+        let area = region(&faded, Rect::new(0.0, 0.0, 568.0, 320.0), &content, &[]).unwrap();
+        let direct = composite(&faded, area, 2.0, &content, &[], true, None).unwrap();
+        assert!((strongest(&far[0].path) * 0.4 - strongest(&direct)).abs() <= 2.0);
+        // A set path's shadow is the same however faded the picture is.
+        let square = Some(vec![vec![Point { x: 0.0, y: 0.0 }, Point { x: 40.0, y: 0.0 }, Point { x: 40.0, y: 30.0 }, Point { x: 0.0, y: 30.0 }, Point { x: 0.0, y: 0.0 }]]);
+        let set = shown(0.4, square.clone());
+        assert!((set[0].alpha - 0.8).abs() < 1e-9, "{}", set[0].alpha);
+        // Nor is it drawn again as the picture fades.
+        assert_eq!(shown(0.9, square)[0].path, set[0].path);
+    }
+
+    /// A group's key is short (every number formatted as text took most of
+    /// a busy fight's group time), the same for the same group anywhere,
+    /// and different when anything it shows changes.
+    #[test]
+    fn group_keys_are_short_and_tell_groups_apart() {
+        let screen = Rect::new(0.0, 0.0, 568.0, 320.0);
+        let place = Transform { tx: 100.0, ty: 100.0, ..IDENTITY };
+        let shadow = crate::fw::pictures::Shadow { color: [0.0, 0.0, 0.0, 0.8], radius: 3.0, offset: (0.0, 4.0), path: None };
+        let group = Group { place, perspective: None, bounds: Rect::new(0.0, 0.0, 40.0, 30.0), clips: false, radius: 0.0, masked: false, shadow: Some(shadow), opacity: 1.0 };
+        let picture = |n: usize| Picture { path: format!("/p/{n}.png"), place: Transform { tx: 100.0 + n as f64, ..place }, area: (40.0, 30.0), alpha: 1.0, mode: 0, size: (40.0, 30.0), text: None, clip: screen, group: None, corner: None, perspective: None };
+        let content: Vec<Picture> = (0..30).map(picture).collect();
+        let area = region(&group, screen, &content, &[]).unwrap();
+        let key = |group: &Group, content: &[Picture], area: Rect| group_key(2.0, area, group, content, &[]).0;
+        let first = key(&group, &content, area);
+        assert!(first.len() <= 64, "{} bytes", first.len());
+        assert_eq!(key(&group, &content, area), first);
+        // Moved as a whole: the same picture, put elsewhere.
+        let by = |t: Transform| Transform { tx: t.tx + 7.5, ty: t.ty - 3.25, ..t };
+        let moved_group = Group { place: by(group.place), ..group.clone() };
+        let moved: Vec<Picture> = content.iter().map(|p| Picture { place: by(p.place), ..p.clone() }).collect();
+        let moved_area = Rect::new(area.origin.x + 7.5, area.origin.y - 3.25, area.size.width, area.size.height);
+        assert_eq!(key(&moved_group, &moved, moved_area), first);
+        // Anything else changed: another key.
+        let mut changed = Vec::new();
+        let with = |f: &dyn Fn(&mut Picture)| { let mut c = content.clone(); f(&mut c[29]); c };
+        changed.push(key(&group, &with(&|p| p.alpha = 0.5), area));
+        changed.push(key(&group, &with(&|p| p.path.push('x')), area));
+        changed.push(key(&group, &with(&|p| p.place.a = 1.0 + 1e-12), area));
+        changed.push(key(&group, &with(&|p| p.text = Some(crate::fw::graphics::text::TextLook { text: "a".into(), font: ("F".into(), 12.0), color: [1.0; 4], shadow: None, alignment: 0, line_break: 0, lines: 1, size: (40.0, 30.0), minimum_font_size: None })), area));
+        changed.push(key(&group, &content[..29], area));
+        changed.push(key(&Group { opacity: 0.5, ..group.clone() }, &content, area));
+        changed.push(key(&Group { shadow: Some(crate::fw::pictures::Shadow { radius: 4.0, ..group.shadow.clone().unwrap() }), ..group.clone() }, &content, area));
+        changed.push(key(&Group { shadow: Some(crate::fw::pictures::Shadow { path: Some(vec![vec![Point { x: 0.0, y: 0.0 }]]), ..group.shadow.clone().unwrap() }), ..group.clone() }, &content, area));
+        changed.push(group_key(3.0, area, &group, &content, &[]).0);
+        changed.push(group_key(2.0, area, &group, &content, &content[..1]).0);
+        for (n, other) in changed.iter().enumerate() {
+            assert_ne!(other, &first, "change {n} kept the key");
+        }
+        let distinct: std::collections::HashSet<&String> = changed.iter().collect();
+        assert_eq!(distinct.len(), changed.len());
+    }
+
+    /// A group's colours become the file's bytes directly, the same bytes
+    /// as written into a premultiplied canvas and read back straight.
+    #[test]
+    fn group_colours_become_the_same_straight_bytes() {
+        let mut colours = Vec::new();
+        let mut state = 9u32;
+        for _ in 0..4000 {
+            let mut next = || {
+                state = state.wrapping_mul(1103515245).wrapping_add(12345);
+                (state >> 8) as f32 / (1u32 << 24) as f32
+            };
+            let a = match colours.len() % 4 { 0 => 0.0, 1 => next() * 0.02, _ => next() };
+            colours.push([next() * a, next() * a, next() * a, a]);
+        }
+        colours.push([0.5, 0.5, 0.5, 1.0]);
+        colours.push([1.2, -0.1, 0.3, 0.9]);
+        let (width, height) = (colours.len(), 1);
+        let mut canvas = Canvas::new(std::ptr::null_mut(), width, height, 8, width * 4, Space::Rgb, PREMULTIPLIED_LAST).unwrap();
+        let layout = canvas.layout;
+        for (pixel, colour) in canvas.memory().chunks_exact_mut(4).zip(&colours) {
+            layout.write(pixel, *colour);
+        }
+        let want = canvas.snapshot().straight_rgba().unwrap();
+        assert!(straight_bytes(&colours) == want);
+    }
 
     /// A made picture file's pixels: width, height, straight RGBA rows.
     fn pixels_of(file: &str) -> (usize, usize, Vec<u8>) {

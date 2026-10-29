@@ -17,8 +17,7 @@
 
 use super::convert::{HostArgs, HostFrame, HostRet};
 use crate::objc::runtime;
-use std::collections::HashMap;
-use std::sync::{Mutex, RwLock};
+use std::sync::RwLock;
 
 std::arch::global_asm!(
     // HostFrame: x[9] @0, d[8] @72, stack @136, ret.x[2] @144, ret.d[4] @160.
@@ -118,7 +117,7 @@ pub fn trampoline_address() -> usize {
 type Dispatch = Box<dyn Fn(&mut HostFrame) + Send + Sync>;
 /// Tests that install a dispatch hook hold this, so they do not swap each other's hook.
 #[cfg(test)]
-pub(crate) static DISPATCH_TEST_LOCK: Mutex<()> = Mutex::new(());
+pub(crate) static DISPATCH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static DISPATCH: RwLock<Option<Dispatch>> = RwLock::new(None);
 
 /// Installs what the trampoline runs: it gets the saved registers and fills
@@ -155,7 +154,7 @@ pub fn call_host(imp: usize, args: &HostArgs) -> HostRet {
 }
 
 /// host class or metaclass -> (guest class, is metaclass)
-static MIRRORS: Mutex<Option<HashMap<usize, (u32, bool)>>> = Mutex::new(None);
+static MIRRORS: RwLock<Option<rustc_hash::FxHashMap<usize, (u32, bool)>>> = RwLock::new(None);
 
 /// Defines the host mirror of a game class: `name` under `host_superclass`
 /// (0 for a root), with the trampoline for each selector the game class
@@ -185,8 +184,8 @@ pub fn define_mirror_class(
         }
         (class, meta)
     };
-    let mut mirrors = MIRRORS.lock().unwrap_or_else(|e| e.into_inner());
-    let map = mirrors.get_or_insert_with(HashMap::new);
+    let mut mirrors = MIRRORS.write().unwrap_or_else(|e| e.into_inner());
+    let map = mirrors.get_or_insert_with(Default::default);
     map.insert(class, (guest_class, false));
     map.insert(meta, (guest_class, true));
     // Its objects' retains and releases are counted (counted.rs, "would dealloc").
@@ -196,7 +195,7 @@ pub fn define_mirror_class(
 
 /// The guest class a mirror class (or its metaclass) stands for.
 pub fn mirror_guest_class(host_class: usize) -> Option<u32> {
-    MIRRORS.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&host_class).map(|m| m.0)
+    MIRRORS.read().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&host_class).map(|m| m.0)
 }
 
 /// Adds the trampoline for a selector the game added later (class_addMethod).

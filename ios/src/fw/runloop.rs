@@ -1374,9 +1374,75 @@ extern "C" fn current_media_time() -> f64 {
     now()
 }
 
-/// The same clock for our own code (Core Animation's layer times).
+/// The same clock for our own code (touches, scrolling, timers, GL frames).
 pub fn media_time() -> f64 {
     now()
+}
+
+/// Core Animation's clock (layer times: begin times, completions, the
+/// frames worked out for the screen). IOS_ANIM_LEAD=1: media time plus the
+/// phone's present lead (`set_animation_lead`), so animation time is when
+/// the frame made now will be on the screen, the clock the phone draws its
+/// frames for. It never goes back when the lead shrinks. CACurrentMediaTime
+/// and media_time stay the real clock (the game's timers, display link,
+/// touches and GL frames).
+pub fn animation_time() -> f64 {
+    if let Some(lead) = LEAD_HERE.with(|l| l.get()) {
+        return media_time() + lead;
+    }
+    if !lead_on() {
+        return media_time();
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    // (Bits of positive floats order as the floats do.)
+    let t = (media_time() + f64::from_bits(LEAD.load(Relaxed))).to_bits();
+    f64::from_bits(LAST_ANIMATION_TIME.fetch_max(t, Relaxed).max(t))
+}
+
+/// The phone's present lead in seconds (IOS_ANIM_LEAD=1; any thread): how
+/// long before it is on the screen a frame is drawn.
+pub fn set_animation_lead(seconds: f64) {
+    if lead_on() && seconds.is_finite() {
+        let lead = lead_with_extra(seconds, lead_extra_ms());
+        if LEAD.swap(lead.to_bits(), std::sync::atomic::Ordering::Relaxed) != lead.to_bits() {
+            crate::log!("animation clock: lead {:.1} ms", lead * 1000.0);
+            // The animation wake set for the old lead is set again on the main thread.
+            post_after(0.0, Box::new(crate::fw::animation::lead_changed));
+        }
+    }
+}
+
+/// The lead used: the phone's measured `lead` plus a margin of `extra_ms`
+/// (IOS_ANIM_LEAD_EXTRA_MS, 0-20 ms: the second half's list also takes a
+/// frame or so to reach the screen), at most 100 ms.
+pub(crate) fn lead_with_extra(lead: f64, extra_ms: f64) -> f64 {
+    (lead.max(0.0) + extra_ms.clamp(0.0, 20.0) / 1000.0).min(0.1)
+}
+
+fn lead_extra_ms() -> f64 {
+    static EXTRA: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *EXTRA.get_or_init(|| std::env::var("IOS_ANIM_LEAD_EXTRA_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0.0))
+}
+
+fn lead_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("IOS_ANIM_LEAD").is_ok_and(|v| v == "1"))
+}
+
+static LEAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LAST_ANIMATION_TIME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    /// A test's own animation lead (`with_animation_lead`).
+    static LEAD_HERE: std::cell::Cell<Option<f64>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub fn with_animation_lead<T>(lead: f64, make: impl FnOnce() -> T) -> T {
+    let before = LEAD_HERE.with(|l| l.replace(Some(lead)));
+    let made = make();
+    LEAD_HERE.with(|l| l.set(before));
+    made
 }
 
 extern "C" fn ignore_size(_this: Id, _: Sel, _size: usize) {}

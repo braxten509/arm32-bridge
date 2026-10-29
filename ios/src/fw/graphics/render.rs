@@ -29,9 +29,24 @@ pub fn render_layer(context: Id, layer: Id) {
         runtime::send(view, "layoutIfNeeded", &[]);
         crate::fw::uikit::display_tree(view);
     }
+    let began = std::time::Instant::now();
+    let (cpu_began, waited_before) = (thread_cpu(), crate::fw::workers::WAITED.with(|w| w.get()));
     context_save_gstate(context);
     draw_layer(context, layer, 0);
     context_restore_gstate(context);
+    // IOS_DRAW_LOG=1: what each snapshot drew and how long it took.
+    if draw_log() {
+        let class = { let rt = lock(); rt.class_name(rt.class_of(if view != 0 { view } else { layer })) };
+        let size = canvas("-[CALayer renderInContext:]", context).map(|c| (c.width, c.height));
+        let waited = crate::fw::workers::WAITED.with(|w| w.get()) - waited_before;
+        crate::log!(
+            "snapshot of {class} {:?} into {size:?} in {:.1} ms ({:.1} ms working here, {:.1} ms waiting for other cores)",
+            layers::bounds(layer),
+            began.elapsed().as_secs_f64() * 1000.0,
+            (thread_cpu() - cpu_began).as_secs_f64() * 1000.0,
+            waited.as_secs_f64() * 1000.0
+        );
+    }
 }
 
 fn is_kind(object: Id, name: &str) -> bool {
@@ -441,4 +456,11 @@ mod tests {
         assert_eq!(runtime::send(shown, "isHighlighted", &[]) & 0xFF, 1);
         assert_eq!(at(&picture(runtime::send(shown, "layer", &[]), 4.0, 4.0, false), 4, 1, 1), [0, 0, 255, 255]);
     }
+}
+
+/// This thread's own CPU time so far (IOS_DRAW_LOG: work versus waiting).
+fn thread_cpu() -> std::time::Duration {
+    let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut t) };
+    std::time::Duration::new(t.tv_sec as u64, t.tv_nsec as u32)
 }

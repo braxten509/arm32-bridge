@@ -99,6 +99,41 @@ pub fn light_lane(pc: u32, index: u32, call: usize) -> Vec<u32> {
     a.code
 }
 
+/// The lane of a message-sending phone function at `pc` (send_cache.rs):
+/// nil receivers and pairs the table at `table` (the address of its live
+/// table pointer) doesn't hold go to the function through the dispatcher;
+/// a remembered (class at [r0], r1) jumps straight to its guest code with
+/// every guest register and flag as it was.
+pub fn send_lane(pc: u32, table: usize) -> Vec<u32> {
+    let mut a = Asm::new();
+    let slow = a.label();
+    a.cbz_w_to(0, slow);
+    a.ldr_w_uxtw(T3, host::MEMORY, 0); // the receiver's class
+    // slot_of: (class >> 3 ^ sel >> 2) & mask, 16 bytes a slot.
+    a.lsr_w_imm(T4, T3, 3);
+    a.eor_w(T4, T4, 1, shift::LSR, 2);
+    a.and_w_imm(T4, T4, (1 << super::send_cache::BITS) - 1, T5);
+    a.mov_x_imm(T5, table as u64);
+    a.ldr_x_off(T5, T5, 0);
+    a.add_x_lsl(T5, T5, T4, 4);
+    // No compares: the guest flags live in NZCV.
+    a.ldr_w_off(T6, T5, 0);
+    a.eor_w(T6, T6, T3, shift::LSL, 0);
+    a.cbnz_w_to(T6, slow);
+    a.ldr_w_off(T6, T5, 4);
+    a.eor_w(T6, T6, 1, shift::LSL, 0);
+    a.cbnz_w_to(T6, slow);
+    a.ldr_w_off(T3, T5, 8);
+    a.cbz_w_to(T3, slow);
+    emit_exit_to(&mut a, T3);
+    a.bind(slow);
+    a.mov_w_imm(host::EXIT_PC, pc);
+    a.mov_w_imm(host::EXIT_REASON, exit::JUMP);
+    a.br(host::EXIT_STUB);
+    a.finish();
+    a.code
+}
+
 /// Puts host FPCR back in the guest's VFP mode before a linked exit from NEON mode (uses T0, T1).
 fn restore_vfp_mode(a: &mut Asm) {
     if a.vfp_restore {

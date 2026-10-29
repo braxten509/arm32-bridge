@@ -11,11 +11,12 @@
 //! from the guest again ([`Hooks`]), from game or host code alike.
 
 use super::bridge::{forward_host_message, send_from_guest, throw_in_guest, Bridge, GuestSide, SendKind};
+use super::classes::Lookup;
 use super::convert::{self, GuestRet, HostFrame};
 use super::encoding::Signature;
 use super::functions::Ctx;
 use crate::fw::invocation::{self, Layout};
-use crate::objc::forward::{steps, Forwarding, Outcome};
+use crate::objc::forward::{steps, steps_after_target, Forwarding, Outcome};
 use crate::objc::runtime;
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -25,7 +26,7 @@ fn lock(bridge: &Mutex<Bridge>) -> MutexGuard<'_, Bridge> {
 }
 
 fn u32_at(g: &dyn GuestSide, addr: u32) -> u32 {
-    u32::from_le_bytes(g.read(addr, 4).try_into().unwrap())
+    g.read_u32(addr)
 }
 
 thread_local! {
@@ -120,15 +121,70 @@ pub(super) fn forward_message(
     missing: &str,
 ) -> Result<GuestRet, String> {
     let stret = matches!(kind, SendKind::Stret | SendKind::Super2Stret);
-    let first = u32::from(stret);
-    let sel = words(first + 1);
+    let sel = words(u32::from(stret) + 1);
     let isa = u32_at(g, receiver);
     let name = lock(bridge).selector_name(g, sel);
     let message = GuestMessage { bridge, g, receiver, isa, start, sel, name };
+    let outcome = steps(&message)?;
+    // Sent to its class's own -forwardingTargetForSelector:, and the
+    // resolver added nothing: until a method changes, the next one asks it
+    // straight away (forward_remembered).
+    if matches!(outcome, Outcome::Target(_)) && start == isa && matches!(kind, SendKind::Normal | SendKind::Stret) {
+        let mut b = lock(bridge);
+        if b.classes.resolution_refused(isa, &message.name) {
+            if let Lookup::Guest(m) = b.classes.lookup(isa, "forwardingTargetForSelector:") {
+                let imp = m.imp;
+                let forwarder = (imp, b.guest_selector(g, "forwardingTargetForSelector:"));
+                b.classes.remember_forward(isa, sel, forwarder);
+            }
+        }
+    }
+    finish(bridge, g, kind, words, receiver, start, outcome, missing)
+}
+
+/// A message `forward_message` remembered (classes `cached_forward`): the
+/// class's -forwardingTargetForSelector: (`forwarder`: code, selector) is
+/// asked straight away, and Apple's later steps follow a nil or self answer.
+pub(super) fn forward_remembered(
+    bridge: &Mutex<Bridge>,
+    g: &dyn GuestSide,
+    kind: SendKind,
+    words: &dyn Fn(u32) -> u32,
+    receiver: u32,
+    forwarder: (u32, u32),
+) -> Result<GuestRet, String> {
+    let stret = matches!(kind, SendKind::Stret | SendKind::Super2Stret);
+    let sel = words(u32::from(stret) + 1);
+    let target = g.call(forwarder.0, &[receiver, forwarder.1, sel])? as u32;
+    let isa = u32_at(g, receiver);
+    let outcome = if target != 0 && target != receiver {
+        Outcome::Target(target)
+    } else {
+        let name = lock(bridge).selector_name(g, sel);
+        steps_after_target(&GuestMessage { bridge, g, receiver, isa, start: isa, sel, name })?
+    };
+    finish(bridge, g, kind, words, receiver, isa, outcome, "")
+}
+
+/// Where a forwarded message goes (`outcome` of Apple's steps).
+#[allow(clippy::too_many_arguments)]
+fn finish(
+    bridge: &Mutex<Bridge>,
+    g: &dyn GuestSide,
+    kind: SendKind,
+    words: &dyn Fn(u32) -> u32,
+    receiver: u32,
+    start: u32,
+    outcome: Outcome<u32>,
+    missing: &str,
+) -> Result<GuestRet, String> {
+    let stret = matches!(kind, SendKind::Stret | SendKind::Super2Stret);
+    let first = u32::from(stret);
+    let sel = words(first + 1);
     // The receiver's word: a super call's words hold its pair there.
     let as_sent = |to: u32| move |i: u32| if i == first { to } else { words(i) };
     let plain = if stret { SendKind::Stret } else { SendKind::Normal };
-    match steps(&message)? {
+    match outcome {
         Outcome::Resolved => {
             RESOLVING.with(|r| r.borrow_mut().push((start, sel)));
             let result = send_from_guest(bridge, g, kind, words);
@@ -170,7 +226,7 @@ pub(super) fn forward_invocation(
         Layout::Armv7 => signature,
         Layout::Arm64 => invocation::make_signature_in(&types.text, Layout::Armv7),
     };
-    let arguments: Vec<Vec<u8>> = sig.args.iter().zip(sig.guest_arg_words()).map(|(ty, at)| convert::guest_bytes(words, at, ty.guest_size())).collect();
+    let arguments: Vec<Vec<u8>> = sig.args.iter().zip(sig.guest_arg_words()).map(|(ty, at)| convert::guest_bytes(words, at, ty.guest_size()).to_vec()).collect();
     let host_invocation = invocation::new_invocation(signature);
     invocation::set_invocation_arguments(host_invocation, &arguments);
     let guest_invocation = lock(bridge).guest_object(g, host_invocation)?;

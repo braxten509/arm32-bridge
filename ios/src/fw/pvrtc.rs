@@ -271,7 +271,20 @@ pub fn size(width: u32, height: u32, two_bits: bool) -> usize {
 }
 
 /// Decodes to RGBA, rows top to bottom. Sizes must be powers of two.
+/// Big textures are decoded on several cores at once.
 pub fn decode(data: &[u8], width: u32, height: u32, two_bits: bool) -> Option<Vec<u8>> {
+    // Below this many pixels, splitting costs more than it saves.
+    const SPLIT_FROM: u32 = 128 * 128;
+    let cores = if width * height < SPLIT_FROM {
+        1
+    } else {
+        crate::fw::workers::cores()
+    };
+    decode_on(data, width, height, two_bits, cores)
+}
+
+/// `decode` on this many cores (threads).
+fn decode_on(data: &[u8], width: u32, height: u32, two_bits: bool, cores: usize) -> Option<Vec<u8>> {
     if !width.is_power_of_two() || !height.is_power_of_two() || data.len() < size(width, height, two_bits) {
         return None;
     }
@@ -290,29 +303,48 @@ pub fn decode(data: &[u8], width: u32, height: u32, two_bits: bool) -> Option<Ve
         }
     };
     let wrap = |count: u32, n: i64| ((n + count as i64) % count as i64) as u32;
-    let mut out = vec![[0u8; 4]; (true_width * true_height) as usize];
-    let mut pixels = [[0u8; 4]; 32];
     let (ww, wh, tw) = (word_width as usize, word_height as usize, true_width as usize);
-    for word_y in -1..(words_y as i64 - 1) {
+    // Each row of words `word_y` (from -1) decodes the lower half of word
+    // row `word_y` (`top`) and the upper half of the next one (`bottom`),
+    // wrapping around; no two rows write the same pixels.
+    let band = |word_y: i64, top: &mut [[u8; 4]], bottom: &mut [[u8; 4]]| {
+        let mut pixels = [[0u8; 4]; 32];
         for word_x in -1..(words_x as i64 - 1) {
             let p = (wrap(words_x, word_x), wrap(words_y, word_y));
             let q = (wrap(words_x, word_x + 1), wrap(words_y, word_y));
             let r = (wrap(words_x, word_x), wrap(words_y, word_y + 1));
             let s = (wrap(words_x, word_x + 1), wrap(words_y, word_y + 1));
             decode_words(word_at(p.0, p.1), word_at(q.0, q.1), word_at(r.0, r.1), word_at(s.0, s.1), &mut pixels, bpp);
+            let (left, right) = (p.0 as usize * ww, q.0 as usize * ww);
             for y in 0..wh / 2 {
                 for x in 0..ww / 2 {
-                    let (px, py) = (p.0 as usize, p.1 as usize);
-                    out[(py * wh + y + wh / 2) * tw + px * ww + x + ww / 2] = pixels[y * ww + x];
-                    let (qx, qy) = (q.0 as usize, q.1 as usize);
-                    out[(qy * wh + y + wh / 2) * tw + qx * ww + x] = pixels[y * ww + x + ww / 2];
-                    let (rx, ry) = (r.0 as usize, r.1 as usize);
-                    out[(ry * wh + y) * tw + rx * ww + x + ww / 2] = pixels[(y + wh / 2) * ww + x];
-                    let (sx, sy) = (s.0 as usize, s.1 as usize);
-                    out[(sy * wh + y) * tw + sx * ww + x] = pixels[(y + wh / 2) * ww + x + ww / 2];
+                    top[y * tw + left + x + ww / 2] = pixels[y * ww + x];
+                    top[y * tw + right + x] = pixels[y * ww + x + ww / 2];
+                    bottom[y * tw + left + x + ww / 2] = pixels[(y + wh / 2) * ww + x];
+                    bottom[y * tw + right + x] = pixels[(y + wh / 2) * ww + x + ww / 2];
                 }
             }
         }
+    };
+    let mut out = vec![[0u8; 4]; (true_width * true_height) as usize];
+    let half = wh / 2 * tw;
+    let (first, rest) = out.split_at_mut(half);
+    let (middle, last) = rest.split_at_mut(rest.len() - half);
+    let mut bands = vec![(-1i64, last, first)];
+    for (word_y, rows) in middle.chunks_mut(2 * half).enumerate() {
+        let (top, bottom) = rows.split_at_mut(half);
+        bands.push((word_y as i64, top, bottom));
+    }
+    if cores <= 1 {
+        for (word_y, top, bottom) in bands {
+            band(word_y, top, bottom);
+        }
+    } else {
+        crate::fw::workers::split(&mut bands, cores, &|group| {
+            for (word_y, top, bottom) in group {
+                band(*word_y, top, bottom);
+            }
+        });
     }
     let mut rgba = Vec::with_capacity((width * height * 4) as usize);
     for y in 0..height as usize {
@@ -342,6 +374,43 @@ mod tests {
         for pixel in rgba.chunks(4) {
             assert_eq!(pixel, [255, 0, 0, 255], "{pixel:?}");
         }
+    }
+
+    /// Made-up texture bytes, the same every run.
+    fn noise(len: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed;
+        (0..len).map(|_| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 56) as u8
+        }).collect()
+    }
+
+    fn fnv(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3))
+    }
+
+    /// Unpacking on several cores gives the same pixels as the
+    /// one-core unpacker did (its results are the numbers below).
+    #[test]
+    fn every_core_count_unpacks_the_same_pixels() {
+        let cases: [(u32, u32, bool, u64); 6] = [
+            (8, 8, false, 2797267487922463627),
+            (16, 8, true, 18441435060227567776),
+            (4, 4, false, 8489950762733553910),
+            (256, 128, false, 4873371005225445656),
+            (64, 256, true, 3162502010997953893),
+            (512, 512, false, 2507185222192835500),
+        ];
+        let found: Vec<u64> = cases.iter().enumerate().map(|(index, &(width, height, two_bits, _))| {
+            let data = noise(size(width, height, two_bits), index as u64 + 1);
+            let one = decode_on(&data, width, height, two_bits, 1).unwrap();
+            for cores in [2, 3, 8] {
+                assert!(decode_on(&data, width, height, two_bits, cores).unwrap() == one, "{width}x{height} on {cores} cores");
+            }
+            assert!(decode(&data, width, height, two_bits).unwrap() == one);
+            fnv(&one)
+        }).collect();
+        assert_eq!(found, cases.iter().map(|c| c.3).collect::<Vec<_>>());
     }
 
     #[test]

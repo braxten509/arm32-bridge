@@ -35,6 +35,16 @@ pub struct HostSend {
     pub plan: std::sync::Arc<super::convert::CallPlan>,
 }
 
+/// A game method the host called: its code and the call's shape, so a
+/// repeat skips the lookups by name and the type parsing.
+#[derive(Debug)]
+pub struct GuestEntry {
+    pub imp: u32,
+    pub signature: super::encoding::Signature,
+    /// Each argument's host type, in order.
+    pub host_types: Vec<super::convert::HostTy>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Lookup<'a> {
     Guest(&'a GuestMethod),
@@ -83,8 +93,21 @@ pub struct GuestClasses {
     /// address); forgotten whenever a method is added.
     sends: HashMap<(u32, u32), CachedSend>,
     /// Messages the host answered, kept and forgotten like `sends`.
-    host_sends: HashMap<(u32, u32), HostSend>,
+    host_sends: HashMap<(u32, u32), std::sync::Arc<HostSend>>,
+    /// Game methods the host called, by (receiver's class, host selector);
+    /// kept and forgotten like `sends`.
+    guest_entries: HashMap<(u32, usize), std::sync::Arc<GuestEntry>>,
+    /// objc_msgSend's lane (dynarec::send_cache): game methods translated
+    /// code may jump to straight; forgotten with `sends`.
+    lane: Option<&'static arm32_bridge::dynarec::send_cache::SendCache>,
+    /// Messages only forwarding answers, by (receiver's class, selector
+    /// address): the game -forwardingTargetForSelector: to ask and its
+    /// selector (see forward.rs `forward_remembered`); forgotten with `sends`.
+    forwards: HashMap<(u32, u32), (u32, u32)>,
 }
+
+/// Times the remembered messages were forgotten (for the stats line).
+pub static FORGOTTEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn method_map(list: &[Method32]) -> HashMap<String, GuestMethod> {
     list.iter().map(|m| (m.name.clone(), GuestMethod { imp: m.imp, types: m.types.clone() })).collect()
@@ -204,12 +227,55 @@ impl GuestClasses {
 
     /// The host method an earlier message to `class` with the selector at
     /// `sel` reached, while no method has been added since.
-    pub fn cached_host_send(&self, class: u32, sel: u32) -> Option<HostSend> {
+    pub fn cached_host_send(&self, class: u32, sel: u32) -> Option<std::sync::Arc<HostSend>> {
         self.host_sends.get(&(class, sel)).cloned()
     }
 
     pub fn remember_host_send(&mut self, class: u32, sel: u32, send: HostSend) {
-        self.host_sends.insert((class, sel), send);
+        self.host_sends.insert((class, sel), std::sync::Arc::new(send));
+    }
+
+    /// The game method an earlier host call to `class` with the host
+    /// selector `sel` reached, while no method has changed since.
+    pub fn cached_guest_entry(&self, class: u32, sel: usize) -> Option<std::sync::Arc<GuestEntry>> {
+        self.guest_entries.get(&(class, sel)).cloned()
+    }
+
+    pub fn remember_guest_entry(&mut self, class: u32, sel: usize, entry: GuestEntry) -> std::sync::Arc<GuestEntry> {
+        let entry = std::sync::Arc::new(entry);
+        self.guest_entries.insert((class, sel), entry.clone());
+        entry
+    }
+
+    /// Forgets every remembered message (a method changed).
+    fn forget_sends(&mut self) {
+        self.sends.clear();
+        self.host_sends.clear();
+        self.guest_entries.clear();
+        self.forwards.clear();
+        if let Some(lane) = self.lane {
+            lane.clear();
+        }
+        FORGOTTEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The game -forwardingTargetForSelector: (code, selector) a message to
+    /// `class` with the selector at `sel` is forwarded by (see `forwards`).
+    pub fn cached_forward(&self, class: u32, sel: u32) -> Option<(u32, u32)> {
+        self.forwards.get(&(class, sel)).copied()
+    }
+
+    pub fn remember_forward(&mut self, class: u32, sel: u32, forwarder: (u32, u32)) {
+        self.forwards.insert((class, sel), forwarder);
+    }
+
+    /// Game methods go into objc_msgSend's lane from now on (see `lane`).
+    pub fn use_lane(&mut self, lane: &'static arm32_bridge::dynarec::send_cache::SendCache) {
+        self.lane = Some(lane);
+    }
+
+    pub fn lane(&self) -> Option<&'static arm32_bridge::dynarec::send_cache::SendCache> {
+        self.lane
     }
 
     pub fn class_named(&self, name: &str) -> Option<&GuestClass> {
@@ -313,8 +379,7 @@ impl GuestClasses {
         }
         methods.insert(sel.to_string(), GuestMethod { imp, types: types.to_string() });
         self.refused_resolutions.clear();
-        self.sends.clear();
-        self.host_sends.clear();
+        self.forget_sends();
         true
     }
 
@@ -322,8 +387,7 @@ impl GuestClasses {
     pub fn replace_method(&mut self, class: u32, sel: &str, imp: u32) -> Option<u32> {
         let method = self.classes.get_mut(&class)?.methods.get_mut(sel)?;
         let old = std::mem::replace(&mut method.imp, imp);
-        self.sends.clear();
-        self.host_sends.clear();
+        self.forget_sends();
         Some(old)
     }
 
@@ -335,8 +399,7 @@ impl GuestClasses {
         }
         c.methods.insert(sel.to_string(), GuestMethod { imp, types: types.to_string() });
         self.refused_resolutions.retain(|(owner, _)| *owner != class);
-        self.sends.clear();
-        self.host_sends.clear();
+        self.forget_sends();
         true
     }
 }

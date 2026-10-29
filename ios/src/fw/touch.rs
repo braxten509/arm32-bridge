@@ -803,7 +803,45 @@ fn send_to_view(view: Id, finger: i32, selector: &'static str, changed: Id, even
 /// are mapped through the picture's rectangle, not the whole window.
 pub fn deliver(finger: i32, phase: Phase, x: f32, y: f32, width: f32, height: f32) {
     let point = window_to_points(x as f64, y as f64, width as i32, height as i32);
-    crate::fw::runloop::post(crate::fw::runloop::Work::Native(Box::new(move || deliver_now(finger, phase, point))));
+    crate::fw::runloop::post(crate::fw::runloop::Work::Native(waiting_change(finger, phase, move || deliver_now(finger, phase, point))));
+}
+
+/// Each finger's move still waiting for the main thread (cleared to false
+/// when a newer move drops it).
+static WAITING_MOVES: Mutex<Option<HashMap<i32, std::sync::Arc<std::sync::atomic::AtomicBool>>>> = Mutex::new(None);
+
+/// A finger change for the main thread's queue. As GraphicsServices' event
+/// queue (GSEventTestEqualTypes, unless GSEventDisableHandEventCoalescing):
+/// a finger's newer move drops its older move still waiting, so a busy game
+/// hears one move with the newest place. Games time a move from the last one
+/// they heard (SpellCraft's stirring divides the turn by it), so two moves
+/// heard at once would look impossibly fast. Downs and ups are never dropped.
+fn waiting_change(finger: i32, phase: Phase, work: impl FnOnce() + Send + 'static) -> Box<dyn FnOnce() + Send> {
+    use std::sync::atomic::Ordering;
+    let mut waiting = WAITING_MOVES.lock().unwrap_or_else(|e| e.into_inner());
+    let waiting = waiting.get_or_insert_with(HashMap::new);
+    if phase != Phase::Moved {
+        // A later move of this finger is no longer the same as the one before.
+        waiting.remove(&finger);
+        return Box::new(work);
+    }
+    let live = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    if let Some(older) = waiting.insert(finger, live.clone()) {
+        older.store(false, Ordering::Relaxed);
+    }
+    Box::new(move || {
+        let mut waiting = WAITING_MOVES.lock().unwrap_or_else(|e| e.into_inner());
+        if !live.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Some(map) = waiting.as_mut() {
+            if map.get(&finger).is_some_and(|w| std::sync::Arc::ptr_eq(w, &live)) {
+                map.remove(&finger);
+            }
+        }
+        drop(waiting);
+        work()
+    })
 }
 
 /// A window pixel (top-left origin) to iPhone screen points; places in the
@@ -1539,6 +1577,31 @@ mod tests {
         FINGERS.lock().unwrap().clear();
         runtime::send(view, "setMultipleTouchEnabled:", &[1]);
         assert_eq!(two_fingers(742, 743), ["began", "began", "ended", "ended"]);
+    }
+
+    /// As GraphicsServices' event queue: a finger's newer move drops its
+    /// older move still waiting for the main thread, but never a finger
+    /// down or up, nor another finger's move.
+    #[test]
+    fn a_newer_move_drops_the_fingers_waiting_move() {
+        static RAN: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+        let change = |finger, phase, name: &'static str| waiting_change(finger, phase, move || RAN.lock().unwrap().push(name));
+        let queue = [
+            change(950, Phase::Began, "down"),
+            change(950, Phase::Moved, "old move"),
+            change(951, Phase::Moved, "other finger"),
+            change(950, Phase::Moved, "new move"),
+            change(950, Phase::Moved, "last move before up"),
+            change(950, Phase::Ended, "up"),
+            change(950, Phase::Began, "down again"),
+            change(950, Phase::Moved, "move after"),
+        ];
+        for work in queue {
+            work();
+        }
+        // A move that already ran is not dropped by the next one.
+        change(950, Phase::Moved, "late move")();
+        assert_eq!(*RAN.lock().unwrap(), ["down", "other finger", "last move before up", "up", "down again", "move after", "late move"]);
     }
 
     #[test]

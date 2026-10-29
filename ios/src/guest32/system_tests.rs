@@ -345,6 +345,88 @@ fn a_signal_raised_in_its_own_handler_runs_when_the_handler_returns() {
 }
 
 #[test]
+fn a_phone_function_parks_its_callers_registers() {
+    // A helper runs signal handlers for a thread sitting in a phone function
+    // with the registers parked here (runtime::deliver_for), so each must be
+    // the caller's own, with its return address as the place to go on.
+    static PARKED: Mutex<Option<[u32; 16]>> = Mutex::new(None);
+    fn handler(uc: &mut Uc, _: &mut Args) -> Ret {
+        let parked = std::array::from_fn(|i| uc.get_data().runner.parked[i].load(Ordering::Relaxed));
+        *PARKED.lock().unwrap() = Some(parked);
+        Ret::Void
+    }
+    setup();
+    if !runtime::parallel() {
+        return; // one thread at a time: nothing is parked
+    }
+    ios32::register_function("test_parking_function", handler);
+    let index = (runtime::stub_for("test_parking_function") - arm32_bridge::mem::stub_base()) / 8;
+    let value = |i: usize| 0x1000 + i as u32 * 0x11;
+    let parked = {
+        let _gil = runtime::hold_gil();
+        let uc = runtime::engine();
+        let saved: Vec<u32> = (0..15).map(|i| uc.reg(i)).collect();
+        (0..15).for_each(|i| uc.set_reg(i, value(i)));
+        runtime::call_stub(uc, index);
+        saved.iter().enumerate().for_each(|(i, v)| uc.set_reg(i, *v));
+        PARKED.lock().unwrap().take().expect("the function ran")
+    };
+    let wanted: [u32; 16] = std::array::from_fn(|i| value(i.min(14)));
+    assert_eq!(parked, wanted);
+}
+
+#[test]
+fn a_send_lane_jumps_straight_to_a_remembered_method() {
+    // objc_msgSend's lane (dynarec::send_cache): a remembered (class,
+    // selector) goes from translated code straight into its method with the
+    // caller's arguments, as Apple's objc_msgSend jumps; anything else still
+    // reaches the phone function.
+    static CALLS: AtomicU32 = AtomicU32::new(0);
+    fn handler(_: &mut Uc, _: &mut Args) -> Ret {
+        CALLS.fetch_add(1, Ordering::SeqCst);
+        Ret::U32(1000)
+    }
+    setup();
+    ios32::register_function("test_send_lane", handler);
+    let stub = runtime::stub_for("test_send_lane");
+    let cache = runtime::send_cache("test_send_lane");
+    // The method: adds r0, r2, #1; bx lr (Thumb).
+    let method = alloc(4);
+    for (i, half) in [0x1C50u16, 0x4770].iter().enumerate() {
+        mem().write_bytes(method + i as u32 * 2, &half.to_le_bytes());
+    }
+    // The caller: push {r4, lr}; blx r3; pop {r4, pc} (ARM).
+    let caller = alloc(12);
+    for (i, word) in [0xE92D_4010u32, 0xE12F_FF33, 0xE8BD_8010].iter().enumerate() {
+        mem().write_u32(caller + i as u32 * 4, *word);
+    }
+    let (class, receiver) = (alloc(16), alloc(16));
+    mem().write_u32(receiver, class);
+    let sel = cstring("testLaneSelector");
+    let _gil = runtime::hold_gil();
+    let uc = runtime::engine();
+    let mut send_sel = |receiver: u32, sel: u32| runtime::call_guest(uc, caller, &[receiver, sel, 5, stub]).unwrap() as u32;
+    // Another selector in the same slot (slot_of uses sel >> 2, 12 bits).
+    let other = sel + (4 << arm32_bridge::dynarec::send_cache::BITS);
+    let calls = || CALLS.load(Ordering::SeqCst);
+    assert_eq!(send_sel(receiver, sel), 1000, "not remembered yet");
+    cache.put(class, sel, method | 1);
+    // New translated code goes live in batches: the lane takes over within a few calls.
+    let mut tries = 0;
+    while send_sel(receiver, sel) == 1000 {
+        tries += 1;
+        assert!(tries < 100_000, "the lane never took the message");
+    }
+    let before = calls();
+    assert_eq!(send_sel(receiver, sel), 6, "straight to the method, r2 as the caller left it");
+    assert_eq!(calls(), before, "the function was not called");
+    assert_eq!(send_sel(0, sel), 1000, "a nil receiver goes to the function");
+    assert_eq!(send_sel(receiver, other), 1000, "another selector goes to the function");
+    cache.clear();
+    assert_eq!(send_sel(receiver, sel), 1000, "forgotten");
+}
+
+#[test]
 fn vm_allocate_at_a_taken_address_answers_no_space() {
     const TASK: u32 = 0x103;
     let address = alloc(4);

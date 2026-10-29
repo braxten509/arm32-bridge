@@ -359,11 +359,70 @@ pub struct HostArgs {
 }
 
 fn words_of(bytes: &[u8]) -> Vec<u64> {
+    word_iter(bytes).collect()
+}
+
+/// The 8-byte host words of `bytes` (the last one zero-padded).
+fn word_iter(bytes: &[u8]) -> impl Iterator<Item = u64> + '_ {
     bytes.chunks(8).map(|c| {
         let mut raw = [0u8; 8];
         raw[..c.len()].copy_from_slice(c);
         u64::from_le_bytes(raw)
-    }).collect()
+    })
+}
+
+fn first_word(bytes: &[u8]) -> u64 {
+    word_iter(bytes).next().unwrap_or(0)
+}
+
+/// Bytes of one argument or result: up to 64 kept in place (every common
+/// type, CGAffineTransform included), more on the heap. Each message made
+/// several small heap requests before, which cost time on every one.
+pub(super) struct Bytes {
+    len: usize,
+    inline: [u8; 64],
+    heap: Vec<u8>,
+}
+
+impl Bytes {
+    pub(super) fn zeroed(len: usize) -> Bytes {
+        Bytes { len, inline: [0; 64], heap: if len > 64 { vec![0; len] } else { Vec::new() } }
+    }
+
+    /// Kept in place (no heap).
+    pub(super) fn is_inline(&self) -> bool {
+        self.len <= 64
+    }
+
+    /// A new length; added bytes are zero.
+    fn resize(&mut self, len: usize) {
+        if len > 64 && self.len <= 64 {
+            self.heap = self.inline[..self.len].to_vec();
+        }
+        if len > 64 || self.len > 64 {
+            self.heap.resize(len, 0);
+        }
+        if len <= 64 && self.len > 64 {
+            self.inline[..len].copy_from_slice(&self.heap[..len]);
+            self.heap = Vec::new();
+        } else if len <= 64 && len > self.len {
+            self.inline[self.len..len].fill(0);
+        }
+        self.len = len;
+    }
+}
+
+impl std::ops::Deref for Bytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        if self.len <= 64 { &self.inline[..self.len] } else { &self.heap }
+    }
+}
+
+impl std::ops::DerefMut for Bytes {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        if self.len <= 64 { &mut self.inline[..self.len] } else { &mut self.heap }
+    }
 }
 
 impl HostArgs {
@@ -387,26 +446,27 @@ impl HostArgs {
 
     fn push(&mut self, hty: &HostTy, bytes: &[u8]) {
         match hty {
-            HostTy::Int { .. } | HostTy::Ptr => self.push_x(words_of(bytes)[0]),
-            HostTy::F32 | HostTy::F64 => self.push_d(words_of(bytes)[0]),
+            HostTy::Int { .. } | HostTy::Ptr => self.push_x(first_word(bytes)),
+            HostTy::F32 | HostTy::F64 => self.push_d(first_word(bytes)),
             HostTy::Struct { size, .. } => {
                 if let Some((element, count)) = hty.hfa() {
                     if self.nsrn + count as usize <= 8 {
                         let step = element.size() as usize;
                         for i in 0..count as usize {
-                            self.push_d(words_of(&bytes[i * step..(i + 1) * step])[0]);
+                            self.push_d(first_word(&bytes[i * step..(i + 1) * step]));
                         }
                     } else {
                         self.nsrn = 8;
-                        self.stack.extend(words_of(bytes));
+                        self.stack.extend(word_iter(bytes));
                     }
                 } else if *size <= 16 {
-                    let words = words_of(bytes);
-                    if self.ngrn + words.len() <= 8 {
-                        words.into_iter().for_each(|w| self.push_x(w));
+                    if self.ngrn + bytes.len().div_ceil(8) <= 8 {
+                        for w in word_iter(bytes) {
+                            self.push_x(w);
+                        }
                     } else {
                         self.ngrn = 8;
-                        self.stack.extend(words);
+                        self.stack.extend(word_iter(bytes));
                     }
                 } else {
                     let copy: Box<[u64]> = words_of(bytes).into_boxed_slice();
@@ -522,37 +582,50 @@ fn needs_indirect_result(hty: &HostTy) -> bool {
     matches!(hty, HostTy::Struct { size, .. } if *size > 16 && hty.hfa().is_none())
 }
 
-fn host_result_bytes(hty: &HostTy, ret: &HostRet, scalar_float: bool, indirect: Option<&[u64]>) -> Vec<u8> {
+pub(super) fn host_result_bytes(hty: &HostTy, ret: &HostRet, scalar_float: bool, indirect: Option<&[u64]>) -> Bytes {
     let size = hty.size() as usize;
-    let mut out: Vec<u8> = match hty {
-        HostTy::Int { .. } | HostTy::Ptr => ret.x[0].to_le_bytes().to_vec(),
-        HostTy::F32 | HostTy::F64 if scalar_float => float_register_as_double(ret.d[0]).to_le_bytes().to_vec(),
-        HostTy::F32 | HostTy::F64 => ret.d[0].to_le_bytes().to_vec(),
+    let words = |out: &mut Bytes, words: &mut dyn Iterator<Item = u64>| {
+        let mut at = 0;
+        for w in words {
+            out.resize(at + 8);
+            out[at..at + 8].copy_from_slice(&w.to_le_bytes());
+            at += 8;
+        }
+    };
+    let mut out = Bytes::zeroed(0);
+    match hty {
+        HostTy::Int { .. } | HostTy::Ptr => words(&mut out, &mut std::iter::once(ret.x[0])),
+        HostTy::F32 | HostTy::F64 if scalar_float => words(&mut out, &mut std::iter::once(float_register_as_double(ret.d[0]))),
+        HostTy::F32 | HostTy::F64 => words(&mut out, &mut std::iter::once(ret.d[0])),
         HostTy::Struct { .. } => match (hty.hfa(), indirect) {
             (Some((element, count)), _) => {
                 let step = element.size() as usize;
-                (0..count as usize).flat_map(|i| ret.d[i].to_le_bytes()[..step].to_vec()).collect()
+                for i in 0..count as usize {
+                    out.resize(out.len() + step);
+                    let at = out.len() - step;
+                    out[at..].copy_from_slice(&ret.d[i].to_le_bytes()[..step]);
+                }
             }
-            (None, Some(buffer)) => buffer.iter().flat_map(|w| w.to_le_bytes()).collect(),
-            (None, None) => ret.x.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            (None, Some(buffer)) => words(&mut out, &mut buffer.iter().copied()),
+            (None, None) => words(&mut out, &mut ret.x.iter().copied()),
         },
-    };
-    out.resize(size.max(8), 0);
+    }
+    out.resize(size.max(8));
     out
 }
 
 fn set_host_result(hty: &HostTy, bytes: &[u8], frame: &mut HostFrame) {
     match hty {
-        HostTy::Int { .. } | HostTy::Ptr => frame.ret.x[0] = words_of(bytes)[0],
-        HostTy::F32 | HostTy::F64 => frame.ret.d[0] = words_of(bytes)[0],
+        HostTy::Int { .. } | HostTy::Ptr => frame.ret.x[0] = first_word(bytes),
+        HostTy::F32 | HostTy::F64 => frame.ret.d[0] = first_word(bytes),
         HostTy::Struct { size, .. } => {
             if let Some((element, count)) = hty.hfa() {
                 let step = element.size() as usize;
                 for i in 0..count as usize {
-                    frame.ret.d[i] = words_of(&bytes[i * step..(i + 1) * step])[0];
+                    frame.ret.d[i] = first_word(&bytes[i * step..(i + 1) * step]);
                 }
             } else if *size <= 16 {
-                for (i, w) in words_of(bytes).into_iter().enumerate().take(2) {
+                for (i, w) in word_iter(bytes).enumerate().take(2) {
                     frame.ret.x[i] = w;
                 }
             } else {
@@ -565,9 +638,14 @@ fn set_host_result(hty: &HostTy, bytes: &[u8], frame: &mut HostFrame) {
 
 // ---------- guest words ----------
 
-pub(super) fn guest_bytes(words: &dyn Fn(u32) -> u32, first: u32, size: u32) -> Vec<u8> {
-    let mut out: Vec<u8> = (0..size.div_ceil(4).max(1)).flat_map(|i| words(first + i).to_le_bytes()).collect();
-    out.truncate(size.max(1) as usize);
+pub(super) fn guest_bytes(words: &dyn Fn(u32) -> u32, first: u32, size: u32) -> Bytes {
+    let count = size.div_ceil(4).max(1);
+    let mut out = Bytes::zeroed(count as usize * 4);
+    for i in 0..count {
+        let at = i as usize * 4;
+        out[at..at + 4].copy_from_slice(&words(first + i).to_le_bytes());
+    }
+    out.resize(size.max(1) as usize);
     out
 }
 
@@ -1019,7 +1097,7 @@ pub fn finish_host_call(call: PreparedHostCall, ret: &HostRet, b: &mut dyn Bound
     let host = host_result_bytes(&call.plan.ret_hty, ret, is_float_scalar(&call.plan.ret), call.indirect.as_deref());
     // A scalar float came back as f64 bits (see float_register_as_double).
     let hty = if is_float_scalar(&call.plan.ret) { &HostTy::F64 } else { &call.plan.ret_hty };
-    let mut guest = vec![0u8; call.plan.ret.guest_size() as usize];
+    let mut guest = Bytes::zeroed(call.plan.ret.guest_size() as usize);
     to_guest(&call.plan.ret, hty, &host, &mut guest, b)?;
     if call.not_found && matches!(call.plan.ret, Ty::Int { .. }) {
         not_found_to_guest(&host, &mut guest);
@@ -1206,12 +1284,17 @@ impl GuestOut {
 /// Converts a host call (registers in `frame`) into guest words by the
 /// guest method's own type encoding.
 pub fn prepare_guest_call(sig: &Signature, frame: &HostFrame, b: &mut dyn Boundary) -> Result<PreparedGuestCall, String> {
+    let host_types = sig.args.iter().map(|ty| host_ty(ty, false)).collect::<Result<Vec<_>, _>>()?;
+    prepare_guest_call_typed(sig, &host_types, frame, b)
+}
+
+/// `prepare_guest_call` with each argument's host type already known.
+pub fn prepare_guest_call_typed(sig: &Signature, host_types: &[HostTy], frame: &HostFrame, b: &mut dyn Boundary) -> Result<PreparedGuestCall, String> {
     let mut words = vec![0u32; sig.guest_total_words() as usize];
     let mut reader = ArgReader { frame, ngrn: 0, nsrn: 0, slot: 0 };
     let mut outs = Vec::new();
-    for (index, (ty, at)) in sig.args.iter().zip(sig.guest_arg_words()).enumerate() {
-        let hty = host_ty(ty, false)?;
-        let host = reader.take(&hty, is_float_scalar(ty));
+    for (index, ((ty, at), hty)) in sig.args.iter().zip(sig.guest_arg_words()).zip(host_types).enumerate() {
+        let host = reader.take(hty, is_float_scalar(ty));
         if let Ty::Pointer(pointee) = ty {
             let h = host_u64(&host) as usize;
             if h != 0 && b.guest_address(h).is_none() && typed_pointee(pointee) {

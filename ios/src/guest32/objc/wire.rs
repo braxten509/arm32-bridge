@@ -3,7 +3,7 @@
 //! Objective-C runtime function, the data imports the game's classes and
 //! constants bind to, and setting up the game's classes after loading.
 
-use super::bridge::{dispatch_from_host, install, is_host_object, run_loads as run_guest_loads, Bridge, GuestSide, Special};
+use super::bridge::{dispatch_from_host, install, is_host_object, run_loads as run_guest_loads, Bridge, GuestSide, SendKind, Special};
 use super::functions::{call_function, functions, Ctx, HOST_FUNCTIONS};
 use super::{exceptions, mirror};
 use arm32_bridge::ios32::Program;
@@ -26,6 +26,9 @@ pub struct Translator;
 impl GuestSide for Translator {
     fn read(&self, addr: u32, len: u32) -> Vec<u8> {
         runtime::mem().bytes(addr, len as usize).to_vec()
+    }
+    fn read_u32(&self, addr: u32) -> u32 {
+        runtime::mem().read_u32(addr)
     }
     fn write(&self, addr: u32, data: &[u8]) {
         runtime::mem().write_bytes(addr, data)
@@ -97,32 +100,70 @@ fn with_engine<R>(uc: &mut Uc, f: impl FnOnce() -> R) -> R {
     result
 }
 
-/// The stand-ins that send a message.
-const SENDS: [&str; 4] = ["objc_msgSend", "objc_msgSend_stret", "objc_msgSendSuper2", "objc_msgSendSuper2_stret"];
-
-/// The handler behind every Objective-C runtime function.
+/// The handler behind every Objective-C runtime function but the message sends.
 fn objc_handler(uc: &mut Uc, args: &mut Args) -> Ret {
+    let name = uc.get_data().current_call;
+    handle(uc, args, false, |c, words| call_function(c, name, words))
+}
+
+/// The message sends, each straight to its kind (no lookup by name).
+fn send_normal(uc: &mut Uc, args: &mut Args) -> Ret {
+    handle(uc, args, true, |c, words| super::functions::send(c, words, SendKind::Normal))
+}
+
+fn send_stret(uc: &mut Uc, args: &mut Args) -> Ret {
+    handle(uc, args, true, |c, words| super::functions::send(c, words, SendKind::Stret))
+}
+
+fn send_super(uc: &mut Uc, args: &mut Args) -> Ret {
+    handle(uc, args, true, |c, words| super::functions::send(c, words, SendKind::Super2))
+}
+
+fn send_super_stret(uc: &mut Uc, args: &mut Args) -> Ret {
+    handle(uc, args, true, |c, words| super::functions::send(c, words, SendKind::Super2Stret))
+}
+
+/// A call's argument words, read from the engine as they are first asked
+/// for; the first 24 kept in place (a message rarely has more).
+struct ArgWords<'a> {
+    args: &'a mut Args,
+    got: [u32; 24],
+    len: usize,
+    more: Vec<u32>,
+}
+
+impl ArgWords<'_> {
+    fn word(&mut self, i: u32) -> u32 {
+        let i = i as usize;
+        while self.len <= i {
+            let value = self.args.u32();
+            if self.len < self.got.len() {
+                self.got[self.len] = value;
+            } else {
+                self.more.push(value);
+            }
+            self.len += 1;
+        }
+        if i < self.got.len() { self.got[i] } else { self.more[i - self.got.len()] }
+    }
+}
+
+/// Runs an Objective-C runtime function: `is_send` for the message sends,
+/// which may jump straight into a game method.
+fn handle(uc: &mut Uc, args: &mut Args, is_send: bool, call: impl FnOnce(&Ctx, &dyn Fn(u32) -> u32) -> Result<u64, String>) -> Ret {
     let name = uc.get_data().current_call;
     let Some(bridge) = bridge() else {
         runtime::stop_with_fault(uc, format!("{name} called before the Objective-C bridge was set up"));
         return Ret::Void;
     };
-    let read = RefCell::new((args, Vec::<u32>::new()));
-    let words = |i: u32| {
-        let mut state = read.borrow_mut();
-        while state.1.len() <= i as usize {
-            let value = state.0.u32();
-            state.1.push(value);
-        }
-        state.1[i as usize]
-    };
+    let read = RefCell::new(ArgWords { args, got: [0; 24], len: 0, more: Vec::new() });
+    let words = |i: u32| read.borrow_mut().word(i);
     // A message to a plain game method jumps into it from here (see
     // allow_jump): no nested call, so it gets the caller's stack words too.
-    super::bridge::allow_jump(SENDS.contains(&name));
+    super::bridge::allow_jump(is_send);
     // An exception raised meanwhile (by host code, or a game exception that
     // escaped a nested game call) is thrown here, in the game code that called.
-    let (result, raised) =
-        crate::fw::exception::catching(|| with_engine(uc, || call_function(&Ctx { bridge, g: &Translator }, name, &words)));
+    let (result, raised) = crate::fw::exception::catching(|| with_engine(uc, || call(&Ctx { bridge, g: &Translator }, &words)));
     super::bridge::allow_jump(false);
     let jump = super::bridge::take_jump();
     let raised = match raised.map(|host| bridge.lock().unwrap_or_else(|e| e.into_inner()).guest_object(&Translator, host)) {
@@ -216,7 +257,14 @@ fn exception_terminate(uc: &mut Uc, _: &mut Args) -> Ret {
 /// Registers the Objective-C runtime functions (before loading).
 pub fn register() {
     for name in functions().iter().map(|f| f.0).chain(HOST_FUNCTIONS.iter().map(|f| f.0)) {
-        super::super::function(name, objc_handler);
+        let handler: fn(&mut Uc, &mut Args) -> Ret = match name {
+            "objc_msgSend" => send_normal,
+            "objc_msgSend_stret" => send_stret,
+            "objc_msgSendSuper2" => send_super,
+            "objc_msgSendSuper2_stret" => send_super_stret,
+            _ => objc_handler,
+        };
+        super::super::function(name, handler);
     }
     super::super::function("UIApplicationMain", ui_application_main);
     super::super::function(exceptions::THROW, exception_throw);
@@ -416,6 +464,15 @@ fn game_field(object: crate::objc::runtime::Id, name: &str) -> Option<crate::fw:
 /// Defines the host mirrors of the game's classes and makes selector
 /// references unique. Runs after `load`.
 pub fn install_program() -> Result<(), String> {
+    // Translated code jumps straight to remembered game methods
+    // (dynarec::send_cache; the stand-ins exist once runtime::init ran).
+    // Test switch IOS_SEND_LANE=0 turns it off.
+    if std::env::var("IOS_SEND_LANE").map_or(true, |v| v != "0") {
+        let lane = arm32_bridge::runtime::send_cache("objc_msgSend");
+        with_bridge(|b| super::bridge::use_lane(b, lane));
+    } else {
+        crate::log!("objc_msgSend: no lane (IOS_SEND_LANE=0)");
+    }
     let (bridge, md) = (bridge().ok_or("no Objective-C bridge")?, METADATA.get().ok_or("no metadata")?);
     install(bridge, &Translator, md)?;
     super::bridge::set_block_owner(&Translator);

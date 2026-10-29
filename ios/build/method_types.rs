@@ -319,7 +319,7 @@ fn words(text: &str) -> Vec<String> {
 /// Words that name a count, index or option (NSInteger/NSUInteger).
 const INTEGER_WORDS: &[&str] = &[
     "index", "indexes", "count", "length", "capacity", "options", "style", "mode", "tag", "location", "limit",
-    "priority", "state", "flags", "mask", "level", "section", "row", "item", "unit", "units", "policy", "behavior",
+    "priority", "state", "status", "flags", "mask", "level", "section", "row", "item", "unit", "units", "policy", "behavior",
     "encoding", "alignment", "orientation", "persistence", "hash", "integer", "position", "seconds", "milliseconds",
 ];
 /// Words that name a block.

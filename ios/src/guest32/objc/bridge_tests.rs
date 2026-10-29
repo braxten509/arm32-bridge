@@ -312,6 +312,58 @@ fn a_repeated_game_message_uses_the_remembered_method_until_the_game_adds_one() 
 }
 
 #[test]
+fn a_repeated_host_call_into_a_game_method_is_remembered_until_the_game_replaces_it() {
+    // Card flips spent ~1.3 ms per burst finding the same game methods by
+    // name for the host's calls. The answer is now remembered per (class,
+    // selector), and forgotten when the game's methods change.
+    host_class("G32HostEntryPanel");
+    let fake = Fake::new();
+    let card = class32(fake, "G32EntryCard", ClassTarget::External("G32HostEntryPanel".into()), "G32HostEntryPanel", vec![method("flip:", "i12@0:4i8", 0x2301)]);
+    let class = card.address;
+    let md = ObjcMetadata32 { classes: vec![card], ..Default::default() };
+    let bridge = Mutex::new(Bridge::new(&md).unwrap());
+    install(&bridge, fake, &md).unwrap();
+    fake.code(0x2301, |w| u64::from(w[2]) + 1);
+    fake.code(0x2311, |w| u64::from(w[2]) + 100);
+    let sel = |name: &str| bridge.lock().unwrap().guest_selector(fake, name);
+    let object = send(&bridge, fake, &[class, sel("alloc")]).unwrap() as u32;
+    let host = bridge.lock().unwrap().host_object(object).unwrap();
+    let flip = runtime::sel("flip:");
+    let call = |n: u64| {
+        let mut frame = HostFrame { x: [host as u64, flip as u64, n, 0, 0, 0, 0, 0, 0], ..Default::default() };
+        dispatch_from_host(&bridge, fake, &mut frame).unwrap();
+        frame.ret.x[0]
+    };
+    assert_eq!(call(1), 2);
+    assert!(bridge.lock().unwrap().classes.cached_guest_entry(class, flip as usize).is_some(), "the answer is remembered");
+    assert_eq!(call(2), 3);
+    // The game swaps the method's code: the new code runs from now on.
+    assert_eq!(bridge.lock().unwrap().classes.replace_method(class, "flip:", 0x2311), Some(0x2301));
+    assert_eq!(call(3), 103);
+}
+
+#[test]
+fn a_host_address_reused_by_another_class_gets_its_own_game_object() {
+    // A freed object's address can come back as another class's object:
+    // the game object remembered for the address must not be handed out.
+    let other = host_class("G32HostReusePanel");
+    let fake = Fake::new();
+    let card = class32(fake, "G32ReuseCard", ClassTarget::External("G32HostReusePanel".into()), "G32HostReusePanel", vec![]);
+    let class = card.address;
+    let md = ObjcMetadata32 { classes: vec![card], ..Default::default() };
+    let bridge = Mutex::new(Bridge::new(&md).unwrap());
+    install(&bridge, fake, &md).unwrap();
+    let sel = |name: &str| bridge.lock().unwrap().guest_selector(fake, name);
+    let object = send(&bridge, fake, &[class, sel("alloc")]).unwrap() as u32;
+    let mut b = bridge.lock().unwrap();
+    let host = b.host_object(object).unwrap();
+    assert_eq!(b.guest_object(fake, host).unwrap(), object);
+    assert_eq!(b.guest_object(fake, host).unwrap(), object, "asked again");
+    unsafe { *(host as *mut usize) = other };
+    assert_ne!(b.guest_object(fake, host).unwrap(), object);
+}
+
+#[test]
 fn bytes_asks_a_game_override_of_length_without_holding_the_bridge() {
     host_class("G32HostBlobBase");
     let fake = Fake::new();
@@ -741,6 +793,59 @@ fn a_game_setter_on_an_observed_game_object_tells_the_observer() {
     let host = bridge.lock().unwrap().host_object(object).unwrap();
     let heard = std::mem::take(&mut *KVO_HEARD.lock().unwrap());
     assert_eq!(heard, [("spell".to_string(), host, hex)]);
+}
+
+/// Translated code jumps straight to what objc_msgSend's lane holds
+/// (dynarec::send_cache). A game method the bridge found goes in, and a
+/// method change empties it; a setter KVO announces must keep coming back
+/// to the bridge, so observing it empties the lane and it stays out.
+#[test]
+fn remembered_game_methods_go_into_the_send_lane_but_not_observed_setters() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(crate::run::setup);
+    let watcher_class = {
+        let mut rt = runtime::lock();
+        let root = rt.by_name["NSObject"];
+        let class = rt.define_class("G32LaneWatcher", root, 8);
+        let observe = rt.sel("observeValueForKeyPath:ofObject:change:context:");
+        rt.add_method(class, observe, host_observe as usize);
+        class
+    };
+    let fake = Fake::new();
+    let wand = class32(fake, "G32LaneWand", ClassTarget::External("NSObject".into()), "NSObject", vec![method("setCharm:", "v12@0:4@8", 0x2501), method("charm", "@8@0:4", 0x2511)]);
+    let class = wand.address;
+    let md = ObjcMetadata32 { classes: vec![wand], ..Default::default() };
+    let bridge: &'static Mutex<Bridge> = Box::leak(Box::new(Mutex::new(Bridge::new(&md).unwrap())));
+    install(bridge, fake, &md).unwrap();
+    let lane = arm32_bridge::dynarec::send_cache::SendCache::leaked();
+    use_lane(&mut bridge.lock().unwrap(), lane);
+    let _hook = mirror::DISPATCH_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    mirror::set_dispatch(Box::new(move |frame: &mut HostFrame| {
+        dispatch_from_host(bridge, fake, frame).unwrap();
+    }));
+    static CHARM: Mutex<u32> = Mutex::new(0);
+    fake.code(0x2501, |w| {
+        *CHARM.lock().unwrap() = w[2];
+        0
+    });
+    fake.code(0x2511, |_| u64::from(*CHARM.lock().unwrap()));
+    let sel = |name: &str| bridge.lock().unwrap().guest_selector(fake, name);
+    let guest = |host: Id| bridge.lock().unwrap().guest_object(fake, host).unwrap();
+    let object = send(bridge, fake, &[class, sel("alloc")]).unwrap() as u32;
+    let (set_charm, charm) = (sel("setCharm:"), sel("charm"));
+    send(bridge, fake, &[object, charm]).unwrap();
+    send(bridge, fake, &[object, set_charm, 0]).unwrap();
+    assert_eq!((lane.get(class, charm), lane.get(class, set_charm)), (Some(0x2511), Some(0x2501)));
+    let watcher = guest(runtime::alloc_instance(watcher_class));
+    let key = guest(crate::fw::string::make("charm"));
+    send(bridge, fake, &[object, sel("addObserver:forKeyPath:options:context:"), watcher, key, 1, 0]).unwrap();
+    assert_eq!(lane.get(class, set_charm), None, "observing the key empties the lane");
+    send(bridge, fake, &[object, set_charm, 0]).unwrap();
+    send(bridge, fake, &[object, charm]).unwrap();
+    assert_eq!((lane.get(class, charm), lane.get(class, set_charm)), (Some(0x2511), None), "the observed setter stays out");
+    send(bridge, fake, &[object, sel("removeObserver:forKeyPath:"), watcher, key]).unwrap();
+    assert!(bridge.lock().unwrap().classes.add_method(class, "glow", 0x2521, "v8@0:4"));
+    assert_eq!(lane.get(class, charm), None, "a new method empties the lane");
 }
 
 static MANUAL_KVO_HEARD: Mutex<Vec<(String, Id, Id)>> = Mutex::new(Vec::new());

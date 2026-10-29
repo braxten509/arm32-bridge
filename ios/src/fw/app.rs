@@ -37,6 +37,7 @@ fn class_for_name(name: Id, fallback: &str) -> Class {
 /// UIApplicationMain(argc, argv, principal class name, delegate class name).
 extern "C" fn ui_application_main(_argc: i32, _argv: usize, principal: Id, delegate_name: Id) -> i32 {
     crate::fw::runloop::mark_main_thread();
+    crate::fw::texture_cache::start();
     // Before anything is shown: the first screen's line must find its tap.
     crate::fw::touch::schedule_test_taps();
     crate::report::stop_when_line_appears();

@@ -1164,7 +1164,7 @@ extern "C" fn compressed_tex_image_2d(target: Enum, level: i32, internal: Enum, 
         let given = (size.max(0) as usize).min(needed);
         let pixels = read_source(&unpack, data, given).and_then(|mut bytes| {
             bytes.resize(needed, 0);
-            crate::fw::pvrtc::decode(&bytes, width as u32, height as u32, two_bits)
+            crate::fw::texture_cache::unpacked(&bytes, width as u32, height as u32, internal, || crate::fw::pvrtc::decode(&bytes, width as u32, height as u32, two_bits))
         });
         match pixels {
             Some(rgba) => upload_plain(&unpack, || unsafe { glTexImage2D(target, level, RGBA as i32, width, height, border, RGBA, UNSIGNED_BYTE, rgba.as_ptr()) }),

@@ -7,6 +7,7 @@
 
 pub mod check;
 pub mod emit;
+pub mod send_cache;
 pub mod thumb;
 
 mod engine;

@@ -39,15 +39,30 @@ class IosPicturesView(context: Context) : View(context) {
     private sealed interface Item
 
     private class Picture(
-        /** The view's own points to screen points. */
-        val place: Matrix,
+        /** The list line's numbers (see `picture`). */
+        val n: FloatArray,
         val area: RectF, val alpha: Float, val mode: Int, val width: Float, val height: Float,
         /** The screen area (points) it may draw in: its clipping views' bounds. */
         val clip: RectF,
-        /** A rounded rectangle (points) it is also cut to: a layer's round corners (masksToBounds). */
-        val corner: Path?,
         val path: String,
-    ) : Item
+    ) : Item {
+        // Its Matrix is set when drawn and its Path made then, not when the list is read: a list
+        // holds a picture for each of its coming frames, and making a native Matrix (and Path)
+        // for each was much of a list's reading time on the phone.
+        /** Sets `m` to the view's own points to screen points: a, b, c, d, tx, ty as Apple writes
+         * them (x' = a x + c y + tx, y' = b x + d y + ty); with perspective (a layer turned in
+         * 3D) both divided by p0 x + p1 y + w. */
+        fun place(m: Matrix, values: FloatArray) {
+            val p = if (n.size == 19 || n.size == 25) n.size - 3 else -1
+            values[0] = n[0]; values[1] = n[2]; values[2] = n[4]; values[3] = n[1]; values[4] = n[3]; values[5] = n[5]
+            values[6] = if (p < 0) 0f else n[p]; values[7] = if (p < 0) 0f else n[p + 1]; values[8] = if (p < 0) 1f else n[p + 2]
+            m.setValues(values)
+        }
+        /** A rounded rectangle (points) it is also cut to: a layer's round corners (masksToBounds). */
+        val corner: Path? by lazy(LazyThreadSafetyMode.NONE) {
+            if (n.size >= 22) Path().apply { addRoundRect(RectF(n[16], n[17], n[16] + n[18], n[17] + n[19]), n[20], n[21], Path.Direction.CW) } else null
+        }
+    }
 
     /** A layer's CATransition: what it showed before and what it shows now. */
     private class Transition(val look: IosPictureList.Transition, val old: List<Item>, val new: List<Item>) : Item {
@@ -58,8 +73,18 @@ class IosPicturesView(context: Context) : View(context) {
         }
     }
 
-    /** A frame's pictures and how much of the OpenGL picture shows with them. */
-    private class Frame(val time: Long, val items: List<Item>, val gl: Float)
+    /** Pictures cut to a turned layer's bounds: its four corners on screen (points). */
+    private class Cut(corners: FloatArray, val items: List<Item>) : Item {
+        val shape = Path().apply {
+            moveTo(corners[0], corners[1])
+            for (i in 2 until corners.size step 2) lineTo(corners[i], corners[i + 1])
+            close()
+        }
+    }
+
+    /** A frame's pictures and how much of the OpenGL picture shows with them; `card`: the seam
+     * gauge's box (IosPictureList.Frame), logged as the frame is drawn. */
+    private class Frame(val time: Long, val items: List<Item>, val gl: Float, val card: FloatArray? = null)
 
     private var screenWidth = 0f
     private var screenHeight = 0f
@@ -67,7 +92,13 @@ class IosPicturesView(context: Context) : View(context) {
     /** Decoded pictures by file, least recently used first; null when a file can't be read here. */
     private val bitmaps = LinkedHashMap<String, Bitmap?>(64, 0.75f, true)
     private val paint = Paint(Paint.FILTER_BITMAP_FLAG)
+    /** Set to each picture's place as it is drawn (UI thread; the canvas copies it). */
+    private val placing = Matrix()
+    private val placingValues = FloatArray(9)
     private val decoder = Executors.newSingleThreadExecutor { Thread(it, "ios-pictures") }
+    /** Where a list's new pictures are decoded side by side (a new card's face and its parts
+     * took ~30 ms one after another, holding the list and the ones behind it). */
+    private val decoders = Executors.newFixedThreadPool(3) { Thread(it, "ios-picture-decode") }
     /** The newest list's number, and the number of the list shown. */
     private var newest = 0L
     private var shown = 0L
@@ -89,24 +120,115 @@ class IosPicturesView(context: Context) : View(context) {
      * the game shows a new OpenGL view's frames from then, under the list that put it up. */
     var onUp: (Long) -> Unit = {}
 
-    /** List `id` from the iPhone layer (on the UI thread). */
-    fun show(list: String, id: Long) {
+    /** Writes live scene `scene`'s frame at `time` into the buffer (the game's nativeLiveFrame):
+     * its length, -1 when it can't, -2 when the buffer is too small. */
+    var liveFrame: (scene: Long, time: Long, into: java.nio.ByteBuffer) -> Int = { _, _, _ -> -1 }
+
+    /** Tells the game a live scene is let go (the game's nativeLiveRelease). */
+    var liveRelease: (scene: Long) -> Unit = {}
+
+    /** Tells the game how far ahead of its drawing a frame shows (the game's nativeAnimationLead). */
+    var animationLead: (nanos: Long) -> Unit = {}
+    /** The presentation leads measured (`PresentLead`), told to the game when they change. */
+    private val presentLead = PresentLead { animationLead(it) }
+
+    /** The live scenes shown or on their way: let go only when neither (UI thread). */
+    private val scenes = LiveScenes { liveRelease(it) }
+    private val main = android.os.Handler(android.os.Looper.getMainLooper())
+
+    /** The live scene of the list up (IOS_PHONE_ANIM=1) and its files; null: the list's own frames. */
+    private var liveScene: Long? = null
+    private var liveFiles = emptyList<String>()
+    private var liveBytes = java.nio.ByteBuffer.allocateDirect(1 shl 16)
+    /** Live frames' times to work out and read (nanoseconds), logged now and then while measuring. */
+    private val liveNanos = ArrayList<Long>()
+    /** The list up draws each frame for when it will show (its "clock present" line). */
+    private var presentClock = false
+    /** The coming frame's vsync time and when the display will show it (Choreographer's frame data). */
+    private var vsyncFrame = 0L
+    private var vsyncShows = 0L
+    private var vsyncAsked = false
+
+    /** A list read, with its frames' pictures placed and the files it shows. */
+    private class Read(val list: IosPictureList, val frames: List<Frame>, val paths: Set<String>)
+
+    /** List `id` from the iPhone layer (on the UI thread). It is read on the decoder's thread (a
+     * long list took a few screen refreshes to read, holding up the frames drawn meanwhile); the
+     * lists still go up in order, as that thread takes them one at a time. */
+    fun show(list: String, id: Long, sent: Long = System.nanoTime()) {
+        // Its scene is held from now until the list is up or dropped (after `close`, let go at once).
+        val scene = IosPictureList.liveScene(list)
+        scenes.read(scene)
         // After the view left its window the decoder is shut down; lists still on their way are dropped.
         if (decoder.isShutdown) return
-        val parsed = IosPictureList.parse(list) ?: return onUp(id)
         val number = ++newest
         ids[number] = id
-        val missing = parsed.paths().filter { it !in bitmaps }
-        if (missing.isEmpty()) {
-            use(number, parsed)
+        val times = Times(sent, System.nanoTime())
+        if (measuring) timing[number] = times
+        decoder.execute {
+            times.parseStart = System.nanoTime()
+            val parsed = IosPictureList.parse(list)
+            val read = parsed?.let { p ->
+                Read(p, p.frames.map { frame -> Frame(frame.time, items(frame.lines.iterator(), top = true), frame.glShown ?: p.glShown, frame.card) }, p.paths())
+            }
+            times.parsed = System.nanoTime()
+            // (The main thread's own queue: a view's post waits for it to be attached again.)
+            main.post { up(number, id, read, scene) }
+        }
+    }
+
+    /** When a list was sent, reached the UI thread, began and ended being read, had its new
+     * pictures decoded (how many), went up, was drawn: logged when it took long, to measure. */
+    private class Times(val sent: Long, val ui: Long) {
+        var parseStart = 0L; var parsed = 0L; var decoded = 0L; var pictures = 0; var used = 0L; var drawn = 0L
+    }
+    private val timing = java.util.concurrent.ConcurrentHashMap<Long, Times>()
+    /** The game's test switch IOS_DRAW_LOG=1 (setprop debug.gamebridge.ios.env) also turns on
+     * these timings and the "ran out" lines (logcat GameBridge). */
+    private val measuring: Boolean by lazy {
+        runCatching {
+            Class.forName("android.os.SystemProperties").getMethod("get", String::class.java).invoke(null, "debug.gamebridge.ios.env") as String
+        }.getOrNull()?.split(';')?.any { it.trim() == "IOS_DRAW_LOG=1" } == true
+    }
+    /** The number here of the list `up` stands for. */
+    private var drawing = 0L
+    /** The iPhone layer's number of the list being drawn (the seam gauge's log). */
+    private var drawingId = 0L
+
+    private fun logTimes(number: Long) {
+        val t = timing.remove(number) ?: return
+        timing.keys.removeAll { it < number }
+        val now = System.nanoTime()
+        fun ms(a: Long, b: Long) = if (a == 0L || b == 0L) -1.0 else (b - a) / 1e6
+        if (now - t.sent > 20_000_000L) {
+            android.util.Log.i("GameBridge", "pictures: list $number up %.1f ms after sent: to UI %.1f, queued %.1f, read %.1f, %d new pictures %.1f, to use %.1f, to draw %.1f, to commit %.1f".format(
+                (now - t.sent) / 1e6, ms(t.sent, t.ui), ms(t.ui, t.parseStart), ms(t.parseStart, t.parsed), t.pictures,
+                if (t.pictures > 0) ms(t.parsed, t.decoded) else 0.0, ms(if (t.decoded != 0L) t.decoded else t.parsed, t.used), ms(t.used, t.drawn), ms(t.drawn, now)))
+        }
+    }
+
+    /** List `number` read (on the UI thread): up now, or once its new picture files are decoded. */
+    private fun up(number: Long, id: Long, read: Read?, scene: Long?) {
+        if (read == null) {
+            scenes.dropped(scene)
+            ids.remove(number)
+            onUp(id)
             return
         }
+        val missing = read.paths.filter { it !in bitmaps }
+        if (missing.isEmpty() || decoder.isShutdown) {
+            use(number, read)
+            return
+        }
+        timing[number]?.pictures = missing.size
         decoder.execute {
-            val decoded = missing.associateWith { decode(it) }
-            post {
+            val decoded = if (missing.size == 1) mapOf(missing[0] to decode(missing[0]))
+                else missing.map { path -> decoders.submit<Bitmap?> { decode(path) } }.let { jobs -> missing.zip(jobs) { path, job -> path to job.get() }.toMap() }
+            timing[number]?.decoded = System.nanoTime()
+            main.post {
                 bitmaps.putAll(decoded)
                 // A newer list may have gone up meanwhile: only its pictures are kept.
-                use(number, parsed)
+                use(number, read)
             }
         }
     }
@@ -117,10 +239,16 @@ class IosPicturesView(context: Context) : View(context) {
         BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.also { it.prepareToDraw() }
     }.getOrNull()
 
-    private fun use(number: Long, list: IosPictureList) {
+    private fun use(number: Long, read: Read) {
+        val list = read.list
         val id = ids.remove(number)
-        if (number <= shown) return
+        if (number <= shown) {
+            scenes.dropped(list.live)
+            return
+        }
         shown = number
+        timing[number]?.used = System.nanoTime()
+        drawing = number
         // Older lists still decoding won't go up; the newest up says for them.
         ids.keys.removeAll { it < number }
         // A transition that began since: the GL picture's cover goes with it from what showed
@@ -135,8 +263,23 @@ class IosPicturesView(context: Context) : View(context) {
         }
         screenWidth = list.screenWidth
         screenHeight = list.screenHeight
-        frames = list.frames.map { frame -> Frame(frame.time, items(frame.lines.iterator(), top = true), frame.glShown ?: list.glShown) }
-        trim(list.paths())
+        // Moving pictures whose coming frames ran out before this list came stood still meanwhile
+        // (a card held edge-on between the two halves of its turn): logged, to measure.
+        if (measuring && frames.size > 1) {
+            val ranOut = (now + refreshNanos() - frames.last().time) / 1e6
+            if (ranOut > 0 && ranOut < 500) android.util.Log.i("GameBridge", "pictures: coming frames ran out %.1f ms before list $number".format(ranOut))
+        }
+        frames = read.frames
+        liveScene = list.live
+        scenes.up(list.live)
+        liveFiles = list.files
+        presentClock = list.presentClock
+        drawingId = id ?: 0L
+        // The seam gauge: when this list went, was read, had its pictures decoded and went up.
+        if (measuring && frames.any { it.card != null }) timing[number]?.let { t ->
+            android.util.Log.i("GameBridge", "pictures: seam list $drawingId sent ${t.sent} ui ${t.ui} read ${t.parsed} decoded ${t.decoded} pictures ${t.pictures} used ${t.used}")
+        }
+        trim(read.paths)
         invalidate()
         // Said once the frame drawing it is handed on to the screen (onDraw), not before:
         // the game's next OpenGL frame would else reach the screen a refresh ahead of it.
@@ -155,6 +298,7 @@ class IosPicturesView(context: Context) : View(context) {
                     val new = items(lines)
                     out.add(Transition(line.transition!!, old, new))
                 }
+                "cut" -> out.add(Cut(line.numbers, items(lines)))
                 else -> if (!top) return out
             }
         }
@@ -173,15 +317,8 @@ class IosPicturesView(context: Context) : View(context) {
 
     private fun picture(line: IosPictureList.Line): Picture {
         val n = line.numbers
-        // a, b, c, d, tx, ty as Apple writes them: x' = a x + c y + tx, y' = b x + d y + ty;
-        // with perspective (a layer turned in 3D) both divided by p0 x + p1 y + w.
-        val perspective = if (n.size == 19 || n.size == 25) floatArrayOf(n[n.size - 3], n[n.size - 2], n[n.size - 1]) else floatArrayOf(0f, 0f, 1f)
-        val place = Matrix().apply { setValues(floatArrayOf(n[0], n[2], n[4], n[1], n[3], n[5], perspective[0], perspective[1], perspective[2])) }
         val clip = RectF(n[12], n[13], n[12] + n[14], n[13] + n[15])
-        val corner = if (n.size >= 22) {
-            Path().apply { addRoundRect(RectF(n[16], n[17], n[16] + n[18], n[17] + n[19]), n[20], n[21], Path.Direction.CW) }
-        } else null
-        return Picture(place, RectF(0f, 0f, n[6], n[7]), n[8], n[9].toInt(), n[10], n[11], clip, corner, line.path)
+        return Picture(n, RectF(0f, 0f, n[6], n[7]), n[8], n[9].toInt(), n[10], n[11], clip, line.path)
     }
 
     /** Lets go of the least recently used pictures not in use beyond KEPT_BYTES. */
@@ -198,17 +335,30 @@ class IosPicturesView(context: Context) : View(context) {
 
     /** Whether a transition in `items` still runs at `time`. */
     private fun running(items: List<Item>, time: Long): Boolean =
-        items.any { it is Transition && (!it.look.doneAt(time) || running(it.new, time)) }
+        items.any { it is Transition && (!it.look.doneAt(time) || running(it.new, time)) || it is Cut && running(it.items, time) }
 
     override fun onDraw(canvas: Canvas) {
         up?.let { id ->
             up = null
-            viewTreeObserver.registerFrameCommitCallback { onUp(id) }
+            val number = drawing
+            timing[number]?.drawn = System.nanoTime()
+            viewTreeObserver.registerFrameCommitCallback { logTimes(number); onUp(id) }
         }
         if (frames.isEmpty() || screenWidth <= 0f || screenHeight <= 0f) return
-        // The frame for when this one reaches the screen, about a refresh from now.
-        val time = System.nanoTime() + refreshNanos()
-        val frame = frameAt(time)
+        // The frame for when this one reaches the screen: about a refresh from now, or (the "clock
+        // present" lists) when the display will show it, as Choreographer says for this vsync.
+        val now = System.nanoTime()
+        if (presentClock) askVsync()
+        val time = if (presentClock && vsyncShows > 0 && now - vsyncFrame < 2 * refreshNanos()) vsyncShows else now + refreshNanos()
+        if (presentClock && time == vsyncShows) presentLead.drawn(time - now)
+        val listed = frameAt(time)
+        val live = liveScene?.let { scene -> liveFrameAt(scene, time, listed.gl) }
+        val frame = live?.first ?: listed
+        if (live?.second == true) postInvalidateOnAnimation()
+        frame.card?.let { card ->
+            if (measuring) android.util.Log.i("GameBridge", "pictures: seam drawn $time at $now list $drawingId card " +
+                if (card.size == 4) String.format(java.util.Locale.ROOT, "%.3f %.3f %.3f %.3f", card[0], card[1], card[2], card[3]) else "none")
+        }
         if (frames.size > 1 && frames.last().time > time || running(frame.items, time) || glNanos > 0 && time - glStart < glNanos) {
             postInvalidateOnAnimation()
         }
@@ -255,6 +405,12 @@ class IosPicturesView(context: Context) : View(context) {
         for (item in items) when (item) {
             is Picture -> draw(canvas, item, alpha)
             is Transition -> draw(canvas, item, alpha, time)
+            is Cut -> {
+                canvas.save()
+                canvas.clipPath(item.shape)
+                draw(canvas, item.items, alpha, time)
+                canvas.restore()
+            }
         }
     }
 
@@ -266,7 +422,8 @@ class IosPicturesView(context: Context) : View(context) {
         canvas.save()
         canvas.clipRect(picture.clip)
         picture.corner?.let { canvas.clipPath(it) }
-        canvas.concat(picture.place)
+        picture.place(placing, placingValues)
+        canvas.concat(placing)
         // Fit inside, or fill and crop, keep the picture's shape (by its pixels); the rest place it by its points.
         val (w, h) = if (picture.mode == 1 || picture.mode == 2) bitmap.width.toFloat() to bitmap.height.toFloat() else picture.width to picture.height
         val (l, t, r, b) = ContentMode.place(picture.mode, area.width(), area.height(), w, h).toList()
@@ -480,6 +637,42 @@ class IosPicturesView(context: Context) : View(context) {
         return out
     }
 
+    /** The live scene's frame at `time` (and whether something in it still moves), worked out by
+     * the game from the scene alone; null when it can't (the list's own frame shows). */
+    private fun liveFrameAt(scene: Long, time: Long, gl: Float): Pair<Frame, Boolean>? {
+        val start = System.nanoTime()
+        var length = liveFrame(scene, time, liveBytes)
+        if (length == -2) {
+            liveBytes = java.nio.ByteBuffer.allocateDirect(liveBytes.capacity() * 4)
+            length = liveFrame(scene, time, liveBytes)
+        }
+        if (length <= 0) return null
+        val read = IosPictureList.liveFrame(liveBytes, length, liveFiles) ?: return null
+        val frame = Frame(time, items(read.lines.iterator(), top = true), gl, if (measuring) read.card ?: FloatArray(0) else null)
+        if (measuring) {
+            liveNanos.add(System.nanoTime() - start)
+            if (liveNanos.size >= 240) {
+                val sorted = liveNanos.sorted()
+                android.util.Log.i("GameBridge", "pictures: live frames worked out and read in %.2f ms median, %.2f p90, %.2f most (%d frames)".format(
+                    sorted[sorted.size / 2] / 1e6, sorted[sorted.size * 9 / 10] / 1e6, sorted.last() / 1e6, sorted.size))
+                liveNanos.clear()
+            }
+        }
+        return frame to read.moving
+    }
+
+    /** Asks Choreographer for the coming frame's data (Android 13 and later): when its vsync is
+     * and when the display will show what is drawn for it. */
+    private fun askVsync() {
+        if (vsyncAsked || android.os.Build.VERSION.SDK_INT < 33) return
+        vsyncAsked = true
+        android.view.Choreographer.getInstance().postVsyncCallback { data ->
+            vsyncAsked = false
+            vsyncFrame = data.frameTimeNanos
+            vsyncShows = data.preferredFrameTimeline.expectedPresentationTimeNanos
+        }
+    }
+
     private fun refreshNanos(): Long {
         val hz = display?.refreshRate ?: 60f
         return (1_000_000_000f / hz.coerceAtLeast(1f)).toLong()
@@ -487,7 +680,12 @@ class IosPicturesView(context: Context) : View(context) {
 
     override fun onDetachedFromWindow() {
         super.onDetachedFromWindow()
+        // The decoding pool goes once the lists already given to the decoder are done with it.
+        if (!decoder.isShutdown) decoder.execute { decoders.shutdown() }
         decoder.shutdown()
+        timing.clear()
+        // Scenes of lists still being read or decoded go once each is done with.
+        scenes.close()
     }
 
     private companion object {

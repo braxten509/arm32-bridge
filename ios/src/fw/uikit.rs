@@ -1432,7 +1432,7 @@ fn shown_value(view: Id, key: &str) -> crate::fw::animation::Value {
     match view_state(view).layer {
         0 => model_value(view, key),
         // A view's layer's bounds are the view's (not in animation::model_of).
-        layer if key == "bounds" => crate::fw::animation::presented_value_at(layer, key, model_value(view, key), crate::fw::runloop::media_time()),
+        layer if key == "bounds" => crate::fw::animation::presented_value_at(layer, key, model_value(view, key), crate::fw::runloop::animation_time()),
         layer => crate::fw::animation::shown_value(layer, key).unwrap_or_else(|| model_value(view, key)),
     }
 }
@@ -1481,7 +1481,7 @@ fn view_timing(duration: f64, delay: f64, options: usize) -> BlockTiming {
         curve: view_curve(options >> 16),
         repeat_count: if options & REPEAT != 0 { f64::INFINITY } else { 0.0 },
         autoreverses: options & AUTOREVERSE != 0,
-        asked: crate::fw::runloop::media_time(),
+        asked: crate::fw::runloop::animation_time(),
     };
     BlockTiming { timing, options }
 }
@@ -1714,7 +1714,7 @@ fn delegate_selector(delegate: Id, set: Sel, defaults: &[&str]) -> Sel {
 fn commit_old_animation(mut later: impl FnMut(Box<dyn FnOnce() + Send>)) {
     let Some(mut done) = OLD_ANIMATIONS.lock().unwrap_or_else(|e| e.into_inner()).pop() else { return };
     // An iOS 3 block's animations begin at its commit, not its begin.
-    with_open_timing(|timing| timing.asked = crate::fw::runloop::media_time());
+    with_open_timing(|timing| timing.asked = crate::fw::runloop::animation_time());
     let started = close_block();
     if done.delegate != 0 {
         done.will_start = delegate_selector(done.delegate, done.will_start, &["animationWillStart:context:", "animationWillStart:"]);

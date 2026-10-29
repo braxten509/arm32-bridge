@@ -889,6 +889,16 @@ fn lookup_block(pc: u32) -> (usize, u32, usize, usize) {
 /// like a block (jump table, links); also puts its jump-table entry back if
 /// another pc with the same index took it.
 fn make_lane(pc: u32, index: u32) {
+    make_lane_with(pc, || thumb::light_lane(pc, index, runtime::call_light_from_lane as *const () as usize));
+}
+
+/// A message-sending phone function's lane (thumb::send_lane), made like
+/// `make_lane`'s.
+fn make_send_lane(pc: u32, cache: &super::send_cache::SendCache) {
+    make_lane_with(pc, || thumb::send_lane(pc, cache.table_address()));
+}
+
+fn make_lane_with(pc: u32, generate: impl FnOnce() -> Vec<u32>) {
     let made = |cache: &Cache| {
         let &(code, _) = cache.blocks.get(&pc)?;
         if !cache.unpublished.contains_key(&pc) {
@@ -904,7 +914,7 @@ fn make_lane(pc: u32, index: u32) {
     if made(cache).is_some() {
         return;
     }
-    let code = thumb::light_lane(pc, index, runtime::call_light_from_lane as *const () as usize);
+    let code = generate();
     let address = cache.memory.place(&code);
     CODE_WRITTEN.fetch_add(1, Ordering::Release);
     note_block(address, code.len() * 4, pc);
@@ -952,6 +962,9 @@ pub fn run(uc: &mut Uc, pc: u32, stop_at: u32) -> Result<(), String> {
                 return Err(format!("guest returned to a stale return trap at {address:#010x}"));
             }
             if !runtime::call_light(uc, index) {
+                if let Some(cache) = runtime::send_cache_of(index).filter(|_| linking()) {
+                    make_send_lane(address, cache);
+                }
                 runtime::call_stub(uc, index);
             } else if linking() {
                 make_lane(address, index);

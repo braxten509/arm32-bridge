@@ -35,7 +35,7 @@ impl Ctx<'_> {
         self.bridge.lock().unwrap_or_else(|e| e.into_inner())
     }
     pub(super) fn word(&self, addr: u32) -> u32 {
-        u32::from_le_bytes(self.g.read(addr, 4).try_into().unwrap())
+        self.g.read_u32(addr)
     }
     pub(super) fn set_word(&self, addr: u32, value: u32) {
         self.g.write(addr, &value.to_le_bytes())
@@ -281,7 +281,7 @@ fn get_size_and_alignment(c: &Ctx, w: Words) -> Result<u64, String> {
 }
 
 pub fn call_function(ctx: &Ctx, name: &str, words: Words) -> Result<u64, String> {
-    static TABLE: std::sync::OnceLock<HashMap<&'static str, ObjcFn>> = std::sync::OnceLock::new();
+    static TABLE: std::sync::OnceLock<rustc_hash::FxHashMap<&'static str, ObjcFn>> = std::sync::OnceLock::new();
     let table = TABLE.get_or_init(|| functions().iter().copied().collect());
     if let Some(f) = table.get(name) {
         return f(ctx, words);
@@ -295,7 +295,7 @@ pub fn call_function(ctx: &Ctx, name: &str, words: Words) -> Result<u64, String>
     Ok(u64::from(r.r0) | u64::from(r.r1) << 32)
 }
 
-fn send(c: &Ctx, w: Words, kind: SendKind) -> Result<u64, String> {
+pub(super) fn send(c: &Ctx, w: Words, kind: SendKind) -> Result<u64, String> {
     let keep_going = crate::trap::KEEP_GOING.load(std::sync::atomic::Ordering::Relaxed);
     let r = skip_missing(send_from_guest(c.bridge, c.g, kind, w), keep_going).map_err(|error| {
         // Which message failed, for the log.

@@ -66,6 +66,13 @@ pub fn steps<F: Forwarding>(f: &F) -> Result<Outcome<F::Value>, String> {
             return Ok(Outcome::Target(target));
         }
     }
+    steps_after_target(f)
+}
+
+/// The steps after -forwardingTargetForSelector: answered nil or the
+/// receiver itself.
+pub fn steps_after_target<F: Forwarding>(f: &F) -> Result<Outcome<F::Value>, String> {
+    let nil = F::Value::default();
     if f.responds("methodSignatureForSelector:")? {
         let signature = f.ask("methodSignatureForSelector:")?;
         if signature != nil {

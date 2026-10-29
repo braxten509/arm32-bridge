@@ -39,8 +39,10 @@ use crate::fw::uikit::{property_get, view_state};
 use crate::objc::runtime::{self, Class, Id};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
+
+pub(crate) mod live;
 
 /// One picture to draw.
 #[derive(Clone, Debug, PartialEq)]
@@ -146,11 +148,47 @@ pub const MASK_MARK: &str = "\u{1}mask";
 /// Ends the group.
 pub const END_MARK: &str = "\u{1}end";
 
+/// IOS_PHONE_ANIM=1: what is under a layer turned in 3D that only clips to
+/// its bounds is cut to them where the phone draws it (no group picture
+/// each frame): a CUT_MARK with the turned bounds' four corners on screen
+/// (tabs between the numbers), then its pictures, then an UNCUT_MARK.
+pub const CUT_MARK: &str = "\u{1}cut";
+pub const UNCUT_MARK: &str = "\u{1}uncut";
+
+/// Animations run on the phone (turned clips cut there), as an iPhone's
+/// render server plays them; IOS_PHONE_ANIM=0 turns that off (tests).
+pub fn phone_anim() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    PHONE_ANIM.with(|p| p.get()).unwrap_or_else(|| *ON.get_or_init(|| phone_anim_setting(std::env::var("IOS_PHONE_ANIM").ok().as_deref())))
+}
+
+/// Whether IOS_PHONE_ANIM's value (None: not set) leaves animations on the phone.
+fn phone_anim_setting(value: Option<&str>) -> bool {
+    value != Some("0")
+}
+
+thread_local! {
+    /// A test's own setting of IOS_PHONE_ANIM (`with_phone_anim`).
+    static PHONE_ANIM: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// How many groups (drawn together on this side) `walk` is inside: no cut inside one.
+    static IN_GROUP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The media time a live scene is drawn at (`live`): nodes with `live` are posed then.
+    static LIVE_AT: std::cell::Cell<Option<f64>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn with_phone_anim<T>(on: bool, make: impl FnOnce() -> T) -> T {
+    let before = PHONE_ANIM.with(|p| p.replace(Some(on)));
+    let made = make();
+    PHONE_ANIM.with(|p| p.set(before));
+    made
+}
+
 /// Starts the pictures of a layer a CATransition runs on (`transitions`):
 /// first ":" and the layer, then (once its old pictures follow) a tab and
 /// how the transition runs. Its place and area are the layer's own points
 /// (from its bounds' corner) to screen points.
-const TRANSITION_MARK: &str = "\u{1}transition";
+pub(crate) const TRANSITION_MARK: &str = "\u{1}transition";
 /// Between a transition's old pictures and its new ones.
 const TRANSITION_TO_MARK: &str = "\u{1}transition-to";
 /// Ends a transition's pictures.
@@ -225,12 +263,12 @@ pub struct Node {
     /// Its layer's shadow (the colour's alpha not yet times the opacity).
     pub shadow: Option<Shadow>,
     /// Its layer's mask, in its own points.
-    pub mask: Option<Rc<Node>>,
+    pub mask: Option<Arc<Node>>,
     /// Its layer's sublayerTransform: applied to what is inside it about its
     /// anchor point, in 3D before they flatten into it (a perspective here
     /// shows its sublayers' 3D turns).
     pub sublayer_transform: Option<Transform3D>,
-    pub children: Vec<Rc<Node>>,
+    pub children: Vec<Arc<Node>>,
     /// How deep in the tree it was built: what is under it stops at 64
     /// levels, so it is reused only at the same depth.
     pub depth: usize,
@@ -245,6 +283,62 @@ pub struct Node {
     /// animation changes them (an image view's animationImages); empty:
     /// `pictures` throughout.
     pub picture_motion: Vec<Vec<Shown>>,
+    /// IOS_PHONE_ANIM=1, while Core Animation moves it: its animations as
+    /// plain data, for the phone to work out any frame (`live`).
+    pub live: Option<Arc<LiveAnim>>,
+    /// Its pictures change with the clock without a Core Animation animation
+    /// (an image view's startAnimating, a table cell): it can't run on the phone.
+    pub ticking: bool,
+}
+
+/// A layer's animations as the phone shows them: over its own values
+/// (`model`), at its own time `time.0 * t + time.1` for media time t, its
+/// bounds and anchor point as they stay while they run.
+#[derive(Debug)]
+pub struct LiveAnim {
+    pub programs: Vec<Arc<crate::fw::animation::Program>>,
+    pub model: crate::fw::animation::Shown,
+    pub time: (f64, f64),
+    pub bounds: Rect,
+    pub anchor: Point,
+}
+
+impl LiveAnim {
+    /// Where the layer shows at media time `t`, as the screen shows it.
+    fn pose(&self, t: f64) -> Pose {
+        let shown = crate::fw::animation::present(&self.programs, self.model, self.time.0 * t + self.time.1, true);
+        let size = self.bounds.size;
+        Pose {
+            origin: Point { x: shown.position.x - size.width * self.anchor.x, y: shown.position.y - size.height * self.anchor.y },
+            transform: shown.transform,
+            alpha: shown.opacity,
+            background: shown.background,
+            bounds: self.bounds,
+        }
+    }
+
+    /// When its last animation stops changing what shows (media time; infinity: never).
+    fn end(&self) -> f64 {
+        let local = self.programs.iter().map(|p| p.timing.end()).fold(f64::NEG_INFINITY, f64::max);
+        if self.time.0 > 0.0 { (local - self.time.1) / self.time.0 } else { f64::INFINITY }
+    }
+}
+
+/// IOS_PHONE_ANIM=1: `layer`'s animations for the phone, when they all
+/// change what it can work out by itself (its place, turn and opacity).
+fn live_anim(layer: Id, model: crate::fw::animation::Shown, bounds: Rect, anchor: Point) -> Option<Arc<LiveAnim>> {
+    if layer == 0 || !phone_anim() || !crate::fw::animation::animating(layer) {
+        return None;
+    }
+    let programs = crate::fw::animation::programs(layer);
+    if !programs.iter().all(|p| crate::fw::animation::runs_on_phone(p)) {
+        return None;
+    }
+    // A layer's time is its parents' put through each one's begin, speed and offset: a line.
+    let now = crate::fw::runloop::animation_time();
+    let (at, later) = (crate::fw::layers::local_time(layer, now), crate::fw::layers::local_time(layer, now + 1.0));
+    let scale = later - at;
+    Some(Arc::new(LiveAnim { programs, model, time: (scale, at - scale * now), bounds, anchor }))
 }
 
 /// A view's place in one frame: its frame's origin, transform, alpha and
@@ -260,8 +354,12 @@ pub struct Pose {
 }
 
 impl Node {
-    /// Its place in coming frame `k` (0: now).
+    /// Its place in coming frame `k` (0: now); while a live scene is drawn
+    /// (`live`), at that moment.
     fn pose(&self, k: usize) -> Pose {
+        if let (Some(live), Some(t)) = (&self.live, LIVE_AT.with(|at| at.get())) {
+            return live.pose(t);
+        }
         match k.checked_sub(1).and_then(|i| self.motion.get(i).or(self.motion.last())) {
             Some(pose) if k > 0 => *pose,
             _ => Pose {
@@ -396,7 +494,7 @@ fn with_gl_contents<T>(value: Option<(Id, String)>, make: impl FnOnce() -> T) ->
 
 /// The pictures of each coming frame (see `Sampling`) of the windows, a
 /// running transition's layer's between its marks with its old pictures.
-fn frames(windows: &[Rc<Node>], count: usize) -> Vec<Vec<Picture>> {
+fn frames(windows: &[Arc<Node>], count: usize) -> Vec<Vec<Picture>> {
     let transitions = TRANSITIONS.with(|t| t.borrow().clone());
     let layers = transitions.iter().map(|t| t.layer).collect();
     with_marked(layers, || (0..count.max(1)).map(|k| with_old_pictures(windows.iter().flat_map(|w| flatten_at(w, k)).collect(), &transitions)).collect())
@@ -485,6 +583,147 @@ fn outside(area: Rect, hole: Rect) -> Vec<Rect> {
     .collect()
 }
 
+/// A node's own points (its bounds) to screen points, posed as `pose`, in
+/// `parent` (see `walk`): it turns and scales around its anchor point (the
+/// middle unless moved), flattened into its parent with its perspective.
+fn own_place(node: &Node, pose: &Pose, parent: Option<(Proj, Option<Transform3D>)>) -> Proj {
+    use crate::fw::geometry::concat_3d;
+    use crate::fw::layers::affine_to_3d;
+    let (size, bounds_origin) = (pose.bounds.size, pose.bounds.origin);
+    let anchor = node.anchor.unwrap_or(Point { x: 0.5, y: 0.5 });
+    match parent {
+        None => Proj::affine(moved(-bounds_origin.x, -bounds_origin.y)),
+        Some((parent, step)) => {
+            let centre = (pose.origin.x + size.width * anchor.x, pose.origin.y + size.height * anchor.y);
+            let to_middle = moved(-bounds_origin.x - size.width * anchor.x, -bounds_origin.y - size.height * anchor.y);
+            let local = concat_3d(concat_3d(affine_to_3d(to_middle), pose.transform), affine_to_3d(moved(centre.0, centre.1)));
+            Proj::of_3d(step.map_or(local, |step| concat_3d(local, step))).then(parent)
+        }
+    }
+}
+
+/// A node's own sublayerTransform about its anchor point, for what is inside it.
+fn inner_step(node: &Node, pose: &Pose) -> Option<Transform3D> {
+    use crate::fw::geometry::concat_3d;
+    use crate::fw::layers::affine_to_3d;
+    let (size, bounds_origin) = (pose.bounds.size, pose.bounds.origin);
+    let anchor = node.anchor.unwrap_or(Point { x: 0.5, y: 0.5 });
+    node.sublayer_transform.map(|s| {
+        let at = (bounds_origin.x + size.width * anchor.x, bounds_origin.y + size.height * anchor.y);
+        concat_3d(concat_3d(affine_to_3d(moved(-at.0, -at.1)), s), affine_to_3d(moved(at.0, at.1)))
+    })
+}
+
+/// IOS_DRAW_LOG=1: the screen box of `layer`'s bounds among `windows` in
+/// coming frame `k` (None when it isn't there), as `walk` places it.
+fn layer_box(windows: &[Arc<Node>], layer: Id, k: usize) -> Option<Rect> {
+    fn find(node: &Node, k: usize, parent: Option<(Proj, Option<Transform3D>)>, layer: Id) -> Option<Rect> {
+        let pose = node.pose(k);
+        let own = own_place(node, &pose, parent);
+        if node.layer == layer {
+            return Some(own.screen_box(pose.bounds));
+        }
+        let inner = inner_step(node, &pose);
+        node.children.iter().find_map(|child| find(child, k, Some((own, inner)), layer))
+    }
+    let turn = crate::fw::uikit::window_turn().map(|turn| (Proj::affine(turn), None));
+    windows.iter().find_map(|w| find(w, k, turn, layer))
+}
+
+/// The layer whose transform animation began last and when (IOS_DRAW_LOG=1):
+/// for a second after, each list frame says where that layer is (`card_lines`).
+static SEAM: Mutex<Option<(Id, f64)>> = Mutex::new(None);
+
+/// A transform animation began on `layer` at media time `now` (fw/animation.rs).
+pub(crate) fn seam_layer_began(layer: Id, now: f64) {
+    *SEAM.lock().unwrap_or_else(|e| e.into_inner()) = Some((layer, now));
+}
+
+fn seam_layer(now: f64) -> Option<Id> {
+    SEAM.lock().unwrap_or_else(|e| e.into_inner()).filter(|(_, began)| now - began < 1.0).map(|(layer, _)| layer)
+}
+
+/// `text` with a line "!", "card" and the seam layer's screen box (x0, x1,
+/// y0, y1, or "none") in each frame: after the first line for the first
+/// frame, after each "@" line for the others. The phone logs the box of each
+/// frame it draws (the seam gauge).
+fn card_lines(text: &str, boxes: &[Option<Rect>]) -> String {
+    let line = |b: &Option<Rect>| match b {
+        Some(r) => format!("!\tcard\t{:.3}\t{:.3}\t{:.3}\t{:.3}\n", r.origin.x, r.origin.x + r.size.width, r.origin.y, r.origin.y + r.size.height),
+        None => "!\tcard\tnone\n".to_string(),
+    };
+    let mut out = String::with_capacity(text.len() + boxes.len() * 40);
+    let mut frame = 0;
+    for (i, piece) in text.split_inclusive('\n').enumerate() {
+        out += piece;
+        if i == 0 || piece.starts_with("@\t") {
+            if i > 0 {
+                frame += 1;
+            }
+            if let Some(b) = boxes.get(frame) {
+                out += &line(b);
+            }
+        }
+    }
+    out
+}
+
+/// IOS_ANIM_LOG=1: when animations begin, each animated layer's tree (what
+/// it holds and how each part is drawn), to tell which can run on the phone.
+fn anim_log() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("IOS_ANIM_LOG").is_ok_and(|v| v == "1"))
+}
+
+fn log_animated(nodes: &[Arc<Node>]) {
+    static DUMPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    fn dump(node: &Node, depth: usize, out: &mut String, left: &mut usize) {
+        if *left == 0 || depth > 10 {
+            return;
+        }
+        *left -= 1;
+        let f = node.frame;
+        let mut flags = Vec::new();
+        for (on, name) in [(node.hidden, "hidden"), (node.clips, "clips"), (node.one_sided, "one-sided"), (node.rasterized, "rasterized"), (node.shadow.is_some(), "shadow"), (node.mask.is_some(), "mask"), (node.sublayer_transform.is_some(), "sublayer-transform"), (node.changing, "changing"), (node.gl, "gl"), (node.video, "video")] {
+            if on {
+                flags.push(name.to_string());
+            }
+        }
+        if node.radius > 0.0 {
+            flags.push(format!("radius {}", node.radius));
+        }
+        if !node.motion.is_empty() || !node.picture_motion.is_empty() {
+            flags.push(format!("motion {}/{}", node.motion.len(), node.picture_motion.len()));
+        }
+        if node.layer != 0 && crate::fw::animation::animating(node.layer) {
+            flags.push(format!("keys {:?}", crate::fw::animation::keys(node.layer)));
+        }
+        if let Some(t) = node.transform.filter(|t| *t != IDENTITY_3D) {
+            flags.push(format!("transform {:?}", t.0.map(|v| (v * 1000.0).round() / 1000.0)));
+        }
+        let pictures: Vec<String> = node.pictures.iter().take(4).map(|p| if p.text.is_some() { "text".to_string() } else { p.path.trim_start_matches('\u{1}').chars().take(40).collect() }).collect();
+        let id = if node.id != 0 { named(node.id) } else { "copy".to_string() };
+        *out += &format!("\n{}{id} frame {:.1},{:.1} {:.1}x{:.1} alpha {:.2} {} pictures {}{:?}", "  ".repeat(depth), f.origin.x, f.origin.y, f.size.width, f.size.height, node.alpha, flags.join(", "), node.pictures.len(), pictures);
+        for child in &node.children {
+            dump(child, depth + 1, out, left);
+        }
+    }
+    fn find(node: &Node, out: &mut String) {
+        if node.layer != 0 && crate::fw::animation::animating(node.layer) {
+            let mut left = 80;
+            dump(node, 0, out, &mut left);
+            return;
+        }
+        node.children.iter().for_each(|child| find(child, out));
+    }
+    if DUMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 40 {
+        return;
+    }
+    let mut out = String::new();
+    nodes.iter().for_each(|node| find(node, &mut out));
+    crate::log!("pictures: animated trees:{out}");
+}
+
 /// `parent`: the parent's own points to screen points (None for the window),
 /// with the parent's sublayerTransform as a step in its own points (about
 /// its anchor point); `facing`: the parent's 3D turns and scales put
@@ -492,30 +731,60 @@ fn outside(area: Rect, hole: Rect) -> Vec<Rect> {
 /// screen area the node may draw in.
 #[allow(clippy::too_many_arguments)]
 fn walk(node: &Node, k: usize, parent: Option<(Proj, Option<Transform3D>)>, facing: [f64; 9], parent_alpha: f64, clip: Rect, corner: Option<Corner>, out: &mut Vec<Picture>) {
+    // A live scene's still layer drawn as one picture: as the scene made it.
+    let key = node as *const Node as usize;
+    let (made, recording) = STILL.with(|still| {
+        let still = still.borrow();
+        (still.shown.as_ref().and_then(|shown| shown.get(&key).cloned()), still.record.as_ref().is_some_and(|(keys, _)| keys.contains(&key)))
+    });
+    if let Some(made) = made {
+        out.extend(made);
+        return;
+    }
+    let start = out.len();
+    walk_node(node, k, parent, facing, parent_alpha, clip, corner, out);
+    if recording {
+        let walked = out[start..].to_vec();
+        STILL.with(|still| still.borrow_mut().record.as_mut().map(|(_, spans)| spans.push((key, walked))));
+    }
+}
+
+/// IOS_PHONE_ANIM=1: a live scene's still layers drawn as one picture
+/// (`live::Scene::build`), by node: what `walk` shows for each.
+type StillPictures = HashMap<usize, Vec<Picture>>;
+
+#[derive(Default)]
+struct Still {
+    /// While a scene's frame is walked: its still layers' pictures, shown as made.
+    shown: Option<Arc<StillPictures>>,
+    /// While a scene is built: the still layers to note, and what was walked for each.
+    record: Option<(Vec<usize>, Vec<(usize, Vec<Picture>)>)>,
+}
+
+thread_local! {
+    static STILL: std::cell::RefCell<Still> = std::cell::RefCell::new(Still::default());
+}
+
+/// `make` with `shown` as the still layers' pictures (`Still::shown`).
+fn with_still<T>(shown: Option<Arc<StillPictures>>, make: impl FnOnce() -> T) -> T {
+    let before = STILL.with(|still| std::mem::replace(&mut still.borrow_mut().shown, shown));
+    let made = make();
+    STILL.with(|still| still.borrow_mut().shown = before);
+    made
+}
+
+fn walk_node(node: &Node, k: usize, parent: Option<(Proj, Option<Transform3D>)>, facing: [f64; 9], parent_alpha: f64, clip: Rect, corner: Option<Corner>, out: &mut Vec<Picture>) {
     use crate::fw::geometry::concat_3d;
-    use crate::fw::layers::affine_to_3d;
     let pose = node.pose(k);
     let alpha = parent_alpha * pose.alpha;
     let (size, bounds_origin) = (pose.bounds.size, pose.bounds.origin);
-    let anchor = node.anchor.unwrap_or(Point { x: 0.5, y: 0.5 });
     // Its transform in its parent's points, the parent's sublayerTransform
     // after it (still in 3D, so a perspective there applies to its turns).
     let turn = match parent {
         Some((_, Some(step))) => concat_3d(pose.transform, step),
         _ => pose.transform,
     };
-    // The view's own points (its bounds) to screen points.
-    let own = match parent {
-        None => Proj::affine(moved(-bounds_origin.x, -bounds_origin.y)),
-        Some((parent, step)) => {
-            // It turns and scales around its anchor point (the middle unless
-            // moved), flattened into its parent with its perspective.
-            let centre = (pose.origin.x + size.width * anchor.x, pose.origin.y + size.height * anchor.y);
-            let to_middle = moved(-bounds_origin.x - size.width * anchor.x, -bounds_origin.y - size.height * anchor.y);
-            let local = concat_3d(concat_3d(affine_to_3d(to_middle), pose.transform), affine_to_3d(moved(centre.0, centre.1)));
-            Proj::of_3d(step.map_or(local, |step| concat_3d(local, step))).then(parent)
-        }
-    };
+    let own = own_place(node, &pose, parent);
     // A layer a transition runs on: its pictures (none when hidden: it may
     // be fading out) between marks.
     let marked = node.layer != 0 && MARKED.with(|m| m.borrow().contains(&node.layer));
@@ -532,11 +801,7 @@ fn walk(node: &Node, k: usize, parent: Option<(Proj, Option<Transform3D>)>, faci
         }
         return;
     }
-    // Its own sublayerTransform about its anchor point, for what is inside it.
-    let inner = node.sublayer_transform.map(|s| {
-        let at = (bounds_origin.x + size.width * anchor.x, bounds_origin.y + size.height * anchor.y);
-        concat_3d(concat_3d(affine_to_3d(moved(-at.0, -at.1)), s), affine_to_3d(moved(at.0, at.1)))
-    });
+    let inner = inner_step(node, &pose);
     // Which way its plane faces: its normal's z after its own and its
     // parents' 3D turns (a mirror in its plane still faces the viewer).
     let m = turn.0;
@@ -583,7 +848,9 @@ fn walk(node: &Node, k: usize, parent: Option<(Proj, Option<Transform3D>)>, faci
     // turned bounds or round ones inside round ones, masked, shadowed or rasterized and faded.
     let turned = flat.b.abs() > 1e-9 || flat.c.abs() > 1e-9 || !own.is_affine();
     let rounded = node.clips && node.radius > 0.0 && !turned && node.mask.is_none() && node.shadow.is_none() && corner.is_none() && !faded;
-    let group = (node.clips && (node.radius > 0.0 && !rounded || turned) || node.mask.is_some() || node.shadow.is_some() || faded).then(|| Group {
+    // IOS_PHONE_ANIM=1: turned, clipping to plain bounds only, cut on the phone (`CUT_MARK`).
+    let cut = node.clips && turned && node.radius <= 0.0 && node.mask.is_none() && node.shadow.is_none() && !faded && IN_GROUP.with(|g| g.get()) == 0 && phone_anim();
+    let group = (!cut && (node.clips && (node.radius > 0.0 && !rounded || turned) || node.mask.is_some() || node.shadow.is_some() || faded)).then(|| Group {
         place: own.for_picture().0,
         perspective: own.for_picture().1,
         bounds: visible,
@@ -609,6 +876,19 @@ fn walk(node: &Node, k: usize, parent: Option<(Proj, Option<Transform3D>)>, faci
     let grouped = group.is_some();
     if let Some(group) = group {
         out.push(mark(GROUP_MARK, Some(group)));
+        IN_GROUP.with(|g| g.set(g.get() + 1));
+    }
+    if cut {
+        let mut path = CUT_MARK.to_string();
+        let (w, h) = (size.width, size.height);
+        for (x, y) in [(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)] {
+            let (x, y) = own.apply(bounds_origin.x + x, bounds_origin.y + y);
+            for v in [x, y] {
+                path.push('\t');
+                push_number(&mut path, v);
+            }
+        }
+        out.push(mark(&path, None));
     }
     let clip = if node.clips { meet(clip, own.screen_box(visible)) } else { clip };
     let corner = if rounded { Some(Corner { rect: screen_box(flat, visible), radius: (node.radius * flat.a.abs(), node.radius * flat.d.abs()) }) } else { corner };
@@ -654,6 +934,9 @@ fn walk(node: &Node, k: usize, parent: Option<(Proj, Option<Transform3D>)>, faci
     if let Some(border) = border.as_ref().filter(|_| !turned_away) {
         draw(border, out);
     }
+    if cut {
+        out.push(mark(UNCUT_MARK, None));
+    }
     if grouped {
         if let Some(mask) = &node.mask {
             out.push(mark(MASK_MARK, None));
@@ -661,6 +944,7 @@ fn walk(node: &Node, k: usize, parent: Option<(Proj, Option<Transform3D>)>, faci
             walk(mask, k, Some((own, None)), facing, 1.0, Rect::new(-1e9, -1e9, 2e9, 2e9), None, out);
         }
         out.push(mark(END_MARK, None));
+        IN_GROUP.with(|g| g.set(g.get() - 1));
     }
     if marked {
         out.push(Picture { path: TRANSITION_END_MARK.into(), ..mark_picture(clip) });
@@ -681,7 +965,7 @@ fn with_marked<T>(layers: Vec<Id>, make: impl FnOnce() -> T) -> T {
 }
 
 /// A mark that draws nothing.
-fn mark_picture(clip: Rect) -> Picture {
+pub(crate) fn mark_picture(clip: Rect) -> Picture {
     Picture { path: String::new(), place: IDENTITY, area: (0.0, 0.0), alpha: 1.0, mode: 0, size: (0.0, 0.0), text: None, clip, group: None, corner: None, perspective: None }
 }
 
@@ -840,7 +1124,7 @@ thread_local! {
     /// `snapshot`) or layer id (a `layer_node`): on the next commit an
     /// untouched subtree is taken from here instead of built again (A2,
     /// Apple's CA::Layer::commit_if_needed visiting only marked parts).
-    static NODE_CACHE: RefCell<HashMap<Id, Rc<Node>>> = RefCell::new(HashMap::new());
+    static NODE_CACHE: RefCell<HashMap<Id, Arc<Node>>> = RefCell::new(HashMap::new());
     /// Whether the nodes being built may come from NODE_CACHE (only a tick's
     /// own builds, not a replicator's delayed copies).
     static CACHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -852,7 +1136,7 @@ thread_local! {
 
 /// `id`'s node from the last commit, while caching, nothing marked it and
 /// it is wanted at the depth it was built at (moved deeper, less of it shows).
-fn cached(id: Id, depth: usize) -> Option<Rc<Node>> {
+fn cached(id: Id, depth: usize) -> Option<Arc<Node>> {
     if !CACHING.with(|c| c.get()) {
         return None;
     }
@@ -869,14 +1153,14 @@ fn with_caching<T>(on: bool, make: impl FnOnce() -> T) -> T {
 
 /// The windows' node trees, untouched parts taken from the last commit
 /// (all built afresh with IOS_PICTURES_FULL=1).
-fn build_windows(windows: &[Id], classes: &Classes) -> Vec<Rc<Node>> {
+fn build_windows(windows: &[Id], classes: &Classes) -> Vec<Arc<Node>> {
     with_caching(!full_pictures(), || windows.iter().map(|&w| snapshot(w, classes, 0)).collect())
 }
 
 /// The committed screen's reusable nodes become the cache (what is no
 /// longer on the screen leaves it).
-fn keep_reusable(nodes: &[Rc<Node>]) {
-    fn keep(node: &Rc<Node>, into: &mut HashMap<Id, Rc<Node>>) {
+fn keep_reusable(nodes: &[Arc<Node>]) {
+    fn keep(node: &Arc<Node>, into: &mut HashMap<Id, Arc<Node>>) {
         // A replicator's copy (no id) is built its delay late: none of it is kept.
         if node.id == 0 {
             return;
@@ -972,7 +1256,7 @@ impl Kinds {
 /// inside it too (its parts are drawn by its state). Off the screen the
 /// climb ends where the view hangs loose: what is there is out of the cache
 /// after the next commit anyway, and comes back built afresh.
-fn invalidate(object: Id, kinds: &Kinds, cache: &mut HashMap<Id, Rc<Node>>) {
+fn invalidate(object: Id, kinds: &Kinds, cache: &mut HashMap<Id, Arc<Node>>) {
     use crate::fw::layers;
     let is_view = |o: Id| runtime::is_kind_of(o, kinds.view);
     if object == 0 || !is_view(object) && !runtime::is_kind_of(object, kinds.layer) {
@@ -982,7 +1266,7 @@ fn invalidate(object: Id, kinds: &Kinds, cache: &mut HashMap<Id, Rc<Node>>) {
         return;
     }
     if runtime::is_kind_of(object, kinds.control) {
-        fn drop_inside(view: Id, cache: &mut HashMap<Id, Rc<Node>>, depth: usize) {
+        fn drop_inside(view: Id, cache: &mut HashMap<Id, Arc<Node>>, depth: usize) {
             for &sub in view_state(view).subviews.iter().filter(|_| depth < 64) {
                 cache.remove(&sub);
                 drop_inside(sub, cache, depth + 1);
@@ -1020,10 +1304,10 @@ fn invalidate(object: Id, kinds: &Kinds, cache: &mut HashMap<Id, Rc<Node>>) {
 
 /// The view tree under `view` as `flatten` reads it (main thread), taken
 /// from the last commit when nothing in it changed.
-fn snapshot(view: Id, classes: &Classes, depth: usize) -> Rc<Node> {
+fn snapshot(view: Id, classes: &Classes, depth: usize) -> Arc<Node> {
     cached(view, depth).unwrap_or_else(|| {
         BUILT.with(|b| b.set(b.get() + 1));
-        Rc::new(snapshot_built(view, classes, depth))
+        Arc::new(snapshot_built(view, classes, depth))
     })
 }
 
@@ -1175,6 +1459,8 @@ fn snapshot_built(view: Id, classes: &Classes, depth: usize) -> Node {
         depth,
         motion: poses(motion, Rect { origin: state.bounds_origin, size }, anchor),
         picture_motion,
+        live: live_anim(state.layer, model, Rect { origin: state.bounds_origin, size }, anchor),
+        ticking: animated_image.is_some() || Classes::is(view, classes.cell),
         ..Default::default()
     };
     let mask_owned = state.layer == 0 || dress(&mut node, state.layer, classes, depth);
@@ -1220,7 +1506,7 @@ fn presented(layer: Id, model: crate::fw::animation::Shown) -> (crate::fw::anima
     let at = |t: f64| crate::fw::animation::presented_at(layer, model, t - late);
     match SAMPLING.with(|s| s.get()) {
         Some(s) => (at(s.start), (1..s.count).map(|k| at(s.start + k as f64 * s.step)).collect()),
-        None => (at(crate::fw::runloop::media_time()), Vec::new()),
+        None => (at(crate::fw::runloop::animation_time()), Vec::new()),
     }
 }
 
@@ -1244,7 +1530,7 @@ fn poses(motion: Vec<crate::fw::animation::Shown>, bounds: Rect, anchor: Point) 
 }
 
 /// Layers with a higher zPosition show in front of their siblings (a stable sort keeps the rest in order).
-fn in_z_order(mut children: Vec<(f64, Rc<Node>)>) -> Vec<Rc<Node>> {
+fn in_z_order(mut children: Vec<(f64, Arc<Node>)>) -> Vec<Arc<Node>> {
     children.sort_by(|a, b| a.0.total_cmp(&b.0));
     children.into_iter().map(|(_, node)| node).collect()
 }
@@ -1252,7 +1538,7 @@ fn in_z_order(mut children: Vec<(f64, Rc<Node>)>) -> Vec<Rc<Node>> {
 /// What is drawn inside a layer: its view's subviews (`view`: 0 for a layer
 /// of its own) and the layers the game added, in order; a replicator
 /// layer's, once per copy.
-fn layer_children(layer: Id, view: Id, classes: &Classes, depth: usize) -> Vec<Rc<Node>> {
+fn layer_children(layer: Id, view: Id, classes: &Classes, depth: usize) -> Vec<Arc<Node>> {
     use crate::fw::layers::{self, Child};
     if depth >= 64 {
         return Vec::new();
@@ -1282,7 +1568,7 @@ fn layer_children(layer: Id, view: Id, classes: &Classes, depth: usize) -> Vec<R
         .map(|i| {
             let before = DELAY.with(|d| d.replace(d.get() + i as f64 * delay));
             // (Built afresh: a copy's animations run its delay late.)
-            let copy = Rc::new(Node { frame: bounds, bounds_origin: bounds.origin, transform: Some(turn), alpha: 1.0, changing: true, children: with_caching(false, nodes), ..Default::default() });
+            let copy = Arc::new(Node { frame: bounds, bounds_origin: bounds.origin, transform: Some(turn), alpha: 1.0, changing: true, children: with_caching(false, nodes), ..Default::default() });
             DELAY.with(|d| d.set(before));
             turn = crate::fw::geometry::concat_3d(turn, step);
             copy
@@ -1292,10 +1578,10 @@ fn layer_children(layer: Id, view: Id, classes: &Classes, depth: usize) -> Vec<R
 
 /// A layer of its own (made by the game) as `flatten` reads it, taken from
 /// the last commit when nothing in it changed.
-fn layer_node(layer: Id, classes: &Classes, depth: usize) -> Rc<Node> {
+fn layer_node(layer: Id, classes: &Classes, depth: usize) -> Arc<Node> {
     cached(layer, depth).unwrap_or_else(|| {
         BUILT.with(|b| b.set(b.get() + 1));
-        Rc::new(layer_node_built(layer, classes, depth))
+        Arc::new(layer_node_built(layer, classes, depth))
     })
 }
 
@@ -1303,7 +1589,8 @@ fn layer_node(layer: Id, classes: &Classes, depth: usize) -> Rc<Node> {
 fn layer_node_built(layer: Id, classes: &Classes, depth: usize) -> Node {
     use crate::fw::layers;
     let anchor = layers::anchor(layer);
-    let (shown, motion) = presented(layer, crate::fw::animation::model_of(layer));
+    let model = crate::fw::animation::model_of(layer);
+    let (shown, motion) = presented(layer, model);
     // Its bounds as shown now (they ease after an implicit size change).
     let bounds = shown.bounds.unwrap_or_else(|| layers::bounds(layer));
     let size = bounds.size;
@@ -1327,6 +1614,7 @@ fn layer_node_built(layer: Id, classes: &Classes, depth: usize) -> Node {
         children: layer_children(layer, 0, classes, depth),
         depth,
         motion: poses(motion, bounds, anchor),
+        live: live_anim(layer, model, bounds, anchor),
         // A contents animation's pictures in the coming frames.
         picture_motion: if crate::fw::animation::animates_contents(layer) { coming_times().into_iter().map(|t| layer_content(layer, bounds, classes, t)).collect() } else { Vec::new() },
         ..Default::default()
@@ -1577,13 +1865,18 @@ fn pixels_per_point() -> f64 {
 /// memory or a turned photo, or one of a stretchable picture's parts; text
 /// is drawn into a PNG. Pictures that can't be made into a file are left out.
 fn resolve(pictures: Vec<Picture>) -> Vec<Picture> {
+    resolve_each(pictures).into_iter().flatten().collect()
+}
+
+/// `resolve`, each picture's result in its place (None: it can't be made).
+fn resolve_each(pictures: Vec<Picture>) -> Vec<Option<Picture>> {
     // All the screen's text at once, so none of its files is let go.
     let looks: Vec<&crate::fw::graphics::TextLook> = pictures.iter().filter_map(|p| p.text.as_ref()).collect();
     let scale = pixels_per_point();
     let mut text_files = crate::fw::graphics::text_pictures(&looks, scale).into_iter();
     pictures
         .into_iter()
-        .filter_map(|mut p| {
+        .map(|mut p| {
             if p.text.is_some() {
                 p.path = text_files.next()??;
                 return Some(p);
@@ -1678,6 +1971,16 @@ pub fn encode(screen: (f64, f64), pictures: &[Picture]) -> String {
 fn encode_lines(text: &mut String, pictures: &[Picture]) {
     for p in pictures {
         let (t, c) = (p.place, p.clip);
+        if let Some(corners) = p.path.strip_prefix(CUT_MARK).filter(|rest| rest.starts_with('\t')) {
+            text.push_str("!\tcut");
+            text.push_str(corners);
+            text.push('\n');
+            continue;
+        }
+        if p.path == UNCUT_MARK {
+            text.push_str("!\tuncut\n");
+            continue;
+        }
         if p.path.starts_with(TRANSITION_MARK) {
             if p.path == TRANSITION_TO_MARK {
                 text.push_str("!\tto\n");
@@ -1875,6 +2178,13 @@ const AHEAD: f64 = 0.3;
 /// of full screen lists.
 const MAX_AHEAD_FRAMES: usize = 240;
 
+/// How far ahead the list of a tick that begins animations reaches: making
+/// and reading a full AHEAD list takes some 20-55 ms on the phone, while the
+/// screen holds the last frame it has (a card edge-on between the two halves
+/// of its turn). Apple's render server begins them within a frame. The next
+/// tick, a refresh later, sends the full list.
+const FIRST_AHEAD: f64 = 0.1;
+
 /// How far a list that was already sent must reach to be reused as it is:
 /// a little past the next tick, or the whole sleep the main thread is about
 /// to take (a reused list that stops before the sleep would leave the screen
@@ -1890,14 +2200,15 @@ fn list_until(sampling: Sampling, sleeping: Option<f64>) -> f64 {
 
 /// The coming frames' step and count for an animation ending at `end`:
 /// one screen refresh apart, at least AHEAD ahead (through `sleep_until`
-/// when the main thread is about to sleep that long), at most
-/// MAX_AHEAD_FRAMES frames.
-fn sampling_plan(now: f64, end: f64, refresh: f64, sleep_until: Option<f64>) -> (f64, usize) {
+/// when the main thread is about to sleep that long; FIRST_AHEAD when
+/// animations begin this tick, `fresh`), at most MAX_AHEAD_FRAMES frames.
+fn sampling_plan(now: f64, end: f64, refresh: f64, sleep_until: Option<f64>, fresh: bool) -> (f64, usize) {
     let start = (now / refresh).ceil() * refresh;
     let mut step = refresh;
+    let ahead = if fresh { FIRST_AHEAD } else { AHEAD };
     // Frames reach a moment past a sleep on the main thread, so the phone
     // keeps animating until the thread is awake and sends the next list.
-    let limit = end.min(sleep_until.map_or(now + AHEAD, |until| until.max(now + AHEAD)));
+    let limit = end.min(sleep_until.map_or(now + ahead, |until| until.max(now + AHEAD)));
     let mut count = 1 + (((limit - start) / step).ceil().max(0.0) as usize);
     if count > MAX_AHEAD_FRAMES {
         step = (limit - start) / (MAX_AHEAD_FRAMES - 1) as f64;
@@ -1918,7 +2229,7 @@ pub fn sleep_starting(seconds: f64) {
     if seconds <= 0.2 || !crate::fw::runloop::is_main_thread() || !active() || crate::fw::animation::latest_end().is_none() {
         return;
     }
-    let until = crate::fw::runloop::media_time() + seconds + crate::fw::runloop::refresh_seconds();
+    let until = crate::fw::runloop::animation_time() + seconds + crate::fw::runloop::refresh_seconds();
     *SLEEP_UNTIL.lock().unwrap_or_else(|e| e.into_inner()) = Some(until);
     // A tick that just ran would turn this list away: it must go before the sleep.
     DRAW_SOON.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1930,7 +2241,7 @@ pub fn sleep_starting(seconds: f64) {
 /// apart on a fixed grid (a moment is sampled the same way every tick),
 /// until the running animations end (at most AHEAD, or through a sleep on
 /// the main thread); None when none runs.
-fn sampling_now(now: f64) -> Option<Sampling> {
+fn sampling_now(now: f64, fresh: bool) -> Option<Sampling> {
     // While a finger drags or a scroll coasts, what shows changes every
     // refresh anyway: coming frames would be stale at once (and making 0.3 s
     // of them each list held scrolling to half the screen's rate).
@@ -1939,7 +2250,11 @@ fn sampling_now(now: f64) -> Option<Sampling> {
     }
     let end = crate::fw::animation::latest_end()?;
     let sleep_until = *SLEEP_UNTIL.lock().unwrap_or_else(|e| e.into_inner());
-    let (step, count) = sampling_plan(now, end, crate::fw::runloop::refresh_seconds(), sleep_until);
+    // Test switch IOS_FIRST_LIST_FULL=1: new animations' first list is a full one
+    // (to compare with the short one).
+    static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let fresh = fresh && !*FULL.get_or_init(|| std::env::var("IOS_FIRST_LIST_FULL").is_ok_and(|v| v == "1"));
+    let (step, count) = sampling_plan(now, end, crate::fw::runloop::refresh_seconds(), sleep_until, fresh);
     let start = (now / step).ceil() * step;
     (count > 1).then_some(Sampling { start, step, count })
 }
@@ -2013,20 +2328,21 @@ impl ScreenTransition {
 }
 
 thread_local! {
-    /// The windows as the last list showed them (the main thread's).
-    static LAST_SCREEN: std::cell::RefCell<Vec<Rc<Node>>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The windows as the last list showed them (the main thread's), and the
+    /// coming frames they were worked out for (None: only now).
+    static LAST_SCREEN: std::cell::RefCell<(Vec<Arc<Node>>, Option<Sampling>)> = const { std::cell::RefCell::new((Vec::new(), None)) };
     /// The transitions the lists show now.
     static TRANSITIONS: std::cell::RefCell<Vec<ScreenTransition>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// The windows a list was made of: a transition added later goes from them.
-fn screen_seen(nodes: Vec<Rc<Node>>) {
-    LAST_SCREEN.with(|last| *last.borrow_mut() = nodes);
+fn screen_seen(nodes: Vec<Arc<Node>>, sampling: Option<Sampling>) {
+    LAST_SCREEN.with(|last| *last.borrow_mut() = (nodes, sampling));
 }
 
 /// Whether a GL view whose layer is `gl_layer` is under the node whose layer
 /// is `layer` (the transition runs on `layer`) among `windows`.
-fn gl_layer_inside(windows: &[Rc<Node>], layer: Id, gl_layer: Id) -> bool {
+fn gl_layer_inside(windows: &[Arc<Node>], layer: Id, gl_layer: Id) -> bool {
     fn has_gl(node: &Node, gl_layer: Id) -> bool {
         (node.gl && node.gl_layer == gl_layer) || node.children.iter().any(|child| has_gl(child, gl_layer))
     }
@@ -2052,14 +2368,18 @@ fn pick_transitions() {
             Some(t) => t.look = look,
             None => {
                 let (old, frame) = LAST_SCREEN.with(|last| {
-                    let last = last.borrow();
+                    let (last, sampling) = &*last.borrow();
+                    // Core Animation takes them from the screen as the
+                    // transition begins: the last list's coming frame then
+                    // (a busy turn can add it well after that list was made).
+                    let frame_at = sampling.map_or(0, |s| (((look.begin - s.start) / s.step).round().max(0.0) as usize).min(s.count.saturating_sub(1)));
                     // A GL view inside the layer keeps its last frame in the
                     // old pictures (Core Animation renders its contents).
                     let gl_layer = crate::fw::eagl::shown_frame_layer().filter(|&gl_layer| gl_layer_inside(&last, layer, gl_layer));
                     let image = gl_layer.and_then(crate::fw::eagl::last_frame_image);
                     let old = match (gl_layer, image) {
-                        (Some(gl_layer), Some(image)) => with_gl_contents(Some((gl_layer, format!("{CG_IMAGE_PREFIX}{image:x}"))), || layer_pictures(&last, layer)).unwrap_or_default(),
-                        _ => layer_pictures(&last, layer).unwrap_or_default(),
+                        (Some(gl_layer), Some(image)) => with_gl_contents(Some((gl_layer, format!("{CG_IMAGE_PREFIX}{image:x}"))), || layer_pictures(&last, layer, frame_at, Some(look.begin))).unwrap_or_default(),
+                        _ => layer_pictures(&last, layer, frame_at, Some(look.begin)).unwrap_or_default(),
                     };
                     (old, image.map(HeldImage::new))
                 });
@@ -2070,10 +2390,13 @@ fn pick_transitions() {
     TRANSITIONS.with(|t| *t.borrow_mut() = shown);
 }
 
-/// The pictures `layer` (and what is inside it) shows among `windows`, None
-/// when it isn't there.
-fn layer_pictures(windows: &[Rc<Node>], layer: Id) -> Option<Vec<Picture>> {
-    let all: Vec<Picture> = with_marked(vec![layer], || windows.iter().flat_map(|w| flatten_at(w, 0)).collect());
+/// The pictures `layer` (and what is inside it) shows among `windows` at
+/// their coming frame `frame` (0: as made), and layers the phone animates
+/// (live) at media time `at`; None when it isn't there.
+fn layer_pictures(windows: &[Arc<Node>], layer: Id, frame: usize, at: Option<f64>) -> Option<Vec<Picture>> {
+    let before = LIVE_AT.with(|t| t.replace(at));
+    let all: Vec<Picture> = with_marked(vec![layer], || windows.iter().flat_map(|w| flatten_at(w, frame)).collect());
+    LIVE_AT.with(|t| t.set(before));
     let start = all.iter().position(|p| p.path == format!("{TRANSITION_MARK}:{layer:x}"))?;
     let end = start + all[start..].iter().position(|p| p.path == TRANSITION_END_MARK)?;
     Some(all[start + 1..end].to_vec())
@@ -2137,7 +2460,7 @@ fn dissolving(line: &str) -> String {
 }
 
 /// The GL layers in `nodes` (CAEAGLLayers whose frames the GL picture shows).
-fn gl_layers(nodes: &[Rc<Node>]) -> Vec<Id> {
+fn gl_layers(nodes: &[Arc<Node>]) -> Vec<Id> {
     fn walk(node: &Node, out: &mut Vec<Id>) {
         if node.gl && node.gl_layer != 0 && !out.contains(&node.gl_layer) {
             out.push(node.gl_layer);
@@ -2160,6 +2483,11 @@ struct GlCommit {
     on: Option<Vec<Id>>,
     /// Lists sent and not yet up: their number, when they went, their GL layers.
     waiting: std::collections::VecDeque<(u64, std::time::Instant, Vec<Id>)>,
+    /// After the phone's word: the layers shown before it, until when. The
+    /// word comes as the phone hands the list to the screen, which may show
+    /// it a refresh or two later; a new layer's frame before then lands on
+    /// the old pictures.
+    settling: Option<(Option<Vec<Id>>, std::time::Instant)>,
 }
 
 impl GlCommit {
@@ -2182,12 +2510,18 @@ impl GlCommit {
         }
     }
 
-    /// The phone put list `number` up (it skips lists a newer one replaced).
-    fn shown(&mut self, number: u64) -> bool {
-        match self.waiting.iter().rposition(|(waiting, _, _)| *waiting <= number) {
-            Some(index) => self.up_to(index),
-            None => false,
+    /// The phone put list `number` up at `now` (it skips lists a newer one replaced).
+    fn shown(&mut self, number: u64, now: std::time::Instant) -> bool {
+        let Some(index) = self.waiting.iter().rposition(|(waiting, _, _)| *waiting <= number) else { return false };
+        let before = match self.settling.take() {
+            Some((before, until)) if now < until => before,
+            _ => self.on.clone(),
+        };
+        let changed = self.up_to(index);
+        if changed && before.is_some() && settle_time() > std::time::Duration::ZERO {
+            self.settling = Some((before, now + settle_time()));
         }
+        changed
     }
 
     fn up_to(&mut self, index: usize) -> bool {
@@ -2198,20 +2532,62 @@ impl GlCommit {
     fn put(&mut self, layers: Vec<Id>) -> bool {
         self.on.replace(layers.clone()).is_none_or(|before| before != layers)
     }
+
+    /// Whether GL layer `layer`'s frames show at `now` (None before any list).
+    fn holds(&mut self, layer: Id, now: std::time::Instant) -> Option<bool> {
+        let layers = match &self.settling {
+            Some((before, until)) if now < *until => before,
+            _ => &self.on,
+        };
+        layers.as_ref().map(|layers| layers.contains(&layer))
+    }
 }
 
-static GL_COMMIT: Mutex<GlCommit> = Mutex::new(GlCommit { on: None, waiting: std::collections::VecDeque::new() });
+/// How long after the phone's word a list's GL layers start to show: two
+/// refreshes (IOS_GL_SETTLE_REFRESHES, 0 = at the word, as before).
+fn settle_time() -> std::time::Duration {
+    static REFRESHES: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    let refreshes = *REFRESHES.get_or_init(|| std::env::var("IOS_GL_SETTLE_REFRESHES").ok().and_then(|v| v.parse().ok()).unwrap_or(2.0f64).clamp(0.0, 10.0));
+    std::time::Duration::from_secs_f64(refreshes * crate::fw::runloop::refresh_seconds())
+}
+
+static GL_COMMIT: Mutex<GlCommit> = Mutex::new(GlCommit { on: None, waiting: std::collections::VecDeque::new(), settling: None });
 
 /// Whether the list up on the screen holds GL layer `layer` (None before any list).
 pub fn gl_committed(layer: Id) -> Option<bool> {
-    GL_COMMIT.lock().unwrap_or_else(|e| e.into_inner()).on.as_ref().map(|layers| layers.contains(&layer))
+    GL_COMMIT.lock().unwrap_or_else(|e| e.into_inner()).holds(layer, std::time::Instant::now())
 }
+
+/// The list sent by the last tick that began animations, and when that tick
+/// began (IOS_DRAW_LOG=1 logs how long it took to reach the screen).
+static FRESH_SENT: Mutex<Option<(u64, std::time::Instant, f64)>> = Mutex::new(None);
 
 /// The phone put list `number` up on its screen (any thread).
 pub fn phone_put_up(number: u64) {
-    if GL_COMMIT.lock().unwrap_or_else(|e| e.into_inner()).shown(number) {
+    let fresh = FRESH_SENT.lock().unwrap_or_else(|e| e.into_inner()).take_if(|(sent, _, _)| number >= *sent);
+    if let Some((sent, began, made)) = fresh {
+        crate::log!("pictures: list {sent} of new animations up {:.1} ms after its tick began (made in {made:.1} ms)", began.elapsed().as_secs_f64() * 1000.0);
+    }
+    if put_up_in(&GL_COMMIT, &LIVE_UP, number, std::time::Instant::now()) {
         draw_soon();
     }
+}
+
+/// `phone_put_up` on these records; true when the GL layers shown changed.
+fn put_up_in(gl: &Mutex<GlCommit>, up: &Mutex<LiveUp>, number: u64, now: std::time::Instant) -> bool {
+    up.lock().unwrap_or_else(|e| e.into_inner()).put_up(number);
+    gl.lock().unwrap_or_else(|e| e.into_inner()).shown(number, now)
+}
+
+/// Sends list `number` (`show`), with its GL `layers`, `live` when it holds
+/// a scene. It waits for the phone's word before it goes: the word may come
+/// back (another thread) before `show` returns. True when the GL layers
+/// shown changed.
+fn send_list(gl: &Mutex<GlCommit>, up: &Mutex<LiveUp>, layers: Vec<Id>, number: u64, live: bool, waits: bool, now: std::time::Instant, show: impl FnOnce()) -> bool {
+    up.lock().unwrap_or_else(|e| e.into_inner()).sent(number, live);
+    let changed = gl.lock().unwrap_or_else(|e| e.into_inner()).list(layers, Some(number), waits, now);
+    show();
+    changed
 }
 
 /// How much of the window's GL picture shows (0 to 1): as Core Animation
@@ -2223,12 +2599,12 @@ pub fn phone_put_up(number: u64) {
 /// phone's video player sits under the pictures too, and a movie often
 /// plays with the GL view hidden or out of the window (under a full-screen
 /// screen).
-fn gl_shown(nodes: &[Rc<Node>], frame: Option<Id>, video: bool) -> f64 {
+fn gl_shown(nodes: &[Arc<Node>], frame: Option<Id>, video: bool) -> f64 {
     gl_shown_at(nodes, frame, video, 0)
 }
 
 /// `gl_shown` in coming frame `k`.
-fn gl_shown_at(nodes: &[Rc<Node>], frame: Option<Id>, video: bool, k: usize) -> f64 {
+fn gl_shown_at(nodes: &[Arc<Node>], frame: Option<Id>, video: bool, k: usize) -> f64 {
     fn shown(node: &Node, parent_alpha: f64, frame: Id, k: usize) -> f64 {
         let alpha = parent_alpha * node.pose(k).alpha;
         if node.hidden || alpha <= 0.01 {
@@ -2243,7 +2619,7 @@ fn gl_shown_at(nodes: &[Rc<Node>], frame: Option<Id>, video: bool, k: usize) -> 
 
 /// `gl_shown` in each of the `count` coming frames (see `Sampling`): a GL
 /// view whose opacity animates shows its picture at that frame's opacity.
-fn gl_amounts(nodes: &[Rc<Node>], frame: Option<Id>, video: bool, count: usize) -> Vec<f64> {
+fn gl_amounts(nodes: &[Arc<Node>], frame: Option<Id>, video: bool, count: usize) -> Vec<f64> {
     (0..count.max(1)).map(|k| gl_shown_at(nodes, frame, video, k)).collect()
 }
 
@@ -2296,7 +2672,7 @@ static LAST_CHANGE: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 pub fn gap() -> f64 {
     let moving = LAST_CHANGE.lock().unwrap_or_else(|e| e.into_inner()).is_some_and(|at| at.elapsed().as_secs_f64() < 0.1);
     let pending = DRAW_SOON.load(std::sync::atomic::Ordering::Relaxed) || commit_needed();
-    let busy = crate::fw::animation::latest_end().is_some() || LAST_SCREEN.with(|last| always_changing(&last.borrow()));
+    let busy = crate::fw::animation::latest_end().is_some() || LAST_SCREEN.with(|last| always_changing(&last.borrow().0));
     gap_for(pending, moving || crate::fw::touch::fingers_down(), busy, crate::fw::runloop::refresh_seconds())
 }
 
@@ -2334,7 +2710,7 @@ fn hold_list(waiting: bool, since: &mut Option<std::time::Instant>, now: std::ti
 
 /// The first frame's pictures as files (see `resolve`), and whether a
 /// picture file they need is still being written on its own thread.
-fn first_frame(nodes: &[Rc<Node>]) -> (Vec<Picture>, bool) {
+fn first_frame(nodes: &[Arc<Node>]) -> (Vec<Picture>, bool) {
     crate::fw::graphics::noting_unready(|| compose_groups(resolve(frames(nodes, 1).remove(0))))
 }
 
@@ -2411,13 +2787,13 @@ pub fn set_verify_pictures(on: bool) {
 /// Whether the last committed screen holds a view that changes every tick
 /// without a mark (a picker, page control, progress bar, text field, table
 /// or video view): the pictures can't be skipped while one is on screen.
-fn always_changing(nodes: &[Rc<Node>]) -> bool {
+fn always_changing(nodes: &[Arc<Node>]) -> bool {
     changing_node(nodes).is_some()
 }
 
 /// The view or layer of the first node that changes every tick (see
 /// `always_changing`; a replicator copy's: the replicator's).
-fn changing_node(nodes: &[Rc<Node>]) -> Option<Id> {
+fn changing_node(nodes: &[Arc<Node>]) -> Option<Id> {
     fn find(node: &Node, above: Id) -> Option<Id> {
         let id = if node.id != 0 { node.id } else { above };
         if node.video || node.changing {
@@ -2453,7 +2829,7 @@ fn log_not_skipped() {
                 }
             }
         }
-    } else if let Some(id) = LAST_SCREEN.with(|last| changing_node(&last.borrow())) {
+    } else if let Some(id) = LAST_SCREEN.with(|last| changing_node(&last.borrow().0)) {
         format!("it changes every tick: {}", named(id))
     } else {
         let layers: Vec<String> = crate::fw::animation::running_layers().into_iter().take(3).map(named).collect();
@@ -2471,7 +2847,7 @@ fn log_not_skipped() {
 /// what a full build shows. At a difference the object whose cached node
 /// went stale is logged (once per object) and the full build is used, so
 /// the cache then holds only fresh nodes.
-fn checked_against_full(nodes: Vec<Rc<Node>>, windows: &[Id], classes: &Classes, sampling: Option<Sampling>) -> Vec<Rc<Node>> {
+fn checked_against_full(nodes: Vec<Arc<Node>>, windows: &[Id], classes: &Classes, sampling: Option<Sampling>) -> Vec<Arc<Node>> {
     let built = BUILT.with(|b| b.get());
     let full_build = || with_caching(false, || windows.iter().map(|&w| snapshot(w, classes, 0)).collect::<Vec<_>>());
     let full = match sampling {
@@ -2501,7 +2877,7 @@ fn checked_against_full(nodes: Vec<Rc<Node>>, windows: &[Id], classes: &Classes,
 
 /// The deepest node whose cached and fresh builds differ themselves (not
 /// only through a child), and the first line where they differ.
-fn stale_node(cached: &Rc<Node>, fresh: &Rc<Node>, lines: &dyn Fn(&Node) -> String) -> (Id, String) {
+fn stale_node(cached: &Arc<Node>, fresh: &Arc<Node>, lines: &dyn Fn(&Node) -> String) -> (Id, String) {
     if cached.children.len() == fresh.children.len() && cached.mask.is_some() == fresh.mask.is_some() {
         let pairs = cached.children.iter().zip(&fresh.children).chain(cached.mask.iter().zip(fresh.mask.iter()));
         for (a, b) in pairs {
@@ -2516,7 +2892,7 @@ fn stale_node(cached: &Rc<Node>, fresh: &Rc<Node>, lines: &dyn Fn(&Node) -> Stri
 
 /// IOS_PICTURES_VERIFY=1: how many of the committed nodes were taken from
 /// the cache, each time the counts change (at most 500 lines).
-fn log_reuse(nodes: &[Rc<Node>], built: usize) {
+fn log_reuse(nodes: &[Arc<Node>], built: usize) {
     fn count(node: &Node) -> usize {
         usize::from(node.id != 0) + node.children.iter().chain(node.mask.iter()).map(|c| count(c)).sum::<usize>()
     }
@@ -2533,7 +2909,7 @@ fn log_reuse(nodes: &[Rc<Node>], built: usize) {
 
 /// The windows' pictures in each coming frame (made into files; frames
 /// after the first only while their groups are made already), with times.
-fn screen_frames(nodes: &[Rc<Node>], sampling: Sampling) -> Vec<(f64, Vec<Picture>)> {
+fn screen_frames(nodes: &[Arc<Node>], sampling: Sampling) -> Vec<(f64, Vec<Picture>)> {
     let mut out = Vec::new();
     for (k, pictures) in frames(nodes, sampling.count).into_iter().enumerate() {
         let time = sampling.start + k as f64 * sampling.step;
@@ -2589,6 +2965,53 @@ impl Drop for TickGuard {
     }
 }
 
+/// Whether a tick can skip listing the screen again: nothing changed (no
+/// mark, no view that changes by itself) and either nothing animates or the
+/// list up is a live scene, whose frames the phone works out (`live`).
+fn tick_may_skip(changed: bool, always_changing: bool, animating: bool, live_up: bool) -> bool {
+    !changed && !always_changing && (!animating || live_up)
+}
+
+/// Whether the list on the phone is a live scene (IOS_PHONE_ANIM=1): the
+/// last list sent was one, and the phone said it put that list up.
+#[derive(Default)]
+struct LiveUp {
+    /// The last list sent, when it was a live one.
+    live: Option<u64>,
+    /// The newest list the phone said it put up.
+    up: u64,
+}
+
+impl LiveUp {
+    fn sent(&mut self, list: u64, live: bool) {
+        self.live = live.then_some(list);
+    }
+
+    fn put_up(&mut self, list: u64) {
+        self.up = self.up.max(list);
+    }
+
+    fn up(&self) -> bool {
+        self.live.is_some_and(|list| self.up >= list)
+    }
+}
+
+static LIVE_UP: Mutex<LiveUp> = Mutex::new(LiveUp { live: None, up: 0 });
+
+fn live_up() -> std::sync::MutexGuard<'static, LiveUp> {
+    LIVE_UP.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Logs why a list isn't a live scene when that changes (IOS_PHONE_ANIM=1).
+fn log_not_live(why: live::NotLive) {
+    static LAST: Mutex<String> = Mutex::new(String::new());
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if *last != why {
+        *last = why.to_string();
+        crate::log!("pictures: animations listed here, not on the phone: {why}");
+    }
+}
+
 /// From the main loop: sends the pictures when they changed (at most 20
 /// times a second, or at once after an animation was added). While
 /// animations run, the list carries the coming frames too (encode_frames);
@@ -2618,9 +3041,12 @@ pub fn tick() {
     // A turn with nothing new: run the commit and skip the rebuild (kept off
     // by IOS_PICTURES_FULL=1; IOS_PICTURES_VERIFY=1 rebuilds to check).
     let would_skip = !full_pictures()
-        && !commit_needed()
-        && LAST_SCREEN.with(|last| !always_changing(&last.borrow()))
-        && crate::fw::animation::latest_end().is_none();
+        && tick_may_skip(
+            commit_needed(),
+            LAST_SCREEN.with(|last| always_changing(&last.borrow().0)),
+            crate::fw::animation::latest_end().is_some(),
+            live_up().up(),
+        );
     if !would_skip && !full_pictures() && verify_pictures() {
         log_not_skipped();
     }
@@ -2641,7 +3067,8 @@ pub fn tick() {
     // begin, the new pictures are made first: making them (SpellCraft's spell
     // panel cards, ~200 ms on the phone) used up a 0.2 s slide before its
     // first frame was sent.
-    if crate::fw::animation::uncommitted() {
+    let fresh = crate::fw::animation::uncommitted();
+    if fresh {
         let nodes = build_windows(&windows, &classes);
         compose_groups(resolve(frames(&nodes, 1).remove(0)));
         crate::fw::animation::commit();
@@ -2649,11 +3076,15 @@ pub fn tick() {
         commit_dirty();
     }
     let (wide, high, _) = crate::fw::uikit::screen_points();
-    let now = crate::fw::runloop::media_time();
+    let now = crate::fw::runloop::animation_time();
     pick_transitions();
     let mut sent = SENT.lock().unwrap_or_else(|e| e.into_inner());
     crate::fw::graphics::new_screen_check();
-    let sampling = sampling_now(now);
+    let sampling = sampling_now(now, fresh);
+    if fresh && sampling.is_some() {
+        // A short list goes now (FIRST_AHEAD); the full one at the next refresh.
+        DRAW_SOON.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     BUILT.with(|b| b.set(0));
     // IOS_PICTURES_VERIFY=1 builds twice: both at one moment, so an
     // animation ending between them doesn't count as a difference.
@@ -2681,12 +3112,52 @@ pub fn tick() {
         crate::fw::layers::commit_new();
         return;
     }
-    let (pictures, text, shown_lines) = match sampling {
+    if fresh && anim_log() {
+        log_animated(&nodes);
+    }
+    // The seam gauge (IOS_DRAW_LOG=1): where the layer whose turn began last is in each frame.
+    let seam = crate::fw::graphics::draw_log().then(|| seam_layer(now)).flatten();
+    // IOS_PHONE_ANIM=1: a scene the phone works the coming frames out from
+    // (`live`), when everything moving can run there.
+    let scene = match sampling.filter(|_| phone_anim()).map(|_| live::Scene::build(&nodes)) {
+        Some(Ok(scene)) => Some(scene),
+        Some(Err(why)) => {
+            log_not_live(why);
+            None
+        }
+        None => None,
+    };
+    let mut live_scene = None;
+    let (pictures, text, shown_lines) = match (sampling, scene) {
+        (Some(sampling), Some(scene)) => {
+            if std::env::var("IOS_LIVE_CHECK").is_ok_and(|v| v == "1") {
+                scene.check(&nodes, sampling);
+            }
+            *sent = None;
+            let lines = lines_of(&first);
+            let mut tail = String::new();
+            for file in &scene.files {
+                tail += &format!("!\tfile\t{file}\n");
+            }
+            let number = live::keep(scene, !screen.says_when_up);
+            live_scene = Some(number);
+            let text = gl_line(&format!("{}\t{}\n{lines}", wide, high), gl_amount) + &format!("!\tlive\t{number}\n") + &tail;
+            let text = match seam {
+                Some(layer) => card_lines(&text, &[layer_box(&nodes, layer, 0)]),
+                None => text,
+            };
+            (first, text, lines)
+        }
+        (sampling, _) => match sampling {
         None => {
             *sent = None;
             let pictures = first;
             let lines = lines_of(&pictures);
             let text = gl_line(&format!("{}\t{}\n{lines}", wide, high), gl_amount);
+            let text = match seam {
+                Some(layer) => card_lines(&text, &[layer_box(&nodes, layer, 0)]),
+                None => text,
+            };
             (pictures, text, lines)
         }
         Some(sampling) => {
@@ -2706,14 +3177,22 @@ pub fn tick() {
                     *sent = Some(Sent { frames: timed.iter().map(|(t, p)| (*t, lines_of(p))).collect() });
                     let amounts = gl_amounts(&nodes, crate::fw::eagl::shown_frame_layer(), crate::fw::media::video_showing(), timed.len());
                     let text = frame_gl_lines(&gl_line(&encode_frames((wide, high), &timed), gl_amount), &amounts);
+                    let text = match seam {
+                        Some(layer) => card_lines(&text, &(0..timed.len()).map(|k| layer_box(&nodes, layer, k)).collect::<Vec<_>>()),
+                        None => text,
+                    };
                     (first, text, lines)
                 }
             }
         }
+        },
     };
+    // IOS_PHONE_ANIM=1: the phone draws each frame for when it will show
+    // (its display's presentation time), as the render server does.
+    let text = if phone_anim() { text + "!\tclock\tpresent\n" } else { text };
     drop(sent);
     let nodes_gl = gl_layers(&nodes);
-    screen_seen(nodes);
+    screen_seen(nodes, build_sampling);
     let changed = last.as_ref().is_none_or(|(_, sent)| *sent != text);
     // A missed mark, only while IOS_PICTURES_VERIFY=1: the skip would have
     // kept the old list, but a fresh one differs from it.
@@ -2737,25 +3216,44 @@ pub fn tick() {
     if changed {
         *LAST_CHANGE.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
     }
-    let mut sent = None;
+    let (mut sent, mut gl_changed, mut nodes_gl) = (None, false, nodes_gl);
     if changed && (last.is_some() || !pictures.is_empty()) {
-        // The first changes in full (where each picture goes), then only how many.
+        // The first changes in full (where each picture goes), then only how
+        // many, when that changes.
         static LOGGED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        static LAST_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+        let count_changed = LAST_COUNT.swap(pictures.len(), std::sync::atomic::Ordering::Relaxed) != pictures.len();
         if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
             crate::log!("pictures: {} shown:\n{}", pictures.len(), encode((wide, high), &pictures).trim_end());
-        } else {
+        } else if count_changed {
             crate::log!("pictures: {} shown", pictures.len());
         }
         static NUMBER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let number = NUMBER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        (screen.show)(&text, number);
+        if fresh && crate::fw::graphics::draw_log() {
+            *FRESH_SENT.lock().unwrap_or_else(|e| e.into_inner()) = Some((number, started, started.elapsed().as_secs_f64() * 1000.0));
+        }
+        if seam.is_some() {
+            crate::log!("seam: list {number} sent {:.6} fresh {}", crate::fw::runloop::media_time(), fresh as u8);
+        }
+        // Its GL views' frames show once it is up (eagl::present), the new
+        // screen's under its own pictures and fade, not before them.
+        if let Some(scene) = live_scene {
+            live::sent(scene, Some(number));
+        }
+        let layers = std::mem::take(&mut nodes_gl);
+        gl_changed = send_list(&GL_COMMIT, &LIVE_UP, layers, number, live_scene.is_some(), screen.says_when_up, std::time::Instant::now(), || (screen.show)(&text, number));
         sent = Some(number);
+    }
+    if sent.is_none() {
+        if let Some(scene) = live_scene {
+            live::sent(scene, None);
+        }
+        gl_changed = GL_COMMIT.lock().unwrap_or_else(|e| e.into_inner()).list(nodes_gl, None, screen.says_when_up, std::time::Instant::now());
     }
     *last = Some((started, text));
     drop(last);
-    // Its GL views' frames show once it is up (eagl::present), the new
-    // screen's under its own pictures and fade, not before them.
-    if GL_COMMIT.lock().unwrap_or_else(|e| e.into_inner()).list(nodes_gl, sent, screen.says_when_up, std::time::Instant::now()) {
+    if gl_changed {
         draw_soon();
     }
     // The layers just drawn are committed (later changes run their actions).
@@ -2773,13 +3271,13 @@ mod tests {
         Rect { origin: Point { x, y }, size: Size { width: w, height: h } }
     }
 
-    fn view(frame: Rect, picture: Option<&str>, children: Vec<Rc<Node>>) -> Node {
+    fn view(frame: Rect, picture: Option<&str>, children: Vec<Arc<Node>>) -> Node {
         let rect = rect(0.0, 0.0, frame.size.width, frame.size.height);
         let pictures = picture.map(|p| Shown { path: p.to_string(), mode: 0, size: (10.0, 10.0), rect, caps: None, tile: false, text: None, alpha: 1.0 }).into_iter().collect();
         Node { frame, alpha: 1.0, pictures, children, ..Default::default() }
     }
 
-    fn window(children: Vec<Rc<Node>>) -> Node {
+    fn window(children: Vec<Arc<Node>>) -> Node {
         Node { alpha: 1.0, frame: rect(0.0, 0.0, 960.0, 540.0), children, ..Default::default() }
     }
 
@@ -2789,17 +3287,50 @@ mod tests {
         ((t.a * x + t.c * y + t.tx).round(), (t.b * x + t.d * y + t.ty).round())
     }
 
+    /// The seam gauge's card box goes with the frame it belongs to: the
+    /// first frame's after the list's first line, each later one's after its "@".
+    #[test]
+    fn each_frames_card_box_follows_its_own_frame_line() {
+        let text = "960\t540\t100\n!\tgl\t1\nA\n@\t200\nB\n@\t300\nC\n";
+        let boxes = [Some(rect(1.0, 2.0, 3.0, 4.0)), None, Some(rect(5.0, 6.0, 7.0, 8.0))];
+        let lines: Vec<String> = card_lines(text, &boxes).lines().map(str::to_string).collect();
+        let after = |line: &str| lines[lines.iter().position(|l| l == line).expect(line) + 1].clone();
+        assert_eq!(after("960\t540\t100"), "!\tcard\t1.000\t4.000\t2.000\t6.000");
+        assert_eq!(after("@\t200"), "!\tcard\tnone");
+        assert_eq!(after("@\t300"), "!\tcard\t5.000\t12.000\t6.000\t14.000");
+        assert_eq!(lines.iter().filter(|l| l.starts_with("!\tcard")).count(), 3);
+    }
+
+    /// Animations beginning this tick go out in a short list first: a chained
+    /// animation (a card turned edge-on, then to its face in the first one's
+    /// completion) shows its first frames as soon as a short list can be made
+    /// and read; the full one follows a tick later.
+    #[test]
+    fn animations_beginning_now_go_out_in_a_short_list_first() {
+        let refresh = 1.0 / 120.0;
+        let (step, count) = sampling_plan(0.0, 0.25, refresh, None, true);
+        let reach = (count - 1) as f64 * step;
+        assert!(reach >= FIRST_AHEAD - 1e-9 && reach < FIRST_AHEAD + refresh, "covers FIRST_AHEAD only: {reach}");
+        let (step, count) = sampling_plan(0.0, 0.25, refresh, None, false);
+        assert!((count - 1) as f64 * step >= 0.25 - 1e-9, "the next tick's list reaches the end");
+        let short = Sent { frames: (0..count.min(13)).map(|i| (i as f64 * step, String::new())).collect() };
+        let until = list_until(Sampling { start: 0.0, step, count }, None);
+        assert!(!short.holds(0.0, "", until), "the short list isn't kept as the full one");
+        let (_, sleeping) = sampling_plan(0.0, 3.0, refresh, Some(1.5), true);
+        assert!(sleeping as f64 * refresh >= 1.5, "a sleep is still covered");
+    }
+
     /// The phone's coming frames reach through a sleep on the main thread
     /// (Apple's render server keeps animating while the app's thread sleeps),
     /// at most MAX_AHEAD_FRAMES of them.
     #[test]
     fn coming_frames_reach_through_a_sleep_on_the_main_thread() {
         let refresh = 1.0 / 120.0;
-        let plain = sampling_plan(0.0, 3.0, refresh, None);
+        let plain = sampling_plan(0.0, 3.0, refresh, None, false);
         assert!(plain.1 as f64 * plain.0 >= 0.29 && plain.1 as f64 * plain.0 < 0.4, "a busy thread is covered for AHEAD: {plain:?}");
-        let sleeping = sampling_plan(0.0, 3.0, refresh, Some(1.5));
+        let sleeping = sampling_plan(0.0, 3.0, refresh, Some(1.5), false);
         assert!(sleeping.1 as f64 * sleeping.0 >= 1.5, "a sleeping main thread is covered through its sleep: {sleeping:?}");
-        let long = sampling_plan(0.0, 30.0, refresh, Some(10.0));
+        let long = sampling_plan(0.0, 30.0, refresh, Some(10.0), false);
         assert!(long.1 <= MAX_AHEAD_FRAMES, "a long sleep keeps the lists bounded: {long:?}");
         assert!(long.1 as f64 * long.0 >= 9.9, "still through the sleep: {long:?}");
     }
@@ -2979,17 +3510,55 @@ mod tests {
         assert!(!gl.list(garden.clone(), Some(2), true, at(10)), "the garden waits for its list to be up");
         assert!(!gl.list(garden.clone(), None, true, at(20)), "a tick with nothing new still waits");
         assert_eq!(gl.on, Some(hall.clone()), "the hall's frames show meanwhile");
-        assert!(gl.shown(2), "the phone put the garden's list up");
+        assert!(gl.shown(2, at(25)), "the phone put the garden's list up");
         assert_eq!(gl.on, Some(garden.clone()));
         gl.list(hall.clone(), Some(3), true, at(30));
         gl.list(garden.clone(), Some(4), true, at(40));
-        assert!(!gl.shown(1) && gl.on == Some(garden.clone()), "an older list's word changes nothing");
-        gl.shown(4);
+        assert!(!gl.shown(1, at(45)) && gl.on == Some(garden.clone()), "an older list's word changes nothing");
+        gl.shown(4, at(46));
         assert!(gl.on == Some(garden.clone()) && gl.waiting.is_empty(), "a newer list up puts the older ones by (the hall of list 3 never shows)");
         gl.list(hall.clone(), Some(5), true, at(50));
         assert!(!gl.list(hall.clone(), None, true, at(290)) && gl.on == Some(garden.clone()));
         assert!(gl.list(hall.clone(), None, true, at(310)), "no word after a quarter second: it counts as up");
         assert_eq!(gl.on, Some(hall));
+    }
+
+    /// The phone's word comes when it hands a list to the screen, which may
+    /// show it a refresh or two later. A GL layer the list adds waits that
+    /// long before its frames show (its first frame landed on the old
+    /// pictures: the garden flashed under the hall's labels for a frame);
+    /// the layers before show meanwhile.
+    #[test]
+    fn a_new_gl_layer_waits_for_its_list_to_reach_the_screen() {
+        let start = std::time::Instant::now();
+        let at = |ms: u64| start + std::time::Duration::from_millis(ms);
+        let mut gl = GlCommit::default();
+        gl.list(vec![0x10], Some(1), true, at(0));
+        gl.shown(1, at(5));
+        assert_eq!(gl.holds(0x10, at(5)), Some(true), "the first list shows at once");
+        gl.list(vec![0x20], Some(2), true, at(200));
+        gl.shown(2, at(210));
+        assert_eq!(gl.holds(0x20, at(211)), Some(false), "the garden waits for its list to reach the screen");
+        assert_eq!(gl.holds(0x10, at(211)), Some(true), "the hall's frames show meanwhile");
+        assert_eq!(gl.holds(0x20, at(300)), Some(true));
+        assert_eq!(gl.holds(0x10, at(300)), Some(false));
+    }
+
+    /// The phone's word that a list is up may come back before sending it
+    /// returns (another thread): the list is waiting by then, so the word
+    /// finds it, its GL layers show and a live scene counts as up.
+    #[test]
+    fn a_list_waits_for_its_word_before_it_goes() {
+        let (gl, up) = (Mutex::new(GlCommit::default()), Mutex::new(LiveUp::default()));
+        let now = std::time::Instant::now();
+        gl.lock().unwrap().list(vec![0x10], Some(1), true, now);
+        assert!(put_up_in(&gl, &up, 1, now), "the hall");
+        send_list(&gl, &up, vec![0x20], 2, true, true, now, || {
+            put_up_in(&gl, &up, 2, now);
+        });
+        let gl = gl.lock().unwrap();
+        assert!(gl.waiting.is_empty() && gl.on == Some(vec![0x20]), "the garden's word found it: {:?} {:?}", gl.waiting.len(), gl.on);
+        assert!(up.lock().unwrap().up(), "the live list counts as up");
     }
 
     /// A picture that can't be made into a file holds nothing back: it is
@@ -3063,7 +3632,7 @@ mod tests {
 
     /// One commit as `tick` makes it: the marks since the last one are
     /// followed, the window built with the cache, and its reusable nodes kept.
-    fn commit_build(window: Id, sampling: Option<Sampling>) -> Rc<Node> {
+    fn commit_build(window: Id, sampling: Option<Sampling>) -> Arc<Node> {
         commit_dirty();
         let build = || build_windows(&[window], &Classes::find());
         let nodes = match sampling {
@@ -3075,7 +3644,7 @@ mod tests {
     }
 
     /// The window built from scratch (no cache).
-    fn full_build(window: Id, sampling: Option<Sampling>) -> Rc<Node> {
+    fn full_build(window: Id, sampling: Option<Sampling>) -> Arc<Node> {
         let build = || snapshot(window, &Classes::find(), 0);
         match sampling {
             Some(sampling) => with_sampling(sampling, build),
@@ -3089,7 +3658,7 @@ mod tests {
     }
 
     /// Changing one sibling rebuilds only its own part of the tree: the
-    /// untouched sibling's node is reused (the same Rc), and the list equals
+    /// untouched sibling's node is reused (the same Arc), and the list equals
     /// a full build's.
     #[test]
     fn changing_one_sibling_reuses_the_other_and_matches_a_full_build() {
@@ -3103,11 +3672,11 @@ mod tests {
         runtime::send(window, "addSubview:", &[b]);
         let first = commit_build(window, None);
         let again = commit_build(window, None);
-        assert!(Rc::ptr_eq(&first, &again), "with no mark the whole window is reused");
+        assert!(Arc::ptr_eq(&first, &again), "with no mark the whole window is reused");
         runtime::send(a, "setText:", &[crate::fw::string::make("A2")]);
         let second = commit_build(window, None);
-        assert!(Rc::ptr_eq(&first.children[1], &second.children[1]), "the untouched sibling's node is reused");
-        assert!(!Rc::ptr_eq(&first.children[0], &second.children[0]), "the changed sibling is built again");
+        assert!(Arc::ptr_eq(&first.children[1], &second.children[1]), "the untouched sibling's node is reused");
+        assert!(!Arc::ptr_eq(&first.children[0], &second.children[0]), "the changed sibling is built again");
         assert_eq!(flatten(&second), flatten(&full_build(window, None)), "the list equals a full build");
     }
 
@@ -3226,8 +3795,8 @@ mod tests {
         let sampling = Some(Sampling { start, step: 0.25, count: 5 });
         let second = commit_build(window, sampling);
         assert_eq!(all_frames(&second, sampling), all_frames(&full_build(window, sampling), sampling), "every coming frame equals a full build");
-        assert!(!Rc::ptr_eq(&unsampled.children[0], &second.children[0]), "the animated part is built again");
-        assert!(Rc::ptr_eq(&first.children[0].children[1], &second.children[0].children[1]), "the still sibling is reused");
+        assert!(!Arc::ptr_eq(&unsampled.children[0], &second.children[0]), "the animated part is built again");
+        assert!(Arc::ptr_eq(&first.children[0].children[1], &second.children[0].children[1]), "the still sibling is reused");
     }
 
     /// PC runs without a phone screen keep each list in the frames folder,
@@ -3269,9 +3838,9 @@ mod tests {
         hidden.hidden = true;
         let mut faint = view(rect(1.0, 1.0, 5.0, 5.0), Some("faint.png"), vec![]);
         faint.alpha = 0.5;
-        let mut panel = view(rect(10.0, 20.0, 300.0, 200.0), Some("panel.png"), vec![Rc::new(view(rect(5.0, 6.0, 50.0, 40.0), Some("button.png"), vec![])), Rc::new(hidden), Rc::new(faint)]);
+        let mut panel = view(rect(10.0, 20.0, 300.0, 200.0), Some("panel.png"), vec![Arc::new(view(rect(5.0, 6.0, 50.0, 40.0), Some("button.png"), vec![])), Arc::new(hidden), Arc::new(faint)]);
         panel.bounds_origin = Point { x: 1.0, y: 2.0 };
-        let pictures = flatten(&window(vec![Rc::new(view(rect(100.0, 100.0, 960.0, 540.0), None, vec![Rc::new(panel)]))]));
+        let pictures = flatten(&window(vec![Arc::new(view(rect(100.0, 100.0, 960.0, 540.0), None, vec![Arc::new(panel)]))]));
         let names: Vec<&str> = pictures.iter().map(|p| p.path.as_str()).collect();
         assert_eq!(names, ["panel.png", "button.png", "faint.png"]);
         assert_eq!((at(&pictures[0], 0.0, 0.0), pictures[0].area), ((110.0, 120.0), (300.0, 200.0)));
@@ -3290,15 +3859,15 @@ mod tests {
         let mut gl = view(full, None, vec![]);
         (gl.gl, gl.gl_layer, gl.layer) = (true, 0x100, 0x100);
         let hud = view(rect(10.0, 10.0, 50.0, 50.0), Some("hud.png"), vec![]);
-        let mut container = view(full, None, vec![Rc::new(view(full, None, vec![Rc::new(gl), Rc::new(hud)]))]);
+        let mut container = view(full, None, vec![Arc::new(view(full, None, vec![Arc::new(gl), Arc::new(hud)]))]);
         container.layer = 0x20;
-        let mut root = window(vec![Rc::new(container)]);
+        let mut root = window(vec![Arc::new(container)]);
         root.background = Some([1.0, 1.0, 1.0, 1.0]);
-        let windows = [Rc::new(root)];
-        let old = with_gl_contents(Some((0x100, "frame.png".into())), || layer_pictures(&windows, 0x20)).unwrap();
+        let windows = [Arc::new(root)];
+        let old = with_gl_contents(Some((0x100, "frame.png".into())), || layer_pictures(&windows, 0x20, 0, None)).unwrap();
         assert_eq!(old.iter().map(|p| p.path.as_str()).collect::<Vec<_>>(), ["frame.png", "hud.png"]);
         assert_eq!((at(&old[0], 0.0, 0.0), at(&old[0], 960.0, 540.0), old[0].alpha), ((0.0, 0.0), (960.0, 540.0), 1.0));
-        let other = with_gl_contents(Some((0x200, "frame.png".into())), || layer_pictures(&windows, 0x20)).unwrap();
+        let other = with_gl_contents(Some((0x200, "frame.png".into())), || layer_pictures(&windows, 0x20, 0, None)).unwrap();
         assert_eq!(other.iter().map(|p| p.path.as_str()).collect::<Vec<_>>(), ["hud.png"]);
     }
 
@@ -3306,7 +3875,7 @@ mod tests {
     fn a_playing_video_covers_what_is_under_it() {
         let mut video = view(rect(0.0, 0.0, 960.0, 540.0), None, vec![]);
         video.video = true;
-        let window = window(vec![Rc::new(view(rect(0.0, 0.0, 960.0, 540.0), Some("splash.png"), vec![])), Rc::new(video), Rc::new(view(rect(700.0, 350.0, 200.0, 80.0), Some("start.png"), vec![]))]);
+        let window = window(vec![Arc::new(view(rect(0.0, 0.0, 960.0, 540.0), Some("splash.png"), vec![])), Arc::new(video), Arc::new(view(rect(700.0, 350.0, 200.0, 80.0), Some("start.png"), vec![]))]);
         let names: Vec<String> = flatten(&window).into_iter().map(|p| p.path).collect();
         assert_eq!(names, ["start.png"]);
     }
@@ -3319,7 +3888,7 @@ mod tests {
         let mut button = view(rect(10.0, 10.0, 100.0, 40.0), None, vec![]);
         let caps = Some([3.0, 4.0, 3.0, 4.0]);
         button.pictures.push(Shown { path: "b.png".into(), mode: 0, size: (20.0, 10.0), rect: rect(0.0, 0.0, 100.0, 40.0), caps, tile: false, text: None, alpha: 1.0 });
-        let pictures = flatten(&window(vec![Rc::new(button)]));
+        let pictures = flatten(&window(vec![Arc::new(button)]));
         let parts: Vec<(String, (f64, f64), (f64, f64), (f64, f64))> =
             pictures.iter().map(|p| (p.path.clone(), at(p, 0.0, 0.0), p.area, p.size)).collect();
         let part = |n: usize| format!("b.png{PART_MARK}{n}");
@@ -3340,13 +3909,13 @@ mod tests {
         // 6 points wide: the 4-point caps shrink to 3 and there is no middle column.
         let mut narrow = view(rect(0.0, 0.0, 6.0, 40.0), None, vec![]);
         narrow.pictures.push(Shown { path: "b.png".into(), mode: 0, size: (20.0, 10.0), rect: rect(0.0, 0.0, 6.0, 40.0), caps, tile: false, text: None, alpha: 1.0 });
-        let widths: Vec<(String, f64)> = flatten(&window(vec![Rc::new(narrow)])).into_iter().map(|p| (p.path, p.area.0)).collect();
+        let widths: Vec<(String, f64)> = flatten(&window(vec![Arc::new(narrow)])).into_iter().map(|p| (p.path, p.area.0)).collect();
         assert_eq!(widths.iter().filter(|(path, _)| path.ends_with(&format!("{PART_MARK}1"))).count(), 0, "{widths:?}");
         assert!(widths.iter().all(|&(_, w)| w == 3.0), "{widths:?}");
         // Shown at its own size (centred): whole.
         let mut centred = view(rect(0.0, 0.0, 100.0, 40.0), None, vec![]);
         centred.pictures.push(Shown { path: "b.png".into(), mode: 4, size: (20.0, 10.0), rect: rect(0.0, 0.0, 100.0, 40.0), caps, tile: false, text: None, alpha: 1.0 });
-        let paths: Vec<String> = flatten(&window(vec![Rc::new(centred)])).into_iter().map(|p| p.path).collect();
+        let paths: Vec<String> = flatten(&window(vec![Arc::new(centred)])).into_iter().map(|p| p.path).collect();
         assert_eq!(paths, ["b.png"]);
     }
 
@@ -3357,7 +3926,7 @@ mod tests {
         let mut button = view(rect(10.0, 10.0, 100.0, 40.0), None, vec![]);
         let caps = Some([3.0, 4.0, 3.0, 4.0]);
         button.pictures.push(Shown { path: "b.png".into(), mode: 0, size: (20.0, 10.0), rect: rect(0.0, 0.0, 100.0, 40.0), caps, tile: true, text: None, alpha: 1.0 });
-        let pictures = flatten(&window(vec![Rc::new(button)]));
+        let pictures = flatten(&window(vec![Arc::new(button)]));
         let part = |n: usize| -> Vec<&Picture> { pictures.iter().filter(|p| p.path == format!("b.png{PART_MARK}{n}")).collect() };
         // The top edge (12 points of picture) across the 92 between the caps: 8 copies.
         let top = part(1);
@@ -3446,7 +4015,7 @@ mod tests {
         runtime::send(holder, "addSubview:", &[card]);
         runtime::send(card, "addSubview:", &[inside]);
         let nodes = || vec![snapshot(window, &Classes::find(), 0)];
-        screen_seen(nodes());
+        screen_seen(nodes(), None);
         let transition = runtime::send(runtime::class_named("CATransition"), "animation", &[]);
         runtime::send(transition, "setType:", &[crate::fw::string::make("push")]);
         runtime::send(transition, "setSubtype:", &[crate::fw::string::make("fromRight")]);
@@ -3475,6 +4044,57 @@ mod tests {
         );
     }
 
+    /// Animations run on the phone unless IOS_PHONE_ANIM=0 turns that off
+    /// (as on an iPhone, where the render server plays them).
+    #[test]
+    fn animations_run_on_the_phone_unless_turned_off() {
+        assert!(phone_anim_setting(None), "on without the switch");
+        assert!(phone_anim_setting(Some("1")), "on with it on");
+        assert!(!phone_anim_setting(Some("0")), "off with IOS_PHONE_ANIM=0");
+    }
+
+    /// A transition's old pictures are what the screen shows as it begins.
+    /// The last list may be older (the game thread was busy; the phone kept
+    /// playing the animation): they come from the moment the transition
+    /// begins, not from when that list was made (a dim at fight start jumped
+    /// back to where the last list began it, then faded again). That holds
+    /// whether the list carried coming frames or only now (the phone works
+    /// the animation out by itself).
+    #[test]
+    fn a_transitions_old_pictures_are_the_screen_as_it_begins() {
+        setup();
+        for count in [5, 1] {
+            let window = new_view("UIWindow", rect(0.0, 0.0, 320.0, 480.0));
+            let holder = new_view("UIView", rect(0.0, 0.0, 320.0, 480.0));
+            let cover = new_view("UIView", rect(0.0, 0.0, 320.0, 480.0));
+            runtime::send(cover, "setBackgroundColor:", &[runtime::send(runtime::class_named("UIColor"), "blackColor", &[])]);
+            runtime::send(holder, "addSubview:", &[cover]);
+            runtime::send(window, "addSubview:", &[holder]);
+            let dim = runtime::send(runtime::class_named("CABasicAnimation"), "animationWithKeyPath:", &[crate::fw::string::make("opacity")]);
+            runtime::send(dim, "setFromValue:", &[crate::fw::collections::number_float(0.0)]);
+            runtime::send(dim, "setToValue:", &[crate::fw::collections::number_float(1.0)]);
+            send_struct(dim, "setDuration:", 0.4f64);
+            let start = crate::fw::runloop::media_time();
+            send_struct(dim, "setBeginTime:", start);
+            runtime::send(runtime::send(cover, "layer", &[]), "addAnimation:forKey:", &[dim, 0]);
+            let sampling = Sampling { start, step: 0.1, count };
+            screen_seen(with_sampling(sampling, || vec![snapshot(window, &Classes::find(), 0)]), Some(sampling));
+            let fade = runtime::send(runtime::class_named("CATransition"), "animation", &[]);
+            runtime::send(fade, "setType:", &[crate::fw::string::make("fade")]);
+            send_struct(fade, "setDuration:", 0.5f64);
+            send_struct(fade, "setBeginTime:", start + 0.3);
+            let layer = runtime::send(holder, "layer", &[]);
+            runtime::send(layer, "addAnimation:forKey:", &[fade, 0]);
+            pick_transitions();
+            let old = TRANSITIONS.with(|t| t.borrow().iter().find(|t| t.layer == layer).map(|t| t.old.clone())).expect("the fade runs");
+            runtime::send(layer, "removeAllAnimations", &[]);
+            pick_transitions();
+            let black = color_path([0.0, 0.0, 0.0, 1.0]);
+            let shown = old.iter().find(|p| p.path == black).map(|p| p.alpha);
+            assert!(shown.is_some_and(|alpha| (alpha - 0.75).abs() < 0.05), "the cover as the fade begins (0.3 s into its 0.4 s), {count} frame(s) in the list: {shown:?}");
+        }
+    }
+
     /// A transition inside a group drawn as one picture (here a rasterized,
     /// faded parent) still runs: the group is drawn once as it was and once
     /// as it is, and the two dissolve along the transition's timing (a slide
@@ -3493,7 +4113,7 @@ mod tests {
         runtime::send(group, "addSublayer:", &[card]);
         runtime::send(runtime::send(window, "layer", &[]), "addSublayer:", &[group]);
         let nodes = || vec![snapshot(window, &Classes::find(), 0)];
-        screen_seen(nodes());
+        screen_seen(nodes(), None);
         let transition = runtime::send(runtime::class_named("CATransition"), "animation", &[]);
         runtime::send(transition, "setType:", &[crate::fw::string::make("push")]);
         send_struct(transition, "setDuration:", 0.5f64);
@@ -3587,7 +4207,7 @@ mod tests {
         runtime::send(layer, "addAnimation:forKey:", &[animation, 0]);
         let sampling = Sampling { start, step: 0.25, count: 5 };
         let node = with_sampling(sampling, || snapshot(parent, &Classes::find(), 0));
-        let frames = frames(&[Rc::new(window(vec![node]))], sampling.count);
+        let frames = frames(&[Arc::new(window(vec![node]))], sampling.count);
         let lefts: Vec<f64> = frames.iter().map(|f| at(&f[0], 0.0, 0.0).0).collect();
         assert_eq!(lefts, [0.0, 25.0, 50.0, 75.0, 100.0], "each frame where the animation has it then");
         let timed: Vec<(f64, Vec<Picture>)> = frames.into_iter().enumerate().map(|(k, f)| (start + k as f64 * 0.25, f)).collect();
@@ -3939,7 +4559,7 @@ mod tests {
         // The coming frames worked out ahead (while the game thread is busy)
         // step through the pictures too.
         let window_node = with_sampling(Sampling { start: start + 0.25, step: 0.5, count: 4 }, || window(vec![snapshot(shown, &Classes::find(), 0)]));
-        let coming: Vec<String> = frames(&[Rc::new(window_node)], 4).into_iter().map(|pictures| pictures.last().unwrap().path.clone()).collect();
+        let coming: Vec<String> = frames(&[Arc::new(window_node)], 4).into_iter().map(|pictures| pictures.last().unwrap().path.clone()).collect();
         assert_eq!(coming, [path(first), path(first), path(second), path(second)], "frames at 0.25, 0.75, 1.25 and 1.75 seconds");
         runtime::send(shown, "stopAnimating", &[]);
         assert_eq!(runtime::send(shown, "isAnimating", &[]) & 0xFF, 0);
@@ -4099,7 +4719,7 @@ mod tests {
         splash.transform = Some(crate::fw::layers::affine_to_3d(Transform { a: 0.0, b: 1.0, c: -1.0, d: 0.0, tx: 0.0, ty: 0.0 }));
         let mut grown = view(rect(100.0, 100.0, 20.0, 10.0), Some("grown.png"), vec![]);
         grown.transform = Some(crate::fw::layers::affine_to_3d(Transform { a: 2.0, b: 0.0, c: 0.0, d: 2.0, tx: 5.0, ty: 0.0 }));
-        let pictures = flatten(&window(vec![Rc::new(splash), Rc::new(grown)]));
+        let pictures = flatten(&window(vec![Arc::new(splash), Arc::new(grown)]));
         // Its corners land on the screen's corners.
         assert_eq!(at(&pictures[0], 0.0, 0.0), (480.0, 0.0));
         assert_eq!(at(&pictures[0], 320.0, 480.0), (0.0, 320.0));
@@ -4116,11 +4736,11 @@ mod tests {
     #[test]
     fn background_colours_fill_views_and_gl_views_cover_what_is_behind() {
         let full = rect(0.0, 0.0, 960.0, 540.0);
-        let mut panel = view(rect(10.0, 20.0, 100.0, 50.0), Some("icon.png"), vec![Rc::new(view(rect(0.0, 0.0, 10.0, 10.0), Some("child.png"), vec![]))]);
+        let mut panel = view(rect(10.0, 20.0, 100.0, 50.0), Some("icon.png"), vec![Arc::new(view(rect(0.0, 0.0, 10.0, 10.0), Some("child.png"), vec![]))]);
         panel.background = Some([1.0, 0.0, 0.0, 0.5]);
         let mut clear = view(rect(0.0, 0.0, 50.0, 50.0), None, vec![]);
         clear.background = Some([0.0, 0.0, 0.0, 0.0]);
-        let pictures = flatten(&window(vec![Rc::new(panel), Rc::new(clear)]));
+        let pictures = flatten(&window(vec![Arc::new(panel), Arc::new(clear)]));
         let paths: Vec<String> = pictures.iter().map(|p| p.path.clone()).collect();
         assert_eq!(paths, [color_path([1.0, 0.0, 0.0, 0.5]), "icon.png".into(), "child.png".into()]);
         assert_eq!((at(&pictures[0], 0.0, 0.0), pictures[0].area, pictures[0].mode), ((10.0, 20.0), (100.0, 50.0), 0));
@@ -4132,11 +4752,11 @@ mod tests {
         // Behind a GL view: covered.
         let mut behind = view(full, Some("behind.png"), vec![]);
         behind.background = Some([0.0, 0.0, 0.0, 1.0]);
-        let mut gl = view(full, None, vec![Rc::new(view(rect(5.0, 5.0, 20.0, 20.0), Some("hud.png"), vec![]))]);
+        let mut gl = view(full, None, vec![Arc::new(view(rect(5.0, 5.0, 20.0, 20.0), Some("hud.png"), vec![]))]);
         gl.gl = true;
         gl.background = Some([0.0, 0.0, 0.0, 1.0]);
         let front = view(rect(0.0, 0.0, 30.0, 30.0), Some("front.png"), vec![]);
-        let paths: Vec<String> = flatten(&window(vec![Rc::new(behind), Rc::new(gl), Rc::new(front)])).into_iter().map(|p| p.path).collect();
+        let paths: Vec<String> = flatten(&window(vec![Arc::new(behind), Arc::new(gl), Arc::new(front)])).into_iter().map(|p| p.path).collect();
         assert_eq!(paths, ["hud.png", "front.png"]);
     }
 
@@ -4147,13 +4767,13 @@ mod tests {
         let under = view(rect(10.0, 10.0, 50.0, 50.0), Some("under.png"), vec![]);
         let mut gl = view(rect(0.0, 0.0, 400.0, 300.0), None, vec![]);
         gl.gl = true;
-        let paths: Vec<String> = flatten(&window(vec![Rc::new(beside), Rc::new(under), Rc::new(gl)])).into_iter().map(|p| p.path).collect();
+        let paths: Vec<String> = flatten(&window(vec![Arc::new(beside), Arc::new(under), Arc::new(gl)])).into_iter().map(|p| p.path).collect();
         assert_eq!(paths, ["beside.png"]);
         // A picture partly under it keeps the rest: cut to the bands around it.
         let background = view(rect(0.0, 0.0, 600.0, 300.0), Some("background.png"), vec![]);
         let mut video = view(rect(200.0, 100.0, 100.0, 100.0), None, vec![]);
         video.video = true;
-        let clips: Vec<(String, Rect)> = flatten(&window(vec![Rc::new(background), Rc::new(video)])).into_iter().map(|p| (p.path, p.clip)).collect();
+        let clips: Vec<(String, Rect)> = flatten(&window(vec![Arc::new(background), Arc::new(video)])).into_iter().map(|p| (p.path, p.clip)).collect();
         let band = |x, y, w, h| ("background.png".to_string(), rect(x, y, w, h));
         assert_eq!(clips, [band(0.0, 0.0, 600.0, 100.0), band(0.0, 200.0, 600.0, 100.0), band(0.0, 100.0, 200.0, 100.0), band(300.0, 100.0, 300.0, 100.0)]);
     }
@@ -4168,19 +4788,19 @@ mod tests {
             (v.gl, v.gl_layer, v.alpha) = (true, layer, alpha);
             v
         };
-        let line = |nodes: &[Rc<Node>], frame: Option<Id>| gl_line("960\t540\nx.png", gl_shown(nodes, frame, false));
-        assert_eq!(line(&[Rc::new(window(vec![Rc::new(gl_view(0x100, 1.0))]))], Some(0x100)), "960\t540\n!\tgl\t1\nx.png");
+        let line = |nodes: &[Arc<Node>], frame: Option<Id>| gl_line("960\t540\nx.png", gl_shown(nodes, frame, false));
+        assert_eq!(line(&[Arc::new(window(vec![Arc::new(gl_view(0x100, 1.0))]))], Some(0x100)), "960\t540\n!\tgl\t1\nx.png");
         // A video showing (the phone's player sits under the pictures, as the
         // GL picture does): nothing is covered, even with the GL view gone
         // (a movie after a full-screen screen took the GL view out).
-        assert_eq!(gl_line("960\t540", gl_shown(&[Rc::new(window(vec![]))], Some(0x100), true)), "960\t540\n!\tgl\t1\n");
-        assert_eq!(line(&[Rc::new(window(vec![Rc::new(gl_view(0x100, 0.5))]))], Some(0x100)), "960\t540\n!\tgl\t0.5\nx.png");
+        assert_eq!(gl_line("960\t540", gl_shown(&[Arc::new(window(vec![]))], Some(0x100), true)), "960\t540\n!\tgl\t1\n");
+        assert_eq!(line(&[Arc::new(window(vec![Arc::new(gl_view(0x100, 0.5))]))], Some(0x100)), "960\t540\n!\tgl\t0.5\nx.png");
         // The view left the window: the old frame is gone.
-        assert_eq!(line(&[Rc::new(window(vec![]))], Some(0x100)), "960\t540\n!\tgl\toff\nx.png");
+        assert_eq!(line(&[Arc::new(window(vec![]))], Some(0x100)), "960\t540\n!\tgl\toff\nx.png");
         // A new GL view before its first frame: not the old one's frame.
-        assert_eq!(line(&[Rc::new(window(vec![Rc::new(gl_view(0x200, 1.0))]))], Some(0x100)), "960\t540\n!\tgl\toff\nx.png");
+        assert_eq!(line(&[Arc::new(window(vec![Arc::new(gl_view(0x200, 1.0))]))], Some(0x100)), "960\t540\n!\tgl\toff\nx.png");
         // A frame not known by a view's layer shows as it is.
-        assert_eq!(line(&[Rc::new(window(vec![]))], None), "960\t540\n!\tgl\t1\nx.png");
+        assert_eq!(line(&[Arc::new(window(vec![]))], None), "960\t540\n!\tgl\t1\nx.png");
     }
 
     /// A GL view whose alpha animates fades: each coming frame of the list
@@ -4192,7 +4812,7 @@ mod tests {
         let mut gl = view(rect(0.0, 0.0, 960.0, 540.0), None, vec![]);
         (gl.gl, gl.gl_layer, gl.alpha) = (true, 0x100, 1.0);
         gl.motion = vec![pose(0.5), pose(0.0)];
-        let nodes = [Rc::new(window(vec![Rc::new(gl)]))];
+        let nodes = [Arc::new(window(vec![Arc::new(gl)]))];
         let amounts = gl_amounts(&nodes, Some(0x100), false, 3);
         assert_eq!(amounts, [1.0, 0.5, 0.0]);
         let timed: Vec<(f64, Vec<Picture>)> = vec![(1.0, vec![]), (1.5, vec![]), (2.0, vec![])];
@@ -4209,13 +4829,13 @@ mod tests {
     #[test]
     fn clipping_views_keep_what_they_hold_inside() {
         let inner = view(rect(20.0, 20.0, 100.0, 100.0), Some("inner.png"), vec![]);
-        let mut small = view(rect(30.0, -10.0, 40.0, 40.0), None, vec![Rc::new(view(rect(0.0, 0.0, 100.0, 100.0), Some("deep.png"), vec![]))]);
+        let mut small = view(rect(30.0, -10.0, 40.0, 40.0), None, vec![Arc::new(view(rect(0.0, 0.0, 100.0, 100.0), Some("deep.png"), vec![]))]);
         small.clips = true;
         let away = view(rect(200.0, 200.0, 10.0, 10.0), Some("away.png"), vec![]);
-        let mut clipping = view(rect(100.0, 100.0, 50.0, 50.0), Some("box.png"), vec![Rc::new(inner), Rc::new(small), Rc::new(away)]);
+        let mut clipping = view(rect(100.0, 100.0, 50.0, 50.0), Some("box.png"), vec![Arc::new(inner), Arc::new(small), Arc::new(away)]);
         clipping.clips = true;
         let free = view(rect(0.0, 0.0, 10.0, 10.0), Some("free.png"), vec![]);
-        let pictures = flatten(&window(vec![Rc::new(clipping), Rc::new(free)]));
+        let pictures = flatten(&window(vec![Arc::new(clipping), Arc::new(free)]));
         let clips: Vec<(&str, Rect)> = pictures.iter().map(|p| (p.path.as_str(), p.clip)).collect();
         assert_eq!(
             clips,
@@ -4234,7 +4854,7 @@ mod tests {
     /// 568x320 views (as on an iPhone 5, where only touches miss there).
     #[test]
     fn windows_do_not_clip_what_they_hold() {
-        let small = Node { alpha: 1.0, frame: rect(0.0, 0.0, 320.0, 480.0), children: vec![Rc::new(view(rect(0.0, 0.0, 568.0, 320.0), Some("menu.png"), vec![]))], ..Default::default() };
+        let small = Node { alpha: 1.0, frame: rect(0.0, 0.0, 320.0, 480.0), children: vec![Arc::new(view(rect(0.0, 0.0, 568.0, 320.0), Some("menu.png"), vec![]))], ..Default::default() };
         let pictures = flatten(&small);
         let (wide, high, _) = crate::fw::uikit::screen_points();
         assert_eq!(pictures[0].clip, rect(0.0, 0.0, wide.max(320.0), high.max(480.0)));
@@ -4577,6 +5197,323 @@ mod tests {
         assert!(alpha_at(70.0, 160.0) > 200, "the near edge reaches far down");
         assert_eq!(alpha_at(60.0, 100.0), 0, "nothing left of the near edge");
         assert_eq!(alpha_at(110.0, 150.0), 0, "the far side is shorter");
+    }
+
+    /// With IOS_PHONE_ANIM=1 a layer turned in 3D that only clips to its
+    /// bounds (a card's clipped label and icon) cuts what it holds to its
+    /// turned bounds where the phone draws it, rather than being drawn into
+    /// a picture of its own every frame: between marks holding the four
+    /// corners on screen (as `layers_turned_in_3d_keep_their_perspective_inside_groups`
+    /// works them out). Off, it is a group, as before.
+    #[test]
+    fn turned_clipping_layers_cut_to_their_corners_on_the_phone() {
+        let (s, c) = 60f64.to_radians().sin_cos();
+        let mut turn = IDENTITY_3D;
+        (turn.0[0], turn.0[2], turn.0[8], turn.0[10]) = (c, -s, s, c);
+        (turn.0[3], turn.0[11]) = (-s * -1.0 / 200.0, c * -1.0 / 200.0);
+        let wide = Arc::new(view(rect(-30.0, 0.0, 160.0, 100.0), Some("a.png"), Vec::new()));
+        let card = Node { clips: true, transform: Some(turn), ..view(rect(50.0, 50.0, 100.0, 100.0), None, vec![wide]) };
+        let screen = window(vec![Arc::new(card)]);
+        let paths = |pictures: &[Picture]| pictures.iter().map(|p| p.path.split('\t').next().unwrap().to_string()).collect::<Vec<_>>();
+        let off = with_phone_anim(false, || flatten(&screen));
+        assert_eq!(paths(&off), [GROUP_MARK, "a.png", END_MARK]);
+        let on = with_phone_anim(true, || flatten(&screen));
+        assert_eq!(paths(&on), [CUT_MARK, "a.png", UNCUT_MARK]);
+        let corners: Vec<(i64, i64)> = on[0].path.split('\t').skip(1).map(|n| n.parse::<f64>().unwrap().round() as i64).collect::<Vec<_>>().chunks(2).map(|p| (p[0], p[1])).collect();
+        assert_eq!(corners, [(68, 36), (121, 59), (121, 141), (68, 164)], "{}", on[0].path);
+        let text = encode((200.0, 200.0), &on);
+        assert!(text.lines().nth(1).unwrap().starts_with("!\tcut\t") && text.lines().nth(3) == Some("!\tuncut"), "{text}");
+    }
+
+    /// While the list up is a live scene, running animations alone don't make
+    /// the game thread list the screen again (the phone works out the frames);
+    /// a change still does, and without a scene animations do, as before.
+    #[test]
+    fn running_animations_skip_the_rebuild_only_under_a_live_scene() {
+        assert!(tick_may_skip(false, false, true, true), "animating under a scene");
+        assert!(!tick_may_skip(false, false, true, false), "animating, baked list");
+        assert!(!tick_may_skip(true, false, true, true), "a change");
+        assert!(!tick_may_skip(false, true, false, true), "a view that changes by itself");
+        assert!(tick_may_skip(false, false, false, false), "nothing new");
+    }
+
+    /// A GL view under the pictures (SpellCraft's root) may be in a live
+    /// scene while it and everything above it stay still: the phone keeps
+    /// showing its frames on their own surface under the scene's pictures.
+    /// One that moves or fades itself, or inside a layer that does, keeps the
+    /// list baked. The card's place at 10.5 s is worked out by hand: its
+    /// middle slides from x 100 to 200 over 10-11 s, so its left edge is at 100.
+    #[test]
+    fn a_still_gl_view_can_be_under_a_live_scene() {
+        use crate::fw::animation::{Program, ProgramKind, Property, Timing, Value};
+        setup();
+        let _files = TEXT_FILES.lock().unwrap_or_else(|e| e.into_inner());
+        let program = |key: &str, from: f64, to: f64| Arc::new(Program {
+            timing: Timing { begin: 10.0, duration: 1.0, ..Default::default() },
+            removed: true,
+            curve: None,
+            kind: ProgramKind::Property(Property { key: key.into(), from: Some(Value::Number(from)), to: Some(Value::Number(to)), ..Default::default() }),
+            committed: None,
+        });
+        let red = [1.0, 0.0, 0.0, 1.0];
+        let live = |key: &str, from: f64, to: f64, middle: (f64, f64), size: f64| Some(Arc::new(LiveAnim {
+            programs: vec![program(key, from, to)],
+            model: crate::fw::animation::Shown::new(1.0, Point { x: middle.0, y: middle.1 }, IDENTITY_3D, Some(red)),
+            time: (1.0, 0.0),
+            bounds: rect(0.0, 0.0, size, size),
+            anchor: Point { x: 0.5, y: 0.5 },
+        }));
+        let card = || Arc::new(Node { background: Some(red), live: live("position.x", 100.0, 200.0, (100.0, 100.0), 100.0), ..view(rect(50.0, 50.0, 100.0, 100.0), None, Vec::new()) });
+        let gl = |live: Option<Arc<LiveAnim>>, children: Vec<Arc<Node>>| Arc::new(Node { gl: true, gl_layer: 0x51, live, ..view(rect(0.0, 0.0, 300.0, 300.0), None, children) });
+        let still = live::Scene::build(&[gl(None, vec![card()])]).expect("a still GL view under a live scene");
+        let p = still.pictures_at(10.5).into_iter().find(|p| p.path.starts_with(COLOR_PREFIX)).expect("the card");
+        assert!((p.place.tx - 100.0).abs() < 1e-9, "by hand: {}", p.place.tx);
+        assert!(live::Scene::build(&[gl(live("opacity", 1.0, 0.0, (150.0, 150.0), 300.0), vec![card()])]).is_err(), "a fading GL view");
+        let parent = Arc::new(Node { live: live("position.x", 150.0, 250.0, (150.0, 150.0), 300.0), ..view(rect(0.0, 0.0, 300.0, 300.0), None, vec![gl(None, Vec::new())]) });
+        assert!(live::Scene::build(&[parent]).is_err(), "a GL view inside a moving layer");
+    }
+
+    /// A scene holds each file from when it is made (before `keep`), so a
+    /// still layer made later can't push an earlier file out of a cache
+    /// meanwhile. One let go, or one whose build fails partway, holds none.
+    #[test]
+    fn a_scene_holds_its_files_from_when_they_are_made() {
+        use crate::fw::animation::{Program, ProgramKind, Property, Timing, Value};
+        use crate::fw::graphics::pin_count;
+        setup();
+        let _files = TEXT_FILES.lock().unwrap_or_else(|e| e.into_inner());
+        let (back, red, faded) = ([0.13, 0.27, 0.41, 1.0], [0.91, 0.07, 0.03, 1.0], [0.05, 0.61, 0.17, 1.0]);
+        let card = Arc::new(Node {
+            background: Some(red),
+            live: Some(Arc::new(LiveAnim {
+                programs: vec![Arc::new(Program {
+                    timing: Timing { begin: 10.0, duration: 1.0, ..Default::default() },
+                    removed: true,
+                    curve: None,
+                    kind: ProgramKind::Property(Property { key: "position.x".into(), from: Some(Value::Number(100.0)), to: Some(Value::Number(200.0)), ..Default::default() }),
+                    committed: None,
+                })],
+                model: crate::fw::animation::Shown::new(1.0, Point { x: 100.0, y: 100.0 }, IDENTITY_3D, Some(red)),
+                time: (1.0, 0.0),
+                bounds: rect(0.0, 0.0, 100.0, 100.0),
+                anchor: Point { x: 0.5, y: 0.5 },
+            })),
+            ..view(rect(50.0, 50.0, 100.0, 100.0), None, Vec::new())
+        });
+        let screen = |children: Vec<Arc<Node>>| vec![Arc::new(Node { background: Some(back), ..view(rect(0.0, 0.0, 300.0, 300.0), None, children) })];
+        let scene = live::Scene::build(&screen(vec![card.clone()])).expect("a scene");
+        assert!(!scene.files.is_empty() && scene.files.iter().all(|f| pin_count(f) == 1), "held before keep: {:?}", scene.files.iter().map(|f| pin_count(f)).collect::<Vec<_>>());
+        let files = scene.files.clone();
+        drop(scene);
+        assert!(files.iter().all(|f| pin_count(f) == 0), "let go with the scene");
+        // One still layer in two places: refused after the others' files are made.
+        let still = Arc::new(Node { rasterized: true, alpha: 0.5, background: Some(faded), ..view(rect(200.0, 200.0, 20.0, 20.0), None, Vec::new()) });
+        assert!(live::Scene::build(&screen(vec![card, still.clone(), still])).is_err(), "in two places");
+        assert!(files.iter().all(|f| pin_count(f) == 0), "a failed build holds nothing");
+    }
+
+    /// Running animations skip the rebuild only once the phone says the live
+    /// list is up: until then the list it shows may be an older baked one,
+    /// whose frames run out.
+    #[test]
+    fn skipping_waits_for_the_phone_to_put_the_live_list_up() {
+        let mut list = LiveUp::default();
+        list.sent(5, true);
+        assert!(!list.up(), "sent, not up yet");
+        list.put_up(4);
+        assert!(!list.up(), "an older list went up");
+        list.put_up(5);
+        assert!(list.up(), "up");
+        list.sent(6, false);
+        list.put_up(6);
+        assert!(!list.up(), "a baked list since");
+    }
+
+    /// A scene's frames and files last while the phone holds it (shown or on
+    /// its way), however many come after it, until it lets go; a cache letting
+    /// one of its files go leaves it until then. Without a screen that says
+    /// what it put up (a PC run), the last MOST_SCENES are kept.
+    #[test]
+    fn live_scenes_last_until_the_phone_lets_them_go() {
+        setup();
+        let _files = TEXT_FILES.lock().unwrap_or_else(|e| e.into_inner());
+        with_phone_anim(true, || {
+            let window = new_view("UIWindow", rect(0.0, 0.0, 300.0, 300.0));
+            let label = new_view("UILabel", rect(50.0, 50.0, 100.0, 30.0));
+            runtime::send(label, "setText:", &[crate::fw::string::make(&format!("held by scenes {}", std::process::id()))]);
+            runtime::send(window, "addSubview:", &[label]);
+            let layer = runtime::send(label, "layer", &[]);
+            let begin = crate::fw::runloop::media_time();
+            let slide = runtime::send(runtime::class_named("CABasicAnimation"), "animationWithKeyPath:", &[crate::fw::string::make("position.x")]);
+            runtime::send(slide, "setFromValue:", &[crate::fw::collections::number_float(100.0)]);
+            runtime::send(slide, "setToValue:", &[crate::fw::collections::number_float(200.0)]);
+            send_struct(slide, "setDuration:", 0.25f64);
+            send_struct(slide, "setBeginTime:", begin);
+            runtime::send(layer, "addAnimation:forKey:", &[slide, crate::fw::string::make("slide")]);
+            let nodes = with_sampling(Sampling { start: begin, step: 1.0 / 120.0, count: 1 }, || vec![snapshot(window, &Classes::find(), 0)]);
+            let scene = || live::Scene::build(&nodes).expect("a scene");
+            let file = scene().files.first().cloned().expect("the label's file");
+            let held: Vec<u64> = (0..live::MOST_SCENES + 2).map(|i| {
+                let number = live::keep(scene(), false);
+                live::sent(number, Some(1000 + i as u64));
+                number
+            }).collect();
+            let mut out = Vec::new();
+            assert!(held.iter().all(|&n| live::frame(n, begin + 0.1, &mut out)), "all held");
+            crate::fw::graphics::remove_picture_file(&file);
+            for &n in &held[..held.len() - 1] {
+                live::release(n);
+            }
+            assert!(!live::frame(held[0], begin + 0.1, &mut out) && live::frame(held[held.len() - 1], begin + 0.1, &mut out), "only the one still held");
+            assert!(std::path::Path::new(&file).exists(), "its file stays while held");
+            live::release(held[held.len() - 1]);
+            assert!(!std::path::Path::new(&file).exists(), "and goes once let go");
+            let unsent = live::keep(scene(), false);
+            live::sent(unsent, None);
+            assert!(!live::frame(unsent, begin + 0.1, &mut out), "not sent: gone");
+            let capped: Vec<u64> = (0..live::MOST_SCENES + 2).map(|_| live::keep(scene(), true)).collect();
+            let kept: Vec<bool> = capped.iter().map(|&n| live::frame(n, begin + 0.1, &mut out)).collect();
+            assert_eq!(kept.iter().filter(|&&k| k).count(), live::MOST_SCENES, "a PC run keeps the last few: {kept:?}");
+            assert!(!kept[0] && !kept[1] && kept[2]);
+            capped.iter().for_each(|&n| live::release(n));
+            runtime::send(layer, "removeAllAnimations", &[]);
+        });
+    }
+
+    /// IOS_PHONE_ANIM=1: a scene shows a sliding, fading card at any moment
+    /// where the game thread's own list puts it then: at the list's frame
+    /// times and 0.37 of a refresh past one; and it does so on another
+    /// thread while this one holds the runtime (it asks no object).
+    #[test]
+    fn live_scenes_show_any_moment_where_the_list_would() {
+        setup();
+        let _files = TEXT_FILES.lock().unwrap_or_else(|e| e.into_inner());
+        with_phone_anim(true, || {
+            let window = new_view("UIWindow", rect(0.0, 0.0, 300.0, 300.0));
+            let card = new_view("UIView", rect(50.0, 50.0, 100.0, 100.0));
+            runtime::send(card, "setBackgroundColor:", &[runtime::send(runtime::class_named("UIColor"), "redColor", &[])]);
+            runtime::send(window, "addSubview:", &[card]);
+            let layer = runtime::send(card, "layer", &[]);
+            let begin = crate::fw::runloop::media_time();
+            let linear = runtime::send(runtime::class_named("CAMediaTimingFunction"), "functionWithName:", &[crate::fw::string::make("linear")]);
+            for (key, from, to) in [("position.x", 100.0, 200.0), ("opacity", 1.0, 0.2)] {
+                let animation = runtime::send(runtime::class_named("CABasicAnimation"), "animationWithKeyPath:", &[crate::fw::string::make(key)]);
+                runtime::send(animation, "setFromValue:", &[crate::fw::collections::number_float(from)]);
+                runtime::send(animation, "setToValue:", &[crate::fw::collections::number_float(to)]);
+                runtime::send(animation, "setTimingFunction:", &[linear]);
+                send_struct(animation, "setDuration:", 0.25f64);
+                send_struct(animation, "setBeginTime:", begin);
+                runtime::send(layer, "addAnimation:forKey:", &[animation, crate::fw::string::make(key)]);
+            }
+            let refresh = 1.0 / 120.0;
+            let listed = |start: f64, count: usize| with_sampling(Sampling { start, step: refresh, count }, || vec![snapshot(window, &Classes::find(), 0)]);
+            let nodes = listed(begin + 0.05, 4);
+            let scene = live::Scene::build(&nodes).expect("a scene");
+            let look = |pictures: &[Picture]| pictures.iter().map(|p| (p.path.clone(), at(p, 0.0, 0.0), (p.alpha * 1000.0).round())).collect::<Vec<_>>();
+            for k in 0..4 {
+                assert_eq!(look(&scene.pictures_at(begin + 0.05 + k as f64 * refresh)), look(&flatten_at(&nodes[0], k)), "frame {k}");
+            }
+            let between = begin + 0.05 + 0.37 * refresh;
+            let there = look(&flatten(&listed(between, 1)[0]));
+            assert_eq!(look(&scene.pictures_at(between)), there, "between frames");
+            assert!(there[0].1 .0 > 50.0 && there[0].2 < 1000.0, "it has moved and faded: {there:?}");
+            // Worked out by hand, not by the evaluator: f of the way through,
+            // the left edge is at 50 + 100 f and the alpha 1 - 0.8 f.
+            let f = (0.05 + 0.37 * refresh) / 0.25;
+            let p = scene.pictures_at(between).remove(0);
+            assert!((p.place.tx - (50.0 + 100.0 * f)).abs() < 1e-6 && (p.alpha - (1.0 - 0.8 * f)).abs() < 1e-6, "by hand: {} {}", p.place.tx, p.alpha);
+            let ended = scene.pictures_at(begin + 0.25).remove(0);
+            assert_eq!((ended.place.tx, ended.alpha), (50.0, 1.0), "from its very end, removed: the model");
+            // From another thread, while this one holds the runtime.
+            let scene = Arc::new(scene);
+            let (tell, told) = std::sync::mpsc::channel();
+            let held = crate::objc::runtime::lock();
+            let other = scene.clone();
+            std::thread::spawn(move || {
+                let mut out = Vec::new();
+                let _ = tell.send(other.frame_bytes(between, &mut out).map(|_| out));
+            });
+            let bytes = told.recv_timeout(std::time::Duration::from_millis(500)).expect("drawn without the runtime").expect("a frame");
+            drop(held);
+            let number = |at: usize| i32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+            assert_eq!((number(0), number(4), number(8)), (1, 1, 1), "one picture, still moving");
+            let x = f32::from_le_bytes(bytes[28 + 6 + 16..28 + 6 + 20].try_into().unwrap());
+            assert_eq!(x.round() as f64, there[0].1 .0, "its place");
+            assert_eq!(scene.files[number(29) as usize].is_empty(), false, "its file");
+            assert!(!scene.moving(begin + 0.3), "done after its end");
+            runtime::send(layer, "removeAllAnimations", &[]);
+        });
+    }
+
+    /// IOS_PHONE_ANIM=1: a layer drawn as one picture (here rasterized and
+    /// faded) may be in a live scene while neither it, nor anything in it or
+    /// around it, animates: its picture is made once with the scene and shown
+    /// where the list shows it (by hand: its frame's corner, 200,200, at its
+    /// opacity 0.5) at every moment. One that moves, or holds an animation,
+    /// keeps the list baked, and the reason names it.
+    #[test]
+    fn a_still_one_picture_layer_can_be_in_a_live_scene() {
+        setup();
+        let _files = TEXT_FILES.lock().unwrap_or_else(|e| e.into_inner());
+        with_phone_anim(true, || {
+            let rgba = crate::fw::graphics::make_color;
+            let window = new_view("UIWindow", rect(0.0, 0.0, 300.0, 300.0));
+            let group = new_layer("CALayer", rect(200.0, 200.0, 60.0, 60.0));
+            runtime::send(group, "setShouldRasterize:", &[1]);
+            send_struct(group, "setOpacity:", 0.5f32);
+            let mut parts = Vec::new();
+            for (color, frame) in [([0.0, 1.0, 0.0, 1.0], rect(0.0, 0.0, 40.0, 40.0)), ([0.0, 0.0, 1.0, 1.0], rect(20.0, 20.0, 40.0, 40.0))] {
+                let part = new_layer("CALayer", frame);
+                runtime::send(part, "setBackgroundColor:", &[rgba(color)]);
+                runtime::send(group, "addSublayer:", &[part]);
+                parts.push(part);
+            }
+            runtime::send(runtime::send(window, "layer", &[]), "addSublayer:", &[group]);
+            let card = new_view("UIView", rect(50.0, 50.0, 40.0, 40.0));
+            runtime::send(card, "setBackgroundColor:", &[runtime::send(runtime::class_named("UIColor"), "redColor", &[])]);
+            runtime::send(window, "addSubview:", &[card]);
+            let begin = crate::fw::runloop::media_time();
+            let linear = runtime::send(runtime::class_named("CAMediaTimingFunction"), "functionWithName:", &[crate::fw::string::make("linear")]);
+            let slide = |layer: Id, key: &str, from: f64, to: f64| {
+                let animation = runtime::send(runtime::class_named("CABasicAnimation"), "animationWithKeyPath:", &[crate::fw::string::make(key)]);
+                runtime::send(animation, "setFromValue:", &[crate::fw::collections::number_float(from)]);
+                runtime::send(animation, "setToValue:", &[crate::fw::collections::number_float(to)]);
+                runtime::send(animation, "setTimingFunction:", &[linear]);
+                send_struct(animation, "setDuration:", 0.25f64);
+                send_struct(animation, "setBeginTime:", begin);
+                runtime::send(layer, "addAnimation:forKey:", &[animation, crate::fw::string::make(key)]);
+            };
+            slide(runtime::send(card, "layer", &[]), "position.x", 70.0, 170.0);
+            let refresh = 1.0 / 120.0;
+            let listed = || with_sampling(Sampling { start: begin + 0.05, step: refresh, count: 4 }, || vec![snapshot(window, &Classes::find(), 0)]);
+            let nodes = listed();
+            let scene = live::Scene::build(&nodes).expect("a still rasterized layer in a live scene");
+            let faded = |pictures: Vec<Picture>| pictures.into_iter().filter(|p| p.alpha < 1.0).collect::<Vec<_>>();
+            let own = faded(compose_groups(resolve(flatten_at(&nodes[0], 0))));
+            assert_eq!(own.len(), 1, "the list draws it as one: {own:?}");
+            for t in [begin + 0.05, begin + 0.2] {
+                let shown = faded(scene.pictures_at(t));
+                assert_eq!(shown.len(), 1, "one picture at {t}: {shown:?}");
+                assert!((shown[0].alpha - 0.5).abs() < 1e-9 && (shown[0].place.tx, shown[0].place.ty) == (200.0, 200.0), "by hand: {:?}", shown[0]);
+                assert_eq!(shown[0].path, own[0].path, "the list's own picture");
+            }
+            let card_x = |t: f64| scene.pictures_at(t).into_iter().find(|p| p.alpha >= 1.0).expect("the card").place.tx;
+            assert!((card_x(begin + 0.05) - 70.0).abs() < 1e-6 && (card_x(begin + 0.2) - 130.0).abs() < 1e-6, "by hand: 50 + 100 f");
+            let mut bytes = Vec::new();
+            scene.frame_bytes(begin + 0.1, &mut bytes).expect("a frame");
+            assert_eq!(i32::from_le_bytes(bytes[4..8].try_into().unwrap()), 2, "the card and the one picture");
+            // Baked, and named: one that moves, and one holding an animation.
+            let why = || live::Scene::build(&listed()).err().map(|why| why.to_string()).unwrap_or_default();
+            slide(group, "position.x", 230.0, 260.0);
+            let moving = why();
+            runtime::send(group, "removeAllAnimations", &[]);
+            slide(parts[0], "opacity", 1.0, 0.5);
+            let holding = why();
+            runtime::send(parts[0], "removeAllAnimations", &[]);
+            runtime::send(runtime::send(card, "layer", &[]), "removeAllAnimations", &[]);
+            assert_eq!(moving, "a layer drawn as one picture that moves: CALayer (rasterized)");
+            assert_eq!(holding, "a layer drawn as one picture with an animation inside: CALayer (rasterized)");
+        });
     }
 
     /// A rasterized layer is drawn as one picture and its opacity applies to

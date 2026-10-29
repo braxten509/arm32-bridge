@@ -516,3 +516,19 @@ fn a_call_plan_made_once_converts_each_call_like_a_fresh_one() {
         }
     }
 }
+
+/// A message's arguments and result are worked on in place: the bytes of a
+/// common argument or result (up to a CGAffineTransform) take no heap
+/// memory, as each memory request cost time on every message.
+#[test]
+fn common_arguments_and_results_take_no_heap() {
+    let list = [7u32; 16];
+    for size in [1, 4, 8, 16, 24] {
+        assert!(guest_bytes(&words(&list), 0, size).is_inline(), "{size} guest bytes");
+    }
+    let ret = HostRet { x: [1, 2], d: [3, 4, 5, 6] };
+    let rect = HostTy::Struct { fields: (0..4).map(|i| (i * 8, HostTy::F64)).collect(), size: 32, align: 8 };
+    for hty in [HostTy::Ptr, HostTy::Int { size: 4, signed: true }, HostTy::F64, rect] {
+        assert!(host_result_bytes(&hty, &ret, false, None).is_inline(), "{hty:?} result");
+    }
+}

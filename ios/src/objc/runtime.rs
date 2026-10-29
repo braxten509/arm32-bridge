@@ -78,7 +78,7 @@ pub struct Runtime {
     cache: HashMap<(Class, Sel), Imp>,
     /// Classes whose +initialize has finished all the way up their chain
     /// (it never goes back, and a class's superclass never changes).
-    chain_done: std::collections::HashSet<Class>,
+    chain_done: HashSet<Class>,
     /// (lookup class, selector) whose resolver was called and added nothing:
     /// it is not asked again until the class's method table changes.
     resolutions_refused: HashSet<(Class, Sel)>,
@@ -167,6 +167,7 @@ impl Runtime {
             unsafe { (*(method as *mut MethodObject)).imp = imp };
         }
         self.cache.clear();
+        METHODS_CHANGED.fetch_add(1, Ordering::Release);
         // A class that gains a method may now answer selectors whose resolver
         // said no: forget its refusals with its methods (Apple clears the
         // class's method cache, refusals included).
@@ -841,6 +842,33 @@ mod trace_tests {
     }
 }
 
+#[cfg(test)]
+mod lookup_tests {
+    use super::*;
+
+    // Code addresses only compared, never called.
+    const FIRST: Imp = 0x1000_1110;
+    const SECOND: Imp = 0x1000_2220;
+
+    /// Found methods are kept per thread; a method added later still wins.
+    #[test]
+    fn a_method_added_after_a_lookup_is_used() {
+        let (class, spin) = {
+            let mut rt = lock();
+            let class = rt.define_class("LookupTestSpinner", 0, 16);
+            let spin = rt.sel("lookupTestSpin");
+            rt.add_method(class, spin, FIRST);
+            (class, spin)
+        };
+        let object = alloc_instance(class);
+        // The second lookup finds the class initialized and keeps the answer.
+        assert_eq!(imp_for(object, spin), Some(FIRST));
+        assert_eq!(imp_for(object, spin), Some(FIRST));
+        lock().add_method(class, spin, SECOND);
+        assert_eq!(imp_for(object, spin), Some(SECOND));
+    }
+}
+
 #[no_mangle]
 extern "C" fn ios_objc_lookup_super(pair: *const [usize; 2], sel: Sel, second_form: usize, caller: usize, saved_x0: *mut Id) -> Imp {
     let [mut receiver, current] = unsafe { *pair };
@@ -859,10 +887,31 @@ extern "C" fn ios_objc_lookup_super(pair: *const [usize; 2], sel: Sel, second_fo
     imp
 }
 
+/// Grows whenever a method is added: the only change that makes a method
+/// found earlier the wrong one (a class's chain never changes, and an
+/// initialized class stays initialized).
+static METHODS_CHANGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    /// This thread's recent `imp_for` answers for initialized classes:
+    /// (class, selector, code, METHODS_CHANGED when found).
+    static FOUND: [std::cell::Cell<(Class, Sel, Imp, u64)>; 64] = const { [const { std::cell::Cell::new((0, 0, 0, 0)) }; 64] };
+}
+
+fn found_slot(class: Class, sel: Sel) -> usize {
+    (class >> 4 ^ sel >> 3) & 63
+}
+
 /// Finds the code for a message, for calls from our own Rust code.
 pub fn imp_for(receiver: Id, sel: Sel) -> Option<Imp> {
     if receiver == 0 {
         return None;
+    }
+    let class = unsafe { *(receiver as *const usize) };
+    let slot = found_slot(class, sel);
+    let (c, s, imp, changes) = FOUND.with(|f| f[slot].get());
+    if c == class && s == sel && changes == METHODS_CHANGED.load(Ordering::Acquire) {
+        return Some(imp);
     }
     let (isa, is_class) = {
         let mut rt = lock();
@@ -884,7 +933,11 @@ pub fn imp_for(receiver: Id, sel: Sel) -> Option<Imp> {
             if !known {
                 rt.chain_done.insert(start);
             }
-            return rt.lookup(isa, sel);
+            // Read under the lock, so no method was added in between.
+            let changes = METHODS_CHANGED.load(Ordering::Acquire);
+            let imp = rt.lookup(isa, sel)?;
+            FOUND.with(|f| f[found_slot(isa, sel)].set((isa, sel, imp, changes)));
+            return Some(imp);
         }
         (isa, is_class)
     };

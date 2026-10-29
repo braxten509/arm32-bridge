@@ -901,6 +901,24 @@ mod tests {
         assert_eq!((available, size), (0, 4));
     }
 
+    /// A player's and its item's status is an NSInteger: key-value coding
+    /// (and so an observer asking for the first value) gets an NSNumber,
+    /// not the raw 1 as an object (Infinity Blade II and III stopped at start).
+    #[test]
+    fn player_status_is_boxed_as_a_number() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let url = runtime::send(runtime::class_named("NSURL"), "fileURLWithPath:", &[string::make("/nothing.m4v")]);
+        let item = runtime::send(runtime::class_named("AVPlayerItem"), "playerItemWithURL:", &[url]);
+        let player = runtime::send(runtime::class_named("AVPlayer"), "playerWithPlayerItem:", &[item]);
+        for object in [item, player] {
+            let class = runtime::lock().class_of(object);
+            assert_eq!(crate::fw::invocation::method_types(class, runtime::sel("status")).as_deref(), Some("q@:"), "status has no NSInteger types");
+            let status = runtime::send(object, "valueForKey:", &[string::make("status")]);
+            assert!(collections::is_number(status) && collections::number_as_i64(status) == 1, "status boxed as a number");
+        }
+    }
+
     static INTERRUPTIONS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
     extern "C" fn c_listener(data: usize, state: u32) {

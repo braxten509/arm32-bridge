@@ -79,7 +79,12 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
         view.holder.addCallback(this)
         root = FrameLayout(this)
         root.addView(view)
-        pictures = IosPicturesView(this).apply { onUp = { nativePicturesUp(it) } }
+        pictures = IosPicturesView(this).apply {
+            onUp = { nativePicturesUp(it) }
+            liveFrame = { scene, time, into -> nativeLiveFrame(scene, time, into) }
+            liveRelease = { nativeLiveRelease(it) }
+            animationLead = { nativeAnimationLead(it) }
+        }
         root.addView(pictures)
         keyboard = KeyboardInput(this) { if (started) nativeType(it) }
         root.addView(keyboard, FrameLayout.LayoutParams(1, 1))
@@ -136,6 +141,8 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
         val reports = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "Game Bridge/logs")
         System.loadLibrary("gamebridge_ios")
         nativeSetReport(name, reports.path)
+        // The settings on in its card's Settings… (saved, so they hold after a restart).
+        nativeSetSettings(GameSettings.env(filesDir, gameId(File(app))))
         nativeSetScreenRate(Math.round(topRefreshRate()))
         if (!nativeStart(holder.surface, app, home, width, height)) {
             finish()
@@ -166,11 +173,16 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
         window.attributes = window.attributes.apply { preferredDisplayModeId = mode.modeId }
     }
 
+    private fun info(folder: File) = runCatching { Plist.read(File(folder, "Info.plist")) as? Map<*, *> }.getOrNull()
+
+    /** The game's CFBundleIdentifier, else its folder's name (as its card's). */
+    private fun gameId(folder: File): String = (info(folder)?.get("CFBundleIdentifier") as? String)?.takeIf { it.isNotBlank() } ?: folder.name
+
     /** The name the user gave the game, else the one in its Info.plist, else its folder's. */
     private fun gameName(folder: File): String {
-        val info = runCatching { Plist.read(File(folder, "Info.plist")) as? Map<*, *> }.getOrNull()
+        val info = info(folder)
         fun text(key: String) = (info?.get(key) as? String)?.takeIf { it.isNotBlank() }
-        return IphoneGames.customName(this, text("CFBundleIdentifier") ?: folder.name)
+        return IphoneGames.customName(this, gameId(folder))
             ?: text("CFBundleDisplayName") ?: text("CFBundleName") ?: folder.nameWithoutExtension
     }
 
@@ -337,7 +349,8 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
     /** Called by the game (any thread): the UIKit pictures to draw (IosPicturesView.show). */
     @Suppress("unused")
     fun showPictures(list: String, number: Long) {
-        runOnUiThread { pictures.show(list, number) }
+        val sent = System.nanoTime()
+        runOnUiThread { pictures.show(list, number, sent) }
     }
 
     /** Called by the game (any thread): it started (true) or stopped (false) editing text. */
@@ -395,7 +408,11 @@ class IosGameActivity : Activity(), SurfaceHolder.Callback {
     private external fun nativePause()
     private external fun nativeNoticeFd(): Int
     private external fun nativeSetReport(name: String, folder: String)
+    private external fun nativeSetSettings(settings: String)
     private external fun nativeSetScreenRate(hz: Int)
     private external fun nativePicturesUp(number: Long)
+    private external fun nativeLiveFrame(scene: Long, time: Long, into: java.nio.ByteBuffer): Int
+    private external fun nativeLiveRelease(scene: Long)
+    private external fun nativeAnimationLead(nanos: Long)
     private external fun nativeResume(surface: android.view.Surface, width: Int, height: Int)
 }

@@ -292,14 +292,18 @@ fn refollow(watchers: &[KeyObserver]) {
         let o = &mut *o;
         if let Some(w) = o.observers.iter_mut().find(|w| w.serial == watcher.serial) {
             let before = link_setters(w);
+            let objects_before = link_objects(w);
             w.chain = chain;
             w.extra = extra;
             let after = link_setters(w);
+            let objects_after = link_objects(w);
             // Most changes only swap the objects along the path, not its keys.
             if before != after {
                 count_setters(o, before, false);
                 count_setters(o, after, true);
             }
+            count_links(o, objects_before, false);
+            count_links(o, objects_after, true);
         }
     }
 }
@@ -312,11 +316,14 @@ struct Observing {
     setter_sels: std::collections::BTreeSet<Sel>,
     /// How many links of all observers have each setter name.
     setter_counts: std::collections::BTreeMap<String, usize>,
+    /// How many links of all observers each object has: a setter sent to
+    /// any other object announces nothing.
+    link_objects: std::collections::BTreeMap<Id, usize>,
     next_serial: u64,
 }
 
 static OBSERVING: std::sync::Mutex<Observing> =
-    std::sync::Mutex::new(Observing { observers: Vec::new(), setters: std::collections::BTreeSet::new(), setter_sels: std::collections::BTreeSet::new(), setter_counts: std::collections::BTreeMap::new(), next_serial: 0 });
+    std::sync::Mutex::new(Observing { observers: Vec::new(), setters: std::collections::BTreeSet::new(), setter_sels: std::collections::BTreeSet::new(), setter_counts: std::collections::BTreeMap::new(), link_objects: std::collections::BTreeMap::new(), next_serial: 0 });
 
 thread_local! {
     /// Changes this thread announced by -willChangeValueForKey: and not yet
@@ -344,9 +351,38 @@ fn link_setters(w: &KeyObserver) -> Vec<String> {
     w.links().flat_map(|(_, key)| setter_names(key)).collect()
 }
 
+/// The objects of an observer's links, one per link.
+fn link_objects(w: &KeyObserver) -> Vec<Id> {
+    w.links().map(|(object, _)| object).collect()
+}
+
+/// Counts link objects in (or out), as `count_setters` does setter names.
+fn count_links(o: &mut Observing, objects: Vec<Id>, add: bool) {
+    for object in objects {
+        let count = o.link_objects.entry(object).or_insert(0);
+        if add {
+            *count += 1;
+        } else {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                o.link_objects.remove(&object);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How often this thread looked through the observers for a setter (tests).
+    static WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Counts setter names in (or out): the observed setters are the names some
 /// link still has. Each observer change only touches its own links, not
 /// every observer's.
+/// Times a setter became observed (see `count_setters`).
+pub static SETTERS_ADDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn count_setters(o: &mut Observing, names: Vec<String>, add: bool) {
     for name in names {
         let count = o.setter_counts.entry(name.clone()).or_insert(0);
@@ -355,6 +391,9 @@ fn count_setters(o: &mut Observing, names: Vec<String>, add: bool) {
             if *count == 1 {
                 o.setter_sels.insert(runtime::sel(&name));
                 o.setters.insert(name);
+                // 32-bit games' objc_msgSend lanes may hold this setter.
+                SETTERS_ADDED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                crate::guest32::objc::bridge::forget_lanes();
             }
         } else {
             *count = count.saturating_sub(1);
@@ -392,9 +431,11 @@ pub fn observed_setter_key(object: Id, selector: &str) -> Option<String> {
     }
     let key = {
         let o = observing();
-        if !o.setters.contains(selector) {
+        if !o.setters.contains(selector) || !o.link_objects.contains_key(&object) {
             return None;
         }
+        #[cfg(test)]
+        WALKS.with(|w| w.set(w.get() + 1));
         let found = o
             .observers
             .iter()
@@ -498,6 +539,7 @@ extern "C" fn add_key_observer(this: Id, _: Sel, observer: Id, path: Id, options
         let watcher = KeyObserver { serial: o.next_serial, object: this, path, observer, options, context, chain, extra };
         o.observers.push(watcher.clone());
         count_setters(&mut o, link_setters(&watcher), true);
+        count_links(&mut o, link_objects(&watcher), true);
         watcher
     };
     if options & OPTION_INITIAL != 0 {
@@ -515,6 +557,7 @@ fn remove_observer(this: Id, observer: Id, path: Id, context: Option<usize>) {
         if let Some(at) = o.observers.iter().rposition(|w| w.object == this && w.observer == observer && w.path == text && context.is_none_or(|c| c == w.context)) {
             let gone = o.observers.remove(at);
             count_setters(&mut o, link_setters(&gone), false);
+            count_links(&mut o, link_objects(&gone), false);
             return;
         }
     }
@@ -1595,6 +1638,28 @@ mod tests {
         runtime::send(root, "removeObserver:forKeyPath:", &[watcher, s(&path)]);
         msg_send(other, runtime::sel("setTitle:"), s("gone"));
         assert_eq!(take(), [], "removed");
+    }
+
+    /// A setter of an observed key sent to an object nobody observes is
+    /// passed by without looking through the observers: every message of a
+    /// setter's name (SpellCraft sends setSpell: and the like to many
+    /// objects) went through all of them before.
+    #[test]
+    fn a_setter_sent_to_an_unobserved_object_does_not_walk_the_observers() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let s = string::make;
+        let watcher_class = define_class("KvoWalkWatcher", "NSObject", 8);
+        methods(watcher_class, &[("observeValueForKeyPath:ofObject:change:context:", watcher_observe as usize)]);
+        let watcher = runtime::alloc_instance(watcher_class);
+        let (watched, other) = (thing("a", 0, 0), thing("b", 0, 0));
+        runtime::send(watched, "addObserver:forKeyPath:options:context:", &[watcher, s("title"), 1, 0]);
+        let walks = || super::WALKS.with(|w| w.get());
+        let before = walks();
+        assert_eq!(super::observed_setter_key(other, "setTitle:"), None);
+        assert_eq!(walks(), before, "no walk for an object nobody observes");
+        assert_eq!(super::observed_setter_key(watched, "setTitle:"), Some("title".to_string()));
+        runtime::send(watched, "removeObserver:forKeyPath:", &[watcher, s("title")]);
     }
 
     static SET_VALUE_HEARD: std::sync::Mutex<Vec<(String, Option<String>, Option<String>)>> = std::sync::Mutex::new(Vec::new());

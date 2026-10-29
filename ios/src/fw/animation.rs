@@ -717,51 +717,231 @@ impl Shown {
     }
 }
 
-fn eased(animation: Id, progress: f64) -> f64 {
-    curve_of(object(animation, "timingFunction")).map_or(progress, |c| c.at(progress))
+/// A running animation as plain data, read from our copy of it when it is
+/// added and again when its turn commits (its begin moves then): what Core
+/// Animation's commit hands the render server (encode_add_animation). No
+/// objects: it can be shown on any thread, at any moment (`present`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Program {
+    pub timing: Timing,
+    /// removedOnCompletion: the screen drops it at its end (`present`).
+    pub removed: bool,
+    /// Its timing function (none: linear).
+    pub curve: Option<Curve>,
+    pub kind: ProgramKind,
+    /// When the commit that began it ran (its parent's time), for one the
+    /// game gave no beginTime: the screen shows nothing of it from before
+    /// then (`apply`). None: the game's own beginTime.
+    pub committed: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProgramKind {
+    Property(Property),
+    /// A CAAnimationGroup's animations, on its own time.
+    Group(Vec<Program>),
+}
+
+/// A property animation's key path and values (basic, key frames, a path).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Property {
+    pub key: String,
+    pub additive: bool,
+    pub cumulative: bool,
+    pub from: Option<Value>,
+    pub to: Option<Value>,
+    pub by: Option<Value>,
+    /// Key frames' values (None for one that can't be read, which makes the whole animation show nothing).
+    pub values: Option<Vec<Option<Value>>>,
+    pub key_times: Vec<f64>,
+    /// Key frames' timing functions, one per segment.
+    pub curves: Option<Vec<Option<Curve>>>,
+    /// calculationMode ("linear", "discrete", "paced", ...).
+    pub mode: String,
+    /// A key frame animation's CGPath, as figures of points.
+    pub path: Option<Vec<Vec<Point>>>,
+    /// rotationMode ("auto", "autoReverse").
+    pub rotation: Option<String>,
+}
+
+/// Reads an animation (our copy) into a program; `fallback`: what a
+/// duration of 0 stands for (a group's own duration for its animations).
+pub fn program_of(animation: Id, fallback: f64) -> Program {
+    let timing = timing_of(animation, fallback);
+    let removed = number(animation, "removedOnCompletion", 1.0) != 0.0;
+    let curve = curve_of(object(animation, "timingFunction"));
+    if is_group(animation) {
+        let children = object(animation, "animations");
+        let children = if children == 0 { Vec::new() } else { collections::array_items(children) };
+        let kind = ProgramKind::Group(children.into_iter().map(|child| program_of(child, timing.duration)).collect());
+        return Program { timing, removed, curve, kind, committed: None };
+    }
+    let items = |key: &'static str| match object(animation, key) {
+        0 => None,
+        list => Some(collections::array_items(list)),
+    };
+    let text = |key: &'static str| match object(animation, key) {
+        0 => None,
+        value => Some(string::get(value)),
+    };
+    let property = Property {
+        key: string::get(object(animation, "keyPath")),
+        additive: number(animation, "additive", 0.0) != 0.0,
+        cumulative: number(animation, "cumulative", 0.0) != 0.0,
+        from: read_value(object(animation, "fromValue")),
+        to: read_value(object(animation, "toValue")),
+        by: read_value(object(animation, "byValue")),
+        values: items("values").map(|values| values.into_iter().map(read_value).collect()),
+        key_times: items("keyTimes").map(|times| times.into_iter().map(layers::number_value).collect()).unwrap_or_default(),
+        curves: items("timingFunctions").map(|curves| curves.into_iter().map(curve_of).collect()),
+        mode: string::get(anim_calculation_mode(animation, 0)),
+        path: match object(animation, "path") {
+            0 => None,
+            path => Some(crate::fw::graphics::path_points(path)),
+        },
+        rotation: text("rotationMode"),
+    };
+    Program { timing, removed, curve, kind: ProgramKind::Property(property), committed: None }
+}
+
+impl Program {
+    fn eased(&self, progress: f64) -> f64 {
+        self.curve.map_or(progress, |c| c.at(progress))
+    }
+
+    /// Applies it, shown at its parent's time `t`, over `shown`. `screen`:
+    /// as the screen shows it, where one removed on completion is gone from
+    /// its very end (the render server drops it then; the app's own copy
+    /// goes at its next tick, holding a forwards fill until then).
+    pub fn apply(&self, t: f64, shown: &mut Shown, screen: bool) {
+        // The render server draws nothing from before the commit that began
+        // it: a frame for a moment before (the phone's present time jitters
+        // under the animation clock's lead) shows it as at its commit.
+        let t = match self.committed {
+            Some(commit) if screen => t.max(commit),
+            _ => t,
+        };
+        let state = self.timing.state(t);
+        if screen && state.ended && self.removed {
+            return;
+        }
+        let Some(progress) = state.progress else { return };
+        match &self.kind {
+            // Its animations run on its own time (clipped to its duration).
+            // removedOnCompletion takes an animation off its layer; a group's
+            // aren't on one, so theirs counts for nothing on the screen too
+            // (one ending inside the group shows its end only by its fill).
+            ProgramKind::Group(children) => {
+                let eased = self.eased(progress);
+                for child in children {
+                    child.apply(eased * self.timing.duration, shown, false);
+                }
+            }
+            ProgramKind::Property(property) => {
+                let eased = self.eased(progress);
+                if let Some(value) = shown.get(&property.key).and_then(|model| property.value_over(eased, self.timing.lap(t), model)) {
+                    shown.set(&property.key, value);
+                    if let Some(turn) = property.turn(eased) {
+                        shown.set("transform.rotation", Value::Number(turn));
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Property {
+    /// Its value `eased` of the way through its simple duration (its timing
+    /// function applied) with `lap` cycles behind it, over the value shown
+    /// without it (`model`). A path (for a point) wins over key frames;
+    /// cumulative laps each start from the end of the ones before.
+    fn value_over(&self, eased: f64, lap: f64, model: Value) -> Option<Value> {
+        let (value, last) = match (&self.path, &self.values) {
+            (Some(path), _) if matches!(model, Value::Point(_)) => (Value::Point(path_sample(path, eased)?.0), Value::Point(path_sample(path, 1.0)?.0)),
+            (_, Some(values)) => self.keyframe_value(values, eased)?,
+            _ => {
+                let (start, end) = match (self.from, self.to, self.by) {
+                    (Some(f), Some(t), _) => (f, t),
+                    (Some(f), None, Some(b)) => (f, Value::add(f, b)?),
+                    (None, Some(t), Some(b)) => (Value::subtract(t, b)?, t),
+                    (Some(f), None, None) => (f, model),
+                    (None, Some(t), None) => (model, t),
+                    (None, None, Some(b)) => (model, Value::add(model, b)?),
+                    (None, None, None) => (model, model),
+                };
+                (Value::lerp(start, end, eased)?, end)
+            }
+        };
+        let value = if lap > 0.0 && self.cumulative { Value::add(Value::times(last, lap), value)? } else { value };
+        if self.additive { Value::add(model, value) } else { Some(value) }
+    }
+
+    /// A path animation's turn along its path (rotationMode auto or
+    /// autoReverse), `eased` of the way along.
+    fn turn(&self, eased: f64) -> Option<f64> {
+        let heading = path_sample(self.path.as_ref()?, eased)?.1;
+        match self.rotation.as_deref()? {
+            "auto" => Some(heading),
+            "autoReverse" => Some(heading + std::f64::consts::PI),
+            _ => None,
+        }
+    }
+
+    /// The key frames' value at `progress`, and their last value.
+    fn keyframe_value(&self, values: &[Option<Value>], progress: f64) -> Option<(Value, Value)> {
+        let values: Vec<Value> = values.iter().copied().collect::<Option<_>>()?;
+        let n = values.len();
+        match n {
+            0 => return None,
+            1 => return Some((values[0], values[0])),
+            _ => {}
+        }
+        let last = values[n - 1];
+        let given = &self.key_times;
+        if self.mode == "discrete" {
+            let times: Vec<f64> = if given.len() >= n { given.clone() } else { (0..n).map(|i| i as f64 / n as f64).collect() };
+            let at = times.iter().take(n).rposition(|&t| t <= progress).unwrap_or(0);
+            return Some((values[at], last));
+        }
+        // Paced modes work out their own times and ignore keyTimes and timingFunctions.
+        let paced = self.mode == "paced" || self.mode == "cubicPaced";
+        let times: Vec<f64> = if paced {
+            let steps: Vec<f64> = values.windows(2).map(|w| Value::distance(w[0], w[1])).collect();
+            let total: f64 = steps.iter().sum();
+            let mut sum = 0.0;
+            std::iter::once(0.0).chain(steps.iter().map(|s| {
+                sum += s;
+                if total > 0.0 { sum / total } else { 0.0 }
+            })).collect()
+        } else if given.len() == n {
+            given.clone()
+        } else {
+            (0..n).map(|i| i as f64 / (n - 1) as f64).collect()
+        };
+        let segment = (0..n - 1).rfind(|&i| times[i] <= progress).unwrap_or(0);
+        let span = times[segment + 1] - times[segment];
+        let mut f = if span > 0.0 { ((progress - times[segment]) / span).clamp(0.0, 1.0) } else { 1.0 };
+        if let Some(curve) = self.curves.as_ref().filter(|_| !paced).and_then(|curves| curves.get(segment).copied().flatten()) {
+            f = curve.at(f);
+        }
+        Some((Value::lerp(values[segment], values[segment + 1], f)?, last))
+    }
 }
 
 /// The animation's value at `progress` of its simple duration with `lap`
 /// cycles behind it, for its key path, over what is shown without it
-/// (`under`). A key frame animation's `path` (for a point) wins over its
-/// values; cumulative laps each start from the end of the ones before.
+/// (`under`).
+#[cfg(test)]
 fn value_at(animation: Id, progress: f64, lap: f64, under: &Shown) -> Option<(String, Value)> {
-    let path = string::get(object(animation, "keyPath"));
-    let model = under.get(&path)?;
-    Some((path, value_over(animation, progress, lap, model)?))
+    let program = program_of(animation, DEFAULT_DURATION);
+    let ProgramKind::Property(property) = &program.kind else { return None };
+    let model = under.get(&property.key)?;
+    Some((property.key.clone(), property.value_over(program.eased(progress), lap, model)?))
 }
 
-/// The animation's value at `progress` (see `value_at`) over the model value.
-fn value_over(animation: Id, progress: f64, lap: f64, model: Value) -> Option<Value> {
-    let eased = eased(animation, progress);
-    let (values, curve_path) = (object(animation, "values"), object(animation, "path"));
-    let (value, last) = if curve_path != 0 && matches!(model, Value::Point(_)) {
-        (Value::Point(path_sample(curve_path, eased)?.0), Value::Point(path_sample(curve_path, 1.0)?.0))
-    } else if values != 0 {
-        keyframe_value(animation, values, eased)?
-    } else {
-        let (from, to, by) = (read_value(object(animation, "fromValue")), read_value(object(animation, "toValue")), read_value(object(animation, "byValue")));
-        let (start, end) = match (from, to, by) {
-            (Some(f), Some(t), _) => (f, t),
-            (Some(f), None, Some(b)) => (f, Value::add(f, b)?),
-            (None, Some(t), Some(b)) => (Value::subtract(t, b)?, t),
-            (Some(f), None, None) => (f, model),
-            (None, Some(t), None) => (model, t),
-            (None, None, Some(b)) => (model, Value::add(model, b)?),
-            (None, None, None) => (model, model),
-        };
-        (Value::lerp(start, end, eased)?, end)
-    };
-    let cumulative = lap > 0.0 && number(animation, "cumulative", 0.0) != 0.0;
-    let value = if cumulative { Value::add(Value::times(last, lap), value)? } else { value };
-    let value = if number(animation, "additive", 0.0) != 0.0 { Value::add(model, value)? } else { value };
-    Some(value)
-}
-
-/// The point `f` (0 to 1) of the way along a CGPath at even speed, and the
-/// path's heading there (radians). Lines between figures take no time.
-fn path_sample(path: Id, f: f64) -> Option<(Point, f64)> {
-    let figures = crate::fw::graphics::path_points(path);
+/// The point `f` (0 to 1) of the way along a path's figures at even speed,
+/// and the path's heading there (radians). Lines between figures take no time.
+fn path_sample(figures: &[Vec<Point>], f: f64) -> Option<(Point, f64)> {
     let first = *figures.iter().flatten().next()?;
     let steps: Vec<(Point, Point)> = figures.iter().flat_map(|points| points.windows(2).map(|w| (w[0], w[1]))).collect();
     let length = |(a, b): &(Point, Point)| (b.x - a.x).hypot(b.y - a.y);
@@ -781,90 +961,33 @@ fn path_sample(path: Id, f: f64) -> Option<(Point, f64)> {
     Some(found)
 }
 
-/// A path animation's turn along its path (rotationMode auto or
-/// autoReverse), at `progress` of its simple duration.
-fn path_turn(animation: Id, progress: f64) -> Option<f64> {
-    let path = object(animation, "path");
-    let mode = object(animation, "rotationMode");
-    if path == 0 || mode == 0 {
-        return None;
-    }
-    let heading = path_sample(path, eased(animation, progress))?.1;
-    match string::get(mode).as_str() {
-        "auto" => Some(heading),
-        "autoReverse" => Some(heading + std::f64::consts::PI),
-        _ => None,
-    }
-}
-
-/// The key frames' value at `progress`, and their last value.
-fn keyframe_value(animation: Id, values: Id, progress: f64) -> Option<(Value, Value)> {
-    let values: Vec<Value> = collections::array_items(values).into_iter().map(read_value).collect::<Option<_>>()?;
-    let n = values.len();
-    match n {
-        0 => return None,
-        1 => return Some((values[0], values[0])),
-        _ => {}
-    }
-    let last = values[n - 1];
-    let mode = string::get(anim_calculation_mode(animation, 0));
-    let given = object(animation, "keyTimes");
-    let given: Vec<f64> = if given == 0 { Vec::new() } else { collections::array_items(given).into_iter().map(layers::number_value).collect() };
-    if mode == "discrete" {
-        let times: Vec<f64> = if given.len() >= n { given } else { (0..n).map(|i| i as f64 / n as f64).collect() };
-        let at = times.iter().take(n).rposition(|&t| t <= progress).unwrap_or(0);
-        return Some((values[at], last));
-    }
-    // Paced modes work out their own times and ignore keyTimes and timingFunctions.
-    let paced = mode == "paced" || mode == "cubicPaced";
-    let times: Vec<f64> = if paced {
-        let steps: Vec<f64> = values.windows(2).map(|w| Value::distance(w[0], w[1])).collect();
-        let total: f64 = steps.iter().sum();
-        let mut sum = 0.0;
-        std::iter::once(0.0).chain(steps.iter().map(|s| {
-            sum += s;
-            if total > 0.0 { sum / total } else { 0.0 }
-        })).collect()
-    } else if given.len() == n {
-        given
-    } else {
-        (0..n).map(|i| i as f64 / (n - 1) as f64).collect()
-    };
-    let segment = (0..n - 1).rfind(|&i| times[i] <= progress).unwrap_or(0);
-    let span = times[segment + 1] - times[segment];
-    let mut f = if span > 0.0 { ((progress - times[segment]) / span).clamp(0.0, 1.0) } else { 1.0 };
-    let curves = object(animation, "timingFunctions");
-    if curves != 0 && !paced {
-        if let Some(curve) = collections::array_items(curves).get(segment).and_then(|&c| curve_of(c)) {
-            f = curve.at(f);
-        }
-    }
-    Some((Value::lerp(values[segment], values[segment + 1], f)?, last))
-}
-
 fn is_group(animation: Id) -> bool {
     let class = runtime::class_named("CAAnimationGroup");
     let rt = lock();
     rt.is_subclass(rt.class_of(animation), class)
 }
 
-/// Applies an animation shown at its parent's time `t` to `shown`.
-fn apply(animation: Id, t: f64, fallback: f64, shown: &mut Shown) {
-    let timing = timing_of(animation, fallback);
-    let Some(progress) = timing.state(t).progress else { return };
-    if is_group(animation) {
-        // Its animations run on its own time (clipped to its duration).
-        let eased = eased(animation, progress);
-        let children = object(animation, "animations");
-        for child in if children == 0 { Vec::new() } else { collections::array_items(children) } {
-            apply(child, eased * timing.duration, timing.duration, shown);
-        }
-    } else if let Some((path, value)) = value_at(animation, progress, timing.lap(t), shown) {
-        shown.set(&path, value);
-        if let Some(turn) = path_turn(animation, progress) {
-            shown.set("transform.rotation", Value::Number(turn));
+/// Whether the phone can show it by itself (IOS_PHONE_ANIM=1): it changes
+/// only where a layer is, how it is turned and how see-through (what the
+/// phone moves pictures by); its size, colour or contents need new pictures.
+pub fn runs_on_phone(program: &Program) -> bool {
+    match &program.kind {
+        ProgramKind::Group(children) => children.iter().all(runs_on_phone),
+        ProgramKind::Property(property) => {
+            matches!(property.key.as_str(), "opacity" | "position" | "position.x" | "position.y" | "transform") || property.key.starts_with("transform.")
         }
     }
+}
+
+/// `model` with `programs` (in beginTime order) shown over it at the
+/// layer's own time `local`; `screen`: as the screen shows them (see
+/// `Program::apply`).
+pub fn present(programs: &[std::sync::Arc<Program>], model: Shown, local: f64, screen: bool) -> Shown {
+    let mut shown = model;
+    for program in programs {
+        program.apply(local, &mut shown, screen);
+    }
+    shown
 }
 
 // ----- animations running on layers -----
@@ -883,6 +1006,8 @@ struct Running {
     /// animationDidStop:finished:, looked up when it was added (as Apple's
     /// lookup_delegate_methods).
     tells: (bool, bool),
+    /// It as plain data, read when it was added and again when it begun.
+    program: std::sync::Arc<Program>,
 }
 
 static RUNNING: Mutex<Vec<Running>> = Mutex::new(Vec::new());
@@ -895,37 +1020,39 @@ fn running() -> std::sync::MutexGuard<'static, Vec<Running>> {
 /// animations: in beginTime order (then the order they were added), later
 /// ones over earlier ones, as Core Animation stacks them.
 pub fn presented(layer: Id, model: Shown) -> Shown {
-    presented_at(layer, model, runloop::media_time())
+    presented_at(layer, model, runloop::animation_time())
 }
 
 pub fn presented_at(layer: Id, model: Shown, now: f64) -> Shown {
-    let mut list: Vec<Id> = running().iter().filter(|r| r.layer == layer).map(|r| r.animation).collect();
+    let list = programs(layer);
     if list.is_empty() {
         return model;
     }
-    list.sort_by(|&a, &b| number(a, "beginTime", 0.0).total_cmp(&number(b, "beginTime", 0.0)));
-    let t = layers::local_time(layer, now);
-    let mut shown = model;
-    for animation in list {
-        apply(animation, t, DEFAULT_DURATION, &mut shown);
-    }
-    shown
+    present(&list, model, layers::local_time(layer, now), false)
+}
+
+/// The programs of the animations running on a layer, in beginTime order
+/// (then the order they were added): what the screen shows them from.
+pub fn programs(layer: Id) -> Vec<std::sync::Arc<Program>> {
+    let mut list: Vec<std::sync::Arc<Program>> = running().iter().filter(|r| r.layer == layer).map(|r| r.program.clone()).collect();
+    list.sort_by(|a, b| a.timing.begin.total_cmp(&b.timing.begin));
+    list
 }
 
 /// What the layer shows of a key `Shown` doesn't carry ("bounds",
 /// "backgroundColor": a UIView block's size and colour changes) over its
 /// own `model` value, with its plain animations of that key path.
 pub fn presented_value_at(layer: Id, key: &str, model: Value, now: f64) -> Value {
-    let list: Vec<Id> = running().iter().filter(|r| r.layer == layer).map(|r| r.animation).collect();
+    let list: Vec<std::sync::Arc<Program>> = running().iter().filter(|r| r.layer == layer).map(|r| r.program.clone()).collect();
     let t = layers::local_time(layer, now);
     let mut shown = model;
-    for animation in list {
-        if is_group(animation) || string::get(object(animation, "keyPath")) != key {
+    for program in list {
+        let ProgramKind::Property(property) = &program.kind else { continue };
+        if property.key != key {
             continue;
         }
-        let timing = timing_of(animation, DEFAULT_DURATION);
-        if let Some(progress) = timing.state(t).progress {
-            if let Some(value) = value_over(animation, progress, timing.lap(t), shown) {
+        if let Some(progress) = program.timing.state(t).progress {
+            if let Some(value) = property.value_over(program.eased(progress), program.timing.lap(t), shown) {
                 shown = value;
             }
         }
@@ -963,7 +1090,7 @@ pub fn presented_contents_at(layer: Id, now: f64) -> Option<Id> {
     for animation in list {
         let timing = timing_of(animation, DEFAULT_DURATION);
         let Some(progress) = timing.state(t).progress else { continue };
-        let progress = eased(animation, progress);
+        let progress = curve_of(object(animation, "timingFunction")).map_or(progress, |c| c.at(progress));
         let values = object(animation, "values");
         let picture = if values != 0 {
             let pictures = collections::array_items(values);
@@ -985,6 +1112,18 @@ pub fn presented_contents_at(layer: Id, now: f64) -> Option<Id> {
 /// The layers with running animations (for a log line).
 pub fn running_layers() -> Vec<Id> {
     running().iter().filter(|r| !r.stopped).map(|r| r.layer).collect()
+}
+
+/// The key paths of the animations running on a layer (for a log line).
+pub fn keys(layer: Id) -> Vec<String> {
+    let list: Vec<Id> = running().iter().filter(|r| r.layer == layer).map(|r| r.animation).collect();
+    list.into_iter()
+        .map(|a| match object(a, "keyPath") {
+            _ if is_group(a) => "group".to_string(),
+            0 => "-".to_string(),
+            path => string::get(path),
+        })
+        .collect()
 }
 
 /// Whether a layer has animations on it now.
@@ -1061,7 +1200,7 @@ fn tell_stopped(animation: Id, finished: bool, tells: (bool, bool)) {
 /// Sends the delegate calls that are due and drops the animations that
 /// ended; then waits for the next start or end. Runs on the main thread.
 pub fn tick() {
-    tick_at(None, runloop::media_time());
+    tick_at(None, runloop::animation_time());
 }
 
 /// `only`: tick just this layer's animations (a test's fake clock must not
@@ -1071,6 +1210,8 @@ pub(crate) fn tick_at(only: Option<Id>, now: f64) {
     let mut stopped = Vec::new();
     let mut next = f64::INFINITY;
     let mut changed = Vec::new();
+    // IOS_DRAW_LOG=1: each stopped animation's layer, key and scheduled end (media time).
+    let mut seam_ends = Vec::new();
     {
         let mut list = running();
         list.retain_mut(|r| {
@@ -1089,6 +1230,10 @@ pub(crate) fn tick_at(only: Option<Id>, now: f64) {
                 r.stopped = true;
                 changed.push(r.layer);
                 let removed = number(r.animation, "removedOnCompletion", 1.0) != 0.0;
+                if crate::fw::graphics::draw_log() {
+                    let end = layers::global_time(r.layer, timing.end()).unwrap_or(f64::NAN);
+                    seam_ends.push((r.animation, r.layer, r.key.clone().unwrap_or_else(|| "-".into()), end));
+                }
                 stopped.push((r.animation, removed, r.tells));
                 if removed {
                     return false;
@@ -1111,6 +1256,11 @@ pub(crate) fn tick_at(only: Option<Id>, now: f64) {
         tell_started(animation, tells);
     }
     for (animation, removed, tells) in stopped {
+        // The seam gauge (IOS_DRAW_LOG=1): when it was due to end, and when its delegate and
+        // completion run (the game's own timer, as on Apple).
+        if let Some((_, layer, key, end)) = seam_ends.iter().find(|(a, ..)| *a == animation) {
+            crate::log!("seam: stop {layer:x} {key} end {end:.6} ran {:.6}", runloop::media_time());
+        }
         tell_stopped(animation, true, tells);
         crate::fw::smallclasses::animation_finished(animation);
         stopped_now(animation, true);
@@ -1133,14 +1283,35 @@ fn let_go(animation: Id) {
 static WAKE: Mutex<f64> = Mutex::new(f64::INFINITY);
 
 fn wake_at(at: f64) {
-    let mut wake = WAKE.lock().unwrap_or_else(|e| e.into_inner());
-    if at < *wake - 1e-6 {
-        *wake = at;
-        drop(wake);
-        runloop::post_after((at - runloop::media_time()).max(0.0), Box::new(|| {
+    arm(&WAKE, at, runloop::post_after);
+}
+
+/// Sets the clock (`wake`) to wake at animation time `at` unless it wakes
+/// sooner, its delay in real seconds given to `post`.
+fn arm(wake: &Mutex<f64>, at: f64, post: impl FnOnce(f64, Box<dyn FnOnce() + Send>)) {
+    let mut set = wake.lock().unwrap_or_else(|e| e.into_inner());
+    if at < *set - 1e-6 {
+        *set = at;
+        drop(set);
+        post((at - runloop::animation_time()).max(0.0), Box::new(|| {
             *WAKE.lock().unwrap_or_else(|e| e.into_inner()) = f64::INFINITY;
             tick();
         }));
+    }
+}
+
+/// The animation clock's lead changed (runloop::set_animation_lead, posted
+/// to the main thread): the clock set to wake is set again for the same
+/// animation time, now that many real seconds away.
+pub(crate) fn lead_changed() {
+    rearm(&WAKE, runloop::post_after);
+}
+
+fn rearm(wake: &Mutex<f64>, post: impl FnOnce(f64, Box<dyn FnOnce() + Send>)) {
+    // (The old timer still runs at its time: it only ticks once more.)
+    let at = std::mem::replace(&mut *wake.lock().unwrap_or_else(|e| e.into_inner()), f64::INFINITY);
+    if at.is_finite() {
+        arm(wake, at, post);
     }
 }
 
@@ -1148,7 +1319,7 @@ fn wake_at(at: f64) {
 /// the next turn of the main run loop.
 pub fn reschedule() {
     if !running().is_empty() {
-        wake_at(runloop::media_time());
+        wake_at(runloop::animation_time());
     }
 }
 
@@ -1198,13 +1369,15 @@ pub fn add(layer: Id, animation: Id, key: Id) -> Id {
             hold(copy, "timingFunction", curve);
         }
     }
-    let now = runloop::media_time();
+    let now = runloop::animation_time();
     let begun_on_add = (number(copy, "beginTime", 0.0) == 0.0).then_some((now, std::thread::current().id()));
     if begun_on_add.is_some() {
         set_number(copy, "beginTime", layers::local_time(layer, now));
     }
     crate::fw::smallclasses::animation_added(copy);
-    running().push(Running { layer, key, animation: copy, started: false, stopped: false, begun_on_add, tells });
+    let committed = begun_on_add.map(|_| layers::local_time(layer, now));
+    let program = std::sync::Arc::new(Program { committed, ..program_of(copy, DEFAULT_DURATION) });
+    running().push(Running { layer, key, animation: copy, started: false, stopped: false, begun_on_add, tells, program });
     wake_at(now);
     crate::fw::changes::changed(layer);
     crate::fw::pictures::draw_soon();
@@ -1218,7 +1391,7 @@ pub fn add(layer: Id, animation: Id, key: Id) -> Id {
 /// made in it are committed (their later changes run implicit actions).
 pub fn commit() {
     layers::commit_new();
-    commit_at(None, runloop::media_time());
+    commit_at(None, runloop::animation_time());
 }
 
 /// Whether this thread added animations that haven't begun yet (`commit`).
@@ -1230,6 +1403,7 @@ pub fn uncommitted() -> bool {
 pub(crate) fn commit_at(only: Option<Id>, now: f64) {
     let mut late = 0.0f64;
     let mut shifted = Vec::new();
+    let mut begun = Vec::new();
     let me = std::thread::current().id();
     for r in running().iter_mut().filter(|r| only.is_none_or(|layer| layer == r.layer)) {
         let Some((added, _)) = r.begun_on_add.take_if(|(_, thread)| *thread == me) else { continue };
@@ -1238,6 +1412,19 @@ pub(crate) fn commit_at(only: Option<Id>, now: f64) {
             set_number(r.animation, "beginTime", number(r.animation, "beginTime", 0.0) + shift);
             late = late.max(now - added);
             shifted.push(r.layer);
+        }
+        // Finished as it begins: what the screen shows it from.
+        r.program = std::sync::Arc::new(Program { committed: Some(layers::local_time(r.layer, now)), ..program_of(r.animation, DEFAULT_DURATION) });
+        if crate::fw::graphics::draw_log() {
+            let begin = layers::global_time(r.layer, number(r.animation, "beginTime", 0.0)).unwrap_or(f64::NAN);
+            begun.push((r.layer, r.key.clone().unwrap_or_else(|| "-".into()), begin));
+        }
+    }
+    // The seam gauge (IOS_DRAW_LOG=1): when each begins (media time), committed now.
+    for (layer, key, begin) in begun {
+        crate::log!("seam: begin {layer:x} {key} at {begin:.6} committed {now:.6}");
+        if key == "transform" {
+            crate::fw::pictures::seam_layer_began(layer, now);
         }
     }
     for layer in shifted {
@@ -1721,6 +1908,89 @@ mod tests {
         });
     }
 
+    /// IOS_ANIM_LEAD=1: Core Animation's clock is when the frame made now
+    /// shows on the phone (media time + the phone's present lead). An
+    /// animation added now begins then, at its commit too, and it ends when
+    /// its last frame is drawn: `lead` sooner in real time. No lead: as before.
+    #[test]
+    fn the_animation_clock_leads_by_the_phones_present_lead() {
+        setup();
+        // IOS_ANIM_LEAD_EXTRA_MS: a margin on the measured lead (0-20 ms), at most 100 ms in all.
+        assert!(close(runloop::lead_with_extra(0.026, 0.0), 0.026) && close(runloop::lead_with_extra(0.026, 8.0), 0.034), "the margin adds");
+        assert!(close(runloop::lead_with_extra(0.026, 50.0), 0.046) && close(runloop::lead_with_extra(0.095, 20.0), 0.1), "clamped: {}", runloop::lead_with_extra(0.026, 50.0));
+        for lead in [0.0, 0.026] {
+            runloop::with_animation_lead(lead, || {
+                let layer = runtime::send(runtime::send(runtime::class_named("CALayer"), "alloc", &[]), "init", &[]);
+                let fade = basic("opacity", collections::number_float(0.0), collections::number_float(1.0));
+                anim_set_duration(fade, 0, 0.1);
+                let before = runloop::media_time();
+                add(layer, fade, string::make("fade"));
+                let added = runloop::media_time();
+                let copy = layer_animation_for_key(layer, 0, string::make("fade"));
+                let begin = number(copy, "beginTime", 0.0);
+                assert!(begin >= before + lead - 1e-9 && begin <= added + lead + 1e-9, "lead {lead}: added, begins {:.4} s after now", begin - before);
+                // The game is busy for 20 ms more in the same turn: it begins at the commit.
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                let (before, _) = (runloop::media_time(), commit());
+                let after = runloop::media_time();
+                let begin = number(copy, "beginTime", 0.0);
+                assert!(begin >= before + lead - 1e-9 && begin <= after + lead + 1e-9, "lead {lead}: committed, begins {:.4} s after now", begin - before);
+                // Ticked on the animation clock until it is removed: when, in real time.
+                let give_up = before + 0.4;
+                while layer_animation_for_key(layer, 0, string::make("fade")) != 0 && runloop::media_time() < give_up {
+                    tick_at(Some(layer), runloop::animation_time());
+                    std::thread::sleep(std::time::Duration::from_micros(500));
+                }
+                let ended = runloop::media_time() - (begin + 0.1 - lead);
+                assert!((-1e-6..0.01).contains(&ended), "lead {lead}: ends {:.4} s after its last frame is drawn", ended);
+                layer_remove_all_animations(layer, 0);
+            });
+        }
+    }
+
+    /// The render server never draws a time before the commit that began an
+    /// animation. The seam of p-x8a: the first half (removed) ends at E,
+    /// the second is committed with B = E + 3.4 ms; the frame for E + 1.8 ms
+    /// shows the second half's start (edge-on), not the model (the face-on
+    /// card). One with the game's own beginTime still shows the model then.
+    #[test]
+    fn the_screen_shows_nothing_from_before_a_commit() {
+        let (e, b) = (10.25, 10.25 + 0.0034);
+        let turn = |begin: f64, from: f64, to: f64, committed: Option<f64>| std::sync::Arc::new(Program {
+            timing: Timing { begin, duration: 0.25, ..Default::default() },
+            removed: true,
+            curve: None,
+            kind: ProgramKind::Property(Property { key: "position.x".into(), from: Some(Value::Number(from)), to: Some(Value::Number(to)), ..Default::default() }),
+            committed,
+        });
+        let (first, second) = (turn(e - 0.25, 0.0, 100.0, Some(e - 0.25)), turn(b, 100.0, 200.0, Some(b)));
+        let model = Shown::new(1.0, Point { x: 200.0, y: 0.0 }, IDENTITY_3D, None);
+        let at = |programs: &[std::sync::Arc<Program>], t: f64| present(programs, model, t, true).position.x;
+        assert_eq!(at(&[first.clone(), second], e + 0.0018), 100.0, "the second half's start");
+        let given = turn(b, 100.0, 200.0, None);
+        assert_eq!(at(&[first.clone(), given.clone()], e + 0.0018), 200.0, "a game's own beginTime: the model, as before");
+        assert!(close(at(&[first, given], b + 0.125), 150.0), "from its begin, as before");
+    }
+
+    /// The lead grows by 10 ms after the clock was set to wake for an end:
+    /// it is set again, to wake at the end less the new lead (real time).
+    #[test]
+    fn a_lead_change_moves_the_wake_already_set() {
+        let wake = Mutex::new(f64::INFINITY);
+        let posted = std::cell::RefCell::new(Vec::new());
+        let end = runloop::with_animation_lead(0.026, || {
+            let end = runloop::animation_time() + 0.1;
+            arm(&wake, end, |delay, _| posted.borrow_mut().push(runloop::media_time() + delay));
+            end
+        });
+        runloop::with_animation_lead(0.036, || rearm(&wake, |delay, _| posted.borrow_mut().push(runloop::media_time() + delay)));
+        let posted = posted.into_inner();
+        assert_eq!(posted.len(), 2, "set again: {posted:?}");
+        assert!((posted[0] - (end - 0.026)).abs() < 0.002, "first for the old lead");
+        assert!((posted[1] - (end - 0.036)).abs() < 0.002, "then for the new: {:.4} s off", posted[1] - (end - 0.036));
+        assert_eq!(*wake.lock().unwrap(), end, "for the same animation time");
+    }
+
     /// On a layer: a copy runs (with the game's keyed values), its delegate
     /// hears start and stop(YES) at the right times, a held animation keeps
     /// its last value, and a removed one stops with NO. The view's opacity
@@ -1977,9 +2247,10 @@ mod tests {
         runtime::send(transaction, "commit", &[]);
         let copy = layer_animation_for_key(layer, 0, string::make("opacity"));
         assert!(curve_of(object(copy, "timingFunction")).is_some(), "the transaction's timing function");
-        anim_set_timing(copy, 0, 0);
+        // (Added, it is read-only, as on Apple: it shows half way along its ease-in.)
         let begin = number(copy, "beginTime", 0.0);
-        assert!(close(presented_at(layer, model, begin + 50.0).opacity, 0.5), "the key is the key path");
+        let half = curve_of(ease_in).unwrap().at(0.5);
+        assert!(close(presented_at(layer, model, begin + 50.0).opacity, half), "the key is the key path");
         layer_remove_all_animations(layer, 0);
 
         // Added later but beginning earlier: applied first, under the other.
@@ -1994,6 +2265,117 @@ mod tests {
         add(layer, early, string::make("early"));
         assert!(close(presented_at(layer, model, layers::global_time(layer, now + 2.0).unwrap()).opacity, 0.1));
         layer_remove_all_animations(layer, 0);
+    }
+
+    /// What a layer's animations hand the screen is finished when their turn
+    /// commits: a UIView-style slide added "now" begins at the commit, and
+    /// the program read then shows it from there at any moment (here a
+    /// third of a refresh past a refresh), with no objects to ask. A
+    /// fromValue alone goes to the model value given when it is shown.
+    #[test]
+    fn programs_are_finished_at_the_commit_and_shown_at_any_moment() {
+        setup();
+        runloop::as_main(|| {
+            let layer = runtime::send(runtime::send(runtime::class_named("CALayer"), "alloc", &[]), "init", &[]);
+            let linear = function_with_name(runtime::class_named("CAMediaTimingFunction"), 0, string::make("linear"));
+            let slide = basic("position.x", collections::number_float(0.0), collections::number_float(100.0));
+            anim_set_duration(slide, 0, 0.25);
+            anim_set_timing(slide, 0, linear);
+            add(layer, slide, string::make("slide"));
+            let fade = basic("opacity", collections::number_float(0.0), 0);
+            anim_set_duration(fade, 0, 0.25);
+            anim_set_timing(fade, 0, linear);
+            add(layer, fade, string::make("fade"));
+            let asked = number(layer_animation_for_key(layer, 0, string::make("slide")), "beginTime", 0.0);
+            commit_at(Some(layer), layers::global_time(layer, asked + 0.15).unwrap());
+            let programs = programs(layer);
+            let refresh = 1.0 / 120.0;
+            let t = asked + 0.15 + 0.37 * refresh;
+            let model = Shown::new(0.6, Point { x: 7.0, y: 0.0 }, IDENTITY_3D, None);
+            let shown = present(&programs, model, t, true);
+            assert!(close(shown.position.x, 100.0 * 0.37 * refresh / 0.25), "from the commit: {}", shown.position.x);
+            assert!(close(shown.opacity, 0.6 * 0.37 * refresh / 0.25), "to the model's opacity: {}", shown.opacity);
+            let end = present(&programs, model, asked + 0.15 + 0.25 + 0.37 * refresh, true);
+            assert_eq!((end.position.x, end.opacity), (7.0, 0.6), "past the end: the model");
+            layer_remove_all_animations(layer, 0);
+        });
+    }
+
+    /// At an animation's end the screen's copy (`present`, dropping ended
+    /// ones removed on completion, as the render server does) shows the
+    /// model at once, while the app's copy keeps a forwards fill until its
+    /// next tick removes it; one not removed holds its end only when filled
+    /// forwards; a delay with a backwards fill shows the start value; an
+    /// autoreversing repeat comes back.
+    #[test]
+    fn programs_end_as_the_render_server_ends_them() {
+        let refresh = 1.0 / 120.0;
+        let fade = |removed: bool, forwards: bool, backwards: bool| {
+            let timing = Timing { begin: 10.0, duration: 0.25, forwards, backwards, ..Default::default() };
+            let property = Property { key: "opacity".into(), from: Some(Value::Number(0.0)), to: Some(Value::Number(1.0)), ..Default::default() };
+            std::sync::Arc::new(Program { timing, removed, curve: None, kind: ProgramKind::Property(property), committed: None })
+        };
+        let model = Shown::new(0.2, Point::default(), IDENTITY_3D, None);
+        let at = |program: std::sync::Arc<Program>, t: f64, screen: bool| present(&[program], model, t, screen).opacity;
+        let after = 10.25 + 0.37 * refresh;
+        assert_eq!(at(fade(true, true, false), after, true), 0.2, "removed at its end on the screen");
+        assert_eq!(at(fade(true, true, false), 10.25, true), 0.2, "from its very end");
+        assert_eq!(at(fade(true, true, false), after, false), 1.0, "the app's copy until its tick");
+        assert_eq!(at(fade(false, true, false), after, true), 1.0, "kept and filled: its end");
+        assert_eq!(at(fade(false, false, false), after, true), 0.2, "kept, not filled: the model");
+        assert_eq!(at(fade(true, false, true), 10.0 - 0.37 * refresh, true), 0.0, "filled backwards before it begins");
+        assert_eq!(at(fade(true, false, false), 10.0 - 0.37 * refresh, true), 0.2, "not begun: the model");
+        assert!(close(at(fade(true, false, false), 10.0 + 0.37 * refresh, true), 0.37 * refresh / 0.25), "just begun");
+        let mut back = fade(true, false, false);
+        std::sync::Arc::make_mut(&mut back).timing = Timing { autoreverses: true, repeat_count: 1.0, ..back.timing };
+        assert!(close(at(back.clone(), 10.25 + 0.37 * refresh, true), 1.0 - 0.37 * refresh / 0.25), "on its way back");
+        assert_eq!(at(back, 10.5, true), 0.2, "back and done");
+    }
+
+    /// A CAAnimationGroup's animations run on the group's time; one that
+    /// ends before the group shows its end only while it fills forwards, on
+    /// the screen as in the app's copy: removedOnCompletion takes an
+    /// animation off its layer, and a group's animations aren't on it. The
+    /// group itself goes from its end. Values worked out by hand: a 1 s
+    /// linear group holding a 0.5 s slide of x 0 to 100 (no fill) and a
+    /// 0.25 s fade in from 0 (filled forwards, removed on completion).
+    #[test]
+    fn group_animations_end_inside_their_group_as_apple_shows_them() {
+        setup();
+        runloop::as_main(|| {
+            let layer = runtime::send(runtime::send(runtime::class_named("CALayer"), "alloc", &[]), "init", &[]);
+            let linear = function_with_name(runtime::class_named("CAMediaTimingFunction"), 0, string::make("linear"));
+            let slide = basic("position.x", collections::number_float(0.0), collections::number_float(100.0));
+            anim_set_duration(slide, 0, 0.5);
+            anim_set_timing(slide, 0, linear);
+            let fade = basic("opacity", collections::number_float(0.0), collections::number_float(1.0));
+            anim_set_duration(fade, 0, 0.25);
+            anim_set_timing(fade, 0, linear);
+            anim_set_fill_mode(fade, 0, string::make("forwards"));
+            let group = runtime::send(runtime::class_named("CAAnimationGroup"), "animation", &[]);
+            runtime::send(group, "setAnimations:", &[collections::array_from(&[slide, fade])]);
+            anim_set_duration(group, 0, 1.0);
+            anim_set_timing(group, 0, linear);
+            let begin = layers::local_time(layer, runloop::media_time()) + 10.0;
+            anim_set_begin(group, 0, begin);
+            add(layer, group, string::make("group"));
+            let model = Shown::new(0.6, Point { x: 7.0, y: 0.0 }, IDENTITY_3D, None);
+            let refresh = 1.0 / 120.0;
+            let both = |local: f64| {
+                let now = layers::global_time(layer, local).unwrap();
+                let (app, screen) = (presented_at(layer, model, now), present(&programs(layer), model, local, true));
+                assert_eq!((app.position.x, app.opacity), (screen.position.x, screen.opacity), "app and screen agree at {}", local - begin);
+                (app.position.x, app.opacity)
+            };
+            let (x, opacity) = both(begin + 0.2 + 0.37 * refresh);
+            assert!(close(x, 40.0 + 100.0 * 0.37 * refresh / 0.5) && close(opacity, 0.8 + 0.37 * refresh / 0.25), "running: {x} {opacity}");
+            for at in [0.6, 0.999] {
+                let (x, opacity) = both(begin + at);
+                assert!(x == 7.0 && close(opacity, 1.0), "at {at}: the slide is over (no fill), the fade holds its end to the group's end: {x} {opacity}");
+            }
+            assert_eq!(present(&programs(layer), model, begin + 1.0, true).opacity, 0.6, "the group goes at its end on the screen");
+            layer_remove_all_animations(layer, 0);
+        });
     }
 
     /// A timeOffset shifts where an animation starts, not when it ends

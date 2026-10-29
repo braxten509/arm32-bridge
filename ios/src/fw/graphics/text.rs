@@ -589,14 +589,15 @@ pub(super) fn look_bitmap(look: &TextLook, scale: f64) -> Option<Bitmap> {
     Some(canvas.snapshot())
 }
 
-/// A look at a scale, as a key: its exact numbers spelled out (Debug prints
-/// each f64 so it reads back the same), so equal looks find one file.
+/// A look at a scale, as a key: a fingerprint of its exact values (every
+/// label on a screen is keyed each frame; writing them out as text took
+/// most of that), so equal looks find one file.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-struct LookKey(String);
+struct LookKey(u128);
 
 impl LookKey {
     fn of(look: &TextLook, scale: f64) -> LookKey {
-        LookKey(format!("{look:?}@{}", scale.to_bits()))
+        LookKey(super::compose::fingerprint(&(look, scale)))
     }
 }
 
@@ -709,7 +710,7 @@ impl TextFiles {
         old.sort_unstable_by_key(|(used, _)| *used);
         for (_, key) in old.into_iter().take(extra) {
             if let Some(TextFile { file: Some(file), .. }) = self.made.remove(&key) {
-                let _ = std::fs::remove_file(file);
+                super::remove_picture_file(&file);
             }
         }
     }
@@ -717,21 +718,15 @@ impl TextFiles {
 
 /// Every look drawn, a few at a time on worker threads, in order.
 fn draw_in_parallel(looks: &[TextLook], scale: f64, draw: &(dyn Fn(&TextLook, f64) -> Option<String> + Sync)) -> Vec<Option<String>> {
-    if looks.is_empty() {
-        return Vec::new();
-    }
-    let workers = looks.len().min(4);
-    let chunk = looks.len().div_ceil(workers);
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..workers)
-            .map(|worker| {
-                let start = (worker * chunk).min(looks.len());
-                let end = ((worker + 1) * chunk).min(looks.len());
-                scope.spawn(move || looks[start..end].iter().map(|look| draw(look, scale)).collect::<Vec<_>>())
-            })
-            .collect();
-        handles.into_iter().flat_map(|handle| handle.join().unwrap()).collect()
-    })
+    // On the kept drawing threads (fw/workers.rs), not threads started
+    // for each screen: starting them cost more than most labels' drawing.
+    let mut slots: Vec<(&TextLook, Option<String>)> = looks.iter().map(|look| (look, None)).collect();
+    crate::fw::workers::split(&mut slots, crate::fw::workers::cores(), &|part| {
+        for (look, file) in part {
+            *file = draw(look, scale);
+        }
+    });
+    slots.into_iter().map(|(_, file)| file).collect()
 }
 
 /// PNG files showing one screen's `looks` at `scale` pixels per point
@@ -1049,6 +1044,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&folder);
     }
 
+    /// A file a live scene holds (pinned, fw/pictures/live.rs) stays on
+    /// disk when the cache lets its look go under pressure, until the last
+    /// scene holding it lets go; an unpinned one goes at once, as before.
+    #[test]
+    fn a_pinned_text_file_outlives_the_cache_until_let_go() {
+        let folder = std::env::temp_dir().join(format!("text-files-pinned-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let make = |look: &TextLook, _: f64| {
+            let file = folder.join(&look.text).to_string_lossy().into_owned();
+            std::fs::write(&file, b"png").ok().map(|()| file)
+        };
+        let (held, plain, next) = (look("held", (10.0, 10.0)), look("plain", (10.0, 10.0)), look("next", (10.0, 10.0)));
+        let mut files = TextFiles::default();
+        let held_file = files.files(&[&held], 2.0, 1, make).remove(0).unwrap();
+        let plain_file = files.files(&[&plain], 2.0, 1, make).remove(0).unwrap();
+        // Two scenes hold the first file (the cache let it go already: one look kept).
+        let exists = |f: &str| std::path::Path::new(f).exists();
+        assert!(!exists(&held_file), "unpinned, it went under pressure");
+        let pinned = files.files(&[&held], 2.0, 1, make).remove(0).unwrap();
+        super::super::pin_files(&[pinned.clone()]);
+        super::super::pin_files(&[pinned.clone()]);
+        files.files(&[&next], 2.0, 1, make);
+        assert!(exists(&pinned), "pinned: kept while the cache lets it go");
+        assert!(!exists(&plain_file), "the plain one went");
+        super::super::unpin_files(&[pinned.clone()]);
+        assert!(exists(&pinned), "one scene still holds it");
+        super::super::unpin_files(&[pinned.clone()]);
+        assert!(!exists(&pinned), "gone once the last holder let go");
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
     /// The PNG file a label draws (the serial and parallel paths both use it).
     fn label_png(look: &TextLook, scale: f64) -> Option<String> {
         draw_look(look, scale)
@@ -1075,6 +1101,25 @@ mod tests {
                 _ => assert_eq!(serial, parallel, "serial and parallel presence differ"),
             }
         }
+    }
+
+    /// New labels are drawn on the kept drawing threads: a screen full of
+    /// new text (a fight opening) starts no threads of its own, which cost
+    /// more than the drawing and waited on the phone's slow cores.
+    #[test]
+    fn new_labels_start_no_threads() {
+        let looks: Vec<TextLook> = (0..12).map(|n| look(&format!("label {n}"), (48.0, 24.0))).collect();
+        let threads = std::sync::Mutex::new(std::collections::HashSet::new());
+        let draw = |look: &TextLook, _: f64| {
+            threads.lock().unwrap().insert(std::thread::current().id());
+            Some(look.text.clone())
+        };
+        for _ in 0..20 {
+            let drawn = draw_in_parallel(&looks, 2.0, &draw);
+            assert_eq!(drawn, looks.iter().map(|l| Some(l.text.clone())).collect::<Vec<_>>());
+        }
+        let used = threads.into_inner().unwrap().len();
+        assert!(used <= crate::fw::workers::cores(), "{used} threads for 20 screens");
     }
 
     /// 32-bit games reach these methods only through a framework_selectors.tsv row.

@@ -302,6 +302,8 @@ pub struct Stub {
     pub calls: AtomicU64,
     used: AtomicBool,
     light: Light,
+    /// A message-sending function's cache (dynarec::send_cache), once given.
+    send_cache: std::sync::OnceLock<&'static crate::dynarec::send_cache::SendCache>,
 }
 
 /// How a phone function may run when translated code calls it.
@@ -740,15 +742,29 @@ pub fn leave_guest(uc: &Uc) {
 /// Records where this thread stops for a phone function (it goes on at
 /// `resume`), so a helper can run signal handlers for it meanwhile.
 fn park_registers(uc: &Uc, resume: u32) {
+    if parallel() {
+        park(uc, &core_registers(uc), resume);
+    }
+}
+
+fn park(uc: &Uc, registers: &[u32; 16], resume: u32) {
     if !parallel() {
         return;
     }
     let runner = &uc.get_data().runner;
     for register in 0..15 {
-        runner.parked[register].store(uc.reg(register), Ordering::Relaxed);
+        runner.parked[register].store(registers[register], Ordering::Relaxed);
     }
     runner.parked[15].store(resume, Ordering::Relaxed);
     runner.parked_valid.store(true, Ordering::Relaxed);
+}
+
+/// r0-r15, read once (one look at which registers are live).
+fn core_registers(uc: &Uc) -> [u32; 16] {
+    match live_native(uc) {
+        Some(state) => state.r,
+        None => std::array::from_fn(|index| uc.reg(index)),
+    }
 }
 
 /// Whether another runner stands in for this thread's identity right now
@@ -1661,6 +1677,19 @@ pub fn stub_for(name: &str) -> u32 {
     make_stub(&mut shared(), name)
 }
 
+/// The message cache of the message-sending phone function `name`
+/// (dynarec::send_cache): translated code that calls it then goes straight
+/// to the guest code the cache holds for its receiver's class and selector.
+pub fn send_cache(name: &str) -> &'static crate::dynarec::send_cache::SendCache {
+    let index = (stub_for(name) - mem::layout().stub_base) / 8;
+    stub(index).expect("a stub just made").send_cache.get_or_init(crate::dynarec::send_cache::SendCache::leaked)
+}
+
+/// The message cache of the phone function in slot `index`, if it has one.
+pub fn send_cache_of(index: u32) -> Option<&'static crate::dynarec::send_cache::SendCache> {
+    stub(index)?.send_cache.get().copied()
+}
+
 fn make_stub(shared: &mut Shared, name: &str) -> u32 {
     let stub_base = mem::layout().stub_base;
     if let Some(&index) = shared.stub_by_name.get(name) {
@@ -1671,7 +1700,7 @@ fn make_stub(shared: &mut Shared, name: &str) -> u32 {
     let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
     let handler = (platform().resolve_stub)(name);
     let light = light_kind(name, handler);
-    let stub = Stub { name: leaked, handler, calls: AtomicU64::new(0), used: AtomicBool::new(false), light };
+    let stub = Stub { name: leaked, handler, calls: AtomicU64::new(0), used: AtomicBool::new(false), light, send_cache: std::sync::OnceLock::new() };
     // Published before its code is written, so a thread calling the code finds it.
     stub_table()[(index - FIRST_STUB) as usize].store(Box::into_raw(Box::new(stub)), Ordering::Release);
     shared.stub_by_name.insert(name.to_string(), index);
@@ -1998,16 +2027,17 @@ pub fn call_stub(uc: &mut Uc, index: u32) {
     share_gil_after_time_slice();
     uc.get_data_mut().current_call = name;
 
-    let mut args = Args::from_registers(uc);
+    let registers = core_registers(uc);
+    let mut args = Args::new([registers[0], registers[1], registers[2], registers[3]], registers[SP]);
+    let resume = registers[LR];
     if trace {
         let r = args.registers;
-        crate::log::line(&format!("[call t{}] {name}({:#x}, {:#x}, {:#x}, {:#x}) from {:#x}", uc.get_data().id, r[0], r[1], r[2], r[3], uc.reg(LR)));
+        crate::log::line(&format!("[call t{}] {name}({:#x}, {:#x}, {:#x}, {:#x}) from {:#x}", uc.get_data().id, r[0], r[1], r[2], r[3], resume));
     }
     let started = ticks();
-    let resume = uc.reg(LR);
     // Signals taken during or right after this call resume at its return address.
     let resume_before = std::mem::replace(&mut uc.get_data_mut().resume_at, Some(resume));
-    park_registers(uc, resume);
+    park(uc, &registers, resume);
     leave_guest(uc);
     let result = match handler {
         Some(handler) => {

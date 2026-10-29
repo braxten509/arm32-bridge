@@ -519,10 +519,25 @@ pub(crate) fn label_draws_plainly(view: Id) -> bool {
     own("drawRect:") == Some(label_draw_rect as usize) && own("drawTextInRect:") == Some(label_draw_text_in_rect as usize)
 }
 
+/// -textRectForBounds:limitedToNumberOfLines:, as iOS 6's UILabel
+/// (_legacy_textRectForBounds:limitedToNumberOfLines:includingShadow:YES):
+/// the text's size plus the shadow's offset, no bigger than the bounds,
+/// placed at the bounds' top and moved across by the alignment (rounded).
 extern "C" fn label_text_rect(this: Id, _: Sel, bounds: Rect, lines: isize) -> Rect {
     let font = text_font(this, 0);
-    let size = text_size(&text_of(get_id(this, "text")), font_size(font), bounds.size.width, lines.max(0) as usize);
-    Rect { origin: bounds.origin, size }
+    let mut size = text_size(&text_of(get_id(this, "text")), font_size(font), bounds.size.width, lines.max(0) as usize);
+    if get_id(this, "shadowColor") != 0 && size.width > 0.0 && size.height > 0.0 {
+        let offset = label_shadow_offset(this, 0);
+        size.width += offset.width.abs();
+        size.height += offset.height.abs();
+    }
+    let size = Size { width: size.width.ceil().min(bounds.size.width), height: size.height.ceil().min(bounds.size.height) };
+    let x = match text_alignment(this, 0) {
+        1 => (bounds.origin.x + (bounds.size.width - size.width) * 0.5).round(),
+        2 => (bounds.origin.x + bounds.size.width - size.width).round(),
+        _ => bounds.origin.x,
+    };
+    Rect { origin: Point { x, y: bounds.origin.y }, size }
 }
 
 // ----- controls and buttons -----
@@ -5869,6 +5884,39 @@ mod tests {
         runtime::send(button, "layoutIfNeeded", &[]);
         assert_eq!(runtime::send(title, "isHidden", &[]) & 0xFF, 1);
         runtime::send(button, "removeFromSuperview", &[]);
+    }
+
+    /// -textRectForBounds:limitedToNumberOfLines: places the text's box by
+    /// the label's alignment inside the bounds, as iOS 6's UILabel
+    /// (_legacy_textRectForBounds:...): SpellCraft's price label draws its
+    /// coin and number from it, right-aligned in the card's corner.
+    #[test]
+    fn a_labels_text_rect_follows_its_alignment() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(crate::run::setup);
+        let label = runtime::send(runtime::class_named("UILabel"), "alloc", &[]);
+        crate::fw::uikit::send_rect(label, "initWithFrame:", Rect::new(0.0, 0.0, 125.0, 32.0));
+        runtime::send(label, "setText:", &[string::make("50")]);
+        let bounds = Rect::new(10.0, 4.0, 125.0, 32.0);
+        let rect_for = |alignment: usize| {
+            runtime::send(label, "setTextAlignment:", &[alignment]);
+            label_text_rect(label, 0, bounds, 1)
+        };
+        let left = rect_for(0);
+        assert_eq!((left.origin.x, left.origin.y), (10.0, 4.0));
+        assert!(left.size.width > 0.0 && left.size.width < 125.0 && left.size.height <= 32.0, "{left:?}");
+        let right = rect_for(2);
+        assert_eq!(right.origin.x, (10.0 + 125.0 - right.size.width).round(), "right edge");
+        assert_eq!(right.origin.y, 4.0);
+        let center = rect_for(1);
+        assert_eq!(center.origin.x, (10.0 + (125.0 - center.size.width) / 2.0).round(), "middle");
+        // The shadow's offset counts toward the size (includingShadow:YES).
+        runtime::send(label, "setTextAlignment:", &[0]);
+        runtime::send(label, "setShadowColor:", &[runtime::send(runtime::class_named("UIColor"), "blackColor", &[])]);
+        label_set_shadow_offset(label, 0, Size { width: 2.0, height: 2.0 });
+        let shadowed = label_text_rect(label, 0, bounds, 1);
+        assert_eq!(shadowed.size.width, left.size.width + 2.0);
+        assert_eq!(shadowed.size.height, (left.size.height + 2.0).min(32.0));
     }
 
     /// A game's change to the title label's font (any -[UIButtonLabel

@@ -64,6 +64,8 @@ import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
@@ -286,6 +288,10 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        // The iPhone game whose Settings box is showing.
+        var setting by remember { mutableStateOf<Game?>(null) }
+        setting?.let { game -> SettingsDialog(game, onDismiss = { setting = null }) }
+
         // The game whose "Reset progress…" (or for an iPhone game, "Undo reset") box is showing.
         var resetting by remember { mutableStateOf<Pair<Game, Boolean>?>(null) }
         resetting?.let { (game, undo) ->
@@ -432,7 +438,7 @@ class MainActivity : ComponentActivity() {
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
                     items(games!!, key = { it.file?.path ?: it.packageName }) { game ->
-                        GameCard(game, states[game.packageName] ?: CardState.Ready, busy, onConvert = { if (game.action == Action.PlayIphone) IphoneGames.play(this@MainActivity, game) else convert(game) }, onReplace = { replacing = game }, onRemove = { removing = game }, onRename = { renaming = game }, onReset = { undo -> resetting = game to undo }, onMove = { move(listOf(game)) }, onToOriginals = { move(listOf(game), Games::moveToOriginals) }, onOpen = {
+                        GameCard(game, states[game.packageName] ?: CardState.Ready, busy, onConvert = { if (game.action == Action.PlayIphone) IphoneGames.play(this@MainActivity, game) else convert(game) }, onReplace = { replacing = game }, onRemove = { removing = game }, onRename = { renaming = game }, onSettings = { setting = game }, onReset = { undo -> resetting = game to undo }, onMove = { move(listOf(game)) }, onToOriginals = { move(listOf(game), Games::moveToOriginals) }, onOpen = {
                             packageManager.getLaunchIntentForPackage(game.packageName)?.let(::startActivity)
                         })
                     }
@@ -561,7 +567,7 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
-    private fun GameCard(game: Game, state: CardState, busy: Boolean, onConvert: () -> Unit, onReplace: () -> Unit, onRemove: () -> Unit, onRename: () -> Unit, onReset: (undo: Boolean) -> Unit, onMove: () -> Unit, onToOriginals: () -> Unit, onOpen: () -> Unit) {
+    private fun GameCard(game: Game, state: CardState, busy: Boolean, onConvert: () -> Unit, onReplace: () -> Unit, onRemove: () -> Unit, onRename: () -> Unit, onSettings: () -> Unit, onReset: (undo: Boolean) -> Unit, onMove: () -> Unit, onToOriginals: () -> Unit, onOpen: () -> Unit) {
         // Outside the Game Bridge folder: Move comes before anything else (an installed game keeps Open).
         val outside = remember(game, Conversions.moved) { Games.needsMove(game) }
         // Press and hold a card for its menu; a running conversion can't be removed under itself.
@@ -607,6 +613,7 @@ class MainActivity : ComponentActivity() {
                 } else if (game.action == Action.PlayIphone) {
                     MenuItem("Play") { close(); onConvert() }
                     MenuItem("Rename") { close(); onRename() }
+                    MenuItem("Settings…") { close(); onSettings() }
                     MenuItem("Reset progress…") { close(); onReset(false) }
                     if (GameResets.canUndo(filesDir, game.file!!.nameWithoutExtension)) MenuItem("Undo reset") { close(); onReset(true) }
                     if (!IphoneApps.isInstalled(this@MainActivity, game)) MenuItem("Install app") { close(); installIphoneApp(game) }
@@ -849,6 +856,40 @@ class MainActivity : ComponentActivity() {
             },
             confirmButton = { TextButton(onClick = { onConfirm(name) }) { Text("Rename", color = AccentText) } },
             dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel", color = AccentText) } },
+        )
+    }
+
+    /** An iPhone game's on/off settings (GameSettings); each switch is saved as it's flipped. */
+    @Composable
+    private fun SettingsDialog(game: Game, onDismiss: () -> Unit) {
+        var choices by remember { mutableStateOf(GameSettings.choices(filesDir, game.packageName)) }
+        AlertDialog(
+            onDismissRequest = onDismiss,
+            containerColor = CardColor,
+            title = { Text("${game.label} settings", color = Color(0xFFE8E8EE)) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                    for (item in GameSettings.settings) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text(item.title, color = Color(0xFFE8E8EE), fontSize = 15.sp)
+                                Text(item.description, color = Muted, fontSize = 13.sp)
+                            }
+                            Spacer(Modifier.width(12.dp))
+                            Switch(
+                                checked = choices[item.key] == true,
+                                onCheckedChange = { on ->
+                                    GameSettings.set(filesDir, game.packageName, item.key, on)
+                                    choices = GameSettings.choices(filesDir, game.packageName)
+                                },
+                                colors = SwitchDefaults.colors(checkedTrackColor = AccentText),
+                            )
+                        }
+                    }
+                    Text("Changes apply the next time the game starts.", color = Muted, fontSize = 13.sp)
+                }
+            },
+            confirmButton = { TextButton(onClick = onDismiss) { Text("Done", color = AccentText) } },
         )
     }
 

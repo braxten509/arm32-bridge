@@ -1104,6 +1104,47 @@ fn volumes(source: &Source, listener: &Listener, model: i32, stereo: bool) -> (f
     }
 }
 
+/// Frame `index` of a buffer as (left, right).
+fn frame_of(samples: &Samples, index: usize) -> (f32, f32) {
+    if samples.channels == 2 {
+        (samples.data[index * 2], samples.data[index * 2 + 1])
+    } else {
+        (samples.data[index], samples.data[index])
+    }
+}
+
+/// Frame `index` counted from the start of queue entry `current`: before or
+/// past it reads the queue's neighbours (around again when looping), and
+/// silence beyond the queue's ends.
+fn queued_frame(queue: &VecDeque<u32>, current: usize, looping: bool, buffers: &HashMap<u32, Arc<Samples>>, index: isize) -> (f32, f32) {
+    let frames_in = |entry: usize| queue.get(entry).and_then(|name| buffers.get(name)).map_or(0, |s| s.frames()) as isize;
+    let (mut entry, mut index) = (current, index);
+    // Every entry once each way at most (a queue of empty buffers ends it).
+    for _ in 0..2 * queue.len() + 2 {
+        if index < 0 {
+            entry = match entry {
+                0 if looping => queue.len() - 1,
+                0 => return (0.0, 0.0),
+                _ => entry - 1,
+            };
+            index += frames_in(entry);
+        } else if index >= frames_in(entry) {
+            index -= frames_in(entry);
+            entry += 1;
+            if entry >= queue.len() {
+                if !looping {
+                    return (0.0, 0.0);
+                }
+                entry = 0;
+            }
+        } else {
+            let samples = &buffers[&queue[entry]];
+            return frame_of(samples, index as usize);
+        }
+    }
+    (0.0, 0.0)
+}
+
 /// Adds one source's next `frames` frames to `out`; moves it along.
 fn mix_source(source: &mut Source, buffers: &HashMap<u32, Arc<Samples>>, listener: &Listener, model: i32, out: &mut [f32], frames: usize, out_rate: f64) {
     let mut made = 0;
@@ -1137,18 +1178,13 @@ fn mix_source(source: &mut Source, buffers: &HashMap<u32, Arc<Samples>>, listene
         let stereo = samples.channels == 2;
         let (left, right) = volumes(source, listener, model, stereo);
         let step = samples.rate * source.pitch as f64 / out_rate;
-        let data = &samples.data;
         while made < frames && source.offset < total as f64 {
-            let index = source.offset as usize;
-            let part = (source.offset - index as f64) as f32;
-            let next = (index + 1).min(total - 1);
-            let (l, r) = if stereo {
-                let a = (data[index * 2], data[index * 2 + 1]);
-                let b = (data[next * 2], data[next * 2 + 1]);
-                (a.0 + (b.0 - a.0) * part, a.1 + (b.1 - a.1) * part)
+            let (l, r) = if step == 1.0 && source.offset.fract() == 0.0 {
+                frame_of(samples, source.offset as usize)
             } else {
-                let value = data[index] + (data[next] - data[index]) * part;
-                (value, value)
+                let (queue, current, looping) = (&source.queue, source.current, source.looping);
+                let total = total as isize;
+                super::resample::read(source.offset, step, |i| if (0..total).contains(&i) { frame_of(samples, i as usize) } else { queued_frame(queue, current, looping, buffers, i) })
             };
             out[made * 2] += l * left;
             out[made * 2 + 1] += r * right;
@@ -1300,6 +1336,39 @@ mod tests {
         mix_source(&mut source, &buffers, &listener, AL_INVERSE_DISTANCE_CLAMPED, &mut out, 6, 100.0);
         assert_eq!(source.state, AL_STOPPED);
         assert_eq!(processed(&source), 2);
+    }
+
+    /// Amplitude of `frequency` in mono `samples` (an exact bin of the window).
+    fn tone(samples: &[f32], rate: f64, frequency: f64) -> f64 {
+        let (mut re, mut im) = (0.0, 0.0);
+        for (n, v) in samples.iter().enumerate() {
+            let angle = 2.0 * std::f64::consts::PI * frequency * n as f64 / rate;
+            re += *v as f64 * angle.cos();
+            im += *v as f64 * angle.sin();
+        }
+        2.0 * (re * re + im * im).sqrt() / samples.len() as f64
+    }
+
+    /// A 22050 Hz sound played at 48000 Hz keeps its 8 kHz tone (linear
+    /// blending dulls it ~4 dB) and gains no mirror tone at 22050 - 8000 Hz
+    /// (linear blending leaves one only ~14 dB down: a fizz on every sound).
+    #[test]
+    fn a_slow_rate_sound_keeps_its_highs_and_gains_no_mirror_tone() {
+        let rate = 22050.0;
+        let data: Vec<f32> = (0..22050).map(|n| 0.5 * (2.0 * std::f64::consts::PI * 8000.0 * n as f64 / rate).sin() as f32).collect();
+        let mut buffers = HashMap::new();
+        buffers.insert(1, Arc::new(Samples { data, channels: 1, rate, bits: 16 }));
+        let listener = Listener { position: [0.0; 3], velocity: [0.0; 3], at: [0.0, 0.0, -1.0], up: [0.0, 1.0, 0.0], gain: 1.0 };
+        let mut source = Source { queue: [1].into_iter().collect(), relative: true, ..Source::default() };
+        play(&mut source);
+        let mut out = vec![0.0; 2 * 24000];
+        mix_source(&mut source, &buffers, &listener, AL_INVERSE_DISTANCE_CLAMPED, &mut out, 24000, 48000.0);
+        // 0.1 s from the middle, left channel (10 Hz bins: both tones exact).
+        let left: Vec<f32> = out.chunks(2).skip(12000).take(4800).map(|f| f[0]).collect();
+        let kept = tone(&left, 48000.0, 8000.0);
+        let mirror = tone(&left, 48000.0, 14050.0);
+        assert!((kept / 0.5 - 1.0).abs() < 0.06, "8 kHz tone at {kept:.4} (wanted 0.5)");
+        assert!(mirror < 0.5 * 1e-3, "mirror tone at {mirror:.5} ({:.1} dB)", 20.0 * (mirror / 0.5).log10());
     }
 
     #[test]

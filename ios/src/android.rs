@@ -58,12 +58,15 @@ pub unsafe extern "C" fn Java_dev_braxten_gamebridge_IosGameActivity_nativeStart
     // Test switches for the game screen (it has no command line; they win
     // over the settings above, IOS_HOME included):
     // setprop debug.gamebridge.ios.env "IOS_STACKS_AT=40;IOS_TAPS=20:550,300"
-    let mut extra = [0u8; 128];
-    if libc::__system_property_get(c"debug.gamebridge.ios.env".as_ptr(), extra.as_mut_ptr() as *mut c_char) > 0 {
-        let extra = CStr::from_ptr(extra.as_ptr() as *const c_char).to_string_lossy().into_owned();
-        for pair in extra.split(';') {
-            if let Some((key, value)) = pair.split_once('=') {
-                std::env::set_var(key.trim(), value.trim());
+    // (a setting holds 91 characters, so more go in debug.gamebridge.ios.env2).
+    for name in [c"debug.gamebridge.ios.env", c"debug.gamebridge.ios.env2"] {
+        let mut extra = [0u8; 128];
+        if libc::__system_property_get(name.as_ptr(), extra.as_mut_ptr() as *mut c_char) > 0 {
+            let extra = CStr::from_ptr(extra.as_ptr() as *const c_char).to_string_lossy().into_owned();
+            for pair in extra.split(';') {
+                if let Some((key, value)) = pair.split_once('=') {
+                    std::env::set_var(key.trim(), value.trim());
+                }
             }
         }
     }
@@ -90,6 +93,7 @@ pub unsafe extern "C" fn Java_dev_braxten_gamebridge_IosGameActivity_nativeStart
         crate::fw::typing::set_keyboard_screen(show_keyboard);
     }
     crate::log!("phone app: starting {app} ({width}x{height} window)");
+    crate::log!("phone app: game settings: {:?}", *SETTINGS.lock().unwrap_or_else(|e| e.into_inner()));
     let started = std::thread::Builder::new().name("ios-main".into()).stack_size(16 << 20).spawn(move || {
         if let Err(error) = crate::run::run(&app) {
             crate::log!("STOP: can't start {app}: {error}");
@@ -109,11 +113,71 @@ pub unsafe extern "C" fn Java_dev_braxten_gamebridge_IosGameActivity_nativeSetRe
     std::env::set_var("IOS_REPORT_DIR", text(env, folder));
 }
 
+/// nativeSetSettings("NAME=VALUE;..."): the switches of the game's settings
+/// that are on (its card's Settings…, GameSettings.kt). Called before
+/// nativeStart, so its test switches (setprop) still win.
+#[no_mangle]
+pub unsafe extern "C" fn Java_dev_braxten_gamebridge_IosGameActivity_nativeSetSettings(env: *mut JNIEnv, _this: jobject, settings: jstring) {
+    let settings = text(env, settings);
+    for pair in settings.split(';') {
+        if let Some((key, value)) = pair.split_once('=') {
+            std::env::set_var(key.trim(), value.trim());
+        }
+    }
+    *SETTINGS.lock().unwrap_or_else(|e| e.into_inner()) = settings;
+}
+
+/// The game's settings as nativeSetSettings got them, for nativeStart's log.
+static SETTINGS: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
 /// nativePicturesUp(number): the phone put picture list `number` up on its
 /// screen (fw/pictures.rs `phone_put_up`).
 #[no_mangle]
 pub unsafe extern "C" fn Java_dev_braxten_gamebridge_IosGameActivity_nativePicturesUp(_env: *mut JNIEnv, _this: jobject, number: jlong) {
     crate::fw::pictures::phone_put_up(number as u64);
+}
+
+/// nativeLiveFrame(scene, time, buffer): the frame of a live scene (IOS_PHONE_ANIM=1,
+/// fw/pictures/live.rs) at `time` (System.nanoTime's clock) into a direct
+/// ByteBuffer, from the screen's own thread: its length, -1 when the scene is
+/// gone or can't draw it, -2 when the buffer is too small.
+#[no_mangle]
+pub unsafe extern "C" fn Java_dev_braxten_gamebridge_IosGameActivity_nativeLiveFrame(env: *mut JNIEnv, _this: jobject, scene: jlong, time: jlong, buffer: jobject) -> jint {
+    thread_local! {
+        static OUT: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let functions = &**env;
+    let address = (functions.GetDirectBufferAddress.unwrap())(env, buffer) as *mut u8;
+    let capacity = (functions.GetDirectBufferCapacity.unwrap())(env, buffer);
+    if address.is_null() || capacity < 0 {
+        return -1;
+    }
+    OUT.with(|out| {
+        let mut out = out.borrow_mut();
+        if !crate::fw::pictures::live::frame(scene as u64, time as f64 / 1e9, &mut out) {
+            return -1;
+        }
+        if out.len() > capacity as usize {
+            return -2;
+        }
+        std::ptr::copy_nonoverlapping(out.as_ptr(), address, out.len());
+        out.len() as jint
+    })
+}
+
+/// nativeLiveRelease(scene): the screen let a live scene go (no longer shown
+/// nor on its way): its frames and files go (fw/pictures/live.rs).
+#[no_mangle]
+pub extern "C" fn Java_dev_braxten_gamebridge_IosGameActivity_nativeLiveRelease(_env: *mut JNIEnv, _this: jobject, scene: jlong) {
+    crate::fw::pictures::live::release(scene as u64);
+}
+
+/// nativeAnimationLead(nanos): how long before it is on the screen the
+/// phone draws a frame (its Choreographer presentation time ahead of the
+/// draw), for Core Animation's clock (IOS_ANIM_LEAD=1, runloop::animation_time).
+#[no_mangle]
+pub extern "C" fn Java_dev_braxten_gamebridge_IosGameActivity_nativeAnimationLead(_env: *mut JNIEnv, _this: jobject, nanos: jlong) {
+    crate::fw::runloop::set_animation_lead(nanos as f64 / 1e9);
 }
 
 /// nativeSetScreenRate(hz): the screen's top refresh rate (IOS_SCREEN_HZ),

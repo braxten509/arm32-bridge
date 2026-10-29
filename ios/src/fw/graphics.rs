@@ -1456,7 +1456,105 @@ impl Canvas {
 
     fn fill_rect(&mut self, rect: Rect) {
         let color = premultiply(self.state.fill);
-        self.paint(rect, Blend::Over, &|_, _| color);
+        if !self.fill_rect_quickly(rect, color) {
+            self.paint(rect, Blend::Over, &|_, _| color);
+        }
+    }
+
+    /// `paint` of one plain colour, the quick way when nothing else changes
+    /// it per pixel: no clip, no kept coverage, the normal blend, no turn,
+    /// 4-byte pixels. A pixel the rectangle wholly covers gets what `blend`
+    /// would make of it, worked out once for each run of alike pixels (a
+    /// snapshot's background is mostly one colour); edge pixels go through
+    /// `blend` itself. False when it can't (then `paint` does it).
+    fn fill_rect_quickly(&mut self, rect: Rect, color: [f32; 4]) -> bool {
+        #[cfg(test)]
+        FILL_BLENDS.with(|n| n.set(0));
+        let ctm = self.state.ctm;
+        if self.state.clip.is_some() || self.cover.is_some() || self.state.blend_mode != shapes::BLEND_NORMAL
+            || ctm.b != 0.0 || ctm.c != 0.0 || self.layout.fast.is_none() || geometry::invert(ctm).is_none()
+        {
+            return false;
+        }
+        let rect = standard(rect);
+        let corners = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)]
+            .map(|(fx, fy)| geometry::apply(ctm, rect.origin.x + fx * rect.size.width, rect.origin.y + fy * rect.size.height));
+        let x0 = corners.iter().map(|c| c.0).fold(f64::INFINITY, f64::min).max(0.0);
+        let x1 = corners.iter().map(|c| c.0).fold(f64::NEG_INFINITY, f64::max).min(self.width as f64);
+        let y0 = corners.iter().map(|c| c.1).fold(f64::INFINITY, f64::min).max(0.0);
+        let y1 = corners.iter().map(|c| c.1).fold(f64::NEG_INFINITY, f64::max).min(self.height as f64);
+        if !(x0 < x1 && y0 < y1) {
+            return true;
+        }
+        // As `paint` gives it to `blend`; a whole pixel's cover of 1 leaves it as it is.
+        let src = scaled(color, self.state.alpha as f32);
+        let layout = self.layout;
+        let (height, bytes_per_row) = (self.height, self.bytes_per_row);
+        let part = |n: usize, low: f64, high: f64| {
+            let f = n as f64;
+            ((f + 1.0).min(high) - f.max(low)).max(0.0)
+        };
+        // When each byte's result depends on that byte alone (premultiplied
+        // or no alpha), a see-through colour is worked out once per byte value.
+        let table = (src[3] != 1.0 && (layout.premultiplied || !layout.has_alpha())).then(|| {
+            let mut table = [[0u8; 256]; 4];
+            for d in 0..256 {
+                let mut px = [d as u8; 4];
+                #[cfg(test)]
+                FILL_BLENDS.with(|n| n.set(n.get() + 1));
+                let blended = over(src, layout.read(&px));
+                layout.write(&mut px, blended);
+                for (place, byte) in px.iter().enumerate() {
+                    table[place][d] = *byte;
+                }
+            }
+            table
+        });
+        // An opaque colour's bytes don't depend on what is there: worked out once.
+        let solid = (src[3] == 1.0).then(|| {
+            let mut px = [0u8; 4];
+            #[cfg(test)]
+            FILL_BLENDS.with(|n| n.set(n.get() + 1));
+            layout.write(&mut px, src);
+            px
+        });
+        let mut last: Option<([u8; 4], [u8; 4])> = None;
+        for y in y0.floor() as usize..y1.ceil() as usize {
+            let coverage_y = part(y, y0, y1);
+            let row = (height - 1 - y) * bytes_per_row;
+            for x in x0.floor() as usize..x1.ceil() as usize {
+                let coverage = part(x, x0, x1) * coverage_y;
+                if coverage <= 0.0 {
+                    continue;
+                }
+                if coverage != 1.0 {
+                    self.blend(x, y, src, coverage as f32, &Blend::Over);
+                    continue;
+                }
+                let pixel = &mut self.memory()[row + x * 4..row + x * 4 + 4];
+                if let Some(solid) = &solid {
+                    pixel.copy_from_slice(solid);
+                    continue;
+                }
+                if let Some(table) = &table {
+                    for (place, byte) in pixel.iter_mut().enumerate() {
+                        *byte = table[place][*byte as usize];
+                    }
+                    continue;
+                }
+                let was: [u8; 4] = (*pixel).try_into().unwrap();
+                match last {
+                    Some((before, after)) if before == was => pixel.copy_from_slice(&after),
+                    _ => {
+                        #[cfg(test)]
+                        FILL_BLENDS.with(|n| n.set(n.get() + 1));
+                        layout.write(pixel, over(src, layout.read(pixel)));
+                        last = Some((was, (*pixel).try_into().unwrap()));
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// The fill colour replacing what is there (UIRectFill).
@@ -1542,8 +1640,43 @@ impl Canvas {
             return;
         }
         if !self.draw_bitmap_fast(rect, bitmap, &source, map) {
+            if draw_log() {
+                self.note_slow_draw(rect, bitmap, &source, map);
+            }
             self.draw_bitmap_paint(rect, bitmap, &source, map);
         }
+    }
+
+    /// IOS_DRAW_LOG=1: why a picture took the slow path (the first 60).
+    fn note_slow_draw(&self, rect: Rect, bitmap: &Bitmap, source: &Layout, map: &dyn Fn(f64, f64) -> (f64, f64)) {
+        static LOGGED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 60 {
+            return;
+        }
+        let ctm = self.state.ctm;
+        let (s00, t00) = map(0.0, 0.0);
+        let (s11, t11) = map(1.0, 1.0);
+        let ((s10, t10), (s01, t01)) = (map(1.0, 0.0), map(0.0, 1.0));
+        crate::log!("slow draw cross terms {:.1e} {:.1e} {:.1e} {:.1e}", s01 - s00, s11 - s10, t10 - t00, t11 - t01);
+        crate::log!(
+            "slow draw {}x{} into {}x{} (info {:#x}, into {:#x}): ctm {:.3} {:.3} {:.3} {:.3}, blend {}, cover {}, source fast {}, canvas fast {}, map ({s00:.2},{t00:.2})-({s11:.2},{t11:.2}), rect {:.1}x{:.1}",
+            bitmap.width,
+            bitmap.height,
+            self.width,
+            self.height,
+            bitmap.info,
+            self.info,
+            ctm.a,
+            ctm.b,
+            ctm.c,
+            ctm.d,
+            self.state.blend_mode,
+            self.cover.is_some(),
+            source.fast.is_some(),
+            self.layout.fast.is_some(),
+            rect.size.width,
+            rect.size.height
+        );
     }
 
     /// The slow, general path: a per-pixel bilinear sample through `paint`.
@@ -1564,10 +1697,21 @@ impl Canvas {
     /// rounded once — no per-pixel closures or array maps. False falls back
     /// to the general path (turned transforms, odd layouts and maps).
     fn draw_bitmap_fast(&mut self, rect: Rect, bitmap: &Bitmap, source: &Layout, map: &dyn Fn(f64, f64) -> (f64, f64)) -> bool {
+        // Big pictures are drawn on several cores, a band of rows each.
+        const SPLIT_FROM: f64 = 128.0 * 128.0;
         let ctm = self.state.ctm;
-        // Axis-aligned only: no rotation, no 90-degree swap, so source x is a
-        // function of device x alone and source y of device y alone.
-        if ctm.b != 0.0 || ctm.c != 0.0 || ctm.a == 0.0 || ctm.d == 0.0 {
+        let area = (rect.size.width * rect.size.height * (ctm.a * ctm.d - ctm.b * ctm.c)).abs();
+        let cores = if area < SPLIT_FROM { 1 } else { crate::fw::workers::cores() };
+        self.draw_bitmap_fast_on(rect, bitmap, source, map, cores)
+    }
+
+    /// `draw_bitmap_fast` on this many cores (threads).
+    fn draw_bitmap_fast_on(&mut self, rect: Rect, bitmap: &Bitmap, source: &Layout, map: &dyn Fn(f64, f64) -> (f64, f64), cores: usize) -> bool {
+        let ctm = self.state.ctm;
+        // Axis-aligned or turned a quarter: each device axis follows one
+        // picture axis alone (a quarter turn swaps them).
+        let swapped = ctm.a == 0.0 && ctm.d == 0.0 && ctm.b != 0.0 && ctm.c != 0.0;
+        if !swapped && (ctm.b != 0.0 || ctm.c != 0.0 || ctm.a == 0.0 || ctm.d == 0.0) {
             return false;
         }
         // Only the normal and clear blends are worked out here, without
@@ -1580,12 +1724,15 @@ impl Canvas {
         };
         // A separable map: s(u, v) == s(u, 0) and t(u, v) == t(0, v), checked
         // at the corners (exact for the affine maps used here, and it also
-        // turns away any u*v cross terms).
+        // turns away any u*v cross terms); rounding noise far below a
+        // picture pixel doesn't count.
+        const NOISE: f64 = 1e-3;
         let (s00, t00) = map(0.0, 0.0);
         let (s10, t10) = map(1.0, 0.0);
         let (s01, t01) = map(0.0, 1.0);
         let (s11, t11) = map(1.0, 1.0);
-        if (s01 - s00).abs() > 1e-12 || (s11 - s10).abs() > 1e-12 || (t10 - t00).abs() > 1e-12 || (t11 - t01).abs() > 1e-12 {
+        let (pw, ph) = (bitmap.width as f64, bitmap.height as f64);
+        if ((s01 - s00) * pw).abs() > NOISE || ((s11 - s10) * pw).abs() > NOISE || ((t10 - t00) * ph).abs() > NOISE || ((t11 - t01) * ph).abs() > NOISE {
             return false;
         }
         let Some(inverse) = geometry::invert(ctm) else {
@@ -1609,31 +1756,38 @@ impl Canvas {
         let (y_start, y_end) = (y0.floor() as usize, y1.ceil() as usize);
 
         let source_bytes = source.bytes;
+        // The two picture pixels (byte offsets) a user x or y falls between, and the weight of the second.
+        let picture_x = |ux: f64| {
+            let u = (ux.clamp(min_x, max_x) - min_x) / rect.size.width;
+            let sx = (map(u, 0.0).0 * bitmap.width as f64 - 0.5).clamp(0.0, (bitmap.width - 1) as f64);
+            let x0i = sx.floor() as usize;
+            let x1i = (x0i + 1).min(bitmap.width - 1);
+            (x0i * source_bytes, x1i * source_bytes, ((sx - x0i as f64) as f32 * FIX as f32).round() as u32)
+        };
+        let picture_y = |uy: f64| {
+            let v = (max_y - uy.clamp(min_y, max_y)) / rect.size.height;
+            let sy = (map(0.0, v).1 * bitmap.height as f64 - 0.5).clamp(0.0, (bitmap.height - 1) as f64);
+            let y0i = sy.floor() as usize;
+            let y1i = (y0i + 1).min(bitmap.height - 1);
+            (y0i * bitmap.bytes_per_row, y1i * bitmap.bytes_per_row, ((sy - y0i as f64) as f32 * FIX as f32).round() as u32)
+        };
+        // Each device column and row: its coverage and the picture pixels it
+        // reads (a picture column for a device column, unless turned a quarter).
         let mut columns: Vec<(f32, usize, usize, u32)> = Vec::with_capacity(x_end - x_start);
         for x in x_start..x_end {
             let fx = x as f64;
             let coverage_x = (((fx + 1.0).min(x1) - fx.max(x0)).max(0.0)) as f32;
-            let ux = geometry::apply(inverse, fx + 0.5, 0.0).0;
-            let u = (ux.clamp(min_x, max_x) - min_x) / rect.size.width;
-            let s = map(u, 0.0).0;
-            let sx = (s * bitmap.width as f64 - 0.5).clamp(0.0, (bitmap.width - 1) as f64);
-            let x0i = sx.floor() as usize;
-            let x1i = (x0i + 1).min(bitmap.width - 1);
-            let wfx = ((sx - x0i as f64) as f32 * FIX as f32).round() as u32;
-            columns.push((coverage_x, x0i * source_bytes, x1i * source_bytes, wfx));
+            let user = geometry::apply(inverse, fx + 0.5, 0.0);
+            let (a, b, w) = if swapped { picture_y(user.1) } else { picture_x(user.0) };
+            columns.push((coverage_x, a, b, w));
         }
         let mut rows: Vec<(f32, usize, usize, u32)> = Vec::with_capacity(y_end - y_start);
         for y in y_start..y_end {
             let fy = y as f64;
             let coverage_y = (((fy + 1.0).min(y1) - fy.max(y0)).max(0.0)) as f32;
-            let uy = geometry::apply(inverse, 0.0, fy + 0.5).1;
-            let v = (max_y - uy.clamp(min_y, max_y)) / rect.size.height;
-            let t = map(0.0, v).1;
-            let sy = (t * bitmap.height as f64 - 0.5).clamp(0.0, (bitmap.height - 1) as f64);
-            let y0i = sy.floor() as usize;
-            let y1i = (y0i + 1).min(bitmap.height - 1);
-            let wfy = ((sy - y0i as f64) as f32 * FIX as f32).round() as u32;
-            rows.push((coverage_y, y0i * bitmap.bytes_per_row, y1i * bitmap.bytes_per_row, wfy));
+            let user = geometry::apply(inverse, 0.0, fy + 0.5);
+            let (a, b, w) = if swapped { picture_x(user.0) } else { picture_y(user.1) };
+            rows.push((coverage_y, a, b, w));
         }
 
         let alpha = self.state.alpha as f32;
@@ -1645,12 +1799,10 @@ impl Canvas {
         let (bytes_per_row, dest_bytes) = (self.bytes_per_row, self.layout.bytes);
         let memory = self.memory();
 
-        for (yi, &(coverage_y, y0_base, y1_base, wfy)) in rows.iter().enumerate() {
-            if coverage_y <= 0.0 {
-                continue;
-            }
+        // One device row (`dev_y`, from the bottom): `memory` is its bytes.
+        let draw_row = |yi: usize, memory: &mut [u8]| {
+            let (coverage_y, y0_base, y1_base, wfy) = rows[yi];
             let dev_y = yi + y_start;
-            let dst_row = (height - 1 - dev_y) * bytes_per_row;
             for (xi, &(coverage_x, x0_off, x1_off, wfx)) in columns.iter().enumerate() {
                 let cov = coverage_x * coverage_y;
                 if cov <= 0.0 {
@@ -1667,7 +1819,7 @@ impl Canvas {
                     // destination's skipped fourth byte is still written 255,
                     // as the general path's blend does.
                     if !df.alpha {
-                        memory[dst_row + dev_x * dest_bytes + df.fourth] = 255;
+                        memory[dev_x * dest_bytes + df.fourth] = 255;
                     }
                     continue;
                 }
@@ -1683,7 +1835,7 @@ impl Canvas {
                 let a = mix_fix(mix_fix(al00, al10, wfx), mix_fix(al01, al11, wfx), wfy);
                 // out = src*k + dst*(1 - alpha*k), premultiplied; a clear
                 // blend drops the src term.
-                let base = dst_row + dev_x * dest_bytes;
+                let base = dev_x * dest_bytes;
                 let dr = memory[base + df.red] as u32;
                 let dg = memory[base + df.green] as u32;
                 let db = memory[base + df.blue] as u32;
@@ -1709,6 +1861,28 @@ impl Canvas {
                 memory[base + df.blue] = out_b as u8;
                 memory[base + df.fourth] = if df.alpha { out_a as u8 } else { 255 };
             }
+        };
+        // The rows to draw, each with its own bytes (rows are stored top first).
+        let mut bands: Vec<(usize, &mut [u8])> = memory
+            .chunks_mut(bytes_per_row)
+            .take(height)
+            .enumerate()
+            .filter_map(|(stored, bytes)| {
+                let dev_y = (height - 1).checked_sub(stored)?;
+                let yi = dev_y.checked_sub(y_start).filter(|&yi| dev_y < y_end && rows[yi].0 > 0.0)?;
+                Some((yi, bytes))
+            })
+            .collect();
+        if cores <= 1 || bands.len() < 2 {
+            for (yi, bytes) in bands {
+                draw_row(yi, bytes);
+            }
+        } else {
+            crate::fw::workers::split(&mut bands, cores, &|group| {
+                for (yi, bytes) in group {
+                    draw_row(*yi, bytes);
+                }
+            });
         }
         true
     }
@@ -2295,6 +2469,59 @@ fn uikit_image_from_cg(picture: Id, scale: f64, orientation: i64) -> Id {
     uikit::make_image(info)
 }
 
+/// Picture files held by live scenes the phone may still draw from
+/// (fw/pictures/live.rs), with how many hold each, and files whose cache let
+/// them go meanwhile: deleted once nothing holds them.
+static PINNED: Mutex<Option<(std::collections::HashMap<String, usize>, Vec<String>)>> = Mutex::new(None);
+
+/// Holds `files` (once each time asked): `remove_picture_file` leaves them until let go.
+pub fn pin_files(files: &[String]) {
+    let mut pinned = PINNED.lock().unwrap_or_else(|e| e.into_inner());
+    let (counts, _) = pinned.get_or_insert_with(Default::default);
+    for file in files {
+        *counts.entry(file.clone()).or_insert(0) += 1;
+    }
+}
+
+/// Lets go of `files` (as many times as pinned); those a cache let go meanwhile go now.
+pub fn unpin_files(files: &[String]) {
+    let mut pinned = PINNED.lock().unwrap_or_else(|e| e.into_inner());
+    let (counts, waiting) = pinned.get_or_insert_with(Default::default);
+    for file in files {
+        if let Some(count) = counts.get_mut(file) {
+            *count -= 1;
+            if *count == 0 {
+                counts.remove(file);
+            }
+        }
+    }
+    waiting.retain(|file| {
+        let held = counts.contains_key(file);
+        if !held {
+            let _ = std::fs::remove_file(file);
+        }
+        held
+    });
+}
+
+/// How many hold `file` (`pin_files`).
+#[cfg(test)]
+pub fn pin_count(file: &str) -> usize {
+    PINNED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|(counts, _)| counts.get(file).copied()).unwrap_or(0)
+}
+
+/// Deletes a picture file a cache lets go of, unless a live scene holds it
+/// (then when it is let go).
+pub fn remove_picture_file(file: &str) {
+    let mut pinned = PINNED.lock().unwrap_or_else(|e| e.into_inner());
+    match pinned.as_mut() {
+        Some((counts, waiting)) if counts.contains_key(file) => waiting.push(file.to_string()),
+        _ => {
+            let _ = std::fs::remove_file(file);
+        }
+    }
+}
+
 /// The UIImage's last reference went: it lets go of its CGImage (the pixels
 /// go once nothing else holds them) and of the file made to show it.
 pub fn ui_image_clean_up(picture: Id) {
@@ -2305,10 +2532,10 @@ pub fn ui_image_clean_up(picture: Id) {
     // The file's bytes, if it was never decoded.
     drop(info.bytes.lock().unwrap_or_else(|e| e.into_inner()).take());
     if let Some(file) = info.picture_file.get_or_init(|| None) {
-        let _ = std::fs::remove_file(file);
+        remove_picture_file(file);
     }
     for file in info.part_files.get_or_init(Vec::new).iter().flatten() {
-        let _ = std::fs::remove_file(file);
+        remove_picture_file(file);
     }
     let darker = DARKER.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|made| made.remove(&picture));
     if let Some(darker) = darker {
@@ -2749,6 +2976,11 @@ fn write_picture_file(picture: Id) -> Option<String> {
 }
 
 /// A new file in the picture folder holding `bytes` (a PNG made to show `what`).
+pub(crate) fn draw_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("IOS_DRAW_LOG").is_ok_and(|v| v == "1"))
+}
+
 fn write_png_file(what: &str, bytes: &[u8]) -> Option<String> {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3172,6 +3404,12 @@ pub fn register(r: &mut Registry) {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// Blends the last quick fill worked out (tests: they don't grow with the pixels).
+    static FILL_BLENDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -3386,6 +3624,149 @@ mod tests {
                     assert!(f.iter().zip(&g).all(|(a, b)| a.abs_diff(*b) <= 1), "fast vs general src={src_info:#x} dst={dst_info:#x} flip={flip}:\n{f:?}\n{g:?}");
                 }
             }
+        }
+    }
+
+    /// Made-up but valid premultiplied colours over a whole canvas.
+    fn speckle(c: &mut Canvas, seed: u32) {
+        let (layout, bytes, rows) = (c.layout, c.layout.bytes, c.height);
+        let per_row = c.bytes_per_row;
+        let mut state = seed;
+        for row in 0..rows {
+            for x in 0..c.width {
+                state = state.wrapping_mul(1103515245).wrapping_add(12345);
+                let a = [1.0f32, 0.0, 0.5, 0.25, 0.8][(state >> 16) as usize % 5];
+                let color = [((state >> 8) & 255) as f32 / 255.0 * a, ((state >> 3) & 255) as f32 / 255.0 * a, ((state >> 20) & 255) as f32 / 255.0 * a, a];
+                let at = row * per_row + x * bytes;
+                layout.write(&mut c.memory()[at..at + bytes], color);
+            }
+        }
+    }
+
+    /// Snapshots fill their backgrounds with a plain colour; the quick way
+    /// gives the same bytes as painting pixel by pixel.
+    #[test]
+    fn plain_colour_fills_match_the_pixel_by_pixel_way() {
+        let transforms = [
+            Transform { a: 1.0, b: 0.0, c: 0.0, d: 1.0, tx: 0.0, ty: 0.0 },
+            Transform { a: 1.0, b: 0.0, c: 0.0, d: -1.0, tx: 0.0, ty: 12.0 },
+            Transform { a: 2.0, b: 0.0, c: 0.0, d: -2.0, tx: 0.5, ty: 11.75 },
+        ];
+        let rects = [Rect::new(0.0, 0.0, 16.0, 12.0), Rect::new(0.5, 1.25, 7.0, 4.5), Rect::new(-3.0, 2.0, 30.0, 3.3)];
+        let fills = [[0.2, 0.4, 0.9, 1.0], [0.0, 0.0, 0.0, 0.55], [1.0, 0.5, 0.25, 0.3]];
+        for info in [PREMULTIPLIED_LAST, PREMULTIPLIED_FIRST | ORDER_32_LITTLE, NONE_SKIP_FIRST | ORDER_32_LITTLE] {
+            for (t, ctm) in transforms.iter().enumerate() {
+                for rect in rects {
+                    for fill in fills {
+                        for alpha in [1.0, 0.6] {
+                            let (mut quick, mut slow) = (canvas(16, 12, info), canvas(16, 12, info));
+                            for c in [&mut quick, &mut slow] {
+                                speckle(c, 7);
+                                c.state.ctm = *ctm;
+                                c.state.alpha = alpha;
+                                c.state.fill = fill;
+                            }
+                            let color = premultiply(fill);
+                            assert!(quick.fill_rect_quickly(rect, color), "{info:#x} transform {t} takes the quick way");
+                            slow.paint(rect, Blend::Over, &|_, _| color);
+                            assert!(quick.memory() == slow.memory(), "{info:#x} transform {t} {rect:?} {fill:?} alpha {alpha}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A picture turned a quarter either way (a card on its side), or whose
+    /// map carries rounding noise far below a pixel, takes the quick way,
+    /// with the general path's pixels.
+    #[test]
+    fn quarter_turned_pictures_take_the_quick_way() {
+        let mut data = vec![0u8; 37 * 23 * 4];
+        let mut state = 5u32;
+        for pixel in data.chunks_mut(4) {
+            state = state.wrapping_mul(1103515245).wrapping_add(12345);
+            let a = (state >> 24) as u8 | 0x0f;
+            pixel.copy_from_slice(&[((state >> 8) as u8).min(a), ((state >> 16) as u8).min(a), (state as u8).min(a), a]);
+        }
+        let picture = Bitmap { width: 37, height: 23, bits_per_pixel: 32, bytes_per_row: 37 * 4, info: PREMULTIPLIED_LAST, space: Space::Rgb, data };
+        let source = picture.layout().unwrap();
+        let turns = [
+            Transform { a: 0.0, b: -2.0, c: 2.0, d: 0.0, tx: 3.5, ty: 46.25 },
+            Transform { a: 0.0, b: 2.0, c: -2.0, d: 0.0, tx: 40.0, ty: 1.0 },
+            Transform { a: 2.0, b: 0.0, c: 0.0, d: -2.0, tx: 3.0, ty: 48.0 },
+            Transform { a: 2.0, b: 0.0, c: 0.0, d: -2.0, tx: 3.5, ty: 48.25 },
+            Transform { a: 0.0, b: -2.0, c: 2.0, d: 0.0, tx: 3.0, ty: 46.0 },
+        ];
+        let plain = |u: f64, v: f64| (u, 1.0 - v);
+        let noisy = |u: f64, v: f64| (u + 1e-9 * v, 1.0 - v + 1e-9 * u);
+        let maps: [&dyn Fn(f64, f64) -> (f64, f64); 2] = [&plain, &noisy];
+        for (i, ctm) in turns.iter().enumerate() {
+            for (m, map) in maps.iter().enumerate() {
+                let (mut fast, mut general) = (canvas(50, 50, PREMULTIPLIED_FIRST | ORDER_32_LITTLE), canvas(50, 50, PREMULTIPLIED_FIRST | ORDER_32_LITTLE));
+                for c in [&mut fast, &mut general] {
+                    speckle(c, 13);
+                    c.state.ctm = *ctm;
+                    c.state.alpha = 0.8;
+                    let mut outline = shapes::Outline::default();
+                    outline.rect(Rect::new(2.0, 3.0, 17.0, 12.0), &c.to_device());
+                    c.clip_to(&outline, false);
+                }
+                assert!(fast.draw_bitmap_fast_on(Rect::new(1.0, 2.0, 20.0, 15.0), &picture, &source, map, 2), "turn {i} map {m} takes the quick way");
+                general.draw_bitmap_paint(Rect::new(1.0, 2.0, 20.0, 15.0), &picture, &source, map);
+                let (f, g) = (fast.memory().to_vec(), general.memory().to_vec());
+                let worst = f.iter().zip(&g).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+                // The quick way's whole-number blend over a faded, speckled
+                // background: as close as the unturned quick way gets (2 steps).
+                assert!(worst <= 2, "turn {i} map {m}: off by {worst}");
+            }
+        }
+    }
+
+    /// A see-through plain colour over a varied background (a card's
+    /// backing in a snapshot): each byte's results are worked out once,
+    /// not once per pixel.
+    #[test]
+    fn a_see_through_fill_is_worked_out_once_per_byte_value() {
+        for info in [PREMULTIPLIED_LAST, PREMULTIPLIED_FIRST | ORDER_32_LITTLE, NONE_SKIP_FIRST | ORDER_32_LITTLE] {
+            let mut c = canvas(64, 64, info);
+            speckle(&mut c, 3);
+            assert!(c.fill_rect_quickly(Rect::new(0.0, 0.0, 64.0, 64.0), premultiply([0.2, 0.4, 0.6, 0.5])));
+            let worked = FILL_BLENDS.with(|n| n.get());
+            assert!(worked <= 256, "{info:#x}: {worked} blends for 4096 pixels");
+            // An opaque colour covers whatever is there the same way.
+            assert!(c.fill_rect_quickly(Rect::new(0.0, 0.0, 64.0, 64.0), [0.1, 0.7, 0.3, 1.0]));
+            let worked = FILL_BLENDS.with(|n| n.get());
+            assert!(worked <= 1, "{info:#x}: {worked} colours worked out for an opaque fill");
+        }
+    }
+
+    /// Pictures are drawn on several cores at once, with the same bytes as on one.
+    #[test]
+    fn pictures_drawn_on_several_cores_match_one_core() {
+        let mut data = vec![0u8; 37 * 23 * 4];
+        let mut state = 3u32;
+        for pixel in data.chunks_mut(4) {
+            state = state.wrapping_mul(1103515245).wrapping_add(12345);
+            let a = (state >> 24) as u8 | 0x0f;
+            pixel.copy_from_slice(&[((state >> 8) as u8).min(a), ((state >> 16) as u8).min(a), (state as u8).min(a), a]);
+        }
+        let picture = Bitmap { width: 37, height: 23, bits_per_pixel: 32, bytes_per_row: 37 * 4, info: PREMULTIPLIED_LAST, space: Space::Rgb, data };
+        let source = picture.layout().unwrap();
+        let draw = |cores: usize| {
+            let mut c = canvas(301, 203, PREMULTIPLIED_FIRST | ORDER_32_LITTLE);
+            speckle(&mut c, 11);
+            c.state.ctm = Transform { a: 2.0, b: 0.0, c: 0.0, d: -2.0, tx: 3.5, ty: 200.25 };
+            c.state.alpha = 0.8;
+            let mut outline = shapes::Outline::default();
+            outline.rect(Rect::new(4.0, 3.0, 120.0, 80.0), &c.to_device());
+            c.clip_to(&outline, false);
+            assert!(c.draw_bitmap_fast_on(Rect::new(1.0, 2.0, 140.0, 90.5), &picture, &source, &|u, v| (u, 1.0 - v), cores));
+            c.memory().to_vec()
+        };
+        let one = draw(1);
+        for cores in [2, 3, 8] {
+            assert!(draw(cores) == one, "{cores} cores");
         }
     }
 

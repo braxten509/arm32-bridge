@@ -295,6 +295,10 @@ pub fn game_autorelease(object: Id) {
 /// removed them).
 pub fn dealloc_pending() {
     static LOGGED: AtomicUsize = AtomicUsize::new(0);
+    // Nothing waiting (nearly every call, one after each host message).
+    if TO_DEALLOC.with(|d| d.borrow().is_empty()) {
+        return;
+    }
     let hook = DEALLOC_HOOK.lock().unwrap_or_else(|e| e.into_inner()).clone();
     if hook.as_ref().is_some_and(|(_, ready)| !ready()) {
         return;
