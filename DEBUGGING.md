@@ -2177,3 +2177,36 @@ program under the same qemu (no bridge) showed both:
   handler), passes after.
 - Self-test: PC 0 failures (1 skip: bionic wide cases), qemu ARM64 0 failures (2 skips: same + timeout read-back,
   0 fallbacks), emulator 0 failures (no skips).
+
+# Farm Story offline mode (2026-10-29, commit c68c2c8)
+
+Farm Story 1.9.6.4 (Storm8/TeamLava) needs servers that are long gone. It now plays with the phone's Network
+permission off: `tools/convert.sh <apk> --offline-pack <folder>`. Design: docs/offline-plan.md. Decisions and
+recordings: ~/dev/arm32-bridge-games/farmstory/OFFLINE-LOG.md and PROTOCOL.md (outside git, game data).
+
+## Verified on the Pixel 10 (Network off)
+- The farm loads with every picture. In the tutorial, harvest, plow and plant work and coins match the recorded
+  real server (10000 -> 10030 -> 10090 -> 10060). Level 2 reached. A force-stop + restart and a reinstall
+  both kept the farm, coins and level; crops kept growing while the game was closed.
+- Tests: 43 bridge lib tests (8 offline), 34 converter tests; planted mistakes caught.
+- Terra review (t18): fixed split bundles getting the offline parts twice, the client rename now applies to
+  every dex or none, and JNI null/exception checks.
+
+## Still unresolved
+1. Neighbours: offline the game sees 1 neighbour (groupSize). Coin-paid expansions past 11x11 need 2-11,
+   so only gem-paid ones work. Reporting a bigger count is one number in src/offline/storm8.rs (group_size),
+   but the game may read a neighbour list that only holds one entry. Owner to decide.
+2. Visiting a neighbour's farm (getBoardForProfileId) fails; a call queued right behind it may also fail and
+   the game may say "out of sync".
+3. Crates: the recorded data has no crate contents, so crates say "can't be opened offline".
+4. Guessed answers never seen from the real server: buyItem / buyCash / buyCrate (expansion cost, 10 gems =
+   5000 coins, parts to storage), tutorialState kept at 10000 (server sent 10001), no gem bonus on level-up.
+5. Buying coins from a notice or limited-time box crashes the game: it reads cashRedemptionSchedule, which
+   this game version never sets (same crash online). Not fixed; the normal market path works.
+6. A save that fails (for example a full phone) is only logged; the game is still told the call worked, so
+   changes since the last good save would be lost on restart.
+7. 1286 CDN files answered 403 when mirrored (gone from the CDN; offline-pack/mirror-failed.txt). None was
+   asked for during the tutorial; watch for "[offline] 404" lines in the log on later levels.
+8. Not checked beyond the tutorial and level 2: later levels, quests, collections, buildings, selling.
+9. Only Apache HttpClient is hooked. Games using HttpURLConnection, OkHttp or native sockets keep their
+   network (the converter warns).
