@@ -24,9 +24,11 @@
 //!
 //! usage: apk-convert <game.apk|bundle> <out.apk|out folder> --bridge <libarm32_bridge.so> --standin <libstandin.so>
 //!                    [--pacer <libgamebridge_pacer.so>] [--work <scratch dir>] [--abi <output ABI, default arm64-v8a>] [--min-target-sdk <N>]
+//!                    [--offline-pack <folder>]
 //!        apk-convert --inspect <game.apk|bundle> [--base <out.apk>] [--work <scratch dir>]
 //! (`--abi x86_64` makes a copy for the PC's Android emulator, with an x86_64 bridge and stand-in.)
 //! (`--min-target-sdk N` raises the game's target Android version to N: phones without root refuse older ones.)
+//! (`--offline-pack folder` makes the game play offline: its servers are answered on the phone from the folder, offline.rs.)
 //! `--inspect` only looks: it prints `kind apk|bundle`, `data yes|no` for a bundle (carries game data),
 //! `download yes|no` (the game's own code starts Google Play's expansion-file download, and doesn't download
 //! its data file itself from a web address in its code), `bits 32|64|none`
@@ -45,6 +47,7 @@ mod fixes;
 mod icon;
 mod manifest;
 mod needed;
+mod offline;
 
 use std::fs::File;
 use std::io::{Read, Seek, Write};
@@ -84,6 +87,8 @@ struct Options {
     abi: String,
     /// Raise the game's target Android version to at least this (phones without root refuse older ones).
     min_target_sdk: Option<u32>,
+    /// The game's offline pack folder (offline.rs): its servers are answered on the phone.
+    offline_pack: Option<PathBuf>,
 }
 
 enum Command {
@@ -96,6 +101,7 @@ fn parse() -> Result<Command, String> {
     let mut positional = Vec::new();
     let (mut bridge, mut standin, mut work, mut abi, mut base, mut pacer) = (None, None, None, None, None, None);
     let mut min_target_sdk = None;
+    let mut offline_pack = None;
     let mut inspect = false;
     while let Some(argument) = arguments.next() {
         let mut value = || arguments.next().ok_or(format!("{argument} needs a value"));
@@ -110,6 +116,7 @@ fn parse() -> Result<Command, String> {
                 let text = value()?;
                 min_target_sdk = Some(text.parse().map_err(|_| format!("--min-target-sdk needs a number, not {text}"))?);
             }
+            "--offline-pack" => offline_pack = Some(PathBuf::from(value()?)),
             "--inspect" => inspect = true,
             _ if argument.starts_with("--") => return Err(format!("unknown option {argument}")),
             _ => positional.push(PathBuf::from(argument)),
@@ -130,6 +137,7 @@ fn parse() -> Result<Command, String> {
         work,
         abi: abi.unwrap_or_else(|| "arm64-v8a".into()),
         min_target_sdk,
+        offline_pack,
     }))
 }
 
@@ -397,6 +405,18 @@ enum Native<'a> {
     Paced { helper: Option<&'a [u8]>, loader: bool },
 }
 
+/// The archive's dex files (classes*.dex at the top).
+fn dex_files<R: Read + Seek>(archive: &mut ZipArchive<R>) -> Result<Vec<Vec<u8>>, Failure> {
+    let names: Vec<String> = archive.file_names().filter(|name| name.starts_with("classes") && name.ends_with(".dex") && !name.contains('/')).map(String::from).collect();
+    let mut files = Vec::new();
+    for name in names {
+        let mut bytes = Vec::new();
+        archive.by_name(&name)?.read_to_end(&mut bytes)?;
+        files.push(bytes);
+    }
+    Ok(files)
+}
+
 /// Writes `archive` to `output` without its old signature, with the dex and
 /// manifest fixes and its native libraries handled as `native` says.
 fn rewrite<R: Read + Seek>(
@@ -410,6 +430,22 @@ fn rewrite<R: Read + Seek>(
 ) -> Result<(), Failure> {
     let paced = matches!(native, Native::Paced { .. });
     let adds_loader = matches!(native, Native::Paced { loader: true, .. });
+    // Offline answers need the bridge (32-bit games only for now). In a split bundle the
+    // classes go in with the Java code and the pack with the bridge, each once.
+    let offline = options.offline_pack.is_some() && !paced;
+    if options.offline_pack.is_some() && paced {
+        println!("warn offline answers need the bridge; this 64-bit game keeps its network");
+    }
+    let has_code = archive.file_names().any(|name| name == "classes.dex");
+    let offline_pack = match &options.offline_pack {
+        Some(folder) if offline && matches!(native, Native::Bridged { bridge: Some(_), .. }) => {
+            Some(offline::pack_folder(folder).map_err(|e| Failure::Other(format!("offline pack {}: {e}", folder.display())))?)
+        }
+        _ => None,
+    };
+    // The client class is renamed in every dex file or in none (dex.rs fix 7).
+    let rename_client = offline && has_code && !dex_files(archive)?.iter().any(|bytes| dex::offline_http_client_refused(bytes));
+    let mut offline_client = false;
     let mut writer = ZipWriter::new(File::create(output)?);
     let stored = |alignment: u16| {
         SimpleFileOptions::default().compression_method(CompressionMethod::Stored).with_alignment(alignment)
@@ -468,6 +504,12 @@ fn rewrite<R: Read + Seek>(
                 }
                 for fix in dex::patch(&mut bytes, carries_game_data) {
                     println!("fix {name}: {}: {} -> {}", fix.reason, fix.old, fix.new);
+                }
+                if rename_client {
+                    if let Some(fix) = dex::offline_http_client(&mut bytes) {
+                        println!("fix {name}: {}: {} -> {}", fix.reason, fix.old, fix.new);
+                        offline_client = true;
+                    }
                 }
                 // Such methods get no env/class arguments; the bridge can't tell them
                 // apart at run time (the annotation isn't visible through reflection).
@@ -532,6 +574,20 @@ fn rewrite<R: Read + Seek>(
             (None, &[], &[])
         }
     };
+    if offline && has_code {
+        if !offline_client {
+            println!("warn the game doesn't make Apache HTTP clients the offline answers can reach; it keeps its network");
+        }
+        let file = next_dex_name(archive.file_names());
+        writer.start_file(file.as_str(), deflated)?;
+        writer.write_all(offline::OFFLINE_DEX)?;
+        println!("fix {file}: offline answer classes added");
+    }
+    if let Some(pack) = &offline_pack {
+        writer.start_file(target(offline::PACK_FILE), stored(LIBRARY_ALIGNMENT))?;
+        writer.write_all(pack)?;
+        println!("fix lib: offline answers added ({} KB pack)", pack.len() / 1024);
+    }
     if let Some(bridge) = bridge {
         writer.start_file(target(BRIDGE_FILE), stored(LIBRARY_ALIGNMENT))?;
         writer.write_all(bridge.library)?;

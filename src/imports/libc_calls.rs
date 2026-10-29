@@ -803,20 +803,6 @@ pub fn handler(name: &str) -> Option<Handler> {
             }
             Ret::U32(text.len() as u32)
         }),
-        // Appends while the whole text fits in `size` bytes; returns the length it tried to make.
-        "strlcat" | "__strlcat_chk" => handler!(|uc, a| {
-            let (destination, source, size) = (a.u32(), a.u32(), a.u32());
-            let m = mem();
-            let start = (m.c_str(destination).to_bytes().len() as u32).min(size);
-            let text = m.c_str(source).to_bytes().to_vec();
-            if start == size {
-                return Ret::U32(size + text.len() as u32);
-            }
-            let copy = text.len().min((size - start - 1) as usize);
-            m.write_bytes(destination + start, &text[..copy]);
-            m.write_u8(destination + start + copy as u32, 0);
-            Ret::U32(start + text.len() as u32)
-        }),
         "strdup" => handler!(|uc, a| {
             let source = a.u32();
             let text = mem().c_str(source).to_bytes().to_vec();
@@ -922,9 +908,6 @@ pub fn handler(name: &str) -> Option<Handler> {
         "isxdigit" => handler!(|uc, a| Ret::U32((unsafe { libc::isxdigit(a.i32()) } != 0) as u32)),
         "isalpha" => handler!(|uc, a| Ret::U32((unsafe { libc::isalpha(a.i32()) } != 0) as u32)),
         "isalnum" => handler!(|uc, a| Ret::U32((unsafe { libc::isalnum(a.i32()) } != 0) as u32)),
-        "islower" => handler!(|uc, a| Ret::U32((unsafe { libc::islower(a.i32()) } != 0) as u32)),
-        "iscntrl" => handler!(|uc, a| Ret::U32((unsafe { libc::iscntrl(a.i32()) } != 0) as u32)),
-        "ispunct" => handler!(|uc, a| Ret::U32((unsafe { libc::ispunct(a.i32()) } != 0) as u32)),
         "isascii" => handler!(|uc, a| Ret::U32((a.u32() < 0x80) as u32)),
         "iscntrl" => handler!(|uc, a| narrow_class(a.i32(), libc::iscntrl)),
         "isprint" => handler!(|uc, a| narrow_class(a.i32(), libc::isprint)),

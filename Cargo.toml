@@ -20,6 +20,8 @@ guest32-image = { path = "ios/guest32-image" }
 mimalloc = { version = "0.1.52", features = ["local_dynamic_tls"] }
 # AI-upscaled picture packs (src/texture_pack.rs): pure-Rust WebP, lossy with alpha.
 image-webp = "0.2"
+# Offline game-server stand-ins (src/offline/storm8.rs); key order kept, Storm8's parser wants "type" first.
+serde_json = { version = "1", features = ["preserve_order"] }
 
 [workspace]
 members = ["converter", "pacer", "ios", "ios/guest32-image"]

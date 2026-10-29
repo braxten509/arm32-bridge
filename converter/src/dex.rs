@@ -519,14 +519,75 @@ pub fn patch(data: &mut [u8], carries_game_data: bool) -> Vec<Fix> {
         }
     }
     if !fixes.is_empty() {
-        // Header: magic[8], adler32 of [12..], SHA-1 of [32..].
-        use sha1::Digest;
-        let digest = sha1::Sha1::digest(&data[32..]);
-        data[12..32].copy_from_slice(&digest);
-        let checksum = adler32(&data[12..]);
-        data[8..12].copy_from_slice(&checksum.to_le_bytes());
+        reseal(data);
     }
     fixes
+}
+
+/// Apache HttpClient's client class, and Game Bridge's offline subclass of it (fix 7): the
+/// same length, so the name can change in place.
+const DEFAULT_HTTP_CLIENT: &str = "Lorg/apache/http/impl/client/DefaultHttpClient;";
+pub const OFFLINE_HTTP_CLIENT: &str = "Lorg/apache/http/impl/client/OfflineHttpClient;";
+
+/// Fix 7 - offline answers: every use of Apache's DefaultHttpClient in the dex (new, its
+/// constructors, subclasses) becomes Game Bridge's OfflineHttpClient, which answers the
+/// game's requests from the phone (src/offline in the bridge). The class name's string is
+/// rewritten in place. Refused (None, nothing changed) when the new name would no longer sort
+/// between its neighbours (ART checks the string table is sorted) or when a method or field of
+/// a class outside this dex takes, returns or holds the type (its signature would change).
+pub fn offline_http_client(data: &mut [u8]) -> Option<Fix> {
+    let index = http_client_string(data)?.ok()?;
+    let dex = Dex { data };
+    let mut at = dex.u32(dex.u32(0x3C) as usize + index as usize * 4) as usize;
+    dex.uleb(&mut at);
+    data[at..at + OFFLINE_HTTP_CLIENT.len()].copy_from_slice(OFFLINE_HTTP_CLIENT.as_bytes());
+    reseal(data);
+    Some(Fix { offset: at, reason: "offline answers from the phone (Apache HTTP client)", old: DEFAULT_HTTP_CLIENT.into(), new: OFFLINE_HTTP_CLIENT.into() })
+}
+
+/// Whether the dex has Apache's client class but fix 7 can't rename it (see above); a game
+/// with such a dex keeps its network in every dex.
+pub fn offline_http_client_refused(data: &[u8]) -> bool {
+    matches!(http_client_string(data), Some(Err(())))
+}
+
+/// The client class name's string index: None without it, Err when the rename is refused.
+fn http_client_string(data: &[u8]) -> Option<Result<u32, ()>> {
+    let dex = Dex { data };
+    let count = dex.u32(0x38);
+    let index = (0..count).find(|&index| dex.string(index) == DEFAULT_HTTP_CLIENT)?;
+    let sorted = (index == 0 || dex.string(index - 1).as_str() < OFFLINE_HTTP_CLIENT)
+        && (index + 1 == count || dex.string(index + 1).as_str() > OFFLINE_HTTP_CLIENT);
+    let outside = dex.type_index(DEFAULT_HTTP_CLIENT).is_some_and(|kind| used_outside(&dex, kind));
+    Some(if sorted && !outside { Ok(index) } else { Err(()) })
+}
+
+/// Whether a method or field of a class not defined in this dex has `kind` in its signature.
+fn used_outside(dex: &Dex, kind: u32) -> bool {
+    let defined: std::collections::HashSet<u32> = (0..dex.u32(0x60) as usize).map(|i| dex.u32(dex.u32(0x64) as usize + i * 32)).collect();
+    let outside = |class: u16| u32::from(class) != kind && !defined.contains(&u32::from(class));
+    let fields = (0..dex.u32(0x50) as usize).map(|i| dex.u32(0x54) as usize + i * 8);
+    if fields.into_iter().any(|at| outside(dex.u16(at)) && u32::from(dex.u16(at + 2)) == kind) {
+        return true;
+    }
+    (0..dex.u32(0x58) as usize).map(|i| dex.u32(0x5C) as usize + i * 8).any(|at| {
+        let proto = dex.u32(0x4C) as usize + dex.u16(at + 2) as usize * 12;
+        let params = dex.u32(proto + 8) as usize;
+        let mut types = vec![dex.u32(proto + 4)];
+        if params != 0 {
+            types.extend((0..dex.u32(params) as usize).map(|i| u32::from(dex.u16(params + 4 + i * 2))));
+        }
+        outside(dex.u16(at)) && types.contains(&kind)
+    })
+}
+
+/// Redoes the header's SHA-1 signature (of [32..]) and adler32 checksum (of [12..]).
+fn reseal(data: &mut [u8]) {
+    use sha1::Digest;
+    let digest = sha1::Sha1::digest(&data[32..]);
+    data[12..32].copy_from_slice(&digest);
+    let checksum = adler32(&data[12..]);
+    data[8..12].copy_from_slice(&checksum.to_le_bytes());
 }
 
 /// `name` if it is one of Java's number parsers (a fix 5 target).
@@ -571,6 +632,47 @@ mod tests {
         let mod_dex = strings_only(&["main.702.com.ea.game.pvz2_rqm.obb", "https://github.com/x/y/releases/download/v1/main.702.com.ea.game.pvz2_rqm.obb"]);
         assert!(super::fetches_own_data(&mod_dex));
         assert!(!super::fetches_own_data(&strings_only(&["main.obb", "https://example.com/news", "getObbDir"])));
+    }
+
+    const DEFAULT_CLIENT: &str = "Lorg/apache/http/impl/client/DefaultHttpClient;";
+    const OFFLINE_CLIENT: &str = "Lorg/apache/http/impl/client/OfflineHttpClient;";
+
+    fn strings_of(data: &[u8]) -> Vec<String> {
+        let dex = super::Dex { data };
+        (0..dex.u32(0x38)).map(|index| dex.string(index)).collect()
+    }
+
+    /// Fix 7: the game's Apache client class becomes Game Bridge's offline one, in place,
+    /// with the string table still sorted and the header checksum and signature redone.
+    #[test]
+    fn http_client_becomes_the_offline_one() {
+        let mut dex = strings_only(&["Lorg/apache/http/entity/StringEntity;", DEFAULT_CLIENT, "Lorg/apache/http/impl/conn/X;"]);
+        let fix = super::offline_http_client(&mut dex).expect("renamed");
+        assert_eq!((fix.old.as_str(), fix.new.as_str()), (DEFAULT_CLIENT, OFFLINE_CLIENT));
+        assert_eq!(strings_of(&dex), ["Lorg/apache/http/entity/StringEntity;", OFFLINE_CLIENT, "Lorg/apache/http/impl/conn/X;"]);
+        assert_eq!(u32::from_le_bytes(dex[8..12].try_into().unwrap()), super::adler32(&dex[12..]), "checksum redone");
+    }
+
+    /// The rename is refused when the new name would sort past a neighbour (ART rejects an
+    /// unsorted string table), and does nothing for a dex without the class.
+    #[test]
+    fn http_client_rename_keeps_the_table_sorted() {
+        let mut dex = strings_only(&[DEFAULT_CLIENT, "Lorg/apache/http/impl/client/Not;"]);
+        let before = dex.clone();
+        assert!(super::offline_http_client(&mut dex).is_none());
+        assert_eq!(dex, before, "unchanged when refused");
+        let mut other = strings_only(&["Ljava/lang/Object;"]);
+        assert!(super::offline_http_client(&mut other).is_none());
+    }
+
+    /// A refusal is told apart from a dex without the class, so a game with several dex
+    /// files gets the rename in all of them or in none (a class renamed in one dex only would
+    /// no longer match the other dex files' references to it).
+    #[test]
+    fn http_client_refusal_is_reported() {
+        assert!(super::offline_http_client_refused(&strings_only(&[DEFAULT_CLIENT, "Lorg/apache/http/impl/client/Not;"])));
+        assert!(!super::offline_http_client_refused(&strings_only(&["Ljava/lang/Object;"])));
+        assert!(!super::offline_http_client_refused(&strings_only(&["Lorg/apache/http/entity/StringEntity;", DEFAULT_CLIENT])));
     }
 
     #[test]

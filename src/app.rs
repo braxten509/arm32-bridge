@@ -71,7 +71,7 @@ fn library_path() -> &'static PathBuf {
 }
 
 /// Directory this library was loaded from (the app's native library dir).
-fn library_directory() -> &'static PathBuf {
+pub(crate) fn library_directory() -> &'static PathBuf {
     static DIRECTORY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     DIRECTORY.get_or_init(|| library_path().parent().map(PathBuf::from).unwrap_or_default())
 }

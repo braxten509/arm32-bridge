@@ -15,6 +15,7 @@ pub mod ios32;
 pub mod jni_names;
 pub mod log;
 pub mod mem;
+pub mod offline;
 pub mod gameswf_blend;
 pub mod gameswf_menus;
 pub mod monster_life_store;
